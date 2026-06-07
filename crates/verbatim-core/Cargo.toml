@@ -11,3 +11,4 @@ serde_json.workspace = true
 toml.workspace = true
 dirs.workspace = true
 async-trait.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
