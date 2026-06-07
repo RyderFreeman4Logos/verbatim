@@ -2,6 +2,7 @@ pub mod chunker;
 pub mod config;
 pub mod context;
 pub mod embed;
+pub mod generate;
 pub mod index;
 pub mod ingest;
 pub mod parser;
