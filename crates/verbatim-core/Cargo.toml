@@ -17,6 +17,9 @@ toml.workspace = true
 dirs.workspace = true
 async-trait.workspace = true
 sha2.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 pdf_oxide = { version = "0.3", optional = true }
 pdfplumber = { version = "0.2", optional = true }
