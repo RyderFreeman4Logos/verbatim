@@ -3,6 +3,7 @@ pub mod config;
 pub mod context;
 pub mod embed;
 pub mod index;
+pub mod ingest;
 pub mod parser;
 pub mod store;
 pub mod traits;
