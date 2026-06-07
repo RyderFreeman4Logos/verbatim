@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/verbatim-core",
+    "crates/verbatim-daemon",
+    "crates/verbatim-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "4.4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json"] }
+url = "2.4"
+sha2 = "0.10"
+walkdir = "2.4"
+dirs = "6"
+async-trait = "0.1"
