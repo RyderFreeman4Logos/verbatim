@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod config;
+pub mod context;
 pub mod embed;
 pub mod index;
 pub mod parser;
