@@ -1,4 +1,5 @@
 pub mod config;
+pub mod parser;
 pub mod store;
 pub mod traits;
 pub mod types;
