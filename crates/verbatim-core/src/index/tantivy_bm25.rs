@@ -79,7 +79,6 @@ impl Bm25Index {
             .writer(50_000_000)
             .context("create index writer")?;
         writer.delete_all_documents()?;
-        writer.commit()?;
 
         for (chunk_id, text, heading) in docs {
             writer.add_document(doc!(

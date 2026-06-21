@@ -38,6 +38,11 @@ impl HnswIndex {
         self.map = None;
     }
 
+    pub fn clear(&mut self) {
+        self.points.clear();
+        self.map = None;
+    }
+
     pub fn build(&mut self) -> Result<()> {
         if self.points.is_empty() {
             self.map = None;
@@ -137,6 +142,19 @@ mod tests {
         let index = HnswIndex::new();
         let results = index.search(&[0.0, 0.0, 0.0], 5);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn clear_removes_previous_points() {
+        let mut index = HnswIndex::new();
+        index.add(&ChunkId("old".into()), seeded_vec(4, 1));
+        index.build().unwrap();
+
+        index.clear();
+        index.build().unwrap();
+
+        assert!(index.is_empty());
+        assert!(index.search(&seeded_vec(4, 1), 5).is_empty());
     }
 
     #[test]

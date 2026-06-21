@@ -15,6 +15,18 @@ pub trait Parser: Send + Sync {
 pub trait EmbeddingClient: Send + Sync {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     fn dimension(&self) -> usize;
+
+    fn prepare_query(&self, query: &str) -> String {
+        query.to_string()
+    }
+
+    fn prepare_document(&self, text: &str, heading: &str) -> String {
+        if heading.is_empty() {
+            text.to_string()
+        } else {
+            format!("{heading}: {text}")
+        }
+    }
 }
 
 pub trait VectorIndex: Send + Sync {

@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::config::ChatConfig;
+use crate::config::{ChatConfig, VerifierConfig};
 use crate::types::{CitationRef, EvidenceUnit, RetrievalResult};
 
 pub struct Generator {
@@ -13,6 +13,7 @@ pub struct Generator {
     model: String,
     temperature: f32,
     api_key: String,
+    verifier_enabled: bool,
 }
 
 pub struct GenerationResult {
@@ -22,13 +23,14 @@ pub struct GenerationResult {
 }
 
 impl Generator {
-    pub fn new(config: &ChatConfig) -> Self {
+    pub fn new(chat: &ChatConfig, verifier: &VerifierConfig) -> Self {
         Self {
             client: Client::new(),
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            model: config.model.clone(),
-            temperature: config.temperature,
-            api_key: config.api_key.clone(),
+            base_url: chat.base_url.trim_end_matches('/').to_string(),
+            model: chat.model.clone(),
+            temperature: chat.temperature,
+            api_key: chat.api_key.clone(),
+            verifier_enabled: verifier.enabled,
         }
     }
 
@@ -45,6 +47,13 @@ impl Generator {
         let raw_answer = self.chat(system_prompt, &user_prompt).await?;
 
         let citations = extract_citations(&raw_answer, &eid_map);
+        if self.verifier_enabled {
+            let verification = self.verify(question, &raw_answer, &citations).await?;
+            return self
+                .apply_verification(question, &raw_answer, citations, verification)
+                .await;
+        }
+
         let answer = render_answer(&raw_answer, &citations);
 
         Ok(GenerationResult {
@@ -96,13 +105,79 @@ impl Generator {
             .trim_end_matches("```")
             .trim();
 
-        match serde_json::from_str::<VerificationResult>(cleaned) {
-            Ok(v) => Ok(v),
-            Err(_) => Ok(VerificationResult {
-                verdict: "pass".into(),
-                unsupported_claims: vec![],
+        serde_json::from_str::<VerificationResult>(cleaned)
+            .context("verifier returned invalid JSON")
+    }
+
+    async fn apply_verification(
+        &self,
+        question: &str,
+        raw_answer: &str,
+        citations: Vec<CitationRef>,
+        verification: VerificationResult,
+    ) -> Result<GenerationResult> {
+        match verification.verdict.as_str() {
+            "pass" => Ok(GenerationResult {
+                answer: render_answer(raw_answer, &citations),
+                citations,
+                verified: true,
             }),
+            "revise" => {
+                let revised = self
+                    .revise_answer(
+                        question,
+                        raw_answer,
+                        &citations,
+                        &verification.unsupported_claims,
+                    )
+                    .await?;
+                let second_pass = self.verify(question, &revised, &citations).await?;
+                if second_pass.verdict == "pass" {
+                    Ok(GenerationResult {
+                        answer: render_answer(&revised, &citations),
+                        citations,
+                        verified: true,
+                    })
+                } else {
+                    Ok(insufficient_generation())
+                }
+            }
+            _ => Ok(insufficient_generation()),
         }
+    }
+
+    async fn revise_answer(
+        &self,
+        question: &str,
+        answer: &str,
+        citations: &[CitationRef],
+        unsupported_claims: &[String],
+    ) -> Result<String> {
+        let sources_json: Vec<serde_json::Value> = citations
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.evidence_id.0,
+                    "locator": c.locator.to_string(),
+                    "text": c.text_preview,
+                })
+            })
+            .collect();
+        let prompt = format!(
+            "Revise the answer so every remaining factual claim is directly supported by the cited sources.\n\n\
+             Question: {question}\n\n\
+             Original answer: {answer}\n\n\
+             Unsupported claims to remove: {unsupported}\n\n\
+             Sources: {sources}\n\n\
+             If the sources are insufficient, output exactly: Evidence insufficient to answer this question.",
+            unsupported = serde_json::to_string_pretty(unsupported_claims)?,
+            sources = serde_json::to_string_pretty(&sources_json)?
+        );
+        self.chat(
+            "You revise answers to remove unsupported claims. Output only the revised answer.",
+            &prompt,
+        )
+        .await
     }
 
     async fn chat(&self, system: &str, user: &str) -> Result<String> {
@@ -137,6 +212,14 @@ impl Generator {
             .first()
             .map(|c| c.message.content.clone())
             .unwrap_or_default())
+    }
+}
+
+fn insufficient_generation() -> GenerationResult {
+    GenerationResult {
+        answer: "Evidence insufficient to answer this question.".into(),
+        citations: Vec::new(),
+        verified: false,
     }
 }
 
@@ -329,5 +412,16 @@ mod tests {
         let rendered = render_answer("Answer text [E1].", &citations);
         assert!(rendered.contains("References:"));
         assert!(rendered.contains("[1] PDF p.42"));
+    }
+
+    #[test]
+    fn insufficient_generation_does_not_expose_citations() {
+        let result = insufficient_generation();
+        assert_eq!(
+            result.answer,
+            "Evidence insufficient to answer this question."
+        );
+        assert!(result.citations.is_empty());
+        assert!(!result.verified);
     }
 }

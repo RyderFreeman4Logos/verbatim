@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::types::{
     Chunk, ChunkId, ChunkType, EvidenceId, EvidenceUnit, Source, SourceId, SourceStatus,
@@ -85,10 +85,104 @@ impl Store {
         }
     }
 
-    pub fn remove_source(&self, id: &SourceId) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM sources WHERE id = ?1", params![id.0])?;
-        Ok(())
+    pub fn remove_source(&self, id: &SourceId) -> Result<u64> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
+        let generation = bump_index_generation(&tx)?;
+        tx.commit()?;
+        Ok(generation)
+    }
+
+    pub fn replace_source_contents(
+        &self,
+        source: &Source,
+        evidence: &[EvidenceUnit],
+        chunks: &[Chunk],
+        links: &[(ChunkId, EvidenceId)],
+    ) -> Result<u64> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM sources WHERE id = ?1", params![&source.id.0])?;
+        tx.execute(
+            "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &source.id.0,
+                source.path.to_str().unwrap_or(""),
+                &source.hash,
+                status_to_str(&source.status),
+                &source.parser_used,
+                &source.last_ingested_at,
+            ],
+        )?;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO evidence_units (id, source_id, locator_json, text, text_hash, heading_path_json, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            )?;
+            for unit in evidence {
+                let locator_json =
+                    serde_json::to_string(&unit.locator).context("serialize locator")?;
+                let heading_json =
+                    serde_json::to_string(&unit.heading_path).context("serialize heading_path")?;
+                stmt.execute(params![
+                    &unit.id.0,
+                    &unit.source_id.0,
+                    locator_json,
+                    &unit.text,
+                    &unit.text_hash,
+                    heading_json,
+                    unit.position,
+                ])?;
+            }
+        }
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO chunks (id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            )?;
+            for chunk in chunks {
+                let heading_json =
+                    serde_json::to_string(&chunk.heading_path).context("serialize heading_path")?;
+                stmt.execute(params![
+                    &chunk.id.0,
+                    &chunk.source_id.0,
+                    &chunk.text,
+                    &chunk.context_text,
+                    chunk.token_count,
+                    chunk_type_to_str(&chunk.chunk_type),
+                    chunk.parent_chunk_id.as_ref().map(|id| &id.0),
+                    heading_json,
+                ])?;
+            }
+        }
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO chunk_evidence (chunk_id, evidence_unit_id) VALUES (?1, ?2)",
+            )?;
+            for (chunk_id, evidence_id) in links {
+                stmt.execute(params![&chunk_id.0, &evidence_id.0])?;
+            }
+        }
+
+        let generation = bump_index_generation(&tx)?;
+        tx.commit()?;
+        Ok(generation)
+    }
+
+    pub fn index_generation(&self) -> Result<u64> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'generation'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<u64>()
+            .context("parse index generation")
     }
 
     pub fn update_source_status(&self, id: &SourceId, status: &SourceStatus) -> Result<()> {
@@ -272,6 +366,18 @@ impl Store {
         Ok(result)
     }
 
+    pub fn list_child_chunks(&self) -> Result<Vec<Chunk>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json FROM chunks WHERE chunk_type = 'Child' ORDER BY source_id, id"
+        )?;
+        let rows = stmt.query_map([], row_to_chunk_tuple)?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(tuple_to_chunk(r?, &self.conn)?);
+        }
+        Ok(result)
+    }
+
     pub fn get_parent_chunk(&self, child_id: &ChunkId) -> Result<Option<Chunk>> {
         let child = self.get_chunk(child_id)?;
         match child.and_then(|c| c.parent_chunk_id) {
@@ -377,6 +483,27 @@ fn get_evidence_ids_for_chunk(conn: &Connection, chunk_id: &str) -> Result<Vec<E
     rows.map(|r| Ok(EvidenceId(r?))).collect()
 }
 
+fn bump_index_generation(tx: &Transaction<'_>) -> Result<u64> {
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT value FROM index_meta WHERE key = 'generation'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let next = current
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<u64>()
+        .context("parse current index generation")?
+        .saturating_add(1);
+    tx.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('generation', ?1)",
+        params![next.to_string()],
+    )?;
+    Ok(next)
+}
+
 fn status_to_str(s: &SourceStatus) -> &'static str {
     match s {
         SourceStatus::Pending => "Pending",
@@ -445,6 +572,10 @@ CREATE TABLE IF NOT EXISTS embeddings_meta (
     hnsw_position INTEGER NOT NULL,
     embedding_model TEXT NOT NULL,
     embedded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS index_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 "#;
 
@@ -618,6 +749,21 @@ mod tests {
             .get_embedding_meta(&ChunkId("child-1".into()))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn list_child_chunks_excludes_parents() {
+        let store = Store::in_memory().unwrap();
+        store.add_source(&sample_source()).unwrap();
+        store
+            .bulk_insert_evidence(&sample_evidence("src-1"))
+            .unwrap();
+        store.bulk_insert_chunks(&sample_chunks("src-1")).unwrap();
+
+        let children = store.list_child_chunks().unwrap();
+
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id.0, "child-1");
     }
 
     #[test]
