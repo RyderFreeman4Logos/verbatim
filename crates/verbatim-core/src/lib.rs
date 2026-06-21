@@ -6,6 +6,7 @@ pub mod generate;
 pub mod index;
 pub mod ingest;
 pub mod parser;
+pub mod provider;
 pub mod retrieve;
 pub mod store;
 pub mod traits;

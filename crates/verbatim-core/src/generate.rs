@@ -1,18 +1,15 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Context, Result};
-use reqwest::Client;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ChatConfig, VerifierConfig};
+use crate::provider::openai_compatible::OpenAiCompatibleChatModel;
+use crate::provider::{ChatMessage, ChatModel, ChatRequest};
 use crate::types::{CitationRef, EvidenceUnit, RetrievalResult};
 
 pub struct Generator {
-    client: Client,
-    base_url: String,
-    model: String,
-    temperature: f32,
-    api_key: String,
+    chat_model: OpenAiCompatibleChatModel,
     verifier_enabled: bool,
 }
 
@@ -25,11 +22,7 @@ pub struct GenerationResult {
 impl Generator {
     pub fn new(chat: &ChatConfig, verifier: &VerifierConfig) -> Self {
         Self {
-            client: Client::new(),
-            base_url: chat.base_url.trim_end_matches('/').to_string(),
-            model: chat.model.clone(),
-            temperature: chat.temperature,
-            api_key: chat.api_key.clone(),
+            chat_model: OpenAiCompatibleChatModel::from_config(chat),
             verifier_enabled: verifier.enabled,
         }
     }
@@ -181,37 +174,15 @@ impl Generator {
     }
 
     async fn chat(&self, system: &str, user: &str) -> Result<String> {
-        let messages = vec![
-            serde_json::json!({"role": "system", "content": system}),
-            serde_json::json!({"role": "user", "content": user}),
-        ];
-
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-        });
-
-        let url = format!("{}/chat/completions", self.base_url);
-        let mut req = self.client.post(&url).json(&body);
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
-
-        let resp = req.send().await.context("chat request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("chat API returned {status}: {text}");
-        }
-
-        let response: ChatResponse = resp.json().await.context("parse chat response")?;
-        Ok(response
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default())
+        let response = self
+            .chat_model
+            .chat(ChatRequest::new(vec![
+                ChatMessage::system(system),
+                ChatMessage::user(user),
+            ]))
+            .await
+            .context("chat completion failed")?;
+        Ok(response.content)
     }
 }
 
@@ -314,21 +285,6 @@ Rules:
 4. If the SOURCE PACK does not contain enough evidence, say so.
 5. Do not use outside knowledge.
 6. Do not invent page numbers, paragraph numbers, quotations, or citations.";
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatMessageResponse,
-}
-
-#[derive(Deserialize)]
-struct ChatMessageResponse {
-    content: String,
-}
 
 #[cfg(test)]
 mod tests {
