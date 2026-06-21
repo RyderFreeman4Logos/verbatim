@@ -10,6 +10,7 @@ pub struct Config {
     pub store: StoreConfig,
     #[serde(default)]
     pub parser: ParserConfig,
+    #[serde(default)]
     pub embedding: EmbeddingConfig,
     #[serde(default)]
     pub retrieval: RetrievalConfig,
@@ -17,6 +18,9 @@ pub struct Config {
     pub rerank: RerankConfig,
     #[serde(default)]
     pub context: ContextConfig,
+    #[serde(default)]
+    pub vision: VisionConfig,
+    #[serde(default)]
     pub chat: ChatConfig,
     #[serde(default)]
     pub verifier: VerifierConfig,
@@ -54,17 +58,58 @@ impl Default for ParserConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_openai_provider")]
+    pub provider: String,
+    #[serde(default = "default_embedding_base_url")]
     pub base_url: String,
     #[serde(default = "default_embedding_model")]
     pub model: String,
     #[serde(default = "default_dimension")]
     pub dimension: usize,
+    #[serde(default = "default_normalize_embeddings")]
+    pub normalize: bool,
     #[serde(default = "default_query_instruction")]
     pub query_instruction: String,
     #[serde(default)]
     pub document_instruction: String,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    #[serde(default = "default_embedding_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: default_openai_provider(),
+            base_url: default_embedding_base_url(),
+            model: default_embedding_model(),
+            dimension: default_dimension(),
+            normalize: true,
+            query_instruction: default_query_instruction(),
+            document_instruction: String::new(),
+            batch_size: default_batch_size(),
+            timeout_seconds: default_embedding_timeout_seconds(),
+            api_key: String::new(),
+        }
+    }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_openai_provider() -> String {
+    "openai_compatible".into()
+}
+
+fn default_embedding_base_url() -> String {
+    "http://127.0.0.1:8002/v1".into()
 }
 
 fn default_embedding_model() -> String {
@@ -75,12 +120,20 @@ fn default_dimension() -> usize {
     4096
 }
 
+fn default_normalize_embeddings() -> bool {
+    true
+}
+
 fn default_query_instruction() -> String {
     "Given a user's question about a document, retrieve the exact passages that directly support a grounded answer with source-level citations.".into()
 }
 
 fn default_batch_size() -> usize {
-    32
+    16
+}
+
+fn default_embedding_timeout_seconds() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,27 +156,48 @@ impl Default for RetrievalConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankConfig {
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_openai_provider")]
+    pub provider: String,
+    #[serde(default = "default_rerank_base_url")]
     pub base_url: String,
-    #[serde(default)]
+    #[serde(default = "default_rerank_model")]
     pub model: String,
     #[serde(default = "default_rerank_top_n")]
     pub top_n: usize,
+    #[serde(default = "default_rerank_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub api_key: String,
 }
 
 impl Default for RerankConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            base_url: String::new(),
-            model: String::new(),
+            provider: default_openai_provider(),
+            base_url: default_rerank_base_url(),
+            model: default_rerank_model(),
             top_n: 12,
+            timeout_seconds: default_rerank_timeout_seconds(),
+            api_key: String::new(),
         }
     }
 }
 
+fn default_rerank_base_url() -> String {
+    "http://127.0.0.1:8003/v1".into()
+}
+
+fn default_rerank_model() -> String {
+    "Qwen/Qwen3-Reranker-8B".into()
+}
+
 fn default_rerank_top_n() -> usize {
     12
+}
+
+fn default_rerank_timeout_seconds() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,12 +213,82 @@ impl Default for ContextConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_openai_provider")]
+    pub provider: String,
+    #[serde(default = "default_chat_base_url")]
     pub base_url: String,
+    #[serde(default = "default_chat_model")]
     pub model: String,
     #[serde(default)]
     pub temperature: f32,
+    #[serde(default = "default_chat_timeout_seconds")]
+    pub timeout_seconds: u64,
     #[serde(default)]
     pub api_key: String,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: default_openai_provider(),
+            base_url: default_chat_base_url(),
+            model: default_chat_model(),
+            temperature: 0.0,
+            timeout_seconds: default_chat_timeout_seconds(),
+            api_key: String::new(),
+        }
+    }
+}
+
+fn default_chat_base_url() -> String {
+    "http://127.0.0.1:8000/v1".into()
+}
+
+fn default_chat_model() -> String {
+    "Qwen/Qwen3.6-27B".into()
+}
+
+fn default_chat_timeout_seconds() -> u64 {
+    120
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisionConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_openai_provider")]
+    pub provider: String,
+    #[serde(default = "default_chat_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_chat_model")]
+    pub model: String,
+    #[serde(default)]
+    pub temperature: f32,
+    #[serde(default = "default_vision_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+impl Default for VisionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: default_openai_provider(),
+            base_url: default_chat_base_url(),
+            model: default_chat_model(),
+            temperature: 0.0,
+            timeout_seconds: default_vision_timeout_seconds(),
+            api_key: String::new(),
+        }
+    }
+}
+
+fn default_vision_timeout_seconds() -> u64 {
+    180
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,12 +437,17 @@ path = "~/.local/share/verbatim"
 default = "pdf_oxide"   # pdf_oxide | pdfplumber
 
 [embedding]
-base_url = "http://127.0.0.1:8001/v1"
+enabled = true
+provider = "openai_compatible"
+base_url = "http://127.0.0.1:8002/v1"
 model = "Qwen/Qwen3-Embedding-8B"
 dimension = 4096
+normalize = true
 query_instruction = "Given a user's question about a document, retrieve the exact passages that directly support a grounded answer with source-level citations."
 document_instruction = ""
-batch_size = 32
+batch_size = 16
+timeout_seconds = 120
+api_key = ""
 
 [retrieval]
 dense_top_k = 80
@@ -307,17 +456,32 @@ rrf_k = 60
 
 [rerank]
 enabled = false
-# base_url = "http://127.0.0.1:8003/v1"
-# model = "Qwen/Qwen3-Reranker-4B"
-# top_n = 12
+provider = "openai_compatible"
+base_url = "http://127.0.0.1:8003/v1"
+model = "Qwen/Qwen3-Reranker-8B"
+top_n = 12
+timeout_seconds = 120
+api_key = ""
 
 [context]
 enabled = true
 
-[chat]
-base_url = "http://127.0.0.1:8002/v1"
-model = "qwen3.6-27b"
+[vision]
+enabled = true
+provider = "openai_compatible"
+base_url = "http://127.0.0.1:8000/v1"
+model = "Qwen/Qwen3.6-27B"
 temperature = 0.0
+timeout_seconds = 180
+api_key = ""
+
+[chat]
+enabled = true
+provider = "openai_compatible"
+base_url = "http://127.0.0.1:8000/v1"
+model = "Qwen/Qwen3.6-27B"
+temperature = 0.0
+timeout_seconds = 120
 api_key = ""
 
 [verifier]
@@ -342,10 +506,20 @@ mod tests {
         let config: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
         assert_eq!(config.store.path, "~/.local/share/verbatim");
         assert_eq!(config.parser.default, "pdf_oxide");
+        assert!(config.embedding.enabled);
+        assert_eq!(config.embedding.provider, "openai_compatible");
+        assert_eq!(config.embedding.base_url, "http://127.0.0.1:8002/v1");
         assert_eq!(config.embedding.dimension, 4096);
+        assert!(config.embedding.normalize);
+        assert_eq!(config.embedding.batch_size, 16);
         assert_eq!(config.retrieval.dense_top_k, 80);
         assert!(!config.rerank.enabled);
+        assert_eq!(config.rerank.model, "Qwen/Qwen3-Reranker-8B");
         assert!(config.context.enabled);
+        assert!(config.vision.enabled);
+        assert_eq!(config.vision.timeout_seconds, 180);
+        assert!(config.chat.enabled);
+        assert_eq!(config.chat.base_url, "http://127.0.0.1:8000/v1");
         assert!(config.verifier.enabled);
         assert!(!config.qdrant.enabled);
         assert_eq!(config.daemon.bind, "127.0.0.1:7700");
@@ -379,6 +553,23 @@ mod tests {
         let redacted = config.redacted_json();
 
         assert_eq!(redacted["chat"]["api_key"], "<redacted>");
-        assert_eq!(redacted["chat"]["base_url"], "http://127.0.0.1:8002/v1");
+        assert_eq!(redacted["chat"]["base_url"], "http://127.0.0.1:8000/v1");
+    }
+
+    #[test]
+    fn redact_secrets_masks_tokens_and_authorization() {
+        let mut value = serde_json::json!({
+            "token": "secret",
+            "headers": {
+                "authorization": "Bearer secret",
+                "x_request_id": "safe"
+            }
+        });
+
+        redact_secrets(&mut value);
+
+        assert_eq!(value["token"], "<redacted>");
+        assert_eq!(value["headers"]["authorization"], "<redacted>");
+        assert_eq!(value["headers"]["x_request_id"], "safe");
     }
 }

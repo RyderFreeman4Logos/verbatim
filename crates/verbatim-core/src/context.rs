@@ -1,26 +1,18 @@
-use anyhow::{bail, Context, Result};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result};
 
 use crate::config::ChatConfig;
+use crate::provider::openai_compatible::OpenAiCompatibleChatModel;
+use crate::provider::{ChatMessage, ChatModel, ChatRequest};
 use crate::types::Chunk;
 
 pub struct ContextGenerator {
-    client: Client,
-    base_url: String,
-    model: String,
-    temperature: f32,
-    api_key: String,
+    chat_model: OpenAiCompatibleChatModel,
 }
 
 impl ContextGenerator {
     pub fn new(config: &ChatConfig) -> Self {
         Self {
-            client: Client::new(),
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            model: config.model.clone(),
-            temperature: config.temperature,
-            api_key: config.api_key.clone(),
+            chat_model: OpenAiCompatibleChatModel::from_config(config),
         }
     }
 
@@ -41,41 +33,12 @@ impl ContextGenerator {
             text = chunk.text
         );
 
-        let messages = vec![ChatMessage {
-            role: "user",
-            content: &prompt,
-        }];
-
-        let body = ChatRequest {
-            model: &self.model,
-            messages: &messages,
-            temperature: self.temperature,
-            max_tokens: 150,
-        };
-
-        let url = format!("{}/chat/completions", self.base_url);
-        let mut req = self.client.post(&url).json(&body);
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
-
-        let resp = req
-            .send()
+        let response = self
+            .chat_model
+            .chat(ChatRequest::new(vec![ChatMessage::user(prompt)]).with_max_tokens(150))
             .await
             .context("context generation request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("chat API returned {status}: {text}");
-        }
-
-        let response: ChatResponse = resp.json().await.context("parse chat response")?;
-        let context = response
-            .choices
-            .first()
-            .map(|c| c.message.content.trim().to_string())
-            .unwrap_or_default();
+        let context = response.content.trim().to_string();
 
         Ok(context)
     }
@@ -133,35 +96,6 @@ impl ContextGenerator {
 
         Ok(enriched)
     }
-}
-
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: &'a [ChatMessage<'a>],
-    temperature: f32,
-    max_tokens: u32,
-}
-
-#[derive(Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatMessageResponse,
-}
-
-#[derive(Deserialize)]
-struct ChatMessageResponse {
-    content: String,
 }
 
 #[cfg(test)]
