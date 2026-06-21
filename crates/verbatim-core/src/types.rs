@@ -184,6 +184,8 @@ pub struct EvidenceUnit {
     pub id: EvidenceId,
     pub source_id: SourceId,
     pub kind: EvidenceKind,
+    #[serde(default)]
+    pub derived_from: Option<EvidenceId>,
     pub locator: SourceLocator,
     pub text: String,
     pub text_hash: String,

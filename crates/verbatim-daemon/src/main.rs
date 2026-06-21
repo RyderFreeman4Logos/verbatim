@@ -110,6 +110,7 @@ struct EvidenceResponse {
     id: String,
     source_id: String,
     kind: &'static str,
+    derived_from: Option<String>,
     locator: String,
     text: String,
     heading_path: Vec<String>,
@@ -390,7 +391,16 @@ async fn get_evidence(
         let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let evidence = pipeline.store().get_evidence(&EvidenceId(eid_clone))?;
         let image_artifact = match &evidence {
-            Some(eu) => pipeline.store().get_image_artifact_by_evidence(&eu.id)?,
+            Some(eu) => {
+                let direct = pipeline.store().get_image_artifact_by_evidence(&eu.id)?;
+                match (direct, &eu.derived_from) {
+                    (Some(artifact), _) => Some(artifact),
+                    (None, Some(source_evidence_id)) => pipeline
+                        .store()
+                        .get_image_artifact_by_evidence(source_evidence_id)?,
+                    (None, None) => None,
+                }
+            }
             None => None,
         };
         Ok::<_, anyhow::Error>((evidence, image_artifact))
@@ -404,6 +414,7 @@ async fn get_evidence(
             kind: evidence_kind_name(eu.kind),
             id: eu.id.0,
             source_id: eu.source_id.0,
+            derived_from: eu.derived_from.map(|id| id.0),
             locator: eu.locator.to_string(),
             text: eu.text,
             heading_path: eu.heading_path,

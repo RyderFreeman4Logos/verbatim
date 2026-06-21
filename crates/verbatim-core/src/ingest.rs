@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chunker::{chunk_evidence, ChunkerConfig};
+use crate::chunker::{chunk_evidence, estimate_tokens, ChunkOutput, ChunkerConfig};
 use crate::config::Config;
 use crate::context::ContextGenerator;
 use crate::embed::OpenAiEmbeddingClient;
@@ -22,8 +22,8 @@ use crate::provider::VisionModel;
 use crate::store::Store;
 use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
 use crate::types::{
-    hex_sha256, Chunk, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, ImageId,
-    ParsedImageArtifact, Source, SourceId, SourceLocator, SourceStatus,
+    hex_sha256, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact,
+    ImageId, ParsedImageArtifact, Source, SourceId, SourceLocator, SourceStatus,
 };
 use crate::vision_caption::{
     caption_derived_evidence, request_image_caption, vision_caption_prompt_hash, CaptionAttempt,
@@ -261,7 +261,6 @@ where
             )
             .await?;
         evidence.extend(prepared_image_artifacts.evidence.clone());
-        evidence.extend(caption_evidence);
         tracing::info!(evidence_count = evidence.len(), "parsed");
 
         let chunker_config = ChunkerConfig::default();
@@ -269,6 +268,7 @@ where
         tracing::info!(chunk_count = output.chunks.len(), "chunked");
 
         let mut chunks = output.chunks;
+        let mut links = output.links;
         if let Some(ctx_gen) = &self.context_gen {
             let title = source
                 .path
@@ -278,6 +278,11 @@ where
             let enriched = ctx_gen.enrich_chunks(&mut chunks, title, 8).await?;
             tracing::info!(enriched, "contextual retrieval done");
         }
+
+        let caption_output = chunk_caption_evidence(source_id, &caption_evidence);
+        chunks.extend(caption_output.chunks);
+        links.extend(caption_output.links);
+        evidence.extend(caption_evidence);
 
         let mut child_chunks = self.child_chunks_without_source(source_id)?;
         child_chunks.extend(
@@ -304,7 +309,7 @@ where
             &evidence,
             &chunks,
             &prepared.vectors,
-            &output.links,
+            &links,
             &prepared_image_artifacts.artifacts,
         ) {
             Ok(generation) => generation,
@@ -467,20 +472,26 @@ where
         position: u32,
     ) -> Result<Option<EvidenceUnit>> {
         let Some(model) = &self.vision_model else {
-            if self
-                .store
-                .get_successful_image_caption(
-                    &artifact.content_hash,
-                    &self.vision_caption_model,
-                    &self.vision_caption_prompt_hash,
-                )?
-                .is_some()
-            {
+            if let Some(record) = self.store.get_successful_image_caption(
+                &artifact.content_hash,
+                &self.vision_caption_model,
+                &self.vision_caption_prompt_hash,
+            )? {
                 tracing::debug!(
                     image_id = %artifact.image_id.0,
                     image_hash = %artifact.content_hash,
-                    "preserving successful image caption cache while vision provider is disabled"
+                    "indexing successful image caption cache while vision provider is disabled"
                 );
+                if let Some(caption) = record.caption {
+                    return Ok(Some(caption_derived_evidence(
+                        source_id,
+                        artifact,
+                        &caption,
+                        &self.vision_caption_model,
+                        &self.vision_caption_prompt_hash,
+                        position,
+                    )));
+                }
                 return Ok(None);
             }
             let attempt =
@@ -705,6 +716,29 @@ fn chunk_search_text(chunk: &Chunk) -> String {
         .unwrap_or_else(|| chunk.text.clone())
 }
 
+fn chunk_caption_evidence(source_id: &SourceId, evidence: &[EvidenceUnit]) -> ChunkOutput {
+    let mut chunks = Vec::with_capacity(evidence.len());
+    let mut links = Vec::with_capacity(evidence.len());
+
+    for unit in evidence {
+        let chunk_id = ChunkId(format!("{}:chunk", unit.id.0));
+        chunks.push(Chunk {
+            id: chunk_id.clone(),
+            source_id: source_id.clone(),
+            text: unit.text.clone(),
+            context_text: None,
+            token_count: estimate_tokens(&unit.text),
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path: unit.heading_path.clone(),
+            evidence_unit_ids: vec![unit.id.clone()],
+        });
+        links.push((chunk_id, unit.id.clone()));
+    }
+
+    ChunkOutput { chunks, links }
+}
+
 fn normalize_evidence_source_ids(
     evidence: &mut [crate::types::EvidenceUnit],
     source_id: &SourceId,
@@ -813,6 +847,7 @@ fn prepare_image_artifacts(
             id: evidence_id.clone(),
             source_id: source_id.clone(),
             kind: EvidenceKind::Image,
+            derived_from: None,
             locator,
             text_hash: hex_sha256(text.as_bytes()),
             text,
@@ -1140,8 +1175,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use crate::config::RetrievalConfig;
     use crate::image_limits::ImageArtifactLimitError;
     use crate::provider::{ImageDescribeRequest, ImageDescription, ProviderResult, VisionModel};
+    use crate::retrieve::RetrievalPipeline;
     use crate::types::{ChunkId, EvidenceId, EvidenceKind, EvidenceUnit, SourceLocator};
     use crate::vision_caption::{vision_caption_prompt_hash, ImageCaptionStatus};
 
@@ -1168,6 +1205,30 @@ mod tests {
 
         fn dimension(&self) -> usize {
             2
+        }
+    }
+
+    struct CaptionKeywordEmbeddingClient;
+
+    #[async_trait]
+    impl EmbeddingClient for CaptionKeywordEmbeddingClient {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| caption_keyword_vector(text))
+                .collect())
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
+    fn caption_keyword_vector(text: &str) -> Vec<f32> {
+        if text.to_ascii_lowercase().contains("captionneedle") {
+            vec![1.0, 0.0]
+        } else {
+            vec![0.0, 1.0]
         }
     }
 
@@ -1231,6 +1292,7 @@ mod tests {
             id: EvidenceId(id.to_string()),
             source_id: source_id.clone(),
             kind: EvidenceKind::Text,
+            derived_from: None,
             locator: SourceLocator::Document {
                 path_or_url: source_id.0.clone(),
                 line_start: 1,
@@ -1900,10 +1962,33 @@ model = "local-vision"
             .filter(|unit| unit.kind == EvidenceKind::Generated)
             .collect::<Vec<_>>();
         assert_eq!(generated.len(), 1);
+        let image_artifacts = pipeline
+            .store()
+            .list_image_artifacts_by_source(&source.id)
+            .unwrap();
+        assert_eq!(image_artifacts.len(), 1);
+        assert_eq!(
+            generated[0].derived_from,
+            Some(image_artifacts[0].evidence_id.clone())
+        );
         assert!(generated[0]
             .text
             .contains("Generated image caption (derived evidence"));
         assert!(generated[0].text.contains("not exact OCR"));
+        assert!(generated[0].text.contains("Detailed description"));
+        assert!(generated[0]
+            .text
+            .contains("Visible text noted by the vision model"));
+        assert!(generated[0].text.contains("Key entities: Input; Index."));
+        assert!(generated[0]
+            .text
+            .contains("Relationships: Input -> Index (feeds)."));
+        assert!(generated[0]
+            .text
+            .contains("Answerable questions: What feeds the index?"));
+        assert!(generated[0]
+            .text
+            .contains("Uncertainties: The small footer text is not legible."));
         assert!(matches!(
             generated[0].locator,
             SourceLocator::PdfImage {
@@ -1912,6 +1997,16 @@ model = "local-vision"
                 ..
             }
         ));
+        let caption_chunks = pipeline
+            .store()
+            .list_chunks_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .filter(|chunk| chunk.evidence_unit_ids == vec![generated[0].id.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(caption_chunks.len(), 1);
+        assert!(caption_chunks[0].text.contains("An indexing flow diagram."));
+        assert!(caption_chunks[0].context_text.is_none());
 
         pipeline.ingest_source(&source.id).await.unwrap();
 
@@ -1927,6 +2022,14 @@ model = "local-vision"
             .filter(|unit| unit.kind == EvidenceKind::Generated)
             .collect::<Vec<_>>();
         assert_eq!(generated_after_cache.len(), 1);
+        let caption_chunks_after_cache = pipeline
+            .store()
+            .list_chunks_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .filter(|chunk| chunk.evidence_unit_ids == vec![generated_after_cache[0].id.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(caption_chunks_after_cache.len(), 1);
     }
 
     #[tokio::test]
@@ -1965,6 +2068,206 @@ model = "local-vision"
         assert_eq!(after_disabled[0].raw_response, cached[0].raw_response);
         assert_eq!(after_disabled[0].attempt_count, cached[0].attempt_count);
         assert_eq!(after_disabled[0].cache_hits, cached[0].cache_hits);
+        let generated_after_disabled = pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .filter(|unit| unit.kind == EvidenceKind::Generated)
+            .collect::<Vec<_>>();
+        assert_eq!(generated_after_disabled.len(), 1);
+        let caption_chunks_after_disabled = pipeline
+            .store()
+            .list_chunks_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .filter(|chunk| chunk.evidence_unit_ids == vec![generated_after_disabled[0].id.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(caption_chunks_after_disabled.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn image_caption_chunks_are_lexically_and_densely_searchable_with_image_chain() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("caption-search.pdf");
+        write_pdf_with_text_and_image_filter(&path, None, &[7u8; 8 * 8 * 3]);
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-caption-search", path);
+        store.add_source(&source).unwrap();
+        let vision = MockVisionModel::new(vec![valid_caption_json(
+            "A captionneedle indexing flow diagram.",
+        )]);
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            CaptionKeywordEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_vision_model("local-vision", vision);
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        let evidence = pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap();
+        assert!(evidence.iter().any(|unit| {
+            unit.kind == EvidenceKind::Text && unit.text.contains("Unsupported image filter text")
+        }));
+        assert!(evidence.iter().all(|unit| {
+            unit.kind == EvidenceKind::Generated || !unit.text.contains("captionneedle")
+        }));
+        let generated = evidence
+            .iter()
+            .find(|unit| unit.kind == EvidenceKind::Generated)
+            .expect("caption evidence should be generated");
+        let original_image_id = generated
+            .derived_from
+            .clone()
+            .expect("caption evidence should point to original image evidence");
+        let caption_chunk = pipeline
+            .store()
+            .list_chunks_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .find(|chunk| chunk.evidence_unit_ids == vec![generated.id.clone()])
+            .expect("caption evidence should have a dedicated child chunk");
+
+        let lexical_hits = pipeline.lexical_index().search("captionneedle", 5).unwrap();
+        assert!(lexical_hits
+            .iter()
+            .any(|(chunk_id, _)| chunk_id == &caption_chunk.id));
+        let dense_hits = pipeline.hnsw().search(&[1.0, 0.0], 5);
+        assert!(dense_hits
+            .iter()
+            .any(|(chunk_id, _)| chunk_id == &caption_chunk.id));
+        assert!(pipeline
+            .store()
+            .list_vector_documents()
+            .unwrap()
+            .iter()
+            .any(|document| document.chunk_id == caption_chunk.id));
+
+        let lexical_index = pipeline.lexical_index();
+        let embed_client = CaptionKeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig::default();
+        let retrieval = RetrievalPipeline::new(
+            pipeline.hnsw(),
+            &lexical_index,
+            pipeline.store(),
+            &embed_client,
+            &retrieval_config,
+        );
+        let results = retrieval.search("captionneedle").await.unwrap();
+        let hit = results
+            .iter()
+            .find(|result| result.chunk_id == caption_chunk.id)
+            .expect("caption query should retrieve caption chunk");
+
+        assert!(hit
+            .evidence_units
+            .iter()
+            .any(|unit| unit.id == generated.id));
+        let original_image = hit
+            .evidence_units
+            .iter()
+            .find(|unit| unit.id == original_image_id)
+            .expect("retrieval should include original image evidence");
+        assert_eq!(original_image.kind, EvidenceKind::Image);
+        assert!(matches!(
+            original_image.locator,
+            SourceLocator::PdfImage {
+                page: 1,
+                image_index: 1,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn image_caption_index_state_is_cleaned_on_reingest_and_source_removal() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("caption-cleanup.pdf");
+        write_pdf_with_text_and_image_filter(&path, None, &[11u8; 8 * 8 * 3]);
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-caption-cleanup", path.clone());
+        store.add_source(&source).unwrap();
+        let vision = MockVisionModel::new(vec![
+            valid_caption_json("A stalecaptionneedle diagram."),
+            valid_caption_json("A freshcaptionneedle diagram."),
+        ]);
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            CaptionKeywordEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_vision_model("local-vision", vision);
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+        let stale_generated = pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .find(|unit| unit.kind == EvidenceKind::Generated)
+            .unwrap();
+        let stale_chunk = pipeline
+            .store()
+            .list_chunks_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .find(|chunk| chunk.evidence_unit_ids == vec![stale_generated.id.clone()])
+            .unwrap();
+        assert!(!pipeline
+            .lexical_index()
+            .search("stalecaptionneedle", 5)
+            .unwrap()
+            .is_empty());
+
+        write_pdf_with_text_and_image_filter(&path, None, &[22u8; 8 * 8 * 3]);
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert!(pipeline
+            .store()
+            .get_evidence(&stale_generated.id)
+            .unwrap()
+            .is_none());
+        assert!(pipeline
+            .store()
+            .get_chunk(&stale_chunk.id)
+            .unwrap()
+            .is_none());
+        assert!(pipeline
+            .lexical_index()
+            .search("stalecaptionneedle", 5)
+            .unwrap()
+            .is_empty());
+        assert!(!pipeline
+            .lexical_index()
+            .search("freshcaptionneedle", 5)
+            .unwrap()
+            .is_empty());
+        assert!(pipeline
+            .store()
+            .list_vector_documents()
+            .unwrap()
+            .iter()
+            .all(|document| document.chunk_id != stale_chunk.id));
+
+        pipeline.remove_source(&source.id).await.unwrap();
+
+        assert!(pipeline
+            .lexical_index()
+            .search("freshcaptionneedle", 5)
+            .unwrap()
+            .is_empty());
+        assert!(pipeline.store().list_vector_documents().unwrap().is_empty());
+        assert!(pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

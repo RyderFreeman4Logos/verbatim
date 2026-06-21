@@ -53,6 +53,7 @@ impl Parser for PdfOxideParser {
                     id: EvidenceId(format!("{}:p{}:n{}", source_id.0, page_num, para_idx)),
                     source_id: source_id.clone(),
                     kind: EvidenceKind::Text,
+                    derived_from: None,
                     locator: SourceLocator::Pdf {
                         page: page_num,
                         paragraph: para_idx as u32,

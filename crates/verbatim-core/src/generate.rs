@@ -313,6 +313,7 @@ mod tests {
                     id: EvidenceId("ev-1".into()),
                     source_id: SourceId("src".into()),
                     kind: EvidenceKind::Text,
+                    derived_from: None,
                     locator: SourceLocator::Pdf {
                         page: 42,
                         paragraph: 3,
@@ -327,6 +328,7 @@ mod tests {
                     id: EvidenceId("ev-2".into()),
                     source_id: SourceId("src".into()),
                     kind: EvidenceKind::Text,
+                    derived_from: None,
                     locator: SourceLocator::Document {
                         path_or_url: "doc.md".into(),
                         line_start: 10,

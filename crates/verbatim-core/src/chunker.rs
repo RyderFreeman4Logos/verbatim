@@ -26,7 +26,7 @@ pub struct ChunkOutput {
     pub links: Vec<(ChunkId, EvidenceId)>,
 }
 
-fn estimate_tokens(text: &str) -> u32 {
+pub(crate) fn estimate_tokens(text: &str) -> u32 {
     (text.len() / CHARS_PER_TOKEN) as u32
 }
 
@@ -222,6 +222,7 @@ mod tests {
                 id: EvidenceId(format!("ev-{i}")),
                 source_id: SourceId("test".into()),
                 kind: EvidenceKind::Text,
+                derived_from: None,
                 locator: SourceLocator::Pdf {
                     page: 1,
                     paragraph: i as u32,

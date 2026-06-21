@@ -157,6 +157,7 @@ fn flush_block(
         id: EvidenceId(format!("{}:L{}:n{}", source_id.0, line_start, position)),
         source_id: source_id.clone(),
         kind: EvidenceKind::Text,
+        derived_from: None,
         locator: SourceLocator::Document {
             path_or_url: path_str.to_string(),
             line_start,
