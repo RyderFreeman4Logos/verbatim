@@ -2,17 +2,29 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
 
 use crate::traits::VectorDocument;
 use crate::types::{
-    Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, ImageId,
-    Source, SourceId, SourceStatus,
+    Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge,
+    GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, ImageArtifact, ImageId, Source, SourceId,
+    SourceStatus,
 };
 use crate::vision_caption::{CaptionAttempt, ImageCaption, ImageCaptionRecord, ImageCaptionStatus};
 
 pub struct Store {
     conn: Connection,
+}
+
+pub struct SourceContentsReplacement<'a> {
+    pub source: &'a Source,
+    pub evidence: &'a [EvidenceUnit],
+    pub chunks: &'a [Chunk],
+    pub vectors: &'a [VectorDocument],
+    pub links: &'a [(ChunkId, EvidenceId)],
+    pub image_artifacts: &'a [ImageArtifact],
+    pub graph_nodes: &'a [GraphNode],
+    pub graph_edges: &'a [GraphEdge],
 }
 
 impl Store {
@@ -127,13 +139,18 @@ impl Store {
 
     pub fn replace_source_contents(
         &self,
-        source: &Source,
-        evidence: &[EvidenceUnit],
-        chunks: &[Chunk],
-        vectors: &[VectorDocument],
-        links: &[(ChunkId, EvidenceId)],
-        image_artifacts: &[ImageArtifact],
+        replacement: SourceContentsReplacement<'_>,
     ) -> Result<u64> {
+        let SourceContentsReplacement {
+            source,
+            evidence,
+            chunks,
+            vectors,
+            links,
+            image_artifacts,
+            graph_nodes,
+            graph_edges,
+        } = replacement;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM sources WHERE id = ?1", params![&source.id.0])?;
         tx.execute(
@@ -180,6 +197,8 @@ impl Store {
         }
 
         insert_image_artifacts_tx(&tx, image_artifacts)?;
+        upsert_graph_nodes_tx(&tx, graph_nodes)?;
+        upsert_graph_edges_tx(&tx, graph_edges)?;
         replace_vector_documents_tx(&tx, vectors)?;
 
         let generation = bump_index_generation(&tx)?;
@@ -482,6 +501,95 @@ impl Store {
         Ok(())
     }
 
+    // --- EvidenceGraph ---
+
+    pub fn upsert_graph_nodes(&self, nodes: &[GraphNode]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        upsert_graph_nodes_tx(&tx, nodes)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_graph_edges(&self, edges: &[GraphEdge]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        upsert_graph_edges_tx(&tx, edges)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_graph_nodes_by_source(&self, source_id: &SourceId) -> Result<Vec<GraphNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, kind, external_id, label, locator_json, ordinal, metadata_json
+             FROM graph_nodes
+             WHERE source_id = ?1
+             ORDER BY kind, ordinal, id",
+        )?;
+        let rows = stmt.query_map(params![source_id.0], row_to_graph_node)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn list_graph_edges_by_source(&self, source_id: &SourceId) -> Result<Vec<GraphEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, edge_type, from_node_id, to_node_id, ordinal, weight, metadata_json
+             FROM graph_edges
+             WHERE source_id = ?1
+             ORDER BY edge_type, ordinal, id",
+        )?;
+        let rows = stmt.query_map(params![source_id.0], row_to_graph_edge)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn list_graph_edges_from(&self, node_id: &GraphNodeId) -> Result<Vec<GraphEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, edge_type, from_node_id, to_node_id, ordinal, weight, metadata_json
+             FROM graph_edges
+             WHERE from_node_id = ?1
+             ORDER BY edge_type, ordinal, id",
+        )?;
+        let rows = stmt.query_map(params![node_id.0], row_to_graph_edge)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn list_graph_edges_to(&self, node_id: &GraphNodeId) -> Result<Vec<GraphEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, edge_type, from_node_id, to_node_id, ordinal, weight, metadata_json
+             FROM graph_edges
+             WHERE to_node_id = ?1
+             ORDER BY edge_type, ordinal, id",
+        )?;
+        let rows = stmt.query_map(params![node_id.0], row_to_graph_edge)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn list_graph_edges_by_type(
+        &self,
+        source_id: &SourceId,
+        edge_type: EdgeType,
+    ) -> Result<Vec<GraphEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, edge_type, from_node_id, to_node_id, ordinal, weight, metadata_json
+             FROM graph_edges
+             WHERE source_id = ?1 AND edge_type = ?2
+             ORDER BY ordinal, id",
+        )?;
+        let rows = stmt.query_map(params![source_id.0, edge_type.as_str()], row_to_graph_edge)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn remove_graph_by_source(&self, source_id: &SourceId) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM graph_edges WHERE source_id = ?1",
+            params![&source_id.0],
+        )?;
+        tx.execute(
+            "DELETE FROM graph_nodes WHERE source_id = ?1",
+            params![&source_id.0],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // --- EmbeddingsMeta ---
 
     pub fn set_embedding_meta(
@@ -639,6 +747,80 @@ fn insert_image_artifacts_tx(tx: &Transaction<'_>, artifacts: &[ImageArtifact]) 
     Ok(())
 }
 
+fn upsert_graph_nodes_tx(tx: &Transaction<'_>, nodes: &[GraphNode]) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO graph_nodes (id, source_id, kind, external_id, label, locator_json, ordinal, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(id) DO UPDATE SET
+            source_id = excluded.source_id,
+            kind = excluded.kind,
+            external_id = excluded.external_id,
+            label = excluded.label,
+            locator_json = excluded.locator_json,
+            ordinal = excluded.ordinal,
+            metadata_json = excluded.metadata_json",
+    )?;
+    for node in nodes {
+        let locator_json = node
+            .locator
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize graph node locator")?;
+        let metadata_json = node
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize graph node metadata")?;
+        stmt.execute(params![
+            &node.id.0,
+            &node.source_id.0,
+            node.kind.as_str(),
+            &node.external_id,
+            node.label.as_deref(),
+            locator_json,
+            node.ordinal,
+            metadata_json,
+        ])?;
+    }
+    Ok(())
+}
+
+fn upsert_graph_edges_tx(tx: &Transaction<'_>, edges: &[GraphEdge]) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO graph_edges (id, source_id, edge_type, from_node_id, to_node_id, ordinal, weight, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(id) DO UPDATE SET
+            source_id = excluded.source_id,
+            edge_type = excluded.edge_type,
+            from_node_id = excluded.from_node_id,
+            to_node_id = excluded.to_node_id,
+            ordinal = excluded.ordinal,
+            weight = excluded.weight,
+            metadata_json = excluded.metadata_json",
+    )?;
+    for edge in edges {
+        let metadata_json = edge
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize graph edge metadata")?;
+        stmt.execute(params![
+            &edge.id.0,
+            &edge.source_id.0,
+            edge.edge_type.as_str(),
+            &edge.from_node_id.0,
+            &edge.to_node_id.0,
+            edge.ordinal,
+            edge.weight,
+            metadata_json,
+        ])?;
+    }
+    Ok(())
+}
+
 fn row_to_image_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageArtifact> {
     let bbox_json: Option<String> = row.get(10)?;
     let bbox = match bbox_json {
@@ -660,6 +842,54 @@ fn row_to_image_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageArtif
         page: row.get(8)?,
         image_index: row.get(9)?,
         bbox,
+    })
+}
+
+fn row_to_graph_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphNode> {
+    let kind_text: String = row.get(2)?;
+    let locator_json: Option<String> = row.get(5)?;
+    let metadata_json: Option<String> = row.get(7)?;
+    let locator = locator_json
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|err| from_json_error(5, "SourceLocator", err))
+        })
+        .transpose()?;
+    let metadata = metadata_json
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|err| from_json_error(7, "serde_json::Value", err))
+        })
+        .transpose()?;
+
+    Ok(GraphNode {
+        id: GraphNodeId(row.get(0)?),
+        source_id: SourceId(row.get(1)?),
+        kind: str_to_graph_node_kind(&kind_text, 2)?,
+        external_id: row.get(3)?,
+        label: row.get(4)?,
+        locator,
+        ordinal: row.get(6)?,
+        metadata,
+    })
+}
+
+fn row_to_graph_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphEdge> {
+    let edge_type_text: String = row.get(2)?;
+    let metadata_json: Option<String> = row.get(7)?;
+    let metadata = metadata_json
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|err| from_json_error(7, "serde_json::Value", err))
+        })
+        .transpose()?;
+
+    Ok(GraphEdge {
+        id: GraphEdgeId(row.get(0)?),
+        source_id: SourceId(row.get(1)?),
+        edge_type: str_to_edge_type(&edge_type_text, 2)?,
+        from_node_id: GraphNodeId(row.get(3)?),
+        to_node_id: GraphNodeId(row.get(4)?),
+        ordinal: row.get(5)?,
+        weight: row.get(6)?,
+        metadata,
     })
 }
 
@@ -857,6 +1087,44 @@ fn str_to_chunk_type(s: &str) -> ChunkType {
     }
 }
 
+fn str_to_graph_node_kind(value: &str, column: usize) -> rusqlite::Result<GraphNodeKind> {
+    match value {
+        "Source" => Ok(GraphNodeKind::Source),
+        "Page" => Ok(GraphNodeKind::Page),
+        "Section" => Ok(GraphNodeKind::Section),
+        "Chunk" => Ok(GraphNodeKind::Chunk),
+        "EvidenceUnit" => Ok(GraphNodeKind::EvidenceUnit),
+        "ImageArtifact" => Ok(GraphNodeKind::ImageArtifact),
+        _ => Err(invalid_text_value(
+            column,
+            format!("unknown graph node kind: {value}"),
+        )),
+    }
+}
+
+fn str_to_edge_type(value: &str, column: usize) -> rusqlite::Result<EdgeType> {
+    match value {
+        "Contains" => Ok(EdgeType::Contains),
+        "DerivedFrom" => Ok(EdgeType::DerivedFrom),
+        "Next" => Ok(EdgeType::Next),
+        _ => Err(invalid_text_value(
+            column,
+            format!("unknown graph edge type: {value}"),
+        )),
+    }
+}
+
+fn invalid_text_value(column: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )),
+    )
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sources (
     id TEXT PRIMARY KEY,
@@ -925,6 +1193,40 @@ CREATE TABLE IF NOT EXISTS chunk_vectors (
     source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     vector_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS graph_nodes (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    label TEXT,
+    locator_json TEXT,
+    ordinal INTEGER,
+    metadata_json TEXT,
+    UNIQUE(source_id, kind, external_id)
+);
+CREATE TABLE IF NOT EXISTS graph_edges (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    edge_type TEXT NOT NULL,
+    from_node_id TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+    to_node_id TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+    ordinal INTEGER,
+    weight REAL,
+    metadata_json TEXT,
+    UNIQUE(source_id, edge_type, from_node_id, to_node_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS graph_nodes_source_idx
+    ON graph_nodes(source_id);
+CREATE INDEX IF NOT EXISTS graph_nodes_kind_external_idx
+    ON graph_nodes(source_id, kind, external_id);
+CREATE INDEX IF NOT EXISTS graph_edges_source_idx
+    ON graph_edges(source_id);
+CREATE INDEX IF NOT EXISTS graph_edges_from_idx
+    ON graph_edges(from_node_id);
+CREATE INDEX IF NOT EXISTS graph_edges_to_idx
+    ON graph_edges(to_node_id);
+CREATE INDEX IF NOT EXISTS graph_edges_type_idx
+    ON graph_edges(source_id, edge_type);
 CREATE TABLE IF NOT EXISTS embeddings_meta (
     chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
     hnsw_position INTEGER NOT NULL,
@@ -1087,6 +1389,56 @@ mod tests {
         }
     }
 
+    fn sample_graph_node(
+        source_id: &SourceId,
+        kind: GraphNodeKind,
+        external_id: &str,
+    ) -> GraphNode {
+        GraphNode {
+            id: GraphNodeId::new(source_id, kind, external_id),
+            source_id: source_id.clone(),
+            kind,
+            external_id: external_id.to_string(),
+            label: Some(external_id.to_string()),
+            locator: None,
+            ordinal: None,
+            metadata: None,
+        }
+    }
+
+    fn sample_graph_edge(
+        source_id: &SourceId,
+        edge_type: EdgeType,
+        from_node_id: &GraphNodeId,
+        to_node_id: &GraphNodeId,
+        ordinal: Option<u32>,
+    ) -> GraphEdge {
+        GraphEdge {
+            id: GraphEdgeId::new(source_id, edge_type, from_node_id, to_node_id, ordinal),
+            source_id: source_id.clone(),
+            edge_type,
+            from_node_id: from_node_id.clone(),
+            to_node_id: to_node_id.clone(),
+            ordinal,
+            weight: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn graph_schema_tables_exist() {
+        let store = Store::in_memory().unwrap();
+
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM graph_nodes", [], |_| Ok(()))
+            .unwrap();
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM graph_edges", [], |_| Ok(()))
+            .unwrap();
+    }
+
     #[test]
     fn source_crud() {
         let store = Store::in_memory().unwrap();
@@ -1112,6 +1464,73 @@ mod tests {
 
         store.remove_source(&SourceId("src-1".into())).unwrap();
         assert!(store.list_sources().unwrap().is_empty());
+    }
+
+    #[test]
+    fn graph_edge_crud_queries_are_idempotent() {
+        let store = Store::in_memory().unwrap();
+        let source = sample_source();
+        let source_id = source.id.clone();
+        store.add_source(&source).unwrap();
+
+        let source_node = sample_graph_node(&source_id, GraphNodeKind::Source, &source_id.0);
+        let chunk_node = sample_graph_node(&source_id, GraphNodeKind::Chunk, "chunk-1");
+        let evidence_node = sample_graph_node(&source_id, GraphNodeKind::EvidenceUnit, "ev-1");
+        let image_node = sample_graph_node(&source_id, GraphNodeKind::ImageArtifact, "img-1");
+        let contains = sample_graph_edge(
+            &source_id,
+            EdgeType::Contains,
+            &source_node.id,
+            &chunk_node.id,
+            Some(0),
+        );
+        let derives = sample_graph_edge(
+            &source_id,
+            EdgeType::DerivedFrom,
+            &evidence_node.id,
+            &image_node.id,
+            None,
+        );
+
+        let nodes = vec![source_node, chunk_node.clone(), evidence_node, image_node];
+        let edges = vec![contains.clone(), derives.clone()];
+        store.upsert_graph_nodes(&nodes).unwrap();
+        store.upsert_graph_edges(&edges).unwrap();
+        store.upsert_graph_nodes(&nodes).unwrap();
+        store.upsert_graph_edges(&edges).unwrap();
+
+        assert_eq!(
+            store.list_graph_nodes_by_source(&source_id).unwrap().len(),
+            4
+        );
+        assert_eq!(
+            store.list_graph_edges_by_source(&source_id).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            store.list_graph_edges_from(&contains.from_node_id).unwrap(),
+            vec![contains.clone()]
+        );
+        assert_eq!(
+            store.list_graph_edges_to(&chunk_node.id).unwrap(),
+            vec![contains]
+        );
+        assert_eq!(
+            store
+                .list_graph_edges_by_type(&source_id, EdgeType::DerivedFrom)
+                .unwrap(),
+            vec![derives]
+        );
+
+        store.remove_graph_by_source(&source_id).unwrap();
+        assert!(store
+            .list_graph_nodes_by_source(&source_id)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .list_graph_edges_by_source(&source_id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1178,6 +1597,20 @@ mod tests {
         store
             .bulk_insert_image_artifacts(&[sample_image_artifact("src-1", "ev-1")])
             .unwrap();
+        let source_id = SourceId("src-1".into());
+        let source_node = sample_graph_node(&source_id, GraphNodeKind::Source, "src-1");
+        let evidence_node = sample_graph_node(&source_id, GraphNodeKind::EvidenceUnit, "ev-1");
+        let edge = sample_graph_edge(
+            &source_id,
+            EdgeType::Contains,
+            &source_node.id,
+            &evidence_node.id,
+            Some(0),
+        );
+        store
+            .upsert_graph_nodes(&[source_node, evidence_node])
+            .unwrap();
+        store.upsert_graph_edges(&[edge]).unwrap();
         assert_eq!(store.list_vector_documents().unwrap().len(), 1);
         assert_eq!(
             store
@@ -1186,8 +1619,16 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            store.list_graph_nodes_by_source(&source_id).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            store.list_graph_edges_by_source(&source_id).unwrap().len(),
+            1
+        );
 
-        store.remove_source(&SourceId("src-1".into())).unwrap();
+        store.remove_source(&source_id).unwrap();
 
         assert!(store
             .get_evidence(&EvidenceId("ev-1".into()))
@@ -1204,6 +1645,14 @@ mod tests {
         assert!(store.list_vector_documents().unwrap().is_empty());
         assert!(store
             .list_image_artifacts_by_source(&SourceId("src-1".into()))
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .list_graph_nodes_by_source(&source_id)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .list_graph_edges_by_source(&source_id)
             .unwrap()
             .is_empty());
     }

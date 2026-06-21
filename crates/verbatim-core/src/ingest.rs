@@ -19,11 +19,12 @@ use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
-use crate::store::Store;
+use crate::store::{SourceContentsReplacement, Store};
 use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
 use crate::types::{
-    hex_sha256, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact,
-    ImageId, ParsedImageArtifact, Source, SourceId, SourceLocator, SourceStatus,
+    hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit,
+    GraphEdge, GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, ImageArtifact, ImageId,
+    ParsedImageArtifact, Source, SourceId, SourceLocator, SourceStatus,
 };
 use crate::vision_caption::{
     caption_derived_evidence, request_image_caption, vision_caption_prompt_hash, CaptionAttempt,
@@ -283,6 +284,13 @@ where
         chunks.extend(caption_output.chunks);
         links.extend(caption_output.links);
         evidence.extend(caption_evidence);
+        let (graph_nodes, graph_edges) = build_evidence_graph(
+            &new_source,
+            &evidence,
+            &chunks,
+            &links,
+            &prepared_image_artifacts.artifacts,
+        );
 
         let mut child_chunks = self.child_chunks_without_source(source_id)?;
         child_chunks.extend(
@@ -304,14 +312,18 @@ where
                 return Err(err);
             }
         };
-        let generation = match self.store.replace_source_contents(
-            &new_source,
-            &evidence,
-            &chunks,
-            &prepared.vectors,
-            &links,
-            &prepared_image_artifacts.artifacts,
-        ) {
+        let generation = match self
+            .store
+            .replace_source_contents(SourceContentsReplacement {
+                source: &new_source,
+                evidence: &evidence,
+                chunks: &chunks,
+                vectors: &prepared.vectors,
+                links: &links,
+                image_artifacts: &prepared_image_artifacts.artifacts,
+                graph_nodes: &graph_nodes,
+                graph_edges: &graph_edges,
+            }) {
             Ok(generation) => generation,
             Err(err) => {
                 cleanup_written_image_files(&written_image_files);
@@ -737,6 +749,421 @@ fn chunk_caption_evidence(source_id: &SourceId, evidence: &[EvidenceUnit]) -> Ch
     }
 
     ChunkOutput { chunks, links }
+}
+
+fn build_evidence_graph(
+    source: &Source,
+    evidence: &[EvidenceUnit],
+    chunks: &[Chunk],
+    links: &[(ChunkId, EvidenceId)],
+    image_artifacts: &[ImageArtifact],
+) -> (Vec<GraphNode>, Vec<GraphEdge>) {
+    let mut graph = GraphBuildState::new(source);
+    let evidence_by_id: HashMap<EvidenceId, &EvidenceUnit> = evidence
+        .iter()
+        .map(|unit| (unit.id.clone(), unit))
+        .collect();
+
+    for unit in evidence {
+        graph.add_evidence_node(unit);
+    }
+
+    for (ordinal, chunk) in chunks.iter().enumerate() {
+        graph.add_chunk_node(chunk, ordinal as u32, &evidence_by_id);
+    }
+
+    for artifact in image_artifacts {
+        graph.add_image_artifact_node(artifact);
+    }
+
+    for (ordinal, (chunk_id, evidence_id)) in links.iter().enumerate() {
+        graph.add_chunk_evidence_edge(chunk_id, evidence_id, ordinal as u32);
+    }
+
+    for chunk in chunks {
+        graph.add_parent_chunk_edge(chunk);
+    }
+
+    for unit in evidence {
+        graph.add_evidence_derivation_edge(unit);
+    }
+
+    for artifact in image_artifacts {
+        graph.add_image_artifact_derivation_edge(artifact);
+    }
+
+    (graph.nodes, graph.edges)
+}
+
+struct GraphBuildState {
+    source_id: SourceId,
+    source_node_id: GraphNodeId,
+    nodes: Vec<GraphNode>,
+    node_ids: HashSet<String>,
+    edges: Vec<GraphEdge>,
+    edge_ids: HashSet<String>,
+    page_nodes: HashMap<u32, GraphNodeId>,
+    section_nodes: HashMap<Vec<String>, GraphNodeId>,
+    evidence_nodes: HashMap<EvidenceId, GraphNodeId>,
+    chunk_nodes: HashMap<ChunkId, GraphNodeId>,
+    image_nodes: HashMap<ImageId, GraphNodeId>,
+}
+
+impl GraphBuildState {
+    fn new(source: &Source) -> Self {
+        let source_id = source.id.clone();
+        let source_node_id = GraphNodeId::new(&source_id, GraphNodeKind::Source, &source_id.0);
+        let mut graph = Self {
+            source_id: source_id.clone(),
+            source_node_id: source_node_id.clone(),
+            nodes: Vec::new(),
+            node_ids: HashSet::new(),
+            edges: Vec::new(),
+            edge_ids: HashSet::new(),
+            page_nodes: HashMap::new(),
+            section_nodes: HashMap::new(),
+            evidence_nodes: HashMap::new(),
+            chunk_nodes: HashMap::new(),
+            image_nodes: HashMap::new(),
+        };
+        graph.push_node(GraphNode {
+            id: source_node_id,
+            source_id,
+            kind: GraphNodeKind::Source,
+            external_id: source.id.0.clone(),
+            label: source
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned),
+            locator: None,
+            ordinal: None,
+            metadata: Some(serde_json::json!({
+                "path": source.path.to_string_lossy(),
+                "hash": &source.hash,
+                "parser_used": &source.parser_used,
+            })),
+        });
+        graph
+    }
+
+    fn add_evidence_node(&mut self, unit: &EvidenceUnit) {
+        let node_id = self.push_node(GraphNode {
+            id: GraphNodeId::new(&self.source_id, GraphNodeKind::EvidenceUnit, &unit.id.0),
+            source_id: self.source_id.clone(),
+            kind: GraphNodeKind::EvidenceUnit,
+            external_id: unit.id.0.clone(),
+            label: Some(format!(
+                "{} evidence {}",
+                evidence_kind_label(unit.kind),
+                unit.position
+            )),
+            locator: Some(unit.locator.clone()),
+            ordinal: Some(unit.position),
+            metadata: Some(serde_json::json!({
+                "kind": evidence_kind_label(unit.kind),
+                "text_hash": &unit.text_hash,
+                "heading_path": &unit.heading_path,
+            })),
+        });
+        self.evidence_nodes.insert(unit.id.clone(), node_id.clone());
+        self.add_source_contains_edge(&node_id, Some(unit.position));
+
+        if let Some(page) = locator_page(&unit.locator) {
+            let page_node_id = self.ensure_page_node(page);
+            self.push_edge(
+                EdgeType::Contains,
+                &page_node_id,
+                &node_id,
+                Some(unit.position),
+            );
+        }
+
+        if let Some(section_node_id) =
+            self.ensure_section_nodes(&unit.heading_path, Some(unit.position))
+        {
+            self.push_edge(
+                EdgeType::Contains,
+                &section_node_id,
+                &node_id,
+                Some(unit.position),
+            );
+        }
+    }
+
+    fn add_chunk_node(
+        &mut self,
+        chunk: &Chunk,
+        ordinal: u32,
+        evidence_by_id: &HashMap<EvidenceId, &EvidenceUnit>,
+    ) {
+        let node_id = self.push_node(GraphNode {
+            id: GraphNodeId::new(&self.source_id, GraphNodeKind::Chunk, &chunk.id.0),
+            source_id: self.source_id.clone(),
+            kind: GraphNodeKind::Chunk,
+            external_id: chunk.id.0.clone(),
+            label: Some(format!("{} chunk", chunk_type_label(&chunk.chunk_type))),
+            locator: None,
+            ordinal: Some(ordinal),
+            metadata: Some(serde_json::json!({
+                "chunk_type": chunk_type_label(&chunk.chunk_type),
+                "token_count": chunk.token_count,
+                "heading_path": &chunk.heading_path,
+            })),
+        });
+        self.chunk_nodes.insert(chunk.id.clone(), node_id.clone());
+        self.add_source_contains_edge(&node_id, Some(ordinal));
+
+        let mut pages = Vec::new();
+        for evidence_id in &chunk.evidence_unit_ids {
+            if let Some(page) = evidence_by_id
+                .get(evidence_id)
+                .and_then(|unit| locator_page(&unit.locator))
+            {
+                if !pages.contains(&page) {
+                    pages.push(page);
+                }
+            }
+        }
+        pages.sort_unstable();
+        for page in pages {
+            let page_node_id = self.ensure_page_node(page);
+            self.push_edge(EdgeType::Contains, &page_node_id, &node_id, Some(ordinal));
+        }
+
+        if let Some(section_node_id) = self.ensure_section_nodes(&chunk.heading_path, Some(ordinal))
+        {
+            self.push_edge(
+                EdgeType::Contains,
+                &section_node_id,
+                &node_id,
+                Some(ordinal),
+            );
+        }
+    }
+
+    fn add_image_artifact_node(&mut self, artifact: &ImageArtifact) {
+        let node_id = self.push_node(GraphNode {
+            id: GraphNodeId::new(
+                &self.source_id,
+                GraphNodeKind::ImageArtifact,
+                &artifact.image_id.0,
+            ),
+            source_id: self.source_id.clone(),
+            kind: GraphNodeKind::ImageArtifact,
+            external_id: artifact.image_id.0.clone(),
+            label: Some(format!("PDF image {}", artifact.image_index)),
+            locator: Some(SourceLocator::PdfImage {
+                page: artifact.page,
+                image_index: artifact.image_index,
+                bbox: artifact.bbox.clone(),
+            }),
+            ordinal: Some(artifact.image_index),
+            metadata: Some(serde_json::json!({
+                "content_hash": &artifact.content_hash,
+                "mime_type": &artifact.mime_type,
+                "width": artifact.width,
+                "height": artifact.height,
+                "page": artifact.page,
+                "image_index": artifact.image_index,
+                "relative_path": artifact.relative_path.to_string_lossy(),
+            })),
+        });
+        self.image_nodes
+            .insert(artifact.image_id.clone(), node_id.clone());
+        self.add_source_contains_edge(&node_id, Some(artifact.image_index));
+
+        let page_node_id = self.ensure_page_node(artifact.page);
+        self.push_edge(
+            EdgeType::Contains,
+            &page_node_id,
+            &node_id,
+            Some(artifact.image_index),
+        );
+    }
+
+    fn add_chunk_evidence_edge(
+        &mut self,
+        chunk_id: &ChunkId,
+        evidence_id: &EvidenceId,
+        ordinal: u32,
+    ) {
+        let Some(chunk_node_id) = self.chunk_nodes.get(chunk_id).cloned() else {
+            return;
+        };
+        let Some(evidence_node_id) = self.evidence_nodes.get(evidence_id).cloned() else {
+            return;
+        };
+        self.push_edge(
+            EdgeType::Contains,
+            &chunk_node_id,
+            &evidence_node_id,
+            Some(ordinal),
+        );
+    }
+
+    fn add_parent_chunk_edge(&mut self, chunk: &Chunk) {
+        let Some(parent_id) = &chunk.parent_chunk_id else {
+            return;
+        };
+        let Some(parent_node_id) = self.chunk_nodes.get(parent_id).cloned() else {
+            return;
+        };
+        let Some(child_node_id) = self.chunk_nodes.get(&chunk.id).cloned() else {
+            return;
+        };
+        self.push_edge(EdgeType::Contains, &parent_node_id, &child_node_id, None);
+    }
+
+    fn add_evidence_derivation_edge(&mut self, unit: &EvidenceUnit) {
+        let Some(derived_from) = &unit.derived_from else {
+            return;
+        };
+        let Some(from_node_id) = self.evidence_nodes.get(&unit.id).cloned() else {
+            return;
+        };
+        let Some(to_node_id) = self.evidence_nodes.get(derived_from).cloned() else {
+            return;
+        };
+        self.push_edge(EdgeType::DerivedFrom, &from_node_id, &to_node_id, None);
+    }
+
+    fn add_image_artifact_derivation_edge(&mut self, artifact: &ImageArtifact) {
+        let Some(evidence_node_id) = self.evidence_nodes.get(&artifact.evidence_id).cloned() else {
+            return;
+        };
+        let Some(image_node_id) = self.image_nodes.get(&artifact.image_id).cloned() else {
+            return;
+        };
+        self.push_edge(
+            EdgeType::DerivedFrom,
+            &evidence_node_id,
+            &image_node_id,
+            None,
+        );
+    }
+
+    fn ensure_page_node(&mut self, page: u32) -> GraphNodeId {
+        if let Some(node_id) = self.page_nodes.get(&page) {
+            return node_id.clone();
+        }
+
+        let external_id = format!("page:{page}");
+        let node_id = self.push_node(GraphNode {
+            id: GraphNodeId::new(&self.source_id, GraphNodeKind::Page, &external_id),
+            source_id: self.source_id.clone(),
+            kind: GraphNodeKind::Page,
+            external_id,
+            label: Some(format!("Page {page}")),
+            locator: None,
+            ordinal: Some(page),
+            metadata: Some(serde_json::json!({ "page": page })),
+        });
+        self.page_nodes.insert(page, node_id.clone());
+        self.add_source_contains_edge(&node_id, Some(page));
+        node_id
+    }
+
+    fn ensure_section_nodes(
+        &mut self,
+        heading_path: &[String],
+        ordinal: Option<u32>,
+    ) -> Option<GraphNodeId> {
+        let mut parent_node_id = None;
+        let mut current_path = Vec::new();
+
+        for heading in heading_path {
+            current_path.push(heading.clone());
+            let node_id = if let Some(node_id) = self.section_nodes.get(&current_path) {
+                node_id.clone()
+            } else {
+                let external_id = format!("section:{}", current_path.join(" > "));
+                let node_id = self.push_node(GraphNode {
+                    id: GraphNodeId::new(&self.source_id, GraphNodeKind::Section, &external_id),
+                    source_id: self.source_id.clone(),
+                    kind: GraphNodeKind::Section,
+                    external_id,
+                    label: Some(heading.clone()),
+                    locator: None,
+                    ordinal,
+                    metadata: Some(serde_json::json!({ "heading_path": &current_path })),
+                });
+                self.section_nodes
+                    .insert(current_path.clone(), node_id.clone());
+                self.add_source_contains_edge(&node_id, ordinal);
+                if let Some(parent) = &parent_node_id {
+                    self.push_edge(EdgeType::Contains, parent, &node_id, ordinal);
+                }
+                node_id
+            };
+            parent_node_id = Some(node_id);
+        }
+
+        parent_node_id
+    }
+
+    fn add_source_contains_edge(&mut self, to_node_id: &GraphNodeId, ordinal: Option<u32>) {
+        let source_node_id = self.source_node_id.clone();
+        self.push_edge(EdgeType::Contains, &source_node_id, to_node_id, ordinal);
+    }
+
+    fn push_node(&mut self, node: GraphNode) -> GraphNodeId {
+        let node_id = node.id.clone();
+        if self.node_ids.insert(node_id.0.clone()) {
+            self.nodes.push(node);
+        }
+        node_id
+    }
+
+    fn push_edge(
+        &mut self,
+        edge_type: EdgeType,
+        from_node_id: &GraphNodeId,
+        to_node_id: &GraphNodeId,
+        ordinal: Option<u32>,
+    ) {
+        let edge = GraphEdge {
+            id: GraphEdgeId::new(
+                &self.source_id,
+                edge_type,
+                from_node_id,
+                to_node_id,
+                ordinal,
+            ),
+            source_id: self.source_id.clone(),
+            edge_type,
+            from_node_id: from_node_id.clone(),
+            to_node_id: to_node_id.clone(),
+            ordinal,
+            weight: None,
+            metadata: None,
+        };
+        if self.edge_ids.insert(edge.id.0.clone()) {
+            self.edges.push(edge);
+        }
+    }
+}
+
+fn locator_page(locator: &SourceLocator) -> Option<u32> {
+    match locator {
+        SourceLocator::Pdf { page, .. } | SourceLocator::PdfImage { page, .. } => Some(*page),
+        SourceLocator::Document { .. } => None,
+    }
+}
+
+fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::Text => "text",
+        EvidenceKind::Image => "image",
+        EvidenceKind::Generated => "generated",
+    }
+}
+
+fn chunk_type_label(chunk_type: &ChunkType) -> &'static str {
+    match chunk_type {
+        ChunkType::Child => "child",
+        ChunkType::Parent => "parent",
+    }
 }
 
 fn normalize_evidence_source_ids(
@@ -1179,7 +1606,10 @@ mod tests {
     use crate::image_limits::ImageArtifactLimitError;
     use crate::provider::{ImageDescribeRequest, ImageDescription, ProviderResult, VisionModel};
     use crate::retrieve::RetrievalPipeline;
-    use crate::types::{ChunkId, EvidenceId, EvidenceKind, EvidenceUnit, SourceLocator};
+    use crate::types::{
+        ChunkId, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge, GraphNode,
+        GraphNodeId, GraphNodeKind, SourceLocator,
+    };
     use crate::vision_caption::{vision_caption_prompt_hash, ImageCaptionStatus};
 
     struct FailingEmbeddingClient;
@@ -1345,6 +1775,24 @@ mod tests {
         }
         hnsw.build().unwrap();
         hnsw
+    }
+
+    fn sorted_graph_node_ids(nodes: &[GraphNode]) -> Vec<String> {
+        let mut ids = nodes
+            .iter()
+            .map(|node| node.id.0.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    fn sorted_graph_edge_ids(edges: &[GraphEdge]) -> Vec<String> {
+        let mut ids = edges
+            .iter()
+            .map(|edge| edge.id.0.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
     }
 
     fn write_pdf_with_image(path: &Path) {
@@ -1849,6 +2297,122 @@ model = "local-vision"
     }
 
     #[tokio::test]
+    async fn ingest_source_builds_graph_and_reingest_replaces_stale_nodes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("graph.md");
+        std::fs::write(
+            &path,
+            "# Intro\n\nFresh graph paragraph.\n\nStale graph paragraph.\n",
+        )
+        .unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-graph", path.clone());
+        store.add_source(&source).unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        let first_nodes = pipeline
+            .store()
+            .list_graph_nodes_by_source(&source.id)
+            .unwrap();
+        assert!(first_nodes
+            .iter()
+            .any(|node| node.kind == GraphNodeKind::Source));
+        assert!(first_nodes
+            .iter()
+            .any(|node| node.kind == GraphNodeKind::Section));
+        assert!(first_nodes
+            .iter()
+            .any(|node| node.kind == GraphNodeKind::Chunk));
+        assert!(first_nodes
+            .iter()
+            .any(|node| node.kind == GraphNodeKind::EvidenceUnit));
+        let first_edges = pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::Contains)
+            .unwrap();
+        let source_node = first_nodes
+            .iter()
+            .find(|node| node.kind == GraphNodeKind::Source)
+            .unwrap();
+        assert!(first_edges
+            .iter()
+            .any(|edge| edge.from_node_id == source_node.id));
+        let stale_evidence = pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .find(|unit| unit.text.contains("Stale graph paragraph"))
+            .unwrap();
+        let stale_node_id = GraphNodeId::new(
+            &source.id,
+            GraphNodeKind::EvidenceUnit,
+            &stale_evidence.id.0,
+        );
+
+        std::fs::write(&path, "# Intro\n\nFresh graph paragraph.\n").unwrap();
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert!(pipeline
+            .store()
+            .get_evidence(&stale_evidence.id)
+            .unwrap()
+            .is_none());
+        let second_nodes = pipeline
+            .store()
+            .list_graph_nodes_by_source(&source.id)
+            .unwrap();
+        assert!(second_nodes.iter().all(|node| node.id != stale_node_id));
+        let second_edges = pipeline
+            .store()
+            .list_graph_edges_by_source(&source.id)
+            .unwrap();
+        let second_node_ids = sorted_graph_node_ids(&second_nodes);
+        let second_edge_ids = sorted_graph_edge_ids(&second_edges);
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert_eq!(
+            sorted_graph_node_ids(
+                &pipeline
+                    .store()
+                    .list_graph_nodes_by_source(&source.id)
+                    .unwrap()
+            ),
+            second_node_ids
+        );
+        assert_eq!(
+            sorted_graph_edge_ids(
+                &pipeline
+                    .store()
+                    .list_graph_edges_by_source(&source.id)
+                    .unwrap()
+            ),
+            second_edge_ids
+        );
+
+        pipeline.remove_source(&source.id).await.unwrap();
+
+        assert!(pipeline
+            .store()
+            .list_graph_nodes_by_source(&source.id)
+            .unwrap()
+            .is_empty());
+        assert!(pipeline
+            .store()
+            .list_graph_edges_by_source(&source.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn pdf_ingest_writes_stable_image_artifacts_and_removes_them_with_source() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("image-fixture.pdf");
@@ -1897,6 +2461,32 @@ model = "local-vision"
             image_evidence.locator,
             SourceLocator::PdfImage { .. }
         ));
+        let image_evidence_node_id = GraphNodeId::new(
+            &source.id,
+            GraphNodeKind::EvidenceUnit,
+            &first.evidence_id.0,
+        );
+        let image_artifact_node_id =
+            GraphNodeId::new(&source.id, GraphNodeKind::ImageArtifact, &first.image_id.0);
+        let graph_nodes = pipeline
+            .store()
+            .list_graph_nodes_by_source(&source.id)
+            .unwrap();
+        assert!(graph_nodes
+            .iter()
+            .any(|node| node.id == image_evidence_node_id));
+        assert!(graph_nodes
+            .iter()
+            .any(|node| node.id == image_artifact_node_id));
+        assert!(pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::DerivedFrom)
+            .unwrap()
+            .iter()
+            .any(|edge| {
+                edge.from_node_id == image_evidence_node_id
+                    && edge.to_node_id == image_artifact_node_id
+            }));
 
         pipeline.ingest_source(&source.id).await.unwrap();
 
@@ -1919,6 +2509,16 @@ model = "local-vision"
         assert!(pipeline
             .store()
             .list_image_artifacts_by_source(&source.id)
+            .unwrap()
+            .is_empty());
+        assert!(pipeline
+            .store()
+            .list_graph_nodes_by_source(&source.id)
+            .unwrap()
+            .is_empty());
+        assert!(pipeline
+            .store()
+            .list_graph_edges_by_source(&source.id)
             .unwrap()
             .is_empty());
         assert!(!source_image_artifact_dir(tempdir.path(), &source.id)
@@ -2007,6 +2607,53 @@ model = "local-vision"
         assert_eq!(caption_chunks.len(), 1);
         assert!(caption_chunks[0].text.contains("An indexing flow diagram."));
         assert!(caption_chunks[0].context_text.is_none());
+        let generated_node_id =
+            GraphNodeId::new(&source.id, GraphNodeKind::EvidenceUnit, &generated[0].id.0);
+        let image_evidence_node_id = GraphNodeId::new(
+            &source.id,
+            GraphNodeKind::EvidenceUnit,
+            &image_artifacts[0].evidence_id.0,
+        );
+        let image_artifact_node_id = GraphNodeId::new(
+            &source.id,
+            GraphNodeKind::ImageArtifact,
+            &image_artifacts[0].image_id.0,
+        );
+        let caption_chunk_node_id =
+            GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &caption_chunks[0].id.0);
+        let first_graph_nodes = pipeline
+            .store()
+            .list_graph_nodes_by_source(&source.id)
+            .unwrap();
+        assert!(first_graph_nodes
+            .iter()
+            .any(|node| node.id == generated_node_id));
+        assert!(first_graph_nodes
+            .iter()
+            .any(|node| node.id == image_evidence_node_id));
+        assert!(first_graph_nodes
+            .iter()
+            .any(|node| node.id == image_artifact_node_id));
+        assert!(first_graph_nodes
+            .iter()
+            .any(|node| node.id == caption_chunk_node_id));
+        let derived_edges = pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::DerivedFrom)
+            .unwrap();
+        assert!(derived_edges.iter().any(|edge| {
+            edge.from_node_id == generated_node_id && edge.to_node_id == image_evidence_node_id
+        }));
+        assert!(derived_edges.iter().any(|edge| {
+            edge.from_node_id == image_evidence_node_id && edge.to_node_id == image_artifact_node_id
+        }));
+        let first_graph_node_ids = sorted_graph_node_ids(&first_graph_nodes);
+        let first_graph_edge_ids = sorted_graph_edge_ids(
+            &pipeline
+                .store()
+                .list_graph_edges_by_source(&source.id)
+                .unwrap(),
+        );
 
         pipeline.ingest_source(&source.id).await.unwrap();
 
@@ -2030,6 +2677,24 @@ model = "local-vision"
             .filter(|chunk| chunk.evidence_unit_ids == vec![generated_after_cache[0].id.clone()])
             .collect::<Vec<_>>();
         assert_eq!(caption_chunks_after_cache.len(), 1);
+        assert_eq!(
+            sorted_graph_node_ids(
+                &pipeline
+                    .store()
+                    .list_graph_nodes_by_source(&source.id)
+                    .unwrap()
+            ),
+            first_graph_node_ids
+        );
+        assert_eq!(
+            sorted_graph_edge_ids(
+                &pipeline
+                    .store()
+                    .list_graph_edges_by_source(&source.id)
+                    .unwrap()
+            ),
+            first_graph_edge_ids
+        );
     }
 
     #[tokio::test]
