@@ -136,15 +136,33 @@ impl GraphNodeKind {
 pub enum EdgeType {
     Contains,
     DerivedFrom,
+    Parent,
+    Child,
+    Previous,
     Next,
+    SameSource,
+    SamePage,
+    SectionContains,
+    PageContainsImage,
+    ImageNearText,
+    MarkdownLinksTo,
 }
 
 impl EdgeType {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Contains => "Contains",
-            Self::DerivedFrom => "DerivedFrom",
-            Self::Next => "Next",
+            Self::Contains => "contains",
+            Self::DerivedFrom => "derived_from",
+            Self::Parent => "parent",
+            Self::Child => "child",
+            Self::Previous => "previous",
+            Self::Next => "next",
+            Self::SameSource => "same_source",
+            Self::SamePage => "same_page",
+            Self::SectionContains => "section_contains",
+            Self::PageContainsImage => "page_contains_image",
+            Self::ImageNearText => "image_near_text",
+            Self::MarkdownLinksTo => "markdown_links_to",
         }
     }
 }

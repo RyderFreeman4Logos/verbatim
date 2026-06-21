@@ -53,6 +53,14 @@ struct PreparedImageArtifacts {
     evidence: Vec<EvidenceUnit>,
     artifacts: Vec<ImageArtifact>,
     files: Vec<PreparedImageFile>,
+    text_proximities: Vec<ImageTextProximity>,
+}
+
+#[derive(Debug)]
+struct ImageTextProximity {
+    image_id: ImageId,
+    nearby_text_before: Option<String>,
+    nearby_text_after: Option<String>,
 }
 
 #[derive(Debug)]
@@ -290,6 +298,7 @@ where
             &chunks,
             &links,
             &prepared_image_artifacts.artifacts,
+            &prepared_image_artifacts.text_proximities,
         );
 
         let mut child_chunks = self.child_chunks_without_source(source_id)?;
@@ -757,6 +766,7 @@ fn build_evidence_graph(
     chunks: &[Chunk],
     links: &[(ChunkId, EvidenceId)],
     image_artifacts: &[ImageArtifact],
+    image_text_proximities: &[ImageTextProximity],
 ) -> (Vec<GraphNode>, Vec<GraphEdge>) {
     let mut graph = GraphBuildState::new(source);
     let evidence_by_id: HashMap<EvidenceId, &EvidenceUnit> = evidence
@@ -791,6 +801,13 @@ fn build_evidence_graph(
     for artifact in image_artifacts {
         graph.add_image_artifact_derivation_edge(artifact);
     }
+
+    graph.add_evidence_adjacency_edges(evidence);
+    graph.add_chunk_adjacency_edges(chunks);
+    graph.add_page_adjacency_edges();
+    graph.add_section_adjacency_edges();
+    graph.add_image_near_text_edges(image_text_proximities, image_artifacts, evidence);
+    graph.add_same_source_edges();
 
     (graph.nodes, graph.edges)
 }
@@ -867,27 +884,30 @@ impl GraphBuildState {
             })),
         });
         self.evidence_nodes.insert(unit.id.clone(), node_id.clone());
-        self.add_source_contains_edge(&node_id, Some(unit.position));
+        let mut has_parent = false;
 
         if let Some(page) = locator_page(&unit.locator) {
             let page_node_id = self.ensure_page_node(page);
+            self.push_parent_child_edges(&page_node_id, &node_id, Some(unit.position));
             self.push_edge(
-                EdgeType::Contains,
+                EdgeType::SamePage,
                 &page_node_id,
                 &node_id,
                 Some(unit.position),
             );
+            has_parent = true;
         }
 
         if let Some(section_node_id) =
             self.ensure_section_nodes(&unit.heading_path, Some(unit.position))
         {
-            self.push_edge(
-                EdgeType::Contains,
-                &section_node_id,
-                &node_id,
-                Some(unit.position),
-            );
+            self.push_parent_child_edges(&section_node_id, &node_id, Some(unit.position));
+            has_parent = true;
+        }
+
+        if !has_parent {
+            let source_node_id = self.source_node_id.clone();
+            self.push_parent_child_edges(&source_node_id, &node_id, Some(unit.position));
         }
     }
 
@@ -912,7 +932,7 @@ impl GraphBuildState {
             })),
         });
         self.chunk_nodes.insert(chunk.id.clone(), node_id.clone());
-        self.add_source_contains_edge(&node_id, Some(ordinal));
+        let mut has_parent = false;
 
         let mut pages = Vec::new();
         for evidence_id in &chunk.evidence_unit_ids {
@@ -928,17 +948,26 @@ impl GraphBuildState {
         pages.sort_unstable();
         for page in pages {
             let page_node_id = self.ensure_page_node(page);
-            self.push_edge(EdgeType::Contains, &page_node_id, &node_id, Some(ordinal));
+            self.push_parent_child_edges(&page_node_id, &node_id, Some(ordinal));
+            self.push_edge(EdgeType::SamePage, &page_node_id, &node_id, Some(ordinal));
+            has_parent = true;
         }
 
         if let Some(section_node_id) = self.ensure_section_nodes(&chunk.heading_path, Some(ordinal))
         {
+            self.push_parent_child_edges(&section_node_id, &node_id, Some(ordinal));
             self.push_edge(
-                EdgeType::Contains,
+                EdgeType::SectionContains,
                 &section_node_id,
                 &node_id,
                 Some(ordinal),
             );
+            has_parent = true;
+        }
+
+        if !has_parent {
+            let source_node_id = self.source_node_id.clone();
+            self.push_parent_child_edges(&source_node_id, &node_id, Some(ordinal));
         }
     }
 
@@ -971,11 +1000,17 @@ impl GraphBuildState {
         });
         self.image_nodes
             .insert(artifact.image_id.clone(), node_id.clone());
-        self.add_source_contains_edge(&node_id, Some(artifact.image_index));
 
         let page_node_id = self.ensure_page_node(artifact.page);
+        self.push_parent_child_edges(&page_node_id, &node_id, Some(artifact.image_index));
         self.push_edge(
-            EdgeType::Contains,
+            EdgeType::PageContainsImage,
+            &page_node_id,
+            &node_id,
+            Some(artifact.image_index),
+        );
+        self.push_edge(
+            EdgeType::SamePage,
             &page_node_id,
             &node_id,
             Some(artifact.image_index),
@@ -994,12 +1029,7 @@ impl GraphBuildState {
         let Some(evidence_node_id) = self.evidence_nodes.get(evidence_id).cloned() else {
             return;
         };
-        self.push_edge(
-            EdgeType::Contains,
-            &chunk_node_id,
-            &evidence_node_id,
-            Some(ordinal),
-        );
+        self.push_parent_child_edges(&chunk_node_id, &evidence_node_id, Some(ordinal));
     }
 
     fn add_parent_chunk_edge(&mut self, chunk: &Chunk) {
@@ -1012,7 +1042,7 @@ impl GraphBuildState {
         let Some(child_node_id) = self.chunk_nodes.get(&chunk.id).cloned() else {
             return;
         };
-        self.push_edge(EdgeType::Contains, &parent_node_id, &child_node_id, None);
+        self.push_parent_child_edges(&parent_node_id, &child_node_id, None);
     }
 
     fn add_evidence_derivation_edge(&mut self, unit: &EvidenceUnit) {
@@ -1060,7 +1090,8 @@ impl GraphBuildState {
             metadata: Some(serde_json::json!({ "page": page })),
         });
         self.page_nodes.insert(page, node_id.clone());
-        self.add_source_contains_edge(&node_id, Some(page));
+        let source_node_id = self.source_node_id.clone();
+        self.push_parent_child_edges(&source_node_id, &node_id, Some(page));
         node_id
     }
 
@@ -1090,9 +1121,11 @@ impl GraphBuildState {
                 });
                 self.section_nodes
                     .insert(current_path.clone(), node_id.clone());
-                self.add_source_contains_edge(&node_id, ordinal);
                 if let Some(parent) = &parent_node_id {
-                    self.push_edge(EdgeType::Contains, parent, &node_id, ordinal);
+                    self.push_parent_child_edges(parent, &node_id, ordinal);
+                } else {
+                    let source_node_id = self.source_node_id.clone();
+                    self.push_parent_child_edges(&source_node_id, &node_id, ordinal);
                 }
                 node_id
             };
@@ -1102,9 +1135,191 @@ impl GraphBuildState {
         parent_node_id
     }
 
-    fn add_source_contains_edge(&mut self, to_node_id: &GraphNodeId, ordinal: Option<u32>) {
+    fn add_evidence_adjacency_edges(&mut self, evidence: &[EvidenceUnit]) {
+        let mut ordered = evidence
+            .iter()
+            .filter_map(|unit| {
+                self.evidence_nodes
+                    .get(&unit.id)
+                    .cloned()
+                    .map(|node_id| (unit.position, node_id))
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| graph_node_id_key(&left.1).cmp(graph_node_id_key(&right.1)))
+        });
+        let node_ids = ordered
+            .into_iter()
+            .map(|(_, node_id)| node_id)
+            .collect::<Vec<_>>();
+        self.push_sequence_edges(&node_ids);
+    }
+
+    fn add_chunk_adjacency_edges(&mut self, chunks: &[Chunk]) {
+        let mut parent_nodes = Vec::new();
+        let mut child_nodes = Vec::new();
+
+        for (ordinal, chunk) in chunks.iter().enumerate() {
+            let Some(node_id) = self.chunk_nodes.get(&chunk.id).cloned() else {
+                continue;
+            };
+            match chunk.chunk_type {
+                ChunkType::Parent => parent_nodes.push((ordinal as u32, node_id)),
+                ChunkType::Child => child_nodes.push((ordinal as u32, node_id)),
+            }
+        }
+
+        parent_nodes.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| graph_node_id_key(&left.1).cmp(graph_node_id_key(&right.1)))
+        });
+        child_nodes.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| graph_node_id_key(&left.1).cmp(graph_node_id_key(&right.1)))
+        });
+        self.push_sequence_edges(
+            &parent_nodes
+                .into_iter()
+                .map(|(_, node_id)| node_id)
+                .collect::<Vec<_>>(),
+        );
+        self.push_sequence_edges(
+            &child_nodes
+                .into_iter()
+                .map(|(_, node_id)| node_id)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    fn add_page_adjacency_edges(&mut self) {
+        let mut pages = self
+            .page_nodes
+            .iter()
+            .map(|(page, node_id)| (*page, node_id.clone()))
+            .collect::<Vec<_>>();
+        pages.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| graph_node_id_key(&left.1).cmp(graph_node_id_key(&right.1)))
+        });
+        let node_ids = pages
+            .into_iter()
+            .map(|(_, node_id)| node_id)
+            .collect::<Vec<_>>();
+        self.push_sequence_edges(&node_ids);
+    }
+
+    fn add_section_adjacency_edges(&mut self) {
+        let mut sections = self
+            .nodes
+            .iter()
+            .filter(|node| node.kind == GraphNodeKind::Section)
+            .map(|node| {
+                (
+                    node.ordinal.unwrap_or(u32::MAX),
+                    node.external_id.clone(),
+                    node.id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        sections.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| graph_node_id_key(&left.2).cmp(graph_node_id_key(&right.2)))
+        });
+        let node_ids = sections
+            .into_iter()
+            .map(|(_, _, node_id)| node_id)
+            .collect::<Vec<_>>();
+        self.push_sequence_edges(&node_ids);
+    }
+
+    fn add_image_near_text_edges(
+        &mut self,
+        proximities: &[ImageTextProximity],
+        image_artifacts: &[ImageArtifact],
+        evidence: &[EvidenceUnit],
+    ) {
+        let image_pages = image_artifacts
+            .iter()
+            .map(|artifact| (artifact.image_id.clone(), artifact.page))
+            .collect::<HashMap<_, _>>();
+
+        for proximity in proximities {
+            let Some(image_node_id) = self.image_nodes.get(&proximity.image_id).cloned() else {
+                continue;
+            };
+            let Some(page) = image_pages.get(&proximity.image_id).copied() else {
+                continue;
+            };
+            let mut linked_text_nodes = HashSet::new();
+
+            for nearby in [
+                exact_nearby_text(&proximity.nearby_text_before),
+                exact_nearby_text(&proximity.nearby_text_after),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for unit in evidence {
+                    if unit.kind != EvidenceKind::Text
+                        || locator_page(&unit.locator) != Some(page)
+                        || !evidence_matches_nearby_text(unit, nearby)
+                    {
+                        continue;
+                    }
+                    let Some(text_node_id) = self.evidence_nodes.get(&unit.id).cloned() else {
+                        continue;
+                    };
+                    if linked_text_nodes.insert(text_node_id.0.clone()) {
+                        self.push_edge(
+                            EdgeType::ImageNearText,
+                            &image_node_id,
+                            &text_node_id,
+                            Some(unit.position),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_same_source_edges(&mut self) {
         let source_node_id = self.source_node_id.clone();
-        self.push_edge(EdgeType::Contains, &source_node_id, to_node_id, ordinal);
+        let node_refs = self
+            .nodes
+            .iter()
+            .filter(|node| node.id != source_node_id)
+            .map(|node| (node.ordinal, node.id.clone()))
+            .collect::<Vec<_>>();
+
+        for (ordinal, node_id) in node_refs {
+            self.push_edge(EdgeType::SameSource, &source_node_id, &node_id, ordinal);
+        }
+    }
+
+    fn push_parent_child_edges(
+        &mut self,
+        parent_node_id: &GraphNodeId,
+        child_node_id: &GraphNodeId,
+        ordinal: Option<u32>,
+    ) {
+        self.push_edge(EdgeType::Child, parent_node_id, child_node_id, ordinal);
+        self.push_edge(EdgeType::Parent, child_node_id, parent_node_id, ordinal);
+    }
+
+    fn push_sequence_edges(&mut self, node_ids: &[GraphNodeId]) {
+        for (ordinal, pair) in node_ids.windows(2).enumerate() {
+            let previous = &pair[0];
+            let next = &pair[1];
+            self.push_edge(EdgeType::Next, previous, next, Some(ordinal as u32));
+            self.push_edge(EdgeType::Previous, next, previous, Some(ordinal as u32));
+        }
     }
 
     fn push_node(&mut self, node: GraphNode) -> GraphNodeId {
@@ -1149,6 +1364,24 @@ fn locator_page(locator: &SourceLocator) -> Option<u32> {
         SourceLocator::Pdf { page, .. } | SourceLocator::PdfImage { page, .. } => Some(*page),
         SourceLocator::Document { .. } => None,
     }
+}
+
+fn graph_node_id_key(node_id: &GraphNodeId) -> &str {
+    &node_id.0
+}
+
+fn exact_nearby_text(text: &Option<String>) -> Option<&str> {
+    let text = text.as_deref()?.trim();
+    if text.is_empty() || text.starts_with("same-page excerpt fallback:") {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn evidence_matches_nearby_text(unit: &EvidenceUnit, nearby_text: &str) -> bool {
+    let evidence_text = unit.text.trim();
+    evidence_text == nearby_text || (nearby_text.len() >= 24 && evidence_text.contains(nearby_text))
 }
 
 fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
@@ -1226,6 +1459,7 @@ fn prepare_image_artifacts(
     let mut evidence = Vec::new();
     let mut artifacts = Vec::new();
     let mut files = Vec::new();
+    let mut text_proximities = Vec::new();
     let mut budget = ImageArtifactBudget::new(limits, ImageArtifactLimitStage::Prepare);
 
     for parsed_artifact in parsed {
@@ -1259,6 +1493,11 @@ fn prepare_image_artifacts(
             parsed_artifact.bbox.as_ref(),
             &id_hash,
         );
+        let text_proximity = ImageTextProximity {
+            image_id: image_id.clone(),
+            nearby_text_before: parsed_artifact.nearby_text_before.clone(),
+            nearby_text_after: parsed_artifact.nearby_text_after.clone(),
+        };
         let evidence_id = EvidenceId(image_id.0.clone());
         let relative_path =
             image_artifact_relative_path(source_id, &image_id, &parsed_artifact.extension)?;
@@ -1301,12 +1540,14 @@ fn prepare_image_artifacts(
             page: parsed_artifact.page,
             image_index: parsed_artifact.image_index,
         });
+        text_proximities.push(text_proximity);
     }
 
     Ok(PreparedImageArtifacts {
         evidence,
         artifacts,
         files,
+        text_proximities,
     })
 }
 
@@ -2217,6 +2458,63 @@ model = "local-vision"
         assert!(!second_path.exists());
     }
 
+    #[test]
+    fn graph_links_image_to_parser_provided_nearby_text() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source = test_source("src-near-image", tempdir.path().join("near.pdf"));
+        let text = "Nearby graph text before image.";
+        let text_evidence = EvidenceUnit {
+            id: EvidenceId("text-1".into()),
+            source_id: source.id.clone(),
+            kind: EvidenceKind::Text,
+            derived_from: None,
+            locator: SourceLocator::Pdf {
+                page: 1,
+                paragraph: 0,
+                bbox: None,
+            },
+            text: text.into(),
+            text_hash: "hash-text-1".into(),
+            heading_path: Vec::new(),
+            position: 0,
+        };
+        let mut parsed_image = test_parsed_image_artifact("png");
+        parsed_image.nearby_text_before = Some(text.into());
+        let prepared = prepare_image_artifacts(
+            tempdir.path(),
+            &source.id,
+            1,
+            vec![parsed_image],
+            ImageArtifactLimits::default(),
+        )
+        .unwrap();
+        let mut evidence = vec![text_evidence.clone()];
+        evidence.extend(prepared.evidence.clone());
+        let chunk_output = chunk_evidence(&source.id, &evidence, &ChunkerConfig::default());
+
+        let (_nodes, edges) = build_evidence_graph(
+            &source,
+            &evidence,
+            &chunk_output.chunks,
+            &chunk_output.links,
+            &prepared.artifacts,
+            &prepared.text_proximities,
+        );
+
+        let image_node_id = GraphNodeId::new(
+            &source.id,
+            GraphNodeKind::ImageArtifact,
+            &prepared.artifacts[0].image_id.0,
+        );
+        let text_node_id =
+            GraphNodeId::new(&source.id, GraphNodeKind::EvidenceUnit, &text_evidence.id.0);
+        assert!(edges.iter().any(|edge| {
+            edge.edge_type == EdgeType::ImageNearText
+                && edge.from_node_id == image_node_id
+                && edge.to_node_id == text_node_id
+        }));
+    }
+
     #[tokio::test]
     async fn remove_source_cleans_lexical_and_dense_state() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -2300,9 +2598,11 @@ model = "local-vision"
     async fn ingest_source_builds_graph_and_reingest_replaces_stale_nodes() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("graph.md");
+        let fresh_paragraph = format!("Fresh graph paragraph {}.", "alpha ".repeat(360));
+        let stale_paragraph = format!("Stale graph paragraph {}.", "beta ".repeat(360));
         std::fs::write(
             &path,
-            "# Intro\n\nFresh graph paragraph.\n\nStale graph paragraph.\n",
+            format!("# Intro\n\n{fresh_paragraph}\n\n{stale_paragraph}\n"),
         )
         .unwrap();
         let store = Store::in_memory().unwrap();
@@ -2333,17 +2633,75 @@ model = "local-vision"
         assert!(first_nodes
             .iter()
             .any(|node| node.kind == GraphNodeKind::EvidenceUnit));
-        let first_edges = pipeline
+        let child_edges = pipeline
             .store()
-            .list_graph_edges_by_type(&source.id, EdgeType::Contains)
+            .list_graph_edges_by_type(&source.id, EdgeType::Child)
             .unwrap();
         let source_node = first_nodes
             .iter()
             .find(|node| node.kind == GraphNodeKind::Source)
             .unwrap();
-        assert!(first_edges
+        assert!(child_edges
             .iter()
             .any(|edge| edge.from_node_id == source_node.id));
+        let chunks = pipeline.store().list_chunks_by_source(&source.id).unwrap();
+        let child_chunk_node_ids = chunks
+            .iter()
+            .filter(|chunk| chunk.chunk_type == ChunkType::Child)
+            .map(|chunk| GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &chunk.id.0).0)
+            .collect::<HashSet<_>>();
+        let parent_chunk_node_ids = chunks
+            .iter()
+            .filter(|chunk| chunk.chunk_type == ChunkType::Parent)
+            .map(|chunk| GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &chunk.id.0).0)
+            .collect::<HashSet<_>>();
+        assert!(child_chunk_node_ids.len() >= 2);
+        assert!(child_edges.iter().any(|edge| {
+            parent_chunk_node_ids.contains(&edge.from_node_id.0)
+                && child_chunk_node_ids.contains(&edge.to_node_id.0)
+        }));
+        assert!(pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::Parent)
+            .unwrap()
+            .iter()
+            .any(|edge| {
+                child_chunk_node_ids.contains(&edge.from_node_id.0)
+                    && parent_chunk_node_ids.contains(&edge.to_node_id.0)
+            }));
+        assert!(pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::Next)
+            .unwrap()
+            .iter()
+            .any(|edge| {
+                child_chunk_node_ids.contains(&edge.from_node_id.0)
+                    && child_chunk_node_ids.contains(&edge.to_node_id.0)
+            }));
+        assert!(pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::Previous)
+            .unwrap()
+            .iter()
+            .any(|edge| {
+                child_chunk_node_ids.contains(&edge.from_node_id.0)
+                    && child_chunk_node_ids.contains(&edge.to_node_id.0)
+            }));
+        assert!(pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::SectionContains)
+            .unwrap()
+            .iter()
+            .any(|edge| child_chunk_node_ids.contains(&edge.to_node_id.0)));
+        let same_source_edges = pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::SameSource)
+            .unwrap();
+        assert!(same_source_edges.len() <= first_nodes.len().saturating_sub(1));
+        assert!(same_source_edges.iter().all(|edge| {
+            !(child_chunk_node_ids.contains(&edge.from_node_id.0)
+                && child_chunk_node_ids.contains(&edge.to_node_id.0))
+        }));
         let stale_evidence = pipeline
             .store()
             .list_evidence_by_source(&source.id)
@@ -2357,7 +2715,7 @@ model = "local-vision"
             &stale_evidence.id.0,
         );
 
-        std::fs::write(&path, "# Intro\n\nFresh graph paragraph.\n").unwrap();
+        std::fs::write(&path, format!("# Intro\n\n{fresh_paragraph}\n")).unwrap();
         pipeline.ingest_source(&source.id).await.unwrap();
 
         assert!(pipeline
@@ -2468,6 +2826,7 @@ model = "local-vision"
         );
         let image_artifact_node_id =
             GraphNodeId::new(&source.id, GraphNodeKind::ImageArtifact, &first.image_id.0);
+        let page_node_id = GraphNodeId::new(&source.id, GraphNodeKind::Page, "page:1");
         let graph_nodes = pipeline
             .store()
             .list_graph_nodes_by_source(&source.id)
@@ -2478,6 +2837,7 @@ model = "local-vision"
         assert!(graph_nodes
             .iter()
             .any(|node| node.id == image_artifact_node_id));
+        assert!(graph_nodes.iter().any(|node| node.id == page_node_id));
         assert!(pipeline
             .store()
             .list_graph_edges_by_type(&source.id, EdgeType::DerivedFrom)
@@ -2487,6 +2847,19 @@ model = "local-vision"
                 edge.from_node_id == image_evidence_node_id
                     && edge.to_node_id == image_artifact_node_id
             }));
+        assert!(pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::PageContainsImage)
+            .unwrap()
+            .iter()
+            .any(|edge| {
+                edge.from_node_id == page_node_id && edge.to_node_id == image_artifact_node_id
+            }));
+        assert!(pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::ImageNearText)
+            .unwrap()
+            .is_empty());
 
         pipeline.ingest_source(&source.id).await.unwrap();
 

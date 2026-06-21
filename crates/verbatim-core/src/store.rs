@@ -1104,9 +1104,18 @@ fn str_to_graph_node_kind(value: &str, column: usize) -> rusqlite::Result<GraphN
 
 fn str_to_edge_type(value: &str, column: usize) -> rusqlite::Result<EdgeType> {
     match value {
-        "Contains" => Ok(EdgeType::Contains),
-        "DerivedFrom" => Ok(EdgeType::DerivedFrom),
-        "Next" => Ok(EdgeType::Next),
+        "contains" | "Contains" => Ok(EdgeType::Contains),
+        "derived_from" | "DerivedFrom" => Ok(EdgeType::DerivedFrom),
+        "parent" => Ok(EdgeType::Parent),
+        "child" => Ok(EdgeType::Child),
+        "previous" => Ok(EdgeType::Previous),
+        "next" | "Next" => Ok(EdgeType::Next),
+        "same_source" => Ok(EdgeType::SameSource),
+        "same_page" => Ok(EdgeType::SamePage),
+        "section_contains" => Ok(EdgeType::SectionContains),
+        "page_contains_image" => Ok(EdgeType::PageContainsImage),
+        "image_near_text" => Ok(EdgeType::ImageNearText),
+        "markdown_links_to" => Ok(EdgeType::MarkdownLinksTo),
         _ => Err(invalid_text_value(
             column,
             format!("unknown graph edge type: {value}"),
