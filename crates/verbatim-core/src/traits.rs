@@ -2,8 +2,10 @@ use std::path::Path;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
-use crate::types::{ChunkId, EvidenceUnit};
+use crate::store::Store;
+use crate::types::{ChunkId, EvidenceUnit, SourceId};
 
 pub trait Parser: Send + Sync {
     fn name(&self) -> &str;
@@ -29,12 +31,45 @@ pub trait EmbeddingClient: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Searchable text derived from a child chunk for lexical indexing.
+pub struct LexicalDocument {
+    pub chunk_id: ChunkId,
+    pub source_id: SourceId,
+    pub text: String,
+    pub heading: String,
+}
+
+/// Lexical index boundary for BM25-style retrieval.
+pub trait LexicalIndex {
+    /// Insert or replace the indexed representation of one child chunk.
+    fn upsert(&self, document: &LexicalDocument) -> Result<()>;
+    /// Remove every lexical entry derived from a source.
+    fn delete_source(&self, source_id: &SourceId) -> Result<()>;
+    /// Return ranked child chunk IDs for a user query.
+    fn search(&self, query: &str, top_k: usize) -> Result<Vec<(ChunkId, f32)>>;
+    /// Rebuild the complete lexical index from SQLite's authoritative chunks.
+    fn rebuild_from_store(&self, store: &Store) -> Result<()>;
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Dense vector derived from a child chunk for local vector indexing.
+pub struct VectorDocument {
+    pub chunk_id: ChunkId,
+    pub source_id: SourceId,
+    pub vector: Vec<f32>,
+}
+
+/// Local dense index boundary for retrieval over stored child chunk vectors.
 pub trait VectorIndex: Send + Sync {
-    fn add(&mut self, chunk_id: &ChunkId, vector: Vec<f32>);
-    fn build(&mut self) -> Result<()>;
+    /// Insert or replace one chunk vector.
+    fn upsert(&mut self, document: VectorDocument);
+    /// Remove every vector derived from a source.
+    fn delete_source(&mut self, source_id: &SourceId) -> Result<()>;
+    /// Return ranked child chunk IDs for a query vector.
     fn search(&self, query: &[f32], top_k: usize) -> Vec<(ChunkId, f32)>;
-    fn save(&self, path: &Path) -> Result<()>;
-    fn load(&mut self, path: &Path) -> Result<()>;
+    /// Rebuild the complete vector index from SQLite's stored vectors.
+    fn rebuild_from_store(&mut self, store: &Store) -> Result<()>;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0

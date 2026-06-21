@@ -329,9 +329,10 @@ async fn execute_ask(
     let runtime = tokio::runtime::Handle::current();
     let results = tokio::task::spawn_blocking(move || {
         let pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let lexical_index = pipeline.lexical_index();
         let retrieval = RetrievalPipeline::new(
-            pipeline.hnsw(),
-            pipeline.bm25(),
+            pipeline.vector_index(),
+            &lexical_index,
             pipeline.store(),
             &state2.embed_client,
             &state2.config.retrieval,

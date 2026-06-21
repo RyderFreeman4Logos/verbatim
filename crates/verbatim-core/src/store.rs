@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
+use crate::traits::VectorDocument;
 use crate::types::{
     Chunk, ChunkId, ChunkType, EvidenceId, EvidenceUnit, Source, SourceId, SourceStatus,
 };
@@ -31,6 +32,10 @@ impl Store {
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         self.conn.execute_batch(SCHEMA)?;
         Ok(())
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
     }
 
     // --- Source ---
@@ -93,11 +98,25 @@ impl Store {
         Ok(generation)
     }
 
+    pub fn remove_source_and_replace_vectors(
+        &self,
+        id: &SourceId,
+        vectors: &[VectorDocument],
+    ) -> Result<u64> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
+        replace_vector_documents_tx(&tx, vectors)?;
+        let generation = bump_index_generation(&tx)?;
+        tx.commit()?;
+        Ok(generation)
+    }
+
     pub fn replace_source_contents(
         &self,
         source: &Source,
         evidence: &[EvidenceUnit],
         chunks: &[Chunk],
+        vectors: &[VectorDocument],
         links: &[(ChunkId, EvidenceId)],
     ) -> Result<u64> {
         let tx = self.conn.unchecked_transaction()?;
@@ -163,6 +182,8 @@ impl Store {
                 stmt.execute(params![&chunk_id.0, &evidence_id.0])?;
             }
         }
+
+        replace_vector_documents_tx(&tx, vectors)?;
 
         let generation = bump_index_generation(&tx)?;
         tx.commit()?;
@@ -434,6 +455,37 @@ impl Store {
             None => Ok(None),
         }
     }
+
+    pub fn replace_all_vector_documents(&self, vectors: &[VectorDocument]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        replace_vector_documents_tx(&tx, vectors)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_vector_documents(&self) -> Result<Vec<VectorDocument>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_id, source_id, vector_json FROM chunk_vectors ORDER BY source_id, chunk_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let (chunk_id, source_id, vector_json) = row?;
+            result.push(VectorDocument {
+                chunk_id: ChunkId(chunk_id),
+                source_id: SourceId(source_id),
+                vector: serde_json::from_str(&vector_json).context("parse stored vector")?,
+            });
+        }
+        Ok(result)
+    }
 }
 
 type ChunkTuple = (
@@ -481,6 +533,24 @@ fn get_evidence_ids_for_chunk(conn: &Connection, chunk_id: &str) -> Result<Vec<E
         conn.prepare("SELECT evidence_unit_id FROM chunk_evidence WHERE chunk_id = ?1")?;
     let rows = stmt.query_map(params![chunk_id], |row| row.get::<_, String>(0))?;
     rows.map(|r| Ok(EvidenceId(r?))).collect()
+}
+
+fn replace_vector_documents_tx(tx: &Transaction<'_>, vectors: &[VectorDocument]) -> Result<()> {
+    tx.execute("DELETE FROM chunk_vectors", [])
+        .context("clear chunk vectors")?;
+    let mut stmt = tx
+        .prepare("INSERT INTO chunk_vectors (chunk_id, source_id, vector_json) VALUES (?1, ?2, ?3)")
+        .context("prepare vector insert")?;
+    for vector in vectors {
+        let vector_json = serde_json::to_string(&vector.vector).context("serialize vector")?;
+        stmt.execute(params![
+            &vector.chunk_id.0,
+            &vector.source_id.0,
+            vector_json,
+        ])
+        .with_context(|| format!("insert vector for chunk {}", vector.chunk_id.0))?;
+    }
+    Ok(())
 }
 
 fn bump_index_generation(tx: &Transaction<'_>) -> Result<u64> {
@@ -567,6 +637,11 @@ CREATE TABLE IF NOT EXISTS chunk_evidence (
     evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
     PRIMARY KEY (chunk_id, evidence_unit_id)
 );
+CREATE TABLE IF NOT EXISTS chunk_vectors (
+    chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    vector_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS embeddings_meta (
     chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
     hnsw_position INTEGER NOT NULL,
@@ -577,6 +652,56 @@ CREATE TABLE IF NOT EXISTS index_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
+    chunk_id UNINDEXED,
+    source_id UNINDEXED,
+    text,
+    heading
+);
+CREATE TRIGGER IF NOT EXISTS chunks_ai_fts
+AFTER INSERT ON chunks
+WHEN NEW.chunk_type = 'Child'
+BEGIN
+    INSERT INTO chunk_fts(rowid, chunk_id, source_id, text, heading)
+    VALUES (
+        NEW.rowid,
+        NEW.id,
+        NEW.source_id,
+        CASE
+            WHEN NEW.context_text IS NULL OR NEW.context_text = '' THEN NEW.text
+            ELSE NEW.context_text || ' ' || NEW.text
+        END,
+        COALESCE(NEW.heading_path_json, '')
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_ad_fts
+AFTER DELETE ON chunks
+WHEN OLD.chunk_type = 'Child'
+BEGIN
+    DELETE FROM chunk_fts WHERE rowid = OLD.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_au_delete_fts
+AFTER UPDATE ON chunks
+WHEN OLD.chunk_type = 'Child'
+BEGIN
+    DELETE FROM chunk_fts WHERE rowid = OLD.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_au_insert_fts
+AFTER UPDATE ON chunks
+WHEN NEW.chunk_type = 'Child'
+BEGIN
+    INSERT INTO chunk_fts(rowid, chunk_id, source_id, text, heading)
+    VALUES (
+        NEW.rowid,
+        NEW.id,
+        NEW.source_id,
+        CASE
+            WHEN NEW.context_text IS NULL OR NEW.context_text = '' THEN NEW.text
+            ELSE NEW.context_text || ' ' || NEW.text
+        END,
+        COALESCE(NEW.heading_path_json, '')
+    );
+END;
 "#;
 
 #[cfg(test)]
@@ -734,6 +859,14 @@ mod tests {
         store
             .set_embedding_meta(&ChunkId("child-1".into()), 0, "model", "2025-01-01")
             .unwrap();
+        store
+            .replace_all_vector_documents(&[VectorDocument {
+                chunk_id: ChunkId("child-1".into()),
+                source_id: SourceId("src-1".into()),
+                vector: vec![1.0, 0.0],
+            }])
+            .unwrap();
+        assert_eq!(store.list_vector_documents().unwrap().len(), 1);
 
         store.remove_source(&SourceId("src-1".into())).unwrap();
 
@@ -749,6 +882,7 @@ mod tests {
             .get_embedding_meta(&ChunkId("child-1".into()))
             .unwrap()
             .is_none());
+        assert!(store.list_vector_documents().unwrap().is_empty());
     }
 
     #[test]

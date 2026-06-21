@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -12,16 +12,15 @@ use crate::config::Config;
 use crate::context::ContextGenerator;
 use crate::embed::OpenAiEmbeddingClient;
 use crate::index::hnsw::HnswIndex;
-use crate::index::tantivy_bm25::Bm25Index;
+use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::parser;
 use crate::store::Store;
-use crate::traits::EmbeddingClient;
-use crate::types::{Chunk, ChunkId, ChunkType, Source, SourceId, SourceStatus};
+use crate::traits::{EmbeddingClient, LexicalIndex, VectorDocument, VectorIndex};
+use crate::types::{Chunk, ChunkType, Source, SourceId, SourceStatus};
 
 pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     store: Store,
     hnsw: HnswIndex,
-    bm25: Bm25Index,
     embed_client: E,
     context_gen: Option<ContextGenerator>,
     data_dir: PathBuf,
@@ -29,7 +28,7 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
 
 struct PreparedIndexes {
     hnsw: HnswIndex,
-    bm25_docs: Vec<(ChunkId, String, String)>,
+    vectors: Vec<VectorDocument>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -44,8 +43,9 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
 
         let db_path = data_dir.join("verbatim.db");
         let store = Store::new(&db_path)?;
+        SqliteFtsIndex::new(&store).rebuild_from_store(&store)?;
 
-        let (hnsw, bm25) = load_published_indexes(data_dir, store.index_generation()?)?;
+        let hnsw = load_published_vector_index(data_dir, &store)?;
 
         let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
 
@@ -58,7 +58,6 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         Ok(Self {
             store,
             hnsw,
-            bm25,
             embed_client,
             context_gen,
             data_dir: data_dir.to_path_buf(),
@@ -78,22 +77,19 @@ where
         &self.hnsw
     }
 
-    pub fn bm25(&self) -> &Bm25Index {
-        &self.bm25
+    pub fn vector_index(&self) -> &dyn VectorIndex {
+        &self.hnsw
+    }
+
+    pub fn lexical_index(&self) -> SqliteFtsIndex<'_> {
+        SqliteFtsIndex::new(&self.store)
     }
 
     #[cfg(test)]
-    fn from_parts(
-        store: Store,
-        hnsw: HnswIndex,
-        bm25: Bm25Index,
-        embed_client: E,
-        data_dir: PathBuf,
-    ) -> Self {
+    fn from_parts(store: Store, hnsw: HnswIndex, embed_client: E, data_dir: PathBuf) -> Self {
         Self {
             store,
             hnsw,
-            bm25,
             embed_client,
             context_gen: None,
             data_dir,
@@ -122,7 +118,10 @@ where
         let child_chunks = self.child_chunks_without_source(source_id)?;
         let prepared = self.prepare_indexes_for_chunks(&child_chunks).await?;
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
-        let generation = match self.store.remove_source(source_id) {
+        let generation = match self
+            .store
+            .remove_source_and_replace_vectors(source_id, &prepared.vectors)
+        {
             Ok(generation) => generation,
             Err(err) => {
                 let _ = remove_dir_if_exists(&staged);
@@ -200,17 +199,19 @@ where
         let prepared = self.prepare_indexes_for_chunks(&child_chunks).await?;
 
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
-        let generation =
-            match self
-                .store
-                .replace_source_contents(&new_source, &evidence, &chunks, &output.links)
-            {
-                Ok(generation) => generation,
-                Err(err) => {
-                    let _ = remove_dir_if_exists(&staged);
-                    return Err(err);
-                }
-            };
+        let generation = match self.store.replace_source_contents(
+            &new_source,
+            &evidence,
+            &chunks,
+            &prepared.vectors,
+            &output.links,
+        ) {
+            Ok(generation) => generation,
+            Err(err) => {
+                let _ = remove_dir_if_exists(&staged);
+                return Err(err);
+            }
+        };
         self.publish_committed_indexes(generation, staged, prepared)?;
 
         tracing::info!(source = %source_id.0, "ingest complete");
@@ -242,6 +243,8 @@ where
         let child_chunks = self.store.list_child_chunks()?;
         tracing::info!(count = child_chunks.len(), "rebuilding local indexes");
         let prepared = self.prepare_indexes_for_chunks(&child_chunks).await?;
+        self.store.replace_all_vector_documents(&prepared.vectors)?;
+        self.lexical_index().rebuild_from_store(&self.store)?;
         self.publish_prepared_indexes(prepared)?;
 
         Ok(())
@@ -258,30 +261,33 @@ where
 
     async fn prepare_indexes_for_chunks(&self, child_chunks: &[Chunk]) -> Result<PreparedIndexes> {
         let mut hnsw = HnswIndex::new();
+        let mut vectors = Vec::new();
         if !child_chunks.is_empty() {
             let texts: Vec<String> = child_chunks
                 .iter()
                 .map(|c| self.embedding_text(c))
                 .collect();
             let embeddings = self.embed_client.embed(&texts).await?;
+            if embeddings.len() != child_chunks.len() {
+                bail!(
+                    "embedding count mismatch: expected {}, got {}",
+                    child_chunks.len(),
+                    embeddings.len()
+                );
+            }
             for (chunk, embedding) in child_chunks.iter().zip(embeddings) {
-                hnsw.add(&chunk.id, embedding);
+                let document = VectorDocument {
+                    chunk_id: chunk.id.clone(),
+                    source_id: chunk.source_id.clone(),
+                    vector: embedding,
+                };
+                hnsw.upsert(document.clone());
+                vectors.push(document);
             }
         }
         hnsw.build()?;
 
-        let bm25_docs: Vec<_> = child_chunks
-            .iter()
-            .map(|c| {
-                (
-                    c.id.clone(),
-                    chunk_search_text(c),
-                    c.heading_path.join(" > "),
-                )
-            })
-            .collect();
-
-        Ok(PreparedIndexes { hnsw, bm25_docs })
+        Ok(PreparedIndexes { hnsw, vectors })
     }
 
     fn publish_prepared_indexes(&mut self, prepared: PreparedIndexes) -> Result<()> {
@@ -296,21 +302,19 @@ where
         staged: PathBuf,
         prepared: PreparedIndexes,
     ) -> Result<()> {
-        let new_bm25 = match publish_staged_index_artifacts(&self.data_dir, generation, &staged) {
-            Ok(new_bm25) => new_bm25,
+        match publish_staged_index_artifacts(&self.data_dir, generation, &staged) {
+            Ok(()) => {}
             Err(err) => {
                 self.invalidate_live_indexes()?;
                 return Err(err);
             }
         };
         self.hnsw = prepared.hnsw;
-        self.bm25 = new_bm25;
         Ok(())
     }
 
     fn invalidate_live_indexes(&mut self) -> Result<()> {
         self.hnsw = HnswIndex::new();
-        self.bm25 = open_unpublished_bm25(&self.data_dir)?;
         Ok(())
     }
 
@@ -320,23 +324,30 @@ where
     }
 }
 
-fn load_published_indexes(
-    data_dir: &Path,
-    store_generation: u64,
-) -> Result<(HnswIndex, Bm25Index)> {
+fn load_published_vector_index(data_dir: &Path, store: &Store) -> Result<HnswIndex> {
+    let store_generation = store.index_generation()?;
     let manifest_generation = read_index_manifest(data_dir)?.map(|manifest| manifest.generation);
     if manifest_generation == Some(store_generation) {
         let generation_dir = index_generation_dir(data_dir, store_generation);
         let hnsw_path = generation_dir.join("vectors.hnsw");
-        let tantivy_dir = generation_dir.join("tantivy");
-        if hnsw_path.exists() && tantivy_dir.exists() {
+        if hnsw_path.exists() {
             let mut hnsw = HnswIndex::new();
-            hnsw.load(&hnsw_path)?;
-            return Ok((hnsw, Bm25Index::open_or_create(&tantivy_dir)?));
+            match hnsw.load(&hnsw_path) {
+                Ok(()) => return Ok(hnsw),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        path = %hnsw_path.display(),
+                        "published vector index unavailable; rebuilding from SQLite"
+                    );
+                }
+            }
         }
     }
 
-    Ok((HnswIndex::new(), open_unpublished_bm25(data_dir)?))
+    let mut hnsw = HnswIndex::new();
+    hnsw.rebuild_from_store(store)?;
+    Ok(hnsw)
 }
 
 fn stage_prepared_index_artifacts(data_dir: &Path, prepared: &PreparedIndexes) -> Result<PathBuf> {
@@ -348,8 +359,6 @@ fn stage_prepared_index_artifacts(data_dir: &Path, prepared: &PreparedIndexes) -
         .with_context(|| format!("create index staging dir: {}", staging_dir.display()))?;
 
     prepared.hnsw.save(&staging_dir.join("vectors.hnsw"))?;
-    let staged_bm25 = Bm25Index::open_or_create(&staging_dir.join("tantivy"))?;
-    staged_bm25.clear_and_rebuild(&prepared.bm25_docs)?;
 
     Ok(staging_dir)
 }
@@ -358,7 +367,7 @@ fn publish_staged_index_artifacts(
     data_dir: &Path,
     generation: u64,
     staging_dir: &Path,
-) -> Result<Bm25Index> {
+) -> Result<()> {
     let generation_dir = index_generation_dir(data_dir, generation);
     if generation_dir.exists() {
         remove_dir_if_exists(&generation_dir)?;
@@ -373,9 +382,8 @@ fn publish_staged_index_artifacts(
         )
     })?;
 
-    let bm25 = Bm25Index::open_or_create(&generation_dir.join("tantivy"))?;
     write_index_manifest(data_dir, generation)?;
-    Ok(bm25)
+    Ok(())
 }
 
 fn read_index_manifest(data_dir: &Path) -> Result<Option<IndexManifest>> {
@@ -404,12 +412,6 @@ fn write_index_manifest(data_dir: &Path, generation: u64) -> Result<()> {
         )
     })?;
     Ok(())
-}
-
-fn open_unpublished_bm25(data_dir: &Path) -> Result<Bm25Index> {
-    let path = index_root_dir(data_dir).join("unpublished-tantivy");
-    remove_dir_if_exists(&path)?;
-    Bm25Index::open_or_create(&path)
 }
 
 fn remove_dir_if_exists(path: &Path) -> Result<()> {
@@ -470,7 +472,7 @@ mod tests {
     use anyhow::bail;
     use async_trait::async_trait;
 
-    use crate::types::{EvidenceId, EvidenceUnit, SourceLocator};
+    use crate::types::{ChunkId, EvidenceId, EvidenceUnit, SourceLocator};
 
     struct FailingEmbeddingClient;
 
@@ -540,8 +542,17 @@ mod tests {
     }
 
     fn insert_source_with_child(store: &Store, source: &Source, chunk_id: &str) -> Result<Chunk> {
-        let evidence = test_evidence(&source.id, &format!("evidence-{chunk_id}"), "old text");
-        let chunk = test_child(&source.id, chunk_id, &evidence.id, "old text");
+        insert_source_with_child_text(store, source, chunk_id, "old text")
+    }
+
+    fn insert_source_with_child_text(
+        store: &Store,
+        source: &Source,
+        chunk_id: &str,
+        text: &str,
+    ) -> Result<Chunk> {
+        let evidence = test_evidence(&source.id, &format!("evidence-{chunk_id}"), text);
+        let chunk = test_child(&source.id, chunk_id, &evidence.id, text);
         store.add_source(source)?;
         store.bulk_insert_evidence(&[evidence])?;
         store.bulk_insert_chunks(std::slice::from_ref(&chunk))?;
@@ -559,6 +570,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_source_cleans_lexical_and_dense_state() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let first = test_source("src-1", tempdir.path().join("first.txt"));
+        let second = test_source("src-2", tempdir.path().join("second.txt"));
+        let first_chunk =
+            insert_source_with_child_text(&store, &first, "chunk-1", "deletedterm").unwrap();
+        let second_chunk =
+            insert_source_with_child_text(&store, &second, "chunk-2", "retainedterm").unwrap();
+        let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            hnsw,
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        pipeline.remove_source(&first.id).await.unwrap();
+
+        assert!(pipeline.store().get_source(&first.id).unwrap().is_none());
+        assert!(pipeline.store().get_source(&second.id).unwrap().is_some());
+        assert!(pipeline
+            .lexical_index()
+            .search("deletedterm", 5)
+            .unwrap()
+            .is_empty());
+        let retained = pipeline.lexical_index().search("retainedterm", 5).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].0 .0, "chunk-2");
+        assert_eq!(pipeline.store().list_vector_documents().unwrap().len(), 1);
+        assert_eq!(pipeline.hnsw().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingest_source_replaces_stale_lexical_and_dense_state() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("doc.txt");
+        std::fs::write(&path, "freshterm text for ingest\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", path);
+        let old_chunk =
+            insert_source_with_child_text(&store, &source, "old-chunk", "obsoleteword").unwrap();
+        let hnsw = hnsw_with_chunks(&[old_chunk]);
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            hnsw,
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert!(pipeline
+            .lexical_index()
+            .search("obsoleteword", 5)
+            .unwrap()
+            .is_empty());
+        assert!(!pipeline
+            .lexical_index()
+            .search("freshterm", 5)
+            .unwrap()
+            .is_empty());
+        let chunks = pipeline.store().list_chunks_by_source(&source.id).unwrap();
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk.id.0 != "old-chunk"));
+        let vectors = pipeline.store().list_vector_documents().unwrap();
+        assert_eq!(
+            vectors.len(),
+            chunks
+                .iter()
+                .filter(|c| c.chunk_type == ChunkType::Child)
+                .count()
+        );
+        assert!(vectors
+            .iter()
+            .all(|vector| vector.chunk_id.0 != "old-chunk"));
+    }
+
+    #[tokio::test]
     async fn remove_source_keeps_store_and_hnsw_when_embedding_rebuild_fails() {
         let tempdir = tempfile::tempdir().unwrap();
         let store = Store::in_memory().unwrap();
@@ -567,11 +657,9 @@ mod tests {
         let first_chunk = insert_source_with_child(&store, &first, "chunk-1").unwrap();
         let second_chunk = insert_source_with_child(&store, &second, "chunk-2").unwrap();
         let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
-        let bm25 = Bm25Index::create_in_ram().unwrap();
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
-            bm25,
             FailingEmbeddingClient,
             tempdir.path().to_path_buf(),
         );
@@ -594,11 +682,9 @@ mod tests {
         let source = test_source("src-1", path);
         let old_chunk = insert_source_with_child(&store, &source, "old-chunk").unwrap();
         let hnsw = hnsw_with_chunks(&[old_chunk]);
-        let bm25 = Bm25Index::create_in_ram().unwrap();
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
-            bm25,
             FailingEmbeddingClient,
             tempdir.path().to_path_buf(),
         );
@@ -623,11 +709,9 @@ mod tests {
         let first_chunk = insert_source_with_child(&store, &first, "chunk-1").unwrap();
         let second_chunk = insert_source_with_child(&store, &second, "chunk-2").unwrap();
         let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
-        let bm25 = Bm25Index::create_in_ram().unwrap();
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
-            bm25,
             StaticEmbeddingClient,
             blocked_data_dir.path().to_path_buf(),
         );
@@ -650,11 +734,9 @@ mod tests {
         let source = test_source("src-1", path);
         let old_chunk = insert_source_with_child(&store, &source, "old-chunk").unwrap();
         let hnsw = hnsw_with_chunks(&[old_chunk]);
-        let bm25 = Bm25Index::create_in_ram().unwrap();
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
-            bm25,
             StaticEmbeddingClient,
             blocked_data_dir.path().to_path_buf(),
         );
@@ -680,11 +762,9 @@ mod tests {
         let first_chunk = insert_source_with_child(&store, &first, "chunk-1").unwrap();
         let second_chunk = insert_source_with_child(&store, &second, "chunk-2").unwrap();
         let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
-        let bm25 = Bm25Index::create_in_ram().unwrap();
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
-            bm25,
             StaticEmbeddingClient,
             tempdir.path().to_path_buf(),
         );
@@ -696,11 +776,8 @@ mod tests {
         assert!(pipeline.store().get_source(&second.id).unwrap().is_some());
         assert_eq!(pipeline.store().index_generation().unwrap(), 1);
         assert!(read_index_manifest(tempdir.path()).unwrap().is_none());
-        let (loaded_hnsw, loaded_bm25) =
-            load_published_indexes(tempdir.path(), pipeline.store().index_generation().unwrap())
-                .unwrap();
-        assert!(loaded_hnsw.is_empty());
-        assert!(loaded_bm25.search("old text", 5).unwrap().is_empty());
+        let loaded_hnsw = load_published_vector_index(tempdir.path(), pipeline.store()).unwrap();
+        assert_eq!(loaded_hnsw.len(), 1);
         assert!(pipeline.hnsw().is_empty());
     }
 
@@ -715,11 +792,9 @@ mod tests {
         let source = test_source("src-1", path);
         let old_chunk = insert_source_with_child(&store, &source, "old-chunk").unwrap();
         let hnsw = hnsw_with_chunks(&[old_chunk]);
-        let bm25 = Bm25Index::create_in_ram().unwrap();
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
-            bm25,
             StaticEmbeddingClient,
             tempdir.path().to_path_buf(),
         );
@@ -732,11 +807,14 @@ mod tests {
         let chunks = pipeline.store().list_chunks_by_source(&source.id).unwrap();
         assert!(!chunks.is_empty());
         assert!(chunks.iter().all(|chunk| chunk.id.0 != "old-chunk"));
-        let (loaded_hnsw, loaded_bm25) =
-            load_published_indexes(tempdir.path(), pipeline.store().index_generation().unwrap())
-                .unwrap();
-        assert!(loaded_hnsw.is_empty());
-        assert!(loaded_bm25.search("new", 5).unwrap().is_empty());
+        let loaded_hnsw = load_published_vector_index(tempdir.path(), pipeline.store()).unwrap();
+        assert_eq!(
+            loaded_hnsw.len(),
+            chunks
+                .iter()
+                .filter(|chunk| chunk.chunk_type == ChunkType::Child)
+                .count()
+        );
         assert!(pipeline.hnsw().is_empty());
     }
 
@@ -749,11 +827,9 @@ mod tests {
         let legacy_source = test_source("legacy", path.clone());
         let old_chunk = insert_source_with_child(&store, &legacy_source, "old-chunk").unwrap();
         let hnsw = hnsw_with_chunks(&[old_chunk]);
-        let bm25 = Bm25Index::create_in_ram().unwrap();
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
-            bm25,
             StaticEmbeddingClient,
             tempdir.path().to_path_buf(),
         );
