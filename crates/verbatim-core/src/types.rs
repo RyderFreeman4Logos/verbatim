@@ -259,6 +259,7 @@ pub struct RetrievalResult {
 pub struct CitationRef {
     pub label: String,
     pub evidence_id: EvidenceId,
+    pub source_id: SourceId,
     pub kind: EvidenceKind,
     #[serde(default)]
     pub derived_from: Option<EvidenceId>,

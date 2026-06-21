@@ -146,25 +146,19 @@ impl Generator {
         citations: &[CitationRef],
         attachments: &[SourcePackAttachment],
     ) -> Result<VerificationResult> {
-        let sources_json: Vec<serde_json::Value> = citations
-            .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "id": c.label,
-                    "evidence_id": c.evidence_id.0,
-                    "kind": citation_kind_label(c.kind, c.derived_from.as_ref()),
-                    "derived_from": c.derived_from.as_ref().map(|id| id.0.as_str()),
-                    "locator": c.locator.to_string(),
-                    "text": c.text_preview,
-                })
-            })
-            .collect();
+        let sources_json = verifier_source_inputs(citations, attachments);
 
         let prompt = format!(
             "Verify this answer against the cited sources.\n\n\
              Question: {question}\n\n\
              Answer: {answer}\n\n\
              Sources: {sources}\n\n\
+             Verification rules:\n\
+             - original_text supports claims grounded in document text.\n\
+             - image_caption_generated is generated derived evidence, not original PDF text; use it conservatively and revise over-strong wording when needed.\n\
+             - image_artifact metadata supports image location/artifact facts; visual content claims need either caption support or an included vision_attachment.\n\
+             - Prefer image_artifact with an included vision_attachment as the strongest visual citation when available.\n\
+             - Unsupported visual claims with no image/caption support must be revise or fail, never pass.\n\n\
              Output JSON with this schema:\n\
              {{\"verdict\": \"pass|revise|fail\", \
              \"unsupported_claims\": [\"claim text\"]}}",
@@ -198,13 +192,13 @@ impl Generator {
         attachments: &[SourcePackAttachment],
         verification: VerificationResult,
     ) -> Result<GenerationResult> {
-        match verification.verdict.as_str() {
-            "pass" => Ok(GenerationResult {
+        match verification.verdict {
+            VerificationVerdict::Pass => Ok(GenerationResult {
                 answer: render_answer(raw_answer, &citations),
                 citations,
                 verified: true,
             }),
-            "revise" => {
+            VerificationVerdict::Revise => {
                 let revised = self
                     .revise_answer(
                         question,
@@ -214,13 +208,24 @@ impl Generator {
                         &verification.unsupported_claims,
                     )
                     .await?;
+                if is_insufficient_answer(&revised) {
+                    return Ok(insufficient_generation());
+                }
+                let revised_citations = filter_citations_for_answer(&revised, &citations);
+                let revised_attachments =
+                    relevant_attachments_for_citations(&revised_citations, attachments);
                 let second_pass = self
-                    .verify_with_attachments(question, &revised, &citations, attachments)
+                    .verify_with_attachments(
+                        question,
+                        &revised,
+                        &revised_citations,
+                        &revised_attachments,
+                    )
                     .await?;
-                if second_pass.verdict == "pass" {
+                if second_pass.verdict == VerificationVerdict::Pass {
                     Ok(GenerationResult {
-                        answer: render_answer(&revised, &citations),
-                        citations,
+                        answer: render_answer(&revised, &revised_citations),
+                        citations: revised_citations,
                         verified: true,
                     })
                 } else {
@@ -239,25 +244,16 @@ impl Generator {
         attachments: &[SourcePackAttachment],
         unsupported_claims: &[String],
     ) -> Result<String> {
-        let sources_json: Vec<serde_json::Value> = citations
-            .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "id": c.label,
-                    "evidence_id": c.evidence_id.0,
-                    "kind": citation_kind_label(c.kind, c.derived_from.as_ref()),
-                    "derived_from": c.derived_from.as_ref().map(|id| id.0.as_str()),
-                    "locator": c.locator.to_string(),
-                    "text": c.text_preview,
-                })
-            })
-            .collect();
+        let sources_json = verifier_source_inputs(citations, attachments);
         let prompt = format!(
             "Revise the answer so every remaining factual claim is directly supported by the cited sources.\n\n\
              Question: {question}\n\n\
              Original answer: {answer}\n\n\
              Unsupported claims to remove: {unsupported}\n\n\
              Sources: {sources}\n\n\
+             Preserve citation labels only for sources still used in the revised answer. \
+             Treat image_caption_generated as caption-only derived evidence unless a vision_attachment is included. \
+             Remove visual claims that lack caption support or included image evidence.\n\n\
              If the sources are insufficient, output exactly: Evidence insufficient to answer this question.",
             unsupported = serde_json::to_string_pretty(unsupported_claims)?,
             sources = serde_json::to_string_pretty(&sources_json)?
@@ -306,10 +302,67 @@ fn insufficient_generation() -> GenerationResult {
     }
 }
 
+fn is_insufficient_answer(answer: &str) -> bool {
+    answer.trim() == "Evidence insufficient to answer this question."
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerificationVerdict {
+    Pass,
+    Revise,
+    Fail,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VerificationResult {
-    pub verdict: String,
+    pub verdict: VerificationVerdict,
+    #[serde(default)]
     pub unsupported_claims: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VerifierEvidenceInput {
+    id: String,
+    evidence_id: String,
+    source_id: String,
+    kind: &'static str,
+    locator: VerifierLocatorInput,
+    text: String,
+    provenance: VerifierEvidenceProvenance,
+    visual_support: VerifierVisualSupport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VerifierLocatorInput {
+    display: String,
+    structured: SourceLocator,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VerifierEvidenceProvenance {
+    summary: &'static str,
+    derived_from: Option<String>,
+    derivation_chain: Vec<VerifierDerivationStep>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VerifierDerivationStep {
+    evidence_id: String,
+    source_id: String,
+    kind: &'static str,
+    locator: VerifierLocatorInput,
+    relation: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VerifierVisualSupport {
+    support_level: &'static str,
+    vision_attachment: &'static str,
+    image_evidence_id: Option<String>,
+    caution: &'static str,
 }
 
 struct SourcePack {
@@ -449,6 +502,149 @@ fn relevant_attachments_for_citations(
             }
         })
         .collect()
+}
+
+fn filter_citations_for_answer(answer: &str, citations: &[CitationRef]) -> Vec<CitationRef> {
+    let cited_labels = cited_labels(answer);
+    citations
+        .iter()
+        .filter(|citation| cited_labels.contains(&citation.label))
+        .cloned()
+        .collect()
+}
+
+fn verifier_source_inputs(
+    citations: &[CitationRef],
+    attachments: &[SourcePackAttachment],
+) -> Vec<VerifierEvidenceInput> {
+    citations
+        .iter()
+        .map(|citation| VerifierEvidenceInput {
+            id: citation.label.clone(),
+            evidence_id: citation.evidence_id.0.clone(),
+            source_id: citation.source_id.0.clone(),
+            kind: citation_kind_label(citation.kind, citation.derived_from.as_ref()),
+            locator: verifier_locator(&citation.locator),
+            text: citation.text_preview.clone(),
+            provenance: verifier_provenance(citation),
+            visual_support: verifier_visual_support(citation, attachments),
+        })
+        .collect()
+}
+
+fn verifier_provenance(citation: &CitationRef) -> VerifierEvidenceProvenance {
+    let summary = match (citation.kind, citation.derived_from.as_ref()) {
+        (EvidenceKind::Text, _) => "original source text",
+        (EvidenceKind::Image, _) => "original image artifact locator",
+        (EvidenceKind::Generated, Some(_)) => {
+            "generated image caption derived from original image artifact"
+        }
+        (EvidenceKind::Generated, None) => "generated derived evidence",
+    };
+
+    VerifierEvidenceProvenance {
+        summary,
+        derived_from: citation.derived_from.as_ref().map(|id| id.0.clone()),
+        derivation_chain: verifier_derivation_chain(citation),
+    }
+}
+
+fn verifier_derivation_chain(citation: &CitationRef) -> Vec<VerifierDerivationStep> {
+    match (citation.kind, citation.derived_from.as_ref()) {
+        (EvidenceKind::Generated, Some(source_image_id)) => vec![
+            VerifierDerivationStep {
+                evidence_id: source_image_id.0.clone(),
+                source_id: citation.source_id.0.clone(),
+                kind: "image_artifact",
+                locator: verifier_locator(&citation.locator),
+                relation: "original_image_artifact",
+            },
+            VerifierDerivationStep {
+                evidence_id: citation.evidence_id.0.clone(),
+                source_id: citation.source_id.0.clone(),
+                kind: "image_caption_generated",
+                locator: verifier_locator(&citation.locator),
+                relation: "generated_caption_from_image",
+            },
+        ],
+        _ => vec![VerifierDerivationStep {
+            evidence_id: citation.evidence_id.0.clone(),
+            source_id: citation.source_id.0.clone(),
+            kind: citation_kind_label(citation.kind, citation.derived_from.as_ref()),
+            locator: verifier_locator(&citation.locator),
+            relation: "source_evidence",
+        }],
+    }
+}
+
+fn verifier_visual_support(
+    citation: &CitationRef,
+    attachments: &[SourcePackAttachment],
+) -> VerifierVisualSupport {
+    let image_evidence_id = citation_image_artifact_evidence_id(citation).cloned();
+    let vision_attachment = match &image_evidence_id {
+        Some(_) if citation_has_attachment(citation, attachments) => "included",
+        Some(_) => "not_included",
+        None => "not_applicable",
+    };
+
+    let (support_level, caution) = match (citation.kind, citation.derived_from.as_ref()) {
+        (EvidenceKind::Text, _) => (
+            "text_only",
+            "Use this source for document text claims, not visual content claims.",
+        ),
+        (EvidenceKind::Image, _) if vision_attachment == "included" => (
+            "image_pixels_available",
+            "The verifier can inspect the cited image payload for visual claims.",
+        ),
+        (EvidenceKind::Image, _) => (
+            "artifact_locator_only",
+            "Image metadata identifies the artifact and location, but does not prove visual content without caption or pixels.",
+        ),
+        (EvidenceKind::Generated, Some(_)) if vision_attachment == "included" => (
+            "caption_plus_pixels",
+            "Generated caption is derived evidence; pixels are also available for visual verification.",
+        ),
+        (EvidenceKind::Generated, Some(_)) => (
+            "caption_only_conservative",
+            "Generated caption is weaker than original text or inspected pixels; revise over-strong visual claims.",
+        ),
+        (EvidenceKind::Generated, None) => (
+            "generated_text",
+            "Generated evidence is not original source text.",
+        ),
+    };
+
+    VerifierVisualSupport {
+        support_level,
+        vision_attachment,
+        image_evidence_id: image_evidence_id.map(|id| id.0),
+        caution,
+    }
+}
+
+fn verifier_locator(locator: &SourceLocator) -> VerifierLocatorInput {
+    VerifierLocatorInput {
+        display: locator.to_string(),
+        structured: locator.clone(),
+    }
+}
+
+fn citation_has_attachment(citation: &CitationRef, attachments: &[SourcePackAttachment]) -> bool {
+    attachments.iter().any(|attachment| {
+        attachment
+            .labels
+            .iter()
+            .any(|label| label == &citation.label)
+    })
+}
+
+fn citation_image_artifact_evidence_id(citation: &CitationRef) -> Option<&EvidenceId> {
+    match citation.kind {
+        EvidenceKind::Image => Some(&citation.evidence_id),
+        EvidenceKind::Generated => citation.derived_from.as_ref(),
+        EvidenceKind::Text => None,
+    }
 }
 
 impl GenerationContext {
@@ -638,6 +834,7 @@ fn extract_citations(answer: &str, evidence_refs: &[EvidenceRef]) -> Vec<Citatio
             citations.push(CitationRef {
                 label: eref.label.clone(),
                 evidence_id: eref.evidence.id.clone(),
+                source_id: eref.evidence.source_id.clone(),
                 kind: eref.evidence.kind,
                 derived_from: eref.evidence.derived_from.clone(),
                 locator: eref.evidence.locator.clone(),
@@ -756,7 +953,8 @@ Rules:
 5. Do not use outside knowledge.
 6. Do not invent page numbers, paragraph numbers, quotations, or citations.
 7. Treat image_caption_generated entries as derived evidence, not original PDF text.
-8. Cite image_artifact entries only for image artifact facts or visual content actually attached in this request.";
+8. Prefer original image_artifact locators for visual claims when an image artifact is available.
+9. Cite image_artifact entries only for image artifact facts or visual content actually attached in this request.";
 
 #[cfg(test)]
 mod tests {
@@ -1005,10 +1203,97 @@ mod tests {
     }
 
     #[test]
+    fn verifier_schema_includes_kind_derivation_and_visual_support() {
+        let mut results = sample_results();
+        results.extend(sample_image_caption_results());
+        let context = GenerationContext::new(
+            vec![sample_image_artifact()],
+            vec![ImageAttachment {
+                evidence_id: EvidenceId("img-1".into()),
+                mime_type: "image/png".into(),
+                bytes: b"abc".to_vec(),
+            }],
+        );
+        let pack = build_source_pack(&results, &context, true);
+        let citations = extract_citations(
+            "Freedom is textual [E1]. The caption mentions chartneedle [E3]. The image is cited [E4].",
+            &pack.evidence_refs,
+        );
+
+        let inputs = verifier_source_inputs(&citations, &pack.attachments);
+        let value = serde_json::to_value(&inputs).unwrap();
+
+        assert_eq!(value[0]["kind"], "original_text");
+        assert_eq!(value[0]["source_id"], "src");
+        assert_eq!(
+            value[0]["provenance"]["derivation_chain"][0]["kind"],
+            "original_text"
+        );
+        assert_eq!(value[0]["visual_support"]["support_level"], "text_only");
+
+        assert_eq!(value[1]["kind"], "image_caption_generated");
+        assert_eq!(value[1]["provenance"]["derived_from"], "img-1");
+        assert_eq!(
+            value[1]["provenance"]["derivation_chain"][0]["kind"],
+            "image_artifact"
+        );
+        assert_eq!(
+            value[1]["provenance"]["derivation_chain"][0]["source_id"],
+            "src"
+        );
+        assert_eq!(
+            value[1]["provenance"]["derivation_chain"][1]["kind"],
+            "image_caption_generated"
+        );
+        assert_eq!(
+            value[1]["visual_support"]["support_level"],
+            "caption_plus_pixels"
+        );
+        assert_eq!(value[1]["visual_support"]["vision_attachment"], "included");
+
+        assert_eq!(value[2]["kind"], "image_artifact");
+        assert_eq!(value[2]["locator"]["structured"]["type"], "PdfImage");
+        assert_eq!(
+            value[2]["visual_support"]["support_level"],
+            "image_pixels_available"
+        );
+        assert_eq!(value[2]["visual_support"]["image_evidence_id"], "img-1");
+    }
+
+    #[test]
+    fn verifier_schema_marks_caption_only_support_conservative() {
+        let context = GenerationContext::new(vec![sample_image_artifact()], Vec::new());
+        let pack = build_source_pack(&sample_image_caption_results(), &context, false);
+        let citations = extract_citations(
+            "The generated caption mentions chartneedle [E1].",
+            &pack.evidence_refs,
+        );
+
+        let inputs = verifier_source_inputs(&citations, &[]);
+        let value = serde_json::to_value(&inputs).unwrap();
+
+        assert_eq!(value[0]["kind"], "image_caption_generated");
+        assert_eq!(value[0]["provenance"]["derived_from"], "img-1");
+        assert_eq!(
+            value[0]["visual_support"]["support_level"],
+            "caption_only_conservative"
+        );
+        assert_eq!(
+            value[0]["visual_support"]["vision_attachment"],
+            "not_included"
+        );
+        assert!(value[0]["visual_support"]["caution"]
+            .as_str()
+            .unwrap()
+            .contains("weaker than original text"));
+    }
+
+    #[test]
     fn render_appends_references() {
         let citations = vec![CitationRef {
             label: "E1".into(),
             evidence_id: EvidenceId("ev-1".into()),
+            source_id: SourceId("src".into()),
             kind: EvidenceKind::Text,
             derived_from: None,
             locator: SourceLocator::Pdf {
@@ -1021,6 +1306,97 @@ mod tests {
         let rendered = render_answer("Answer text [E1].", &citations);
         assert!(rendered.contains("References:"));
         assert!(rendered.contains("[E1] original_text: PDF p.42"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_visual_claim_fails_without_visual_or_caption_evidence() {
+        let model = Arc::new(RecordingChatModel::with_responses([
+            "The page shows a blue triangle [E1].",
+            r#"{"verdict":"fail","unsupported_claims":["The page shows a blue triangle"]}"#,
+        ]));
+        let generator =
+            Generator::with_chat_model(model, true, ChatVisionAttachmentConfig::default());
+
+        let result = generator
+            .generate("What does the page show?", &sample_results())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.answer,
+            "Evidence insufficient to answer this question."
+        );
+        assert!(result.citations.is_empty());
+        assert!(!result.verified);
+    }
+
+    #[tokio::test]
+    async fn unsupported_visual_claim_is_revised_before_return() {
+        let model = Arc::new(RecordingChatModel::with_responses([
+            "The page shows a blue triangle [E1].",
+            r#"{"verdict":"revise","unsupported_claims":["The page shows a blue triangle"]}"#,
+            "The document defines freedom [E1].",
+            r#"{"verdict":"pass","unsupported_claims":[]}"#,
+        ]));
+        let generator =
+            Generator::with_chat_model(model.clone(), true, ChatVisionAttachmentConfig::default());
+
+        let result = generator
+            .generate("What does the page show?", &sample_results())
+            .await
+            .unwrap();
+
+        assert!(result.verified);
+        assert!(result.answer.contains("defines freedom"));
+        assert!(!result.answer.contains("blue triangle"));
+        assert_eq!(result.citations.len(), 1);
+        assert_eq!(model.requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn supported_caption_claim_passes_with_caption_provenance_visible() {
+        let model = Arc::new(RecordingChatModel::with_responses([
+            "The generated caption says chartneedle appears in the diagram [E1].",
+            r#"{"verdict":"pass","unsupported_claims":[]}"#,
+        ]));
+        let generator = Generator::with_chat_model(
+            model.clone(),
+            true,
+            ChatVisionAttachmentConfig {
+                enabled: false,
+                model_supports_vision: true,
+                ..ChatVisionAttachmentConfig::default()
+            },
+        );
+        let context = GenerationContext::new(vec![sample_image_artifact()], Vec::new());
+
+        let result = generator
+            .generate_with_context(
+                "What does the generated caption say?",
+                &sample_image_caption_results(),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.verified);
+        assert!(result.answer.contains("generated caption says"));
+        assert!(result.answer.contains("[E1] image_caption_generated"));
+        assert!(result.answer.contains("derived from img-1"));
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_request_is_text_only(&requests[1]);
+        match &requests[1].messages[1].content {
+            ChatMessageContent::Text(text) => {
+                assert!(text.contains("generated image caption derived"));
+                assert!(text.contains("\"derived_from\": \"img-1\""));
+                assert!(text.contains("caption_only_conservative"));
+            }
+            ChatMessageContent::Parts(_) => {
+                panic!("disabled attachments must keep verifier text-only")
+            }
+        }
     }
 
     #[tokio::test]
