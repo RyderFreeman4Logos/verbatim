@@ -3,32 +3,29 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use crate::config::RetrievalConfig;
-use crate::embed::OpenAiEmbeddingClient;
-use crate::index::hnsw::HnswIndex;
-use crate::index::tantivy_bm25::Bm25Index;
 use crate::store::Store;
-use crate::traits::EmbeddingClient;
+use crate::traits::{EmbeddingClient, LexicalIndex, VectorIndex};
 use crate::types::{ChunkId, ChunkType, EvidenceUnit, RetrievalResult, SourceId};
 
 pub struct RetrievalPipeline<'a> {
-    hnsw: &'a HnswIndex,
-    bm25: &'a Bm25Index,
+    vector_index: &'a dyn VectorIndex,
+    lexical_index: &'a dyn LexicalIndex,
     store: &'a Store,
-    embed_client: &'a OpenAiEmbeddingClient,
+    embed_client: &'a dyn EmbeddingClient,
     config: &'a RetrievalConfig,
 }
 
 impl<'a> RetrievalPipeline<'a> {
     pub fn new(
-        hnsw: &'a HnswIndex,
-        bm25: &'a Bm25Index,
+        vector_index: &'a dyn VectorIndex,
+        lexical_index: &'a dyn LexicalIndex,
         store: &'a Store,
-        embed_client: &'a OpenAiEmbeddingClient,
+        embed_client: &'a dyn EmbeddingClient,
         config: &'a RetrievalConfig,
     ) -> Self {
         Self {
-            hnsw,
-            bm25,
+            vector_index,
+            lexical_index,
             store,
             embed_client,
             config,
@@ -59,15 +56,15 @@ impl<'a> RetrievalPipeline<'a> {
             0
         };
         let dense_top_k = source_filter
-            .map(|_| self.hnsw.len().max(self.config.dense_top_k))
+            .map(|_| self.vector_index.len().max(self.config.dense_top_k))
             .unwrap_or(self.config.dense_top_k);
         let bm25_top_k = source_filter
             .map(|_| all_child_count.max(self.config.bm25_top_k))
             .unwrap_or(self.config.bm25_top_k);
 
-        let dense_results = self.hnsw.search(&query_vec, dense_top_k);
+        let dense_results = self.vector_index.search(&query_vec, dense_top_k);
 
-        let bm25_results = self.bm25.search(query, bm25_top_k)?;
+        let bm25_results = self.lexical_index.search(query, bm25_top_k)?;
 
         let mut fused = rrf_fusion(&dense_results, &bm25_results, self.config.rrf_k);
         if let Some(source_id) = source_filter {
@@ -135,6 +132,13 @@ fn rrf_fusion(dense: &[(ChunkId, f32)], bm25: &[(ChunkId, f32)], k: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    use crate::index::hnsw::HnswIndex;
+    use crate::index::sqlite_fts::SqliteFtsIndex;
+    use crate::store::Store;
+    use crate::traits::{VectorDocument, VectorIndex};
+    use crate::types::{Chunk, Source, SourceLocator, SourceStatus};
 
     #[test]
     fn rrf_merges_rankings() {
@@ -177,5 +181,117 @@ mod tests {
     fn rrf_empty_inputs() {
         let fused = rrf_fusion(&[], &[], 60);
         assert!(fused.is_empty());
+    }
+
+    struct KeywordEmbeddingClient;
+
+    #[async_trait]
+    impl EmbeddingClient for KeywordEmbeddingClient {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|text| keyword_vector(text)).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
+    fn keyword_vector(text: &str) -> Vec<f32> {
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("alpha") {
+            vec![1.0, 0.0]
+        } else if lower.contains("beta") {
+            vec![0.0, 1.0]
+        } else {
+            vec![0.5, 0.5]
+        }
+    }
+
+    fn source(id: &str) -> Source {
+        Source {
+            id: SourceId(id.into()),
+            path: std::path::PathBuf::from(format!("/tmp/{id}.txt")),
+            hash: format!("hash-{id}"),
+            status: SourceStatus::Indexed,
+            parser_used: Some("plaintext".into()),
+            last_ingested_at: None,
+        }
+    }
+
+    fn insert_child(store: &Store, source: &Source, chunk_id: &str, text: &str) -> Chunk {
+        let evidence = EvidenceUnit {
+            id: crate::types::EvidenceId(format!("ev-{chunk_id}")),
+            source_id: source.id.clone(),
+            locator: SourceLocator::Document {
+                path_or_url: source.path.to_string_lossy().into_owned(),
+                line_start: 1,
+                line_end: None,
+            },
+            text: text.into(),
+            text_hash: format!("hash-{chunk_id}"),
+            heading_path: Vec::new(),
+            position: 0,
+        };
+        let chunk = Chunk {
+            id: ChunkId(chunk_id.into()),
+            source_id: source.id.clone(),
+            text: text.into(),
+            context_text: None,
+            token_count: 4,
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path: Vec::new(),
+            evidence_unit_ids: vec![evidence.id.clone()],
+        };
+
+        store.add_source(source).unwrap();
+        store.bulk_insert_evidence(&[evidence]).unwrap();
+        store
+            .bulk_insert_chunks(std::slice::from_ref(&chunk))
+            .unwrap();
+        store
+            .link_chunk_evidence(&[(chunk.id.clone(), chunk.evidence_unit_ids[0].clone())])
+            .unwrap();
+        chunk
+    }
+
+    #[tokio::test]
+    async fn retrieval_source_filter_applies_after_lexical_and_dense_search() {
+        let store = Store::in_memory().unwrap();
+        let first = source("src-1");
+        let second = source("src-2");
+        let alpha = insert_child(&store, &first, "chunk-alpha", "alpha content");
+        let beta = insert_child(&store, &second, "chunk-beta", "beta content");
+        store
+            .replace_all_vector_documents(&[
+                VectorDocument {
+                    chunk_id: alpha.id.clone(),
+                    source_id: first.id.clone(),
+                    vector: keyword_vector(&alpha.text),
+                },
+                VectorDocument {
+                    chunk_id: beta.id.clone(),
+                    source_id: second.id.clone(),
+                    vector: keyword_vector(&beta.text),
+                },
+            ])
+            .unwrap();
+        let mut hnsw = HnswIndex::new();
+        hnsw.rebuild_from_store(&store).unwrap();
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let config = RetrievalConfig::default();
+        let pipeline =
+            RetrievalPipeline::new(&hnsw, &lexical_index, &store, &embed_client, &config);
+
+        let results = pipeline
+            .search_filtered("beta", Some(&second.id))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_id.0, "chunk-beta");
+        assert_eq!(results[0].chunk.source_id, second.id);
+        assert_eq!(results[0].evidence_units.len(), 1);
     }
 }

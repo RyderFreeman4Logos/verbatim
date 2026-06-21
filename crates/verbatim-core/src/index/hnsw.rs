@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use instant_distance::{Builder, HnswMap, Point, Search};
 use serde::{Deserialize, Serialize};
 
-use crate::types::ChunkId;
+use crate::store::Store;
+use crate::traits::{VectorDocument, VectorIndex};
+use crate::types::{ChunkId, SourceId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct VecPoint(Vec<f32>);
@@ -21,7 +23,7 @@ impl Point for VecPoint {
 }
 
 pub struct HnswIndex {
-    points: Vec<(ChunkId, VecPoint)>,
+    points: Vec<VectorDocument>,
     map: Option<HnswMap<VecPoint, ChunkId>>,
 }
 
@@ -34,8 +36,19 @@ impl HnswIndex {
     }
 
     pub fn add(&mut self, chunk_id: &ChunkId, vector: Vec<f32>) {
-        self.points.push((chunk_id.clone(), VecPoint(vector)));
-        self.map = None;
+        self.upsert(VectorDocument {
+            chunk_id: chunk_id.clone(),
+            source_id: SourceId(String::new()),
+            vector,
+        });
+    }
+
+    pub fn add_for_source(&mut self, chunk_id: &ChunkId, source_id: &SourceId, vector: Vec<f32>) {
+        self.upsert(VectorDocument {
+            chunk_id: chunk_id.clone(),
+            source_id: source_id.clone(),
+            vector,
+        });
     }
 
     pub fn clear(&mut self) {
@@ -51,9 +64,9 @@ impl HnswIndex {
 
         let mut values = Vec::with_capacity(self.points.len());
         let mut keys = Vec::with_capacity(self.points.len());
-        for (k, v) in &self.points {
-            values.push(v.clone());
-            keys.push(k.clone());
+        for document in &self.points {
+            values.push(VecPoint(document.vector.clone()));
+            keys.push(document.chunk_id.clone());
         }
 
         let map = Builder::default().build(values, keys);
@@ -113,6 +126,33 @@ impl Default for HnswIndex {
     }
 }
 
+impl VectorIndex for HnswIndex {
+    fn upsert(&mut self, document: VectorDocument) {
+        self.points
+            .retain(|point| point.chunk_id != document.chunk_id);
+        self.points.push(document);
+        self.map = None;
+    }
+
+    fn delete_source(&mut self, source_id: &SourceId) -> Result<()> {
+        self.points.retain(|point| point.source_id != *source_id);
+        self.build()
+    }
+
+    fn search(&self, query: &[f32], top_k: usize) -> Vec<(ChunkId, f32)> {
+        HnswIndex::search(self, query, top_k)
+    }
+
+    fn rebuild_from_store(&mut self, store: &Store) -> Result<()> {
+        self.points = store.list_vector_documents()?;
+        self.build()
+    }
+
+    fn len(&self) -> usize {
+        HnswIndex::len(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +195,22 @@ mod tests {
 
         assert!(index.is_empty());
         assert!(index.search(&seeded_vec(4, 1), 5).is_empty());
+    }
+
+    #[test]
+    fn delete_source_removes_points_from_dense_results() {
+        let mut index = HnswIndex::new();
+        let first = SourceId("src-1".into());
+        let second = SourceId("src-2".into());
+        index.add_for_source(&ChunkId("old".into()), &first, seeded_vec(4, 1));
+        index.add_for_source(&ChunkId("kept".into()), &second, seeded_vec(4, 2));
+        index.build().unwrap();
+
+        index.delete_source(&first).unwrap();
+
+        let results = index.search(&seeded_vec(4, 1), 5);
+        assert_eq!(index.len(), 1);
+        assert_eq!(results[0].0 .0, "kept");
     }
 
     #[test]
