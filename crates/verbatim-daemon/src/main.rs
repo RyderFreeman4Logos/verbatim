@@ -421,6 +421,7 @@ fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Text => "text",
         EvidenceKind::Image => "image",
+        EvidenceKind::Generated => "generated",
     }
 }
 

@@ -9,6 +9,7 @@ use crate::types::{
     Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, ImageId,
     Source, SourceId, SourceStatus,
 };
+use crate::vision_caption::{CaptionAttempt, ImageCaption, ImageCaptionRecord, ImageCaptionStatus};
 
 pub struct Store {
     conn: Connection,
@@ -291,6 +292,101 @@ impl Store {
         }
     }
 
+    // --- ImageCaption ---
+
+    pub fn get_image_caption(
+        &self,
+        image_hash: &str,
+        model: &str,
+        prompt_hash: &str,
+    ) -> Result<Option<ImageCaptionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT image_hash, model, prompt_version, prompt_hash, status, caption_json, raw_response, error_message, attempt_count, cache_hits, created_at, updated_at FROM image_captions WHERE image_hash = ?1 AND model = ?2 AND prompt_hash = ?3"
+        )?;
+        stmt.query_row(
+            params![image_hash, model, prompt_hash],
+            row_to_image_caption_record,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn get_successful_image_caption(
+        &self,
+        image_hash: &str,
+        model: &str,
+        prompt_hash: &str,
+    ) -> Result<Option<ImageCaptionRecord>> {
+        let record = self.get_image_caption(image_hash, model, prompt_hash)?;
+        Ok(record.filter(|record| {
+            record.status == ImageCaptionStatus::Success && record.caption.is_some()
+        }))
+    }
+
+    pub fn list_image_captions(&self) -> Result<Vec<ImageCaptionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT image_hash, model, prompt_version, prompt_hash, status, caption_json, raw_response, error_message, attempt_count, cache_hits, created_at, updated_at FROM image_captions ORDER BY image_hash, model, prompt_hash"
+        )?;
+        let rows = stmt.query_map([], row_to_image_caption_record)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub(crate) fn upsert_image_caption_attempt(
+        &self,
+        image_hash: &str,
+        model: &str,
+        prompt_version: &str,
+        prompt_hash: &str,
+        attempt: &CaptionAttempt,
+    ) -> Result<()> {
+        let caption_json = attempt
+            .caption
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize image caption")?;
+        let now = unix_timestamp_string();
+        self.conn.execute(
+            "INSERT INTO image_captions (image_hash, model, prompt_version, prompt_hash, status, caption_json, raw_response, error_message, attempt_count, cache_hits, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10)
+             ON CONFLICT(image_hash, model, prompt_hash) DO UPDATE SET
+                prompt_version = excluded.prompt_version,
+                status = excluded.status,
+                caption_json = excluded.caption_json,
+                raw_response = excluded.raw_response,
+                error_message = excluded.error_message,
+                attempt_count = excluded.attempt_count,
+                updated_at = excluded.updated_at",
+            params![
+                image_hash,
+                model,
+                prompt_version,
+                prompt_hash,
+                image_caption_status_to_str(attempt.status),
+                caption_json,
+                attempt.raw_response.as_deref(),
+                attempt.error_message.as_deref(),
+                attempt.attempt_count,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_image_caption_cache_hit(
+        &self,
+        image_hash: &str,
+        model: &str,
+        prompt_hash: &str,
+    ) -> Result<()> {
+        let now = unix_timestamp_string();
+        self.conn.execute(
+            "UPDATE image_captions SET cache_hits = cache_hits + 1, updated_at = ?4 WHERE image_hash = ?1 AND model = ?2 AND prompt_hash = ?3",
+            params![image_hash, model, prompt_hash, now],
+        )?;
+        Ok(())
+    }
+
     // --- Chunk ---
 
     pub fn bulk_insert_chunks(&self, chunks: &[Chunk]) -> Result<()> {
@@ -558,6 +654,34 @@ fn row_to_image_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageArtif
     })
 }
 
+fn row_to_image_caption_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageCaptionRecord> {
+    let caption_json: Option<String> = row.get(5)?;
+    let caption = match caption_json {
+        Some(json) => Some(
+            serde_json::from_str::<ImageCaption>(&json)
+                .map_err(|err| from_json_error(5, "ImageCaption", err))?,
+        ),
+        None => None,
+    };
+    let attempt_count: i64 = row.get(8)?;
+    let cache_hits: i64 = row.get(9)?;
+
+    Ok(ImageCaptionRecord {
+        image_hash: row.get(0)?,
+        model: row.get(1)?,
+        prompt_version: row.get(2)?,
+        prompt_hash: row.get(3)?,
+        status: str_to_image_caption_status(&row.get::<_, String>(4)?),
+        caption,
+        raw_response: row.get(6)?,
+        error_message: row.get(7)?,
+        attempt_count: attempt_count.try_into().unwrap_or(0),
+        cache_hits: cache_hits.try_into().unwrap_or(0),
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
 fn from_json_error(idx: usize, ty: &'static str, err: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         idx,
@@ -675,14 +799,39 @@ fn evidence_kind_to_str(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Text => "Text",
         EvidenceKind::Image => "Image",
+        EvidenceKind::Generated => "Generated",
     }
 }
 
 fn str_to_evidence_kind(kind: &str) -> EvidenceKind {
     match kind {
         "Image" => EvidenceKind::Image,
+        "Generated" => EvidenceKind::Generated,
         _ => EvidenceKind::Text,
     }
+}
+
+fn image_caption_status_to_str(status: ImageCaptionStatus) -> &'static str {
+    match status {
+        ImageCaptionStatus::Success => "Success",
+        ImageCaptionStatus::Failed => "Failed",
+        ImageCaptionStatus::Skipped => "Skipped",
+    }
+}
+
+fn str_to_image_caption_status(status: &str) -> ImageCaptionStatus {
+    match status {
+        "Success" => ImageCaptionStatus::Success,
+        "Skipped" => ImageCaptionStatus::Skipped,
+        _ => ImageCaptionStatus::Failed,
+    }
+}
+
+fn unix_timestamp_string() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 fn chunk_type_to_str(ct: &ChunkType) -> &'static str {
@@ -730,6 +879,21 @@ CREATE TABLE IF NOT EXISTS image_artifacts (
     page INTEGER NOT NULL,
     image_index INTEGER NOT NULL,
     bbox_json TEXT
+);
+CREATE TABLE IF NOT EXISTS image_captions (
+    image_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    prompt_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    caption_json TEXT,
+    raw_response TEXT,
+    error_message TEXT,
+    attempt_count INTEGER NOT NULL,
+    cache_hits INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (image_hash, model, prompt_hash)
 );
 CREATE TABLE IF NOT EXISTS chunks (
     id TEXT PRIMARY KEY,

@@ -176,6 +176,7 @@ pub struct Source {
 pub enum EvidenceKind {
     Text,
     Image,
+    Generated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
