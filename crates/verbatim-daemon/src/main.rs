@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::convert::Infallible;
+use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
@@ -18,10 +20,15 @@ use tower_http::cors::CorsLayer;
 
 use verbatim_core::config::{self, Config};
 use verbatim_core::embed::OpenAiEmbeddingClient;
-use verbatim_core::generate::Generator;
+use verbatim_core::generate::{
+    image_artifact_evidence_id, select_image_attachments, GenerationContext, Generator,
+};
 use verbatim_core::ingest::IngestPipeline;
 use verbatim_core::retrieve::RetrievalPipeline;
-use verbatim_core::types::{BBox, EvidenceId, EvidenceKind, ImageArtifact, SourceId};
+use verbatim_core::store::Store;
+use verbatim_core::types::{
+    BBox, CitationRef, EvidenceId, EvidenceKind, ImageArtifact, RetrievalResult, SourceId,
+};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -40,6 +47,7 @@ struct AppState {
     generator: Generator,
     embed_client: OpenAiEmbeddingClient,
     config: Config,
+    data_dir: PathBuf,
 }
 
 type SharedState = Arc<AppState>;
@@ -100,7 +108,10 @@ struct AskResponse {
 
 #[derive(Serialize)]
 struct CitationResponse {
+    label: String,
     evidence_id: String,
+    kind: &'static str,
+    derived_from: Option<String>,
     locator: String,
     text_preview: String,
 }
@@ -343,7 +354,7 @@ async fn execute_ask(
     let state2 = Arc::clone(&state);
     let question2 = question.clone();
     let runtime = tokio::runtime::Handle::current();
-    let results = tokio::task::spawn_blocking(move || {
+    let (results, generation_context) = tokio::task::spawn_blocking(move || {
         let pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let lexical_index = pipeline.lexical_index();
         let retrieval = RetrievalPipeline::new(
@@ -353,7 +364,19 @@ async fn execute_ask(
             &state2.embed_client,
             &state2.config.retrieval,
         );
-        runtime.block_on(retrieval.search_filtered(&question2, source_filter.as_ref()))
+        let results =
+            runtime.block_on(retrieval.search_filtered(&question2, source_filter.as_ref()))?;
+        let image_artifacts = collect_image_artifacts_for_results(&results, pipeline.store())?;
+        let image_attachments = select_image_attachments(
+            &results,
+            &image_artifacts,
+            &state2.config.chat.vision_attachments,
+            |artifact| read_image_attachment_bytes(&state2.data_dir, artifact),
+        )?;
+        Ok::<_, anyhow::Error>((
+            results,
+            GenerationContext::new(image_artifacts, image_attachments),
+        ))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
@@ -362,7 +385,7 @@ async fn execute_ask(
     // Step 2: generate (Send-safe, no store access)
     let gen_result = state
         .generator
-        .generate(&question, &results)
+        .generate_with_context(&question, &results, &generation_context)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -371,14 +394,99 @@ async fn execute_ask(
         citations: gen_result
             .citations
             .into_iter()
-            .map(|c| CitationResponse {
-                evidence_id: c.evidence_id.0,
-                locator: c.locator.to_string(),
-                text_preview: c.text_preview,
+            .map(|c| {
+                let kind = citation_kind_name(&c);
+                CitationResponse {
+                    label: c.label,
+                    evidence_id: c.evidence_id.0,
+                    kind,
+                    derived_from: c.derived_from.map(|id| id.0),
+                    locator: c.locator.to_string(),
+                    text_preview: c.text_preview,
+                }
             })
             .collect(),
         verified: gen_result.verified,
     })
+}
+
+fn collect_image_artifacts_for_results(
+    results: &[RetrievalResult],
+    store: &Store,
+) -> Result<Vec<ImageArtifact>> {
+    let mut artifacts = Vec::new();
+    let mut seen = HashSet::new();
+
+    for result in results {
+        for evidence in &result.evidence_units {
+            let Some(evidence_id) = image_artifact_evidence_id(evidence) else {
+                continue;
+            };
+            if !seen.insert(evidence_id.0.clone()) {
+                continue;
+            }
+            if let Some(artifact) = store.get_image_artifact_by_evidence(evidence_id)? {
+                artifacts.push(artifact);
+            }
+        }
+    }
+
+    Ok(artifacts)
+}
+
+fn read_image_attachment_bytes(data_dir: &FsPath, artifact: &ImageArtifact) -> Result<Vec<u8>> {
+    let path = checked_image_artifact_absolute_path(data_dir, &artifact.relative_path)?;
+    fs::read(&path).with_context(|| format!("read image attachment: {}", path.display()))
+}
+
+fn checked_image_artifact_absolute_path(
+    data_dir: &FsPath,
+    relative_path: &FsPath,
+) -> Result<PathBuf> {
+    ensure_relative_image_artifact_path(relative_path)?;
+    let root = data_dir.join("image-artifacts");
+    let absolute_path = data_dir.join(relative_path);
+    let parent = absolute_path.parent().with_context(|| {
+        format!(
+            "image artifact path has no parent: {}",
+            absolute_path.display()
+        )
+    })?;
+    if absolute_path == data_dir
+        || absolute_path == root
+        || !absolute_path.starts_with(&root)
+        || parent == root
+        || !parent.starts_with(&root)
+    {
+        bail!(
+            "unsafe image artifact path outside artifact root: {}",
+            absolute_path.display()
+        );
+    }
+    Ok(absolute_path)
+}
+
+fn ensure_relative_image_artifact_path(relative_path: &FsPath) -> Result<()> {
+    let components: Vec<Component<'_>> = relative_path.components().collect();
+    match components.as_slice() {
+        [Component::Normal(root), Component::Normal(source), Component::Normal(file)]
+            if root.to_str() == Some("image-artifacts")
+                && is_safe_path_component(source)
+                && is_safe_path_component(file) =>
+        {
+            Ok(())
+        }
+        _ => bail!(
+            "unsafe image artifact relative path: {}",
+            relative_path.display()
+        ),
+    }
+}
+
+fn is_safe_path_component(component: &std::ffi::OsStr) -> bool {
+    component
+        .to_str()
+        .is_some_and(|text| !text.is_empty() && text != "." && text != "..")
 }
 
 async fn get_evidence(
@@ -432,6 +540,15 @@ fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Text => "text",
         EvidenceKind::Image => "image",
+        EvidenceKind::Generated => "generated",
+    }
+}
+
+fn citation_kind_name(citation: &CitationRef) -> &'static str {
+    match citation.kind {
+        EvidenceKind::Text => "original_text",
+        EvidenceKind::Image => "image_artifact",
+        EvidenceKind::Generated if citation.derived_from.is_some() => "image_caption_generated",
         EvidenceKind::Generated => "generated",
     }
 }
@@ -539,6 +656,7 @@ async fn run_daemon() -> Result<()> {
         generator,
         embed_client,
         config,
+        data_dir,
     });
 
     let app = Router::new()

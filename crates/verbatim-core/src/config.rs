@@ -232,6 +232,8 @@ pub struct ChatConfig {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
+    pub vision_attachments: ChatVisionAttachmentConfig,
 }
 
 impl Default for ChatConfig {
@@ -244,6 +246,7 @@ impl Default for ChatConfig {
             temperature: 0.0,
             timeout_seconds: default_chat_timeout_seconds(),
             api_key: String::new(),
+            vision_attachments: ChatVisionAttachmentConfig::default(),
         }
     }
 }
@@ -258,6 +261,62 @@ fn default_chat_model() -> String {
 
 fn default_chat_timeout_seconds() -> u64 {
     120
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatVisionAttachmentConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model_supports_vision: bool,
+    #[serde(default = "default_chat_vision_attachment_max_images")]
+    pub max_images: usize,
+    #[serde(default = "default_chat_vision_attachment_max_total_bytes")]
+    pub max_total_bytes: usize,
+    #[serde(default = "default_chat_vision_attachment_detail")]
+    pub detail: String,
+}
+
+impl Default for ChatVisionAttachmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_supports_vision: false,
+            max_images: default_chat_vision_attachment_max_images(),
+            max_total_bytes: default_chat_vision_attachment_max_total_bytes(),
+            detail: default_chat_vision_attachment_detail(),
+        }
+    }
+}
+
+impl ChatVisionAttachmentConfig {
+    pub fn can_attach_images(&self) -> bool {
+        self.enabled
+            && self.model_supports_vision
+            && self.max_images > 0
+            && self.max_total_bytes > 0
+    }
+
+    pub fn detail_value(&self) -> Option<String> {
+        let detail = self.detail.trim();
+        if detail.is_empty() {
+            None
+        } else {
+            Some(detail.to_string())
+        }
+    }
+}
+
+fn default_chat_vision_attachment_max_images() -> usize {
+    2
+}
+
+fn default_chat_vision_attachment_max_total_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+fn default_chat_vision_attachment_detail() -> String {
+    "auto".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,6 +556,13 @@ temperature = 0.0
 timeout_seconds = 120
 api_key = ""
 
+[chat.vision_attachments]
+enabled = false
+model_supports_vision = false
+max_images = 2
+max_total_bytes = 8388608
+detail = "auto"
+
 [verifier]
 enabled = true
 
@@ -545,6 +611,14 @@ mod tests {
         assert_eq!(config.vision.timeout_seconds, 180);
         assert!(config.chat.enabled);
         assert_eq!(config.chat.base_url, "http://127.0.0.1:8000/v1");
+        assert!(!config.chat.vision_attachments.enabled);
+        assert!(!config.chat.vision_attachments.model_supports_vision);
+        assert_eq!(config.chat.vision_attachments.max_images, 2);
+        assert_eq!(
+            config.chat.vision_attachments.max_total_bytes,
+            8 * 1024 * 1024
+        );
+        assert_eq!(config.chat.vision_attachments.detail, "auto");
         assert!(config.verifier.enabled);
         assert!(!config.qdrant.enabled);
         assert_eq!(config.daemon.bind, "127.0.0.1:7700");
@@ -564,6 +638,25 @@ model = "Qwen/Qwen3.6-27B"
         assert_eq!(config.vision.model, "Qwen/Qwen3.6-27B");
         assert!(config.embedding.enabled);
         assert!(config.chat.enabled);
+    }
+
+    #[test]
+    fn partial_chat_vision_attachment_config_defaults_disabled() {
+        let config: Config = toml::from_str(
+            r#"
+[chat.vision_attachments]
+model_supports_vision = true
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.chat.vision_attachments.enabled);
+        assert!(config.chat.vision_attachments.model_supports_vision);
+        assert_eq!(config.chat.vision_attachments.max_images, 2);
+        assert_eq!(
+            config.chat.vision_attachments.max_total_bytes,
+            8 * 1024 * 1024
+        );
     }
 
     #[test]
