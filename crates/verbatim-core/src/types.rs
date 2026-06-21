@@ -257,7 +257,11 @@ pub struct RetrievalResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CitationRef {
+    pub label: String,
     pub evidence_id: EvidenceId,
+    pub kind: EvidenceKind,
+    #[serde(default)]
+    pub derived_from: Option<EvidenceId>,
     pub locator: SourceLocator,
     pub text_preview: String,
 }
