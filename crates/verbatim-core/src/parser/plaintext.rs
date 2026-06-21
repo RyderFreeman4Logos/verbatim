@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::traits::Parser;
-use crate::types::{EvidenceId, EvidenceUnit, SourceId, SourceLocator};
+use crate::types::{EvidenceId, EvidenceKind, EvidenceUnit, SourceId, SourceLocator};
 
 pub struct PlaintextParser;
 
@@ -41,6 +41,7 @@ impl Parser for PlaintextParser {
                             source_id.0, para_start_line, position
                         )),
                         source_id: source_id.clone(),
+                        kind: EvidenceKind::Text,
                         locator: SourceLocator::Document {
                             path_or_url: path_str.clone(),
                             line_start: para_start_line,
@@ -80,6 +81,7 @@ impl Parser for PlaintextParser {
                     source_id.0, para_start_line, position
                 )),
                 source_id: source_id.clone(),
+                kind: EvidenceKind::Text,
                 locator: SourceLocator::Document {
                     path_or_url: path_str,
                     line_start: para_start_line,

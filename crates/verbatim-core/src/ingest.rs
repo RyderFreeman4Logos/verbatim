@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -11,12 +11,18 @@ use crate::chunker::{chunk_evidence, ChunkerConfig};
 use crate::config::Config;
 use crate::context::ContextGenerator;
 use crate::embed::OpenAiEmbeddingClient;
+use crate::image_limits::{
+    ImageArtifactBudget, ImageArtifactLimitError, ImageArtifactLimitStage, ImageArtifactLimits,
+};
 use crate::index::hnsw::HnswIndex;
 use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::parser;
 use crate::store::Store;
-use crate::traits::{EmbeddingClient, LexicalIndex, VectorDocument, VectorIndex};
-use crate::types::{Chunk, ChunkType, Source, SourceId, SourceStatus};
+use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
+use crate::types::{
+    hex_sha256, Chunk, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, ImageId,
+    ParsedImageArtifact, Source, SourceId, SourceLocator, SourceStatus,
+};
 
 pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     store: Store,
@@ -24,12 +30,38 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     embed_client: E,
     context_gen: Option<ContextGenerator>,
     data_dir: PathBuf,
+    image_artifact_limits: ImageArtifactLimits,
 }
 
 struct PreparedIndexes {
     hnsw: HnswIndex,
     vectors: Vec<VectorDocument>,
 }
+
+#[derive(Debug)]
+struct PreparedImageArtifacts {
+    evidence: Vec<EvidenceUnit>,
+    artifacts: Vec<ImageArtifact>,
+    files: Vec<PreparedImageFile>,
+}
+
+#[derive(Debug)]
+struct PreparedImageFile {
+    absolute_path: PathBuf,
+    bytes: Vec<u8>,
+    content_hash: String,
+    page: u32,
+    image_index: u32,
+}
+
+#[derive(Debug)]
+struct WrittenImageFile {
+    absolute_path: PathBuf,
+    preexisting: bool,
+}
+
+const IMAGE_ARTIFACTS_DIR: &str = "image-artifacts";
+const COMPONENT_HASH_LEN: usize = 16;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct IndexManifest {
@@ -61,6 +93,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             embed_client,
             context_gen,
             data_dir: data_dir.to_path_buf(),
+            image_artifact_limits: config.parser.image_artifacts,
         })
     }
 }
@@ -93,6 +126,7 @@ where
             embed_client,
             context_gen: None,
             data_dir,
+            image_artifact_limits: ImageArtifactLimits::default(),
         }
     }
 
@@ -115,6 +149,9 @@ where
     }
 
     pub async fn remove_source(&mut self, source_id: &SourceId) -> Result<()> {
+        self.store
+            .get_source(source_id)?
+            .with_context(|| format!("source not found: {}", source_id.0))?;
         let child_chunks = self.child_chunks_without_source(source_id)?;
         let prepared = self.prepare_indexes_for_chunks(&child_chunks).await?;
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
@@ -129,6 +166,12 @@ where
             }
         };
         self.publish_committed_indexes(generation, staged, prepared)?;
+        remove_source_image_artifacts(&self.data_dir, source_id).with_context(|| {
+            format!(
+                "cleanup image artifacts after committed source removal: {}",
+                source_id.0
+            )
+        })?;
         Ok(())
     }
 
@@ -172,6 +215,19 @@ where
         new_source.parser_used = Some(parser.name().to_string());
         let mut evidence = parser.parse(&source.path)?;
         normalize_evidence_source_ids(&mut evidence, source_id);
+        let parsed_image_artifacts = extract_image_artifacts_for_ingest(
+            parser.as_ref(),
+            &source.path,
+            self.image_artifact_limits,
+        )?;
+        let prepared_image_artifacts = prepare_image_artifacts(
+            &self.data_dir,
+            source_id,
+            evidence.len() as u32,
+            parsed_image_artifacts,
+            self.image_artifact_limits,
+        )?;
+        evidence.extend(prepared_image_artifacts.evidence.clone());
         tracing::info!(evidence_count = evidence.len(), "parsed");
 
         let chunker_config = ChunkerConfig::default();
@@ -199,20 +255,43 @@ where
         let prepared = self.prepare_indexes_for_chunks(&child_chunks).await?;
 
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let written_image_files = match write_image_artifact_files(
+            &prepared_image_artifacts.files,
+            self.image_artifact_limits,
+        ) {
+            Ok(written) => written,
+            Err(err) => {
+                let _ = remove_dir_if_exists(&staged);
+                return Err(err);
+            }
+        };
         let generation = match self.store.replace_source_contents(
             &new_source,
             &evidence,
             &chunks,
             &prepared.vectors,
             &output.links,
+            &prepared_image_artifacts.artifacts,
         ) {
             Ok(generation) => generation,
             Err(err) => {
+                cleanup_written_image_files(&written_image_files);
                 let _ = remove_dir_if_exists(&staged);
                 return Err(err);
             }
         };
         self.publish_committed_indexes(generation, staged, prepared)?;
+        cleanup_stale_source_image_artifacts(
+            &self.data_dir,
+            source_id,
+            &prepared_image_artifacts.artifacts,
+        )
+        .with_context(|| {
+            format!(
+                "cleanup stale image artifacts after committed source ingest: {}",
+                source_id.0
+            )
+        })?;
 
         tracing::info!(source = %source_id.0, "ingest complete");
         Ok(())
@@ -459,6 +538,416 @@ fn normalize_evidence_source_ids(
     }
 }
 
+fn extract_image_artifacts_for_ingest(
+    parser: &dyn Parser,
+    path: &Path,
+    limits: ImageArtifactLimits,
+) -> Result<Vec<ParsedImageArtifact>> {
+    match parser.extract_image_artifacts_with_limits(path, limits) {
+        Ok(artifacts) => Ok(artifacts),
+        Err(err) => {
+            if let Some(limit) = err
+                .downcast_ref::<ImageArtifactLimitError>()
+                .filter(|limit| limit.is_unsupported_extraction())
+            {
+                warn_unsupported_image_extraction(limit);
+                Ok(Vec::new())
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+fn warn_unsupported_image_extraction(limit: &ImageArtifactLimitError) {
+    if let ImageArtifactLimitError::UnsupportedImageExtraction {
+        stage,
+        backend,
+        reason,
+        page,
+        image_index,
+    } = limit
+    {
+        tracing::warn!(
+            stage = %stage,
+            backend = *backend,
+            reason = *reason,
+            page = *page,
+            image_index = *image_index,
+            "skipping unsupported PDF image artifact during ingest"
+        );
+    }
+}
+
+fn prepare_image_artifacts(
+    data_dir: &Path,
+    source_id: &SourceId,
+    start_position: u32,
+    parsed: Vec<ParsedImageArtifact>,
+    limits: ImageArtifactLimits,
+) -> Result<PreparedImageArtifacts> {
+    let mut evidence = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut files = Vec::new();
+    let mut budget = ImageArtifactBudget::new(limits, ImageArtifactLimitStage::Prepare);
+
+    for parsed_artifact in parsed {
+        budget.reserve_image_slot(parsed_artifact.page, parsed_artifact.image_index)?;
+        budget.validate_dimensions(
+            parsed_artifact.page,
+            parsed_artifact.image_index,
+            parsed_artifact.width,
+            parsed_artifact.height,
+        )?;
+        budget.accept_image_bytes(
+            parsed_artifact.page,
+            parsed_artifact.image_index,
+            parsed_artifact.bytes.len(),
+        )?;
+        let content_hash = parsed_artifact.content_hash();
+        let id_hash = if parsed_artifact.bbox.is_some() {
+            content_hash.clone()
+        } else {
+            // Without a bbox, repeated placements of the same image on one page
+            // would otherwise collide. The stored content_hash remains the real
+            // image hash; the ID input only disambiguates the placement fallback.
+            format!(
+                "{}:image-index:{}",
+                content_hash, parsed_artifact.image_index
+            )
+        };
+        let image_id = ImageId::for_pdf_image(
+            source_id,
+            parsed_artifact.page,
+            parsed_artifact.bbox.as_ref(),
+            &id_hash,
+        );
+        let evidence_id = EvidenceId(image_id.0.clone());
+        let relative_path =
+            image_artifact_relative_path(source_id, &image_id, &parsed_artifact.extension)?;
+        let absolute_path = checked_image_artifact_absolute_path(data_dir, &relative_path)?;
+        let locator = SourceLocator::PdfImage {
+            page: parsed_artifact.page,
+            image_index: parsed_artifact.image_index,
+            bbox: parsed_artifact.bbox.clone(),
+        };
+        let text = image_evidence_text(&parsed_artifact, &relative_path, &locator);
+
+        evidence.push(EvidenceUnit {
+            id: evidence_id.clone(),
+            source_id: source_id.clone(),
+            kind: EvidenceKind::Image,
+            locator,
+            text_hash: hex_sha256(text.as_bytes()),
+            text,
+            heading_path: Vec::new(),
+            position: start_position + evidence.len() as u32,
+        });
+        artifacts.push(ImageArtifact {
+            image_id,
+            source_id: source_id.clone(),
+            evidence_id,
+            relative_path: relative_path.clone(),
+            content_hash: content_hash.clone(),
+            mime_type: parsed_artifact.mime_type,
+            width: parsed_artifact.width,
+            height: parsed_artifact.height,
+            page: parsed_artifact.page,
+            image_index: parsed_artifact.image_index,
+            bbox: parsed_artifact.bbox,
+        });
+        files.push(PreparedImageFile {
+            absolute_path,
+            bytes: parsed_artifact.bytes,
+            content_hash,
+            page: parsed_artifact.page,
+            image_index: parsed_artifact.image_index,
+        });
+    }
+
+    Ok(PreparedImageArtifacts {
+        evidence,
+        artifacts,
+        files,
+    })
+}
+
+fn image_evidence_text(
+    artifact: &ParsedImageArtifact,
+    relative_path: &Path,
+    locator: &SourceLocator,
+) -> String {
+    let mut text = format!(
+        "Image evidence at {locator}. Artifact path: {}. Mime type: {}. Dimensions: {}x{} px.",
+        relative_path.display(),
+        artifact.mime_type,
+        artifact.width,
+        artifact.height
+    );
+    if let Some(before) = &artifact.nearby_text_before {
+        if before.starts_with("same-page excerpt fallback:") {
+            text.push_str(" Parser limitation: exact nearby text before/after was unavailable; ");
+            text.push_str(before);
+            text.push('.');
+        } else {
+            text.push_str(" Nearby text before image: ");
+            text.push_str(before);
+            text.push('.');
+        }
+    }
+    if let Some(after) = &artifact.nearby_text_after {
+        text.push_str(" Nearby text after image: ");
+        text.push_str(after);
+        text.push('.');
+    }
+    text
+}
+
+fn write_image_artifact_files(
+    files: &[PreparedImageFile],
+    limits: ImageArtifactLimits,
+) -> Result<Vec<WrittenImageFile>> {
+    validate_image_artifact_write_budget(files, limits)?;
+    let mut written = Vec::new();
+    for file in files {
+        let preexisting = if file.absolute_path.exists() {
+            file_hash(&file.absolute_path)? == file.content_hash
+        } else {
+            false
+        };
+        if !preexisting {
+            if let Some(parent) = file.absolute_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create image artifact dir: {}", parent.display()))?;
+            }
+            let tmp_path = image_artifact_tmp_path(&file.absolute_path);
+            fs::write(&tmp_path, &file.bytes)
+                .with_context(|| format!("write image artifact temp: {}", tmp_path.display()))?;
+            fs::rename(&tmp_path, &file.absolute_path).with_context(|| {
+                format!(
+                    "publish image artifact: {} -> {}",
+                    tmp_path.display(),
+                    file.absolute_path.display()
+                )
+            })?;
+        }
+        written.push(WrittenImageFile {
+            absolute_path: file.absolute_path.clone(),
+            preexisting,
+        });
+    }
+    Ok(written)
+}
+
+fn validate_image_artifact_write_budget(
+    files: &[PreparedImageFile],
+    limits: ImageArtifactLimits,
+) -> Result<()> {
+    let mut budget = ImageArtifactBudget::new(limits, ImageArtifactLimitStage::Write);
+    for (idx, file) in files.iter().enumerate() {
+        let image_index = if file.image_index == 0 {
+            idx as u32 + 1
+        } else {
+            file.image_index
+        };
+        budget.reserve_image_slot(file.page, image_index)?;
+        budget.accept_image_bytes(file.page, image_index, file.bytes.len())?;
+    }
+    Ok(())
+}
+
+fn cleanup_written_image_files(files: &[WrittenImageFile]) {
+    for file in files {
+        if !file.preexisting {
+            let _ = fs::remove_file(&file.absolute_path);
+        }
+    }
+}
+
+fn cleanup_stale_source_image_artifacts(
+    data_dir: &Path,
+    source_id: &SourceId,
+    artifacts: &[ImageArtifact],
+) -> Result<()> {
+    let source_dir = source_image_artifact_dir(data_dir, source_id)?;
+    if !source_dir.exists() {
+        return Ok(());
+    }
+    let keep: HashSet<PathBuf> = artifacts
+        .iter()
+        .map(|artifact| checked_image_artifact_absolute_path(data_dir, &artifact.relative_path))
+        .collect::<Result<_>>()?;
+    for entry in fs::read_dir(&source_dir)
+        .with_context(|| format!("read image artifact dir: {}", source_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.is_file() && !keep.contains(&path) {
+            fs::remove_file(&path)
+                .with_context(|| format!("remove stale image artifact: {}", path.display()))?;
+        }
+    }
+    if artifacts.is_empty() || fs::read_dir(&source_dir)?.next().is_none() {
+        remove_dir_if_exists(&source_dir)?;
+    }
+    Ok(())
+}
+
+fn remove_source_image_artifacts(data_dir: &Path, source_id: &SourceId) -> Result<()> {
+    let source_dir = source_image_artifact_dir(data_dir, source_id)?;
+    remove_dir_if_exists(&source_dir)
+}
+
+fn image_artifact_relative_path(
+    source_id: &SourceId,
+    image_id: &ImageId,
+    extension: &str,
+) -> Result<PathBuf> {
+    let relative_path = PathBuf::from(IMAGE_ARTIFACTS_DIR)
+        .join(source_image_artifact_component(source_id))
+        .join(format!(
+            "{}.{}",
+            sanitize_path_component(&image_id.0, "image"),
+            sanitize_extension(extension)
+        ));
+    ensure_relative_image_artifact_path(&relative_path)?;
+    Ok(relative_path)
+}
+
+fn source_image_artifact_dir(data_dir: &Path, source_id: &SourceId) -> Result<PathBuf> {
+    let root = image_artifacts_root_dir(data_dir);
+    let source_dir = root.join(source_image_artifact_component(source_id));
+    ensure_source_image_artifact_dir(data_dir, &root, &source_dir, source_id)?;
+    Ok(source_dir)
+}
+
+fn image_artifacts_root_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(IMAGE_ARTIFACTS_DIR)
+}
+
+fn source_image_artifact_component(source_id: &SourceId) -> String {
+    sanitize_path_component(&source_id.0, "source")
+}
+
+fn checked_image_artifact_absolute_path(data_dir: &Path, relative_path: &Path) -> Result<PathBuf> {
+    ensure_relative_image_artifact_path(relative_path)?;
+    let root = image_artifacts_root_dir(data_dir);
+    let absolute_path = data_dir.join(relative_path);
+    let parent = absolute_path.parent().with_context(|| {
+        format!(
+            "image artifact path has no parent: {}",
+            absolute_path.display()
+        )
+    })?;
+    if absolute_path == data_dir
+        || absolute_path == root
+        || !absolute_path.starts_with(&root)
+        || parent == root
+        || !parent.starts_with(&root)
+    {
+        bail!(
+            "unsafe image artifact path outside artifact root: {}",
+            absolute_path.display()
+        );
+    }
+    Ok(absolute_path)
+}
+
+fn ensure_source_image_artifact_dir(
+    data_dir: &Path,
+    root: &Path,
+    source_dir: &Path,
+    source_id: &SourceId,
+) -> Result<()> {
+    if source_dir == data_dir
+        || source_dir == root
+        || !source_dir.starts_with(root)
+        || source_dir.parent() != Some(root)
+    {
+        bail!(
+            "unsafe image artifact source directory for source {}: {}",
+            source_id.0,
+            source_dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_relative_image_artifact_path(relative_path: &Path) -> Result<()> {
+    let components: Vec<Component<'_>> = relative_path.components().collect();
+    match components.as_slice() {
+        [Component::Normal(root), Component::Normal(source), Component::Normal(file)]
+            if root.to_str() == Some(IMAGE_ARTIFACTS_DIR)
+                && safe_component_text(source).is_some()
+                && safe_component_text(file).is_some() =>
+        {
+            Ok(())
+        }
+        _ => bail!(
+            "unsafe image artifact relative path: {}",
+            relative_path.display()
+        ),
+    }
+}
+
+fn image_artifact_tmp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact");
+    path.with_file_name(format!("{}.tmp-{}", name, std::process::id()))
+}
+
+fn sanitize_path_component(value: &str, fallback_prefix: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return hashed_component(fallback_prefix, value);
+    }
+    if sanitized == value {
+        sanitized.to_string()
+    } else {
+        format!("{}-{}", sanitized, component_hash(value))
+    }
+}
+
+fn safe_component_text(component: &std::ffi::OsStr) -> Option<&str> {
+    component
+        .to_str()
+        .filter(|value| !value.is_empty() && *value != "." && *value != "..")
+}
+
+fn hashed_component(prefix: &str, value: &str) -> String {
+    format!("{}-{}", prefix, component_hash(value))
+}
+
+fn component_hash(value: &str) -> String {
+    let digest = hex_sha256(value.as_bytes());
+    digest[..COMPONENT_HASH_LEN].to_string()
+}
+
+fn sanitize_extension(value: &str) -> String {
+    let sanitized = value
+        .trim_matches('.')
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        "bin".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
 fn file_hash(path: &Path) -> Result<String> {
     let data = std::fs::read(path).with_context(|| format!("read file: {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -472,7 +961,8 @@ mod tests {
     use anyhow::bail;
     use async_trait::async_trait;
 
-    use crate::types::{ChunkId, EvidenceId, EvidenceUnit, SourceLocator};
+    use crate::image_limits::ImageArtifactLimitError;
+    use crate::types::{ChunkId, EvidenceId, EvidenceKind, EvidenceUnit, SourceLocator};
 
     struct FailingEmbeddingClient;
 
@@ -515,6 +1005,7 @@ mod tests {
         EvidenceUnit {
             id: EvidenceId(id.to_string()),
             source_id: source_id.clone(),
+            kind: EvidenceKind::Text,
             locator: SourceLocator::Document {
                 path_or_url: source_id.0.clone(),
                 line_start: 1,
@@ -567,6 +1058,384 @@ mod tests {
         }
         hnsw.build().unwrap();
         hnsw
+    }
+
+    fn write_pdf_with_image(path: &Path) {
+        let image_bytes = vec![255u8; 8 * 8 * 3];
+        let content = b"q\n36 0 0 36 72 72 cm\n/Im1 Do\nQ\n";
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            stream_object(
+                b"<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+                &image_bytes,
+            ),
+            stream_object(b"<<", content),
+        ];
+        fs::write(path, pdf_bytes(objects)).expect("fixture PDF should save");
+    }
+
+    fn write_pdf_with_text_and_image_filter(path: &Path, filter: Option<&str>, image_bytes: &[u8]) {
+        let mut image_prefix =
+            b"<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8"
+                .to_vec();
+        if let Some(filter) = filter {
+            image_prefix.extend(format!(" /Filter /{filter}").as_bytes());
+        }
+        let content = b"BT\n/F1 12 Tf\n72 120 Td\n(Unsupported image filter text evidence) Tj\nET\nq\n36 0 0 36 72 72 cm\n/Im1 Do\nQ\n";
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 5 0 R >> >> /Contents 6 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            stream_object(&image_prefix, image_bytes),
+            stream_object(b"<<", content),
+        ];
+        fs::write(path, pdf_bytes(objects)).expect("fixture PDF should save");
+    }
+
+    fn write_blocking_image_artifact_path(data_dir: &Path, source_id: &SourceId) {
+        let path = source_image_artifact_dir(data_dir, source_id).unwrap();
+        fs::create_dir_all(path.parent().expect("artifact dir has parent")).unwrap();
+        fs::write(path, b"not a directory").unwrap();
+    }
+
+    fn test_parsed_image_artifact(extension: &str) -> ParsedImageArtifact {
+        test_parsed_image_artifact_with(extension, 1, 1, vec![1, 2, 3, 4], 2, 2)
+    }
+
+    fn test_parsed_image_artifact_with(
+        extension: &str,
+        page: u32,
+        image_index: u32,
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> ParsedImageArtifact {
+        ParsedImageArtifact {
+            page,
+            image_index,
+            bbox: None,
+            bytes,
+            mime_type: format!("image/{extension}"),
+            extension: extension.to_string(),
+            width,
+            height,
+            nearby_text_before: None,
+            nearby_text_after: None,
+        }
+    }
+
+    fn image_limit_error(err: &anyhow::Error) -> &ImageArtifactLimitError {
+        err.downcast_ref::<ImageArtifactLimitError>()
+            .expect("error should preserve structured image limit type")
+    }
+
+    fn stream_object(prefix: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut object = prefix.to_vec();
+        object.extend(format!(" /Length {} >>\nstream\n", data.len()).as_bytes());
+        object.extend(data);
+        object.extend(b"\nendstream");
+        object
+    }
+
+    fn pdf_bytes(objects: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (idx, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend(format!("{} 0 obj\n", idx + 1).as_bytes());
+            pdf.extend(object);
+            pdf.extend(b"\nendobj\n");
+        }
+        let xref_offset = pdf.len();
+        pdf.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+        for offset in offsets {
+            pdf.extend(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn unsafe_source_ids_map_to_safe_artifact_directories() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path();
+        let root = image_artifacts_root_dir(data_dir);
+
+        for raw in ["..", ".", "---"] {
+            let source_id = SourceId(raw.to_string());
+            let source_dir = source_image_artifact_dir(data_dir, &source_id).unwrap();
+
+            assert!(source_dir.starts_with(&root));
+            assert_ne!(source_dir, data_dir);
+            assert_ne!(source_dir, root);
+            assert_eq!(source_dir.parent(), Some(root.as_path()));
+            assert!(source_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("safe component should be UTF-8")
+                .starts_with("source-"));
+        }
+    }
+
+    #[test]
+    fn unsafe_source_cleanup_preserves_artifact_root_and_siblings() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path();
+        let root = image_artifacts_root_dir(data_dir);
+        let sibling_file = root.join("safe-sibling").join("keep.bin");
+        let data_file = data_dir.join("verbatim.db");
+        fs::create_dir_all(sibling_file.parent().unwrap()).unwrap();
+        fs::write(&sibling_file, b"keep").unwrap();
+        fs::write(&data_file, b"db").unwrap();
+
+        for raw in ["..", ".", "---"] {
+            let source_id = SourceId(raw.to_string());
+            let source_dir = source_image_artifact_dir(data_dir, &source_id).unwrap();
+            fs::create_dir_all(&source_dir).unwrap();
+            fs::write(source_dir.join("owned.bin"), b"owned").unwrap();
+
+            remove_source_image_artifacts(data_dir, &source_id).unwrap();
+
+            assert!(!source_dir.exists());
+            assert!(data_dir.exists());
+            assert!(root.exists());
+            assert!(sibling_file.exists());
+            assert!(data_file.exists());
+
+            fs::create_dir_all(&source_dir).unwrap();
+            fs::write(source_dir.join("stale.bin"), b"stale").unwrap();
+
+            cleanup_stale_source_image_artifacts(data_dir, &source_id, &[]).unwrap();
+
+            assert!(!source_dir.exists());
+            assert!(data_dir.exists());
+            assert!(root.exists());
+            assert!(sibling_file.exists());
+            assert!(data_file.exists());
+        }
+    }
+
+    #[test]
+    fn unsafe_source_image_artifact_writes_stay_in_source_subtree() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path();
+        let root = image_artifacts_root_dir(data_dir);
+
+        for raw in ["..", ".", "---"] {
+            let source_id = SourceId(raw.to_string());
+            let prepared = prepare_image_artifacts(
+                data_dir,
+                &source_id,
+                0,
+                vec![test_parsed_image_artifact("png")],
+                ImageArtifactLimits::default(),
+            )
+            .unwrap();
+
+            assert_eq!(prepared.files.len(), 1);
+            assert_eq!(prepared.artifacts.len(), 1);
+            let source_dir = source_image_artifact_dir(data_dir, &source_id).unwrap();
+            let artifact_path = &prepared.files[0].absolute_path;
+            assert!(artifact_path.starts_with(&source_dir));
+            assert_eq!(artifact_path.parent(), Some(source_dir.as_path()));
+            assert_ne!(artifact_path, data_dir);
+            assert_ne!(artifact_path, &root);
+            assert!(prepared.artifacts[0]
+                .relative_path
+                .starts_with(Path::new(IMAGE_ARTIFACTS_DIR)));
+
+            write_image_artifact_files(&prepared.files, ImageArtifactLimits::default()).unwrap();
+
+            assert!(artifact_path.exists());
+            assert!(source_dir.exists());
+        }
+    }
+
+    #[test]
+    fn prepare_image_artifacts_rejects_too_many_images() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_id = SourceId("src-1".to_string());
+        let limits = ImageArtifactLimits {
+            max_images_per_source: 1,
+            ..ImageArtifactLimits::default()
+        };
+
+        let err = prepare_image_artifacts(
+            tempdir.path(),
+            &source_id,
+            0,
+            vec![
+                test_parsed_image_artifact_with("png", 1, 1, vec![1], 1, 1),
+                test_parsed_image_artifact_with("png", 1, 2, vec![2], 1, 1),
+            ],
+            limits,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            image_limit_error(&err),
+            ImageArtifactLimitError::TooManyImages {
+                stage: ImageArtifactLimitStage::Prepare,
+                limit: 1,
+                attempted: 2,
+                page: 1,
+                image_index: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn prepare_image_artifacts_rejects_per_image_byte_limit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_id = SourceId("src-1".to_string());
+        let limits = ImageArtifactLimits {
+            max_bytes_per_image: 3,
+            ..ImageArtifactLimits::default()
+        };
+
+        let err = prepare_image_artifacts(
+            tempdir.path(),
+            &source_id,
+            0,
+            vec![test_parsed_image_artifact_with(
+                "png",
+                1,
+                1,
+                vec![1, 2, 3, 4],
+                2,
+                2,
+            )],
+            limits,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            image_limit_error(&err),
+            ImageArtifactLimitError::ImageBytesExceeded {
+                stage: ImageArtifactLimitStage::Prepare,
+                limit: 3,
+                actual: 4,
+                page: 1,
+                image_index: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn prepare_image_artifacts_rejects_total_artifact_byte_limit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_id = SourceId("src-1".to_string());
+        let limits = ImageArtifactLimits {
+            max_total_bytes_per_source: 3,
+            ..ImageArtifactLimits::default()
+        };
+
+        let err = prepare_image_artifacts(
+            tempdir.path(),
+            &source_id,
+            0,
+            vec![
+                test_parsed_image_artifact_with("png", 1, 1, vec![1, 2], 1, 1),
+                test_parsed_image_artifact_with("png", 1, 2, vec![3, 4], 1, 1),
+            ],
+            limits,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            image_limit_error(&err),
+            ImageArtifactLimitError::TotalBytesExceeded {
+                stage: ImageArtifactLimitStage::Prepare,
+                limit: 3,
+                attempted_total: 4,
+                page: 1,
+                image_index: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn prepare_image_artifacts_rejects_pixel_limit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_id = SourceId("src-1".to_string());
+        let limits = ImageArtifactLimits {
+            max_image_pixels: 3,
+            ..ImageArtifactLimits::default()
+        };
+
+        let err = prepare_image_artifacts(
+            tempdir.path(),
+            &source_id,
+            0,
+            vec![test_parsed_image_artifact_with("png", 1, 1, vec![1], 2, 2)],
+            limits,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            image_limit_error(&err),
+            ImageArtifactLimitError::ImageDimensionsExceeded {
+                stage: ImageArtifactLimitStage::Prepare,
+                max_pixels: 3,
+                width: 2,
+                height: 2,
+                pixels: 4,
+                page: 1,
+                image_index: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn write_image_artifact_files_rejects_total_budget_before_writing() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let first_path = tempdir.path().join("first.png");
+        let second_path = tempdir.path().join("second.png");
+        let files = vec![
+            PreparedImageFile {
+                absolute_path: first_path.clone(),
+                bytes: vec![1, 2],
+                content_hash: "first".into(),
+                page: 1,
+                image_index: 1,
+            },
+            PreparedImageFile {
+                absolute_path: second_path.clone(),
+                bytes: vec![3, 4],
+                content_hash: "second".into(),
+                page: 1,
+                image_index: 2,
+            },
+        ];
+        let limits = ImageArtifactLimits {
+            max_total_bytes_per_source: 3,
+            ..ImageArtifactLimits::default()
+        };
+
+        let err = write_image_artifact_files(&files, limits).unwrap_err();
+
+        assert!(matches!(
+            image_limit_error(&err),
+            ImageArtifactLimitError::TotalBytesExceeded {
+                stage: ImageArtifactLimitStage::Write,
+                limit: 3,
+                attempted_total: 4,
+                page: 1,
+                image_index: 2
+            }
+        ));
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
     }
 
     #[tokio::test]
@@ -646,6 +1515,262 @@ mod tests {
         assert!(vectors
             .iter()
             .all(|vector| vector.chunk_id.0 != "old-chunk"));
+    }
+
+    #[tokio::test]
+    async fn pdf_ingest_writes_stable_image_artifacts_and_removes_them_with_source() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("image-fixture.pdf");
+        write_pdf_with_image(&path);
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", path);
+        store.add_source(&source).unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        let first_artifacts = pipeline
+            .store()
+            .list_image_artifacts_by_source(&source.id)
+            .unwrap();
+        assert_eq!(first_artifacts.len(), 1);
+        let first = &first_artifacts[0];
+        assert_eq!(first.page, 1);
+        assert_eq!(first.image_index, 1);
+        assert_eq!(first.mime_type, "image/png");
+        let first_image_id = first.image_id.clone();
+        let first_relative_path = first.relative_path.clone();
+        let first_artifact_path = tempdir.path().join(&first_relative_path);
+        assert!(first_artifact_path.exists());
+        assert_eq!(
+            pipeline
+                .store()
+                .get_image_artifact_by_evidence(&first.evidence_id)
+                .unwrap()
+                .as_ref()
+                .map(|artifact| &artifact.image_id),
+            Some(&first_image_id)
+        );
+        let image_evidence = pipeline
+            .store()
+            .get_evidence(&first.evidence_id)
+            .unwrap()
+            .expect("image evidence should be stored");
+        assert_eq!(image_evidence.kind, EvidenceKind::Image);
+        assert!(matches!(
+            image_evidence.locator,
+            SourceLocator::PdfImage { .. }
+        ));
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        let second_artifacts = pipeline
+            .store()
+            .list_image_artifacts_by_source(&source.id)
+            .unwrap();
+        assert_eq!(second_artifacts.len(), 1);
+        assert_eq!(second_artifacts[0].image_id, first_image_id);
+        assert_eq!(second_artifacts[0].relative_path, first_relative_path);
+        let artifact_files =
+            fs::read_dir(source_image_artifact_dir(tempdir.path(), &source.id).unwrap())
+                .unwrap()
+                .count();
+        assert_eq!(artifact_files, 1);
+
+        pipeline.remove_source(&source.id).await.unwrap();
+
+        assert!(pipeline.store().get_source(&source.id).unwrap().is_none());
+        assert!(pipeline
+            .store()
+            .list_image_artifacts_by_source(&source.id)
+            .unwrap()
+            .is_empty());
+        assert!(!source_image_artifact_dir(tempdir.path(), &source.id)
+            .unwrap()
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn pdf_ingest_skips_unsupported_image_filter_and_keeps_text_evidence() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("unsupported-image-filter.pdf");
+        write_pdf_with_text_and_image_filter(
+            &path,
+            Some("FlateDecode"),
+            &[120, 156, 3, 0, 0, 0, 0, 1],
+        );
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", path);
+        store.add_source(&source).unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        let evidence = pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap();
+        assert!(evidence.iter().any(|unit| {
+            unit.kind == EvidenceKind::Text
+                && unit.text.contains("Unsupported image filter text evidence")
+        }));
+        assert!(pipeline
+            .store()
+            .list_image_artifacts_by_source(&source.id)
+            .unwrap()
+            .is_empty());
+        assert!(!source_image_artifact_dir(tempdir.path(), &source.id)
+            .unwrap()
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn pdf_ingest_keeps_image_resource_limits_hard() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("image-limit.pdf");
+        write_pdf_with_text_and_image_filter(&path, None, &[255u8; 8 * 8 * 3]);
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", path);
+        store.add_source(&source).unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        pipeline.image_artifact_limits = ImageArtifactLimits {
+            max_images_per_source: 0,
+            ..ImageArtifactLimits::default()
+        };
+
+        let err = pipeline.ingest_source(&source.id).await.unwrap_err();
+
+        assert!(matches!(
+            image_limit_error(&err),
+            ImageArtifactLimitError::TooManyImages {
+                stage: ImageArtifactLimitStage::Parser,
+                limit: 0,
+                attempted: 1,
+                page: 1,
+                image_index: 1
+            }
+        ));
+        assert!(pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap()
+            .is_empty());
+        assert!(pipeline
+            .store()
+            .list_image_artifacts_by_source(&source.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_unknown_source_does_not_cleanup_image_artifacts() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path();
+        let root = image_artifacts_root_dir(data_dir);
+        let sibling_file = root.join("safe-sibling").join("keep.bin");
+        fs::create_dir_all(sibling_file.parent().unwrap()).unwrap();
+        fs::write(&sibling_file, b"keep").unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            data_dir.to_path_buf(),
+        );
+
+        let err = pipeline
+            .remove_source(&SourceId("---".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("source not found"));
+        assert!(data_dir.exists());
+        assert!(root.exists());
+        assert!(sibling_file.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_source_publishes_dense_index_when_image_cleanup_fails() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let first = test_source("src-1", tempdir.path().join("first.txt"));
+        let second = test_source("src-2", tempdir.path().join("second.txt"));
+        let first_chunk = insert_source_with_child(&store, &first, "chunk-1").unwrap();
+        let second_chunk = insert_source_with_child(&store, &second, "chunk-2").unwrap();
+        let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
+        write_blocking_image_artifact_path(tempdir.path(), &first.id);
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            hnsw,
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        let err = pipeline.remove_source(&first.id).await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("cleanup image artifacts after committed source removal"));
+        assert!(pipeline.store().get_source(&first.id).unwrap().is_none());
+        assert!(pipeline.store().get_source(&second.id).unwrap().is_some());
+        assert_eq!(pipeline.store().list_vector_documents().unwrap().len(), 1);
+        assert_eq!(pipeline.hnsw().len(), 1);
+        let results = pipeline.hnsw().search(&[1.0, 0.0], 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0 .0, "chunk-2");
+    }
+
+    #[tokio::test]
+    async fn ingest_source_publishes_dense_index_when_stale_image_cleanup_fails() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("doc.txt");
+        std::fs::write(&path, "freshterm text for ingest\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", path);
+        let old_chunk = insert_source_with_child(&store, &source, "old-chunk").unwrap();
+        let hnsw = hnsw_with_chunks(&[old_chunk]);
+        write_blocking_image_artifact_path(tempdir.path(), &source.id);
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            hnsw,
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        let err = pipeline.ingest_source(&source.id).await.unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("cleanup stale image artifacts after committed source ingest"));
+        let chunks = pipeline.store().list_chunks_by_source(&source.id).unwrap();
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|chunk| chunk.id.0 != "old-chunk"));
+        let vectors = pipeline.store().list_vector_documents().unwrap();
+        assert!(!vectors.is_empty());
+        assert!(vectors
+            .iter()
+            .all(|vector| vector.chunk_id.0 != "old-chunk"));
+        assert_eq!(pipeline.hnsw().len(), vectors.len());
+        let results = pipeline.hnsw().search(&[1.0, 0.0], vectors.len() + 1);
+        assert_eq!(results.len(), vectors.len());
+        assert!(results
+            .iter()
+            .all(|(chunk_id, _score)| chunk_id.0 != "old-chunk"));
     }
 
     #[tokio::test]

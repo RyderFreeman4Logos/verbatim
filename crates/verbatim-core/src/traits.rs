@@ -4,13 +4,24 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::image_limits::ImageArtifactLimits;
 use crate::store::Store;
-use crate::types::{ChunkId, EvidenceUnit, SourceId};
+use crate::types::{ChunkId, EvidenceUnit, ParsedImageArtifact, SourceId};
 
 pub trait Parser: Send + Sync {
     fn name(&self) -> &str;
     fn supported_extensions(&self) -> &[&str];
     fn parse(&self, path: &Path) -> Result<Vec<EvidenceUnit>>;
+    fn extract_image_artifacts(&self, path: &Path) -> Result<Vec<ParsedImageArtifact>> {
+        self.extract_image_artifacts_with_limits(path, ImageArtifactLimits::default())
+    }
+    fn extract_image_artifacts_with_limits(
+        &self,
+        _path: &Path,
+        _limits: ImageArtifactLimits,
+    ) -> Result<Vec<ParsedImageArtifact>> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]

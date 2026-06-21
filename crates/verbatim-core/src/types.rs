@@ -40,6 +40,26 @@ fn sanitize_source_stem(stem: &str) -> String {
 pub struct EvidenceId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ImageId(pub String);
+
+impl ImageId {
+    pub fn for_pdf_image(
+        source_id: &SourceId,
+        page: u32,
+        bbox: Option<&BBox>,
+        image_hash: &str,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(source_id.0.as_bytes());
+        hasher.update(page.to_be_bytes());
+        hasher.update(canonical_bbox_key(bbox).as_bytes());
+        hasher.update(image_hash.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        Self(format!("{}:img:{}", source_id.0, &digest[..16]))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,6 +78,11 @@ pub enum SourceLocator {
         paragraph: u32,
         bbox: Option<BBox>,
     },
+    PdfImage {
+        page: u32,
+        image_index: u32,
+        bbox: Option<BBox>,
+    },
     Document {
         path_or_url: String,
         line_start: u32,
@@ -71,6 +96,20 @@ impl fmt::Display for SourceLocator {
             Self::Pdf {
                 page, paragraph, ..
             } => write!(f, "PDF p.{page}, para {paragraph}"),
+            Self::PdfImage {
+                page,
+                image_index,
+                bbox: Some(bbox),
+            } => write!(
+                f,
+                "PDF p.{page}, image {image_index}, bbox={}",
+                format_bbox(bbox)
+            ),
+            Self::PdfImage {
+                page,
+                image_index,
+                bbox: None,
+            } => write!(f, "PDF p.{page}, image {image_index}"),
             Self::Document {
                 path_or_url,
                 line_start,
@@ -82,6 +121,37 @@ impl fmt::Display for SourceLocator {
                 line_end: None,
             } => write!(f, "{path_or_url} L{line_start}"),
         }
+    }
+}
+
+fn canonical_bbox_key(bbox: Option<&BBox>) -> String {
+    bbox.map(|bbox| {
+        format!(
+            "{:.3},{:.3},{:.3},{:.3}",
+            normalize_zero(bbox.x0),
+            normalize_zero(bbox.y0),
+            normalize_zero(bbox.x1),
+            normalize_zero(bbox.y1)
+        )
+    })
+    .unwrap_or_else(|| "none".to_string())
+}
+
+fn format_bbox(bbox: &BBox) -> String {
+    format!(
+        "[{:.2},{:.2},{:.2},{:.2}]",
+        normalize_zero(bbox.x0),
+        normalize_zero(bbox.y0),
+        normalize_zero(bbox.x1),
+        normalize_zero(bbox.y1)
+    )
+}
+
+fn normalize_zero(value: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else {
+        value
     }
 }
 
@@ -102,15 +172,57 @@ pub struct Source {
     pub last_ingested_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvidenceKind {
+    Text,
+    Image,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceUnit {
     pub id: EvidenceId,
     pub source_id: SourceId,
+    pub kind: EvidenceKind,
     pub locator: SourceLocator,
     pub text: String,
     pub text_hash: String,
     pub heading_path: Vec<String>,
     pub position: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedImageArtifact {
+    pub page: u32,
+    pub image_index: u32,
+    pub bbox: Option<BBox>,
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+    pub extension: String,
+    pub width: u32,
+    pub height: u32,
+    pub nearby_text_before: Option<String>,
+    pub nearby_text_after: Option<String>,
+}
+
+impl ParsedImageArtifact {
+    pub fn content_hash(&self) -> String {
+        hex_sha256(&self.bytes)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageArtifact {
+    pub image_id: ImageId,
+    pub source_id: SourceId,
+    pub evidence_id: EvidenceId,
+    pub relative_path: PathBuf,
+    pub content_hash: String,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub page: u32,
+    pub image_index: u32,
+    pub bbox: Option<BBox>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +259,12 @@ pub struct CitationRef {
     pub text_preview: String,
 }
 
+pub fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +287,42 @@ mod tests {
         assert_ne!(left_id, right_id);
         assert!(left_id.0.starts_with("notes-"));
         assert!(right_id.0.starts_with("notes-"));
+    }
+
+    #[test]
+    fn pdf_image_locators_include_image_index_and_bbox() {
+        let locator = SourceLocator::PdfImage {
+            page: 84,
+            image_index: 2,
+            bbox: Some(BBox {
+                x0: 1.0,
+                y0: 2.0,
+                x1: 3.0,
+                y1: 4.0,
+            }),
+        };
+
+        assert_eq!(
+            locator.to_string(),
+            "PDF p.84, image 2, bbox=[1.00,2.00,3.00,4.00]"
+        );
+    }
+
+    #[test]
+    fn pdf_image_ids_are_stable_for_same_hash_and_bbox() {
+        let source_id = SourceId("src".into());
+        let bbox = BBox {
+            x0: 1.0,
+            y0: 2.0,
+            x1: 3.0,
+            y1: 4.0,
+        };
+
+        let first = ImageId::for_pdf_image(&source_id, 1, Some(&bbox), "hash");
+        let second = ImageId::for_pdf_image(&source_id, 1, Some(&bbox), "hash");
+        let different = ImageId::for_pdf_image(&source_id, 2, Some(&bbox), "hash");
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
     }
 }

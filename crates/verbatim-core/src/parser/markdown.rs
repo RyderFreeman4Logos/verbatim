@@ -6,7 +6,7 @@ use pulldown_cmark::{Event, HeadingLevel, Parser as MdParser, Tag, TagEnd};
 use sha2::{Digest, Sha256};
 
 use crate::traits::Parser;
-use crate::types::{EvidenceId, EvidenceUnit, SourceId, SourceLocator};
+use crate::types::{EvidenceId, EvidenceKind, EvidenceUnit, SourceId, SourceLocator};
 
 pub struct MarkdownParser;
 
@@ -156,6 +156,7 @@ fn flush_block(
     units.push(EvidenceUnit {
         id: EvidenceId(format!("{}:L{}:n{}", source_id.0, line_start, position)),
         source_id: source_id.clone(),
+        kind: EvidenceKind::Text,
         locator: SourceLocator::Document {
             path_or_url: path_str.to_string(),
             line_start,

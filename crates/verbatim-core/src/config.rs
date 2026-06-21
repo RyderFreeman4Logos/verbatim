@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::image_limits::ImageArtifactLimits;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -46,12 +48,15 @@ impl Default for StoreConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParserConfig {
     pub default: String,
+    #[serde(default)]
+    pub image_artifacts: ImageArtifactLimits,
 }
 
 impl Default for ParserConfig {
     fn default() -> Self {
         Self {
             default: "pdf_oxide".into(),
+            image_artifacts: ImageArtifactLimits::default(),
         }
     }
 }
@@ -436,6 +441,14 @@ path = "~/.local/share/verbatim"
 [parser]
 default = "pdf_oxide"   # pdf_oxide | pdfplumber
 
+[parser.image_artifacts]
+max_images_per_source = 512
+max_bytes_per_image = 16777216
+max_total_bytes_per_source = 268435456
+max_image_width = 10000
+max_image_height = 10000
+max_image_pixels = 100000000
+
 [embedding]
 enabled = true
 provider = "openai_compatible"
@@ -506,6 +519,18 @@ mod tests {
         let config: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
         assert_eq!(config.store.path, "~/.local/share/verbatim");
         assert_eq!(config.parser.default, "pdf_oxide");
+        assert_eq!(config.parser.image_artifacts.max_images_per_source, 512);
+        assert_eq!(
+            config.parser.image_artifacts.max_bytes_per_image,
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            config.parser.image_artifacts.max_total_bytes_per_source,
+            256 * 1024 * 1024
+        );
+        assert_eq!(config.parser.image_artifacts.max_image_width, 10_000);
+        assert_eq!(config.parser.image_artifacts.max_image_height, 10_000);
+        assert_eq!(config.parser.image_artifacts.max_image_pixels, 100_000_000);
         assert!(config.embedding.enabled);
         assert_eq!(config.embedding.provider, "openai_compatible");
         assert_eq!(config.embedding.base_url, "http://127.0.0.1:8002/v1");

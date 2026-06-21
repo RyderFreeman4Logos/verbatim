@@ -21,7 +21,7 @@ use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::Generator;
 use verbatim_core::ingest::IngestPipeline;
 use verbatim_core::retrieve::RetrievalPipeline;
-use verbatim_core::types::{EvidenceId, SourceId};
+use verbatim_core::types::{BBox, EvidenceId, EvidenceKind, ImageArtifact, SourceId};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -109,10 +109,25 @@ struct CitationResponse {
 struct EvidenceResponse {
     id: String,
     source_id: String,
+    kind: &'static str,
     locator: String,
     text: String,
     heading_path: Vec<String>,
     position: u32,
+    image_artifact: Option<ImageArtifactResponse>,
+}
+
+#[derive(Serialize)]
+struct ImageArtifactResponse {
+    image_id: String,
+    path: String,
+    content_hash: String,
+    mime_type: String,
+    width: u32,
+    height: u32,
+    page: u32,
+    image_index: u32,
+    bbox: Option<BBox>,
 }
 
 #[derive(Serialize)]
@@ -371,9 +386,14 @@ async fn get_evidence(
 ) -> Result<Json<EvidenceResponse>, (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(&state);
     let eid_clone = eid.clone();
-    let evidence = tokio::task::spawn_blocking(move || {
+    let (evidence, image_artifact) = tokio::task::spawn_blocking(move || {
         let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().get_evidence(&EvidenceId(eid_clone))
+        let evidence = pipeline.store().get_evidence(&EvidenceId(eid_clone))?;
+        let image_artifact = match &evidence {
+            Some(eu) => pipeline.store().get_image_artifact_by_evidence(&eu.id)?,
+            None => None,
+        };
+        Ok::<_, anyhow::Error>((evidence, image_artifact))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
@@ -381,17 +401,42 @@ async fn get_evidence(
 
     match evidence {
         Some(eu) => Ok(Json(EvidenceResponse {
+            kind: evidence_kind_name(eu.kind),
             id: eu.id.0,
             source_id: eu.source_id.0,
             locator: eu.locator.to_string(),
             text: eu.text,
             heading_path: eu.heading_path,
             position: eu.position,
+            image_artifact: image_artifact.map(ImageArtifactResponse::from),
         })),
         None => Err(err(
             StatusCode::NOT_FOUND,
             anyhow::anyhow!("evidence not found: {eid}"),
         )),
+    }
+}
+
+fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::Text => "text",
+        EvidenceKind::Image => "image",
+    }
+}
+
+impl From<ImageArtifact> for ImageArtifactResponse {
+    fn from(artifact: ImageArtifact) -> Self {
+        Self {
+            image_id: artifact.image_id.0,
+            path: artifact.relative_path.display().to_string(),
+            content_hash: artifact.content_hash,
+            mime_type: artifact.mime_type,
+            width: artifact.width,
+            height: artifact.height,
+            page: artifact.page,
+            image_index: artifact.image_index,
+            bbox: artifact.bbox,
+        }
     }
 }
 

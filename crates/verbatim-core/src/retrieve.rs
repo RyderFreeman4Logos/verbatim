@@ -138,7 +138,7 @@ mod tests {
     use crate::index::sqlite_fts::SqliteFtsIndex;
     use crate::store::Store;
     use crate::traits::{VectorDocument, VectorIndex};
-    use crate::types::{Chunk, Source, SourceLocator, SourceStatus};
+    use crate::types::{Chunk, EvidenceKind, Source, SourceLocator, SourceStatus};
 
     #[test]
     fn rrf_merges_rankings() {
@@ -222,6 +222,7 @@ mod tests {
         let evidence = EvidenceUnit {
             id: crate::types::EvidenceId(format!("ev-{chunk_id}")),
             source_id: source.id.clone(),
+            kind: EvidenceKind::Text,
             locator: SourceLocator::Document {
                 path_or_url: source.path.to_string_lossy().into_owned(),
                 line_start: 1,
