@@ -286,6 +286,7 @@ pub(crate) fn caption_derived_evidence(
         id: caption_evidence_id(&artifact.image_id, model, prompt_hash),
         source_id: source_id.clone(),
         kind: EvidenceKind::Generated,
+        derived_from: Some(artifact.evidence_id.clone()),
         locator,
         text_hash: hex_sha256(text.as_bytes()),
         text,

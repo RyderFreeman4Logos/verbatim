@@ -39,6 +39,12 @@ impl Store {
             "kind",
             "ALTER TABLE evidence_units ADD COLUMN kind TEXT NOT NULL DEFAULT 'Text'",
         )?;
+        ensure_column(
+            &self.conn,
+            "evidence_units",
+            "derived_from_evidence_id",
+            "ALTER TABLE evidence_units ADD COLUMN derived_from_evidence_id TEXT",
+        )?;
         Ok(())
     }
 
@@ -241,7 +247,7 @@ impl Store {
 
     pub fn get_evidence(&self, id: &EvidenceId) -> Result<Option<EvidenceUnit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, position FROM evidence_units WHERE id = ?1"
+            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, position, derived_from_evidence_id FROM evidence_units WHERE id = ?1"
         )?;
         let mut rows = stmt.query_map(params![id.0], row_to_evidence_unit)?;
         match rows.next() {
@@ -252,7 +258,7 @@ impl Store {
 
     pub fn list_evidence_by_source(&self, source_id: &SourceId) -> Result<Vec<EvidenceUnit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, position FROM evidence_units WHERE source_id = ?1 ORDER BY position"
+            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, position, derived_from_evidence_id FROM evidence_units WHERE source_id = ?1 ORDER BY position"
         )?;
         let rows = stmt.query_map(params![source_id.0], row_to_evidence_unit)?;
         rows.map(|row| row.map_err(Into::into)).collect()
@@ -555,7 +561,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) 
 
 fn insert_evidence_units_tx(tx: &Transaction<'_>, units: &[EvidenceUnit]) -> Result<()> {
     let mut stmt = tx.prepare(
-        "INSERT INTO evidence_units (id, source_id, kind, locator_json, text, text_hash, heading_path_json, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        "INSERT INTO evidence_units (id, source_id, kind, locator_json, text, text_hash, heading_path_json, position, derived_from_evidence_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
     )?;
     for unit in units {
         let locator_json = serde_json::to_string(&unit.locator).context("serialize locator")?;
@@ -570,6 +576,7 @@ fn insert_evidence_units_tx(tx: &Transaction<'_>, units: &[EvidenceUnit]) -> Res
             &unit.text_hash,
             heading_json,
             unit.position,
+            unit.derived_from.as_ref().map(|id| &id.0),
         ])?;
     }
     Ok(())
@@ -584,6 +591,7 @@ fn row_to_evidence_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceUni
     let text_hash: String = row.get(5)?;
     let heading_json: String = row.get(6)?;
     let position: u32 = row.get(7)?;
+    let derived_from: Option<String> = row.get(8)?;
 
     let locator = serde_json::from_str(&locator_json)
         .map_err(|err| from_json_error(3, "SourceLocator", err))?;
@@ -594,6 +602,7 @@ fn row_to_evidence_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceUni
         id: EvidenceId(id),
         source_id: SourceId(source_id),
         kind: str_to_evidence_kind(&kind),
+        derived_from: derived_from.map(EvidenceId),
         locator,
         text,
         text_hash,
@@ -865,7 +874,8 @@ CREATE TABLE IF NOT EXISTS evidence_units (
     text TEXT NOT NULL,
     text_hash TEXT NOT NULL,
     heading_path_json TEXT,
-    position INTEGER NOT NULL
+    position INTEGER NOT NULL,
+    derived_from_evidence_id TEXT
 );
 CREATE TABLE IF NOT EXISTS image_artifacts (
     image_id TEXT PRIMARY KEY,
@@ -1000,6 +1010,7 @@ mod tests {
                 id: EvidenceId("ev-1".into()),
                 source_id: SourceId(source_id.into()),
                 kind: EvidenceKind::Text,
+                derived_from: None,
                 locator: SourceLocator::Pdf {
                     page: 1,
                     paragraph: 1,
@@ -1014,6 +1025,7 @@ mod tests {
                 id: EvidenceId("ev-2".into()),
                 source_id: SourceId(source_id.into()),
                 kind: EvidenceKind::Text,
+                derived_from: None,
                 locator: SourceLocator::Pdf {
                     page: 1,
                     paragraph: 2,

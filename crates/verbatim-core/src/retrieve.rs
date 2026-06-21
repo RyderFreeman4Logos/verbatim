@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
 use crate::config::RetrievalConfig;
 use crate::store::Store;
 use crate::traits::{EmbeddingClient, LexicalIndex, VectorIndex};
-use crate::types::{ChunkId, ChunkType, EvidenceUnit, RetrievalResult, SourceId};
+use crate::types::{Chunk, ChunkId, ChunkType, EvidenceUnit, RetrievalResult, SourceId};
 
 pub struct RetrievalPipeline<'a> {
     vector_index: &'a dyn VectorIndex,
@@ -95,11 +95,7 @@ impl<'a> RetrievalPipeline<'a> {
 
             let display_chunk = parent_chunk.unwrap_or_else(|| chunk.clone());
 
-            let evidence_units: Vec<EvidenceUnit> = chunk
-                .evidence_unit_ids
-                .iter()
-                .filter_map(|eid| self.store.get_evidence(eid).ok().flatten())
-                .collect();
+            let evidence_units = self.evidence_units_for_chunk(&chunk)?;
 
             results.push(RetrievalResult {
                 chunk_id: chunk.id.clone(),
@@ -110,6 +106,27 @@ impl<'a> RetrievalPipeline<'a> {
         }
 
         Ok(results)
+    }
+
+    fn evidence_units_for_chunk(&self, chunk: &Chunk) -> Result<Vec<EvidenceUnit>> {
+        let mut evidence_units = Vec::new();
+        let mut seen = HashSet::new();
+
+        for evidence_id in &chunk.evidence_unit_ids {
+            let Some(unit) = self.store.get_evidence(evidence_id)? else {
+                continue;
+            };
+            let derived_from = unit.derived_from.clone();
+            push_unique_evidence(&mut evidence_units, &mut seen, unit);
+
+            if let Some(source_evidence_id) = derived_from {
+                if let Some(source_unit) = self.store.get_evidence(&source_evidence_id)? {
+                    push_unique_evidence(&mut evidence_units, &mut seen, source_unit);
+                }
+            }
+        }
+
+        Ok(evidence_units)
     }
 }
 
@@ -127,6 +144,16 @@ fn rrf_fusion(dense: &[(ChunkId, f32)], bm25: &[(ChunkId, f32)], k: usize) -> Ve
     let mut results: Vec<(ChunkId, f32)> = scores.into_iter().collect();
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     results
+}
+
+fn push_unique_evidence(
+    evidence_units: &mut Vec<EvidenceUnit>,
+    seen: &mut HashSet<String>,
+    unit: EvidenceUnit,
+) {
+    if seen.insert(unit.id.0.clone()) {
+        evidence_units.push(unit);
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +250,7 @@ mod tests {
             id: crate::types::EvidenceId(format!("ev-{chunk_id}")),
             source_id: source.id.clone(),
             kind: EvidenceKind::Text,
+            derived_from: None,
             locator: SourceLocator::Document {
                 path_or_url: source.path.to_string_lossy().into_owned(),
                 line_start: 1,

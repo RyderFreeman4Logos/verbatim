@@ -192,6 +192,7 @@ mod tests {
             id: EvidenceId(id.into()),
             source_id: source_id.clone(),
             kind: EvidenceKind::Text,
+            derived_from: None,
             locator: SourceLocator::Document {
                 path_or_url: source_id.0.clone(),
                 line_start: 1,

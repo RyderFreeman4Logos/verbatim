@@ -42,6 +42,7 @@ impl Parser for PlaintextParser {
                         )),
                         source_id: source_id.clone(),
                         kind: EvidenceKind::Text,
+                        derived_from: None,
                         locator: SourceLocator::Document {
                             path_or_url: path_str.clone(),
                             line_start: para_start_line,
@@ -82,6 +83,7 @@ impl Parser for PlaintextParser {
                 )),
                 source_id: source_id.clone(),
                 kind: EvidenceKind::Text,
+                derived_from: None,
                 locator: SourceLocator::Document {
                     path_or_url: path_str,
                     line_start: para_start_line,
