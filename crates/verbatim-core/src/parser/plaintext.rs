@@ -107,11 +107,7 @@ fn hex_sha256(text: &str) -> String {
 }
 
 fn source_id_from_path(path: &Path) -> SourceId {
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-    SourceId(name.to_string())
+    SourceId::from_path(path)
 }
 
 #[cfg(test)]

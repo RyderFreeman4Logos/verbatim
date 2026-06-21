@@ -8,7 +8,7 @@ use crate::index::hnsw::HnswIndex;
 use crate::index::tantivy_bm25::Bm25Index;
 use crate::store::Store;
 use crate::traits::EmbeddingClient;
-use crate::types::{ChunkId, ChunkType, EvidenceUnit, RetrievalResult};
+use crate::types::{ChunkId, ChunkType, EvidenceUnit, RetrievalResult, SourceId};
 
 pub struct RetrievalPipeline<'a> {
     hnsw: &'a HnswIndex,
@@ -36,6 +36,14 @@ impl<'a> RetrievalPipeline<'a> {
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<RetrievalResult>> {
+        self.search_filtered(query, None).await
+    }
+
+    pub async fn search_filtered(
+        &self,
+        query: &str,
+        source_filter: Option<&SourceId>,
+    ) -> Result<Vec<RetrievalResult>> {
         let query_text = self.embed_client.prepare_query(query);
         let query_vec = self
             .embed_client
@@ -45,11 +53,32 @@ impl<'a> RetrievalPipeline<'a> {
             .next()
             .unwrap_or_default();
 
-        let dense_results = self.hnsw.search(&query_vec, self.config.dense_top_k);
+        let all_child_count = if source_filter.is_some() {
+            self.store.list_child_chunks()?.len()
+        } else {
+            0
+        };
+        let dense_top_k = source_filter
+            .map(|_| self.hnsw.len().max(self.config.dense_top_k))
+            .unwrap_or(self.config.dense_top_k);
+        let bm25_top_k = source_filter
+            .map(|_| all_child_count.max(self.config.bm25_top_k))
+            .unwrap_or(self.config.bm25_top_k);
 
-        let bm25_results = self.bm25.search(query, self.config.bm25_top_k)?;
+        let dense_results = self.hnsw.search(&query_vec, dense_top_k);
 
-        let fused = rrf_fusion(&dense_results, &bm25_results, self.config.rrf_k);
+        let bm25_results = self.bm25.search(query, bm25_top_k)?;
+
+        let mut fused = rrf_fusion(&dense_results, &bm25_results, self.config.rrf_k);
+        if let Some(source_id) = source_filter {
+            fused.retain(|(chunk_id, _)| {
+                self.store
+                    .get_chunk(chunk_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|chunk| chunk.source_id == *source_id)
+            });
+        }
 
         let mut results = Vec::new();
         for (chunk_id, score) in fused {

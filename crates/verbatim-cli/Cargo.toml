@@ -1,0 +1,11 @@
+[package]
+name = "verbatim-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "verbatim"
+path = "src/main.rs"
+
+[dependencies]

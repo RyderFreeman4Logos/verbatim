@@ -1,11 +1,16 @@
+use std::convert::Infallible;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use futures::stream;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -90,6 +95,7 @@ struct AskRequest {
 struct AskResponse {
     answer: String,
     citations: Vec<CitationResponse>,
+    verified: bool,
 }
 
 #[derive(Serialize)]
@@ -130,8 +136,7 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn get_config(State(state): State<SharedState>) -> Json<serde_json::Value> {
-    let val = serde_json::to_value(&state.config).unwrap_or(serde_json::json!({}));
-    Json(val)
+    Json(state.config.redacted_json())
 }
 
 async fn add_source(
@@ -216,9 +221,10 @@ async fn delete_source(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(&state);
+    let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().remove_source(&SourceId(id))
+        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        runtime.block_on(pipeline.remove_source(&SourceId(id)))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
@@ -253,10 +259,10 @@ async fn ingest_all(
     // We use a dedicated tokio runtime thread via `spawn_blocking` combined
     // with a local async runtime to drive the pipeline's async work.
     let state = Arc::clone(&state);
+    let runtime = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking(move || {
         let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(pipeline.ingest_all(force))
+        runtime.block_on(pipeline.ingest_all(force))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
@@ -270,10 +276,10 @@ async fn ingest_one(
     Path(id): Path<String>,
 ) -> Result<Json<IngestResponse>, (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(&state);
+    let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(pipeline.ingest_source(&SourceId(id)))
+        runtime.block_on(pipeline.ingest_source(&SourceId(id)))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
@@ -286,12 +292,41 @@ async fn ask(
     State(state): State<SharedState>,
     Json(req): Json<AskRequest>,
 ) -> Result<Json<AskResponse>, (StatusCode, Json<ErrorResponse>)> {
+    execute_ask(state, req).await.map(Json)
+}
+
+async fn ask_stream(
+    State(state): State<SharedState>,
+    Json(req): Json<AskRequest>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let event = match execute_ask(state, req).await {
+        Ok(response) => Event::default()
+            .event("answer")
+            .json_data(response)
+            .unwrap_or_else(|_| Event::default().event("error").data("serialize response")),
+        Err((status, Json(error))) => Event::default().event("error").data(
+            serde_json::json!({
+                "status": status.as_u16(),
+                "error": error.error,
+            })
+            .to_string(),
+        ),
+    };
+
+    Sse::new(stream::once(async move { Ok(event) }))
+}
+
+async fn execute_ask(
+    state: SharedState,
+    req: AskRequest,
+) -> Result<AskResponse, (StatusCode, Json<ErrorResponse>)> {
     let question = req.question;
-    let source_filter = req.source_id;
+    let source_filter = req.source_id.map(SourceId);
 
     // Step 1: retrieve (involves !Send store + async embed)
     let state2 = Arc::clone(&state);
     let question2 = question.clone();
+    let runtime = tokio::runtime::Handle::current();
     let results = tokio::task::spawn_blocking(move || {
         let pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let retrieval = RetrievalPipeline::new(
@@ -301,15 +336,7 @@ async fn ask(
             &state2.embed_client,
             &state2.config.retrieval,
         );
-        let rt = tokio::runtime::Handle::current();
-        let mut results = rt.block_on(retrieval.search(&question2))?;
-
-        // Filter by source_id if requested
-        if let Some(ref sid) = source_filter {
-            results.retain(|r| r.chunk.source_id.0 == *sid);
-        }
-
-        Ok::<_, anyhow::Error>(results)
+        runtime.block_on(retrieval.search_filtered(&question2, source_filter.as_ref()))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
@@ -322,7 +349,7 @@ async fn ask(
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok(Json(AskResponse {
+    Ok(AskResponse {
         answer: gen_result.answer,
         citations: gen_result
             .citations
@@ -333,7 +360,8 @@ async fn ask(
                 text_preview: c.text_preview,
             })
             .collect(),
-    }))
+        verified: gen_result.verified,
+    })
 }
 
 async fn get_evidence(
@@ -415,12 +443,35 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if write_version_if_requested(std::env::args().skip(1), &mut std::io::stdout())? {
+        return Ok(());
+    }
+
+    run_daemon().await
+}
+
+fn write_version_if_requested<I, W>(args: I, stdout: &mut W) -> Result<bool>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+    W: Write,
+{
+    match args.into_iter().next() {
+        Some(arg) if matches!(arg.as_ref(), "-V" | "--version") => {
+            writeln!(stdout, "verbatim-daemon {}", env!("CARGO_PKG_VERSION"))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn run_daemon() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let config = Config::load().context("failed to load config")?;
     let data_dir = config::data_dir(&config);
     let pipeline = IngestPipeline::new(&config, &data_dir)?;
-    let generator = Generator::new(&config.chat);
+    let generator = Generator::new(&config.chat, &config.verifier);
     let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
 
     let bind_addr = config.daemon.bind.clone();
@@ -443,6 +494,7 @@ async fn main() -> Result<()> {
         .route("/api/ingest", post(ingest_all))
         .route("/api/ingest/{id}", post(ingest_one))
         .route("/api/ask", post(ask))
+        .route("/api/ask/stream", post(ask_stream))
         .route("/api/evidence/{eid}", get(get_evidence))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -459,4 +511,45 @@ async fn main() -> Result<()> {
         .context("server error")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_flag_prints_package_version() {
+        let mut stdout = Vec::new();
+
+        let handled = write_version_if_requested(["--version"], &mut stdout).unwrap();
+
+        assert!(handled);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("verbatim-daemon {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn short_version_flag_prints_package_version() {
+        let mut stdout = Vec::new();
+
+        let handled = write_version_if_requested(["-V"], &mut stdout).unwrap();
+
+        assert!(handled);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("verbatim-daemon {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn no_args_continue_to_daemon_startup() {
+        let mut stdout = Vec::new();
+
+        let handled = write_version_if_requested(std::iter::empty::<&str>(), &mut stdout).unwrap();
+
+        assert!(!handled);
+        assert!(stdout.is_empty());
+    }
 }

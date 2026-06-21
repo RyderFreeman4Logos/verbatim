@@ -128,6 +128,14 @@ impl EmbeddingClient for OpenAiEmbeddingClient {
     fn dimension(&self) -> usize {
         self.dimension
     }
+
+    fn prepare_query(&self, query: &str) -> String {
+        OpenAiEmbeddingClient::prepare_query(self, query)
+    }
+
+    fn prepare_document(&self, text: &str, heading: &str) -> String {
+        OpenAiEmbeddingClient::prepare_document(self, text, heading)
+    }
 }
 
 #[derive(Serialize)]

@@ -234,6 +234,42 @@ impl Config {
     pub fn show(&self) -> Result<String> {
         toml::to_string_pretty(self).with_context(|| "failed to serialize config")
     }
+
+    pub fn redacted_json(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        redact_secrets(&mut value);
+        value
+    }
+}
+
+fn redact_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_secret_key(key) {
+                    *child = serde_json::Value::String("<redacted>".to_string());
+                } else {
+                    redact_secrets(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_secrets(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    normalized.contains("apikey")
+        || normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("password")
+        || normalized.contains("authorization")
+        || normalized.contains("bearer")
 }
 
 pub fn init_default_config() -> Result<PathBuf> {
@@ -333,5 +369,16 @@ mod tests {
         let config: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
         let serialized = config.show().unwrap();
         let _reparsed: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    #[test]
+    fn redacted_json_masks_secret_like_fields() {
+        let mut config: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        config.chat.api_key = "***".into();
+
+        let redacted = config.redacted_json();
+
+        assert_eq!(redacted["chat"]["api_key"], "<redacted>");
+        assert_eq!(redacted["chat"]["base_url"], "http://127.0.0.1:8002/v1");
     }
 }
