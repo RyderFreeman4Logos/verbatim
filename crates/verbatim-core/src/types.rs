@@ -62,6 +62,93 @@ impl ImageId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkId(pub String);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GraphNodeId(pub String);
+
+impl GraphNodeId {
+    pub fn new(source_id: &SourceId, kind: GraphNodeKind, external_id: &str) -> Self {
+        let digest =
+            hex_sha256(format!("{}:{}:{external_id}", &source_id.0, kind.as_str()).as_bytes());
+        Self(format!(
+            "{}:graph:{}:{}",
+            &source_id.0,
+            kind.as_str(),
+            &digest[..16]
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GraphEdgeId(pub String);
+
+impl GraphEdgeId {
+    pub fn new(
+        source_id: &SourceId,
+        edge_type: EdgeType,
+        from_node_id: &GraphNodeId,
+        to_node_id: &GraphNodeId,
+        ordinal: Option<u32>,
+    ) -> Self {
+        let ordinal_key = ordinal.map(|value| value.to_string()).unwrap_or_default();
+        let digest = hex_sha256(
+            format!(
+                "{}:{}:{}:{}:{ordinal_key}",
+                &source_id.0,
+                edge_type.as_str(),
+                &from_node_id.0,
+                &to_node_id.0
+            )
+            .as_bytes(),
+        );
+        Self(format!(
+            "{}:graph-edge:{}:{}",
+            &source_id.0,
+            edge_type.as_str(),
+            &digest[..16]
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GraphNodeKind {
+    Source,
+    Page,
+    Section,
+    Chunk,
+    EvidenceUnit,
+    ImageArtifact,
+}
+
+impl GraphNodeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "Source",
+            Self::Page => "Page",
+            Self::Section => "Section",
+            Self::Chunk => "Chunk",
+            Self::EvidenceUnit => "EvidenceUnit",
+            Self::ImageArtifact => "ImageArtifact",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeType {
+    Contains,
+    DerivedFrom,
+    Next,
+}
+
+impl EdgeType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Contains => "Contains",
+            Self::DerivedFrom => "DerivedFrom",
+            Self::Next => "Next",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BBox {
     pub x0: f64,
@@ -226,6 +313,32 @@ pub struct ImageArtifact {
     pub page: u32,
     pub image_index: u32,
     pub bbox: Option<BBox>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub id: GraphNodeId,
+    pub source_id: SourceId,
+    pub kind: GraphNodeKind,
+    pub external_id: String,
+    pub label: Option<String>,
+    pub locator: Option<SourceLocator>,
+    pub ordinal: Option<u32>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub id: GraphEdgeId,
+    pub source_id: SourceId,
+    pub edge_type: EdgeType,
+    pub from_node_id: GraphNodeId,
+    pub to_node_id: GraphNodeId,
+    pub ordinal: Option<u32>,
+    pub weight: Option<f64>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
