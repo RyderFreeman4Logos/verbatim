@@ -971,7 +971,8 @@ mod tests {
         ProviderResult,
     };
     use crate::types::{
-        BBox, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, ImageId, SourceId, SourceLocator,
+        BBox, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, ImageId, RetrievalProvenance,
+        SourceId, SourceLocator,
     };
 
     struct RecordingChatModel {
@@ -1093,6 +1094,7 @@ mod tests {
                     position: 1,
                 },
             ],
+            provenance: RetrievalProvenance::seed(1, ChunkId("c1".into()), SourceId("src".into())),
         }]
     }
 
@@ -1165,6 +1167,11 @@ mod tests {
                     position: 9,
                 },
             ],
+            provenance: RetrievalProvenance::seed(
+                1,
+                ChunkId("caption-child".into()),
+                SourceId("src".into()),
+            ),
         }]
     }
 

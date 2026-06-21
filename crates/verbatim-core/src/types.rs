@@ -133,6 +133,7 @@ impl GraphNodeKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EdgeType {
     Contains,
     DerivedFrom,
@@ -384,6 +385,96 @@ pub struct RetrievalResult {
     pub score: f32,
     pub chunk: Chunk,
     pub evidence_units: Vec<EvidenceUnit>,
+    #[serde(default)]
+    pub provenance: RetrievalProvenance,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalOrigin {
+    #[default]
+    Seed,
+    GraphExpansion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphTraversalDirection {
+    Outgoing,
+    Incoming,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphExpansionStep {
+    pub edge_type: EdgeType,
+    pub from_node_id: GraphNodeId,
+    pub to_node_id: GraphNodeId,
+    pub direction: GraphTraversalDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalProvenance {
+    #[serde(default)]
+    pub origin: RetrievalOrigin,
+    #[serde(default)]
+    pub result_rank: usize,
+    #[serde(default)]
+    pub seed_rank: Option<usize>,
+    #[serde(default)]
+    pub seed_chunk_id: Option<ChunkId>,
+    #[serde(default)]
+    pub seed_source_id: Option<SourceId>,
+    #[serde(default)]
+    pub hop_distance: u32,
+    #[serde(default)]
+    pub graph_path: Vec<GraphExpansionStep>,
+}
+
+impl RetrievalProvenance {
+    pub fn seed(result_rank: usize, chunk_id: ChunkId, source_id: SourceId) -> Self {
+        Self {
+            origin: RetrievalOrigin::Seed,
+            result_rank,
+            seed_rank: Some(result_rank),
+            seed_chunk_id: Some(chunk_id),
+            seed_source_id: Some(source_id),
+            hop_distance: 0,
+            graph_path: Vec::new(),
+        }
+    }
+
+    pub fn graph_expansion(
+        result_rank: usize,
+        seed_rank: usize,
+        seed_chunk_id: ChunkId,
+        seed_source_id: SourceId,
+        hop_distance: u32,
+        graph_path: Vec<GraphExpansionStep>,
+    ) -> Self {
+        Self {
+            origin: RetrievalOrigin::GraphExpansion,
+            result_rank,
+            seed_rank: Some(seed_rank),
+            seed_chunk_id: Some(seed_chunk_id),
+            seed_source_id: Some(seed_source_id),
+            hop_distance,
+            graph_path,
+        }
+    }
+}
+
+impl Default for RetrievalProvenance {
+    fn default() -> Self {
+        Self {
+            origin: RetrievalOrigin::Seed,
+            result_rank: 0,
+            seed_rank: None,
+            seed_chunk_id: None,
+            seed_source_id: None,
+            hop_distance: 0,
+            graph_path: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
