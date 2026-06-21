@@ -295,6 +295,16 @@ impl ImageDescribeRequest {
             max_tokens: None,
         }
     }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
 }
 
 /// Supported local image reference forms for OpenAI-compatible vision chat.

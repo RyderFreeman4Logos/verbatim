@@ -262,7 +262,7 @@ fn default_chat_timeout_seconds() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisionConfig {
-    #[serde(default = "default_enabled")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_openai_provider")]
     pub provider: String,
@@ -281,7 +281,7 @@ pub struct VisionConfig {
 impl Default for VisionConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             provider: default_openai_provider(),
             base_url: default_chat_base_url(),
             model: default_chat_model(),
@@ -480,7 +480,7 @@ api_key = ""
 enabled = true
 
 [vision]
-enabled = true
+enabled = false
 provider = "openai_compatible"
 base_url = "http://127.0.0.1:8000/v1"
 model = "Qwen/Qwen3.6-27B"
@@ -541,13 +541,29 @@ mod tests {
         assert!(!config.rerank.enabled);
         assert_eq!(config.rerank.model, "Qwen/Qwen3-Reranker-8B");
         assert!(config.context.enabled);
-        assert!(config.vision.enabled);
+        assert!(!config.vision.enabled);
         assert_eq!(config.vision.timeout_seconds, 180);
         assert!(config.chat.enabled);
         assert_eq!(config.chat.base_url, "http://127.0.0.1:8000/v1");
         assert!(config.verifier.enabled);
         assert!(!config.qdrant.enabled);
         assert_eq!(config.daemon.bind, "127.0.0.1:7700");
+    }
+
+    #[test]
+    fn partial_vision_config_defaults_disabled() {
+        let config: Config = toml::from_str(
+            r#"
+[vision]
+model = "Qwen/Qwen3.6-27B"
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.vision.enabled);
+        assert_eq!(config.vision.model, "Qwen/Qwen3.6-27B");
+        assert!(config.embedding.enabled);
+        assert!(config.chat.enabled);
     }
 
     #[test]

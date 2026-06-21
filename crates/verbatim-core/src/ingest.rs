@@ -17,11 +17,17 @@ use crate::image_limits::{
 use crate::index::hnsw::HnswIndex;
 use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::parser;
+use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
+use crate::provider::VisionModel;
 use crate::store::Store;
 use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
 use crate::types::{
     hex_sha256, Chunk, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, ImageId,
     ParsedImageArtifact, Source, SourceId, SourceLocator, SourceStatus,
+};
+use crate::vision_caption::{
+    caption_derived_evidence, request_image_caption, vision_caption_prompt_hash, CaptionAttempt,
+    ImageCaptionStatus, VISION_CAPTION_PROMPT_VERSION,
 };
 
 pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
@@ -29,6 +35,9 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     hnsw: HnswIndex,
     embed_client: E,
     context_gen: Option<ContextGenerator>,
+    vision_model: Option<Box<dyn VisionModel>>,
+    vision_caption_model: String,
+    vision_caption_prompt_hash: String,
     data_dir: PathBuf,
     image_artifact_limits: ImageArtifactLimits,
 }
@@ -86,12 +95,16 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         } else {
             None
         };
+        let (vision_model, vision_caption_model) = configured_vision_model(config);
 
         Ok(Self {
             store,
             hnsw,
             embed_client,
             context_gen,
+            vision_model,
+            vision_caption_model,
+            vision_caption_prompt_hash: vision_caption_prompt_hash(),
             data_dir: data_dir.to_path_buf(),
             image_artifact_limits: config.parser.image_artifacts,
         })
@@ -125,9 +138,22 @@ where
             hnsw,
             embed_client,
             context_gen: None,
+            vision_model: None,
+            vision_caption_model: "vision-disabled".to_string(),
+            vision_caption_prompt_hash: vision_caption_prompt_hash(),
             data_dir,
             image_artifact_limits: ImageArtifactLimits::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_vision_model<V>(mut self, model_name: impl Into<String>, vision_model: V) -> Self
+    where
+        V: VisionModel + 'static,
+    {
+        self.vision_caption_model = model_name.into();
+        self.vision_model = Some(Box::new(vision_model));
+        self
     }
 
     pub fn add_source(&self, path: &Path) -> Result<SourceId> {
@@ -227,7 +253,15 @@ where
             parsed_image_artifacts,
             self.image_artifact_limits,
         )?;
+        let caption_evidence = self
+            .caption_prepared_image_artifacts(
+                source_id,
+                &prepared_image_artifacts,
+                evidence.len() as u32 + prepared_image_artifacts.evidence.len() as u32,
+            )
+            .await?;
         evidence.extend(prepared_image_artifacts.evidence.clone());
+        evidence.extend(caption_evidence);
         tracing::info!(evidence_count = evidence.len(), "parsed");
 
         let chunker_config = ChunkerConfig::default();
@@ -401,6 +435,148 @@ where
         self.embed_client
             .prepare_document(&chunk_search_text(chunk), &chunk.heading_path.join(" > "))
     }
+
+    async fn caption_prepared_image_artifacts(
+        &self,
+        source_id: &SourceId,
+        prepared: &PreparedImageArtifacts,
+        start_position: u32,
+    ) -> Result<Vec<EvidenceUnit>> {
+        let mut evidence = Vec::new();
+        for (artifact, file) in prepared.artifacts.iter().zip(&prepared.files) {
+            if let Some(unit) = self
+                .caption_prepared_image(
+                    source_id,
+                    artifact,
+                    file,
+                    start_position + evidence.len() as u32,
+                )
+                .await?
+            {
+                evidence.push(unit);
+            }
+        }
+        Ok(evidence)
+    }
+
+    async fn caption_prepared_image(
+        &self,
+        source_id: &SourceId,
+        artifact: &ImageArtifact,
+        file: &PreparedImageFile,
+        position: u32,
+    ) -> Result<Option<EvidenceUnit>> {
+        let Some(model) = &self.vision_model else {
+            if self
+                .store
+                .get_successful_image_caption(
+                    &artifact.content_hash,
+                    &self.vision_caption_model,
+                    &self.vision_caption_prompt_hash,
+                )?
+                .is_some()
+            {
+                tracing::debug!(
+                    image_id = %artifact.image_id.0,
+                    image_hash = %artifact.content_hash,
+                    "preserving successful image caption cache while vision provider is disabled"
+                );
+                return Ok(None);
+            }
+            let attempt =
+                CaptionAttempt::skipped("vision caption provider is disabled or not configured");
+            self.store.upsert_image_caption_attempt(
+                &artifact.content_hash,
+                &self.vision_caption_model,
+                VISION_CAPTION_PROMPT_VERSION,
+                &self.vision_caption_prompt_hash,
+                &attempt,
+            )?;
+            return Ok(None);
+        };
+
+        if let Some(record) = self.store.get_successful_image_caption(
+            &artifact.content_hash,
+            &self.vision_caption_model,
+            &self.vision_caption_prompt_hash,
+        )? {
+            self.store.record_image_caption_cache_hit(
+                &artifact.content_hash,
+                &self.vision_caption_model,
+                &self.vision_caption_prompt_hash,
+            )?;
+            if let Some(caption) = record.caption {
+                return Ok(Some(caption_derived_evidence(
+                    source_id,
+                    artifact,
+                    &caption,
+                    &self.vision_caption_model,
+                    &self.vision_caption_prompt_hash,
+                    position,
+                )));
+            }
+        }
+
+        let attempt = request_image_caption(model.as_ref(), &file.bytes, &artifact.mime_type).await;
+
+        self.store.upsert_image_caption_attempt(
+            &artifact.content_hash,
+            &self.vision_caption_model,
+            VISION_CAPTION_PROMPT_VERSION,
+            &self.vision_caption_prompt_hash,
+            &attempt,
+        )?;
+
+        if attempt.status != ImageCaptionStatus::Success {
+            tracing::warn!(
+                image_id = %artifact.image_id.0,
+                image_hash = %artifact.content_hash,
+                status = ?attempt.status,
+                error = ?attempt.error_message,
+                "image caption unavailable; continuing ingest"
+            );
+            return Ok(None);
+        }
+
+        Ok(attempt.caption.map(|caption| {
+            caption_derived_evidence(
+                source_id,
+                artifact,
+                &caption,
+                &self.vision_caption_model,
+                &self.vision_caption_prompt_hash,
+                position,
+            )
+        }))
+    }
+}
+
+fn configured_vision_model(config: &Config) -> (Option<Box<dyn VisionModel>>, String) {
+    let model_name = if config.vision.model.trim().is_empty() {
+        "vision-disabled".to_string()
+    } else {
+        config.vision.model.clone()
+    };
+    if !config.vision.enabled {
+        return (None, model_name);
+    }
+    if config.vision.provider != "openai_compatible" {
+        tracing::warn!(
+            provider = %config.vision.provider,
+            "unsupported vision provider; image captioning disabled"
+        );
+        return (None, model_name);
+    }
+    if config.vision.base_url.trim().is_empty() || config.vision.model.trim().is_empty() {
+        tracing::warn!("vision config is incomplete; image captioning disabled");
+        return (None, model_name);
+    }
+    (
+        Some(Box::new(OpenAiCompatibleVisionModel::from_config(
+            &config.vision,
+        ))),
+        model_name,
+    )
 }
 
 fn load_published_vector_index(data_dir: &Path, store: &Store) -> Result<HnswIndex> {
@@ -960,9 +1136,14 @@ mod tests {
     use super::*;
     use anyhow::bail;
     use async_trait::async_trait;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::image_limits::ImageArtifactLimitError;
+    use crate::provider::{ImageDescribeRequest, ImageDescription, ProviderResult, VisionModel};
     use crate::types::{ChunkId, EvidenceId, EvidenceKind, EvidenceUnit, SourceLocator};
+    use crate::vision_caption::{vision_caption_prompt_hash, ImageCaptionStatus};
 
     struct FailingEmbeddingClient;
 
@@ -987,6 +1168,50 @@ mod tests {
 
         fn dimension(&self) -> usize {
             2
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockVisionModel {
+        responses: Arc<Mutex<VecDeque<String>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockVisionModel {
+        fn new<S>(responses: impl IntoIterator<Item = S>) -> Self
+        where
+            S: Into<String>,
+        {
+            Self {
+                responses: Arc::new(Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(Into::into)
+                        .collect::<VecDeque<_>>(),
+                )),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl VisionModel for MockVisionModel {
+        async fn describe_image(
+            &self,
+            _req: ImageDescribeRequest,
+        ) -> ProviderResult<ImageDescription> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = self
+                .responses
+                .lock()
+                .expect("mock response lock should not be poisoned")
+                .pop_front()
+                .expect("mock vision response should be available");
+            Ok(ImageDescription { text })
         }
     }
 
@@ -1125,6 +1350,50 @@ mod tests {
             nearby_text_before: None,
             nearby_text_after: None,
         }
+    }
+
+    fn valid_caption_json(short_caption: &str) -> String {
+        format!(
+            r#"{{
+  "type": "diagram",
+  "short_caption": "{short_caption}",
+  "detailed_description": "A diagram shows an input flowing into an index.",
+  "visible_text": ["Input", "Index"],
+  "key_entities": ["Input", "Index"],
+  "relationships": [{{"from": "Input", "to": "Index", "label": "feeds"}}],
+  "answerable_questions": ["What feeds the index?"],
+  "uncertainties": ["The small footer text is not legible."]
+}}"#
+        )
+    }
+
+    #[test]
+    fn configured_vision_model_requires_explicit_enable() {
+        let partial: Config = toml::from_str(
+            r#"
+[vision]
+model = "local-vision"
+"#,
+        )
+        .unwrap();
+
+        let (model, model_name) = configured_vision_model(&partial);
+        assert!(model.is_none());
+        assert_eq!(model_name, "local-vision");
+
+        let enabled: Config = toml::from_str(
+            r#"
+[vision]
+enabled = true
+base_url = "http://127.0.0.1:8000/v1"
+model = "local-vision"
+"#,
+        )
+        .unwrap();
+
+        let (model, model_name) = configured_vision_model(&enabled);
+        assert!(model.is_some());
+        assert_eq!(model_name, "local-vision");
     }
 
     fn image_limit_error(err: &anyhow::Error) -> &ImageArtifactLimitError {
@@ -1593,6 +1862,243 @@ mod tests {
         assert!(!source_image_artifact_dir(tempdir.path(), &source.id)
             .unwrap()
             .exists());
+    }
+
+    #[tokio::test]
+    async fn pdf_image_caption_success_persists_derived_evidence_and_reuses_cache() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("image-fixture.pdf");
+        write_pdf_with_image(&path);
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", path);
+        store.add_source(&source).unwrap();
+        let vision = MockVisionModel::new(vec![valid_caption_json("An indexing flow diagram.")]);
+        let vision_calls = vision.clone();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_vision_model("local-vision", vision);
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert_eq!(vision_calls.call_count(), 1);
+        let caption_records = pipeline.store().list_image_captions().unwrap();
+        assert_eq!(caption_records.len(), 1);
+        assert_eq!(caption_records[0].status, ImageCaptionStatus::Success);
+        assert_eq!(caption_records[0].model, "local-vision");
+        assert_eq!(caption_records[0].prompt_hash, vision_caption_prompt_hash());
+        assert_eq!(caption_records[0].attempt_count, 1);
+        assert_eq!(caption_records[0].cache_hits, 0);
+        let generated = pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .filter(|unit| unit.kind == EvidenceKind::Generated)
+            .collect::<Vec<_>>();
+        assert_eq!(generated.len(), 1);
+        assert!(generated[0]
+            .text
+            .contains("Generated image caption (derived evidence"));
+        assert!(generated[0].text.contains("not exact OCR"));
+        assert!(matches!(
+            generated[0].locator,
+            SourceLocator::PdfImage {
+                page: 1,
+                image_index: 1,
+                ..
+            }
+        ));
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert_eq!(vision_calls.call_count(), 1);
+        let caption_records = pipeline.store().list_image_captions().unwrap();
+        assert_eq!(caption_records.len(), 1);
+        assert_eq!(caption_records[0].cache_hits, 1);
+        let generated_after_cache = pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .filter(|unit| unit.kind == EvidenceKind::Generated)
+            .collect::<Vec<_>>();
+        assert_eq!(generated_after_cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pdf_image_caption_disabled_preserves_successful_cache() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("image-fixture.pdf");
+        write_pdf_with_image(&path);
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", path);
+        store.add_source(&source).unwrap();
+        let vision = MockVisionModel::new(vec![valid_caption_json("An indexing flow diagram.")]);
+        let vision_calls = vision.clone();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_vision_model("local-vision", vision);
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+        let cached = pipeline.store().list_image_captions().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].status, ImageCaptionStatus::Success);
+        assert!(cached[0].caption.is_some());
+        assert!(cached[0].raw_response.is_some());
+
+        pipeline.vision_model = None;
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert_eq!(vision_calls.call_count(), 1);
+        let after_disabled = pipeline.store().list_image_captions().unwrap();
+        assert_eq!(after_disabled.len(), 1);
+        assert_eq!(after_disabled[0].status, ImageCaptionStatus::Success);
+        assert_eq!(after_disabled[0].caption, cached[0].caption);
+        assert_eq!(after_disabled[0].raw_response, cached[0].raw_response);
+        assert_eq!(after_disabled[0].attempt_count, cached[0].attempt_count);
+        assert_eq!(after_disabled[0].cache_hits, cached[0].cache_hits);
+    }
+
+    #[tokio::test]
+    async fn pdf_image_caption_repairs_malformed_json_once() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("image-fixture.pdf");
+        write_pdf_with_image(&path);
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", path);
+        store.add_source(&source).unwrap();
+        let vision = MockVisionModel::new(vec![
+            "not json".to_string(),
+            valid_caption_json("A repaired diagram caption."),
+        ]);
+        let vision_calls = vision.clone();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_vision_model("local-vision", vision);
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert_eq!(vision_calls.call_count(), 2);
+        let caption_records = pipeline.store().list_image_captions().unwrap();
+        assert_eq!(caption_records.len(), 1);
+        assert_eq!(caption_records[0].status, ImageCaptionStatus::Success);
+        assert_eq!(caption_records[0].attempt_count, 2);
+        let generated = pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .filter(|unit| unit.kind == EvidenceKind::Generated)
+            .collect::<Vec<_>>();
+        assert_eq!(generated.len(), 1);
+        assert!(generated[0].text.contains("A repaired diagram caption."));
+    }
+
+    #[tokio::test]
+    async fn pdf_image_caption_records_repair_failure_without_aborting_ingest() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("image-fixture.pdf");
+        write_pdf_with_image(&path);
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", path);
+        store.add_source(&source).unwrap();
+        let vision = MockVisionModel::new(vec![
+            "not json".to_string(),
+            r#"{"type":"photo"}"#.to_string(),
+        ]);
+        let vision_calls = vision.clone();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_vision_model("local-vision", vision);
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert_eq!(vision_calls.call_count(), 2);
+        let stored_source = pipeline
+            .store()
+            .get_source(&source.id)
+            .unwrap()
+            .expect("source should remain indexed");
+        assert_eq!(stored_source.status, SourceStatus::Indexed);
+        assert_eq!(
+            pipeline
+                .store()
+                .list_image_artifacts_by_source(&source.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let caption_records = pipeline.store().list_image_captions().unwrap();
+        assert_eq!(caption_records.len(), 1);
+        assert_eq!(caption_records[0].status, ImageCaptionStatus::Failed);
+        assert_eq!(caption_records[0].attempt_count, 2);
+        assert!(caption_records[0]
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("caption JSON repair failed"));
+        let generated = pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap()
+            .into_iter()
+            .filter(|unit| unit.kind == EvidenceKind::Generated)
+            .count();
+        assert_eq!(generated, 0);
+    }
+
+    #[tokio::test]
+    async fn pdf_image_caption_disabled_records_skip_and_keeps_text_ingest() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("text-and-image.pdf");
+        write_pdf_with_text_and_image_filter(&path, None, &[255u8; 8 * 8 * 3]);
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", path);
+        store.add_source(&source).unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        let evidence = pipeline
+            .store()
+            .list_evidence_by_source(&source.id)
+            .unwrap();
+        assert!(evidence.iter().any(|unit| {
+            unit.kind == EvidenceKind::Text
+                && unit.text.contains("Unsupported image filter text evidence")
+        }));
+        assert!(evidence
+            .iter()
+            .all(|unit| unit.kind != EvidenceKind::Generated));
+        let caption_records = pipeline.store().list_image_captions().unwrap();
+        assert_eq!(caption_records.len(), 1);
+        assert_eq!(caption_records[0].status, ImageCaptionStatus::Skipped);
+        assert!(caption_records[0]
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("disabled or not configured"));
     }
 
     #[tokio::test]
