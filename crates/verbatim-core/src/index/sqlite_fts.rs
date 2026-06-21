@@ -171,7 +171,8 @@ mod tests {
     use super::*;
     use crate::store::Store;
     use crate::types::{
-        Chunk, ChunkType, EvidenceId, EvidenceUnit, Source, SourceLocator, SourceStatus,
+        Chunk, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, Source, SourceLocator,
+        SourceStatus,
     };
     use std::path::PathBuf;
 
@@ -190,6 +191,7 @@ mod tests {
         EvidenceUnit {
             id: EvidenceId(id.into()),
             source_id: source_id.clone(),
+            kind: EvidenceKind::Text,
             locator: SourceLocator::Document {
                 path_or_url: source_id.0.clone(),
                 line_start: 1,

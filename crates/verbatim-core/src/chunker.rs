@@ -214,13 +214,14 @@ fn build_parent(source_id: &SourceId, children: &[Chunk], counter: &mut usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SourceLocator;
+    use crate::types::{EvidenceKind, SourceLocator};
 
     fn make_evidence(n: usize, heading: &str) -> Vec<EvidenceUnit> {
         (0..n)
             .map(|i| EvidenceUnit {
                 id: EvidenceId(format!("ev-{i}")),
                 source_id: SourceId("test".into()),
+                kind: EvidenceKind::Text,
                 locator: SourceLocator::Pdf {
                     page: 1,
                     paragraph: i as u32,

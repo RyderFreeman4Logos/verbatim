@@ -289,7 +289,9 @@ Rules:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Chunk, ChunkId, ChunkType, EvidenceId, SourceId, SourceLocator};
+    use crate::types::{
+        Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, SourceId, SourceLocator,
+    };
 
     fn sample_results() -> Vec<RetrievalResult> {
         vec![RetrievalResult {
@@ -310,6 +312,7 @@ mod tests {
                 EvidenceUnit {
                     id: EvidenceId("ev-1".into()),
                     source_id: SourceId("src".into()),
+                    kind: EvidenceKind::Text,
                     locator: SourceLocator::Pdf {
                         page: 42,
                         paragraph: 3,
@@ -323,6 +326,7 @@ mod tests {
                 EvidenceUnit {
                     id: EvidenceId("ev-2".into()),
                     source_id: SourceId("src".into()),
+                    kind: EvidenceKind::Text,
                     locator: SourceLocator::Document {
                         path_or_url: "doc.md".into(),
                         line_start: 10,

@@ -1,3 +1,5 @@
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
+mod bounded_pdf_images;
 pub mod markdown;
 #[cfg(feature = "parser-pdf-oxide")]
 pub mod oxide;

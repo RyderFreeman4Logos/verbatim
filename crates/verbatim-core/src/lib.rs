@@ -3,6 +3,7 @@ pub mod config;
 pub mod context;
 pub mod embed;
 pub mod generate;
+pub mod image_limits;
 pub mod index;
 pub mod ingest;
 pub mod parser;

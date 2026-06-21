@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::traits::VectorDocument;
 use crate::types::{
-    Chunk, ChunkId, ChunkType, EvidenceId, EvidenceUnit, Source, SourceId, SourceStatus,
+    Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, ImageId,
+    Source, SourceId, SourceStatus,
 };
 
 pub struct Store {
@@ -31,6 +32,12 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         self.conn.execute_batch(SCHEMA)?;
+        ensure_column(
+            &self.conn,
+            "evidence_units",
+            "kind",
+            "ALTER TABLE evidence_units ADD COLUMN kind TEXT NOT NULL DEFAULT 'Text'",
+        )?;
         Ok(())
     }
 
@@ -118,6 +125,7 @@ impl Store {
         chunks: &[Chunk],
         vectors: &[VectorDocument],
         links: &[(ChunkId, EvidenceId)],
+        image_artifacts: &[ImageArtifact],
     ) -> Result<u64> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM sources WHERE id = ?1", params![&source.id.0])?;
@@ -133,26 +141,7 @@ impl Store {
             ],
         )?;
 
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO evidence_units (id, source_id, locator_json, text, text_hash, heading_path_json, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-            )?;
-            for unit in evidence {
-                let locator_json =
-                    serde_json::to_string(&unit.locator).context("serialize locator")?;
-                let heading_json =
-                    serde_json::to_string(&unit.heading_path).context("serialize heading_path")?;
-                stmt.execute(params![
-                    &unit.id.0,
-                    &unit.source_id.0,
-                    locator_json,
-                    &unit.text,
-                    &unit.text_hash,
-                    heading_json,
-                    unit.position,
-                ])?;
-            }
-        }
+        insert_evidence_units_tx(&tx, evidence)?;
 
         {
             let mut stmt = tx.prepare(
@@ -183,6 +172,7 @@ impl Store {
             }
         }
 
+        insert_image_artifacts_tx(&tx, image_artifacts)?;
         replace_vector_documents_tx(&tx, vectors)?;
 
         let generation = bump_index_generation(&tx)?;
@@ -243,95 +233,62 @@ impl Store {
 
     pub fn bulk_insert_evidence(&self, units: &[EvidenceUnit]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO evidence_units (id, source_id, locator_json, text, text_hash, heading_path_json, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-            )?;
-            for u in units {
-                let locator_json =
-                    serde_json::to_string(&u.locator).context("serialize locator")?;
-                let heading_json =
-                    serde_json::to_string(&u.heading_path).context("serialize heading_path")?;
-                stmt.execute(params![
-                    u.id.0,
-                    u.source_id.0,
-                    locator_json,
-                    u.text,
-                    u.text_hash,
-                    heading_json,
-                    u.position,
-                ])?;
-            }
-        }
+        insert_evidence_units_tx(&tx, units)?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn get_evidence(&self, id: &EvidenceId) -> Result<Option<EvidenceUnit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, locator_json, text, text_hash, heading_path_json, position FROM evidence_units WHERE id = ?1"
+            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, position FROM evidence_units WHERE id = ?1"
         )?;
-        let mut rows = stmt.query_map(params![id.0], |row| {
-            let locator_json: String = row.get(2)?;
-            let heading_json: String = row.get(5)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                locator_json,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                heading_json,
-                row.get::<_, u32>(6)?,
-            ))
-        })?;
+        let mut rows = stmt.query_map(params![id.0], row_to_evidence_unit)?;
         match rows.next() {
-            Some(r) => {
-                let (id, source_id, locator_json, text, text_hash, heading_json, position) = r?;
-                Ok(Some(EvidenceUnit {
-                    id: EvidenceId(id),
-                    source_id: SourceId(source_id),
-                    locator: serde_json::from_str(&locator_json)?,
-                    text,
-                    text_hash,
-                    heading_path: serde_json::from_str(&heading_json)?,
-                    position,
-                }))
-            }
+            Some(r) => Ok(Some(r?)),
             None => Ok(None),
         }
     }
 
     pub fn list_evidence_by_source(&self, source_id: &SourceId) -> Result<Vec<EvidenceUnit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, locator_json, text, text_hash, heading_path_json, position FROM evidence_units WHERE source_id = ?1 ORDER BY position"
+            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, position FROM evidence_units WHERE source_id = ?1 ORDER BY position"
         )?;
-        let rows = stmt.query_map(params![source_id.0], |row| {
-            let locator_json: String = row.get(2)?;
-            let heading_json: String = row.get(5)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                locator_json,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                heading_json,
-                row.get::<_, u32>(6)?,
-            ))
-        })?;
-        let mut result = Vec::new();
-        for r in rows {
-            let (id, source_id, locator_json, text, text_hash, heading_json, position) = r?;
-            result.push(EvidenceUnit {
-                id: EvidenceId(id),
-                source_id: SourceId(source_id),
-                locator: serde_json::from_str(&locator_json)?,
-                text,
-                text_hash,
-                heading_path: serde_json::from_str(&heading_json)?,
-                position,
-            });
+        let rows = stmt.query_map(params![source_id.0], row_to_evidence_unit)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    // --- ImageArtifact ---
+
+    pub fn bulk_insert_image_artifacts(&self, artifacts: &[ImageArtifact]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        insert_image_artifacts_tx(&tx, artifacts)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_image_artifacts_by_source(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<Vec<ImageArtifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT image_id, source_id, evidence_unit_id, relative_path, content_hash, mime_type, width, height, page, image_index, bbox_json FROM image_artifacts WHERE source_id = ?1 ORDER BY page, image_index"
+        )?;
+        let rows = stmt.query_map(params![source_id.0], row_to_image_artifact)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn get_image_artifact_by_evidence(
+        &self,
+        evidence_id: &EvidenceId,
+    ) -> Result<Option<ImageArtifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT image_id, source_id, evidence_unit_id, relative_path, content_hash, mime_type, width, height, page, image_index, bbox_json FROM image_artifacts WHERE evidence_unit_id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![evidence_id.0], row_to_image_artifact)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
         }
-        Ok(result)
     }
 
     // --- Chunk ---
@@ -389,7 +346,7 @@ impl Store {
 
     pub fn list_child_chunks(&self) -> Result<Vec<Chunk>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json FROM chunks WHERE chunk_type = 'Child' ORDER BY source_id, id"
+        "SELECT id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json FROM chunks WHERE chunk_type = 'Child' ORDER BY source_id, id"
         )?;
         let rows = stmt.query_map([], row_to_chunk_tuple)?;
         let mut result = Vec::new();
@@ -486,6 +443,130 @@ impl Store {
         }
         Ok(result)
     }
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+    conn.execute_batch(alter_sql)?;
+    Ok(())
+}
+
+fn insert_evidence_units_tx(tx: &Transaction<'_>, units: &[EvidenceUnit]) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO evidence_units (id, source_id, kind, locator_json, text, text_hash, heading_path_json, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+    )?;
+    for unit in units {
+        let locator_json = serde_json::to_string(&unit.locator).context("serialize locator")?;
+        let heading_json =
+            serde_json::to_string(&unit.heading_path).context("serialize heading_path")?;
+        stmt.execute(params![
+            &unit.id.0,
+            &unit.source_id.0,
+            evidence_kind_to_str(unit.kind),
+            locator_json,
+            &unit.text,
+            &unit.text_hash,
+            heading_json,
+            unit.position,
+        ])?;
+    }
+    Ok(())
+}
+
+fn row_to_evidence_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceUnit> {
+    let id: String = row.get(0)?;
+    let source_id: String = row.get(1)?;
+    let kind: String = row.get(2)?;
+    let locator_json: String = row.get(3)?;
+    let text: String = row.get(4)?;
+    let text_hash: String = row.get(5)?;
+    let heading_json: String = row.get(6)?;
+    let position: u32 = row.get(7)?;
+
+    let locator = serde_json::from_str(&locator_json)
+        .map_err(|err| from_json_error(3, "SourceLocator", err))?;
+    let heading_path = serde_json::from_str(&heading_json)
+        .map_err(|err| from_json_error(6, "Vec<String>", err))?;
+
+    Ok(EvidenceUnit {
+        id: EvidenceId(id),
+        source_id: SourceId(source_id),
+        kind: str_to_evidence_kind(&kind),
+        locator,
+        text,
+        text_hash,
+        heading_path,
+        position,
+    })
+}
+
+fn insert_image_artifacts_tx(tx: &Transaction<'_>, artifacts: &[ImageArtifact]) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO image_artifacts (image_id, source_id, evidence_unit_id, relative_path, content_hash, mime_type, width, height, page, image_index, bbox_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+    )?;
+    for artifact in artifacts {
+        let bbox_json = artifact
+            .bbox
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize image bbox")?;
+        stmt.execute(params![
+            &artifact.image_id.0,
+            &artifact.source_id.0,
+            &artifact.evidence_id.0,
+            artifact.relative_path.to_string_lossy(),
+            &artifact.content_hash,
+            &artifact.mime_type,
+            artifact.width,
+            artifact.height,
+            artifact.page,
+            artifact.image_index,
+            bbox_json,
+        ])?;
+    }
+    Ok(())
+}
+
+fn row_to_image_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageArtifact> {
+    let bbox_json: Option<String> = row.get(10)?;
+    let bbox = match bbox_json {
+        Some(json) => {
+            Some(serde_json::from_str(&json).map_err(|err| from_json_error(10, "BBox", err))?)
+        }
+        None => None,
+    };
+
+    Ok(ImageArtifact {
+        image_id: ImageId(row.get(0)?),
+        source_id: SourceId(row.get(1)?),
+        evidence_id: EvidenceId(row.get(2)?),
+        relative_path: PathBuf::from(row.get::<_, String>(3)?),
+        content_hash: row.get(4)?,
+        mime_type: row.get(5)?,
+        width: row.get(6)?,
+        height: row.get(7)?,
+        page: row.get(8)?,
+        image_index: row.get(9)?,
+        bbox,
+    })
+}
+
+fn from_json_error(idx: usize, ty: &'static str, err: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        idx,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("parse {ty}: {err}"),
+        )),
+    )
 }
 
 type ChunkTuple = (
@@ -590,6 +671,20 @@ fn str_to_status(s: &str) -> SourceStatus {
     }
 }
 
+fn evidence_kind_to_str(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::Text => "Text",
+        EvidenceKind::Image => "Image",
+    }
+}
+
+fn str_to_evidence_kind(kind: &str) -> EvidenceKind {
+    match kind {
+        "Image" => EvidenceKind::Image,
+        _ => EvidenceKind::Text,
+    }
+}
+
 fn chunk_type_to_str(ct: &ChunkType) -> &'static str {
     match ct {
         ChunkType::Child => "Child",
@@ -616,11 +711,25 @@ CREATE TABLE IF NOT EXISTS sources (
 CREATE TABLE IF NOT EXISTS evidence_units (
     id TEXT PRIMARY KEY,
     source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'Text',
     locator_json TEXT NOT NULL,
     text TEXT NOT NULL,
     text_hash TEXT NOT NULL,
     heading_path_json TEXT,
     position INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS image_artifacts (
+    image_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
+    relative_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    page INTEGER NOT NULL,
+    image_index INTEGER NOT NULL,
+    bbox_json TEXT
 );
 CREATE TABLE IF NOT EXISTS chunks (
     id TEXT PRIMARY KEY,
@@ -707,7 +816,7 @@ END;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SourceLocator;
+    use crate::types::{BBox, SourceLocator};
     use std::path::PathBuf;
 
     fn sample_source() -> Source {
@@ -726,6 +835,7 @@ mod tests {
             EvidenceUnit {
                 id: EvidenceId("ev-1".into()),
                 source_id: SourceId(source_id.into()),
+                kind: EvidenceKind::Text,
                 locator: SourceLocator::Pdf {
                     page: 1,
                     paragraph: 1,
@@ -739,6 +849,7 @@ mod tests {
             EvidenceUnit {
                 id: EvidenceId("ev-2".into()),
                 source_id: SourceId(source_id.into()),
+                kind: EvidenceKind::Text,
                 locator: SourceLocator::Pdf {
                     page: 1,
                     paragraph: 2,
@@ -777,6 +888,27 @@ mod tests {
                 evidence_unit_ids: vec![],
             },
         ]
+    }
+
+    fn sample_image_artifact(source_id: &str, evidence_id: &str) -> ImageArtifact {
+        ImageArtifact {
+            image_id: ImageId("src-1:img:abc".into()),
+            source_id: SourceId(source_id.into()),
+            evidence_id: EvidenceId(evidence_id.into()),
+            relative_path: PathBuf::from("image-artifacts/src-1/src-1-img-abc.png"),
+            content_hash: "image-hash".into(),
+            mime_type: "image/png".into(),
+            width: 16,
+            height: 8,
+            page: 1,
+            image_index: 1,
+            bbox: Some(BBox {
+                x0: 1.0,
+                y0: 2.0,
+                x1: 3.0,
+                y1: 4.0,
+            }),
+        }
     }
 
     #[test]
@@ -818,6 +950,7 @@ mod tests {
             .list_evidence_by_source(&SourceId("src-1".into()))
             .unwrap();
         assert_eq!(ev_list.len(), 2);
+        assert_eq!(ev_list[0].kind, EvidenceKind::Text);
 
         let chunks = sample_chunks("src-1");
         store.bulk_insert_chunks(&chunks).unwrap();
@@ -866,7 +999,17 @@ mod tests {
                 vector: vec![1.0, 0.0],
             }])
             .unwrap();
+        store
+            .bulk_insert_image_artifacts(&[sample_image_artifact("src-1", "ev-1")])
+            .unwrap();
         assert_eq!(store.list_vector_documents().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_image_artifacts_by_source(&SourceId("src-1".into()))
+                .unwrap()
+                .len(),
+            1
+        );
 
         store.remove_source(&SourceId("src-1".into())).unwrap();
 
@@ -883,6 +1026,40 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(store.list_vector_documents().unwrap().is_empty());
+        assert!(store
+            .list_image_artifacts_by_source(&SourceId("src-1".into()))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn image_artifact_lookup_by_evidence() {
+        let store = Store::in_memory().unwrap();
+        store.add_source(&sample_source()).unwrap();
+        store
+            .bulk_insert_evidence(&sample_evidence("src-1"))
+            .unwrap();
+
+        store
+            .bulk_insert_image_artifacts(&[sample_image_artifact("src-1", "ev-1")])
+            .unwrap();
+
+        let artifact = store
+            .get_image_artifact_by_evidence(&EvidenceId("ev-1".into()))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(artifact.image_index, 1);
+        assert_eq!(artifact.mime_type, "image/png");
+        assert_eq!(
+            artifact.bbox,
+            Some(BBox {
+                x0: 1.0,
+                y0: 2.0,
+                x1: 3.0,
+                y1: 4.0,
+            })
+        );
     }
 
     #[test]
