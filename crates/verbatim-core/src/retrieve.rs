@@ -798,7 +798,11 @@ impl<'a> RetrievalPipeline<'a> {
                 };
                 self.result_for_evidence_id(artifact.evidence_id, score, provenance)
             }
-            GraphNodeKind::Source | GraphNodeKind::Page | GraphNodeKind::Section => Ok(None),
+            GraphNodeKind::Source
+            | GraphNodeKind::Page
+            | GraphNodeKind::Section
+            | GraphNodeKind::GeneratedEntity
+            | GraphNodeKind::GeneratedClaim => Ok(None),
         }
     }
 
@@ -1708,6 +1712,7 @@ mod tests {
             max_expanded_chunks: 30,
             max_neighbors_per_seed: 6,
             edge_types,
+            extraction: Default::default(),
         }
     }
 

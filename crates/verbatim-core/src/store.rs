@@ -1196,6 +1196,8 @@ fn str_to_graph_node_kind(value: &str, column: usize) -> rusqlite::Result<GraphN
         "Chunk" => Ok(GraphNodeKind::Chunk),
         "EvidenceUnit" => Ok(GraphNodeKind::EvidenceUnit),
         "ImageArtifact" => Ok(GraphNodeKind::ImageArtifact),
+        "GeneratedEntity" => Ok(GraphNodeKind::GeneratedEntity),
+        "GeneratedClaim" => Ok(GraphNodeKind::GeneratedClaim),
         _ => Err(invalid_text_value(
             column,
             format!("unknown graph node kind: {value}"),
@@ -1217,6 +1219,12 @@ fn str_to_edge_type(value: &str, column: usize) -> rusqlite::Result<EdgeType> {
         "page_contains_image" => Ok(EdgeType::PageContainsImage),
         "image_near_text" => Ok(EdgeType::ImageNearText),
         "markdown_links_to" => Ok(EdgeType::MarkdownLinksTo),
+        "generated_depends_on" => Ok(EdgeType::GeneratedDependsOn),
+        "generated_implements" => Ok(EdgeType::GeneratedImplements),
+        "generated_mentions" => Ok(EdgeType::GeneratedMentions),
+        "generated_conflicts_with" => Ok(EdgeType::GeneratedConflictsWith),
+        "generated_supports" => Ok(EdgeType::GeneratedSupports),
+        "generated_other" => Ok(EdgeType::GeneratedOther),
         _ => Err(invalid_text_value(
             column,
             format!("unknown graph edge type: {value}"),

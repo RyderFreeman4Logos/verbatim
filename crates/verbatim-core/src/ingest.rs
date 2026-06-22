@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::chunker::{chunk_evidence, estimate_tokens, ChunkOutput, ChunkerConfig};
-use crate::config::Config;
+use crate::config::{Config, GraphExtractionConfig};
 use crate::context::ContextGenerator;
 use crate::embed::OpenAiEmbeddingClient;
+use crate::graph_extraction::GraphExtractor;
 use crate::image_limits::{
     ImageArtifactBudget, ImageArtifactLimitError, ImageArtifactLimitStage, ImageArtifactLimits,
 };
@@ -37,6 +38,8 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     embed_client: E,
     context_gen: Option<ContextGenerator>,
     vision_model: Option<Box<dyn VisionModel>>,
+    graph_extractor: Option<GraphExtractor>,
+    graph_extraction_config: GraphExtractionConfig,
     vision_caption_model: String,
     vision_caption_prompt_hash: String,
     data_dir: PathBuf,
@@ -105,6 +108,12 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             None
         };
         let (vision_model, vision_caption_model) = configured_vision_model(config);
+        let graph_extraction_config = config.graph.extraction.clone();
+        let graph_extractor = if graph_extraction_config.enabled && config.chat.enabled {
+            Some(GraphExtractor::from_config(&config.chat))
+        } else {
+            None
+        };
 
         Ok(Self {
             store,
@@ -112,6 +121,8 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             embed_client,
             context_gen,
             vision_model,
+            graph_extractor,
+            graph_extraction_config,
             vision_caption_model,
             vision_caption_prompt_hash: vision_caption_prompt_hash(),
             data_dir: data_dir.to_path_buf(),
@@ -148,6 +159,8 @@ where
             embed_client,
             context_gen: None,
             vision_model: None,
+            graph_extractor: None,
+            graph_extraction_config: GraphExtractionConfig::default(),
             vision_caption_model: "vision-disabled".to_string(),
             vision_caption_prompt_hash: vision_caption_prompt_hash(),
             data_dir,
@@ -162,6 +175,17 @@ where
     {
         self.vision_caption_model = model_name.into();
         self.vision_model = Some(Box::new(vision_model));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_graph_extractor(
+        mut self,
+        config: GraphExtractionConfig,
+        graph_extractor: GraphExtractor,
+    ) -> Self {
+        self.graph_extraction_config = config;
+        self.graph_extractor = Some(graph_extractor);
         self
     }
 
@@ -292,7 +316,7 @@ where
         chunks.extend(caption_output.chunks);
         links.extend(caption_output.links);
         evidence.extend(caption_evidence);
-        let (graph_nodes, graph_edges) = build_evidence_graph(
+        let (mut graph_nodes, mut graph_edges) = build_evidence_graph(
             &new_source,
             &evidence,
             &chunks,
@@ -300,6 +324,8 @@ where
             &prepared_image_artifacts.artifacts,
             &prepared_image_artifacts.text_proximities,
         );
+        self.append_generated_graph(&new_source, &chunks, &mut graph_nodes, &mut graph_edges)
+            .await;
 
         let mut child_chunks = self.child_chunks_without_source(source_id)?;
         child_chunks.extend(
@@ -355,6 +381,54 @@ where
 
         tracing::info!(source = %source_id.0, "ingest complete");
         Ok(())
+    }
+
+    async fn append_generated_graph(
+        &self,
+        source: &Source,
+        chunks: &[Chunk],
+        graph_nodes: &mut Vec<GraphNode>,
+        graph_edges: &mut Vec<GraphEdge>,
+    ) {
+        if !self.graph_extraction_config.enabled {
+            return;
+        }
+
+        let Some(extractor) = &self.graph_extractor else {
+            tracing::warn!(
+                source = %source.id.0,
+                "llm graph extraction enabled but chat model is disabled; continuing without generated graph data"
+            );
+            return;
+        };
+
+        match extractor
+            .extract(source, chunks, &self.graph_extraction_config)
+            .await
+        {
+            Ok(outcome) => {
+                tracing::info!(
+                    source = %source.id.0,
+                    selected_chunks = outcome.stats.selected_chunk_count,
+                    entities = outcome.stats.entity_count,
+                    relationships = outcome.stats.relationship_count,
+                    claims = outcome.stats.claim_count,
+                    dropped = outcome.stats.dropped_item_count,
+                    attempts = outcome.stats.attempt_count,
+                    response_truncated = outcome.stats.response_truncated,
+                    "llm graph extraction complete"
+                );
+                graph_nodes.extend(outcome.nodes);
+                graph_edges.extend(outcome.edges);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    source = %source.id.0,
+                    reason = %bounded_graph_extraction_error(&err, self.graph_extraction_config.max_error_chars),
+                    "llm graph extraction failed; continuing with deterministic graph data"
+                );
+            }
+        }
     }
 
     pub async fn ingest_all(&mut self, force: bool) -> Result<usize> {
@@ -1399,6 +1473,10 @@ fn chunk_type_label(chunk_type: &ChunkType) -> &'static str {
     }
 }
 
+fn bounded_graph_extraction_error(error: &anyhow::Error, max_chars: usize) -> String {
+    error.to_string().chars().take(max_chars.min(512)).collect()
+}
+
 fn normalize_evidence_source_ids(
     evidence: &mut [crate::types::EvidenceUnit],
     source_id: &SourceId,
@@ -1839,13 +1917,17 @@ mod tests {
     use super::*;
     use anyhow::bail;
     use async_trait::async_trait;
+    use futures::StreamExt;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use crate::config::RetrievalConfig;
     use crate::image_limits::ImageArtifactLimitError;
-    use crate::provider::{ImageDescribeRequest, ImageDescription, ProviderResult, VisionModel};
+    use crate::provider::{
+        ChatMessageContent, ChatModel, ChatRequest, ChatResponse, ChatStream, ImageDescribeRequest,
+        ImageDescription, ProviderError, ProviderResult, TokenUsage, VisionModel,
+    };
     use crate::retrieve::RetrievalPipeline;
     use crate::types::{
         ChunkId, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge, GraphNode,
@@ -1945,6 +2027,109 @@ mod tests {
                 .expect("mock vision response should be available");
             Ok(ImageDescription { text })
         }
+    }
+
+    #[derive(Clone)]
+    struct MockGraphChatModel {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl MockGraphChatModel {
+        fn succeeds() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            }
+        }
+
+        fn fails() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ChatModel for MockGraphChatModel {
+        async fn chat(&self, req: ChatRequest) -> ProviderResult<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(ProviderError::MalformedResponse {
+                    operation: "test graph extraction",
+                    message: "provider unavailable".to_string(),
+                });
+            }
+            let chunk_id = first_prompt_chunk_id(&req).unwrap_or_else(|| "missing-chunk".into());
+            Ok(ChatResponse {
+                content: generated_graph_response(&chunk_id),
+                finish_reason: None,
+                usage: Some(TokenUsage {
+                    prompt_tokens: Some(1),
+                    completion_tokens: Some(1),
+                    total_tokens: Some(2),
+                }),
+            })
+        }
+
+        async fn stream_chat(&self, _req: ChatRequest) -> ProviderResult<ChatStream> {
+            Ok(futures::stream::empty().boxed())
+        }
+    }
+
+    fn first_prompt_chunk_id(req: &ChatRequest) -> Option<String> {
+        req.messages.iter().find_map(|message| {
+            let ChatMessageContent::Text(text) = &message.content else {
+                return None;
+            };
+            let (_, rest) = text.split_once("<chunk id=\"")?;
+            let (chunk_id, _) = rest.split_once('"')?;
+            Some(chunk_id.to_string())
+        })
+    }
+
+    fn generated_graph_response(chunk_id: &str) -> String {
+        serde_json::json!({
+            "entities": [
+                {
+                    "name": "Feature A",
+                    "type": "feature",
+                    "description": "An extracted feature",
+                    "source_spans": [format!("{chunk_id}:1-1")]
+                },
+                {
+                    "name": "Component B",
+                    "type": "component",
+                    "description": "An extracted component",
+                    "source_spans": [format!("{chunk_id}:1-1")]
+                }
+            ],
+            "relationships": [
+                {
+                    "source": "Feature A",
+                    "target": "Component B",
+                    "type": "supports",
+                    "description": "Feature A supports Component B.",
+                    "confidence": 0.75,
+                    "source_spans": [format!("{chunk_id}:1-1")]
+                }
+            ],
+            "claims": [
+                {
+                    "claim": "Feature A supports Component B.",
+                    "subject": "Feature A",
+                    "predicate": "supports",
+                    "object": "Component B",
+                    "source_spans": [format!("{chunk_id}:1-1")]
+                }
+            ]
+        })
+        .to_string()
     }
 
     fn test_source(id: &str, path: PathBuf) -> Source {
@@ -2766,6 +2951,173 @@ model = "local-vision"
         assert!(pipeline
             .store()
             .list_graph_edges_by_source(&source.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn graph_extraction_disabled_does_not_call_chat_model() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("graph-extraction-disabled.md");
+        std::fs::write(&path, "Feature A supports Component B.\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-graph-extraction-disabled", path);
+        store.add_source(&source).unwrap();
+        let chat_model = MockGraphChatModel::succeeds();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_graph_extractor(
+            GraphExtractionConfig::default(),
+            GraphExtractor::from_chat_model(Arc::new(chat_model.clone())),
+        );
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert_eq!(chat_model.call_count(), 0);
+        assert!(pipeline
+            .store()
+            .list_graph_nodes_by_source(&source.id)
+            .unwrap()
+            .iter()
+            .all(|node| node.kind != GraphNodeKind::GeneratedEntity
+                && node.kind != GraphNodeKind::GeneratedClaim));
+    }
+
+    #[tokio::test]
+    async fn graph_extraction_stores_generated_rows_with_provenance_separate_from_deterministic_edges(
+    ) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("graph-extraction.md");
+        std::fs::write(&path, "Feature A supports Component B.\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-graph-extraction", path);
+        store.add_source(&source).unwrap();
+        let chat_model = MockGraphChatModel::succeeds();
+        let config = GraphExtractionConfig {
+            enabled: true,
+            max_chunks: 1,
+            max_retries: 0,
+            ..GraphExtractionConfig::default()
+        };
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_graph_extractor(
+            config,
+            GraphExtractor::from_chat_model(Arc::new(chat_model.clone())),
+        );
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert_eq!(chat_model.call_count(), 1);
+        let nodes = pipeline
+            .store()
+            .list_graph_nodes_by_source(&source.id)
+            .unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| node.kind == GraphNodeKind::GeneratedEntity)
+                .count(),
+            2
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| node.kind == GraphNodeKind::GeneratedClaim)
+                .count(),
+            1
+        );
+        assert!(nodes
+            .iter()
+            .filter(|node| {
+                node.kind == GraphNodeKind::GeneratedEntity
+                    || node.kind == GraphNodeKind::GeneratedClaim
+            })
+            .all(|node| node
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("origin"))
+                .and_then(serde_json::Value::as_str)
+                == Some("llm_generated")));
+
+        let generated_edges = pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::GeneratedSupports)
+            .unwrap();
+        assert_eq!(generated_edges.len(), 1);
+        assert_eq!(generated_edges[0].weight, Some(0.75));
+        assert_eq!(
+            generated_edges[0]
+                .metadata
+                .as_ref()
+                .and_then(|value| value.get("source_spans"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let deterministic_child_edges = pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::Child)
+            .unwrap();
+        assert!(!deterministic_child_edges.is_empty());
+        assert!(deterministic_child_edges.iter().all(|edge| edge
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("origin"))
+            .and_then(serde_json::Value::as_str)
+            != Some("llm_generated")));
+    }
+
+    #[tokio::test]
+    async fn graph_extraction_provider_failure_keeps_deterministic_ingest() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("graph-extraction-provider-failure.md");
+        std::fs::write(&path, "Feature A supports Component B.\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-graph-extraction-provider-failure", path);
+        store.add_source(&source).unwrap();
+        let chat_model = MockGraphChatModel::fails();
+        let config = GraphExtractionConfig {
+            enabled: true,
+            max_chunks: 1,
+            max_retries: 0,
+            ..GraphExtractionConfig::default()
+        };
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_graph_extractor(
+            config,
+            GraphExtractor::from_chat_model(Arc::new(chat_model.clone())),
+        );
+
+        pipeline.ingest_source(&source.id).await.unwrap();
+
+        assert_eq!(chat_model.call_count(), 1);
+        let nodes = pipeline
+            .store()
+            .list_graph_nodes_by_source(&source.id)
+            .unwrap();
+        assert!(nodes.iter().any(|node| node.kind == GraphNodeKind::Chunk));
+        assert!(nodes
+            .iter()
+            .all(|node| node.kind != GraphNodeKind::GeneratedEntity
+                && node.kind != GraphNodeKind::GeneratedClaim));
+        assert!(!pipeline
+            .store()
+            .list_graph_edges_by_type(&source.id, EdgeType::Child)
             .unwrap()
             .is_empty());
     }
