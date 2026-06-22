@@ -1918,6 +1918,7 @@ async fn run_daemon() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use verbatim_core::types::{
         Chunk, ChunkId, ChunkType, EvidenceUnit, RetrievalEvidenceRole, RetrievalProvenance,
         SourceLocator,
@@ -2098,6 +2099,63 @@ mod tests {
         assert!(response.debug.is_none());
     }
 
+    #[tokio::test]
+    async fn retrieve_handler_returns_context_pack_when_chat_is_disabled_and_unavailable() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("retrieve-chat-disabled");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Alpha retrieval evidence answers the context-only question.",
+        )
+        .unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        assert!(!config.chat.enabled);
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+
+        let state = Arc::new(AppState {
+            pipeline: std::sync::Mutex::new(pipeline),
+            generator: Generator::new(&config.chat, &config.verifier),
+            embed_client: OpenAiEmbeddingClient::new(&config.embedding),
+            reranker: Some(OpenAiCompatibleReranker::from_config(&config.rerank)),
+            config,
+            data_dir: test_dir.path().to_path_buf(),
+        });
+        let response = retrieve(
+            State(state),
+            Json(RetrieveRequest {
+                question: "Alpha context-only question?".into(),
+                source_id: Some(source_id.0.clone()),
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(1),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: false,
+                include_locator: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response.source_id.as_deref(), Some(source_id.0.as_str()));
+        assert_eq!(response.returned_results, 1);
+        assert_eq!(response.results[0].label, "E1");
+        assert!(response.results[0]
+            .snippet
+            .contains("Alpha retrieval evidence"));
+        assert!(model_server.embedding_requests() >= 2);
+        assert_eq!(model_server.chat_requests(), 0);
+    }
+
     fn test_retrieval_result(
         rank: usize,
         chunk_id: &str,
@@ -2140,6 +2198,157 @@ mod tests {
             evidence_units: vec![evidence],
             provenance: RetrievalProvenance::seed(rank, chunk_id, source_id),
         }
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let unique = format!(
+                "verbatim-daemon-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &FsPath {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct MockModelServer {
+        base_url: String,
+        embedding_requests: Arc<AtomicUsize>,
+        chat_requests: Arc<AtomicUsize>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockModelServer {
+        async fn start(dimension: usize) -> Self {
+            let state = MockModelState {
+                dimension,
+                embedding_requests: Arc::new(AtomicUsize::new(0)),
+                chat_requests: Arc::new(AtomicUsize::new(0)),
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route("/v1/embeddings", post(mock_embeddings))
+                .route("/v1/chat/completions", post(mock_forbidden_chat))
+                .with_state(state.clone());
+            let handle = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            Self {
+                base_url: format!("http://{addr}/v1"),
+                embedding_requests: state.embedding_requests,
+                chat_requests: state.chat_requests,
+                handle,
+            }
+        }
+
+        fn embedding_requests(&self) -> usize {
+            self.embedding_requests.load(Ordering::SeqCst)
+        }
+
+        fn chat_requests(&self) -> usize {
+            self.chat_requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for MockModelServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockModelState {
+        dimension: usize,
+        embedding_requests: Arc<AtomicUsize>,
+        chat_requests: Arc<AtomicUsize>,
+    }
+
+    async fn mock_embeddings(
+        State(state): State<MockModelState>,
+        Json(payload): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        state.embedding_requests.fetch_add(1, Ordering::SeqCst);
+        let input_count = payload
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        let embedding = {
+            let mut values = vec![0.0; state.dimension];
+            if let Some(first) = values.first_mut() {
+                *first = 1.0;
+            }
+            values
+        };
+        let data = (0..input_count)
+            .map(|_| serde_json::json!({ "embedding": embedding.clone() }))
+            .collect::<Vec<_>>();
+        Json(serde_json::json!({ "data": data }))
+    }
+
+    async fn mock_forbidden_chat(
+        State(state): State<MockModelState>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        state.chat_requests.fetch_add(1, Ordering::SeqCst);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "chat must not be called by retrieve" })),
+        )
+    }
+
+    fn retrieve_test_config(model_base_url: &str) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "embedding": {
+                "base_url": model_base_url,
+                "model": "test-embedding",
+                "dimension": 3,
+                "normalize": false,
+                "query_instruction": "",
+                "document_instruction": "",
+                "batch_size": 16,
+                "timeout_seconds": 1
+            },
+            "retrieval": {
+                "dense_top_k": 4,
+                "bm25_top_k": 4,
+                "rrf_k": 60,
+                "default_limit": 3,
+                "default_page_size": 1
+            },
+            "context": {
+                "enabled": false
+            },
+            "chat": {
+                "enabled": false,
+                "base_url": model_base_url,
+                "model": "chat-must-not-be-called",
+                "timeout_seconds": 1
+            },
+            "verifier": {
+                "enabled": false
+            }
+        }))
+        .unwrap()
     }
 
     #[tokio::test]
