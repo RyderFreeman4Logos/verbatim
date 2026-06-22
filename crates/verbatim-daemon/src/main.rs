@@ -27,7 +27,8 @@ use verbatim_core::ingest::IngestPipeline;
 use verbatim_core::retrieve::RetrievalPipeline;
 use verbatim_core::store::Store;
 use verbatim_core::types::{
-    BBox, CitationRef, EvidenceId, EvidenceKind, ImageArtifact, RetrievalResult, SourceId,
+    BBox, CitationRef, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug,
+    RetrievalRerankDebug, RetrievalResult, SourceId,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,6 +98,8 @@ struct AskRequest {
     question: String,
     #[serde(default)]
     source_id: Option<String>,
+    #[serde(default)]
+    show_retrieval: bool,
 }
 
 #[derive(Serialize)]
@@ -104,6 +107,8 @@ struct AskResponse {
     answer: String,
     citations: Vec<CitationResponse>,
     verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retrieval: Option<RetrievalDebug>,
 }
 
 #[derive(Serialize)]
@@ -349,12 +354,13 @@ async fn execute_ask(
 ) -> Result<AskResponse, (StatusCode, Json<ErrorResponse>)> {
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
+    let show_retrieval = req.show_retrieval;
 
     // Step 1: retrieve (involves !Send store + async embed)
     let state2 = Arc::clone(&state);
     let question2 = question.clone();
     let runtime = tokio::runtime::Handle::current();
-    let (results, generation_context) = tokio::task::spawn_blocking(move || {
+    let (results, generation_context, retrieval_debug) = tokio::task::spawn_blocking(move || {
         let pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let lexical_index = pipeline.lexical_index();
         let retrieval = RetrievalPipeline::new_with_graph(
@@ -365,8 +371,23 @@ async fn execute_ask(
             &state2.config.retrieval,
             &state2.config.graph,
         );
-        let results =
-            runtime.block_on(retrieval.search_filtered(&question2, source_filter.as_ref()))?;
+        let (results, mut retrieval_debug) = if show_retrieval {
+            let (results, debug) = runtime.block_on(
+                retrieval.search_filtered_with_debug(&question2, source_filter.as_ref()),
+            )?;
+            (results, Some(debug))
+        } else {
+            let results =
+                runtime.block_on(retrieval.search_filtered(&question2, source_filter.as_ref()))?;
+            (results, None)
+        };
+        if let Some(debug) = retrieval_debug.as_mut() {
+            debug.reranker = if state2.config.rerank.enabled {
+                RetrievalRerankDebug::skipped("not_run_by_current_ask_pipeline")
+            } else {
+                RetrievalRerankDebug::disabled()
+            };
+        }
         let image_artifacts = collect_image_artifacts_for_results(&results, pipeline.store())?;
         let image_attachments = select_image_attachments(
             &results,
@@ -377,6 +398,7 @@ async fn execute_ask(
         Ok::<_, anyhow::Error>((
             results,
             GenerationContext::new(image_artifacts, image_attachments),
+            retrieval_debug,
         ))
     })
     .await
@@ -408,6 +430,7 @@ async fn execute_ask(
             })
             .collect(),
         verified: gen_result.verified,
+        retrieval: retrieval_debug,
     })
 }
 
@@ -728,5 +751,62 @@ mod tests {
 
         assert!(!handled);
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn ask_request_defaults_retrieval_debug_off() {
+        let req: AskRequest =
+            serde_json::from_value(serde_json::json!({"question": "What is cited?"})).unwrap();
+
+        assert_eq!(req.question, "What is cited?");
+        assert!(req.source_id.is_none());
+        assert!(!req.show_retrieval);
+    }
+
+    #[test]
+    fn ask_response_omits_retrieval_when_debug_is_off() {
+        let response = AskResponse {
+            answer: "Answer [E1].".into(),
+            citations: Vec::new(),
+            verified: false,
+            retrieval: None,
+        };
+
+        let encoded = serde_json::to_value(response).unwrap();
+
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "answer": "Answer [E1].",
+                "citations": [],
+                "verified": false,
+            })
+        );
+    }
+
+    #[test]
+    fn ask_response_includes_structured_retrieval_when_requested() {
+        let response = AskResponse {
+            answer: "Answer [E1].".into(),
+            citations: Vec::new(),
+            verified: false,
+            retrieval: Some(RetrievalDebug {
+                bm25_hits: Vec::new(),
+                dense_hits: Vec::new(),
+                rrf_fused_hits: Vec::new(),
+                graph_expanded_hits: Vec::new(),
+                reranker: RetrievalRerankDebug::disabled(),
+                final_evidence_pack: Vec::new(),
+            }),
+        };
+
+        let encoded = serde_json::to_string(&response).unwrap();
+
+        assert!(encoded.contains("retrieval"));
+        assert!(encoded.contains("bm25_hits"));
+        assert!(encoded.contains("final_evidence_pack"));
+        assert!(encoded.contains("disabled"));
+        assert!(!encoded.contains("api_key"));
+        assert!(!encoded.contains("secret full raw source text"));
     }
 }
