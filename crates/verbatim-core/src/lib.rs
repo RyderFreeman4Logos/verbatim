@@ -5,6 +5,7 @@ pub mod context;
 pub mod embed;
 pub mod generate;
 pub mod graph_extraction;
+pub mod graphrag;
 pub mod image_limits;
 pub mod index;
 pub mod ingest;
