@@ -21,6 +21,9 @@ use super::{
 const CHAT_COMPLETIONS_PATH: &str = "chat/completions";
 const EMBEDDINGS_PATH: &str = "embeddings";
 const RERANK_PATH: &str = "rerank";
+const RERANK_V1_PATH: &str = "v1/rerank";
+const RERANK_V2_PATH: &str = "v2/rerank";
+const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 4096;
 
 /// OpenAI-compatible chat completion adapter.
 #[derive(Clone, Debug)]
@@ -178,6 +181,7 @@ impl OpenAiCompatibleEmbeddingModel {
 #[derive(Clone, Debug)]
 pub struct OpenAiCompatibleReranker {
     endpoint: OpenAiEndpoint,
+    provider: RerankProviderKind,
     default_top_n: usize,
 }
 
@@ -190,6 +194,7 @@ impl OpenAiCompatibleReranker {
                 &config.api_key,
                 config.timeout_seconds,
             ),
+            provider: RerankProviderKind::from_provider(&config.provider),
             default_top_n: config.top_n,
         }
     }
@@ -307,9 +312,10 @@ impl ProviderReranker for OpenAiCompatibleReranker {
             top_n,
         };
 
+        let paths = self.provider.rerank_paths(&self.endpoint.base_url);
         let response: OpenAiRerankResponse = self
             .endpoint
-            .post_json(RERANK_PATH, &body, "rerank")
+            .post_json_paths(&paths, &body, "rerank")
             .await?;
         let results = response.into_hits();
         if results.is_empty() && !body.documents.is_empty() {
@@ -319,6 +325,39 @@ impl ProviderReranker for OpenAiCompatibleReranker {
             ));
         }
         Ok(results)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RerankProviderKind {
+    Vllm,
+    Cohere,
+    Jina,
+    OpenAiCompatible,
+}
+
+impl RerankProviderKind {
+    fn from_provider(provider: &str) -> Self {
+        match provider.to_ascii_lowercase().as_str() {
+            "cohere" => Self::Cohere,
+            "jina" => Self::Jina,
+            "openai_compatible" => Self::OpenAiCompatible,
+            _ => Self::Vllm,
+        }
+    }
+
+    fn rerank_paths(self, base_url: &str) -> Vec<&'static str> {
+        let trimmed = base_url.trim_end_matches('/');
+        if trimmed.ends_with("/v1") || trimmed.ends_with("/v2") {
+            return vec![RERANK_PATH];
+        }
+
+        match self {
+            Self::Cohere => vec![RERANK_V2_PATH, RERANK_V1_PATH],
+            Self::Vllm | Self::Jina | Self::OpenAiCompatible => {
+                vec![RERANK_V1_PATH, RERANK_V2_PATH]
+            }
+        }
     }
 }
 
@@ -371,6 +410,33 @@ impl OpenAiEndpoint {
             .json::<T>()
             .await
             .map_err(|source| ProviderError::ResponseDecode { operation, source })
+    }
+
+    async fn post_json_paths<T: serde::de::DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        paths: &[&str],
+        body: &B,
+        operation: &'static str,
+    ) -> ProviderResult<T> {
+        let mut last_variant_error = None;
+        for (idx, path) in paths.iter().enumerate() {
+            match self.post_json(path, body, operation).await {
+                Ok(value) => return Ok(value),
+                Err(error @ ProviderError::HttpStatus { status, .. })
+                    if idx + 1 < paths.len()
+                        && matches!(
+                            status,
+                            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                        ) =>
+                {
+                    last_variant_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_variant_error.unwrap_or_else(|| {
+            ProviderError::configuration(operation, "no provider endpoint paths configured")
+        }))
     }
 
     async fn post<B: Serialize + ?Sized>(
@@ -471,14 +537,18 @@ struct OpenAiRerankResponse {
     results: Vec<OpenAiRerankResult>,
     #[serde(default)]
     data: Vec<OpenAiRerankResult>,
+    #[serde(default)]
+    rankings: Vec<OpenAiRerankResult>,
 }
 
 impl OpenAiRerankResponse {
     fn into_hits(self) -> Vec<RerankHit> {
-        let results = if self.results.is_empty() {
+        let results = if !self.results.is_empty() {
+            self.results
+        } else if !self.data.is_empty() {
             self.data
         } else {
-            self.results
+            self.rankings
         };
         results
             .into_iter()
@@ -492,8 +562,9 @@ impl OpenAiRerankResponse {
 
 #[derive(Debug, Deserialize)]
 struct OpenAiRerankResult {
+    #[serde(alias = "document_index")]
     index: usize,
-    #[serde(alias = "relevance_score")]
+    #[serde(alias = "relevance_score", alias = "rerank_score")]
     score: f32,
 }
 
@@ -528,16 +599,30 @@ async fn http_status_error(
     status: StatusCode,
     response: reqwest::Response,
 ) -> ProviderError {
-    let message = match response.text().await {
-        Ok(body) => openai_error_message(&body)
-            .unwrap_or_else(|| "provider returned a non-success response".to_string()),
-        Err(_) => "provider returned a non-success response".to_string(),
-    };
+    let body = bounded_response_text(response, MAX_PROVIDER_ERROR_BODY_BYTES).await;
+    let message = openai_error_message(&body)
+        .unwrap_or_else(|| "provider returned a non-success response".to_string());
     ProviderError::HttpStatus {
         operation,
         status,
         message,
     }
+}
+
+async fn bounded_response_text(mut response: reqwest::Response, max_bytes: usize) -> String {
+    let mut body = Vec::new();
+    while body.len() < max_bytes {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) | Err(_) => break,
+        };
+        let remaining = max_bytes - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() > remaining {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 fn openai_error_message(body: &str) -> Option<String> {
@@ -721,8 +806,88 @@ fn parse_sse_frame(frame: &str, pending: &mut VecDeque<ProviderResult<ChatStream
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ChatMessageContent, ImageInput};
+    use crate::provider::{
+        ChatMessageContent, ImageInput, RerankDoc, Reranker as ProviderReranker,
+    };
     use futures::stream;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    #[derive(Debug)]
+    struct RecordedRequest {
+        path: String,
+        body: String,
+    }
+
+    fn spawn_json_server(
+        status: &'static str,
+        response_body: &'static str,
+    ) -> (String, thread::JoinHandle<RecordedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = read_http_request(&mut stream);
+            write_http_response(&mut stream, status, response_body);
+            request
+        });
+        (base_url, handle)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> RecordedRequest {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 512];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).expect("read request");
+            assert!(read > 0, "request closed before headers");
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(position) = find_header_end(&buffer) {
+                break position;
+            }
+        };
+
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let body_start = header_end + 4;
+        while buffer.len().saturating_sub(body_start) < content_length {
+            let read = stream.read(&mut chunk).expect("read body");
+            assert!(read > 0, "request closed before body");
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+
+        let path = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string();
+        let body = String::from_utf8(buffer[body_start..body_start + content_length].to_vec())
+            .expect("request body utf8");
+
+        RecordedRequest { path, body }
+    }
+
+    fn find_header_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    }
 
     #[test]
     fn serializes_text_chat_request_shape() {
@@ -836,6 +1001,97 @@ mod tests {
             vec![RerankHit {
                 index: 1,
                 score: 0.8
+            }]
+        );
+
+        let response: OpenAiRerankResponse =
+            serde_json::from_str(r#"{"rankings":[{"document_index":3,"rerank_score":0.6}]}"#)
+                .expect("parse jina-style rerank ranking");
+        assert_eq!(
+            response.into_hits(),
+            vec![RerankHit {
+                index: 3,
+                score: 0.6
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn reranker_posts_vllm_request_to_v1_rerank() {
+        let (base_url, handle) = spawn_json_server(
+            "200 OK",
+            r#"{"results":[{"index":1,"relevance_score":0.93}]}"#,
+        );
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "rerank-model".into(),
+            top_n: 2,
+            timeout_seconds: 5,
+            api_key: String::new(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+
+        let hits = ProviderReranker::rerank(
+            &reranker,
+            "alpha?",
+            vec![RerankDoc::new("first"), RerankDoc::new("second")],
+            1,
+        )
+        .await
+        .expect("rerank request succeeds");
+        let request = handle.join().expect("server thread joins");
+        let body: serde_json::Value = serde_json::from_str(&request.body).expect("request json");
+
+        assert_eq!(request.path, "/v1/rerank");
+        assert_eq!(body["model"], "rerank-model");
+        assert_eq!(body["query"], "alpha?");
+        assert_eq!(body["documents"][0], "first");
+        assert_eq!(body["documents"][1], "second");
+        assert_eq!(body["top_n"], 1);
+        assert_eq!(
+            hits,
+            vec![RerankHit {
+                index: 1,
+                score: 0.93
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn reranker_posts_cohere_request_to_v2_rerank() {
+        let (base_url, handle) = spawn_json_server(
+            "200 OK",
+            r#"{"results":[{"index":0,"relevance_score":0.88}]}"#,
+        );
+        let config = RerankConfig {
+            enabled: true,
+            provider: "cohere".into(),
+            base_url,
+            model: "cohere-rerank".into(),
+            top_n: 1,
+            timeout_seconds: 5,
+            api_key: String::new(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+
+        let hits = ProviderReranker::rerank(
+            &reranker,
+            "alpha?",
+            vec![RerankDoc::new("first"), RerankDoc::new("second")],
+            1,
+        )
+        .await
+        .expect("rerank request succeeds");
+        let request = handle.join().expect("server thread joins");
+
+        assert_eq!(request.path, "/v2/rerank");
+        assert_eq!(
+            hits,
+            vec![RerankHit {
+                index: 0,
+                score: 0.88
             }]
         );
     }

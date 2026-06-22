@@ -278,6 +278,18 @@ where
     } else {
         writeln!(writer, "  {status}: {reason}")?;
     }
+    let provider = value_string(reranker, "provider");
+    let model = value_string(reranker, "model");
+    let top_n = value_string(reranker, "top_n");
+    let candidate_count = value_string(reranker, "candidate_count");
+    if !provider.is_empty() || !model.is_empty() || !top_n.is_empty() || !candidate_count.is_empty()
+    {
+        writeln!(
+            writer,
+            "  provider={} model={} top_n={} candidates={}",
+            provider, model, top_n, candidate_count
+        )?;
+    }
     let scores = reranker
         .get("scores")
         .and_then(Value::as_array)

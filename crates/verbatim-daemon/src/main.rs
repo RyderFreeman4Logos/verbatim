@@ -30,11 +30,11 @@ use verbatim_core::generate::{
     image_artifact_evidence_id, select_image_attachments, GenerationContext, Generator,
 };
 use verbatim_core::ingest::IngestPipeline;
+use verbatim_core::provider::openai_compatible::OpenAiCompatibleReranker;
 use verbatim_core::retrieve::RetrievalPipeline;
 use verbatim_core::store::Store;
 use verbatim_core::types::{
-    CitationRef, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug, RetrievalRerankDebug,
-    RetrievalResult, SourceId,
+    CitationRef, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug, RetrievalResult, SourceId,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,6 +53,7 @@ struct AppState {
     pipeline: std::sync::Mutex<IngestPipeline>,
     generator: Generator,
     embed_client: OpenAiEmbeddingClient,
+    reranker: Option<OpenAiCompatibleReranker>,
     config: Config,
     data_dir: PathBuf,
 }
@@ -380,7 +381,7 @@ async fn prepare_generation_context(
     let (results, generation_context, retrieval_debug) = tokio::task::spawn_blocking(move || {
         let pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let lexical_index = pipeline.lexical_index();
-        let retrieval = RetrievalPipeline::new_with_graph(
+        let mut retrieval = RetrievalPipeline::new_with_graph(
             pipeline.vector_index(),
             &lexical_index,
             pipeline.store(),
@@ -388,7 +389,10 @@ async fn prepare_generation_context(
             &state2.config.retrieval,
             &state2.config.graph,
         );
-        let (results, mut retrieval_debug) = if show_retrieval {
+        if let Some(reranker) = state2.reranker.as_ref() {
+            retrieval = retrieval.with_reranker(&state2.config.rerank, reranker);
+        }
+        let (results, retrieval_debug) = if show_retrieval {
             let (results, debug) = runtime.block_on(
                 retrieval.search_filtered_with_debug(&question2, source_filter.as_ref()),
             )?;
@@ -398,13 +402,6 @@ async fn prepare_generation_context(
                 runtime.block_on(retrieval.search_filtered(&question2, source_filter.as_ref()))?;
             (results, None)
         };
-        if let Some(debug) = retrieval_debug.as_mut() {
-            debug.reranker = if state2.config.rerank.enabled {
-                RetrievalRerankDebug::skipped("not_run_by_current_ask_pipeline")
-            } else {
-                RetrievalRerankDebug::disabled()
-            };
-        }
         let image_artifacts = collect_image_artifacts_for_results(&results, pipeline.store())?;
         let image_attachments = select_image_attachments(
             &results,
@@ -683,6 +680,10 @@ async fn run_daemon() -> Result<()> {
     let pipeline = IngestPipeline::new(&config, &data_dir)?;
     let generator = Generator::new(&config.chat, &config.verifier);
     let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+    let reranker = config
+        .rerank
+        .enabled
+        .then(|| OpenAiCompatibleReranker::from_config(&config.rerank));
 
     let bind_addr = config.daemon.bind.clone();
 
@@ -690,6 +691,7 @@ async fn run_daemon() -> Result<()> {
         pipeline: std::sync::Mutex::new(pipeline),
         generator,
         embed_client,
+        reranker,
         config,
         data_dir,
     });
@@ -806,7 +808,7 @@ mod tests {
                 dense_hits: Vec::new(),
                 rrf_fused_hits: Vec::new(),
                 graph_expanded_hits: Vec::new(),
-                reranker: RetrievalRerankDebug::disabled(),
+                reranker: verbatim_core::types::RetrievalRerankDebug::disabled(),
                 final_evidence_pack: Vec::new(),
             }),
         };

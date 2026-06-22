@@ -217,8 +217,9 @@ fn default_graph_edge_types() -> Vec<EdgeType> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankConfig {
+    #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_openai_provider")]
+    #[serde(default = "default_rerank_provider")]
     pub provider: String,
     #[serde(default = "default_rerank_base_url")]
     pub base_url: String,
@@ -236,7 +237,7 @@ impl Default for RerankConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: default_openai_provider(),
+            provider: default_rerank_provider(),
             base_url: default_rerank_base_url(),
             model: default_rerank_model(),
             top_n: 12,
@@ -246,12 +247,16 @@ impl Default for RerankConfig {
     }
 }
 
+fn default_rerank_provider() -> String {
+    "vllm".into()
+}
+
 fn default_rerank_base_url() -> String {
-    "http://127.0.0.1:8003/v1".into()
+    "http://127.0.0.1:8003".into()
 }
 
 fn default_rerank_model() -> String {
-    "Qwen/Qwen3-Reranker-8B".into()
+    "Qwen/Qwen3-Reranker-4B".into()
 }
 
 fn default_rerank_top_n() -> usize {
@@ -592,9 +597,9 @@ edge_types = ["parent", "previous", "next", "section_contains", "page_contains_i
 
 [rerank]
 enabled = false
-provider = "openai_compatible"
-base_url = "http://127.0.0.1:8003/v1"
-model = "Qwen/Qwen3-Reranker-8B"
+provider = "vllm"              # vllm | cohere | jina
+base_url = "http://127.0.0.1:8003"
+model = "Qwen/Qwen3-Reranker-4B"
 top_n = 12
 timeout_seconds = 120
 api_key = ""
@@ -685,7 +690,10 @@ mod tests {
             ]
         );
         assert!(!config.rerank.enabled);
-        assert_eq!(config.rerank.model, "Qwen/Qwen3-Reranker-8B");
+        assert_eq!(config.rerank.provider, "vllm");
+        assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
+        assert_eq!(config.rerank.model, "Qwen/Qwen3-Reranker-4B");
+        assert_eq!(config.rerank.top_n, 12);
         assert!(config.context.enabled);
         assert!(!config.vision.enabled);
         assert_eq!(config.vision.timeout_seconds, 180);
@@ -735,6 +743,23 @@ enabled = false
         assert_eq!(config.graph.max_expanded_chunks, 30);
         assert_eq!(config.graph.max_neighbors_per_seed, 6);
         assert!(config.graph.edge_types.contains(&EdgeType::Parent));
+    }
+
+    #[test]
+    fn partial_rerank_config_defaults_disabled() {
+        let config: Config = toml::from_str(
+            r#"
+[rerank]
+model = "custom-reranker"
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.rerank.enabled);
+        assert_eq!(config.rerank.provider, "vllm");
+        assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
+        assert_eq!(config.rerank.model, "custom-reranker");
+        assert_eq!(config.rerank.top_n, 12);
     }
 
     #[test]

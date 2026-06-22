@@ -526,6 +526,14 @@ pub struct RetrievalRerankDebug {
     pub status: RetrievalRerankStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_count: Option<usize>,
     pub scores: Vec<RetrievalRerankScore>,
 }
 
@@ -534,6 +542,10 @@ impl RetrievalRerankDebug {
         Self {
             status: RetrievalRerankStatus::Disabled,
             reason: None,
+            provider: None,
+            model: None,
+            top_n: None,
+            candidate_count: None,
             scores: Vec::new(),
         }
     }
@@ -541,7 +553,47 @@ impl RetrievalRerankDebug {
     pub fn skipped(reason: impl Into<String>) -> Self {
         Self {
             status: RetrievalRerankStatus::Skipped,
-            reason: Some(reason.into()),
+            reason: Some(bounded_debug_text(&reason.into())),
+            provider: None,
+            model: None,
+            top_n: None,
+            candidate_count: None,
+            scores: Vec::new(),
+        }
+    }
+
+    pub fn succeeded(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        top_n: usize,
+        candidate_count: usize,
+        scores: Vec<RetrievalRerankScore>,
+    ) -> Self {
+        Self {
+            status: RetrievalRerankStatus::Succeeded,
+            reason: None,
+            provider: Some(bounded_debug_text(&provider.into())),
+            model: Some(bounded_debug_text(&model.into())),
+            top_n: Some(top_n),
+            candidate_count: Some(candidate_count),
+            scores,
+        }
+    }
+
+    pub fn fallback(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        top_n: usize,
+        candidate_count: usize,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: RetrievalRerankStatus::Fallback,
+            reason: Some(bounded_debug_text(&reason.into())),
+            provider: Some(bounded_debug_text(&provider.into())),
+            model: Some(bounded_debug_text(&model.into())),
+            top_n: Some(top_n),
+            candidate_count: Some(candidate_count),
             scores: Vec::new(),
         }
     }
@@ -552,7 +604,8 @@ impl RetrievalRerankDebug {
 pub enum RetrievalRerankStatus {
     Disabled,
     Skipped,
-    Ran,
+    Succeeded,
+    Fallback,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -560,6 +613,15 @@ pub struct RetrievalRerankScore {
     pub rank: usize,
     pub chunk_id: ChunkId,
     pub score: f32,
+}
+
+fn bounded_debug_text(input: &str) -> String {
+    const MAX_DEBUG_TEXT_CHARS: usize = 96;
+    let mut output = String::new();
+    for ch in input.chars().take(MAX_DEBUG_TEXT_CHARS) {
+        output.push(ch);
+    }
+    output
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
