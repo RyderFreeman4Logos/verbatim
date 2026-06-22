@@ -8,6 +8,10 @@ use rusqlite::{
     Connection, OptionalExtension, Transaction,
 };
 
+use crate::task::{
+    bounded_error, bounded_json, bounded_message, TaskEvent, TaskId, TaskKind, TaskSpan,
+    TaskStatus, TaskSummary,
+};
 use crate::traits::VectorDocument;
 use crate::types::{
     Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge,
@@ -770,6 +774,280 @@ impl Store {
         }
         Ok(result)
     }
+
+    // --- Task ---
+
+    pub fn create_task(
+        &self,
+        task_id: &TaskId,
+        kind: TaskKind,
+        request: &serde_json::Value,
+    ) -> Result<TaskSummary> {
+        let now = unix_timestamp_string();
+        let request = bounded_json(request.clone());
+        let request_json = serde_json::to_string(&request).context("serialize task request")?;
+        self.conn.execute(
+            "INSERT INTO tasks (id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error)
+             VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL, ?5, NULL, NULL)",
+            params![
+                &task_id.0,
+                kind.as_str(),
+                TaskStatus::Queued.as_str(),
+                &now,
+                request_json,
+            ],
+        )?;
+        Ok(TaskSummary {
+            id: task_id.clone(),
+            kind,
+            status: TaskStatus::Queued,
+            created_at: now.clone(),
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            request,
+            result: None,
+            error: None,
+        })
+    }
+
+    pub fn get_task(&self, task_id: &TaskId) -> Result<Option<TaskSummary>> {
+        self.conn
+            .prepare(
+                "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error
+                 FROM tasks WHERE id = ?1",
+            )?
+            .query_row(params![&task_id.0], row_to_task_summary)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn start_task(&self, task_id: &TaskId) -> Result<()> {
+        let now = unix_timestamp_string();
+        self.conn.execute(
+            "UPDATE tasks
+             SET status = ?2, started_at = COALESCE(started_at, ?3), updated_at = ?3
+             WHERE id = ?1 AND status = ?4",
+            params![
+                &task_id.0,
+                TaskStatus::Running.as_str(),
+                now,
+                TaskStatus::Queued.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_task_success(
+        &self,
+        task_id: &TaskId,
+        result: &serde_json::Value,
+    ) -> Result<bool> {
+        let now = unix_timestamp_string();
+        let result = serde_json::to_string(&bounded_json(result.clone()))
+            .context("serialize task success result")?;
+        let changed = self.conn.execute(
+            "UPDATE tasks
+             SET status = ?2, updated_at = ?3, finished_at = COALESCE(finished_at, ?3), result_json = ?4, error = NULL
+             WHERE id = ?1 AND status != ?5",
+            params![
+                &task_id.0,
+                TaskStatus::Succeeded.as_str(),
+                now,
+                result,
+                TaskStatus::Cancelled.as_str(),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn finish_task_failed(&self, task_id: &TaskId, error: &str) -> Result<bool> {
+        let now = unix_timestamp_string();
+        let changed = self.conn.execute(
+            "UPDATE tasks
+             SET status = ?2, updated_at = ?3, finished_at = COALESCE(finished_at, ?3), error = ?4
+             WHERE id = ?1 AND status != ?5",
+            params![
+                &task_id.0,
+                TaskStatus::Failed.as_str(),
+                now,
+                bounded_error(error),
+                TaskStatus::Cancelled.as_str(),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn cancel_task(&self, task_id: &TaskId) -> Result<bool> {
+        let now = unix_timestamp_string();
+        let changed = self.conn.execute(
+            "UPDATE tasks
+             SET status = ?2, updated_at = ?3, finished_at = COALESCE(finished_at, ?3)
+             WHERE id = ?1 AND status IN (?4, ?5)",
+            params![
+                &task_id.0,
+                TaskStatus::Cancelled.as_str(),
+                now,
+                TaskStatus::Queued.as_str(),
+                TaskStatus::Running.as_str(),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn insert_task_event(
+        &self,
+        task_id: &TaskId,
+        event_type: &str,
+        message: &str,
+        payload: &serde_json::Value,
+    ) -> Result<TaskEvent> {
+        let now = unix_timestamp_string();
+        let payload = bounded_json(payload.clone());
+        let payload_json =
+            serde_json::to_string(&payload).context("serialize task event payload")?;
+        let message = bounded_message(message);
+        self.conn.execute(
+            "INSERT INTO task_events (task_id, event_type, message, payload_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![&task_id.0, event_type, &message, payload_json, &now],
+        )?;
+        let sequence = self.conn.last_insert_rowid();
+        Ok(TaskEvent {
+            sequence,
+            task_id: task_id.clone(),
+            event_type: event_type.to_string(),
+            message,
+            payload,
+            created_at: now,
+        })
+    }
+
+    pub fn list_task_events(
+        &self,
+        task_id: &TaskId,
+        after_sequence: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TaskEvent>> {
+        let after_sequence = after_sequence.unwrap_or_default();
+        let limit = sql_limit(limit);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, event_type, message, payload_json, created_at
+             FROM task_events
+             WHERE task_id = ?1 AND id > ?2
+             ORDER BY id
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![&task_id.0, after_sequence, limit],
+            row_to_task_event,
+        )?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn insert_task_span(
+        &self,
+        task_id: &TaskId,
+        phase: &str,
+        started_at: &str,
+        duration_ms: u64,
+        metadata: &serde_json::Value,
+    ) -> Result<TaskSpan> {
+        let metadata = bounded_json(metadata.clone());
+        let metadata_json =
+            serde_json::to_string(&metadata).context("serialize task span metadata")?;
+        self.conn.execute(
+            "INSERT INTO task_spans (task_id, phase, started_at, duration_ms, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &task_id.0,
+                phase,
+                started_at,
+                duration_ms.min(i64::MAX as u64) as i64,
+                metadata_json,
+            ],
+        )?;
+        let sequence = self.conn.last_insert_rowid();
+        Ok(TaskSpan {
+            sequence,
+            task_id: task_id.clone(),
+            phase: phase.to_string(),
+            started_at: started_at.to_string(),
+            duration_ms,
+            metadata,
+        })
+    }
+
+    pub fn list_task_spans(&self, task_id: &TaskId) -> Result<Vec<TaskSpan>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, phase, started_at, duration_ms, metadata_json
+             FROM task_spans
+             WHERE task_id = ?1
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![&task_id.0], row_to_task_span)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+}
+
+fn row_to_task_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSummary> {
+    let kind_text: String = row.get(1)?;
+    let status_text: String = row.get(2)?;
+    let request_json: String = row.get(7)?;
+    let result_json: Option<String> = row.get(8)?;
+    let request = serde_json::from_str(&request_json)
+        .map_err(|err| from_json_error(7, "serde_json::Value", err))?;
+    let result = result_json
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|err| from_json_error(8, "serde_json::Value", err))
+        })
+        .transpose()?;
+    let kind = TaskKind::from_store_str(&kind_text)
+        .ok_or_else(|| invalid_text_value(1, format!("unknown task kind: {kind_text}")))?;
+    let status = TaskStatus::from_store_str(&status_text)
+        .ok_or_else(|| invalid_text_value(2, format!("unknown task status: {status_text}")))?;
+
+    Ok(TaskSummary {
+        id: TaskId(row.get(0)?),
+        kind,
+        status,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+        started_at: row.get(5)?,
+        finished_at: row.get(6)?,
+        request,
+        result,
+        error: row.get(9)?,
+    })
+}
+
+fn row_to_task_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEvent> {
+    let payload_json: String = row.get(4)?;
+    let payload = serde_json::from_str(&payload_json)
+        .map_err(|err| from_json_error(4, "serde_json::Value", err))?;
+    Ok(TaskEvent {
+        sequence: row.get(0)?,
+        task_id: TaskId(row.get(1)?),
+        event_type: row.get(2)?,
+        message: row.get(3)?,
+        payload,
+        created_at: row.get(5)?,
+    })
+}
+
+fn row_to_task_span(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSpan> {
+    let metadata_json: String = row.get(5)?;
+    let metadata = serde_json::from_str(&metadata_json)
+        .map_err(|err| from_json_error(5, "serde_json::Value", err))?;
+    let duration_ms: i64 = row.get(4)?;
+    Ok(TaskSpan {
+        sequence: row.get(0)?,
+        task_id: TaskId(row.get(1)?),
+        phase: row.get(2)?,
+        started_at: row.get(3)?,
+        duration_ms: duration_ms.try_into().unwrap_or_default(),
+        metadata,
+    })
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) -> Result<()> {
@@ -1365,6 +1643,42 @@ CREATE INDEX IF NOT EXISTS graph_edges_to_idx
     ON graph_edges(to_node_id);
 CREATE INDEX IF NOT EXISTS graph_edges_type_idx
     ON graph_edges(source_id, edge_type);
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    request_json TEXT NOT NULL,
+    result_json TEXT,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS tasks_status_updated_idx
+    ON tasks(status, updated_at);
+CREATE TABLE IF NOT EXISTS task_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_events_task_id_idx
+    ON task_events(task_id, id);
+CREATE TABLE IF NOT EXISTS task_spans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    phase TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_spans_task_id_idx
+    ON task_spans(task_id, id);
+CREATE INDEX IF NOT EXISTS task_spans_phase_idx
+    ON task_spans(phase);
 CREATE TABLE IF NOT EXISTS embeddings_meta (
     chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
     hnsw_position INTEGER NOT NULL,
@@ -1430,6 +1744,10 @@ END;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task::{
+        ask_request_metadata, ask_result_metadata, ingest_request_metadata, PhaseTiming,
+        TASK_EVENT_MESSAGE_MAX_CHARS,
+    };
     use crate::types::{BBox, SourceLocator};
     use std::path::PathBuf;
 
@@ -1575,6 +1893,101 @@ mod tests {
             .connection()
             .query_row("SELECT COUNT(*) FROM graph_edges", [], |_| Ok(()))
             .unwrap();
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM tasks", [], |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn task_summary_events_and_spans_are_persisted_bounded_and_queryable() {
+        let store = Store::in_memory().unwrap();
+        let task_id = TaskId("task-test".into());
+        let request = ask_request_metadata(
+            "Do not persist this raw prompt with password=secret.",
+            Some("src-1"),
+            true,
+        );
+
+        let created = store
+            .create_task(&task_id, TaskKind::Ask, &request)
+            .unwrap();
+
+        assert_eq!(created.status, TaskStatus::Queued);
+        assert_eq!(created.kind, TaskKind::Ask);
+        assert!(created.request.get("question_sha256").is_some());
+
+        store.start_task(&task_id).unwrap();
+        let event = store
+            .insert_task_event(
+                &task_id,
+                "phase",
+                &"x".repeat(TASK_EVENT_MESSAGE_MAX_CHARS + 20),
+                &serde_json::json!({"api_key": "should-not-print", "safe": "ok"}),
+            )
+            .unwrap();
+        assert_eq!(event.sequence, 1);
+        assert!(event.message.contains("...[truncated]"));
+        assert_eq!(event.payload["api_key"], "<redacted>");
+
+        let timing = PhaseTiming::start("chat").finish(serde_json::json!({"model": "qwen"}));
+        let span = store
+            .insert_task_span(
+                &task_id,
+                &timing.phase,
+                &timing.started_at,
+                timing.duration_ms,
+                &timing.metadata,
+            )
+            .unwrap();
+        assert_eq!(span.phase, "chat");
+
+        let result = ask_result_metadata("Do not persist this raw answer [E1].", 1, true, false);
+        store.finish_task_success(&task_id, &result).unwrap();
+
+        let summary = store.get_task(&task_id).unwrap().unwrap();
+        let encoded = serde_json::to_string(&summary).unwrap();
+        assert_eq!(summary.status, TaskStatus::Succeeded);
+        assert!(summary.started_at.is_some());
+        assert!(summary.finished_at.is_some());
+        assert!(summary.result.unwrap().get("answer_sha256").is_some());
+        assert!(!encoded.contains("Do not persist this raw prompt"));
+        assert!(!encoded.contains("Do not persist this raw answer"));
+        assert!(!encoded.contains("should-not-print"));
+
+        let events = store.list_task_events(&task_id, None, 100).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(store
+            .list_task_events(&task_id, Some(events[0].sequence), 100)
+            .unwrap()
+            .is_empty());
+        let spans = store.list_task_spans(&task_id).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].metadata["model"], "qwen");
+    }
+
+    #[test]
+    fn cancelled_task_is_not_overwritten_by_late_success() {
+        let store = Store::in_memory().unwrap();
+        let task_id = TaskId("task-cancel".into());
+
+        store
+            .create_task(
+                &task_id,
+                TaskKind::Ingest,
+                &ingest_request_metadata(Some("src-1"), false),
+            )
+            .unwrap();
+        store.start_task(&task_id).unwrap();
+
+        assert!(store.cancel_task(&task_id).unwrap());
+        store
+            .finish_task_success(&task_id, &serde_json::json!({"ingested": 1}))
+            .unwrap();
+
+        let summary = store.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(summary.status, TaskStatus::Cancelled);
+        assert!(summary.result.is_none());
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
 use crate::store::{SourceContentsReplacement, Store};
+use crate::task::{PhaseTiming, TaskId};
 use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
 use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit,
@@ -269,6 +270,22 @@ where
     }
 
     pub async fn ingest_source(&mut self, source_id: &SourceId) -> Result<()> {
+        self.ingest_source_inner(source_id, None).await
+    }
+
+    pub async fn ingest_source_with_task(
+        &mut self,
+        source_id: &SourceId,
+        task_id: &TaskId,
+    ) -> Result<()> {
+        self.ingest_source_inner(source_id, Some(task_id)).await
+    }
+
+    async fn ingest_source_inner(
+        &mut self,
+        source_id: &SourceId,
+        task_id: Option<&TaskId>,
+    ) -> Result<()> {
         let source = self
             .store
             .get_source(source_id)?
@@ -290,6 +307,7 @@ where
         tracing::info!(parser = parser.name(), "parsing");
         new_source.status = SourceStatus::Indexed;
         new_source.parser_used = Some(parser.name().to_string());
+        let phase = PhaseTiming::start("ingest_parsing");
         let mut evidence = parser.parse(&source.path)?;
         normalize_evidence_source_ids(&mut evidence, source_id);
         let parsed_image_artifacts = extract_image_artifacts_for_ingest(
@@ -304,6 +322,16 @@ where
             parsed_image_artifacts,
             self.image_artifact_limits,
         )?;
+        self.record_task_phase(
+            task_id,
+            phase,
+            serde_json::json!({
+                "source_id": source_id.0,
+                "evidence_count": evidence.len(),
+                "image_artifact_count": prepared_image_artifacts.artifacts.len(),
+            }),
+        );
+        let phase = PhaseTiming::start("model_call");
         let caption_evidence = self
             .caption_prepared_image_artifacts(
                 source_id,
@@ -311,16 +339,34 @@ where
                 evidence.len() as u32 + prepared_image_artifacts.evidence.len() as u32,
             )
             .await?;
+        self.record_task_phase(
+            task_id,
+            phase,
+            serde_json::json!({
+                "operation": "image_caption",
+                "generated_evidence_count": caption_evidence.len(),
+            }),
+        );
         evidence.extend(prepared_image_artifacts.evidence.clone());
         tracing::info!(evidence_count = evidence.len(), "parsed");
 
         let chunker_config = ChunkerConfig::default();
+        let phase = PhaseTiming::start("ingest_chunking");
         let output = chunk_evidence(source_id, &evidence, &chunker_config);
         tracing::info!(chunk_count = output.chunks.len(), "chunked");
+        self.record_task_phase(
+            task_id,
+            phase,
+            serde_json::json!({
+                "source_id": source_id.0,
+                "chunk_count": output.chunks.len(),
+            }),
+        );
 
         let mut chunks = output.chunks;
         let mut links = output.links;
         if let Some(ctx_gen) = &self.context_gen {
+            let phase = PhaseTiming::start("model_call");
             let title = source
                 .path
                 .file_stem()
@@ -328,6 +374,14 @@ where
                 .unwrap_or("document");
             let enriched = ctx_gen.enrich_chunks(&mut chunks, title, 8).await?;
             tracing::info!(enriched, "contextual retrieval done");
+            self.record_task_phase(
+                task_id,
+                phase,
+                serde_json::json!({
+                    "operation": "contextual_retrieval",
+                    "enriched": enriched,
+                }),
+            );
         }
 
         let caption_output = chunk_caption_evidence(source_id, &caption_evidence);
@@ -342,8 +396,18 @@ where
             &prepared_image_artifacts.artifacts,
             &prepared_image_artifacts.text_proximities,
         );
+        let phase = PhaseTiming::start("graph_expansion");
         self.append_generated_graph(&new_source, &chunks, &mut graph_nodes, &mut graph_edges)
             .await;
+        self.record_task_phase(
+            task_id,
+            phase,
+            serde_json::json!({
+                "source_id": source_id.0,
+                "graph_node_count": graph_nodes.len(),
+                "graph_edge_count": graph_edges.len(),
+            }),
+        );
 
         let mut child_chunks = self.child_chunks_without_source(source_id)?;
         child_chunks.extend(
@@ -352,8 +416,18 @@ where
                 .filter(|chunk| chunk.chunk_type == ChunkType::Child)
                 .cloned(),
         );
+        let phase = PhaseTiming::start("embedding");
         let prepared = self.prepare_indexes_for_chunks(&child_chunks).await?;
+        self.record_task_phase(
+            task_id,
+            phase,
+            serde_json::json!({
+                "child_chunk_count": child_chunks.len(),
+                "vector_count": prepared.vectors.len(),
+            }),
+        );
 
+        let phase = PhaseTiming::start("ingest_index_publishing");
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
         let written_image_files = match write_image_artifact_files(
             &prepared_image_artifacts.files,
@@ -365,6 +439,7 @@ where
                 return Err(err);
             }
         };
+        let db_phase = PhaseTiming::start("db");
         let generation = match self
             .store
             .replace_source_contents(SourceContentsReplacement {
@@ -384,7 +459,24 @@ where
                 return Err(err);
             }
         };
+        self.record_task_phase(
+            task_id,
+            db_phase,
+            serde_json::json!({
+                "operation": "replace_source_contents",
+                "source_id": source_id.0,
+                "index_generation": generation,
+            }),
+        );
         self.publish_committed_indexes(generation, staged, prepared)?;
+        self.record_task_phase(
+            task_id,
+            phase,
+            serde_json::json!({
+                "source_id": source_id.0,
+                "index_generation": generation,
+            }),
+        );
         #[cfg(feature = "qdrant")]
         self.sync_qdrant_source(source_id).await;
         cleanup_stale_source_image_artifacts(
@@ -452,6 +544,14 @@ where
     }
 
     pub async fn ingest_all(&mut self, force: bool) -> Result<usize> {
+        self.ingest_all_inner(force, None).await
+    }
+
+    pub async fn ingest_all_with_task(&mut self, force: bool, task_id: &TaskId) -> Result<usize> {
+        self.ingest_all_inner(force, Some(task_id)).await
+    }
+
+    async fn ingest_all_inner(&mut self, force: bool, task_id: Option<&TaskId>) -> Result<usize> {
         if !force {
             self.check_stale()?;
         }
@@ -466,7 +566,7 @@ where
         let total = to_ingest.len();
         for (i, source_id) in to_ingest.iter().enumerate() {
             tracing::info!(progress = format!("{}/{}", i + 1, total), source = %source_id.0);
-            self.ingest_source(source_id).await?;
+            self.ingest_source_inner(source_id, task_id).await?;
         }
         if force {
             #[cfg(feature = "qdrant")]
@@ -474,6 +574,32 @@ where
         }
 
         Ok(total)
+    }
+
+    fn record_task_phase(
+        &self,
+        task_id: Option<&TaskId>,
+        phase: PhaseTiming,
+        metadata: serde_json::Value,
+    ) {
+        let Some(task_id) = task_id else {
+            return;
+        };
+        let finished = phase.finish(metadata);
+        if let Err(err) = self.store.insert_task_span(
+            task_id,
+            &finished.phase,
+            &finished.started_at,
+            finished.duration_ms,
+            &finished.metadata,
+        ) {
+            tracing::warn!(
+                task_id = %task_id.0,
+                phase = %finished.phase,
+                error = %err,
+                "failed to persist task phase timing"
+            );
+        }
     }
 
     pub async fn rebuild_indexes_from_store(&mut self) -> Result<()> {

@@ -13,6 +13,7 @@ pub mod parser;
 pub mod provider;
 pub mod retrieve;
 pub mod store;
+pub mod task;
 pub mod traits;
 pub mod types;
 pub mod vision_caption;

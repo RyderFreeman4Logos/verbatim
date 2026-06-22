@@ -3,8 +3,9 @@ use std::io::{self, Write};
 use serde_json::Value;
 use verbatim_core::api::{
     AskResponse, CheckStaleResponse, CitationResponse, ConfigResponse, EvidenceResponse,
-    HealthResponse, IngestResponse, SourceResponse,
+    HealthResponse, IngestResponse, SourceResponse, TaskCreatedResponse,
 };
+use verbatim_core::task::{TaskEvent, TaskSpan, TaskStatus, TaskSummary};
 use verbatim_core::types::RetrievalDebug;
 
 pub fn write_sources<W>(writer: &mut W, sources: &[SourceResponse]) -> std::io::Result<()>
@@ -63,6 +64,105 @@ where
     W: Write,
 {
     writeln!(writer, "Ingested {} source(s).", response.ingested)
+}
+
+pub fn write_task_created<W>(writer: &mut W, response: &TaskCreatedResponse) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Task queued: {}", response.task_id)?;
+    writeln!(writer, "Wait: verbatim task wait {}", response.task_id)
+}
+
+pub fn write_task_status_line<W>(writer: &mut W, task: &TaskSummary) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Task {} status={}", task.id.0, task.status.as_str())
+}
+
+pub fn write_task_summary<W>(
+    writer: &mut W,
+    task: &TaskSummary,
+    spans: &[TaskSpan],
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Task: {}", task.id.0)?;
+    writeln!(writer, "  kind: {}", task.kind.as_str())?;
+    writeln!(writer, "  status: {}", task.status.as_str())?;
+    writeln!(writer, "  created_at: {}", task.created_at)?;
+    if let Some(started_at) = &task.started_at {
+        writeln!(writer, "  started_at: {started_at}")?;
+    }
+    if let Some(finished_at) = &task.finished_at {
+        writeln!(writer, "  finished_at: {finished_at}")?;
+    }
+    if let Some(error) = &task.error {
+        writeln!(writer, "  error: {error}")?;
+    }
+    writeln!(writer, "  request: {}", compact_json(&task.request))?;
+    if let Some(result) = &task.result {
+        writeln!(writer, "  result: {}", compact_json(result))?;
+    }
+    write_task_spans(writer, spans)?;
+    if task.status == TaskStatus::Cancelled {
+        writeln!(
+            writer,
+            "  note: cancellation is best-effort for in-flight model/file work"
+        )?;
+    }
+    Ok(())
+}
+
+pub fn write_task_events<W>(writer: &mut W, events: &[TaskEvent]) -> std::io::Result<()>
+where
+    W: Write,
+{
+    for event in events {
+        if event
+            .payload
+            .as_object()
+            .is_some_and(|object| object.is_empty())
+        {
+            writeln!(
+                writer,
+                "[{}] {}: {}",
+                event.sequence, event.event_type, event.message
+            )?;
+        } else {
+            writeln!(
+                writer,
+                "[{}] {}: {} {}",
+                event.sequence,
+                event.event_type,
+                event.message,
+                compact_json(&event.payload)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub fn write_task_spans<W>(writer: &mut W, spans: &[TaskSpan]) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if spans.is_empty() {
+        return Ok(());
+    }
+    writeln!(writer, "  spans:")?;
+    for span in spans {
+        writeln!(
+            writer,
+            "    {} {}ms {}",
+            span.phase,
+            span.duration_ms,
+            compact_json(&span.metadata)
+        )?;
+    }
+    Ok(())
 }
 
 pub fn write_evidence<W>(writer: &mut W, evidence: &EvidenceResponse) -> std::io::Result<()>
@@ -354,6 +454,10 @@ fn graph_path(path: Option<&Value>) -> String {
         })
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "<invalid-json>".into())
 }
 
 fn value_string(value: &Value, key: &str) -> String {

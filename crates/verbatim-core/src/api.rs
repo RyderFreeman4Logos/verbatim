@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::task::{TaskEvent, TaskSpan, TaskSummary};
 use crate::types::{BBox, ImageArtifact, RetrievalDebug};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +34,42 @@ pub struct CheckStaleResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestResponse {
     pub ingested: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCreatedResponse {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskIngestRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskSummaryResponse {
+    pub task: TaskSummary,
+    #[serde(default)]
+    pub spans: Vec<TaskSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskEventsResponse {
+    #[serde(default)]
+    pub events: Vec<TaskEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskWaitEvent {
+    pub task: TaskSummary,
+    #[serde(default)]
+    pub events: Vec<TaskEvent>,
+    #[serde(default)]
+    pub spans: Vec<TaskSpan>,
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -96,23 +96,38 @@ where
 {
     match cli.command {
         Commands::Source { command } => run_source(command, stdout, client),
-        Commands::Ingest { source_id, force } => {
-            let response = client.ingest(source_id.as_deref(), force)?;
-            render::write_ingest(stdout, &response)?;
+        Commands::Ingest {
+            source_id,
+            force,
+            background,
+        } => {
+            if background {
+                let response = client.submit_ingest_task(source_id.as_deref(), force)?;
+                render::write_task_created(stdout, &response)?;
+            } else {
+                let response = client.ingest(source_id.as_deref(), force)?;
+                render::write_ingest(stdout, &response)?;
+            }
             Ok(0)
         }
         Commands::Ask {
             question,
             source_id,
             show_retrieval,
+            background,
         } => {
             let request = AskRequest {
                 question: question.join(" "),
                 source_id,
                 show_retrieval,
             };
-            client.ask(&request, stdout)?;
-            writeln!(stdout)?;
+            if background {
+                let response = client.submit_ask_task(&request)?;
+                render::write_task_created(stdout, &response)?;
+            } else {
+                client.ask(&request, stdout)?;
+                writeln!(stdout)?;
+            }
             Ok(0)
         }
         Commands::Evidence { eid } => {
@@ -122,6 +137,7 @@ where
         }
         Commands::Config { command } => run_config(command, stdout, client, local),
         Commands::Daemon { command } => run_daemon(command, stdout, client, local),
+        Commands::Task { command } => run_task(command, stdout, client),
     }
 }
 
@@ -209,6 +225,31 @@ where
     }
 }
 
+fn run_task<W, C>(command: TaskCommand, stdout: &mut W, client: &C) -> Result<u8, CliError>
+where
+    W: Write,
+    C: DaemonClient,
+{
+    match command {
+        TaskCommand::Show { task_id } => {
+            let response = client.get_task(&task_id)?;
+            render::write_task_summary(stdout, &response.task, &response.spans)?;
+        }
+        TaskCommand::Events { task_id, after } => {
+            let response = client.get_task_events(&task_id, after)?;
+            render::write_task_events(stdout, &response.events)?;
+        }
+        TaskCommand::Wait { task_id, after } => {
+            client.wait_task(&task_id, after, stdout)?;
+        }
+        TaskCommand::Cancel { task_id } => {
+            let response = client.cancel_task(&task_id)?;
+            render::write_task_summary(stdout, &response.task, &response.spans)?;
+        }
+    }
+    Ok(0)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "verbatim",
@@ -234,6 +275,9 @@ enum Commands {
         /// Re-ingest all sources, including already indexed sources.
         #[arg(long)]
         force: bool,
+        /// Queue ingest as a persistent daemon task and return immediately.
+        #[arg(long)]
+        background: bool,
     },
     /// Ask a question and stream the answer from the daemon.
     Ask {
@@ -243,6 +287,9 @@ enum Commands {
         /// Show retrieval provenance and ranking debug output.
         #[arg(long)]
         show_retrieval: bool,
+        /// Queue ask as a persistent daemon task and return immediately.
+        #[arg(long)]
+        background: bool,
         /// Question text.
         #[arg(required = true, num_args = 1..)]
         question: Vec<String>,
@@ -261,6 +308,11 @@ enum Commands {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Inspect and wait for persistent daemon tasks.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
     },
 }
 
@@ -311,6 +363,36 @@ enum DaemonCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// Show task summary and phase spans.
+    Show {
+        /// Task id.
+        task_id: String,
+    },
+    /// List bounded task events.
+    Events {
+        /// Task id.
+        task_id: String,
+        /// Only show events after this sequence.
+        #[arg(long)]
+        after: Option<i64>,
+    },
+    /// Wait for task events until the task reaches a terminal status.
+    Wait {
+        /// Task id.
+        task_id: String,
+        /// Only stream events after this sequence.
+        #[arg(long)]
+        after: Option<i64>,
+    },
+    /// Request best-effort task cancellation.
+    Cancel {
+        /// Task id.
+        task_id: String,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -319,8 +401,10 @@ mod tests {
     use serde_json::Value;
     use verbatim_core::api::{
         AddSourceResponse, CheckStaleResponse, CitationResponse, ConfigResponse, EvidenceResponse,
-        HealthResponse, IngestResponse, SourceResponse,
+        HealthResponse, IngestResponse, SourceResponse, TaskCreatedResponse, TaskEventsResponse,
+        TaskSummaryResponse,
     };
+    use verbatim_core::task::{TaskEvent, TaskId, TaskKind, TaskSpan, TaskStatus, TaskSummary};
 
     use super::*;
 
@@ -354,6 +438,11 @@ mod tests {
             &["daemon", "start", "--help"],
             &["daemon", "status", "--help"],
             &["daemon", "install", "--help"],
+            &["task", "--help"],
+            &["task", "show", "--help"],
+            &["task", "events", "--help"],
+            &["task", "wait", "--help"],
+            &["task", "cancel", "--help"],
         ];
 
         for args in cases {
@@ -404,6 +493,62 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert_eq!(client.calls.borrow().as_slice(), ["health"]);
         assert!(stdout.contains("Daemon status: ok"));
+    }
+
+    #[test]
+    fn background_ask_and_ingest_submit_tasks() {
+        let (code, stdout, stderr, client, _) = run_mock(["ingest", "--background", "--force"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["submit_ingest_task:None:true"]
+        );
+        assert!(stdout.contains("Task queued: task-1"));
+        assert!(stdout.contains("verbatim task wait task-1"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) =
+            run_mock(["ask", "--background", "-s", "src-1", "What", "is", "cited?"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.last_ask.borrow().as_ref().unwrap(),
+            &AskRequest {
+                question: "What is cited?".into(),
+                source_id: Some("src-1".into()),
+                show_retrieval: false,
+            }
+        );
+        assert_eq!(client.calls.borrow().as_slice(), ["submit_ask_task"]);
+        assert!(stdout.contains("Task queued: task-1"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn task_commands_call_daemon_client() {
+        let (code, stdout, _, client, _) = run_mock(["task", "show", "task-1"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["get_task:task-1"]);
+        assert!(stdout.contains("Task: task-1"));
+        assert!(stdout.contains("spans:"));
+
+        let (code, stdout, _, client, _) = run_mock(["task", "events", "task-1", "--after", "3"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["get_task_events:task-1:Some(3)"]
+        );
+        assert!(stdout.contains("[4] phase: retrieval complete"));
+
+        let (code, _, _, client, _) = run_mock(["task", "wait", "task-1"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["wait_task:task-1:None"]);
+
+        let (code, stdout, _, client, _) = run_mock(["task", "cancel", "task-1"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["cancel_task:task-1"]);
+        assert!(stdout.contains("status: cancelled"));
     }
 
     #[test]
@@ -595,6 +740,67 @@ mod tests {
             Ok(IngestResponse { ingested: 1 })
         }
 
+        fn submit_ask_task(&self, request: &AskRequest) -> client::CliResult<TaskCreatedResponse> {
+            self.calls.borrow_mut().push("submit_ask_task".into());
+            self.last_ask.replace(Some(request.clone()));
+            Ok(TaskCreatedResponse {
+                task_id: "task-1".into(),
+            })
+        }
+
+        fn submit_ingest_task(
+            &self,
+            source_id: Option<&str>,
+            force: bool,
+        ) -> client::CliResult<TaskCreatedResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("submit_ingest_task:{source_id:?}:{force}"));
+            Ok(TaskCreatedResponse {
+                task_id: "task-1".into(),
+            })
+        }
+
+        fn get_task(&self, task_id: &str) -> client::CliResult<TaskSummaryResponse> {
+            self.calls.borrow_mut().push(format!("get_task:{task_id}"));
+            Ok(sample_task_response(TaskStatus::Succeeded))
+        }
+
+        fn get_task_events(
+            &self,
+            task_id: &str,
+            after: Option<i64>,
+        ) -> client::CliResult<TaskEventsResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("get_task_events:{task_id}:{after:?}"));
+            Ok(TaskEventsResponse {
+                events: vec![sample_task_event()],
+            })
+        }
+
+        fn wait_task<W>(
+            &self,
+            task_id: &str,
+            after: Option<i64>,
+            _stdout: &mut W,
+        ) -> client::CliResult<()>
+        where
+            W: Write,
+        {
+            self.calls
+                .borrow_mut()
+                .push(format!("wait_task:{task_id}:{after:?}"));
+            Ok(())
+        }
+
+        fn cancel_task(&self, task_id: &str) -> client::CliResult<TaskSummaryResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("cancel_task:{task_id}"));
+            Ok(sample_task_response(TaskStatus::Cancelled))
+        }
+
         fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> client::CliResult<()>
         where
             W: Write,
@@ -701,6 +907,42 @@ mod tests {
             derived_from: None,
             locator: "PDF p.1 para.1".into(),
             text_preview: "preview".into(),
+        }
+    }
+
+    fn sample_task_response(status: TaskStatus) -> TaskSummaryResponse {
+        TaskSummaryResponse {
+            task: TaskSummary {
+                id: TaskId("task-1".into()),
+                kind: TaskKind::Ask,
+                status,
+                created_at: "1".into(),
+                updated_at: "2".into(),
+                started_at: Some("1".into()),
+                finished_at: Some("2".into()),
+                request: serde_json::json!({"question_chars": 14}),
+                result: Some(serde_json::json!({"citation_count": 1})),
+                error: None,
+            },
+            spans: vec![TaskSpan {
+                sequence: 1,
+                task_id: TaskId("task-1".into()),
+                phase: "retrieval".into(),
+                started_at: "1".into(),
+                duration_ms: 7,
+                metadata: serde_json::json!({"result_count": 1}),
+            }],
+        }
+    }
+
+    fn sample_task_event() -> TaskEvent {
+        TaskEvent {
+            sequence: 4,
+            task_id: TaskId("task-1".into()),
+            event_type: "phase".into(),
+            message: "retrieval complete".into(),
+            payload: serde_json::json!({"result_count": 1}),
+            created_at: "2".into(),
         }
     }
 

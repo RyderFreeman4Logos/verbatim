@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use axum::extract::{Path, Query, State};
@@ -22,7 +23,8 @@ use tower_http::cors::CorsLayer;
 use verbatim_core::api::{
     AddSourceRequest, AddSourceResponse, AskCitationEvent, AskErrorEvent, AskRequest, AskResponse,
     AskTokenEvent, CheckStaleResponse, CitationResponse, ErrorResponse, EvidenceResponse,
-    HealthResponse, ImageArtifactResponse, IngestResponse, SourceResponse,
+    HealthResponse, ImageArtifactResponse, IngestResponse, SourceResponse, TaskCreatedResponse,
+    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
 };
 use verbatim_core::config::{self, Config};
 use verbatim_core::embed::OpenAiEmbeddingClient;
@@ -34,6 +36,10 @@ use verbatim_core::ingest::IngestPipeline;
 use verbatim_core::provider::openai_compatible::OpenAiCompatibleReranker;
 use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
 use verbatim_core::store::Store;
+use verbatim_core::task::{
+    ask_request_metadata, ask_result_metadata, bounded_error, ingest_request_metadata,
+    ingest_result_metadata, PhaseTiming, TaskId, TaskKind,
+};
 use verbatim_core::types::{
     CitationRef, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug, RetrievalResult, SourceId,
 };
@@ -62,11 +68,20 @@ struct AppState {
 type SharedState = Arc<AppState>;
 
 const ASK_STREAM_EVENT_BUFFER: usize = 32;
+const TASK_WAIT_EVENT_BUFFER: usize = 16;
+const TASK_WAIT_EVENT_LIMIT: usize = 100;
+const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 struct IngestQuery {
     #[serde(default)]
     force: bool,
+}
+
+#[derive(Deserialize)]
+struct TaskEventsQuery {
+    after: Option<i64>,
+    limit: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,49 +209,242 @@ async fn check_stale(
     }))
 }
 
+async fn create_persisted_task(
+    state: &SharedState,
+    kind: TaskKind,
+    request: serde_json::Value,
+) -> Result<TaskId, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let task_id = TaskId::new();
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.store().create_task(&task_id, kind, &request)?;
+        pipeline.store().insert_task_event(
+            &task_id,
+            "queued",
+            "task queued",
+            &serde_json::json!({ "kind": kind.as_str() }),
+        )?;
+        Ok::<_, anyhow::Error>(task_id)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn mark_task_started(
+    state: &SharedState,
+    task_id: &TaskId,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    let task_id = task_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.store().start_task(&task_id)?;
+        pipeline.store().insert_task_event(
+            &task_id,
+            "started",
+            "task started",
+            &serde_json::json!({}),
+        )?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn record_task_event(
+    state: &SharedState,
+    task_id: &TaskId,
+    event_type: &'static str,
+    message: impl Into<String>,
+    payload: serde_json::Value,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    let task_id = task_id.clone();
+    let message = message.into();
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline
+            .store()
+            .insert_task_event(&task_id, event_type, &message, &payload)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn record_task_span(
+    state: &SharedState,
+    task_id: &TaskId,
+    timing: verbatim_core::task::FinishedPhaseTiming,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    let task_id = task_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.store().insert_task_span(
+            &task_id,
+            &timing.phase,
+            &timing.started_at,
+            timing.duration_ms,
+            &timing.metadata,
+        )?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn finish_task_success(
+    state: &SharedState,
+    task_id: &TaskId,
+    result: serde_json::Value,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    let task_id = task_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if pipeline.store().finish_task_success(&task_id, &result)? {
+            pipeline
+                .store()
+                .insert_task_event(&task_id, "succeeded", "task succeeded", &result)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn finish_task_failed(
+    state: &SharedState,
+    task_id: &TaskId,
+    error_message: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    let task_id = task_id.clone();
+    let error_message = bounded_error(error_message);
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if pipeline
+            .store()
+            .finish_task_failed(&task_id, &error_message)?
+        {
+            pipeline.store().insert_task_event(
+                &task_id,
+                "failed",
+                "task failed",
+                &serde_json::json!({ "error": error_message }),
+            )?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn task_summary_response(
+    state: &SharedState,
+    task_id: TaskId,
+) -> Result<TaskSummaryResponse, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let task = pipeline
+            .store()
+            .get_task(&task_id)?
+            .with_context(|| format!("task not found: {}", task_id.0))?;
+        let spans = pipeline.store().list_task_spans(&task_id)?;
+        Ok::<_, anyhow::Error>(TaskSummaryResponse { task, spans })
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| {
+        if e.to_string().contains("task not found") {
+            err(StatusCode::NOT_FOUND, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })
+}
+
+async fn task_events_response(
+    state: &SharedState,
+    task_id: TaskId,
+    after: Option<i64>,
+    limit: Option<usize>,
+) -> Result<TaskEventsResponse, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline
+            .store()
+            .get_task(&task_id)?
+            .with_context(|| format!("task not found: {}", task_id.0))?;
+        let events = pipeline.store().list_task_events(
+            &task_id,
+            after,
+            limit.unwrap_or(TASK_WAIT_EVENT_LIMIT),
+        )?;
+        Ok::<_, anyhow::Error>(TaskEventsResponse { events })
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| {
+        if e.to_string().contains("task not found") {
+            err(StatusCode::NOT_FOUND, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })
+}
+
 async fn ingest_all(
     State(state): State<SharedState>,
     query: Query<IngestQuery>,
 ) -> Result<Json<IngestResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let force = query.force;
-    // Ingest is async (embeds, context gen) but also touches the !Send store.
-    // We use a dedicated tokio runtime thread via `spawn_blocking` combined
-    // with a local async runtime to drive the pipeline's async work.
-    let state = Arc::clone(&state);
-    let runtime = tokio::runtime::Handle::current();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        runtime.block_on(pipeline.ingest_all(force))
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(Json(IngestResponse { ingested: result }))
+    let task_id = create_persisted_task(
+        &state,
+        TaskKind::Ingest,
+        ingest_request_metadata(None, query.force),
+    )
+    .await?;
+    execute_ingest_task(state, task_id, None, query.force)
+        .await
+        .map(Json)
 }
 
 async fn ingest_one(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<IngestResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        runtime.block_on(pipeline.ingest_source(&SourceId(id)))
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(Json(IngestResponse { ingested: 1 }))
+    let task_id = create_persisted_task(
+        &state,
+        TaskKind::Ingest,
+        ingest_request_metadata(Some(&id), false),
+    )
+    .await?;
+    execute_ingest_task(state, task_id, Some(id), false)
+        .await
+        .map(Json)
 }
 
 async fn ask(
     State(state): State<SharedState>,
     Json(req): Json<AskRequest>,
 ) -> Result<Json<AskResponse>, (StatusCode, Json<ErrorResponse>)> {
-    execute_ask(state, req).await.map(Json)
+    let task_id = create_persisted_task(
+        &state,
+        TaskKind::Ask,
+        ask_request_metadata(&req.question, req.source_id.as_deref(), req.show_retrieval),
+    )
+    .await?;
+    execute_ask_task(state, task_id, req).await.map(Json)
 }
 
 async fn ask_stream(
@@ -244,9 +452,129 @@ async fn ask_stream(
     Json(req): Json<AskRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(ASK_STREAM_EVENT_BUFFER);
+    match create_persisted_task(
+        &state,
+        TaskKind::Ask,
+        ask_request_metadata(&req.question, req.source_id.as_deref(), req.show_retrieval),
+    )
+    .await
+    {
+        Ok(task_id) => {
+            tokio::spawn(async move {
+                if let Err((status, Json(error))) =
+                    execute_ask_stream_task(state, task_id, req, tx.clone()).await
+                {
+                    let _ = tx.send(sse_error_event(status, error.error)).await;
+                }
+            });
+        }
+        Err((status, Json(error))) => {
+            let _ = tx.try_send(sse_error_event(status, error.error));
+        }
+    }
+
+    Sse::new(stream::unfold(rx, |mut rx: mpsc::Receiver<Event>| async {
+        rx.recv().await.map(|event| (Ok(event), rx))
+    }))
+}
+
+async fn submit_ask_task(
+    State(state): State<SharedState>,
+    Json(req): Json<AskRequest>,
+) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let task_id = create_persisted_task(
+        &state,
+        TaskKind::Ask,
+        ask_request_metadata(&req.question, req.source_id.as_deref(), req.show_retrieval),
+    )
+    .await?;
+    spawn_ask_task(state, task_id.clone(), req);
+    Ok(Json(TaskCreatedResponse { task_id: task_id.0 }))
+}
+async fn submit_ingest_task(
+    State(state): State<SharedState>,
+    Json(req): Json<TaskIngestRequest>,
+) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if req.source_id.is_some() && req.force {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("force is only supported for all-source ingest"),
+        ));
+    }
+    let task_id = create_persisted_task(
+        &state,
+        TaskKind::Ingest,
+        ingest_request_metadata(req.source_id.as_deref(), req.force),
+    )
+    .await?;
+    spawn_ingest_task(state, task_id.clone(), req.source_id, req.force);
+    Ok(Json(TaskCreatedResponse { task_id: task_id.0 }))
+}
+
+async fn show_task(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    task_summary_response(&state, TaskId(id)).await.map(Json)
+}
+
+async fn list_task_events_handler(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Query(query): Query<TaskEventsQuery>,
+) -> Result<Json<TaskEventsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    task_events_response(&state, TaskId(id), query.after, query.limit)
+        .await
+        .map(Json)
+}
+
+async fn cancel_task_handler(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let task_id = TaskId(id);
+    let changed = cancel_task_record(&state, &task_id).await?;
+    if !changed {
+        let response = task_summary_response(&state, task_id.clone()).await?;
+        if response.task.status.is_terminal() {
+            return Ok(Json(response));
+        }
+    }
+    task_summary_response(&state, task_id).await.map(Json)
+}
+
+async fn wait_task(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+    Query(query): Query<TaskEventsQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::channel::<Event>(TASK_WAIT_EVENT_BUFFER);
     tokio::spawn(async move {
-        if let Err((status, Json(error))) = execute_ask_stream(state, req, tx.clone()).await {
-            let _ = tx.send(sse_error_event(status, error.error)).await;
+        let task_id = TaskId(id);
+        let mut after = query.after;
+        let limit = query.limit.unwrap_or(TASK_WAIT_EVENT_LIMIT);
+        loop {
+            match task_wait_snapshot(&state, task_id.clone(), after, limit).await {
+                Ok(wait_event) => {
+                    after = wait_event
+                        .events
+                        .last()
+                        .map(|event| event.sequence)
+                        .or(after);
+                    let terminal = wait_event.terminal;
+                    if tx.send(sse_json_event("task", &wait_event)).await.is_err() {
+                        break;
+                    }
+                    if terminal {
+                        break;
+                    }
+                }
+                Err((status, Json(error))) => {
+                    let _ = tx.send(sse_error_event(status, error.error)).await;
+                    break;
+                }
+            }
+            tokio::time::sleep(TASK_WAIT_POLL_INTERVAL).await;
         }
     });
 
@@ -255,26 +583,72 @@ async fn ask_stream(
     }))
 }
 
-async fn execute_ask(
+async fn execute_ask_task(
     state: SharedState,
+    task_id: TaskId,
     req: AskRequest,
 ) -> Result<AskResponse, (StatusCode, Json<ErrorResponse>)> {
+    let result = execute_ask_task_inner(Arc::clone(&state), &task_id, req).await;
+    if let Err((_, Json(error))) = &result {
+        let _ = finish_task_failed(&state, &task_id, &error.error).await;
+    }
+    result
+}
+
+async fn execute_ask_task_inner(
+    state: SharedState,
+    task_id: &TaskId,
+    req: AskRequest,
+) -> Result<AskResponse, (StatusCode, Json<ErrorResponse>)> {
+    mark_task_started(&state, task_id).await?;
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
     let show_retrieval = req.show_retrieval;
 
+    let timing = PhaseTiming::start("retrieval");
     let (results, generation_context, retrieval_debug) =
         prepare_generation_context(Arc::clone(&state), &question, source_filter, show_retrieval)
             .await?;
+    record_task_span(
+        &state,
+        task_id,
+        timing.finish(serde_json::json!({
+            "result_count": results.len(),
+            "retrieval_debug": retrieval_debug.is_some(),
+        })),
+    )
+    .await?;
+    record_task_event(
+        &state,
+        task_id,
+        "phase",
+        "retrieval complete",
+        serde_json::json!({ "result_count": results.len() }),
+    )
+    .await?;
 
-    // Step 2: generate (Send-safe, no store access)
+    let timing = PhaseTiming::start("chat");
     let gen_result = state
         .generator
         .generate_with_context(&question, &results, &generation_context)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let chat_timing = timing.finish(serde_json::json!({
+        "citation_count": gen_result.citations.len(),
+        "verified": gen_result.verified,
+    }));
+    record_task_span(&state, task_id, chat_timing.clone()).await?;
+    record_task_span(
+        &state,
+        task_id,
+        verbatim_core::task::FinishedPhaseTiming {
+            phase: "model_call".into(),
+            ..chat_timing
+        },
+    )
+    .await?;
 
-    Ok(AskResponse {
+    let response = AskResponse {
         answer: gen_result.answer,
         citations: gen_result
             .citations
@@ -283,40 +657,91 @@ async fn execute_ask(
             .collect(),
         verified: gen_result.verified,
         retrieval: retrieval_debug,
-    })
+    };
+    finish_task_success(
+        &state,
+        task_id,
+        ask_result_metadata(
+            &response.answer,
+            response.citations.len(),
+            response.verified,
+            response.retrieval.is_some(),
+        ),
+    )
+    .await?;
+    Ok(response)
 }
 
-async fn execute_ask_stream(
+async fn execute_ask_stream_task(
     state: SharedState,
+    task_id: TaskId,
     req: AskRequest,
     tx: mpsc::Sender<Event>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let result = execute_ask_stream_task_inner(Arc::clone(&state), &task_id, req, tx).await;
+    if let Err((_, Json(error))) = &result {
+        let _ = finish_task_failed(&state, &task_id, &error.error).await;
+    }
+    result
+}
+
+async fn execute_ask_stream_task_inner(
+    state: SharedState,
+    task_id: &TaskId,
+    req: AskRequest,
+    tx: mpsc::Sender<Event>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    mark_task_started(&state, task_id).await?;
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
     let show_retrieval = req.show_retrieval;
 
+    let timing = PhaseTiming::start("retrieval");
     let (results, generation_context, retrieval_debug) =
         prepare_generation_context(Arc::clone(&state), &question, source_filter, show_retrieval)
             .await?;
+    record_task_span(
+        &state,
+        task_id,
+        timing.finish(serde_json::json!({
+            "result_count": results.len(),
+            "retrieval_debug": retrieval_debug.is_some(),
+        })),
+    )
+    .await?;
 
     let tx_tokens = tx.clone();
+    let timing = PhaseTiming::start("chat");
     let gen_result = state
         .generator
         .generate_streaming_with_context(&question, &results, &generation_context, move |delta| {
-            try_send_stream_event(
-                &tx_tokens,
-                sse_json_event(
-                    "token",
-                    &AskTokenEvent {
-                        text: delta.to_string(),
-                    },
-                ),
-            )?;
+            let _ = tx_tokens.try_send(sse_json_event(
+                "token",
+                &AskTokenEvent {
+                    text: delta.to_string(),
+                },
+            ));
             Ok(())
         })
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let chat_timing = timing.finish(serde_json::json!({
+        "citation_count": gen_result.citations.len(),
+        "verified": gen_result.verified,
+        "streaming": true,
+    }));
+    record_task_span(&state, task_id, chat_timing.clone()).await?;
+    record_task_span(
+        &state,
+        task_id,
+        verbatim_core::task::FinishedPhaseTiming {
+            phase: "model_call".into(),
+            ..chat_timing
+        },
+    )
+    .await?;
 
+    let citation_count = gen_result.citations.len();
     send_stream_event(
         &tx,
         sse_json_event(
@@ -324,7 +749,8 @@ async fn execute_ask_stream(
             &AskCitationEvent {
                 citations: gen_result
                     .citations
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .map(citation_response)
                     .collect(),
                 verified: gen_result.verified,
@@ -337,9 +763,156 @@ async fn execute_ask_stream(
         send_stream_event(&tx, sse_json_event("retrieval", &debug)).await?;
     }
 
+    finish_task_success(
+        &state,
+        task_id,
+        ask_result_metadata(
+            &gen_result.answer,
+            citation_count,
+            gen_result.verified,
+            show_retrieval,
+        ),
+    )
+    .await?;
     Ok(())
 }
 
+fn spawn_ask_task(state: SharedState, task_id: TaskId, req: AskRequest) {
+    tokio::spawn(async move {
+        let _ = execute_ask_task(state, task_id, req).await;
+    });
+}
+
+fn spawn_ingest_task(state: SharedState, task_id: TaskId, source_id: Option<String>, force: bool) {
+    tokio::spawn(async move {
+        let _ = execute_ingest_task(state, task_id, source_id, force).await;
+    });
+}
+
+async fn execute_ingest_task(
+    state: SharedState,
+    task_id: TaskId,
+    source_id: Option<String>,
+    force: bool,
+) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
+    let result = execute_ingest_task_inner(Arc::clone(&state), &task_id, source_id, force).await;
+    if let Err((_, Json(error))) = &result {
+        let _ = finish_task_failed(&state, &task_id, &error.error).await;
+    }
+    result
+}
+
+async fn execute_ingest_task_inner(
+    state: SharedState,
+    task_id: &TaskId,
+    source_id: Option<String>,
+    force: bool,
+) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
+    mark_task_started(&state, task_id).await?;
+    let state2 = Arc::clone(&state);
+    let task_id2 = task_id.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let timing = PhaseTiming::start("ingest");
+    let result = tokio::task::spawn_blocking(move || {
+        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        match source_id {
+            Some(id) => {
+                runtime.block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2))?;
+                Ok::<_, anyhow::Error>(1)
+            }
+            None => runtime.block_on(pipeline.ingest_all_with_task(force, &task_id2)),
+        }
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let response = IngestResponse { ingested: result };
+    record_task_span(
+        &state,
+        task_id,
+        timing.finish(serde_json::json!({
+            "ingested": response.ingested,
+            "force": force,
+        })),
+    )
+    .await?;
+    finish_task_success(&state, task_id, ingest_result_metadata(response.ingested)).await?;
+    Ok(response)
+}
+
+async fn cancel_task_record(
+    state: &SharedState,
+    task_id: &TaskId,
+) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    let task_id = task_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline
+            .store()
+            .get_task(&task_id)?
+            .with_context(|| format!("task not found: {}", task_id.0))?;
+        let changed = pipeline.store().cancel_task(&task_id)?;
+        if changed {
+            pipeline.store().insert_task_event(
+                &task_id,
+                "cancelled",
+                "task cancelled",
+                &serde_json::json!({}),
+            )?;
+        }
+        Ok::<_, anyhow::Error>(changed)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| {
+        if e.to_string().contains("task not found") {
+            err(StatusCode::NOT_FOUND, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })
+}
+
+async fn task_wait_snapshot(
+    state: &SharedState,
+    task_id: TaskId,
+    after: Option<i64>,
+    limit: usize,
+) -> Result<TaskWaitEvent, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let task = pipeline
+            .store()
+            .get_task(&task_id)?
+            .with_context(|| format!("task not found: {}", task_id.0))?;
+        let events = pipeline.store().list_task_events(&task_id, after, limit)?;
+        let spans = if task.status.is_terminal() {
+            pipeline.store().list_task_spans(&task_id)?
+        } else {
+            Vec::new()
+        };
+        let terminal = task.status.is_terminal();
+        Ok::<_, anyhow::Error>(TaskWaitEvent {
+            task,
+            events,
+            spans,
+            terminal,
+        })
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| {
+        if e.to_string().contains("task not found") {
+            err(StatusCode::NOT_FOUND, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })
+}
+
+#[cfg(test)]
 fn try_send_stream_event(tx: &mpsc::Sender<Event>, event: Event) -> Result<()> {
     match tx.try_send(event) {
         Ok(()) => Ok(()),
@@ -739,6 +1312,12 @@ async fn run_daemon() -> Result<()> {
         .route("/api/ingest/{id}", post(ingest_one))
         .route("/api/ask", post(ask))
         .route("/api/ask/stream", post(ask_stream))
+        .route("/api/tasks/ask", post(submit_ask_task))
+        .route("/api/tasks/ingest", post(submit_ingest_task))
+        .route("/api/tasks/{id}", get(show_task))
+        .route("/api/tasks/{id}/events", get(list_task_events_handler))
+        .route("/api/tasks/{id}/wait", get(wait_task))
+        .route("/api/tasks/{id}/cancel", post(cancel_task_handler))
         .route("/api/evidence/{eid}", get(get_evidence))
         .layer(CorsLayer::permissive())
         .with_state(state);
