@@ -100,12 +100,24 @@ where
             source_id,
             force,
             background,
+            embedding_profile,
+            vectors_only,
         } => {
             if background {
-                let response = client.submit_ingest_task(source_id.as_deref(), force)?;
+                let response = client.submit_ingest_task(
+                    source_id.as_deref(),
+                    force,
+                    embedding_profile.as_deref(),
+                    vectors_only,
+                )?;
                 render::write_task_created(stdout, &response)?;
             } else {
-                let response = client.ingest(source_id.as_deref(), force)?;
+                let response = client.ingest(
+                    source_id.as_deref(),
+                    force,
+                    embedding_profile.as_deref(),
+                    vectors_only,
+                )?;
                 render::write_ingest(stdout, &response)?;
             }
             Ok(0)
@@ -113,12 +125,14 @@ where
         Commands::Ask {
             question,
             source_id,
+            embedding_profile,
             show_retrieval,
             background,
         } => {
             let request = AskRequest {
                 question: question.join(" "),
                 source_id,
+                embedding_profile_id: embedding_profile,
                 show_retrieval,
             };
             if background {
@@ -275,6 +289,12 @@ enum Commands {
         /// Re-ingest all sources, including already indexed sources.
         #[arg(long)]
         force: bool,
+        /// Build vectors for this embedding profile from existing chunks.
+        #[arg(long = "embedding-profile")]
+        embedding_profile: Option<String>,
+        /// Build only profile vectors/indexes without re-parsing sources.
+        #[arg(long)]
+        vectors_only: bool,
         /// Queue ingest as a persistent daemon task and return immediately.
         #[arg(long)]
         background: bool,
@@ -284,6 +304,9 @@ enum Commands {
         /// Restrict retrieval to one source.
         #[arg(short = 's', long = "source-id")]
         source_id: Option<String>,
+        /// Use this embedding profile for retrieval.
+        #[arg(long = "embedding-profile")]
+        embedding_profile: Option<String>,
         /// Show retrieval provenance and ranking debug output.
         #[arg(long)]
         show_retrieval: bool,
@@ -477,7 +500,10 @@ mod tests {
     fn ingest_evidence_config_and_status_call_daemon_client() {
         let (code, _, _, client, _) = run_mock(["ingest", "--force"]);
         assert_eq!(code.unwrap(), 0);
-        assert_eq!(client.calls.borrow().as_slice(), ["ingest:None:true"]);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["ingest:None:true:None:false"]
+        );
 
         let (code, stdout, _, client, _) = run_mock(["evidence", "ev-1"]);
         assert_eq!(code.unwrap(), 0);
@@ -502,7 +528,7 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert_eq!(
             client.calls.borrow().as_slice(),
-            ["submit_ingest_task:None:true"]
+            ["submit_ingest_task:None:true:None:false"]
         );
         assert!(stdout.contains("Task queued: task-1"));
         assert!(stdout.contains("verbatim task wait task-1"));
@@ -517,6 +543,7 @@ mod tests {
             &AskRequest {
                 question: "What is cited?".into(),
                 source_id: Some("src-1".into()),
+                embedding_profile_id: None,
                 show_retrieval: false,
             }
         );
@@ -570,6 +597,7 @@ mod tests {
             &AskRequest {
                 question: "What is cited?".into(),
                 source_id: Some("src-1".into()),
+                embedding_profile_id: None,
                 show_retrieval: true,
             }
         );
@@ -577,6 +605,39 @@ mod tests {
         assert!(stdout.contains("Retrieval Debug"));
         assert!(stdout.contains("Final evidence pack:"));
         assert!(!stdout.contains("secret full raw source text"));
+    }
+
+    #[test]
+    fn embedding_profile_flags_are_plumbed() {
+        let (code, _, stderr, client, _) = run_mock([
+            "ingest",
+            "src-1",
+            "--embedding-profile",
+            "alt",
+            "--vectors-only",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["ingest:Some(\"src-1\"):false:Some(\"alt\"):true"]
+        );
+        assert!(stderr.is_empty());
+
+        let (code, _, stderr, client, _) =
+            run_mock(["ask", "--embedding-profile", "alt", "What", "is", "cited?"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.last_ask.borrow().as_ref().unwrap(),
+            &AskRequest {
+                question: "What is cited?".into(),
+                source_id: None,
+                embedding_profile_id: Some("alt".into()),
+                show_retrieval: false,
+            }
+        );
+        assert!(stderr.is_empty());
     }
 
     #[test]
@@ -733,10 +794,12 @@ mod tests {
             &self,
             source_id: Option<&str>,
             force: bool,
+            embedding_profile_id: Option<&str>,
+            vectors_only: bool,
         ) -> client::CliResult<IngestResponse> {
-            self.calls
-                .borrow_mut()
-                .push(format!("ingest:{source_id:?}:{force}"));
+            self.calls.borrow_mut().push(format!(
+                "ingest:{source_id:?}:{force}:{embedding_profile_id:?}:{vectors_only}"
+            ));
             Ok(IngestResponse { ingested: 1 })
         }
 
@@ -752,10 +815,12 @@ mod tests {
             &self,
             source_id: Option<&str>,
             force: bool,
+            embedding_profile_id: Option<&str>,
+            vectors_only: bool,
         ) -> client::CliResult<TaskCreatedResponse> {
-            self.calls
-                .borrow_mut()
-                .push(format!("submit_ingest_task:{source_id:?}:{force}"));
+            self.calls.borrow_mut().push(format!(
+                "submit_ingest_task:{source_id:?}:{force}:{embedding_profile_id:?}:{vectors_only}"
+            ));
             Ok(TaskCreatedResponse {
                 task_id: "task-1".into(),
             })

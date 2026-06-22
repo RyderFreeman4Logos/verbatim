@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::image_limits::ImageArtifactLimits;
-use crate::types::EdgeType;
+use crate::types::{EdgeType, EmbeddingProfileId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -66,6 +66,8 @@ impl Default for ParserConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
+    #[serde(default)]
+    pub profile_id: EmbeddingProfileId,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default = "default_openai_provider")]
@@ -93,6 +95,7 @@ pub struct EmbeddingConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
+            profile_id: EmbeddingProfileId::default_profile(),
             enabled: true,
             provider: default_openai_provider(),
             base_url: default_embedding_base_url(),
@@ -739,6 +742,7 @@ max_image_height = 10000
 max_image_pixels = 100000000
 
 [embedding]
+profile_id = "default"
 enabled = true
 provider = "openai_compatible"
 base_url = "http://127.0.0.1:8002/v1"

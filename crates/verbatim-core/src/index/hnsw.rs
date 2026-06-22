@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::Store;
 use crate::traits::{VectorDocument, VectorIndex};
-use crate::types::{ChunkId, SourceId};
+use crate::types::{ChunkId, EmbeddingProfileId, SourceId};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct VecPoint(Vec<f32>);
@@ -118,6 +118,15 @@ impl HnswIndex {
     pub fn is_empty(&self) -> bool {
         self.points.is_empty()
     }
+
+    pub fn rebuild_from_store_for_profile(
+        &mut self,
+        store: &Store,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<()> {
+        self.points = store.list_vector_documents_for_profile(profile_id)?;
+        self.build()
+    }
 }
 
 impl Default for HnswIndex {
@@ -144,8 +153,7 @@ impl VectorIndex for HnswIndex {
     }
 
     fn rebuild_from_store(&mut self, store: &Store) -> Result<()> {
-        self.points = store.list_vector_documents()?;
-        self.build()
+        self.rebuild_from_store_for_profile(store, &EmbeddingProfileId::default_profile())
     }
 
     fn len(&self) -> usize {

@@ -12,7 +12,7 @@ use url::form_urlencoded::byte_serialize;
 use crate::config::QdrantConfig;
 use crate::store::Store;
 use crate::traits::VectorDocument;
-use crate::types::{Chunk, ChunkId, SourceId};
+use crate::types::{Chunk, ChunkId, EmbeddingProfileId, SourceId};
 
 const DISTANCE: &str = "Cosine";
 const MAX_QDRANT_ERROR_BODY_BYTES: u64 = 4096;
@@ -41,8 +41,17 @@ pub fn records_from_store(
     store: &Store,
     source_filter: Option<&SourceId>,
 ) -> Result<Vec<QdrantVectorRecord>> {
+    records_from_store_for_profile(store, &EmbeddingProfileId::default_profile(), source_filter)
+}
+
+/// Build Qdrant records for one embedding profile.
+pub fn records_from_store_for_profile(
+    store: &Store,
+    profile_id: &EmbeddingProfileId,
+    source_filter: Option<&SourceId>,
+) -> Result<Vec<QdrantVectorRecord>> {
     let mut records = Vec::new();
-    for document in store.list_vector_documents()? {
+    for document in store.list_vector_documents_for_profile(profile_id)? {
         if source_filter.is_some_and(|source_id| &document.source_id != source_id) {
             continue;
         }

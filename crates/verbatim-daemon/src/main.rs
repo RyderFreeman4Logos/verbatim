@@ -41,7 +41,8 @@ use verbatim_core::task::{
     ingest_result_metadata, PhaseTiming, TaskId, TaskKind,
 };
 use verbatim_core::types::{
-    CitationRef, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug, RetrievalResult, SourceId,
+    CitationRef, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug,
+    RetrievalResult, SourceId,
 };
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,10 @@ const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 struct IngestQuery {
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    embedding_profile_id: Option<String>,
+    #[serde(default)]
+    vectors_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -424,30 +429,57 @@ async fn ingest_all(
     State(state): State<SharedState>,
     query: Query<IngestQuery>,
 ) -> Result<Json<IngestResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if query.vectors_only && query.force {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("force is not supported for vectors-only embedding profile builds"),
+        ));
+    }
     let task_id = create_persisted_task(
         &state,
         TaskKind::Ingest,
         ingest_request_metadata(None, query.force),
     )
     .await?;
-    execute_ingest_task(state, task_id, None, query.force)
-        .await
-        .map(Json)
+    execute_ingest_task(
+        state,
+        task_id,
+        None,
+        query.force,
+        query.embedding_profile_id.clone(),
+        query.vectors_only,
+    )
+    .await
+    .map(Json)
 }
 
 async fn ingest_one(
     State(state): State<SharedState>,
     Path(id): Path<String>,
+    query: Query<IngestQuery>,
 ) -> Result<Json<IngestResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if query.force {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("force is only supported for all-source ingest"),
+        ));
+    }
     let task_id = create_persisted_task(
         &state,
         TaskKind::Ingest,
         ingest_request_metadata(Some(&id), false),
     )
     .await?;
-    execute_ingest_task(state, task_id, Some(id), false)
-        .await
-        .map(Json)
+    execute_ingest_task(
+        state,
+        task_id,
+        Some(id),
+        false,
+        query.embedding_profile_id.clone(),
+        query.vectors_only,
+    )
+    .await
+    .map(Json)
 }
 
 async fn ask(
@@ -517,13 +549,26 @@ async fn submit_ingest_task(
             anyhow::anyhow!("force is only supported for all-source ingest"),
         ));
     }
+    if req.vectors_only && req.force {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("force is not supported for vectors-only embedding profile builds"),
+        ));
+    }
     let task_id = create_persisted_task(
         &state,
         TaskKind::Ingest,
         ingest_request_metadata(req.source_id.as_deref(), req.force),
     )
     .await?;
-    spawn_ingest_task(state, task_id.clone(), req.source_id, req.force);
+    spawn_ingest_task(
+        state,
+        task_id.clone(),
+        req.source_id,
+        req.force,
+        req.embedding_profile_id,
+        req.vectors_only,
+    );
     Ok(Json(TaskCreatedResponse { task_id: task_id.0 }))
 }
 
@@ -619,12 +664,22 @@ async fn execute_ask_task_inner(
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
+    let embedding_profile_id = parse_embedding_profile_id(
+        req.embedding_profile_id.as_deref(),
+        &state.config.embedding.profile_id,
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let show_retrieval = req.show_retrieval;
 
     let timing = PhaseTiming::start("retrieval");
-    let (results, generation_context, retrieval_debug) =
-        prepare_generation_context(Arc::clone(&state), &question, source_filter, show_retrieval)
-            .await?;
+    let (results, generation_context, retrieval_debug) = prepare_generation_context(
+        Arc::clone(&state),
+        &question,
+        source_filter,
+        &embedding_profile_id,
+        show_retrieval,
+    )
+    .await?;
     record_task_span(
         &state,
         task_id,
@@ -710,12 +765,22 @@ async fn execute_ask_stream_task_inner(
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
+    let embedding_profile_id = parse_embedding_profile_id(
+        req.embedding_profile_id.as_deref(),
+        &state.config.embedding.profile_id,
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let show_retrieval = req.show_retrieval;
 
     let timing = PhaseTiming::start("retrieval");
-    let (results, generation_context, retrieval_debug) =
-        prepare_generation_context(Arc::clone(&state), &question, source_filter, show_retrieval)
-            .await?;
+    let (results, generation_context, retrieval_debug) = prepare_generation_context(
+        Arc::clone(&state),
+        &question,
+        source_filter,
+        &embedding_profile_id,
+        show_retrieval,
+    )
+    .await?;
     record_task_span(
         &state,
         task_id,
@@ -802,9 +867,24 @@ fn spawn_ask_task(state: SharedState, task_id: TaskId, req: AskRequest) {
     });
 }
 
-fn spawn_ingest_task(state: SharedState, task_id: TaskId, source_id: Option<String>, force: bool) {
+fn spawn_ingest_task(
+    state: SharedState,
+    task_id: TaskId,
+    source_id: Option<String>,
+    force: bool,
+    embedding_profile_id: Option<String>,
+    vectors_only: bool,
+) {
     tokio::spawn(async move {
-        let _ = execute_ingest_task(state, task_id, source_id, force).await;
+        let _ = execute_ingest_task(
+            state,
+            task_id,
+            source_id,
+            force,
+            embedding_profile_id,
+            vectors_only,
+        )
+        .await;
     });
 }
 
@@ -813,8 +893,18 @@ async fn execute_ingest_task(
     task_id: TaskId,
     source_id: Option<String>,
     force: bool,
+    embedding_profile_id: Option<String>,
+    vectors_only: bool,
 ) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
-    let result = execute_ingest_task_inner(Arc::clone(&state), &task_id, source_id, force).await;
+    let result = execute_ingest_task_inner(
+        Arc::clone(&state),
+        &task_id,
+        source_id,
+        force,
+        embedding_profile_id,
+        vectors_only,
+    )
+    .await;
     if let Err((_, Json(error))) = &result {
         let _ = finish_task_failed(&state, &task_id, &error.error).await;
     }
@@ -826,14 +916,36 @@ async fn execute_ingest_task_inner(
     task_id: &TaskId,
     source_id: Option<String>,
     force: bool,
+    embedding_profile_id: Option<String>,
+    vectors_only: bool,
 ) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
     ensure_task_started(&state, task_id).await?;
+    if embedding_profile_id.is_some() && !vectors_only {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!(
+                "embedding_profile_id is supported for vectors-only builds; set [embedding].profile_id for parse ingest"
+            ),
+        ));
+    }
+    let profile_id = parse_embedding_profile_id(
+        embedding_profile_id.as_deref(),
+        &state.config.embedding.profile_id,
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let state2 = Arc::clone(&state);
     let task_id2 = task_id.clone();
+    let profile_id_for_task = profile_id.clone();
     let runtime = tokio::runtime::Handle::current();
     let timing = PhaseTiming::start("ingest");
     let result = tokio::task::spawn_blocking(move || {
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if vectors_only {
+            let source_filter = source_id.as_ref().map(|id| SourceId(id.clone()));
+            return runtime.block_on(
+                pipeline.build_embedding_profile(&profile_id_for_task, source_filter.as_ref()),
+            );
+        }
         match source_id {
             Some(id) => {
                 runtime.block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2))?;
@@ -852,6 +964,8 @@ async fn execute_ingest_task_inner(
         timing.finish(serde_json::json!({
             "ingested": response.ingested,
             "force": force,
+            "embedding_profile_id": profile_id.as_str(),
+            "vectors_only": vectors_only,
         })),
     )
     .await?;
@@ -953,10 +1067,22 @@ async fn send_stream_event(
     })
 }
 
+fn parse_embedding_profile_id(
+    requested: Option<&str>,
+    default_profile_id: &EmbeddingProfileId,
+) -> Result<EmbeddingProfileId> {
+    requested
+        .map(EmbeddingProfileId::try_from)
+        .transpose()
+        .map(|profile_id| profile_id.unwrap_or_else(|| default_profile_id.clone()))
+        .map_err(Into::into)
+}
+
 async fn prepare_generation_context(
     state: SharedState,
     question: &str,
     source_filter: Option<SourceId>,
+    embedding_profile_id: &EmbeddingProfileId,
     show_retrieval: bool,
 ) -> Result<
     (
@@ -969,9 +1095,11 @@ async fn prepare_generation_context(
     // Retrieve first; this touches the !Send store and async embed client.
     let state2 = Arc::clone(&state);
     let question2 = question.to_string();
+    let embedding_profile_id = embedding_profile_id.clone();
     let runtime = tokio::runtime::Handle::current();
     let (results, generation_context, retrieval_debug) = tokio::task::spawn_blocking(move || {
-        let pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.select_embedding_profile(&embedding_profile_id)?;
         let lexical_index = pipeline.lexical_index();
         let mut retrieval = RetrievalPipeline::new_with_graph(
             pipeline.vector_index(),
@@ -981,6 +1109,7 @@ async fn prepare_generation_context(
             &state2.config.retrieval,
             &state2.config.graph,
         )
+        .require_embedding_profile(&embedding_profile_id)
         .with_qdrant_search(&state2.config.qdrant);
         if let Some(reranker) = state2.reranker.as_ref() {
             retrieval = retrieval.with_reranker(&state2.config.rerank, reranker);

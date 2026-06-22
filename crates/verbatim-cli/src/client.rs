@@ -70,12 +70,20 @@ pub trait DaemonClient {
     fn get_source(&self, id: &str) -> CliResult<SourceResponse>;
     fn remove_source(&self, id: &str) -> CliResult<()>;
     fn check_sources(&self) -> CliResult<CheckStaleResponse>;
-    fn ingest(&self, source_id: Option<&str>, force: bool) -> CliResult<IngestResponse>;
+    fn ingest(
+        &self,
+        source_id: Option<&str>,
+        force: bool,
+        embedding_profile_id: Option<&str>,
+        vectors_only: bool,
+    ) -> CliResult<IngestResponse>;
     fn submit_ask_task(&self, request: &AskRequest) -> CliResult<TaskCreatedResponse>;
     fn submit_ingest_task(
         &self,
         source_id: Option<&str>,
         force: bool,
+        embedding_profile_id: Option<&str>,
+        vectors_only: bool,
     ) -> CliResult<TaskCreatedResponse>;
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
     fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse>;
@@ -237,7 +245,13 @@ impl DaemonClient for HttpDaemonClient {
         self.request_json::<CheckStaleResponse, ()>(Method::POST, "/api/sources/check", None)
     }
 
-    fn ingest(&self, source_id: Option<&str>, force: bool) -> CliResult<IngestResponse> {
+    fn ingest(
+        &self,
+        source_id: Option<&str>,
+        force: bool,
+        embedding_profile_id: Option<&str>,
+        vectors_only: bool,
+    ) -> CliResult<IngestResponse> {
         let path = match (source_id, force) {
             (Some(_), true) => {
                 return Err(CliError::Api(
@@ -245,9 +259,20 @@ impl DaemonClient for HttpDaemonClient {
                 ));
             }
             (Some(id), false) => format!("/api/ingest/{id}"),
-            (None, true) => "/api/ingest?force=true".into(),
+            (None, true) => "/api/ingest".into(),
             (None, false) => "/api/ingest".into(),
         };
+        if force && vectors_only {
+            return Err(CliError::Api(
+                "--force is not supported with --vectors-only".into(),
+            ));
+        }
+        if embedding_profile_id.is_some() && !vectors_only {
+            return Err(CliError::Api(
+                "--embedding-profile requires --vectors-only".into(),
+            ));
+        }
+        let path = ingest_path_with_query(&path, force, embedding_profile_id, vectors_only);
         self.request_json::<IngestResponse, ()>(Method::POST, &path, None)
     }
 
@@ -259,15 +284,29 @@ impl DaemonClient for HttpDaemonClient {
         &self,
         source_id: Option<&str>,
         force: bool,
+        embedding_profile_id: Option<&str>,
+        vectors_only: bool,
     ) -> CliResult<TaskCreatedResponse> {
         if source_id.is_some() && force {
             return Err(CliError::Api(
                 "--force is only supported for all-source ingest".into(),
             ));
         }
+        if force && vectors_only {
+            return Err(CliError::Api(
+                "--force is not supported with --vectors-only".into(),
+            ));
+        }
+        if embedding_profile_id.is_some() && !vectors_only {
+            return Err(CliError::Api(
+                "--embedding-profile requires --vectors-only".into(),
+            ));
+        }
         let request = TaskIngestRequest {
             source_id: source_id.map(str::to_string),
             force,
+            embedding_profile_id: embedding_profile_id.map(str::to_string),
+            vectors_only,
         };
         self.request_json(Method::POST, "/api/tasks/ingest", Some(&request))
     }
@@ -377,7 +416,7 @@ fn is_long_running_mutation(method: &Method, path: &str) -> bool {
         return path == "/api/sources"
             || path == "/api/sources/check"
             || path == "/api/ingest"
-            || path == "/api/ingest?force=true"
+            || path.starts_with("/api/ingest?")
             || path.starts_with("/api/ingest/");
     }
     false
@@ -407,6 +446,44 @@ fn daemon_http_timeout_seconds(config: &Config) -> u64 {
     max_model_timeout
         .max(DEFAULT_DAEMON_HTTP_TIMEOUT_SECONDS)
         .saturating_add(DAEMON_HTTP_TIMEOUT_PADDING_SECONDS)
+}
+
+fn ingest_path_with_query(
+    base_path: &str,
+    force: bool,
+    embedding_profile_id: Option<&str>,
+    vectors_only: bool,
+) -> String {
+    let mut params = Vec::new();
+    if force {
+        params.push("force=true".to_string());
+    }
+    if let Some(profile_id) = embedding_profile_id {
+        params.push(format!(
+            "embedding_profile_id={}",
+            encode_query_component(profile_id)
+        ));
+    }
+    if vectors_only {
+        params.push("vectors_only=true".to_string());
+    }
+    if params.is_empty() {
+        base_path.to_string()
+    } else {
+        format!("{base_path}?{}", params.join("&"))
+    }
+}
+
+fn encode_query_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn decode_response<T>(response: reqwest::blocking::Response) -> CliResult<T>
@@ -720,12 +797,29 @@ mod tests {
         );
         let client = HttpDaemonClient::with_base_url(server.base_url());
 
-        let response = client.ingest(None, true).unwrap();
+        let response = client.ingest(None, true, None, false).unwrap();
 
         assert_eq!(response.ingested, 2);
         assert!(server
             .request()
             .starts_with("POST /api/ingest?force=true HTTP/1.1"));
+    }
+
+    #[test]
+    fn http_ingest_profile_vectors_only_uses_query_parameters() {
+        let server = TestServer::respond_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ingested\":1}",
+        );
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let response = client
+            .ingest(Some("src-1"), false, Some("alt.profile"), true)
+            .unwrap();
+
+        assert_eq!(response.ingested, 1);
+        assert!(server.request().starts_with(
+            "POST /api/ingest/src-1?embedding_profile_id=alt.profile&vectors_only=true HTTP/1.1"
+        ));
     }
 
     #[test]
@@ -753,13 +847,14 @@ mod tests {
         let ask = AskRequest {
             question: "Why?".into(),
             source_id: Some("src-1".into()),
+            embedding_profile_id: None,
             show_retrieval: false,
         };
 
         assert_eq!(client.submit_ask_task(&ask).unwrap().task_id, "task-1");
         assert_eq!(
             client
-                .submit_ingest_task(Some("src-1"), false)
+                .submit_ingest_task(Some("src-1"), false, None, false)
                 .unwrap()
                 .task_id,
             "task-2"
