@@ -173,6 +173,8 @@ pub struct GraphConfig {
     pub max_neighbors_per_seed: usize,
     #[serde(default = "default_graph_edge_types")]
     pub edge_types: Vec<EdgeType>,
+    #[serde(default)]
+    pub extraction: GraphExtractionConfig,
 }
 
 impl Default for GraphConfig {
@@ -183,6 +185,7 @@ impl Default for GraphConfig {
             max_expanded_chunks: default_graph_max_expanded_chunks(),
             max_neighbors_per_seed: default_graph_max_neighbors_per_seed(),
             edge_types: default_graph_edge_types(),
+            extraction: GraphExtractionConfig::default(),
         }
     }
 }
@@ -213,6 +216,83 @@ fn default_graph_edge_types() -> Vec<EdgeType> {
         EdgeType::ImageNearText,
         EdgeType::MarkdownLinksTo,
     ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphExtractionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_graph_extraction_max_chunks")]
+    pub max_chunks: usize,
+    #[serde(default = "default_graph_extraction_max_chunk_chars")]
+    pub max_chunk_chars: usize,
+    #[serde(default = "default_graph_extraction_max_entities")]
+    pub max_entities: usize,
+    #[serde(default = "default_graph_extraction_max_relationships")]
+    pub max_relationships: usize,
+    #[serde(default = "default_graph_extraction_max_claims")]
+    pub max_claims: usize,
+    #[serde(default = "default_graph_extraction_max_retries")]
+    pub max_retries: usize,
+    #[serde(default = "default_graph_extraction_max_output_tokens")]
+    pub max_output_tokens: u32,
+    #[serde(default = "default_graph_extraction_max_response_chars")]
+    pub max_response_chars: usize,
+    #[serde(default = "default_graph_extraction_max_error_chars")]
+    pub max_error_chars: usize,
+}
+
+impl Default for GraphExtractionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_chunks: default_graph_extraction_max_chunks(),
+            max_chunk_chars: default_graph_extraction_max_chunk_chars(),
+            max_entities: default_graph_extraction_max_entities(),
+            max_relationships: default_graph_extraction_max_relationships(),
+            max_claims: default_graph_extraction_max_claims(),
+            max_retries: default_graph_extraction_max_retries(),
+            max_output_tokens: default_graph_extraction_max_output_tokens(),
+            max_response_chars: default_graph_extraction_max_response_chars(),
+            max_error_chars: default_graph_extraction_max_error_chars(),
+        }
+    }
+}
+
+fn default_graph_extraction_max_chunks() -> usize {
+    8
+}
+
+fn default_graph_extraction_max_chunk_chars() -> usize {
+    3_000
+}
+
+fn default_graph_extraction_max_entities() -> usize {
+    24
+}
+
+fn default_graph_extraction_max_relationships() -> usize {
+    32
+}
+
+fn default_graph_extraction_max_claims() -> usize {
+    32
+}
+
+fn default_graph_extraction_max_retries() -> usize {
+    1
+}
+
+fn default_graph_extraction_max_output_tokens() -> u32 {
+    2_048
+}
+
+fn default_graph_extraction_max_response_chars() -> usize {
+    32 * 1024
+}
+
+fn default_graph_extraction_max_error_chars() -> usize {
+    256
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,6 +675,18 @@ max_expanded_chunks = 30
 max_neighbors_per_seed = 6
 edge_types = ["parent", "previous", "next", "section_contains", "page_contains_image", "image_near_text", "markdown_links_to"]
 
+[graph.extraction]
+enabled = false
+max_chunks = 8
+max_chunk_chars = 3000
+max_entities = 24
+max_relationships = 32
+max_claims = 32
+max_retries = 1
+max_output_tokens = 2048
+max_response_chars = 32768
+max_error_chars = 256
+
 [rerank]
 enabled = false
 provider = "vllm"              # vllm | cohere | jina
@@ -689,6 +781,16 @@ mod tests {
                 EdgeType::MarkdownLinksTo,
             ]
         );
+        assert!(!config.graph.extraction.enabled);
+        assert_eq!(config.graph.extraction.max_chunks, 8);
+        assert_eq!(config.graph.extraction.max_chunk_chars, 3_000);
+        assert_eq!(config.graph.extraction.max_entities, 24);
+        assert_eq!(config.graph.extraction.max_relationships, 32);
+        assert_eq!(config.graph.extraction.max_claims, 32);
+        assert_eq!(config.graph.extraction.max_retries, 1);
+        assert_eq!(config.graph.extraction.max_output_tokens, 2_048);
+        assert_eq!(config.graph.extraction.max_response_chars, 32 * 1024);
+        assert_eq!(config.graph.extraction.max_error_chars, 256);
         assert!(!config.rerank.enabled);
         assert_eq!(config.rerank.provider, "vllm");
         assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
@@ -743,6 +845,31 @@ enabled = false
         assert_eq!(config.graph.max_expanded_chunks, 30);
         assert_eq!(config.graph.max_neighbors_per_seed, 6);
         assert!(config.graph.edge_types.contains(&EdgeType::Parent));
+        assert!(!config.graph.extraction.enabled);
+        assert_eq!(config.graph.extraction.max_chunks, 8);
+    }
+
+    #[test]
+    fn partial_graph_extraction_config_defaults_disabled_and_bounded() {
+        let config: Config = toml::from_str(
+            r#"
+[graph.extraction]
+enabled = true
+max_chunks = 2
+"#,
+        )
+        .unwrap();
+
+        assert!(config.graph.extraction.enabled);
+        assert_eq!(config.graph.extraction.max_chunks, 2);
+        assert_eq!(config.graph.extraction.max_chunk_chars, 3_000);
+        assert_eq!(config.graph.extraction.max_entities, 24);
+        assert_eq!(config.graph.extraction.max_relationships, 32);
+        assert_eq!(config.graph.extraction.max_claims, 32);
+        assert_eq!(config.graph.extraction.max_retries, 1);
+        assert_eq!(config.graph.extraction.max_output_tokens, 2_048);
+        assert_eq!(config.graph.extraction.max_response_chars, 32 * 1024);
+        assert_eq!(config.graph.extraction.max_error_chars, 256);
     }
 
     #[test]

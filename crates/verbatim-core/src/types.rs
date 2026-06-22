@@ -117,6 +117,8 @@ pub enum GraphNodeKind {
     Chunk,
     EvidenceUnit,
     ImageArtifact,
+    GeneratedEntity,
+    GeneratedClaim,
 }
 
 impl GraphNodeKind {
@@ -128,6 +130,8 @@ impl GraphNodeKind {
             Self::Chunk => "Chunk",
             Self::EvidenceUnit => "EvidenceUnit",
             Self::ImageArtifact => "ImageArtifact",
+            Self::GeneratedEntity => "GeneratedEntity",
+            Self::GeneratedClaim => "GeneratedClaim",
         }
     }
 }
@@ -147,6 +151,12 @@ pub enum EdgeType {
     PageContainsImage,
     ImageNearText,
     MarkdownLinksTo,
+    GeneratedDependsOn,
+    GeneratedImplements,
+    GeneratedMentions,
+    GeneratedConflictsWith,
+    GeneratedSupports,
+    GeneratedOther,
 }
 
 impl EdgeType {
@@ -164,6 +174,12 @@ impl EdgeType {
             Self::PageContainsImage => "page_contains_image",
             Self::ImageNearText => "image_near_text",
             Self::MarkdownLinksTo => "markdown_links_to",
+            Self::GeneratedDependsOn => "generated_depends_on",
+            Self::GeneratedImplements => "generated_implements",
+            Self::GeneratedMentions => "generated_mentions",
+            Self::GeneratedConflictsWith => "generated_conflicts_with",
+            Self::GeneratedSupports => "generated_supports",
+            Self::GeneratedOther => "generated_other",
         }
     }
 }
