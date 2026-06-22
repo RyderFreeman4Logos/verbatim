@@ -2,18 +2,21 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 
-use crate::config::{GraphConfig, RetrievalConfig};
+use crate::config::{GraphConfig, RerankConfig, RetrievalConfig};
+use crate::provider::ProviderError;
 use crate::store::Store;
-use crate::traits::{EmbeddingClient, LexicalIndex, VectorIndex};
+use crate::traits::{EmbeddingClient, LexicalIndex, Reranker, VectorIndex};
 use crate::types::{
     Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit,
     GraphExpansionStep, GraphNodeId, GraphNodeKind, GraphTraversalDirection, ImageId,
     RetrievalDebug, RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalFusedHit,
     RetrievalGraphExpansionDebug, RetrievalLocatorDebug, RetrievalProvenance, RetrievalRerankDebug,
-    RetrievalResult, RetrievalStageHit, SourceId, SourceLocator,
+    RetrievalRerankScore, RetrievalResult, RetrievalStageHit, SourceId, SourceLocator,
 };
 
 const GRAPH_EXPANSION_SCORE_DECAY: f32 = 0.5;
+const MAX_RERANK_CANDIDATE_CHUNKS: usize = 50;
+const MAX_RERANK_DOCUMENT_CHARS: usize = 8_000;
 
 pub struct RetrievalPipeline<'a> {
     vector_index: &'a dyn VectorIndex,
@@ -22,6 +25,8 @@ pub struct RetrievalPipeline<'a> {
     embed_client: &'a dyn EmbeddingClient,
     config: &'a RetrievalConfig,
     graph_config: Option<&'a GraphConfig>,
+    rerank_config: Option<&'a RerankConfig>,
+    reranker: Option<&'a dyn Reranker>,
 }
 
 impl<'a> RetrievalPipeline<'a> {
@@ -39,6 +44,8 @@ impl<'a> RetrievalPipeline<'a> {
             embed_client,
             config,
             graph_config: None,
+            rerank_config: None,
+            reranker: None,
         }
     }
 
@@ -57,7 +64,15 @@ impl<'a> RetrievalPipeline<'a> {
             embed_client,
             config,
             graph_config: Some(graph_config),
+            rerank_config: None,
+            reranker: None,
         }
+    }
+
+    pub fn with_reranker(mut self, config: &'a RerankConfig, reranker: &'a dyn Reranker) -> Self {
+        self.rerank_config = Some(config);
+        self.reranker = Some(reranker);
+        self
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<RetrievalResult>> {
@@ -143,6 +158,11 @@ impl<'a> RetrievalPipeline<'a> {
             Vec::new()
         };
 
+        let RerankOutcome {
+            fused,
+            debug: reranker_debug,
+        } = self.rerank_fused(query, fused).await?;
+
         let mut results = Vec::new();
         for (rank, (chunk_id, score)) in fused.into_iter().enumerate() {
             let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
@@ -163,7 +183,7 @@ impl<'a> RetrievalPipeline<'a> {
                 dense_hits,
                 rrf_fused_hits,
                 graph_expanded_hits: graph_expansion_debug_hits(&results),
-                reranker: RetrievalRerankDebug::skipped("not_run"),
+                reranker: reranker_debug,
                 final_evidence_pack: final_evidence_pack_debug(&results),
             })
         } else {
@@ -198,6 +218,100 @@ impl<'a> RetrievalPipeline<'a> {
             evidence_units,
             provenance,
         })
+    }
+
+    async fn rerank_fused(&self, query: &str, fused: Vec<(ChunkId, f32)>) -> Result<RerankOutcome> {
+        let Some(config) = self.rerank_config else {
+            return Ok(RerankOutcome {
+                fused,
+                debug: RetrievalRerankDebug::disabled(),
+            });
+        };
+        if !config.enabled {
+            return Ok(RerankOutcome {
+                fused,
+                debug: RetrievalRerankDebug::disabled(),
+            });
+        }
+        if fused.is_empty() {
+            return Ok(RerankOutcome {
+                fused,
+                debug: RetrievalRerankDebug::skipped("no_candidates"),
+            });
+        }
+
+        let Some(reranker) = self.reranker else {
+            return Ok(RerankOutcome {
+                fused,
+                debug: RetrievalRerankDebug::skipped("reranker_not_configured"),
+            });
+        };
+
+        let mut candidates = Vec::new();
+        for (chunk_id, _) in fused.iter().take(MAX_RERANK_CANDIDATE_CHUNKS) {
+            let Some(chunk) = self.store.get_chunk(chunk_id)? else {
+                continue;
+            };
+            candidates.push(RerankCandidate {
+                chunk_id: chunk_id.clone(),
+                text: rerank_document_text(&chunk),
+            });
+        }
+
+        if candidates.is_empty() {
+            return Ok(RerankOutcome {
+                fused,
+                debug: RetrievalRerankDebug::skipped("no_available_candidate_text"),
+            });
+        }
+
+        let top_n = bounded_rerank_top_n(config.top_n, candidates.len());
+        let documents = candidates
+            .iter()
+            .map(|candidate| candidate.text.clone())
+            .collect::<Vec<_>>();
+
+        match reranker.rerank(query, &documents, top_n).await {
+            Ok(hits) => {
+                let (reranked, scores) = validated_rerank_hits(&candidates, hits, top_n);
+                if reranked.is_empty() {
+                    return Ok(RerankOutcome {
+                        fused,
+                        debug: RetrievalRerankDebug::fallback(
+                            &config.provider,
+                            &config.model,
+                            top_n,
+                            candidates.len(),
+                            "no_usable_results",
+                        ),
+                    });
+                }
+                Ok(RerankOutcome {
+                    fused: reranked,
+                    debug: RetrievalRerankDebug::succeeded(
+                        &config.provider,
+                        &config.model,
+                        top_n,
+                        candidates.len(),
+                        scores,
+                    ),
+                })
+            }
+            Err(error) => {
+                let reason = rerank_failure_reason(&error);
+                tracing::warn!(reason = %reason, "rerank failed; falling back to RRF ordering");
+                Ok(RerankOutcome {
+                    fused,
+                    debug: RetrievalRerankDebug::fallback(
+                        &config.provider,
+                        &config.model,
+                        top_n,
+                        candidates.len(),
+                        reason,
+                    ),
+                })
+            }
+        }
     }
 
     fn evidence_units_for_chunk(&self, chunk: &Chunk) -> Result<Vec<EvidenceUnit>> {
@@ -723,6 +837,16 @@ struct RetrievalSearchOutput {
     debug: Option<RetrievalDebug>,
 }
 
+struct RerankOutcome {
+    fused: Vec<(ChunkId, f32)>,
+    debug: RetrievalRerankDebug,
+}
+
+struct RerankCandidate {
+    chunk_id: ChunkId,
+    text: String,
+}
+
 impl RetrievalSearchOutput {
     fn into_results_with_debug(self) -> Result<(Vec<RetrievalResult>, RetrievalDebug)> {
         let debug = self
@@ -808,6 +932,88 @@ fn graph_expansion_debug_hits(results: &[RetrievalResult]) -> Vec<RetrievalGraph
             })
         })
         .collect()
+}
+
+fn bounded_rerank_top_n(top_n: usize, candidate_count: usize) -> usize {
+    if candidate_count == 0 {
+        return 0;
+    }
+    top_n
+        .max(1)
+        .min(candidate_count)
+        .min(MAX_RERANK_CANDIDATE_CHUNKS)
+}
+
+fn rerank_document_text(chunk: &Chunk) -> String {
+    let text = chunk
+        .context_text
+        .as_ref()
+        .filter(|context| !context.is_empty())
+        .map(|context| format!("{context} {}", chunk.text))
+        .unwrap_or_else(|| chunk.text.clone());
+    text.chars().take(MAX_RERANK_DOCUMENT_CHARS).collect()
+}
+
+fn validated_rerank_hits(
+    candidates: &[RerankCandidate],
+    hits: Vec<(usize, f32)>,
+    top_n: usize,
+) -> (Vec<(ChunkId, f32)>, Vec<RetrievalRerankScore>) {
+    let mut seen_indices = HashSet::new();
+    let mut valid_hits = hits
+        .into_iter()
+        .filter(|(index, score)| {
+            *index < candidates.len() && score.is_finite() && seen_indices.insert(*index)
+        })
+        .collect::<Vec<_>>();
+
+    valid_hits.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    valid_hits.truncate(top_n);
+
+    let reranked = valid_hits
+        .iter()
+        .map(|(index, score)| (candidates[*index].chunk_id.clone(), *score))
+        .collect::<Vec<_>>();
+    let scores = valid_hits
+        .iter()
+        .enumerate()
+        .map(|(rank, (index, score))| RetrievalRerankScore {
+            rank: rank + 1,
+            chunk_id: candidates[*index].chunk_id.clone(),
+            score: *score,
+        })
+        .collect();
+
+    (reranked, scores)
+}
+
+fn rerank_failure_reason(error: &anyhow::Error) -> String {
+    if let Some(provider_error) = error.downcast_ref::<ProviderError>() {
+        return match provider_error {
+            ProviderError::Configuration { .. } => "invalid_configuration".to_string(),
+            ProviderError::Transport { source, .. } if source.is_timeout() => {
+                "request_timeout".to_string()
+            }
+            ProviderError::Transport { .. } => "request_failed".to_string(),
+            ProviderError::HttpStatus { status, .. } => format!("http_status_{}", status.as_u16()),
+            ProviderError::ResponseDecode { .. } => "invalid_json".to_string(),
+            ProviderError::StreamDecode { .. } | ProviderError::MalformedResponse { .. } => {
+                "invalid_response".to_string()
+            }
+        };
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("timeout") || message.contains("timed out") {
+        "request_timeout".to_string()
+    } else {
+        "request_failed".to_string()
+    }
 }
 
 fn final_evidence_pack_debug(results: &[RetrievalResult]) -> Vec<RetrievalEvidencePackEntry> {
@@ -934,11 +1140,13 @@ fn push_unique_evidence(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use crate::index::hnsw::HnswIndex;
     use crate::index::sqlite_fts::SqliteFtsIndex;
     use crate::store::Store;
-    use crate::traits::{VectorDocument, VectorIndex};
+    use crate::traits::{LexicalIndex, VectorDocument, VectorIndex};
     use crate::types::{
         BBox, EdgeType, EvidenceId, EvidenceKind, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
         GraphNodeKind, GraphTraversalDirection, ImageArtifact, ImageId, RetrievalEvidenceRole,
@@ -1012,6 +1220,126 @@ mod tests {
         }
     }
 
+    struct StaticVectorIndex {
+        hits: Vec<(ChunkId, f32)>,
+    }
+
+    impl StaticVectorIndex {
+        fn new(hits: Vec<(ChunkId, f32)>) -> Self {
+            Self { hits }
+        }
+    }
+
+    impl VectorIndex for StaticVectorIndex {
+        fn upsert(&mut self, _document: VectorDocument) {}
+
+        fn delete_source(&mut self, _source_id: &SourceId) -> Result<()> {
+            Ok(())
+        }
+
+        fn search(&self, _query: &[f32], top_k: usize) -> Vec<(ChunkId, f32)> {
+            self.hits.iter().take(top_k).cloned().collect()
+        }
+
+        fn rebuild_from_store(&mut self, _store: &Store) -> Result<()> {
+            Ok(())
+        }
+
+        fn len(&self) -> usize {
+            self.hits.len()
+        }
+    }
+
+    struct StaticLexicalIndex {
+        hits: Vec<(ChunkId, f32)>,
+    }
+
+    impl StaticLexicalIndex {
+        fn new(hits: Vec<(ChunkId, f32)>) -> Self {
+            Self { hits }
+        }
+    }
+
+    impl LexicalIndex for StaticLexicalIndex {
+        fn upsert(&self, _document: &crate::traits::LexicalDocument) -> Result<()> {
+            Ok(())
+        }
+
+        fn delete_source(&self, _source_id: &SourceId) -> Result<()> {
+            Ok(())
+        }
+
+        fn search(&self, _query: &str, top_k: usize) -> Result<Vec<(ChunkId, f32)>> {
+            Ok(self.hits.iter().take(top_k).cloned().collect())
+        }
+
+        fn rebuild_from_store(&self, _store: &Store) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    enum MockRerankResponse {
+        Hits(Vec<(usize, f32)>),
+        Error(&'static str),
+    }
+
+    struct RecordingReranker {
+        response: MockRerankResponse,
+        calls: AtomicUsize,
+        docs: Mutex<Vec<Vec<String>>>,
+        top_ns: Mutex<Vec<usize>>,
+    }
+
+    impl RecordingReranker {
+        fn hits(hits: Vec<(usize, f32)>) -> Self {
+            Self {
+                response: MockRerankResponse::Hits(hits),
+                calls: AtomicUsize::new(0),
+                docs: Mutex::new(Vec::new()),
+                top_ns: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn error(message: &'static str) -> Self {
+            Self {
+                response: MockRerankResponse::Error(message),
+                calls: AtomicUsize::new(0),
+                docs: Mutex::new(Vec::new()),
+                top_ns: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn recorded_docs(&self) -> Vec<Vec<String>> {
+            self.docs.lock().unwrap().clone()
+        }
+
+        fn recorded_top_ns(&self) -> Vec<usize> {
+            self.top_ns.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Reranker for RecordingReranker {
+        async fn rerank(
+            &self,
+            _query: &str,
+            docs: &[String],
+            top_n: usize,
+        ) -> Result<Vec<(usize, f32)>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.docs.lock().unwrap().push(docs.to_vec());
+            self.top_ns.lock().unwrap().push(top_n);
+            match &self.response {
+                MockRerankResponse::Hits(hits) => Ok(hits.clone()),
+                MockRerankResponse::Error(message) => Err(anyhow!(*message)),
+            }
+        }
+    }
+
     fn source(id: &str) -> Source {
         Source {
             id: SourceId(id.into()),
@@ -1075,6 +1403,30 @@ mod tests {
             },
             Vec::new(),
             None,
+            None,
+        )
+    }
+
+    fn insert_text_chunk_with_context(
+        store: &Store,
+        source: &Source,
+        chunk_id: &str,
+        text: &str,
+        context_text: &str,
+    ) -> Chunk {
+        insert_text_chunk_with(
+            store,
+            source,
+            chunk_id,
+            text,
+            SourceLocator::Document {
+                path_or_url: source.path.to_string_lossy().into_owned(),
+                line_start: 1,
+                line_end: None,
+            },
+            Vec::new(),
+            None,
+            Some(context_text.to_string()),
         )
     }
 
@@ -1096,6 +1448,7 @@ mod tests {
                 bbox: None,
             },
             Vec::new(),
+            None,
             None,
         )
     }
@@ -1119,6 +1472,7 @@ mod tests {
             },
             heading_path,
             None,
+            None,
         )
     }
 
@@ -1141,6 +1495,7 @@ mod tests {
             },
             Vec::new(),
             Some(parent_chunk_id),
+            None,
         )
     }
 
@@ -1152,6 +1507,7 @@ mod tests {
         locator: SourceLocator,
         heading_path: Vec<String>,
         parent_chunk_id: Option<ChunkId>,
+        context_text: Option<String>,
     ) -> Chunk {
         let evidence = EvidenceUnit {
             id: EvidenceId(format!("ev-{chunk_id}")),
@@ -1168,7 +1524,7 @@ mod tests {
             id: ChunkId(chunk_id.into()),
             source_id: source.id.clone(),
             text: text.into(),
-            context_text: None,
+            context_text,
             token_count: 4,
             chunk_type: ChunkType::Child,
             parent_chunk_id,
@@ -1396,6 +1752,283 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rerank_success_replaces_rrf_order_before_graph_expansion() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-rerank");
+        store.add_source(&source).unwrap();
+        let first = insert_text_chunk(&store, &source, "chunk-first", "alpha first");
+        let second = insert_text_chunk(&store, &source, "chunk-second", "alpha second");
+        let third = insert_text_chunk(&store, &source, "chunk-third", "alpha third");
+        let vector_index = StaticVectorIndex::new(vec![
+            (first.id.clone(), 0.9),
+            (second.id.clone(), 0.8),
+            (third.id.clone(), 0.7),
+        ]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 3,
+            bm25_top_k: 0,
+            rrf_k: 60,
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            model: "test-reranker".into(),
+            top_n: 2,
+            ..Default::default()
+        };
+        let reranker = RecordingReranker::hits(vec![(2, 0.99), (0, 0.7)]);
+
+        let (results, debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &reranker)
+        .search_filtered_with_debug("alpha", None)
+        .await
+        .unwrap();
+
+        assert_eq!(chunk_ids(&results), vec!["chunk-third", "chunk-first"]);
+        assert_eq!(reranker.call_count(), 1);
+        assert_eq!(reranker.recorded_top_ns(), vec![2]);
+        assert_eq!(reranker.recorded_docs()[0].len(), 3);
+        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Succeeded);
+        assert_eq!(debug.reranker.provider.as_deref(), Some("vllm"));
+        assert_eq!(debug.reranker.model.as_deref(), Some("test-reranker"));
+        assert_eq!(debug.reranker.top_n, Some(2));
+        assert_eq!(debug.reranker.candidate_count, Some(3));
+        assert_eq!(debug.reranker.scores[0].chunk_id, third.id);
+        assert_eq!(debug.final_evidence_pack[0].chunk_id, third.id);
+    }
+
+    #[tokio::test]
+    async fn rerank_documents_include_context_and_chunk_text() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-rerank-context");
+        store.add_source(&source).unwrap();
+        let chunk = insert_text_chunk_with_context(
+            &store,
+            &source,
+            "chunk-context",
+            "the original passage contains the decisive evidence",
+            "generated document context",
+        );
+        let vector_index = StaticVectorIndex::new(vec![(chunk.id.clone(), 0.9)]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 1,
+            bm25_top_k: 0,
+            rrf_k: 60,
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            top_n: 1,
+            ..Default::default()
+        };
+        let reranker = RecordingReranker::hits(vec![(0, 0.9)]);
+
+        let (_results, _debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &reranker)
+        .search_filtered_with_debug("alpha", None)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reranker.recorded_docs(),
+            vec![vec![
+                "generated document context the original passage contains the decisive evidence"
+                    .to_string()
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_disabled_preserves_rrf_order_and_does_not_call_reranker() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-rerank-disabled");
+        store.add_source(&source).unwrap();
+        let first = insert_text_chunk(&store, &source, "chunk-first", "alpha first");
+        let second = insert_text_chunk(&store, &source, "chunk-second", "alpha second");
+        let vector_index =
+            StaticVectorIndex::new(vec![(first.id.clone(), 0.9), (second.id.clone(), 0.8)]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 0,
+            rrf_k: 60,
+        };
+        let rerank_config = RerankConfig {
+            enabled: false,
+            top_n: 1,
+            ..Default::default()
+        };
+        let reranker = RecordingReranker::hits(vec![(1, 1.0)]);
+
+        let (results, debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &reranker)
+        .search_filtered_with_debug("alpha", None)
+        .await
+        .unwrap();
+
+        assert_eq!(chunk_ids(&results), vec!["chunk-first", "chunk-second"]);
+        assert_eq!(reranker.call_count(), 0);
+        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Disabled);
+        assert!(debug.reranker.scores.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rerank_failure_falls_back_to_rrf_order_with_bounded_debug() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-rerank-fallback");
+        store.add_source(&source).unwrap();
+        let first = insert_text_chunk(&store, &source, "chunk-first", "alpha first");
+        let second = insert_text_chunk(&store, &source, "chunk-second", "alpha second");
+        let vector_index =
+            StaticVectorIndex::new(vec![(first.id.clone(), 0.9), (second.id.clone(), 0.8)]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 0,
+            rrf_k: 60,
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            provider: "jina".into(),
+            model: "fallback-reranker".into(),
+            top_n: 2,
+            ..Default::default()
+        };
+        let reranker = RecordingReranker::error("request timed out after a long provider message");
+
+        let (results, debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &reranker)
+        .search_filtered_with_debug("alpha", None)
+        .await
+        .unwrap();
+
+        assert_eq!(chunk_ids(&results), vec!["chunk-first", "chunk-second"]);
+        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Fallback);
+        assert_eq!(debug.reranker.reason.as_deref(), Some("request_timeout"));
+        assert_eq!(debug.reranker.provider.as_deref(), Some("jina"));
+        assert!(debug.reranker.scores.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rerank_ignores_out_of_range_duplicate_and_nonfinite_indices() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-rerank-invalid");
+        store.add_source(&source).unwrap();
+        let first = insert_text_chunk(&store, &source, "chunk-first", "alpha first");
+        let second = insert_text_chunk(&store, &source, "chunk-second", "alpha second");
+        let third = insert_text_chunk(&store, &source, "chunk-third", "alpha third");
+        let vector_index = StaticVectorIndex::new(vec![
+            (first.id.clone(), 0.9),
+            (second.id.clone(), 0.8),
+            (third.id.clone(), 0.7),
+        ]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 3,
+            bm25_top_k: 0,
+            rrf_k: 60,
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            top_n: 3,
+            ..Default::default()
+        };
+        let reranker = RecordingReranker::hits(vec![
+            (99, 0.99),
+            (2, f32::NAN),
+            (1, 0.8),
+            (1, 0.7),
+            (0, 0.8),
+        ]);
+
+        let (results, debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &reranker)
+        .search_filtered_with_debug("alpha", None)
+        .await
+        .unwrap();
+
+        assert_eq!(chunk_ids(&results), vec!["chunk-first", "chunk-second"]);
+        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Succeeded);
+        assert_eq!(debug.reranker.scores.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rerank_top_n_is_bounded_by_candidate_count() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-rerank-topn");
+        store.add_source(&source).unwrap();
+        let first = insert_text_chunk(&store, &source, "chunk-first", "alpha first");
+        let second = insert_text_chunk(&store, &source, "chunk-second", "alpha second");
+        let vector_index =
+            StaticVectorIndex::new(vec![(first.id.clone(), 0.9), (second.id.clone(), 0.8)]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 0,
+            rrf_k: 60,
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            top_n: 999,
+            ..Default::default()
+        };
+        let reranker = RecordingReranker::hits(vec![(1, 0.9), (0, 0.8)]);
+
+        let (_results, debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &reranker)
+        .search_filtered_with_debug("alpha", None)
+        .await
+        .unwrap();
+
+        assert_eq!(reranker.recorded_top_ns(), vec![2]);
+        assert_eq!(debug.reranker.top_n, Some(2));
+        assert_eq!(debug.reranker.candidate_count, Some(2));
+    }
+
+    #[tokio::test]
     async fn graph_expansion_disabled_preserves_seed_results() {
         let store = Store::in_memory().unwrap();
         let source = source("src-disabled");
@@ -1567,7 +2200,7 @@ mod tests {
             GraphTraversalDirection::Outgoing
         );
 
-        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Skipped);
+        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Disabled);
         assert_eq!(debug.reranker.scores, Vec::new());
         assert!(debug
             .final_evidence_pack
