@@ -822,9 +822,9 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn start_task(&self, task_id: &TaskId) -> Result<()> {
+    pub fn start_task(&self, task_id: &TaskId) -> Result<bool> {
         let now = unix_timestamp_string();
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE tasks
              SET status = ?2, started_at = COALESCE(started_at, ?3), updated_at = ?3
              WHERE id = ?1 AND status = ?4",
@@ -835,7 +835,7 @@ impl Store {
                 TaskStatus::Queued.as_str(),
             ],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     pub fn finish_task_success(
@@ -1917,7 +1917,7 @@ mod tests {
         assert_eq!(created.kind, TaskKind::Ask);
         assert!(created.request.get("question_sha256").is_some());
 
-        store.start_task(&task_id).unwrap();
+        assert!(store.start_task(&task_id).unwrap());
         let event = store
             .insert_task_event(
                 &task_id,
@@ -1978,7 +1978,7 @@ mod tests {
                 &ingest_request_metadata(Some("src-1"), false),
             )
             .unwrap();
-        store.start_task(&task_id).unwrap();
+        assert!(store.start_task(&task_id).unwrap());
 
         assert!(store.cancel_task(&task_id).unwrap());
         store
@@ -1986,6 +1986,34 @@ mod tests {
             .unwrap();
 
         let summary = store.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(summary.status, TaskStatus::Cancelled);
+        assert!(summary.result.is_none());
+    }
+
+    #[test]
+    fn cancelled_queued_task_cannot_start_work_body() {
+        let store = Store::in_memory().unwrap();
+        let task_id = TaskId("task-cancel-queued".into());
+
+        store
+            .create_task(
+                &task_id,
+                TaskKind::Ingest,
+                &ingest_request_metadata(Some("src-1"), false),
+            )
+            .unwrap();
+        assert!(store.cancel_task(&task_id).unwrap());
+
+        let mut work_called = false;
+        if store.start_task(&task_id).unwrap() {
+            work_called = true;
+            store
+                .finish_task_success(&task_id, &serde_json::json!({"ingested": 1}))
+                .unwrap();
+        }
+
+        let summary = store.get_task(&task_id).unwrap().unwrap();
+        assert!(!work_called);
         assert_eq!(summary.status, TaskStatus::Cancelled);
         assert!(summary.result.is_none());
     }

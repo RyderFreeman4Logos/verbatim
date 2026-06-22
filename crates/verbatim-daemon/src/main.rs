@@ -235,23 +235,39 @@ async fn create_persisted_task(
 async fn mark_task_started(
     state: &SharedState,
     task_id: &TaskId,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(state);
     let task_id = task_id.clone();
     tokio::task::spawn_blocking(move || {
         let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().start_task(&task_id)?;
+        let started = pipeline.store().start_task(&task_id)?;
+        if !started {
+            return Ok(false);
+        }
         pipeline.store().insert_task_event(
             &task_id,
             "started",
             "task started",
             &serde_json::json!({}),
         )?;
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>(true)
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn ensure_task_started(
+    state: &SharedState,
+    task_id: &TaskId,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if mark_task_started(state, task_id).await? {
+        return Ok(());
+    }
+    Err(err(
+        StatusCode::CONFLICT,
+        anyhow::anyhow!("task was cancelled before it started"),
+    ))
 }
 
 async fn record_task_event(
@@ -600,7 +616,7 @@ async fn execute_ask_task_inner(
     task_id: &TaskId,
     req: AskRequest,
 ) -> Result<AskResponse, (StatusCode, Json<ErrorResponse>)> {
-    mark_task_started(&state, task_id).await?;
+    ensure_task_started(&state, task_id).await?;
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
     let show_retrieval = req.show_retrieval;
@@ -691,7 +707,7 @@ async fn execute_ask_stream_task_inner(
     req: AskRequest,
     tx: mpsc::Sender<Event>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    mark_task_started(&state, task_id).await?;
+    ensure_task_started(&state, task_id).await?;
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
     let show_retrieval = req.show_retrieval;
@@ -715,12 +731,15 @@ async fn execute_ask_stream_task_inner(
     let gen_result = state
         .generator
         .generate_streaming_with_context(&question, &results, &generation_context, move |delta| {
-            let _ = tx_tokens.try_send(sse_json_event(
-                "token",
-                &AskTokenEvent {
-                    text: delta.to_string(),
-                },
-            ));
+            try_send_stream_event(
+                &tx_tokens,
+                sse_json_event(
+                    "token",
+                    &AskTokenEvent {
+                        text: delta.to_string(),
+                    },
+                ),
+            )?;
             Ok(())
         })
         .await
@@ -808,7 +827,7 @@ async fn execute_ingest_task_inner(
     source_id: Option<String>,
     force: bool,
 ) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
-    mark_task_started(&state, task_id).await?;
+    ensure_task_started(&state, task_id).await?;
     let state2 = Arc::clone(&state);
     let task_id2 = task_id.clone();
     let runtime = tokio::runtime::Handle::current();
@@ -912,7 +931,6 @@ async fn task_wait_snapshot(
     })
 }
 
-#[cfg(test)]
 fn try_send_stream_event(tx: &mpsc::Sender<Event>, event: Event) -> Result<()> {
     match tx.try_send(event) {
         Ok(()) => Ok(()),
@@ -1532,6 +1550,29 @@ mod tests {
         let error =
             try_send_stream_event(&tx, Event::default().event("token").data("two")).unwrap_err();
 
+        assert!(error.to_string().contains("not keeping up"));
+    }
+
+    #[tokio::test]
+    async fn ask_stream_token_callback_propagates_backpressure() {
+        let (tx, _rx) = mpsc::channel::<Event>(1);
+        let tx_tokens = tx.clone();
+        try_send_stream_event(&tx, Event::default().event("token").data("one")).unwrap();
+
+        let on_delta = move |delta: &str| {
+            try_send_stream_event(
+                &tx_tokens,
+                sse_json_event(
+                    "token",
+                    &AskTokenEvent {
+                        text: delta.to_string(),
+                    },
+                ),
+            )?;
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let error = on_delta("two").unwrap_err();
         assert!(error.to_string().contains("not keeping up"));
     }
 }
