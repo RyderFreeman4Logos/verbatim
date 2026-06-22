@@ -1,7 +1,9 @@
 use std::fmt;
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use reqwest::blocking::Client;
+use reqwest::blocking::RequestBuilder;
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -16,6 +18,8 @@ use crate::sse;
 
 const MAX_HTTP_ERROR_BODY_BYTES: usize = 4096;
 const HTTP_ERROR_TRUNCATION_MARKER: &str = "...[truncated]";
+const DEFAULT_DAEMON_HTTP_TIMEOUT_SECONDS: u64 = 300;
+const DAEMON_HTTP_TIMEOUT_PADDING_SECONDS: u64 = 120;
 
 pub type CliResult<T> = Result<T, CliError>;
 
@@ -122,13 +126,55 @@ impl HttpDaemonClient {
         Ok(format!("{}{}", self.base_url()?, path))
     }
 
+    fn request_timeout(&self) -> CliResult<Duration> {
+        let seconds = if self.base_url.is_some() {
+            DEFAULT_DAEMON_HTTP_TIMEOUT_SECONDS
+        } else {
+            let path = config::config_path();
+            if path.exists() {
+                let config = Config::load_from(&path).map_err(|error| {
+                    CliError::Api(format!(
+                        "failed to load config {}: {error:#}",
+                        path.display()
+                    ))
+                })?;
+                daemon_http_timeout_seconds(&config)
+            } else {
+                DEFAULT_DAEMON_HTTP_TIMEOUT_SECONDS
+            }
+        };
+        Ok(Duration::from_secs(seconds.max(1)))
+    }
+
+    fn request_timeout_for_policy(
+        &self,
+        policy: RequestTimeoutPolicy,
+    ) -> CliResult<Option<Duration>> {
+        match policy {
+            RequestTimeoutPolicy::Finite => Ok(Some(self.request_timeout()?)),
+            RequestTimeoutPolicy::LongRunning => Ok(None),
+        }
+    }
+
+    fn apply_timeout(
+        &self,
+        request: RequestBuilder,
+        policy: RequestTimeoutPolicy,
+    ) -> CliResult<RequestBuilder> {
+        Ok(match self.request_timeout_for_policy(policy)? {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        })
+    }
+
     fn request_json<T, B>(&self, method: Method, path: &str, body: Option<&B>) -> CliResult<T>
     where
         T: DeserializeOwned,
         B: Serialize + ?Sized,
     {
         let url = self.url(path)?;
-        let mut request = self.client.request(method, &url);
+        let policy = json_timeout_policy(&method, path);
+        let mut request = self.apply_timeout(self.client.request(method, &url), policy)?;
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -165,8 +211,7 @@ impl DaemonClient for HttpDaemonClient {
     fn remove_source(&self, id: &str) -> CliResult<()> {
         let url = self.url(&format!("/api/sources/{id}"))?;
         let response = self
-            .client
-            .delete(&url)
+            .apply_timeout(self.client.delete(&url), RequestTimeoutPolicy::LongRunning)?
             .send()
             .map_err(|error| request_error(&url, error))?;
         if response.status() == StatusCode::NO_CONTENT {
@@ -199,8 +244,7 @@ impl DaemonClient for HttpDaemonClient {
     {
         let url = self.url("/api/ask/stream")?;
         let response = self
-            .client
-            .post(&url)
+            .apply_timeout(self.client.post(&url), RequestTimeoutPolicy::Finite)?
             .json(request)
             .send()
             .map_err(|error| request_error(&url, error))?;
@@ -234,6 +278,57 @@ pub fn bind_to_base_url(bind: &str) -> String {
     } else {
         format!("http://{}", bind.trim_end_matches('/'))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestTimeoutPolicy {
+    Finite,
+    LongRunning,
+}
+
+fn json_timeout_policy(method: &Method, path: &str) -> RequestTimeoutPolicy {
+    if is_long_running_mutation(method, path) {
+        RequestTimeoutPolicy::LongRunning
+    } else {
+        RequestTimeoutPolicy::Finite
+    }
+}
+
+fn is_long_running_mutation(method: &Method, path: &str) -> bool {
+    if method == Method::POST {
+        return path == "/api/sources"
+            || path == "/api/sources/check"
+            || path == "/api/ingest"
+            || path == "/api/ingest?force=true"
+            || path.starts_with("/api/ingest/");
+    }
+    false
+}
+
+fn daemon_http_timeout_seconds(config: &Config) -> u64 {
+    let max_model_timeout = [
+        config
+            .embedding
+            .enabled
+            .then_some(config.embedding.timeout_seconds),
+        config
+            .rerank
+            .enabled
+            .then_some(config.rerank.timeout_seconds),
+        config.chat.enabled.then_some(config.chat.timeout_seconds),
+        config
+            .vision
+            .enabled
+            .then_some(config.vision.timeout_seconds),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(DEFAULT_DAEMON_HTTP_TIMEOUT_SECONDS);
+
+    max_model_timeout
+        .max(DEFAULT_DAEMON_HTTP_TIMEOUT_SECONDS)
+        .saturating_add(DAEMON_HTTP_TIMEOUT_PADDING_SECONDS)
 }
 
 fn decode_response<T>(response: reqwest::blocking::Response) -> CliResult<T>
@@ -430,6 +525,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
 
@@ -439,6 +535,88 @@ mod tests {
         assert_eq!(
             bind_to_base_url("http://127.0.0.1:7700/"),
             "http://127.0.0.1:7700"
+        );
+    }
+
+    #[test]
+    fn daemon_http_timeout_uses_largest_enabled_model_timeout_with_padding() {
+        let mut config = default_config();
+        config.embedding.timeout_seconds = 1800;
+        config.rerank.timeout_seconds = 90;
+        config.chat.timeout_seconds = 600;
+        config.vision.timeout_seconds = 45;
+
+        assert_eq!(daemon_http_timeout_seconds(&config), 1920);
+    }
+
+    #[test]
+    fn daemon_http_timeout_ignores_disabled_model_timeouts() {
+        let mut config = default_config();
+        config.embedding.enabled = false;
+        config.embedding.timeout_seconds = 7200;
+        config.rerank.enabled = false;
+        config.chat.enabled = true;
+        config.chat.timeout_seconds = 300;
+        config.vision.enabled = false;
+
+        assert_eq!(daemon_http_timeout_seconds(&config), 420);
+    }
+
+    #[test]
+    fn long_running_mutations_do_not_use_finite_request_timeout() {
+        assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/sources"),
+            RequestTimeoutPolicy::LongRunning
+        );
+        assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/sources/check"),
+            RequestTimeoutPolicy::LongRunning
+        );
+        assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/ingest"),
+            RequestTimeoutPolicy::LongRunning
+        );
+        assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/ingest?force=true"),
+            RequestTimeoutPolicy::LongRunning
+        );
+        assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/ingest/src-1"),
+            RequestTimeoutPolicy::LongRunning
+        );
+    }
+
+    #[test]
+    fn interactive_and_read_only_requests_keep_finite_request_timeout() {
+        assert_eq!(
+            json_timeout_policy(&Method::GET, "/api/sources"),
+            RequestTimeoutPolicy::Finite
+        );
+        assert_eq!(
+            json_timeout_policy(&Method::GET, "/api/config"),
+            RequestTimeoutPolicy::Finite
+        );
+        assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/ask/stream"),
+            RequestTimeoutPolicy::Finite
+        );
+    }
+
+    #[test]
+    fn long_running_timeout_policy_is_unbounded() {
+        let client = HttpDaemonClient::with_base_url("http://127.0.0.1:1");
+
+        assert_eq!(
+            client
+                .request_timeout_for_policy(RequestTimeoutPolicy::LongRunning)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            client
+                .request_timeout_for_policy(RequestTimeoutPolicy::Finite)
+                .unwrap(),
+            Some(Duration::from_secs(DEFAULT_DAEMON_HTTP_TIMEOUT_SECONDS))
         );
     }
 
@@ -601,6 +779,10 @@ mod tests {
             self.handle.join().unwrap();
             self.requests.lock().unwrap().clone()
         }
+    }
+
+    fn default_config() -> Config {
+        serde_json::from_value(serde_json::json!({})).expect("empty config uses serde defaults")
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
