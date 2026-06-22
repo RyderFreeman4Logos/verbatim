@@ -1578,6 +1578,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mvp_regression_verifier_pass_revise_and_fail_paths_are_deterministic() {
+        let pass_model = Arc::new(RecordingChatModel::with_responses([
+            "The document defines freedom [E1].",
+            r#"{"verdict":"pass","unsupported_claims":[]}"#,
+        ]));
+        let pass_generator =
+            Generator::with_chat_model(pass_model, true, ChatVisionAttachmentConfig::default());
+
+        let pass = pass_generator
+            .generate("What is defined?", &sample_results())
+            .await
+            .unwrap();
+
+        assert!(pass.verified);
+        assert_eq!(pass.citations.len(), 1);
+        assert!(pass.answer.contains("defines freedom"));
+
+        let revise_model = Arc::new(RecordingChatModel::with_responses([
+            "The page shows a blue triangle [E1].",
+            r#"{"verdict":"revise","unsupported_claims":["The page shows a blue triangle"]}"#,
+            "The document defines freedom [E1].",
+            r#"{"verdict":"pass","unsupported_claims":[]}"#,
+        ]));
+        let revise_generator =
+            Generator::with_chat_model(revise_model, true, ChatVisionAttachmentConfig::default());
+
+        let revised = revise_generator
+            .generate("What does the page show?", &sample_results())
+            .await
+            .unwrap();
+
+        assert!(revised.verified);
+        assert_eq!(revised.citations.len(), 1);
+        assert!(revised.answer.contains("defines freedom"));
+        assert!(!revised.answer.contains("blue triangle"));
+
+        let fail_model = Arc::new(RecordingChatModel::with_responses([
+            "The page shows a blue triangle [E1].",
+            r#"{"verdict":"fail","unsupported_claims":["The page shows a blue triangle"]}"#,
+        ]));
+        let fail_generator =
+            Generator::with_chat_model(fail_model, true, ChatVisionAttachmentConfig::default());
+
+        let failed = fail_generator
+            .generate("What does the page show?", &sample_results())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            failed.answer,
+            "Evidence insufficient to answer this question."
+        );
+        assert!(failed.citations.is_empty());
+        assert!(!failed.verified);
+    }
+
+    #[tokio::test]
     async fn unsupported_visual_claim_fails_without_visual_or_caption_evidence() {
         let model = Arc::new(RecordingChatModel::with_responses([
             "The page shows a blue triangle [E1].",

@@ -1922,7 +1922,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use crate::config::RetrievalConfig;
+    use crate::config::{GraphConfig, RetrievalConfig};
     use crate::image_limits::ImageArtifactLimitError;
     use crate::provider::{
         ChatMessageContent, ChatModel, ChatRequest, ChatResponse, ChatStream, ImageDescribeRequest,
@@ -1931,7 +1931,7 @@ mod tests {
     use crate::retrieve::RetrievalPipeline;
     use crate::types::{
         ChunkId, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge, GraphNode,
-        GraphNodeId, GraphNodeKind, SourceLocator,
+        GraphNodeId, GraphNodeKind, RetrievalOrigin, SourceLocator,
     };
     use crate::vision_caption::{vision_caption_prompt_hash, ImageCaptionStatus};
 
@@ -2330,6 +2330,226 @@ model = "local-vision"
         let (model, model_name) = configured_vision_model(&enabled);
         assert!(model.is_some());
         assert_eq!(model_name, "local-vision");
+    }
+
+    #[tokio::test]
+    async fn mvp_regression_ingest_retrieval_graph_and_source_lifecycle() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let left_dir = tempdir.path().join("left");
+        let right_dir = tempdir.path().join("right");
+        fs::create_dir_all(&left_dir).unwrap();
+        fs::create_dir_all(&right_dir).unwrap();
+
+        let markdown_path = left_dir.join("notes.md");
+        fs::write(
+            &markdown_path,
+            "# MVP Heading\n\nSee [linked graph](https://example.test/graph) for markdownneedle retrieval.\n\nGraphneighbor sibling evidence stays in the same section.\n",
+        )
+        .unwrap();
+        let same_stem_path = right_dir.join("notes.md");
+        fs::write(&same_stem_path, "# Other\n\nsame stem stays distinct.\n").unwrap();
+        let plaintext_path = tempdir.path().join("plain.txt");
+        fs::write(
+            &plaintext_path,
+            "plainneedle first line\ncontinues on line two\n\noldplainneedle removal target\n",
+        )
+        .unwrap();
+        let pdf_path = tempdir.path().join("diagram.pdf");
+        write_pdf_with_text_and_image_filter(&pdf_path, None, &[7u8; 8 * 8 * 3]);
+
+        let vision = MockVisionModel::new(vec![valid_caption_json(
+            "A captionneedle indexing flow diagram.",
+        )]);
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            CaptionKeywordEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_vision_model("local-vision", vision);
+
+        let markdown_id = pipeline.add_source(&markdown_path).unwrap();
+        let same_stem_id = pipeline.add_source(&same_stem_path).unwrap();
+        let plaintext_id = pipeline.add_source(&plaintext_path).unwrap();
+        let pdf_id = pipeline.add_source(&pdf_path).unwrap();
+        assert_ne!(markdown_id, same_stem_id);
+        assert!(markdown_id.0.starts_with("notes-"));
+        assert!(same_stem_id.0.starts_with("notes-"));
+
+        for source_id in [&markdown_id, &same_stem_id, &plaintext_id, &pdf_id] {
+            pipeline.ingest_source(source_id).await.unwrap();
+        }
+
+        let markdown_evidence = pipeline
+            .store()
+            .list_evidence_by_source(&markdown_id)
+            .unwrap();
+        assert!(markdown_evidence.iter().any(|unit| {
+            unit.heading_path == vec!["MVP Heading"]
+                && unit.text.contains("linked graph")
+                && unit.text.contains("markdownneedle")
+        }));
+
+        let plaintext_evidence = pipeline
+            .store()
+            .list_evidence_by_source(&plaintext_id)
+            .unwrap();
+        assert!(plaintext_evidence.iter().any(|unit| {
+            unit.text == "plainneedle first line continues on line two"
+                && matches!(
+                    unit.locator,
+                    SourceLocator::Document {
+                        line_start: 1,
+                        line_end: Some(2),
+                        ..
+                    }
+                )
+        }));
+
+        let pdf_evidence = pipeline.store().list_evidence_by_source(&pdf_id).unwrap();
+        assert!(pdf_evidence.iter().any(|unit| {
+            unit.kind == EvidenceKind::Text
+                && unit.text.contains("Unsupported image filter text evidence")
+                && matches!(unit.locator, SourceLocator::Pdf { page: 1, .. })
+        }));
+        let generated_caption = pdf_evidence
+            .iter()
+            .find(|unit| {
+                unit.kind == EvidenceKind::Generated && unit.text.contains("captionneedle")
+            })
+            .expect("PDF image caption should be indexed as generated evidence");
+        let original_image_id = generated_caption
+            .derived_from
+            .clone()
+            .expect("caption should point to the original image evidence");
+        assert!(pdf_evidence
+            .iter()
+            .any(|unit| unit.id == original_image_id && unit.kind == EvidenceKind::Image));
+
+        assert!(!pipeline
+            .lexical_index()
+            .search("markdownneedle", 5)
+            .unwrap()
+            .is_empty());
+        assert!(!pipeline
+            .lexical_index()
+            .search("plainneedle", 5)
+            .unwrap()
+            .is_empty());
+        assert!(!pipeline
+            .lexical_index()
+            .search("captionneedle", 5)
+            .unwrap()
+            .is_empty());
+
+        {
+            let lexical_index = pipeline.lexical_index();
+            let embed_client = CaptionKeywordEmbeddingClient;
+            let retrieval_config = RetrievalConfig {
+                dense_top_k: 5,
+                bm25_top_k: 5,
+                rrf_k: 60,
+            };
+            let retrieval = RetrievalPipeline::new(
+                pipeline.hnsw(),
+                &lexical_index,
+                pipeline.store(),
+                &embed_client,
+                &retrieval_config,
+            );
+
+            let caption_results = retrieval
+                .search_filtered("captionneedle", Some(&pdf_id))
+                .await
+                .unwrap();
+            let caption_hit = caption_results
+                .iter()
+                .find(|result| {
+                    result
+                        .evidence_units
+                        .iter()
+                        .any(|unit| unit.id == generated_caption.id)
+                })
+                .expect("caption query should retrieve generated caption evidence");
+            assert!(caption_hit
+                .evidence_units
+                .iter()
+                .any(|unit| unit.id == original_image_id && unit.kind == EvidenceKind::Image));
+        }
+
+        {
+            let lexical_index = pipeline.lexical_index();
+            let embed_client = CaptionKeywordEmbeddingClient;
+            let retrieval_config = RetrievalConfig {
+                dense_top_k: 0,
+                bm25_top_k: 3,
+                rrf_k: 60,
+            };
+            let graph_config = GraphConfig {
+                enabled: true,
+                max_hops: 1,
+                max_expanded_chunks: 5,
+                max_neighbors_per_seed: 5,
+                edge_types: vec![EdgeType::SectionContains],
+                extraction: Default::default(),
+                global_search: Default::default(),
+            };
+            let retrieval = RetrievalPipeline::new_with_graph(
+                pipeline.hnsw(),
+                &lexical_index,
+                pipeline.store(),
+                &embed_client,
+                &retrieval_config,
+                &graph_config,
+            );
+
+            let (graph_results, debug) = retrieval
+                .search_filtered_with_debug("markdownneedle", Some(&markdown_id))
+                .await
+                .unwrap();
+            let expanded_sibling = graph_results
+                .iter()
+                .find(|result| {
+                    result.provenance.origin == RetrievalOrigin::GraphExpansion
+                        && result
+                            .evidence_units
+                            .iter()
+                            .any(|unit| unit.text.contains("Graphneighbor sibling evidence"))
+                })
+                .expect("section seed should graph-expand to sibling evidence");
+            assert!(expanded_sibling
+                .provenance
+                .graph_path
+                .iter()
+                .any(|step| step.edge_type == EdgeType::SectionContains));
+            assert!(!debug.graph_expanded_hits.is_empty());
+        }
+
+        fs::write(&plaintext_path, "freshplainneedle replacement paragraph\n").unwrap();
+        pipeline.ingest_source(&plaintext_id).await.unwrap();
+        assert!(pipeline
+            .lexical_index()
+            .search("oldplainneedle", 5)
+            .unwrap()
+            .is_empty());
+        assert!(!pipeline
+            .lexical_index()
+            .search("freshplainneedle", 5)
+            .unwrap()
+            .is_empty());
+
+        pipeline.remove_source(&plaintext_id).await.unwrap();
+        assert!(pipeline
+            .store()
+            .get_source(&plaintext_id)
+            .unwrap()
+            .is_none());
+        assert!(pipeline
+            .lexical_index()
+            .search("freshplainneedle", 5)
+            .unwrap()
+            .is_empty());
     }
 
     fn image_limit_error(err: &anyhow::Error) -> &ImageArtifactLimitError {

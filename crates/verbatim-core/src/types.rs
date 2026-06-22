@@ -694,7 +694,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_ids_include_path_hash_to_avoid_stem_collisions() {
+    fn mvp_regression_source_ids_include_path_hash_to_avoid_stem_collisions() {
         let tmp = tempfile::tempdir().unwrap();
         let left_dir = tmp.path().join("left");
         let right_dir = tmp.path().join("right");

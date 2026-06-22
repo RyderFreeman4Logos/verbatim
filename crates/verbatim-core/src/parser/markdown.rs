@@ -221,4 +221,26 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn mvp_regression_markdown_headings_and_links() {
+        let units = parse_str(
+            "# Retrieval Notes\n\nSee [graph expansion](https://example.test/graph) for citation flow.\n",
+        );
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].heading_path, vec!["Retrieval Notes"]);
+        assert_eq!(units[0].text, "See graph expansion for citation flow.");
+        match &units[0].locator {
+            SourceLocator::Document {
+                line_start,
+                line_end,
+                ..
+            } => {
+                assert_eq!(*line_start, 3);
+                assert_eq!(*line_end, None);
+            }
+            _ => panic!("expected Document locator"),
+        }
+    }
 }
