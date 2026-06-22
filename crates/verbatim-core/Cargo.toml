@@ -21,6 +21,7 @@ sha2.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 tracing.workspace = true
+url.workspace = true
 futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 pdf_oxide = { version = "0.3", optional = true }

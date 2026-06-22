@@ -586,28 +586,40 @@ impl Default for VerifierConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QdrantConfig {
-    pub enabled: bool,
     #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_qdrant_url")]
     pub url: String,
-    #[serde(default = "default_collection")]
+    #[serde(default = "default_qdrant_collection")]
     pub collection: String,
     #[serde(default)]
     pub prefer_for_search: bool,
+    #[serde(default = "default_qdrant_timeout_seconds")]
+    pub timeout_seconds: u64,
 }
 
 impl Default for QdrantConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            url: String::new(),
-            collection: "verbatim".into(),
+            url: default_qdrant_url(),
+            collection: default_qdrant_collection(),
             prefer_for_search: false,
+            timeout_seconds: default_qdrant_timeout_seconds(),
         }
     }
 }
 
-fn default_collection() -> String {
+fn default_qdrant_url() -> String {
+    "http://rpi4b:6334".into()
+}
+
+fn default_qdrant_collection() -> String {
     "verbatim".into()
+}
+
+fn default_qdrant_timeout_seconds() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -817,9 +829,10 @@ enabled = true
 
 [qdrant]
 enabled = false
-# url = "http://rpi4b:6334"
-# collection = "verbatim"
-# prefer_for_search = false
+url = "http://rpi4b:6334"
+collection = "verbatim"
+prefer_for_search = false
+timeout_seconds = 5
 
 [daemon]
 bind = "127.0.0.1:7700"
@@ -907,7 +920,29 @@ mod tests {
         assert_eq!(config.chat.vision_attachments.detail, "auto");
         assert!(config.verifier.enabled);
         assert!(!config.qdrant.enabled);
+        assert_eq!(config.qdrant.url, "http://rpi4b:6334");
+        assert_eq!(config.qdrant.collection, "verbatim");
+        assert!(!config.qdrant.prefer_for_search);
+        assert_eq!(config.qdrant.timeout_seconds, 5);
         assert_eq!(config.daemon.bind, "127.0.0.1:7700");
+    }
+
+    #[test]
+    fn partial_qdrant_config_defaults_disabled_and_bounded() {
+        let config: Config = toml::from_str(
+            r#"
+[qdrant]
+enabled = true
+collection = "custom"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.qdrant.enabled);
+        assert_eq!(config.qdrant.url, "http://rpi4b:6334");
+        assert_eq!(config.qdrant.collection, "custom");
+        assert!(!config.qdrant.prefer_for_search);
+        assert_eq!(config.qdrant.timeout_seconds, 5);
     }
 
     #[test]

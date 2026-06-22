@@ -24,6 +24,6 @@ just install
 ```
 
 See [docs/mvp.md](docs/mvp.md) for the full MVP release gate, local model
-configuration, daemon setup, manual smoke sequence, PDF image notes, reranker
-and graph retrieval toggles, and troubleshooting. See [docs/evals.md](docs/evals.md)
-for deterministic MVP regression fixtures.
+configuration, daemon setup, manual smoke sequence, PDF image notes, reranker,
+graph retrieval toggles, optional Qdrant sync/search, and troubleshooting. See
+[docs/evals.md](docs/evals.md) for deterministic MVP regression fixtures.

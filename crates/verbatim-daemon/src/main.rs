@@ -389,7 +389,8 @@ async fn prepare_generation_context(
             &state2.embed_client,
             &state2.config.retrieval,
             &state2.config.graph,
-        );
+        )
+        .with_qdrant_search(&state2.config.qdrant);
         if let Some(reranker) = state2.reranker.as_ref() {
             retrieval = retrieval.with_reranker(&state2.config.rerank, reranker);
         }

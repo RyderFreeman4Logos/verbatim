@@ -23,12 +23,11 @@ Verbatim MVP includes:
 - Graph expansion, enabled by default with bounded hops.
 - LLM graph extraction and full GraphRAG/global search as optional,
   config-gated MVP capabilities.
+- Optional Qdrant vector sync/search, disabled by default and config-gated.
 - Deterministic MVP regression fixtures. See [evals.md](evals.md).
 
 Post-MVP:
 
-- Qdrant remains deferred to open issue #17, `Optional Qdrant integration`.
-  Keep `[qdrant].enabled = false` for MVP release validation.
 - A Qdrant backend is not required for build, smoke, or regression gates.
 
 Open issue audit for this gate:
@@ -36,7 +35,8 @@ Open issue audit for this gate:
 - `gh issue list --repo RyderFreeman4Logos/verbatim --state open --limit 100`
   on 2026-06-22 showed #48 and #17 only.
 - #48 is this MVP release documentation gate.
-- #17 is intentionally post-MVP/deferred.
+- #17 is implemented as an opt-in enhancement; it remains disabled for MVP
+  validation unless explicitly configured.
 
 ## Prerequisites
 
@@ -330,15 +330,26 @@ MVP-capable but not required for the base smoke path or CI.
 
 ## Qdrant
 
-Keep Qdrant disabled for MVP:
+Qdrant is an optional remote vector backend. It is disabled by default, and
+local SQLite, HNSW, and Tantivy indexes remain authoritative.
 
 ```toml
 [qdrant]
 enabled = false
+url = "http://rpi4b:6334"
+collection = "verbatim"
+prefer_for_search = false
+timeout_seconds = 5
 ```
 
-Qdrant support is post-MVP work tracked by open issue #17. MVP retrieval uses
-local SQLite, HNSW, and Tantivy indexes.
+When `enabled = true`, ingest best-effort syncs chunk vectors to Qdrant with
+`chunk_id`, `source_id`, `heading_path`, and `text_preview` payload fields.
+Source removal deletes matching Qdrant points by `source_id`; force ingest
+recreates the configured collection before uploading the current vector set.
+
+Set `prefer_for_search = true` only when the Qdrant service is reachable and
+you want dense retrieval to try Qdrant before local HNSW. If Qdrant is
+unavailable, Verbatim logs a warning and falls back to local HNSW search.
 
 ## Troubleshooting
 
@@ -387,4 +398,5 @@ Manual model-backed validation:
 - Graph expansion can be enabled and disabled.
 - LLM graph extraction and full GraphRAG/global search are documented as
   optional/config-gated MVP capabilities.
-- Qdrant is documented as post-MVP/deferred.
+- Qdrant can be enabled as an optional backend, and local retrieval remains the
+  default fallback.
