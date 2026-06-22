@@ -2,7 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    params, params_from_iter,
+    types::{Type, Value},
+    Connection, OptionalExtension, Transaction,
+};
 
 use crate::traits::VectorDocument;
 use crate::types::{
@@ -317,6 +321,17 @@ impl Store {
         }
     }
 
+    pub fn get_image_artifact(&self, image_id: &ImageId) -> Result<Option<ImageArtifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT image_id, source_id, evidence_unit_id, relative_path, content_hash, mime_type, width, height, page, image_index, bbox_json FROM image_artifacts WHERE image_id = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![image_id.0], row_to_image_artifact)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     // --- ImageCaption ---
 
     pub fn get_image_caption(
@@ -501,7 +516,36 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_chunks_for_evidence(&self, evidence_id: &EvidenceId) -> Result<Vec<Chunk>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.source_id, c.text, c.context_text, c.token_count, c.chunk_type, c.parent_chunk_id, c.heading_path_json
+             FROM chunks c
+             INNER JOIN chunk_evidence ce ON ce.chunk_id = c.id
+             WHERE ce.evidence_unit_id = ?1
+             ORDER BY CASE c.chunk_type WHEN 'Child' THEN 0 ELSE 1 END, c.id",
+        )?;
+        let rows = stmt.query_map(params![evidence_id.0], row_to_chunk_tuple)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(tuple_to_chunk(row?, &self.conn)?);
+        }
+        Ok(result)
+    }
+
     // --- EvidenceGraph ---
+
+    pub fn get_graph_node(&self, node_id: &GraphNodeId) -> Result<Option<GraphNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, kind, external_id, label, locator_json, ordinal, metadata_json
+             FROM graph_nodes
+             WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![node_id.0], row_to_graph_node)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
 
     pub fn upsert_graph_nodes(&self, nodes: &[GraphNode]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
@@ -550,6 +594,15 @@ impl Store {
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
+    pub fn list_graph_edges_from_by_types_limited(
+        &self,
+        node_id: &GraphNodeId,
+        edge_types: &[EdgeType],
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>> {
+        self.list_graph_edges_by_endpoint_types_limited("from_node_id", node_id, edge_types, limit)
+    }
+
     pub fn list_graph_edges_to(&self, node_id: &GraphNodeId) -> Result<Vec<GraphEdge>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, source_id, edge_type, from_node_id, to_node_id, ordinal, weight, metadata_json
@@ -559,6 +612,15 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![node_id.0], row_to_graph_edge)?;
         rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn list_graph_edges_to_by_types_limited(
+        &self,
+        node_id: &GraphNodeId,
+        edge_types: &[EdgeType],
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>> {
+        self.list_graph_edges_by_endpoint_types_limited("to_node_id", node_id, edge_types, limit)
     }
 
     pub fn list_graph_edges_by_type(
@@ -573,6 +635,41 @@ impl Store {
              ORDER BY ordinal, id",
         )?;
         let rows = stmt.query_map(params![source_id.0, edge_type.as_str()], row_to_graph_edge)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    fn list_graph_edges_by_endpoint_types_limited(
+        &self,
+        endpoint_column: &str,
+        node_id: &GraphNodeId,
+        edge_types: &[EdgeType],
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>> {
+        if edge_types.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", edge_types.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, source_id, edge_type, from_node_id, to_node_id, ordinal, weight, metadata_json
+             FROM graph_edges
+             WHERE {endpoint_column} = ? AND edge_type IN ({placeholders})
+             ORDER BY edge_type, ordinal, id
+             LIMIT ?",
+        );
+        let mut values = Vec::with_capacity(edge_types.len() + 2);
+        values.push(Value::Text(node_id.0.clone()));
+        values.extend(
+            edge_types
+                .iter()
+                .map(|edge_type| Value::Text(edge_type.as_str().to_string())),
+        );
+        values.push(Value::Integer(sql_limit(limit)));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), row_to_graph_edge)?;
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
@@ -891,6 +988,10 @@ fn row_to_graph_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphEdge> {
         weight: row.get(6)?,
         metadata,
     })
+}
+
+fn sql_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
 fn row_to_image_caption_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageCaptionRecord> {

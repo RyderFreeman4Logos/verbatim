@@ -357,12 +357,13 @@ async fn execute_ask(
     let (results, generation_context) = tokio::task::spawn_blocking(move || {
         let pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let lexical_index = pipeline.lexical_index();
-        let retrieval = RetrievalPipeline::new(
+        let retrieval = RetrievalPipeline::new_with_graph(
             pipeline.vector_index(),
             &lexical_index,
             pipeline.store(),
             &state2.embed_client,
             &state2.config.retrieval,
+            &state2.config.graph,
         );
         let results =
             runtime.block_on(retrieval.search_filtered(&question2, source_filter.as_ref()))?;

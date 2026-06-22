@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::image_limits::ImageArtifactLimits;
+use crate::types::EdgeType;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -16,6 +17,8 @@ pub struct Config {
     pub embedding: EmbeddingConfig,
     #[serde(default)]
     pub retrieval: RetrievalConfig,
+    #[serde(default)]
+    pub graph: GraphConfig,
     #[serde(default)]
     pub rerank: RerankConfig,
     #[serde(default)]
@@ -156,6 +159,60 @@ impl Default for RetrievalConfig {
             rrf_k: 60,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphConfig {
+    #[serde(default = "default_graph_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_graph_max_hops")]
+    pub max_hops: usize,
+    #[serde(default = "default_graph_max_expanded_chunks")]
+    pub max_expanded_chunks: usize,
+    #[serde(default = "default_graph_max_neighbors_per_seed")]
+    pub max_neighbors_per_seed: usize,
+    #[serde(default = "default_graph_edge_types")]
+    pub edge_types: Vec<EdgeType>,
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_graph_enabled(),
+            max_hops: default_graph_max_hops(),
+            max_expanded_chunks: default_graph_max_expanded_chunks(),
+            max_neighbors_per_seed: default_graph_max_neighbors_per_seed(),
+            edge_types: default_graph_edge_types(),
+        }
+    }
+}
+
+fn default_graph_enabled() -> bool {
+    true
+}
+
+fn default_graph_max_hops() -> usize {
+    1
+}
+
+fn default_graph_max_expanded_chunks() -> usize {
+    30
+}
+
+fn default_graph_max_neighbors_per_seed() -> usize {
+    6
+}
+
+fn default_graph_edge_types() -> Vec<EdgeType> {
+    vec![
+        EdgeType::Parent,
+        EdgeType::Previous,
+        EdgeType::Next,
+        EdgeType::SectionContains,
+        EdgeType::PageContainsImage,
+        EdgeType::ImageNearText,
+        EdgeType::MarkdownLinksTo,
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -526,6 +583,13 @@ dense_top_k = 80
 bm25_top_k = 50
 rrf_k = 60
 
+[graph]
+enabled = true
+max_hops = 1
+max_expanded_chunks = 30
+max_neighbors_per_seed = 6
+edge_types = ["parent", "previous", "next", "section_contains", "page_contains_image", "image_near_text", "markdown_links_to"]
+
 [rerank]
 enabled = false
 provider = "openai_compatible"
@@ -604,6 +668,22 @@ mod tests {
         assert!(config.embedding.normalize);
         assert_eq!(config.embedding.batch_size, 16);
         assert_eq!(config.retrieval.dense_top_k, 80);
+        assert!(config.graph.enabled);
+        assert_eq!(config.graph.max_hops, 1);
+        assert_eq!(config.graph.max_expanded_chunks, 30);
+        assert_eq!(config.graph.max_neighbors_per_seed, 6);
+        assert_eq!(
+            config.graph.edge_types,
+            vec![
+                EdgeType::Parent,
+                EdgeType::Previous,
+                EdgeType::Next,
+                EdgeType::SectionContains,
+                EdgeType::PageContainsImage,
+                EdgeType::ImageNearText,
+                EdgeType::MarkdownLinksTo,
+            ]
+        );
         assert!(!config.rerank.enabled);
         assert_eq!(config.rerank.model, "Qwen/Qwen3-Reranker-8B");
         assert!(config.context.enabled);
@@ -638,6 +718,36 @@ model = "Qwen/Qwen3.6-27B"
         assert_eq!(config.vision.model, "Qwen/Qwen3.6-27B");
         assert!(config.embedding.enabled);
         assert!(config.chat.enabled);
+    }
+
+    #[test]
+    fn partial_graph_config_defaults_to_bounded_expansion() {
+        let config: Config = toml::from_str(
+            r#"
+[graph]
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.graph.enabled);
+        assert_eq!(config.graph.max_hops, 1);
+        assert_eq!(config.graph.max_expanded_chunks, 30);
+        assert_eq!(config.graph.max_neighbors_per_seed, 6);
+        assert!(config.graph.edge_types.contains(&EdgeType::Parent));
+    }
+
+    #[test]
+    fn graph_config_rejects_unknown_edge_type() {
+        let error = toml::from_str::<Config>(
+            r#"
+[graph]
+edge_types = ["parent", "not_an_edge"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("not_an_edge"));
     }
 
     #[test]

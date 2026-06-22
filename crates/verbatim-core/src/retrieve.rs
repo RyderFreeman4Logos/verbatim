@@ -2,10 +2,16 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
-use crate::config::RetrievalConfig;
+use crate::config::{GraphConfig, RetrievalConfig};
 use crate::store::Store;
 use crate::traits::{EmbeddingClient, LexicalIndex, VectorIndex};
-use crate::types::{Chunk, ChunkId, ChunkType, EvidenceUnit, RetrievalResult, SourceId};
+use crate::types::{
+    Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceUnit, GraphExpansionStep, GraphNodeId,
+    GraphNodeKind, GraphTraversalDirection, ImageId, RetrievalProvenance, RetrievalResult,
+    SourceId, SourceLocator,
+};
+
+const GRAPH_EXPANSION_SCORE_DECAY: f32 = 0.5;
 
 pub struct RetrievalPipeline<'a> {
     vector_index: &'a dyn VectorIndex,
@@ -13,6 +19,7 @@ pub struct RetrievalPipeline<'a> {
     store: &'a Store,
     embed_client: &'a dyn EmbeddingClient,
     config: &'a RetrievalConfig,
+    graph_config: Option<&'a GraphConfig>,
 }
 
 impl<'a> RetrievalPipeline<'a> {
@@ -29,6 +36,25 @@ impl<'a> RetrievalPipeline<'a> {
             store,
             embed_client,
             config,
+            graph_config: None,
+        }
+    }
+
+    pub fn new_with_graph(
+        vector_index: &'a dyn VectorIndex,
+        lexical_index: &'a dyn LexicalIndex,
+        store: &'a Store,
+        embed_client: &'a dyn EmbeddingClient,
+        config: &'a RetrievalConfig,
+        graph_config: &'a GraphConfig,
+    ) -> Self {
+        Self {
+            vector_index,
+            lexical_index,
+            store,
+            embed_client,
+            config,
+            graph_config: Some(graph_config),
         }
     }
 
@@ -78,34 +104,47 @@ impl<'a> RetrievalPipeline<'a> {
         }
 
         let mut results = Vec::new();
-        for (chunk_id, score) in fused {
-            let chunk = match self.store.get_chunk(&chunk_id)? {
-                Some(c) => c,
-                None => continue,
+        for (rank, (chunk_id, score)) in fused.into_iter().enumerate() {
+            let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
+                continue;
             };
+            let result_rank = rank + 1;
+            let provenance =
+                RetrievalProvenance::seed(result_rank, chunk.id.clone(), chunk.source_id.clone());
 
-            let parent_chunk = if chunk.chunk_type == ChunkType::Child {
-                chunk
-                    .parent_chunk_id
-                    .as_ref()
-                    .and_then(|pid| self.store.get_chunk(pid).ok().flatten())
-            } else {
-                None
-            };
-
-            let display_chunk = parent_chunk.unwrap_or_else(|| chunk.clone());
-
-            let evidence_units = self.evidence_units_for_chunk(&chunk)?;
-
-            results.push(RetrievalResult {
-                chunk_id: chunk.id.clone(),
-                score,
-                chunk: display_chunk,
-                evidence_units,
-            });
+            results.push(self.result_for_chunk(chunk, score, provenance)?);
         }
 
+        self.expand_graph_results(&mut results, source_filter)?;
+
         Ok(results)
+    }
+
+    fn result_for_chunk(
+        &self,
+        chunk: Chunk,
+        score: f32,
+        provenance: RetrievalProvenance,
+    ) -> Result<RetrievalResult> {
+        let parent_chunk = if chunk.chunk_type == ChunkType::Child {
+            chunk
+                .parent_chunk_id
+                .as_ref()
+                .and_then(|pid| self.store.get_chunk(pid).ok().flatten())
+        } else {
+            None
+        };
+
+        let display_chunk = parent_chunk.unwrap_or_else(|| chunk.clone());
+        let evidence_units = self.evidence_units_for_chunk(&chunk)?;
+
+        Ok(RetrievalResult {
+            chunk_id: chunk.id.clone(),
+            score,
+            chunk: display_chunk,
+            evidence_units,
+            provenance,
+        })
     }
 
     fn evidence_units_for_chunk(&self, chunk: &Chunk) -> Result<Vec<EvidenceUnit>> {
@@ -128,6 +167,489 @@ impl<'a> RetrievalPipeline<'a> {
 
         Ok(evidence_units)
     }
+
+    fn expand_graph_results(
+        &self,
+        results: &mut Vec<RetrievalResult>,
+        source_filter: Option<&SourceId>,
+    ) -> Result<()> {
+        let Some(config) = self.graph_config else {
+            return Ok(());
+        };
+        if !config.enabled
+            || config.max_hops == 0
+            || config.max_expanded_chunks == 0
+            || config.max_neighbors_per_seed == 0
+            || config.edge_types.is_empty()
+        {
+            return Ok(());
+        }
+
+        let mut edge_types = config.edge_types.clone();
+        edge_types.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        edge_types.dedup();
+        let seeds = results.clone();
+        let mut seen_chunks = results
+            .iter()
+            .map(|result| result.chunk_id.0.clone())
+            .collect::<HashSet<_>>();
+        let mut expanded_count = 0usize;
+
+        for seed in &seeds {
+            if expanded_count >= config.max_expanded_chunks {
+                break;
+            }
+
+            let seed_rank = seed
+                .provenance
+                .seed_rank
+                .unwrap_or(seed.provenance.result_rank)
+                .max(1);
+            let mut state = GraphExpansionState {
+                config,
+                edge_types: &edge_types,
+                results,
+                seen_chunks: &mut seen_chunks,
+                expanded_count: &mut expanded_count,
+                seed_expanded_count: 0,
+                source_filter,
+            };
+
+            self.expand_page_images(seed, seed_rank, &mut state)?;
+            self.expand_section_contains(seed, seed_rank, &mut state)?;
+            self.expand_graph_bfs(seed, seed_rank, &mut state)?;
+        }
+
+        Ok(())
+    }
+
+    fn expand_page_images(
+        &self,
+        seed: &RetrievalResult,
+        seed_rank: usize,
+        state: &mut GraphExpansionState<'_>,
+    ) -> Result<()> {
+        if !state.edge_types.contains(&EdgeType::PageContainsImage) {
+            return Ok(());
+        }
+
+        let mut page_node_ids = Vec::new();
+        let mut seen_pages = HashSet::new();
+        for evidence in &seed.evidence_units {
+            let Some(page) = locator_page(&evidence.locator) else {
+                continue;
+            };
+            if seen_pages.insert((evidence.source_id.0.clone(), page)) {
+                page_node_ids.push(GraphNodeId::new(
+                    &evidence.source_id,
+                    GraphNodeKind::Page,
+                    &format!("page:{page}"),
+                ));
+            }
+        }
+
+        for page_node_id in page_node_ids {
+            if !state.has_budget() {
+                break;
+            }
+
+            let limit = state.remaining_candidate_limit();
+            let mut edges = self.store.list_graph_edges_from_by_types_limited(
+                &page_node_id,
+                &[EdgeType::PageContainsImage],
+                limit,
+            )?;
+            sort_edges(&mut edges);
+
+            for edge in edges {
+                if !state.has_budget() {
+                    break;
+                }
+                let path = vec![graph_step(&edge, GraphTraversalDirection::Outgoing)];
+                self.try_push_graph_candidate(
+                    seed,
+                    seed_rank,
+                    CandidateExpansion {
+                        node_id: &edge.to_node_id,
+                        score: derived_graph_score(seed.score, 1),
+                        hop_distance: 1,
+                        graph_path: path,
+                    },
+                    state,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn expand_section_contains(
+        &self,
+        seed: &RetrievalResult,
+        seed_rank: usize,
+        state: &mut GraphExpansionState<'_>,
+    ) -> Result<()> {
+        if !state.edge_types.contains(&EdgeType::SectionContains) {
+            return Ok(());
+        }
+
+        let seed_chunk_node_id = GraphNodeId::new(
+            &seed.chunk.source_id,
+            GraphNodeKind::Chunk,
+            &seed.chunk_id.0,
+        );
+        let limit = state.remaining_candidate_limit();
+        let mut containing_edges = self.store.list_graph_edges_to_by_types_limited(
+            &seed_chunk_node_id,
+            &[EdgeType::SectionContains],
+            limit,
+        )?;
+        sort_edges(&mut containing_edges);
+
+        for containing_edge in containing_edges {
+            if !state.has_budget() {
+                break;
+            }
+
+            let section_node_id = containing_edge.from_node_id.clone();
+            let limit = state.remaining_candidate_limit();
+            let mut contained_edges = self.store.list_graph_edges_from_by_types_limited(
+                &section_node_id,
+                &[EdgeType::SectionContains],
+                limit,
+            )?;
+            sort_edges(&mut contained_edges);
+
+            for edge in contained_edges {
+                if !state.has_budget() {
+                    break;
+                }
+                let path = vec![
+                    graph_step(&containing_edge, GraphTraversalDirection::Incoming),
+                    graph_step(&edge, GraphTraversalDirection::Outgoing),
+                ];
+                self.try_push_graph_candidate(
+                    seed,
+                    seed_rank,
+                    CandidateExpansion {
+                        node_id: &edge.to_node_id,
+                        score: derived_graph_score(seed.score, 1),
+                        hop_distance: 1,
+                        graph_path: path,
+                    },
+                    state,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn expand_graph_bfs(
+        &self,
+        seed: &RetrievalResult,
+        seed_rank: usize,
+        state: &mut GraphExpansionState<'_>,
+    ) -> Result<()> {
+        let seed_nodes = self.seed_graph_nodes(seed)?;
+        let mut visited_nodes = seed_nodes
+            .iter()
+            .map(|node_id| node_id.0.clone())
+            .collect::<HashSet<_>>();
+        let mut frontier = seed_nodes
+            .into_iter()
+            .map(|node_id| FrontierNode {
+                node_id,
+                path: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        for hop in 1..=state.config.max_hops {
+            if frontier.is_empty() || !state.has_budget() {
+                break;
+            }
+
+            let mut next_frontier = Vec::new();
+            for frontier_node in frontier {
+                if !state.has_budget() {
+                    break;
+                }
+                if self.is_source_graph_node(&frontier_node.node_id)? {
+                    continue;
+                }
+
+                let limit = state.remaining_candidate_limit();
+                for transition in
+                    self.graph_transitions(&frontier_node.node_id, state.edge_types, limit)?
+                {
+                    if !state.has_budget() {
+                        break;
+                    }
+
+                    let mut path = frontier_node.path.clone();
+                    path.push(transition.step);
+
+                    if visited_nodes.insert(transition.neighbor_node_id.0.clone()) {
+                        next_frontier.push(FrontierNode {
+                            node_id: transition.neighbor_node_id.clone(),
+                            path: path.clone(),
+                        });
+                    }
+
+                    self.try_push_graph_candidate(
+                        seed,
+                        seed_rank,
+                        CandidateExpansion {
+                            node_id: &transition.neighbor_node_id,
+                            score: derived_graph_score(seed.score, hop),
+                            hop_distance: hop as u32,
+                            graph_path: path,
+                        },
+                        state,
+                    )?;
+                }
+            }
+
+            frontier = next_frontier;
+        }
+
+        Ok(())
+    }
+
+    fn seed_graph_nodes(&self, seed: &RetrievalResult) -> Result<Vec<GraphNodeId>> {
+        let mut node_ids = Vec::new();
+        let mut seen = HashSet::new();
+
+        push_unique_node_id(
+            &mut node_ids,
+            &mut seen,
+            GraphNodeId::new(
+                &seed.chunk.source_id,
+                GraphNodeKind::Chunk,
+                &seed.chunk_id.0,
+            ),
+        );
+
+        for evidence in &seed.evidence_units {
+            push_unique_node_id(
+                &mut node_ids,
+                &mut seen,
+                GraphNodeId::new(
+                    &evidence.source_id,
+                    GraphNodeKind::EvidenceUnit,
+                    &evidence.id.0,
+                ),
+            );
+
+            if let Some(artifact) = self.store.get_image_artifact_by_evidence(&evidence.id)? {
+                push_unique_node_id(
+                    &mut node_ids,
+                    &mut seen,
+                    GraphNodeId::new(
+                        &artifact.source_id,
+                        GraphNodeKind::ImageArtifact,
+                        &artifact.image_id.0,
+                    ),
+                );
+            }
+        }
+
+        Ok(node_ids)
+    }
+
+    fn graph_transitions(
+        &self,
+        node_id: &GraphNodeId,
+        edge_types: &[EdgeType],
+        limit: usize,
+    ) -> Result<Vec<GraphTransition>> {
+        let mut transitions = Vec::new();
+
+        for edge in self
+            .store
+            .list_graph_edges_from_by_types_limited(node_id, edge_types, limit)?
+        {
+            transitions.push(GraphTransition {
+                neighbor_node_id: edge.to_node_id.clone(),
+                step: graph_step(&edge, GraphTraversalDirection::Outgoing),
+            });
+        }
+
+        let remaining_limit = limit.saturating_sub(transitions.len());
+        for edge in
+            self.store
+                .list_graph_edges_to_by_types_limited(node_id, edge_types, remaining_limit)?
+        {
+            transitions.push(GraphTransition {
+                neighbor_node_id: edge.from_node_id.clone(),
+                step: graph_step(&edge, GraphTraversalDirection::Incoming),
+            });
+        }
+
+        transitions.sort_by(|left, right| {
+            left.step
+                .edge_type
+                .as_str()
+                .cmp(right.step.edge_type.as_str())
+                .then_with(|| left.step.from_node_id.0.cmp(&right.step.from_node_id.0))
+                .then_with(|| left.step.to_node_id.0.cmp(&right.step.to_node_id.0))
+                .then_with(|| {
+                    direction_key(&left.step.direction).cmp(direction_key(&right.step.direction))
+                })
+        });
+
+        Ok(transitions)
+    }
+
+    fn is_source_graph_node(&self, node_id: &GraphNodeId) -> Result<bool> {
+        Ok(self
+            .store
+            .get_graph_node(node_id)?
+            .is_some_and(|node| node.kind == GraphNodeKind::Source))
+    }
+
+    fn try_push_graph_candidate(
+        &self,
+        seed: &RetrievalResult,
+        seed_rank: usize,
+        candidate: CandidateExpansion<'_>,
+        state: &mut GraphExpansionState<'_>,
+    ) -> Result<()> {
+        if !state.has_budget() {
+            return Ok(());
+        }
+
+        let provenance = RetrievalProvenance::graph_expansion(
+            state.results.len() + 1,
+            seed_rank,
+            seed.chunk_id.clone(),
+            seed.chunk.source_id.clone(),
+            candidate.hop_distance,
+            candidate.graph_path,
+        );
+        let Some(result) =
+            self.result_for_graph_node(candidate.node_id, candidate.score, provenance)?
+        else {
+            return Ok(());
+        };
+        if state
+            .source_filter
+            .is_some_and(|source_id| result.chunk.source_id != *source_id)
+        {
+            return Ok(());
+        }
+        if !state.seen_chunks.insert(result.chunk_id.0.clone()) {
+            return Ok(());
+        }
+
+        state.results.push(result);
+        *state.expanded_count += 1;
+        state.seed_expanded_count += 1;
+        Ok(())
+    }
+
+    fn result_for_graph_node(
+        &self,
+        node_id: &GraphNodeId,
+        score: f32,
+        provenance: RetrievalProvenance,
+    ) -> Result<Option<RetrievalResult>> {
+        let Some(node) = self.store.get_graph_node(node_id)? else {
+            return Ok(None);
+        };
+
+        match node.kind {
+            GraphNodeKind::Chunk => {
+                self.result_for_chunk_id(ChunkId(node.external_id), score, provenance)
+            }
+            GraphNodeKind::EvidenceUnit => {
+                self.result_for_evidence_id(EvidenceId(node.external_id), score, provenance)
+            }
+            GraphNodeKind::ImageArtifact => {
+                let Some(artifact) = self.store.get_image_artifact(&ImageId(node.external_id))?
+                else {
+                    return Ok(None);
+                };
+                self.result_for_evidence_id(artifact.evidence_id, score, provenance)
+            }
+            GraphNodeKind::Source | GraphNodeKind::Page | GraphNodeKind::Section => Ok(None),
+        }
+    }
+
+    fn result_for_chunk_id(
+        &self,
+        chunk_id: ChunkId,
+        score: f32,
+        provenance: RetrievalProvenance,
+    ) -> Result<Option<RetrievalResult>> {
+        let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.result_for_chunk(chunk, score, provenance)?))
+    }
+
+    fn result_for_evidence_id(
+        &self,
+        evidence_id: EvidenceId,
+        score: f32,
+        provenance: RetrievalProvenance,
+    ) -> Result<Option<RetrievalResult>> {
+        let Some(chunk) = self
+            .store
+            .list_chunks_for_evidence(&evidence_id)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.result_for_chunk(chunk, score, provenance)?))
+    }
+}
+
+struct GraphExpansionState<'a> {
+    config: &'a GraphConfig,
+    edge_types: &'a [EdgeType],
+    results: &'a mut Vec<RetrievalResult>,
+    seen_chunks: &'a mut HashSet<String>,
+    expanded_count: &'a mut usize,
+    seed_expanded_count: usize,
+    source_filter: Option<&'a SourceId>,
+}
+
+impl GraphExpansionState<'_> {
+    fn has_budget(&self) -> bool {
+        *self.expanded_count < self.config.max_expanded_chunks
+            && self.seed_expanded_count < self.config.max_neighbors_per_seed
+    }
+
+    fn remaining_candidate_limit(&self) -> usize {
+        let remaining_global = self
+            .config
+            .max_expanded_chunks
+            .saturating_sub(*self.expanded_count);
+        let remaining_seed = self
+            .config
+            .max_neighbors_per_seed
+            .saturating_sub(self.seed_expanded_count);
+        remaining_global.min(remaining_seed)
+    }
+}
+
+struct CandidateExpansion<'a> {
+    node_id: &'a GraphNodeId,
+    score: f32,
+    hop_distance: u32,
+    graph_path: Vec<GraphExpansionStep>,
+}
+
+struct FrontierNode {
+    node_id: GraphNodeId,
+    path: Vec<GraphExpansionStep>,
+}
+
+struct GraphTransition {
+    neighbor_node_id: GraphNodeId,
+    step: GraphExpansionStep,
 }
 
 fn rrf_fusion(dense: &[(ChunkId, f32)], bm25: &[(ChunkId, f32)], k: usize) -> Vec<(ChunkId, f32)> {
@@ -144,6 +666,57 @@ fn rrf_fusion(dense: &[(ChunkId, f32)], bm25: &[(ChunkId, f32)], k: usize) -> Ve
     let mut results: Vec<(ChunkId, f32)> = scores.into_iter().collect();
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     results
+}
+
+fn derived_graph_score(seed_score: f32, hop: usize) -> f32 {
+    let distance = hop.max(1) as i32;
+    seed_score * GRAPH_EXPANSION_SCORE_DECAY.powi(distance)
+}
+
+fn graph_step(
+    edge: &crate::types::GraphEdge,
+    direction: GraphTraversalDirection,
+) -> GraphExpansionStep {
+    GraphExpansionStep {
+        edge_type: edge.edge_type,
+        from_node_id: edge.from_node_id.clone(),
+        to_node_id: edge.to_node_id.clone(),
+        direction,
+    }
+}
+
+fn sort_edges(edges: &mut [crate::types::GraphEdge]) {
+    edges.sort_by(|left, right| {
+        left.edge_type
+            .as_str()
+            .cmp(right.edge_type.as_str())
+            .then_with(|| left.ordinal.cmp(&right.ordinal))
+            .then_with(|| left.id.0.cmp(&right.id.0))
+    });
+}
+
+fn direction_key(direction: &GraphTraversalDirection) -> &'static str {
+    match direction {
+        GraphTraversalDirection::Outgoing => "outgoing",
+        GraphTraversalDirection::Incoming => "incoming",
+    }
+}
+
+fn locator_page(locator: &SourceLocator) -> Option<u32> {
+    match locator {
+        SourceLocator::Pdf { page, .. } | SourceLocator::PdfImage { page, .. } => Some(*page),
+        SourceLocator::Document { .. } => None,
+    }
+}
+
+fn push_unique_node_id(
+    node_ids: &mut Vec<GraphNodeId>,
+    seen: &mut HashSet<String>,
+    node_id: GraphNodeId,
+) {
+    if seen.insert(node_id.0.clone()) {
+        node_ids.push(node_id);
+    }
 }
 
 fn push_unique_evidence(
@@ -165,7 +738,11 @@ mod tests {
     use crate::index::sqlite_fts::SqliteFtsIndex;
     use crate::store::Store;
     use crate::traits::{VectorDocument, VectorIndex};
-    use crate::types::{Chunk, EvidenceKind, Source, SourceLocator, SourceStatus};
+    use crate::types::{
+        BBox, EdgeType, EvidenceId, EvidenceKind, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
+        GraphNodeKind, GraphTraversalDirection, ImageArtifact, ImageId, RetrievalOrigin, Source,
+        SourceLocator, SourceStatus,
+    };
 
     #[test]
     fn rrf_merges_rankings() {
@@ -284,6 +861,299 @@ mod tests {
         chunk
     }
 
+    fn insert_text_chunk(store: &Store, source: &Source, chunk_id: &str, text: &str) -> Chunk {
+        insert_text_chunk_with(
+            store,
+            source,
+            chunk_id,
+            text,
+            SourceLocator::Document {
+                path_or_url: source.path.to_string_lossy().into_owned(),
+                line_start: 1,
+                line_end: None,
+            },
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn insert_pdf_text_chunk(
+        store: &Store,
+        source: &Source,
+        chunk_id: &str,
+        text: &str,
+        page: u32,
+    ) -> Chunk {
+        insert_text_chunk_with(
+            store,
+            source,
+            chunk_id,
+            text,
+            SourceLocator::Pdf {
+                page,
+                paragraph: 1,
+                bbox: None,
+            },
+            Vec::new(),
+            None,
+        )
+    }
+
+    fn insert_text_chunk_with_heading(
+        store: &Store,
+        source: &Source,
+        chunk_id: &str,
+        text: &str,
+        heading_path: Vec<String>,
+    ) -> Chunk {
+        insert_text_chunk_with(
+            store,
+            source,
+            chunk_id,
+            text,
+            SourceLocator::Document {
+                path_or_url: source.path.to_string_lossy().into_owned(),
+                line_start: 1,
+                line_end: None,
+            },
+            heading_path,
+            None,
+        )
+    }
+
+    fn insert_text_chunk_with_parent(
+        store: &Store,
+        source: &Source,
+        chunk_id: &str,
+        text: &str,
+        parent_chunk_id: ChunkId,
+    ) -> Chunk {
+        insert_text_chunk_with(
+            store,
+            source,
+            chunk_id,
+            text,
+            SourceLocator::Document {
+                path_or_url: source.path.to_string_lossy().into_owned(),
+                line_start: 1,
+                line_end: None,
+            },
+            Vec::new(),
+            Some(parent_chunk_id),
+        )
+    }
+
+    fn insert_text_chunk_with(
+        store: &Store,
+        source: &Source,
+        chunk_id: &str,
+        text: &str,
+        locator: SourceLocator,
+        heading_path: Vec<String>,
+        parent_chunk_id: Option<ChunkId>,
+    ) -> Chunk {
+        let evidence = EvidenceUnit {
+            id: EvidenceId(format!("ev-{chunk_id}")),
+            source_id: source.id.clone(),
+            kind: EvidenceKind::Text,
+            derived_from: None,
+            locator,
+            text: text.into(),
+            text_hash: format!("hash-{chunk_id}"),
+            heading_path: heading_path.clone(),
+            position: 0,
+        };
+        let chunk = Chunk {
+            id: ChunkId(chunk_id.into()),
+            source_id: source.id.clone(),
+            text: text.into(),
+            context_text: None,
+            token_count: 4,
+            chunk_type: ChunkType::Child,
+            parent_chunk_id,
+            heading_path,
+            evidence_unit_ids: vec![evidence.id.clone()],
+        };
+        store.bulk_insert_evidence(&[evidence]).unwrap();
+        store
+            .bulk_insert_chunks(std::slice::from_ref(&chunk))
+            .unwrap();
+        store
+            .link_chunk_evidence(&[(chunk.id.clone(), chunk.evidence_unit_ids[0].clone())])
+            .unwrap();
+        chunk
+    }
+
+    fn insert_parent_chunk(
+        store: &Store,
+        source: &Source,
+        chunk_id: &str,
+        text: &str,
+        evidence_ids: Vec<EvidenceId>,
+    ) -> Chunk {
+        let chunk = Chunk {
+            id: ChunkId(chunk_id.into()),
+            source_id: source.id.clone(),
+            text: text.into(),
+            context_text: None,
+            token_count: 12,
+            chunk_type: ChunkType::Parent,
+            parent_chunk_id: None,
+            heading_path: Vec::new(),
+            evidence_unit_ids: evidence_ids,
+        };
+        store
+            .bulk_insert_chunks(std::slice::from_ref(&chunk))
+            .unwrap();
+        let links = chunk
+            .evidence_unit_ids
+            .iter()
+            .cloned()
+            .map(|evidence_id| (chunk.id.clone(), evidence_id))
+            .collect::<Vec<_>>();
+        store.link_chunk_evidence(&links).unwrap();
+        chunk
+    }
+
+    fn insert_image_chunk(
+        store: &Store,
+        source: &Source,
+        chunk_id: &str,
+        image_id: &str,
+        page: u32,
+    ) -> (Chunk, ImageArtifact) {
+        let evidence_id = EvidenceId(format!("ev-{chunk_id}"));
+        let evidence = EvidenceUnit {
+            id: evidence_id.clone(),
+            source_id: source.id.clone(),
+            kind: EvidenceKind::Image,
+            derived_from: None,
+            locator: SourceLocator::PdfImage {
+                page,
+                image_index: 1,
+                bbox: Some(BBox {
+                    x0: 1.0,
+                    y0: 2.0,
+                    x1: 3.0,
+                    y1: 4.0,
+                }),
+            },
+            text: "Image evidence artifact.".into(),
+            text_hash: format!("hash-{chunk_id}"),
+            heading_path: Vec::new(),
+            position: 1,
+        };
+        let chunk = Chunk {
+            id: ChunkId(chunk_id.into()),
+            source_id: source.id.clone(),
+            text: "Image evidence artifact.".into(),
+            context_text: None,
+            token_count: 4,
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path: Vec::new(),
+            evidence_unit_ids: vec![evidence_id.clone()],
+        };
+        let artifact = ImageArtifact {
+            image_id: ImageId(image_id.into()),
+            source_id: source.id.clone(),
+            evidence_id,
+            relative_path: std::path::PathBuf::from(format!(
+                "image-artifacts/{}/{}.png",
+                source.id.0, image_id
+            )),
+            content_hash: format!("hash-{image_id}"),
+            mime_type: "image/png".into(),
+            width: 100,
+            height: 80,
+            page,
+            image_index: 1,
+            bbox: None,
+        };
+
+        store.bulk_insert_evidence(&[evidence]).unwrap();
+        store
+            .bulk_insert_chunks(std::slice::from_ref(&chunk))
+            .unwrap();
+        store
+            .link_chunk_evidence(&[(chunk.id.clone(), chunk.evidence_unit_ids[0].clone())])
+            .unwrap();
+        store
+            .bulk_insert_image_artifacts(std::slice::from_ref(&artifact))
+            .unwrap();
+
+        (chunk, artifact)
+    }
+
+    fn graph_node(source_id: &SourceId, kind: GraphNodeKind, external_id: &str) -> GraphNode {
+        GraphNode {
+            id: GraphNodeId::new(source_id, kind, external_id),
+            source_id: source_id.clone(),
+            kind,
+            external_id: external_id.into(),
+            label: None,
+            locator: None,
+            ordinal: None,
+            metadata: None,
+        }
+    }
+
+    fn graph_edge(
+        source_id: &SourceId,
+        edge_type: EdgeType,
+        from_node_id: &GraphNodeId,
+        to_node_id: &GraphNodeId,
+        ordinal: u32,
+    ) -> GraphEdge {
+        GraphEdge {
+            id: GraphEdgeId::new(
+                source_id,
+                edge_type,
+                from_node_id,
+                to_node_id,
+                Some(ordinal),
+            ),
+            source_id: source_id.clone(),
+            edge_type,
+            from_node_id: from_node_id.clone(),
+            to_node_id: to_node_id.clone(),
+            ordinal: Some(ordinal),
+            weight: None,
+            metadata: None,
+        }
+    }
+
+    fn upsert_chunk_graph_nodes(store: &Store, source_id: &SourceId, chunks: &[&Chunk]) {
+        let nodes = chunks
+            .iter()
+            .map(|chunk| graph_node(source_id, GraphNodeKind::Chunk, &chunk.id.0))
+            .collect::<Vec<_>>();
+        store.upsert_graph_nodes(&nodes).unwrap();
+    }
+
+    fn hnsw_with_seed(store: &Store, seed: &Chunk) -> HnswIndex {
+        store
+            .replace_all_vector_documents(&[VectorDocument {
+                chunk_id: seed.id.clone(),
+                source_id: seed.source_id.clone(),
+                vector: keyword_vector(&seed.text),
+            }])
+            .unwrap();
+        let mut hnsw = HnswIndex::new();
+        hnsw.rebuild_from_store(store).unwrap();
+        hnsw
+    }
+
+    fn graph_config(edge_types: Vec<EdgeType>) -> GraphConfig {
+        GraphConfig {
+            enabled: true,
+            max_hops: 1,
+            max_expanded_chunks: 30,
+            max_neighbors_per_seed: 6,
+            edge_types,
+        }
+    }
+
     #[tokio::test]
     async fn retrieval_source_filter_applies_after_lexical_and_dense_search() {
         let store = Store::in_memory().unwrap();
@@ -322,5 +1192,536 @@ mod tests {
         assert_eq!(results[0].chunk_id.0, "chunk-beta");
         assert_eq!(results[0].chunk.source_id, second.id);
         assert_eq!(results[0].evidence_units.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_disabled_preserves_seed_results() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-disabled");
+        store.add_source(&source).unwrap();
+        let seed = insert_text_chunk(&store, &source, "chunk-seed", "alpha seed");
+        let neighbor = insert_text_chunk(&store, &source, "chunk-neighbor", "neighbor context");
+        upsert_chunk_graph_nodes(&store, &source.id, &[&seed, &neighbor]);
+
+        let seed_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &seed.id.0);
+        let neighbor_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &neighbor.id.0);
+        store
+            .upsert_graph_edges(&[graph_edge(
+                &source.id,
+                EdgeType::Next,
+                &seed_node,
+                &neighbor_node,
+                0,
+            )])
+            .unwrap();
+
+        let hnsw = hnsw_with_seed(&store, &seed);
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig::default();
+        let baseline = RetrievalPipeline::new(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+        )
+        .search("alpha")
+        .await
+        .unwrap();
+        let disabled_graph = GraphConfig {
+            enabled: false,
+            ..graph_config(vec![EdgeType::Next])
+        };
+        let with_disabled_graph = RetrievalPipeline::new_with_graph(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+            &disabled_graph,
+        )
+        .search("alpha")
+        .await
+        .unwrap();
+
+        assert_eq!(chunk_ids(&with_disabled_graph), chunk_ids(&baseline));
+        assert_eq!(
+            with_disabled_graph[0].provenance.origin,
+            RetrievalOrigin::Seed
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_recovers_previous_and_next_neighbors_from_inverse_edges() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-adjacent");
+        store.add_source(&source).unwrap();
+        let previous = insert_text_chunk(&store, &source, "chunk-previous", "previous context");
+        let seed = insert_text_chunk(&store, &source, "chunk-seed", "alpha seed");
+        let next = insert_text_chunk(&store, &source, "chunk-next", "next context");
+        upsert_chunk_graph_nodes(&store, &source.id, &[&previous, &seed, &next]);
+
+        let previous_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &previous.id.0);
+        let seed_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &seed.id.0);
+        let next_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &next.id.0);
+        store
+            .upsert_graph_edges(&[
+                graph_edge(&source.id, EdgeType::Next, &previous_node, &seed_node, 0),
+                graph_edge(&source.id, EdgeType::Previous, &next_node, &seed_node, 1),
+            ])
+            .unwrap();
+
+        let hnsw = hnsw_with_seed(&store, &seed);
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig::default();
+        let graph_config = graph_config(vec![EdgeType::Previous, EdgeType::Next]);
+        let results = RetrievalPipeline::new_with_graph(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+            &graph_config,
+        )
+        .search("alpha")
+        .await
+        .unwrap();
+
+        let ids = chunk_ids(&results);
+        assert_eq!(ids[0], "chunk-seed");
+        assert!(ids.contains(&"chunk-previous".to_string()));
+        assert!(ids.contains(&"chunk-next".to_string()));
+
+        let expanded = results
+            .iter()
+            .find(|result| result.chunk_id == previous.id)
+            .unwrap();
+        assert_eq!(expanded.provenance.origin, RetrievalOrigin::GraphExpansion);
+        assert_eq!(expanded.provenance.seed_chunk_id, Some(seed.id.clone()));
+        assert_eq!(expanded.provenance.seed_source_id, Some(source.id.clone()));
+        assert_eq!(expanded.provenance.hop_distance, 1);
+        assert_eq!(
+            expanded.provenance.graph_path[0].direction,
+            GraphTraversalDirection::Incoming
+        );
+        assert!(expanded.score < results[0].score);
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_recovers_parent_chunk_evidence() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-parent");
+        store.add_source(&source).unwrap();
+        let parent_extra = EvidenceUnit {
+            id: EvidenceId("ev-parent-extra".into()),
+            source_id: source.id.clone(),
+            kind: EvidenceKind::Text,
+            derived_from: None,
+            locator: SourceLocator::Document {
+                path_or_url: source.path.to_string_lossy().into_owned(),
+                line_start: 2,
+                line_end: None,
+            },
+            text: "Parent-only context.".into(),
+            text_hash: "hash-parent-extra".into(),
+            heading_path: Vec::new(),
+            position: 1,
+        };
+        store
+            .bulk_insert_evidence(std::slice::from_ref(&parent_extra))
+            .unwrap();
+        let parent = insert_parent_chunk(
+            &store,
+            &source,
+            "chunk-parent",
+            "Parent-only context.",
+            vec![parent_extra.id.clone()],
+        );
+        let seed = insert_text_chunk_with_parent(
+            &store,
+            &source,
+            "chunk-child",
+            "alpha child",
+            parent.id.clone(),
+        );
+        store
+            .link_chunk_evidence(&[(parent.id.clone(), seed.evidence_unit_ids[0].clone())])
+            .unwrap();
+        upsert_chunk_graph_nodes(&store, &source.id, &[&seed, &parent]);
+
+        let seed_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &seed.id.0);
+        let parent_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &parent.id.0);
+        store
+            .upsert_graph_edges(&[graph_edge(
+                &source.id,
+                EdgeType::Parent,
+                &seed_node,
+                &parent_node,
+                0,
+            )])
+            .unwrap();
+
+        let hnsw = hnsw_with_seed(&store, &seed);
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig::default();
+        let graph_config = graph_config(vec![EdgeType::Parent]);
+        let results = RetrievalPipeline::new_with_graph(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+            &graph_config,
+        )
+        .search("alpha")
+        .await
+        .unwrap();
+
+        let parent_result = results
+            .iter()
+            .find(|result| result.chunk_id == parent.id)
+            .unwrap();
+        assert!(parent_result
+            .evidence_units
+            .iter()
+            .any(|evidence| evidence.id == parent_extra.id));
+        assert_eq!(
+            parent_result.provenance.graph_path[0].edge_type,
+            EdgeType::Parent
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_recovers_section_context_without_whole_source() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-section");
+        store.add_source(&source).unwrap();
+        let heading = vec!["Intro".to_string()];
+        let seed = insert_text_chunk_with_heading(
+            &store,
+            &source,
+            "chunk-seed",
+            "alpha seed",
+            heading.clone(),
+        );
+        let sibling = insert_text_chunk_with_heading(
+            &store,
+            &source,
+            "chunk-sibling",
+            "sibling context",
+            heading,
+        );
+        let outside = insert_text_chunk_with_heading(
+            &store,
+            &source,
+            "chunk-outside",
+            "outside context",
+            vec!["Other".to_string()],
+        );
+        let section = graph_node(&source.id, GraphNodeKind::Section, "section:Intro");
+        store
+            .upsert_graph_nodes(std::slice::from_ref(&section))
+            .unwrap();
+        upsert_chunk_graph_nodes(&store, &source.id, &[&seed, &sibling, &outside]);
+        let seed_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &seed.id.0);
+        let sibling_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &sibling.id.0);
+        store
+            .upsert_graph_edges(&[
+                graph_edge(
+                    &source.id,
+                    EdgeType::SectionContains,
+                    &section.id,
+                    &seed_node,
+                    0,
+                ),
+                graph_edge(
+                    &source.id,
+                    EdgeType::SectionContains,
+                    &section.id,
+                    &sibling_node,
+                    1,
+                ),
+            ])
+            .unwrap();
+
+        let hnsw = hnsw_with_seed(&store, &seed);
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig::default();
+        let graph_config = graph_config(vec![EdgeType::SectionContains]);
+        let results = RetrievalPipeline::new_with_graph(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+            &graph_config,
+        )
+        .search("alpha")
+        .await
+        .unwrap();
+
+        let ids = chunk_ids(&results);
+        assert!(ids.contains(&sibling.id.0));
+        assert!(!ids.contains(&outside.id.0));
+        let sibling_result = results
+            .iter()
+            .find(|result| result.chunk_id == sibling.id)
+            .unwrap();
+        assert_eq!(sibling_result.provenance.hop_distance, 1);
+        assert_eq!(sibling_result.provenance.graph_path.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_recovers_page_image_candidates() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-image");
+        store.add_source(&source).unwrap();
+        let seed = insert_pdf_text_chunk(&store, &source, "chunk-seed", "alpha page text", 7);
+        let (image_chunk, artifact) =
+            insert_image_chunk(&store, &source, "chunk-image", "img-1", 7);
+        let page_node = graph_node(&source.id, GraphNodeKind::Page, "page:7");
+        let image_node = graph_node(
+            &source.id,
+            GraphNodeKind::ImageArtifact,
+            &artifact.image_id.0,
+        );
+        store
+            .upsert_graph_nodes(&[page_node.clone(), image_node.clone()])
+            .unwrap();
+        upsert_chunk_graph_nodes(&store, &source.id, &[&seed, &image_chunk]);
+        store
+            .upsert_graph_edges(&[graph_edge(
+                &source.id,
+                EdgeType::PageContainsImage,
+                &page_node.id,
+                &image_node.id,
+                0,
+            )])
+            .unwrap();
+
+        let hnsw = hnsw_with_seed(&store, &seed);
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig::default();
+        let graph_config = graph_config(vec![EdgeType::PageContainsImage]);
+        let results = RetrievalPipeline::new_with_graph(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+            &graph_config,
+        )
+        .search("alpha")
+        .await
+        .unwrap();
+
+        let image_result = results
+            .iter()
+            .find(|result| result.chunk_id == image_chunk.id)
+            .unwrap();
+        assert!(image_result
+            .evidence_units
+            .iter()
+            .any(|evidence| evidence.kind == EvidenceKind::Image));
+        assert_eq!(
+            image_result.provenance.graph_path[0].edge_type,
+            EdgeType::PageContainsImage
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_bounds_page_image_candidate_edges_before_resolution() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-image-budget");
+        store.add_source(&source).unwrap();
+        let seed = insert_pdf_text_chunk(&store, &source, "chunk-seed", "alpha page text", 7);
+        let (image_chunk, artifact) =
+            insert_image_chunk(&store, &source, "chunk-image", "img-valid", 7);
+        let page_node = graph_node(&source.id, GraphNodeKind::Page, "page:7");
+        let missing_image_nodes = (0..5)
+            .map(|idx| {
+                graph_node(
+                    &source.id,
+                    GraphNodeKind::ImageArtifact,
+                    &format!("img-missing-{idx}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let valid_image_node = graph_node(
+            &source.id,
+            GraphNodeKind::ImageArtifact,
+            &artifact.image_id.0,
+        );
+        let mut graph_nodes = vec![page_node.clone(), valid_image_node.clone()];
+        graph_nodes.extend(missing_image_nodes.iter().cloned());
+        store.upsert_graph_nodes(&graph_nodes).unwrap();
+        upsert_chunk_graph_nodes(&store, &source.id, &[&seed, &image_chunk]);
+
+        let mut edges = missing_image_nodes
+            .iter()
+            .enumerate()
+            .map(|(ordinal, missing_node)| {
+                graph_edge(
+                    &source.id,
+                    EdgeType::PageContainsImage,
+                    &page_node.id,
+                    &missing_node.id,
+                    ordinal as u32,
+                )
+            })
+            .collect::<Vec<_>>();
+        edges.push(graph_edge(
+            &source.id,
+            EdgeType::PageContainsImage,
+            &page_node.id,
+            &valid_image_node.id,
+            99,
+        ));
+        store.upsert_graph_edges(&edges).unwrap();
+
+        let hnsw = hnsw_with_seed(&store, &seed);
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig::default();
+        let graph_config = GraphConfig {
+            max_expanded_chunks: 3,
+            max_neighbors_per_seed: 3,
+            ..graph_config(vec![EdgeType::PageContainsImage])
+        };
+        let results = RetrievalPipeline::new_with_graph(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+            &graph_config,
+        )
+        .search("alpha")
+        .await
+        .unwrap();
+
+        assert_eq!(chunk_ids(&results), vec!["chunk-seed".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_respects_edge_type_filter() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-filter");
+        store.add_source(&source).unwrap();
+        let seed = insert_text_chunk(&store, &source, "chunk-seed", "alpha seed");
+        let neighbor = insert_text_chunk(&store, &source, "chunk-neighbor", "neighbor context");
+        upsert_chunk_graph_nodes(&store, &source.id, &[&seed, &neighbor]);
+        let seed_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &seed.id.0);
+        let neighbor_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &neighbor.id.0);
+        store
+            .upsert_graph_edges(&[graph_edge(
+                &source.id,
+                EdgeType::Next,
+                &seed_node,
+                &neighbor_node,
+                0,
+            )])
+            .unwrap();
+
+        let hnsw = hnsw_with_seed(&store, &seed);
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig::default();
+        let graph_config = graph_config(vec![EdgeType::Parent]);
+        let results = RetrievalPipeline::new_with_graph(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+            &graph_config,
+        )
+        .search("alpha")
+        .await
+        .unwrap();
+
+        assert_eq!(chunk_ids(&results), vec!["chunk-seed".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_respects_neighbor_and_global_budgets() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-budget");
+        store.add_source(&source).unwrap();
+        let seed = insert_text_chunk(&store, &source, "chunk-seed", "alpha seed");
+        let targets = ["chunk-a", "chunk-b", "chunk-c"]
+            .into_iter()
+            .map(|id| insert_text_chunk(&store, &source, id, "linked context"))
+            .collect::<Vec<_>>();
+        let mut chunk_refs = vec![&seed];
+        chunk_refs.extend(targets.iter());
+        upsert_chunk_graph_nodes(&store, &source.id, &chunk_refs);
+
+        let seed_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &seed.id.0);
+        let edges = targets
+            .iter()
+            .enumerate()
+            .map(|(ordinal, chunk)| {
+                let target_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &chunk.id.0);
+                graph_edge(
+                    &source.id,
+                    EdgeType::MarkdownLinksTo,
+                    &seed_node,
+                    &target_node,
+                    ordinal as u32,
+                )
+            })
+            .collect::<Vec<_>>();
+        store.upsert_graph_edges(&edges).unwrap();
+
+        let hnsw = hnsw_with_seed(&store, &seed);
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig::default();
+        let neighbor_limited = GraphConfig {
+            max_neighbors_per_seed: 2,
+            ..graph_config(vec![EdgeType::MarkdownLinksTo])
+        };
+        let neighbor_limited_results = RetrievalPipeline::new_with_graph(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+            &neighbor_limited,
+        )
+        .search("alpha")
+        .await
+        .unwrap();
+        assert_eq!(neighbor_limited_results.len(), 3);
+
+        let globally_limited = GraphConfig {
+            max_expanded_chunks: 1,
+            ..graph_config(vec![EdgeType::MarkdownLinksTo])
+        };
+        let globally_limited_results = RetrievalPipeline::new_with_graph(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+            &globally_limited,
+        )
+        .search("alpha")
+        .await
+        .unwrap();
+        assert_eq!(globally_limited_results.len(), 2);
+    }
+
+    fn chunk_ids(results: &[RetrievalResult]) -> Vec<String> {
+        results
+            .iter()
+            .map(|result| result.chunk_id.0.clone())
+            .collect()
     }
 }
