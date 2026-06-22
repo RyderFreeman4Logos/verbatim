@@ -79,6 +79,20 @@ pub trait VectorIndex: Send + Sync {
     fn delete_source(&mut self, source_id: &SourceId) -> Result<()>;
     /// Return ranked child chunk IDs for a query vector.
     fn search(&self, query: &[f32], top_k: usize) -> Vec<(ChunkId, f32)>;
+    /// Return ranked child chunk IDs for a query vector and optional source filter.
+    fn search_filtered(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        source_filter: Option<&SourceId>,
+    ) -> Vec<(ChunkId, f32)> {
+        let _ = source_filter;
+        self.search(query, top_k)
+    }
+    /// Whether this index can apply source filtering before ranking.
+    fn supports_source_filter(&self) -> bool {
+        false
+    }
     /// Rebuild the complete vector index from SQLite's stored vectors.
     fn rebuild_from_store(&mut self, store: &Store) -> Result<()>;
     fn len(&self) -> usize;

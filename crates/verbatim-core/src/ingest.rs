@@ -16,6 +16,7 @@ use crate::image_limits::{
     ImageArtifactBudget, ImageArtifactLimitError, ImageArtifactLimitStage, ImageArtifactLimits,
 };
 use crate::index::hnsw::HnswIndex;
+use crate::index::qdrant::{records_from_store, QdrantClient};
 use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
@@ -40,6 +41,7 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     vision_model: Option<Box<dyn VisionModel>>,
     graph_extractor: Option<GraphExtractor>,
     graph_extraction_config: GraphExtractionConfig,
+    qdrant: Option<QdrantClient>,
     vision_caption_model: String,
     vision_caption_prompt_hash: String,
     data_dir: PathBuf,
@@ -114,6 +116,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         } else {
             None
         };
+        let qdrant = QdrantClient::from_config(&config.qdrant);
 
         Ok(Self {
             store,
@@ -123,6 +126,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             vision_model,
             graph_extractor,
             graph_extraction_config,
+            qdrant,
             vision_caption_model,
             vision_caption_prompt_hash: vision_caption_prompt_hash(),
             data_dir: data_dir.to_path_buf(),
@@ -161,6 +165,7 @@ where
             vision_model: None,
             graph_extractor: None,
             graph_extraction_config: GraphExtractionConfig::default(),
+            qdrant: None,
             vision_caption_model: "vision-disabled".to_string(),
             vision_caption_prompt_hash: vision_caption_prompt_hash(),
             data_dir,
@@ -186,6 +191,12 @@ where
     ) -> Self {
         self.graph_extraction_config = config;
         self.graph_extractor = Some(graph_extractor);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_qdrant_client(mut self, qdrant: QdrantClient) -> Self {
+        self.qdrant = Some(qdrant);
         self
     }
 
@@ -225,6 +236,7 @@ where
             }
         };
         self.publish_committed_indexes(generation, staged, prepared)?;
+        self.sync_qdrant_delete_source(source_id).await;
         remove_source_image_artifacts(&self.data_dir, source_id).with_context(|| {
             format!(
                 "cleanup image artifacts after committed source removal: {}",
@@ -367,6 +379,7 @@ where
             }
         };
         self.publish_committed_indexes(generation, staged, prepared)?;
+        self.sync_qdrant_source(source_id).await;
         cleanup_stale_source_image_artifacts(
             &self.data_dir,
             source_id,
@@ -448,6 +461,9 @@ where
             tracing::info!(progress = format!("{}/{}", i + 1, total), source = %source_id.0);
             self.ingest_source(source_id).await?;
         }
+        if force {
+            self.sync_qdrant_all().await;
+        }
 
         Ok(total)
     }
@@ -459,6 +475,7 @@ where
         self.store.replace_all_vector_documents(&prepared.vectors)?;
         self.lexical_index().rebuild_from_store(&self.store)?;
         self.publish_prepared_indexes(prepared)?;
+        self.sync_qdrant_all().await;
 
         Ok(())
     }
@@ -529,6 +546,57 @@ where
     fn invalidate_live_indexes(&mut self) -> Result<()> {
         self.hnsw = HnswIndex::new();
         Ok(())
+    }
+
+    async fn sync_qdrant_source(&self, source_id: &SourceId) {
+        let Some(qdrant) = &self.qdrant else {
+            return;
+        };
+        let result: Result<()> = async {
+            let records = records_from_store(&self.store, Some(source_id))?;
+            qdrant.delete_source(source_id).await?;
+            qdrant.upsert_records(&records).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                source = %source_id.0,
+                error = %err,
+                "qdrant source sync failed; local ingest remains authoritative"
+            );
+        }
+    }
+
+    async fn sync_qdrant_delete_source(&self, source_id: &SourceId) {
+        let Some(qdrant) = &self.qdrant else {
+            return;
+        };
+        if let Err(err) = qdrant.delete_source(source_id).await {
+            tracing::warn!(
+                source = %source_id.0,
+                error = %err,
+                "qdrant source delete failed; local removal remains authoritative"
+            );
+        }
+    }
+
+    async fn sync_qdrant_all(&self) {
+        let Some(qdrant) = &self.qdrant else {
+            return;
+        };
+        let result: Result<()> = async {
+            let records = records_from_store(&self.store, None)?;
+            qdrant.recreate_with_records(&records).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                error = %err,
+                "qdrant full sync failed; local indexes remain authoritative"
+            );
+        }
     }
 
     fn embedding_text(&self, chunk: &Chunk) -> String {
@@ -1919,10 +1987,13 @@ mod tests {
     use async_trait::async_trait;
     use futures::StreamExt;
     use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread;
 
-    use crate::config::{GraphConfig, RetrievalConfig};
+    use crate::config::{GraphConfig, QdrantConfig, RetrievalConfig};
     use crate::image_limits::ImageArtifactLimitError;
     use crate::provider::{
         ChatMessageContent, ChatModel, ChatRequest, ChatResponse, ChatStream, ImageDescribeRequest,
@@ -2201,6 +2272,88 @@ mod tests {
         }
         hnsw.build().unwrap();
         hnsw
+    }
+
+    #[derive(Debug)]
+    struct TestHttpRequest {
+        line: String,
+        body: String,
+    }
+
+    fn qdrant_test_config(url: String) -> QdrantConfig {
+        QdrantConfig {
+            enabled: true,
+            url,
+            collection: "verbatim".into(),
+            prefer_for_search: false,
+            timeout_seconds: 2,
+        }
+    }
+
+    fn spawn_qdrant_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, thread::JoinHandle<Vec<TestHttpRequest>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind qdrant test server");
+        let addr = listener.local_addr().expect("qdrant test server addr");
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept qdrant request");
+                requests.push(read_http_request(&mut stream));
+                write_http_response(&mut stream, response.0, response.1);
+            }
+            requests
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> TestHttpRequest {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).expect("read http request");
+            if n == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..n]);
+            if http_request_complete(&buffer) {
+                break;
+            }
+        }
+        let text = String::from_utf8(buffer).expect("request utf8");
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        TestHttpRequest {
+            line: head.lines().next().unwrap_or_default().to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    fn http_request_complete(buffer: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(buffer);
+        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+            return false;
+        };
+        let content_len = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        body.len() >= content_len
+    }
+
+    fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
+        let reason = if status == 200 { "OK" } else { "ERR" };
+        write!(
+            stream,
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write http response");
     }
 
     fn sorted_graph_node_ids(nodes: &[GraphNode]) -> Vec<String> {
@@ -2952,6 +3105,94 @@ model = "local-vision"
         assert_eq!(retained[0].0 .0, "chunk-2");
         assert_eq!(pipeline.store().list_vector_documents().unwrap().len(), 1);
         assert_eq!(pipeline.hnsw().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_source_deletes_qdrant_points_by_source_after_commit() {
+        let (qdrant_url, handle) = spawn_qdrant_server(vec![
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
+            ),
+        ]);
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let first = test_source("src-1", tempdir.path().join("first.txt"));
+        let second = test_source("src-2", tempdir.path().join("second.txt"));
+        let first_chunk = insert_source_with_child(&store, &first, "chunk-1").unwrap();
+        let second_chunk = insert_source_with_child(&store, &second, "chunk-2").unwrap();
+        let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
+        let qdrant = QdrantClient::new(qdrant_test_config(qdrant_url));
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            hnsw,
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_qdrant_client(qdrant);
+
+        pipeline.remove_source(&first.id).await.unwrap();
+
+        let requests = handle.join().unwrap();
+        assert_eq!(requests[0].line, "GET /collections/verbatim HTTP/1.1");
+        assert_eq!(
+            requests[1].line,
+            "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        );
+        let body: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(body["filter"]["must"][0]["key"], "source_id");
+        assert_eq!(body["filter"]["must"][0]["match"]["value"], "src-1");
+    }
+
+    #[tokio::test]
+    async fn force_ingest_recreates_qdrant_collection_after_local_ingest() {
+        let (qdrant_url, handle) = spawn_qdrant_server(vec![
+            (404, r#"{"status":{"error":"missing"},"result":null}"#),
+            (404, r#"{"status":{"error":"missing"},"result":null}"#),
+            (200, r#"{"status":"ok","result":true}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
+            ),
+            (200, r#"{"status":"ok","result":true}"#),
+            (200, r#"{"status":"ok","result":true}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
+            ),
+        ]);
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("force.txt");
+        std::fs::write(&path, "force qdrant sync paragraph\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-force", path);
+        store.add_source(&source).unwrap();
+        let qdrant = QdrantClient::new(qdrant_test_config(qdrant_url));
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_qdrant_client(qdrant);
+
+        let ingested = pipeline.ingest_all(true).await.unwrap();
+
+        assert_eq!(ingested, 1);
+        let requests = handle.join().unwrap();
+        assert_eq!(requests[4].line, "DELETE /collections/verbatim HTTP/1.1");
+        assert_eq!(requests[5].line, "PUT /collections/verbatim HTTP/1.1");
+        assert_eq!(
+            requests[6].line,
+            "PUT /collections/verbatim/points?wait=true HTTP/1.1"
+        );
+        let body: serde_json::Value = serde_json::from_str(&requests[6].body).unwrap();
+        assert_eq!(body["points"][0]["payload"]["source_id"], "src-force");
+        assert!(body["points"][0]["payload"]["chunk_id"]
+            .as_str()
+            .unwrap()
+            .contains("src-force"));
     }
 
     #[tokio::test]
