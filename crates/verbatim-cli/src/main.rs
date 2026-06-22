@@ -201,8 +201,8 @@ where
             render::write_health(stdout, &health)?;
             Ok(0)
         }
-        DaemonCommand::Install => {
-            let path = local.daemon_install()?;
+        DaemonCommand::Install { force } => {
+            let path = local.daemon_install(force)?;
             local::write_daemon_install(stdout, &path)?;
             Ok(0)
         }
@@ -303,8 +303,12 @@ enum DaemonCommand {
     Start,
     /// Check daemon health through the daemon API.
     Status,
-    /// Write a minimal systemd user unit.
-    Install,
+    /// Install the systemd user service.
+    Install {
+        /// Overwrite an existing service file.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[cfg(test)]
@@ -482,6 +486,38 @@ mod tests {
         assert!(String::from_utf8(stderr).unwrap().contains("HTTP 500"));
     }
 
+    #[test]
+    fn daemon_install_prints_generated_path_and_systemctl_commands() {
+        let (code, stdout, stderr, _, local) = run_mock(["daemon", "install"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(local.calls.borrow().as_slice(), ["daemon_install:false"]);
+        assert!(stdout.contains("Generated /tmp/verbatim.service"));
+        assert!(stdout.contains("Run: systemctl --user daemon-reload"));
+        assert!(stdout.contains("Run: systemctl --user enable --now verbatim"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn daemon_install_force_is_plumbed_to_local_action() {
+        let (code, stdout, stderr, _, local) = run_mock(["daemon", "install", "--force"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(local.calls.borrow().as_slice(), ["daemon_install:true"]);
+        assert!(stdout.contains("Generated /tmp/verbatim.service"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn daemon_install_help_documents_force() {
+        let (code, stdout, stderr, _, _) = run_mock(["daemon", "install", "--help"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stdout.contains("--force"));
+        assert!(stdout.contains("Overwrite an existing service file"));
+        assert!(stderr.is_empty());
+    }
+
     fn run_mock<I>(
         args: I,
     ) -> (
@@ -616,8 +652,10 @@ mod tests {
             Ok(0)
         }
 
-        fn daemon_install(&self) -> client::CliResult<PathBuf> {
-            self.calls.borrow_mut().push("daemon_install".into());
+        fn daemon_install(&self, force: bool) -> client::CliResult<PathBuf> {
+            self.calls
+                .borrow_mut()
+                .push(format!("daemon_install:{force}"));
             Ok(PathBuf::from("/tmp/verbatim.service"))
         }
     }
