@@ -1,14 +1,16 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use crate::config::{GraphConfig, RetrievalConfig};
 use crate::store::Store;
 use crate::traits::{EmbeddingClient, LexicalIndex, VectorIndex};
 use crate::types::{
-    Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceUnit, GraphExpansionStep, GraphNodeId,
-    GraphNodeKind, GraphTraversalDirection, ImageId, RetrievalProvenance, RetrievalResult,
-    SourceId, SourceLocator,
+    Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit,
+    GraphExpansionStep, GraphNodeId, GraphNodeKind, GraphTraversalDirection, ImageId,
+    RetrievalDebug, RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalFusedHit,
+    RetrievalGraphExpansionDebug, RetrievalLocatorDebug, RetrievalProvenance, RetrievalRerankDebug,
+    RetrievalResult, RetrievalStageHit, SourceId, SourceLocator,
 };
 
 const GRAPH_EXPANSION_SCORE_DECAY: f32 = 0.5;
@@ -67,6 +69,28 @@ impl<'a> RetrievalPipeline<'a> {
         query: &str,
         source_filter: Option<&SourceId>,
     ) -> Result<Vec<RetrievalResult>> {
+        Ok(self
+            .search_filtered_internal(query, source_filter, false)
+            .await?
+            .results)
+    }
+
+    pub async fn search_filtered_with_debug(
+        &self,
+        query: &str,
+        source_filter: Option<&SourceId>,
+    ) -> Result<(Vec<RetrievalResult>, RetrievalDebug)> {
+        self.search_filtered_internal(query, source_filter, true)
+            .await?
+            .into_results_with_debug()
+    }
+
+    async fn search_filtered_internal(
+        &self,
+        query: &str,
+        source_filter: Option<&SourceId>,
+        include_debug: bool,
+    ) -> Result<RetrievalSearchOutput> {
         let query_text = self.embed_client.prepare_query(query);
         let query_vec = self
             .embed_client
@@ -103,6 +127,22 @@ impl<'a> RetrievalPipeline<'a> {
             });
         }
 
+        let bm25_hits = if include_debug {
+            self.stage_debug_hits(&bm25_results, source_filter)?
+        } else {
+            Vec::new()
+        };
+        let dense_hits = if include_debug {
+            self.stage_debug_hits(&dense_results, source_filter)?
+        } else {
+            Vec::new()
+        };
+        let rrf_fused_hits = if include_debug {
+            self.fused_debug_hits(&fused, &dense_results, &bm25_results)?
+        } else {
+            Vec::new()
+        };
+
         let mut results = Vec::new();
         for (rank, (chunk_id, score)) in fused.into_iter().enumerate() {
             let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
@@ -117,7 +157,20 @@ impl<'a> RetrievalPipeline<'a> {
 
         self.expand_graph_results(&mut results, source_filter)?;
 
-        Ok(results)
+        let debug = if include_debug {
+            Some(RetrievalDebug {
+                bm25_hits,
+                dense_hits,
+                rrf_fused_hits,
+                graph_expanded_hits: graph_expansion_debug_hits(&results),
+                reranker: RetrievalRerankDebug::skipped("not_run"),
+                final_evidence_pack: final_evidence_pack_debug(&results),
+            })
+        } else {
+            None
+        };
+
+        Ok(RetrievalSearchOutput { results, debug })
     }
 
     fn result_for_chunk(
@@ -166,6 +219,65 @@ impl<'a> RetrievalPipeline<'a> {
         }
 
         Ok(evidence_units)
+    }
+
+    fn stage_debug_hits(
+        &self,
+        hits: &[(ChunkId, f32)],
+        source_filter: Option<&SourceId>,
+    ) -> Result<Vec<RetrievalStageHit>> {
+        let mut debug_hits = Vec::new();
+
+        for (rank, (chunk_id, score)) in hits.iter().enumerate() {
+            let chunk = self.store.get_chunk(chunk_id)?;
+            if source_filter.is_some_and(|source_id| {
+                chunk
+                    .as_ref()
+                    .is_none_or(|chunk| chunk.source_id != *source_id)
+            }) {
+                continue;
+            }
+
+            debug_hits.push(RetrievalStageHit {
+                rank: rank + 1,
+                chunk_id: chunk_id.clone(),
+                source_id: chunk.as_ref().map(|chunk| chunk.source_id.clone()),
+                score: *score,
+                evidence_ids: chunk
+                    .map(|chunk| chunk.evidence_unit_ids)
+                    .unwrap_or_default(),
+            });
+        }
+
+        Ok(debug_hits)
+    }
+
+    fn fused_debug_hits(
+        &self,
+        hits: &[(ChunkId, f32)],
+        dense_results: &[(ChunkId, f32)],
+        bm25_results: &[(ChunkId, f32)],
+    ) -> Result<Vec<RetrievalFusedHit>> {
+        let dense_ranks = rank_by_chunk_id(dense_results);
+        let bm25_ranks = rank_by_chunk_id(bm25_results);
+
+        hits.iter()
+            .enumerate()
+            .map(|(rank, (chunk_id, score))| {
+                let chunk = self.store.get_chunk(chunk_id)?;
+                Ok(RetrievalFusedHit {
+                    rank: rank + 1,
+                    chunk_id: chunk_id.clone(),
+                    source_id: chunk.as_ref().map(|chunk| chunk.source_id.clone()),
+                    score: *score,
+                    dense_rank: dense_ranks.get(chunk_id).copied(),
+                    bm25_rank: bm25_ranks.get(chunk_id).copied(),
+                    evidence_ids: chunk
+                        .map(|chunk| chunk.evidence_unit_ids)
+                        .unwrap_or_default(),
+                })
+            })
+            .collect()
     }
 
     fn expand_graph_results(
@@ -606,6 +718,20 @@ impl<'a> RetrievalPipeline<'a> {
     }
 }
 
+struct RetrievalSearchOutput {
+    results: Vec<RetrievalResult>,
+    debug: Option<RetrievalDebug>,
+}
+
+impl RetrievalSearchOutput {
+    fn into_results_with_debug(self) -> Result<(Vec<RetrievalResult>, RetrievalDebug)> {
+        let debug = self
+            .debug
+            .ok_or_else(|| anyhow!("retrieval debug output missing after debug search"))?;
+        Ok((self.results, debug))
+    }
+}
+
 struct GraphExpansionState<'a> {
     config: &'a GraphConfig,
     edge_types: &'a [EdgeType],
@@ -650,6 +776,81 @@ struct FrontierNode {
 struct GraphTransition {
     neighbor_node_id: GraphNodeId,
     step: GraphExpansionStep,
+}
+
+fn rank_by_chunk_id(hits: &[(ChunkId, f32)]) -> HashMap<ChunkId, usize> {
+    hits.iter()
+        .enumerate()
+        .map(|(rank, (chunk_id, _))| (chunk_id.clone(), rank + 1))
+        .collect()
+}
+
+fn graph_expansion_debug_hits(results: &[RetrievalResult]) -> Vec<RetrievalGraphExpansionDebug> {
+    results
+        .iter()
+        .filter_map(|result| {
+            let provenance = &result.provenance;
+            if provenance.origin != crate::types::RetrievalOrigin::GraphExpansion {
+                return None;
+            }
+
+            Some(RetrievalGraphExpansionDebug {
+                result_rank: provenance.result_rank,
+                seed_rank: provenance.seed_rank.unwrap_or(0),
+                seed_chunk_id: provenance.seed_chunk_id.clone()?,
+                seed_source_id: provenance.seed_source_id.clone()?,
+                expanded_chunk_id: result.chunk_id.clone(),
+                expanded_source_id: result.chunk.source_id.clone(),
+                score: result.score,
+                hop_distance: provenance.hop_distance,
+                path: provenance.graph_path.clone(),
+                reason: "included_by_configured_graph_expansion".into(),
+            })
+        })
+        .collect()
+}
+
+fn final_evidence_pack_debug(results: &[RetrievalResult]) -> Vec<RetrievalEvidencePackEntry> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for result in results {
+        for evidence in &result.evidence_units {
+            if !seen.insert(evidence.id.0.clone()) {
+                continue;
+            }
+
+            entries.push(RetrievalEvidencePackEntry {
+                label: format!("E{}", entries.len() + 1),
+                result_rank: result.provenance.result_rank,
+                chunk_id: result.chunk_id.clone(),
+                score: result.score,
+                evidence_id: evidence.id.clone(),
+                source_id: evidence.source_id.clone(),
+                role: evidence_debug_role(evidence),
+                kind: evidence.kind,
+                derived_from: evidence.derived_from.clone(),
+                locator: RetrievalLocatorDebug {
+                    display: evidence.locator.to_string(),
+                    structured: evidence.locator.clone(),
+                },
+                provenance: result.provenance.clone(),
+            });
+        }
+    }
+
+    entries
+}
+
+fn evidence_debug_role(evidence: &EvidenceUnit) -> RetrievalEvidenceRole {
+    match evidence.kind {
+        EvidenceKind::Text => RetrievalEvidenceRole::OriginalText,
+        EvidenceKind::Image => RetrievalEvidenceRole::ImageArtifact,
+        EvidenceKind::Generated if evidence.derived_from.is_some() => {
+            RetrievalEvidenceRole::ImageCaptionGenerated
+        }
+        EvidenceKind::Generated => RetrievalEvidenceRole::Generated,
+    }
 }
 
 fn rrf_fusion(dense: &[(ChunkId, f32)], bm25: &[(ChunkId, f32)], k: usize) -> Vec<(ChunkId, f32)> {
@@ -740,8 +941,8 @@ mod tests {
     use crate::traits::{VectorDocument, VectorIndex};
     use crate::types::{
         BBox, EdgeType, EvidenceId, EvidenceKind, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
-        GraphNodeKind, GraphTraversalDirection, ImageArtifact, ImageId, RetrievalOrigin, Source,
-        SourceLocator, SourceStatus,
+        GraphNodeKind, GraphTraversalDirection, ImageArtifact, ImageId, RetrievalEvidenceRole,
+        RetrievalOrigin, RetrievalRerankStatus, Source, SourceLocator, SourceStatus,
     };
 
     #[test]
@@ -1307,6 +1508,92 @@ mod tests {
             GraphTraversalDirection::Incoming
         );
         assert!(expanded.score < results[0].score);
+    }
+
+    #[tokio::test]
+    async fn search_debug_reports_seed_rankings_graph_path_and_final_pack() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-debug");
+        store.add_source(&source).unwrap();
+        let seed = insert_text_chunk(&store, &source, "chunk-seed", "alpha seed");
+        let neighbor = insert_text_chunk(&store, &source, "chunk-neighbor", "neighbor context");
+        upsert_chunk_graph_nodes(&store, &source.id, &[&seed, &neighbor]);
+
+        let seed_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &seed.id.0);
+        let neighbor_node = GraphNodeId::new(&source.id, GraphNodeKind::Chunk, &neighbor.id.0);
+        store
+            .upsert_graph_edges(&[graph_edge(
+                &source.id,
+                EdgeType::Next,
+                &seed_node,
+                &neighbor_node,
+                0,
+            )])
+            .unwrap();
+
+        let hnsw = hnsw_with_seed(&store, &seed);
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig::default();
+        let graph_config = graph_config(vec![EdgeType::Next]);
+        let (_results, debug) = RetrievalPipeline::new_with_graph(
+            &hnsw,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+            &graph_config,
+        )
+        .search_filtered_with_debug("alpha", None)
+        .await
+        .unwrap();
+
+        assert!(!debug.bm25_hits.is_empty());
+        assert!(!debug.dense_hits.is_empty());
+        assert!(!debug.rrf_fused_hits.is_empty());
+        assert_eq!(debug.rrf_fused_hits[0].rank, 1);
+        assert_eq!(debug.rrf_fused_hits[0].chunk_id, seed.id);
+        assert_eq!(debug.rrf_fused_hits[0].dense_rank, Some(1));
+
+        assert_eq!(debug.graph_expanded_hits.len(), 1);
+        let expanded = &debug.graph_expanded_hits[0];
+        assert_eq!(expanded.seed_rank, 1);
+        assert_eq!(expanded.seed_chunk_id, seed.id);
+        assert_eq!(expanded.expanded_chunk_id, neighbor.id);
+        assert_eq!(expanded.hop_distance, 1);
+        assert_eq!(expanded.path[0].edge_type, EdgeType::Next);
+        assert_eq!(
+            expanded.path[0].direction,
+            GraphTraversalDirection::Outgoing
+        );
+
+        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Skipped);
+        assert_eq!(debug.reranker.scores, Vec::new());
+        assert!(debug
+            .final_evidence_pack
+            .iter()
+            .any(
+                |entry| entry.evidence_id == EvidenceId("ev-chunk-seed".into())
+                    && entry.role == RetrievalEvidenceRole::OriginalText
+            ));
+
+        let encoded = serde_json::to_string(&debug).unwrap();
+        assert!(!encoded.contains("alpha seed"));
+        assert!(!encoded.contains("neighbor context"));
+    }
+
+    #[test]
+    fn debug_search_output_returns_error_when_debug_is_missing() {
+        let output = RetrievalSearchOutput {
+            results: Vec::new(),
+            debug: None,
+        };
+
+        let error = output.into_results_with_debug().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("retrieval debug output missing after debug search"));
     }
 
     #[tokio::test]

@@ -477,6 +477,122 @@ impl Default for RetrievalProvenance {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalDebug {
+    pub bm25_hits: Vec<RetrievalStageHit>,
+    pub dense_hits: Vec<RetrievalStageHit>,
+    pub rrf_fused_hits: Vec<RetrievalFusedHit>,
+    pub graph_expanded_hits: Vec<RetrievalGraphExpansionDebug>,
+    pub reranker: RetrievalRerankDebug,
+    pub final_evidence_pack: Vec<RetrievalEvidencePackEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalStageHit {
+    pub rank: usize,
+    pub chunk_id: ChunkId,
+    pub source_id: Option<SourceId>,
+    pub score: f32,
+    pub evidence_ids: Vec<EvidenceId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalFusedHit {
+    pub rank: usize,
+    pub chunk_id: ChunkId,
+    pub source_id: Option<SourceId>,
+    pub score: f32,
+    pub dense_rank: Option<usize>,
+    pub bm25_rank: Option<usize>,
+    pub evidence_ids: Vec<EvidenceId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalGraphExpansionDebug {
+    pub result_rank: usize,
+    pub seed_rank: usize,
+    pub seed_chunk_id: ChunkId,
+    pub seed_source_id: SourceId,
+    pub expanded_chunk_id: ChunkId,
+    pub expanded_source_id: SourceId,
+    pub score: f32,
+    pub hop_distance: u32,
+    pub path: Vec<GraphExpansionStep>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalRerankDebug {
+    pub status: RetrievalRerankStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub scores: Vec<RetrievalRerankScore>,
+}
+
+impl RetrievalRerankDebug {
+    pub fn disabled() -> Self {
+        Self {
+            status: RetrievalRerankStatus::Disabled,
+            reason: None,
+            scores: Vec::new(),
+        }
+    }
+
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            status: RetrievalRerankStatus::Skipped,
+            reason: Some(reason.into()),
+            scores: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalRerankStatus {
+    Disabled,
+    Skipped,
+    Ran,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalRerankScore {
+    pub rank: usize,
+    pub chunk_id: ChunkId,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalEvidencePackEntry {
+    pub label: String,
+    pub result_rank: usize,
+    pub chunk_id: ChunkId,
+    pub score: f32,
+    pub evidence_id: EvidenceId,
+    pub source_id: SourceId,
+    pub role: RetrievalEvidenceRole,
+    pub kind: EvidenceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<EvidenceId>,
+    pub locator: RetrievalLocatorDebug,
+    pub provenance: RetrievalProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalEvidenceRole {
+    OriginalText,
+    ImageArtifact,
+    ImageCaptionGenerated,
+    Generated,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalLocatorDebug {
+    pub display: String,
+    pub structured: SourceLocator,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CitationRef {
     pub label: String,
@@ -554,5 +670,81 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first, different);
+    }
+
+    #[test]
+    fn retrieval_debug_serializes_without_raw_text_or_secrets() {
+        let debug = RetrievalDebug {
+            bm25_hits: vec![RetrievalStageHit {
+                rank: 1,
+                chunk_id: ChunkId("chunk-1".into()),
+                source_id: Some(SourceId("src-1".into())),
+                score: 4.2,
+                evidence_ids: vec![EvidenceId("ev-1".into())],
+            }],
+            dense_hits: Vec::new(),
+            rrf_fused_hits: vec![RetrievalFusedHit {
+                rank: 1,
+                chunk_id: ChunkId("chunk-1".into()),
+                source_id: Some(SourceId("src-1".into())),
+                score: 0.03,
+                dense_rank: None,
+                bm25_rank: Some(1),
+                evidence_ids: vec![EvidenceId("ev-1".into())],
+            }],
+            graph_expanded_hits: vec![RetrievalGraphExpansionDebug {
+                result_rank: 2,
+                seed_rank: 1,
+                seed_chunk_id: ChunkId("chunk-1".into()),
+                seed_source_id: SourceId("src-1".into()),
+                expanded_chunk_id: ChunkId("chunk-2".into()),
+                expanded_source_id: SourceId("src-1".into()),
+                score: 0.01,
+                hop_distance: 1,
+                path: vec![GraphExpansionStep {
+                    edge_type: EdgeType::Next,
+                    from_node_id: GraphNodeId("node-1".into()),
+                    to_node_id: GraphNodeId("node-2".into()),
+                    direction: GraphTraversalDirection::Outgoing,
+                }],
+                reason: "included_by_configured_graph_expansion".into(),
+            }],
+            reranker: RetrievalRerankDebug::skipped("disabled"),
+            final_evidence_pack: vec![RetrievalEvidencePackEntry {
+                label: "E1".into(),
+                result_rank: 1,
+                chunk_id: ChunkId("chunk-1".into()),
+                score: 0.03,
+                evidence_id: EvidenceId("ev-1".into()),
+                source_id: SourceId("src-1".into()),
+                role: RetrievalEvidenceRole::OriginalText,
+                kind: EvidenceKind::Text,
+                derived_from: None,
+                locator: RetrievalLocatorDebug {
+                    display: "/tmp/doc.txt L1".into(),
+                    structured: SourceLocator::Document {
+                        path_or_url: "/tmp/doc.txt".into(),
+                        line_start: 1,
+                        line_end: None,
+                    },
+                },
+                provenance: RetrievalProvenance::seed(
+                    1,
+                    ChunkId("chunk-1".into()),
+                    SourceId("src-1".into()),
+                ),
+            }],
+        };
+
+        let encoded = serde_json::to_string(&debug).unwrap();
+        assert!(encoded.contains("bm25_hits"));
+        assert!(encoded.contains("graph_expanded_hits"));
+        assert!(encoded.contains("final_evidence_pack"));
+        assert!(encoded.contains("disabled"));
+        assert!(!encoded.contains("api_key"));
+        assert!(!encoded.contains("secret full raw source text"));
+
+        let decoded: RetrievalDebug = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, debug);
     }
 }
