@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
 
 use crate::config::{GraphConfig, QdrantConfig, RerankConfig, RetrievalConfig};
+#[cfg(feature = "qdrant")]
 use crate::index::qdrant::QdrantClient;
 use crate::provider::ProviderError;
 use crate::store::Store;
@@ -28,6 +29,7 @@ pub struct RetrievalPipeline<'a> {
     graph_config: Option<&'a GraphConfig>,
     rerank_config: Option<&'a RerankConfig>,
     reranker: Option<&'a dyn Reranker>,
+    #[cfg(feature = "qdrant")]
     qdrant: Option<QdrantClient>,
 }
 
@@ -48,6 +50,7 @@ impl<'a> RetrievalPipeline<'a> {
             graph_config: None,
             rerank_config: None,
             reranker: None,
+            #[cfg(feature = "qdrant")]
             qdrant: None,
         }
     }
@@ -69,6 +72,7 @@ impl<'a> RetrievalPipeline<'a> {
             graph_config: Some(graph_config),
             rerank_config: None,
             reranker: None,
+            #[cfg(feature = "qdrant")]
             qdrant: None,
         }
     }
@@ -79,10 +83,16 @@ impl<'a> RetrievalPipeline<'a> {
         self
     }
 
+    #[cfg(feature = "qdrant")]
     pub fn with_qdrant_search(mut self, config: &QdrantConfig) -> Self {
         if config.enabled && config.prefer_for_search {
             self.qdrant = QdrantClient::from_config(config);
         }
+        self
+    }
+
+    #[cfg(not(feature = "qdrant"))]
+    pub fn with_qdrant_search(self, _config: &QdrantConfig) -> Self {
         self
     }
 
@@ -131,7 +141,10 @@ impl<'a> RetrievalPipeline<'a> {
         } else {
             0
         };
+        #[cfg(feature = "qdrant")]
         let qdrant_can_filter = self.qdrant.is_some();
+        #[cfg(not(feature = "qdrant"))]
+        let qdrant_can_filter = false;
         let dense_top_k = if source_filter.is_some()
             && !qdrant_can_filter
             && !self.vector_index.supports_source_filter()
@@ -218,6 +231,7 @@ impl<'a> RetrievalPipeline<'a> {
         top_k: usize,
         source_filter: Option<&SourceId>,
     ) -> Result<Vec<(ChunkId, f32)>> {
+        #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &self.qdrant {
             let local_results = self.local_dense_search(query_vec, top_k, source_filter);
             return match qdrant.search(query_vec, top_k, source_filter).await {
@@ -251,6 +265,7 @@ impl<'a> RetrievalPipeline<'a> {
             .search_filtered(query_vec, fallback_top_k, source_filter)
     }
 
+    #[cfg(feature = "qdrant")]
     fn valid_dense_hits(
         &self,
         hits: Vec<(ChunkId, f32)>,
@@ -267,6 +282,7 @@ impl<'a> RetrievalPipeline<'a> {
         Ok(valid)
     }
 
+    #[cfg(feature = "qdrant")]
     fn merge_preferred_dense_hits(
         &self,
         preferred_hits: Vec<(ChunkId, f32)>,
@@ -303,6 +319,7 @@ impl<'a> RetrievalPipeline<'a> {
         Ok(merged)
     }
 
+    #[cfg(feature = "qdrant")]
     fn append_next_valid_dense_hit<I>(
         &self,
         target: &mut Vec<(ChunkId, f32)>,
@@ -1286,10 +1303,13 @@ fn push_unique_evidence(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    #[cfg(feature = "qdrant")]
     use std::io::{Read, Write};
+    #[cfg(feature = "qdrant")]
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    #[cfg(feature = "qdrant")]
     use std::thread;
 
     use crate::index::hnsw::HnswIndex;
@@ -1369,6 +1389,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "qdrant")]
     fn qdrant_config(url: String) -> QdrantConfig {
         QdrantConfig {
             enabled: true,
@@ -1379,6 +1400,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "qdrant")]
     fn spawn_qdrant_search_response(
         status: u16,
         body: &'static str,
@@ -1394,6 +1416,7 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    #[cfg(feature = "qdrant")]
     fn read_request_line(stream: &mut TcpStream) -> String {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -1415,6 +1438,7 @@ mod tests {
             .to_string()
     }
 
+    #[cfg(feature = "qdrant")]
     fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
         let reason = if status == 200 { "OK" } else { "ERR" };
         write!(
@@ -1959,6 +1983,7 @@ mod tests {
         assert_eq!(results[0].evidence_units.len(), 1);
     }
 
+    #[cfg(feature = "qdrant")]
     #[tokio::test]
     async fn qdrant_search_failure_falls_back_to_local_dense_index() {
         let (qdrant_url, handle) =
@@ -1997,6 +2022,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "qdrant")]
     #[tokio::test]
     async fn qdrant_empty_success_fills_from_local_dense_index_with_source_filter() {
         let (qdrant_url, handle) =
@@ -2041,6 +2067,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "qdrant")]
     #[tokio::test]
     async fn qdrant_valid_success_prefers_remote_then_fills_from_local_dense_index() {
         let (qdrant_url, handle) = spawn_qdrant_search_response(
@@ -2094,6 +2121,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "qdrant")]
     #[tokio::test]
     async fn qdrant_stale_existing_hits_still_include_local_dense_evidence() {
         let (qdrant_url, handle) = spawn_qdrant_search_response(
@@ -2160,6 +2188,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "qdrant")]
     #[tokio::test]
     async fn qdrant_stale_or_malformed_success_fills_from_local_dense_index() {
         let (qdrant_url, handle) = spawn_qdrant_search_response(

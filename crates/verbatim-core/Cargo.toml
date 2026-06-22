@@ -8,6 +8,7 @@ license.workspace = true
 default = ["parser-pdf-oxide"]
 parser-pdf-oxide = ["dep:image", "dep:lopdf", "dep:pdf_oxide"]
 parser-pdfplumber = ["dep:image", "dep:lopdf", "dep:pdfplumber"]
+qdrant = []
 
 [dependencies]
 anyhow.workspace = true

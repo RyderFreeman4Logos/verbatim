@@ -16,6 +16,7 @@ use crate::image_limits::{
     ImageArtifactBudget, ImageArtifactLimitError, ImageArtifactLimitStage, ImageArtifactLimits,
 };
 use crate::index::hnsw::HnswIndex;
+#[cfg(feature = "qdrant")]
 use crate::index::qdrant::{records_from_store, QdrantClient};
 use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::parser;
@@ -41,6 +42,7 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     vision_model: Option<Box<dyn VisionModel>>,
     graph_extractor: Option<GraphExtractor>,
     graph_extraction_config: GraphExtractionConfig,
+    #[cfg(feature = "qdrant")]
     qdrant: Option<QdrantClient>,
     vision_caption_model: String,
     vision_caption_prompt_hash: String,
@@ -116,6 +118,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         } else {
             None
         };
+        #[cfg(feature = "qdrant")]
         let qdrant = QdrantClient::from_config(&config.qdrant);
 
         Ok(Self {
@@ -126,6 +129,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             vision_model,
             graph_extractor,
             graph_extraction_config,
+            #[cfg(feature = "qdrant")]
             qdrant,
             vision_caption_model,
             vision_caption_prompt_hash: vision_caption_prompt_hash(),
@@ -165,6 +169,7 @@ where
             vision_model: None,
             graph_extractor: None,
             graph_extraction_config: GraphExtractionConfig::default(),
+            #[cfg(feature = "qdrant")]
             qdrant: None,
             vision_caption_model: "vision-disabled".to_string(),
             vision_caption_prompt_hash: vision_caption_prompt_hash(),
@@ -194,7 +199,7 @@ where
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "qdrant"))]
     fn with_qdrant_client(mut self, qdrant: QdrantClient) -> Self {
         self.qdrant = Some(qdrant);
         self
@@ -236,6 +241,7 @@ where
             }
         };
         self.publish_committed_indexes(generation, staged, prepared)?;
+        #[cfg(feature = "qdrant")]
         self.sync_qdrant_delete_source(source_id).await;
         remove_source_image_artifacts(&self.data_dir, source_id).with_context(|| {
             format!(
@@ -379,6 +385,7 @@ where
             }
         };
         self.publish_committed_indexes(generation, staged, prepared)?;
+        #[cfg(feature = "qdrant")]
         self.sync_qdrant_source(source_id).await;
         cleanup_stale_source_image_artifacts(
             &self.data_dir,
@@ -462,6 +469,7 @@ where
             self.ingest_source(source_id).await?;
         }
         if force {
+            #[cfg(feature = "qdrant")]
             self.sync_qdrant_all().await;
         }
 
@@ -475,6 +483,7 @@ where
         self.store.replace_all_vector_documents(&prepared.vectors)?;
         self.lexical_index().rebuild_from_store(&self.store)?;
         self.publish_prepared_indexes(prepared)?;
+        #[cfg(feature = "qdrant")]
         self.sync_qdrant_all().await;
 
         Ok(())
@@ -548,6 +557,7 @@ where
         Ok(())
     }
 
+    #[cfg(feature = "qdrant")]
     async fn sync_qdrant_source(&self, source_id: &SourceId) {
         let Some(qdrant) = &self.qdrant else {
             return;
@@ -568,6 +578,7 @@ where
         }
     }
 
+    #[cfg(feature = "qdrant")]
     async fn sync_qdrant_delete_source(&self, source_id: &SourceId) {
         let Some(qdrant) = &self.qdrant else {
             return;
@@ -581,6 +592,7 @@ where
         }
     }
 
+    #[cfg(feature = "qdrant")]
     async fn sync_qdrant_all(&self) {
         let Some(qdrant) = &self.qdrant else {
             return;
@@ -1987,14 +1999,21 @@ mod tests {
     use async_trait::async_trait;
     use futures::StreamExt;
     use std::collections::VecDeque;
+    #[cfg(feature = "qdrant")]
     use std::io::{Read, Write};
+    #[cfg(feature = "qdrant")]
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    #[cfg(feature = "qdrant")]
     use std::thread;
 
-    use crate::config::{GraphConfig, QdrantConfig, RetrievalConfig};
+    #[cfg(feature = "qdrant")]
+    use crate::config::QdrantConfig;
+    use crate::config::{GraphConfig, RetrievalConfig};
     use crate::image_limits::ImageArtifactLimitError;
+    #[cfg(feature = "qdrant")]
+    use crate::index::qdrant::QdrantClient;
     use crate::provider::{
         ChatMessageContent, ChatModel, ChatRequest, ChatResponse, ChatStream, ImageDescribeRequest,
         ImageDescription, ProviderError, ProviderResult, TokenUsage, VisionModel,
@@ -2275,11 +2294,13 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[cfg(feature = "qdrant")]
     struct TestHttpRequest {
         line: String,
         body: String,
     }
 
+    #[cfg(feature = "qdrant")]
     fn qdrant_test_config(url: String) -> QdrantConfig {
         QdrantConfig {
             enabled: true,
@@ -2290,6 +2311,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "qdrant")]
     fn spawn_qdrant_server(
         responses: Vec<(u16, &'static str)>,
     ) -> (String, thread::JoinHandle<Vec<TestHttpRequest>>) {
@@ -2307,6 +2329,7 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    #[cfg(feature = "qdrant")]
     fn read_http_request(stream: &mut TcpStream) -> TestHttpRequest {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -2328,6 +2351,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "qdrant")]
     fn http_request_complete(buffer: &[u8]) -> bool {
         let text = String::from_utf8_lossy(buffer);
         let Some((head, body)) = text.split_once("\r\n\r\n") else {
@@ -2345,6 +2369,7 @@ mod tests {
         body.len() >= content_len
     }
 
+    #[cfg(feature = "qdrant")]
     fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
         let reason = if status == 200 { "OK" } else { "ERR" };
         write!(
@@ -3107,6 +3132,7 @@ model = "local-vision"
         assert_eq!(pipeline.hnsw().len(), 1);
     }
 
+    #[cfg(feature = "qdrant")]
     #[tokio::test]
     async fn remove_source_deletes_qdrant_points_by_source_after_commit() {
         let (qdrant_url, handle) = spawn_qdrant_server(vec![
@@ -3145,6 +3171,7 @@ model = "local-vision"
         assert_eq!(body["filter"]["must"][0]["match"]["value"], "src-1");
     }
 
+    #[cfg(feature = "qdrant")]
     #[tokio::test]
     async fn force_ingest_recreates_qdrant_collection_after_local_ingest() {
         let (qdrant_url, handle) = spawn_qdrant_server(vec![
