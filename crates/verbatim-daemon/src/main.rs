@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
 use std::io::Write;
@@ -23,10 +23,12 @@ use tower_http::cors::CorsLayer;
 use verbatim_core::api::{
     AddSourceRequest, AddSourceResponse, AskCitationEvent, AskErrorEvent, AskRequest, AskResponse,
     AskTokenEvent, CheckStaleResponse, CitationResponse, ErrorResponse, EvidenceResponse,
-    HealthResponse, ImageArtifactResponse, IngestResponse, SourceResponse, TaskCreatedResponse,
-    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
+    HealthResponse, ImageArtifactResponse, IngestResponse, RetrieveControlsResponse,
+    RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
+    SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest,
+    TaskSummaryResponse, TaskWaitEvent,
 };
-use verbatim_core::config::{self, Config};
+use verbatim_core::config::{self, Config, RerankConfig, RetrievalConfig};
 use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::{
     image_artifact_evidence_id, select_image_attachments, GenerationContext, Generator,
@@ -38,11 +40,12 @@ use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeli
 use verbatim_core::store::Store;
 use verbatim_core::task::{
     ask_request_metadata, ask_result_metadata, bounded_error, ingest_request_metadata,
-    ingest_result_metadata, PhaseTiming, TaskId, TaskKind,
+    ingest_result_metadata, retrieve_request_metadata, retrieve_result_metadata, PhaseTiming,
+    TaskId, TaskKind,
 };
 use verbatim_core::types::{
     CitationRef, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug,
-    RetrievalResult, SourceId,
+    RetrievalEvidenceRole, RetrievalResult, SourceId,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,6 +75,8 @@ const ASK_STREAM_EVENT_BUFFER: usize = 32;
 const TASK_WAIT_EVENT_BUFFER: usize = 16;
 const TASK_WAIT_EVENT_LIMIT: usize = 100;
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const FAST_RETRIEVAL_TOP_K: usize = 20;
+const DEFAULT_SNIPPET_CHARS: usize = 240;
 
 #[derive(Deserialize)]
 struct IngestQuery {
@@ -539,6 +544,30 @@ async fn submit_ask_task(
     spawn_ask_task(state, task_id.clone(), req);
     Ok(Json(TaskCreatedResponse { task_id: task_id.0 }))
 }
+
+async fn retrieve(
+    State(state): State<SharedState>,
+    Json(req): Json<RetrieveRequest>,
+) -> Result<Json<RetrieveResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let controls = resolve_retrieve_controls(&req, &state.config)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let task_id = create_persisted_task(
+        &state,
+        TaskKind::Retrieve,
+        retrieve_request_metadata(
+            &req.question,
+            req.source_id.as_deref(),
+            controls.limit,
+            controls.page_size,
+            controls.page,
+        ),
+    )
+    .await?;
+    execute_retrieve_task(state, task_id, req, controls)
+        .await
+        .map(Json)
+}
+
 async fn submit_ingest_task(
     State(state): State<SharedState>,
     Json(req): Json<TaskIngestRequest>,
@@ -654,6 +683,97 @@ async fn execute_ask_task(
         let _ = finish_task_failed(&state, &task_id, &error.error).await;
     }
     result
+}
+
+async fn execute_retrieve_task(
+    state: SharedState,
+    task_id: TaskId,
+    req: RetrieveRequest,
+    controls: EffectiveRetrieveControls,
+) -> Result<RetrieveResponse, (StatusCode, Json<ErrorResponse>)> {
+    let result = execute_retrieve_task_inner(Arc::clone(&state), &task_id, req, controls).await;
+    if let Err((_, Json(error))) = &result {
+        let _ = finish_task_failed(&state, &task_id, &error.error).await;
+    }
+    result
+}
+
+async fn execute_retrieve_task_inner(
+    state: SharedState,
+    task_id: &TaskId,
+    req: RetrieveRequest,
+    controls: EffectiveRetrieveControls,
+) -> Result<RetrieveResponse, (StatusCode, Json<ErrorResponse>)> {
+    ensure_task_started(&state, task_id).await?;
+    let question = req.question;
+    let source_filter = req.source_id.map(SourceId);
+    let embedding_profile_id = parse_embedding_profile_id(
+        req.embedding_profile_id.as_deref(),
+        &state.config.embedding.profile_id,
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+
+    let timing = PhaseTiming::start("retrieval");
+    let RetrievedContext {
+        results,
+        debug,
+        source_paths,
+    } = prepare_retrieve_context(
+        Arc::clone(&state),
+        &question,
+        source_filter.clone(),
+        &embedding_profile_id,
+        &controls,
+    )
+    .await?;
+    let retrieval_timing = timing.finish(serde_json::json!({
+        "result_count": results.len(),
+        "returned_results": page_len(
+            debug.final_evidence_pack.len(),
+            controls.limit,
+            controls.page_size,
+            controls.page,
+        ),
+        "rerank_enabled": controls.rerank_config.enabled,
+        "dense_top_k": controls.retrieval_config.dense_top_k,
+        "bm25_top_k": controls.retrieval_config.bm25_top_k,
+    }));
+    record_task_span(&state, task_id, retrieval_timing.clone()).await?;
+    record_task_event(
+        &state,
+        task_id,
+        "phase",
+        "context retrieval complete",
+        serde_json::json!({
+            "result_count": results.len(),
+            "rerank_enabled": controls.rerank_config.enabled,
+        }),
+    )
+    .await?;
+
+    let response = retrieve_response(RetrieveResponseInput {
+        task_id: task_id.clone(),
+        query: question,
+        source_filter,
+        embedding_profile_id,
+        controls,
+        results,
+        debug,
+        source_paths,
+        retrieval_ms: retrieval_timing.duration_ms,
+    });
+
+    finish_task_success(
+        &state,
+        task_id,
+        retrieve_result_metadata(
+            response.total_results,
+            response.returned_results,
+            response.controls.rerank_enabled,
+        ),
+    )
+    .await?;
+    Ok(response)
 }
 
 async fn execute_ask_task_inner(
@@ -867,6 +987,91 @@ fn spawn_ask_task(state: SharedState, task_id: TaskId, req: AskRequest) {
     });
 }
 
+#[derive(Debug, Clone)]
+struct EffectiveRetrieveControls {
+    limit: usize,
+    page_size: usize,
+    page: usize,
+    include_debug: bool,
+    include_locator: bool,
+    fast: bool,
+    retrieval_config: RetrievalConfig,
+    rerank_config: RerankConfig,
+}
+
+struct RetrievedContext {
+    results: Vec<RetrievalResult>,
+    debug: RetrievalDebug,
+    source_paths: HashMap<String, String>,
+}
+
+struct RetrieveResponseInput {
+    task_id: TaskId,
+    query: String,
+    source_filter: Option<SourceId>,
+    embedding_profile_id: EmbeddingProfileId,
+    controls: EffectiveRetrieveControls,
+    results: Vec<RetrievalResult>,
+    debug: RetrievalDebug,
+    source_paths: HashMap<String, String>,
+    retrieval_ms: u64,
+}
+
+fn resolve_retrieve_controls(
+    req: &RetrieveRequest,
+    config: &Config,
+) -> Result<EffectiveRetrieveControls> {
+    let mut retrieval_config = config.retrieval.clone();
+    let mut rerank_config = config.rerank.clone();
+
+    if req.fast {
+        retrieval_config.dense_top_k = FAST_RETRIEVAL_TOP_K;
+        retrieval_config.bm25_top_k = FAST_RETRIEVAL_TOP_K;
+        rerank_config.enabled = false;
+        rerank_config.top_n = 0;
+    }
+
+    if let Some(dense_top_k) = req.dense_top_k {
+        retrieval_config.dense_top_k = nonzero_control("dense_top_k", dense_top_k)?;
+    }
+    if let Some(bm25_top_k) = req.bm25_top_k {
+        retrieval_config.bm25_top_k = nonzero_control("bm25_top_k", bm25_top_k)?;
+    }
+    if let Some(rerank) = req.rerank {
+        rerank_config.enabled = rerank;
+        if rerank && rerank_config.top_n == 0 {
+            rerank_config.top_n = config.rerank.top_n;
+        }
+    }
+    if let Some(rerank_top_n) = req.rerank_top_n {
+        rerank_config.top_n = rerank_top_n;
+        if rerank_top_n == 0 {
+            rerank_config.enabled = false;
+        }
+    }
+
+    Ok(EffectiveRetrieveControls {
+        limit: nonzero_control("limit", req.limit.unwrap_or(config.retrieval.default_limit))?,
+        page_size: nonzero_control(
+            "page_size",
+            req.page_size.unwrap_or(config.retrieval.default_page_size),
+        )?,
+        page: nonzero_control("page", req.page.unwrap_or(1))?,
+        include_debug: req.include_debug,
+        include_locator: req.include_locator,
+        fast: req.fast,
+        retrieval_config,
+        rerank_config,
+    })
+}
+
+fn nonzero_control(name: &str, value: usize) -> Result<usize> {
+    if value == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
+}
+
 fn spawn_ingest_task(
     state: SharedState,
     task_id: TaskId,
@@ -1078,6 +1283,69 @@ fn parse_embedding_profile_id(
         .map_err(Into::into)
 }
 
+async fn prepare_retrieve_context(
+    state: SharedState,
+    question: &str,
+    source_filter: Option<SourceId>,
+    embedding_profile_id: &EmbeddingProfileId,
+    controls: &EffectiveRetrieveControls,
+) -> Result<RetrievedContext, (StatusCode, Json<ErrorResponse>)> {
+    let state2 = Arc::clone(&state);
+    let question2 = question.to_string();
+    let embedding_profile_id = embedding_profile_id.clone();
+    let controls = controls.clone();
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.select_embedding_profile(&embedding_profile_id)?;
+        let lexical_index = pipeline.lexical_index();
+        let mut retrieval = RetrievalPipeline::new_with_graph(
+            pipeline.vector_index(),
+            &lexical_index,
+            pipeline.store(),
+            &state2.embed_client,
+            &controls.retrieval_config,
+            &state2.config.graph,
+        )
+        .require_embedding_profile(&embedding_profile_id)
+        .with_qdrant_search(&state2.config.qdrant);
+        if let Some(reranker) = state2.reranker.as_ref() {
+            retrieval = retrieval.with_reranker(&controls.rerank_config, reranker);
+        }
+        let source_filter_ref = source_filter.as_ref();
+        let (mut results, mut debug) = runtime
+            .block_on(retrieval.search_filtered_with_debug(&question2, source_filter_ref))?;
+        if state2.config.graph.global_search.enabled && source_filter_ref.is_none() {
+            let global_results =
+                GraphRagService::new(pipeline.store(), &state2.config.graph.global_search)
+                    .global_search_results(&question2, None)?;
+            let mut debug_option = Some(debug);
+            prepend_global_results(&mut results, global_results, &mut debug_option);
+            debug = debug_option.unwrap_or_else(empty_retrieval_debug);
+        }
+        let source_paths = source_paths_for_results(&results, pipeline.store())?;
+        Ok::<_, anyhow::Error>(RetrievedContext {
+            results,
+            debug,
+            source_paths,
+        })
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+fn empty_retrieval_debug() -> RetrievalDebug {
+    RetrievalDebug {
+        bm25_hits: Vec::new(),
+        dense_hits: Vec::new(),
+        rrf_fused_hits: Vec::new(),
+        graph_expanded_hits: Vec::new(),
+        reranker: verbatim_core::types::RetrievalRerankDebug::disabled(),
+        final_evidence_pack: Vec::new(),
+    }
+}
+
 async fn prepare_generation_context(
     state: SharedState,
     question: &str,
@@ -1229,6 +1497,163 @@ fn checked_image_artifact_absolute_path(
     Ok(absolute_path)
 }
 
+fn source_paths_for_results(
+    results: &[RetrievalResult],
+    store: &Store,
+) -> Result<HashMap<String, String>> {
+    let mut paths = HashMap::new();
+    for result in results {
+        for evidence in &result.evidence_units {
+            if paths.contains_key(&evidence.source_id.0) {
+                continue;
+            }
+            if let Some(source) = store.get_source(&evidence.source_id)? {
+                paths.insert(
+                    evidence.source_id.0.clone(),
+                    source.path.display().to_string(),
+                );
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
+    let RetrieveResponseInput {
+        task_id,
+        query,
+        source_filter,
+        embedding_profile_id,
+        controls,
+        results,
+        debug,
+        source_paths,
+        retrieval_ms,
+    } = input;
+    let total_results = debug.final_evidence_pack.len();
+    let returned_results = page_len(
+        total_results,
+        controls.limit,
+        controls.page_size,
+        controls.page,
+    );
+    let results_page = retrieve_result_page(
+        &results,
+        &debug,
+        &source_paths,
+        controls.limit,
+        controls.page_size,
+        controls.page,
+        controls.include_locator,
+    );
+    let debug = controls.include_debug.then_some(debug);
+
+    RetrieveResponse {
+        task_id: task_id.0,
+        query,
+        source_id: source_filter.map(|source_id| source_id.0),
+        embedding_profile_id: embedding_profile_id.into_string(),
+        limit: controls.limit,
+        page_size: controls.page_size,
+        page: controls.page,
+        total_results,
+        returned_results,
+        controls: RetrieveControlsResponse {
+            fast: controls.fast,
+            rerank_enabled: controls.rerank_config.enabled,
+            dense_top_k: controls.retrieval_config.dense_top_k,
+            bm25_top_k: controls.retrieval_config.bm25_top_k,
+            rrf_k: controls.retrieval_config.rrf_k,
+            rerank_top_n: controls.rerank_config.top_n,
+        },
+        timings: vec![RetrieveTimingResponse {
+            phase: "retrieval".into(),
+            duration_ms: retrieval_ms,
+        }],
+        results: results_page,
+        debug,
+    }
+}
+
+fn page_len(total_results: usize, limit: usize, page_size: usize, page: usize) -> usize {
+    let end = total_results.min(limit);
+    let start = page_start(page, page_size);
+    if start >= end {
+        0
+    } else {
+        end.saturating_sub(start).min(page_size)
+    }
+}
+
+fn retrieve_result_page(
+    results: &[RetrievalResult],
+    debug: &RetrievalDebug,
+    source_paths: &HashMap<String, String>,
+    limit: usize,
+    page_size: usize,
+    page: usize,
+    include_locator: bool,
+) -> Vec<RetrieveResultResponse> {
+    let start = page_start(page, page_size);
+    let end = debug.final_evidence_pack.len().min(limit);
+    if start >= end {
+        return Vec::new();
+    }
+
+    debug
+        .final_evidence_pack
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(end - start)
+        .take(page_size)
+        .map(|(index, entry)| RetrieveResultResponse {
+            index,
+            rank: index + 1,
+            label: entry.label.clone(),
+            evidence_id: entry.evidence_id.0.clone(),
+            source_id: entry.source_id.0.clone(),
+            source_path: source_paths.get(&entry.source_id.0).cloned(),
+            chunk_id: entry.chunk_id.0.clone(),
+            kind: evidence_kind_name(entry.kind).to_string(),
+            role: retrieval_role_name(entry.role).to_string(),
+            score: entry.score,
+            locator: entry.locator.display.clone(),
+            structured_locator: include_locator.then(|| entry.locator.structured.clone()),
+            provenance: include_locator.then(|| entry.provenance.clone()),
+            derived_from: entry.derived_from.as_ref().map(|id| id.0.clone()),
+            snippet: evidence_snippet(results, &entry.evidence_id.0),
+        })
+        .collect()
+}
+
+fn page_start(page: usize, page_size: usize) -> usize {
+    page.saturating_sub(1).saturating_mul(page_size)
+}
+
+fn evidence_snippet(results: &[RetrievalResult], evidence_id: &str) -> String {
+    let text = results
+        .iter()
+        .flat_map(|result| &result.evidence_units)
+        .find(|evidence| evidence.id.0 == evidence_id)
+        .map(|evidence| evidence.text.as_str())
+        .unwrap_or_default();
+    compact_snippet(text, DEFAULT_SNIPPET_CHARS)
+}
+
+fn compact_snippet(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut snippet = String::new();
+    for (index, ch) in normalized.chars().enumerate() {
+        if index == max_chars {
+            snippet.push_str("...");
+            return snippet;
+        }
+        snippet.push(ch);
+    }
+    snippet
+}
+
 fn ensure_relative_image_artifact_path(relative_path: &FsPath) -> Result<()> {
     let components: Vec<Component<'_>> = relative_path.components().collect();
     match components.as_slice() {
@@ -1313,6 +1738,15 @@ fn citation_kind_name(citation: &CitationRef) -> &'static str {
         EvidenceKind::Image => "image_artifact",
         EvidenceKind::Generated if citation.derived_from.is_some() => "image_caption_generated",
         EvidenceKind::Generated => "generated",
+    }
+}
+
+fn retrieval_role_name(role: RetrievalEvidenceRole) -> &'static str {
+    match role {
+        RetrievalEvidenceRole::OriginalText => "original_text",
+        RetrievalEvidenceRole::ImageArtifact => "image_artifact",
+        RetrievalEvidenceRole::ImageCaptionGenerated => "image_caption_generated",
+        RetrievalEvidenceRole::Generated => "generated",
     }
 }
 
@@ -1431,10 +1865,7 @@ async fn run_daemon() -> Result<()> {
     let pipeline = IngestPipeline::new(&config, &data_dir)?;
     let generator = Generator::new(&config.chat, &config.verifier);
     let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
-    let reranker = config
-        .rerank
-        .enabled
-        .then(|| OpenAiCompatibleReranker::from_config(&config.rerank));
+    let reranker = Some(OpenAiCompatibleReranker::from_config(&config.rerank));
 
     let bind_addr = config.daemon.bind.clone();
 
@@ -1459,6 +1890,7 @@ async fn run_daemon() -> Result<()> {
         .route("/api/ingest/{id}", post(ingest_one))
         .route("/api/ask", post(ask))
         .route("/api/ask/stream", post(ask_stream))
+        .route("/api/retrieve", post(retrieve))
         .route("/api/tasks/ask", post(submit_ask_task))
         .route("/api/tasks/ingest", post(submit_ingest_task))
         .route("/api/tasks/{id}", get(show_task))
@@ -1486,6 +1918,7 @@ async fn run_daemon() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use verbatim_core::types::{
         Chunk, ChunkId, ChunkType, EvidenceUnit, RetrievalEvidenceRole, RetrievalProvenance,
         SourceLocator,
@@ -1627,6 +2060,102 @@ mod tests {
         assert_eq!(final_pack[1].result_rank, 2);
     }
 
+    #[test]
+    fn retrieve_response_pages_context_pack_without_full_locator_by_default() {
+        let results = vec![
+            test_retrieval_result(1, "chunk-1", "ev-1", EvidenceKind::Text),
+            test_retrieval_result(2, "chunk-2", "ev-2", EvidenceKind::Text),
+        ];
+        let mut debug = empty_retrieval_debug();
+        refresh_final_evidence_pack_debug(&mut debug, &results);
+
+        let response = retrieve_response(RetrieveResponseInput {
+            task_id: TaskId("task-1".into()),
+            query: "What is cited?".into(),
+            source_filter: Some(SourceId("src".into())),
+            embedding_profile_id: EmbeddingProfileId::default_profile(),
+            controls: EffectiveRetrieveControls {
+                limit: 2,
+                page_size: 1,
+                page: 2,
+                include_debug: false,
+                include_locator: false,
+                fast: false,
+                retrieval_config: RetrievalConfig::default(),
+                rerank_config: RerankConfig::default(),
+            },
+            results,
+            debug,
+            source_paths: HashMap::new(),
+            retrieval_ms: 7,
+        });
+
+        assert_eq!(response.total_results, 2);
+        assert_eq!(response.returned_results, 1);
+        assert_eq!(response.results[0].index, 1);
+        assert_eq!(response.results[0].evidence_id, "ev-2");
+        assert!(response.results[0].structured_locator.is_none());
+        assert!(response.results[0].provenance.is_none());
+        assert!(response.debug.is_none());
+    }
+
+    #[tokio::test]
+    async fn retrieve_handler_returns_context_pack_when_chat_is_disabled_and_unavailable() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("retrieve-chat-disabled");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Alpha retrieval evidence answers the context-only question.",
+        )
+        .unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        assert!(!config.chat.enabled);
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+
+        let state = Arc::new(AppState {
+            pipeline: std::sync::Mutex::new(pipeline),
+            generator: Generator::new(&config.chat, &config.verifier),
+            embed_client: OpenAiEmbeddingClient::new(&config.embedding),
+            reranker: Some(OpenAiCompatibleReranker::from_config(&config.rerank)),
+            config,
+            data_dir: test_dir.path().to_path_buf(),
+        });
+        let response = retrieve(
+            State(state),
+            Json(RetrieveRequest {
+                question: "Alpha context-only question?".into(),
+                source_id: Some(source_id.0.clone()),
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(1),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: false,
+                include_locator: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response.source_id.as_deref(), Some(source_id.0.as_str()));
+        assert_eq!(response.returned_results, 1);
+        assert_eq!(response.results[0].label, "E1");
+        assert!(response.results[0]
+            .snippet
+            .contains("Alpha retrieval evidence"));
+        assert!(model_server.embedding_requests() >= 2);
+        assert_eq!(model_server.chat_requests(), 0);
+    }
+
     fn test_retrieval_result(
         rank: usize,
         chunk_id: &str,
@@ -1669,6 +2198,157 @@ mod tests {
             evidence_units: vec![evidence],
             provenance: RetrievalProvenance::seed(rank, chunk_id, source_id),
         }
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let unique = format!(
+                "verbatim-daemon-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &FsPath {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct MockModelServer {
+        base_url: String,
+        embedding_requests: Arc<AtomicUsize>,
+        chat_requests: Arc<AtomicUsize>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockModelServer {
+        async fn start(dimension: usize) -> Self {
+            let state = MockModelState {
+                dimension,
+                embedding_requests: Arc::new(AtomicUsize::new(0)),
+                chat_requests: Arc::new(AtomicUsize::new(0)),
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route("/v1/embeddings", post(mock_embeddings))
+                .route("/v1/chat/completions", post(mock_forbidden_chat))
+                .with_state(state.clone());
+            let handle = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            Self {
+                base_url: format!("http://{addr}/v1"),
+                embedding_requests: state.embedding_requests,
+                chat_requests: state.chat_requests,
+                handle,
+            }
+        }
+
+        fn embedding_requests(&self) -> usize {
+            self.embedding_requests.load(Ordering::SeqCst)
+        }
+
+        fn chat_requests(&self) -> usize {
+            self.chat_requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for MockModelServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockModelState {
+        dimension: usize,
+        embedding_requests: Arc<AtomicUsize>,
+        chat_requests: Arc<AtomicUsize>,
+    }
+
+    async fn mock_embeddings(
+        State(state): State<MockModelState>,
+        Json(payload): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        state.embedding_requests.fetch_add(1, Ordering::SeqCst);
+        let input_count = payload
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        let embedding = {
+            let mut values = vec![0.0; state.dimension];
+            if let Some(first) = values.first_mut() {
+                *first = 1.0;
+            }
+            values
+        };
+        let data = (0..input_count)
+            .map(|_| serde_json::json!({ "embedding": embedding.clone() }))
+            .collect::<Vec<_>>();
+        Json(serde_json::json!({ "data": data }))
+    }
+
+    async fn mock_forbidden_chat(
+        State(state): State<MockModelState>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        state.chat_requests.fetch_add(1, Ordering::SeqCst);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "chat must not be called by retrieve" })),
+        )
+    }
+
+    fn retrieve_test_config(model_base_url: &str) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "embedding": {
+                "base_url": model_base_url,
+                "model": "test-embedding",
+                "dimension": 3,
+                "normalize": false,
+                "query_instruction": "",
+                "document_instruction": "",
+                "batch_size": 16,
+                "timeout_seconds": 1
+            },
+            "retrieval": {
+                "dense_top_k": 4,
+                "bm25_top_k": 4,
+                "rrf_k": 60,
+                "default_limit": 3,
+                "default_page_size": 1
+            },
+            "context": {
+                "enabled": false
+            },
+            "chat": {
+                "enabled": false,
+                "base_url": model_base_url,
+                "model": "chat-must-not-be-called",
+                "timeout_seconds": 1
+            },
+            "verifier": {
+                "enabled": false
+            }
+        }))
+        .unwrap()
     }
 
     #[tokio::test]

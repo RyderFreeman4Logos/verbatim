@@ -47,6 +47,7 @@ impl Default for TaskId {
 pub enum TaskKind {
     Ask,
     Ingest,
+    Retrieve,
 }
 
 impl TaskKind {
@@ -54,6 +55,7 @@ impl TaskKind {
         match self {
             Self::Ask => "ask",
             Self::Ingest => "ingest",
+            Self::Retrieve => "retrieve",
         }
     }
 
@@ -61,6 +63,7 @@ impl TaskKind {
         match value {
             "ask" => Some(Self::Ask),
             "ingest" => Some(Self::Ingest),
+            "retrieve" => Some(Self::Retrieve),
             _ => None,
         }
     }
@@ -196,6 +199,23 @@ pub fn ask_request_metadata(
     }))
 }
 
+pub fn retrieve_request_metadata(
+    question: &str,
+    source_id: Option<&str>,
+    limit: usize,
+    page_size: usize,
+    page: usize,
+) -> Value {
+    bounded_json(json!({
+        "question_chars": question.chars().count(),
+        "question_sha256": hex_sha256(question.as_bytes()),
+        "source_id": source_id,
+        "limit": limit,
+        "page_size": page_size,
+        "page": page,
+    }))
+}
+
 pub fn ask_result_metadata(
     answer: &str,
     citation_count: usize,
@@ -208,6 +228,18 @@ pub fn ask_result_metadata(
         "citation_count": citation_count,
         "verified": verified,
         "retrieval_included": retrieval_included,
+    }))
+}
+
+pub fn retrieve_result_metadata(
+    total_results: usize,
+    returned_results: usize,
+    rerank_enabled: bool,
+) -> Value {
+    bounded_json(json!({
+        "total_results": total_results,
+        "returned_results": returned_results,
+        "rerank_enabled": rerank_enabled,
     }))
 }
 
@@ -316,8 +348,9 @@ mod tests {
     fn ask_metadata_does_not_store_raw_question_or_answer() {
         let question = "What is the secret launch password?";
         let request = ask_request_metadata(question, Some("src-1"), true);
+        let retrieve = retrieve_request_metadata(question, Some("src-1"), 12, 1, 1);
         let result = ask_result_metadata("Raw answer text [E1].", 1, true, false);
-        let encoded = serde_json::to_string(&(request, result)).unwrap();
+        let encoded = serde_json::to_string(&(request, retrieve, result)).unwrap();
 
         assert!(encoded.contains("question_sha256"));
         assert!(encoded.contains("answer_sha256"));

@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use serde_json::Value;
 use verbatim_core::api::{
     AskResponse, CheckStaleResponse, CitationResponse, ConfigResponse, EvidenceResponse,
-    HealthResponse, IngestResponse, SourceResponse, TaskCreatedResponse,
+    HealthResponse, IngestResponse, RetrieveResponse, SourceResponse, TaskCreatedResponse,
 };
 use verbatim_core::task::{TaskEvent, TaskSpan, TaskStatus, TaskSummary};
 use verbatim_core::types::RetrievalDebug;
@@ -231,6 +231,80 @@ where
     }
 
     Ok(())
+}
+
+pub fn write_retrieve_response<W>(
+    writer: &mut W,
+    response: &RetrieveResponse,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Context pack: {}", response.task_id)?;
+    writeln!(writer, "  query: {}", response.query)?;
+    if let Some(source_id) = &response.source_id {
+        writeln!(writer, "  source_id: {source_id}")?;
+    }
+    writeln!(
+        writer,
+        "  page: {} page_size={} limit={} total={} returned={}",
+        response.page,
+        response.page_size,
+        response.limit,
+        response.total_results,
+        response.returned_results
+    )?;
+    writeln!(
+        writer,
+        "  controls: fast={} rerank={} dense_top_k={} bm25_top_k={} rerank_top_n={}",
+        response.controls.fast,
+        response.controls.rerank_enabled,
+        response.controls.dense_top_k,
+        response.controls.bm25_top_k,
+        response.controls.rerank_top_n
+    )?;
+    for timing in &response.timings {
+        writeln!(
+            writer,
+            "  timing: {}={}ms",
+            timing.phase, timing.duration_ms
+        )?;
+    }
+
+    if response.results.is_empty() {
+        return writeln!(writer, "No retrieval results on this page.");
+    }
+
+    writeln!(writer)?;
+    writeln!(writer, "Results:")?;
+    for result in &response.results {
+        writeln!(
+            writer,
+            "  [{}] {} score={:.4} evidence={} kind={} role={} source={}",
+            result.index,
+            result.label,
+            result.score,
+            result.evidence_id,
+            result.kind,
+            result.role,
+            result.source_id
+        )?;
+        if let Some(source_path) = &result.source_path {
+            writeln!(writer, "      source_path: {source_path}")?;
+        }
+        writeln!(writer, "      locator: {}", result.locator)?;
+        writeln!(writer, "      snippet: {}", result.snippet)?;
+    }
+
+    Ok(())
+}
+
+pub fn write_retrieve_json<W>(writer: &mut W, response: &RetrieveResponse) -> std::io::Result<()>
+where
+    W: Write,
+{
+    serde_json::to_writer_pretty(&mut *writer, response).map_err(io::Error::other)?;
+    writeln!(writer)
 }
 
 pub fn write_citations<W>(writer: &mut W, citations: &[CitationResponse]) -> std::io::Result<()>

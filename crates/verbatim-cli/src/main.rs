@@ -2,8 +2,8 @@ use std::env;
 use std::io::Write;
 use std::process::ExitCode;
 
-use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
-use verbatim_core::api::AskRequest;
+use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use verbatim_core::api::{AskRequest, RetrieveRequest};
 
 mod client;
 mod local;
@@ -88,6 +88,24 @@ fn clap_exit_code(error: &clap::Error) -> u8 {
     }
 }
 
+fn rerank_override(rerank: bool, no_rerank: bool) -> Option<bool> {
+    match (rerank, no_rerank) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("must be a positive integer: {error}"))?;
+    if parsed == 0 {
+        return Err("must be greater than zero".into());
+    }
+    Ok(parsed)
+}
+
 fn dispatch<W, C, L>(cli: Cli, stdout: &mut W, client: &C, local: &L) -> Result<u8, CliError>
 where
     W: Write,
@@ -141,6 +159,46 @@ where
             } else {
                 client.ask(&request, stdout)?;
                 writeln!(stdout)?;
+            }
+            Ok(0)
+        }
+        Commands::Retrieve {
+            question,
+            source_id,
+            embedding_profile,
+            limit,
+            page_size,
+            page,
+            fast,
+            rerank,
+            no_rerank,
+            dense_top_k,
+            bm25_top_k,
+            rerank_top_n,
+            show_debug,
+            show_locator,
+            format,
+        } => {
+            let include_locator = show_locator || format == RetrieveFormat::Json;
+            let request = RetrieveRequest {
+                question: question.join(" "),
+                source_id,
+                embedding_profile_id: embedding_profile,
+                limit,
+                page_size,
+                page,
+                fast,
+                rerank: rerank_override(rerank, no_rerank),
+                dense_top_k,
+                bm25_top_k,
+                rerank_top_n,
+                include_debug: show_debug,
+                include_locator,
+            };
+            let response = client.retrieve(&request)?;
+            match format {
+                RetrieveFormat::Text => render::write_retrieve_response(stdout, &response)?,
+                RetrieveFormat::Json => render::write_retrieve_json(stdout, &response)?,
             }
             Ok(0)
         }
@@ -299,7 +357,7 @@ enum Commands {
         #[arg(long)]
         background: bool,
     },
-    /// Ask a question and stream the answer from the daemon.
+    /// Generate an answer through the configured chat model and stream it.
     Ask {
         /// Restrict retrieval to one source.
         #[arg(short = 's', long = "source-id")]
@@ -313,6 +371,54 @@ enum Commands {
         /// Queue ask as a persistent daemon task and return immediately.
         #[arg(long)]
         background: bool,
+        /// Question text.
+        #[arg(required = true, num_args = 1..)]
+        question: Vec<String>,
+    },
+    /// Retrieve a compact context/evidence pack without invoking chat generation.
+    Retrieve {
+        /// Restrict retrieval to one source.
+        #[arg(short = 's', long = "source-id")]
+        source_id: Option<String>,
+        /// Use this embedding profile for retrieval.
+        #[arg(long = "embedding-profile")]
+        embedding_profile: Option<String>,
+        /// Maximum evidence/context entries to consider before pagination.
+        #[arg(long, value_parser = parse_nonzero_usize)]
+        limit: Option<usize>,
+        /// Evidence/context entries per page. Use 1 for agent-sized pages.
+        #[arg(long, value_parser = parse_nonzero_usize)]
+        page_size: Option<usize>,
+        /// 1-based page number.
+        #[arg(long, value_parser = parse_nonzero_usize)]
+        page: Option<usize>,
+        /// Use a faster retrieval preset: lower top-k and no rerank unless overridden.
+        #[arg(long)]
+        fast: bool,
+        /// Enable reranking for this request even if the config default is off.
+        #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_rerank")]
+        rerank: bool,
+        /// Disable reranking for this request even if the config default is on.
+        #[arg(long = "no-rerank", action = ArgAction::SetTrue)]
+        no_rerank: bool,
+        /// Override dense vector candidate count for this request.
+        #[arg(long = "dense-top-k", value_parser = parse_nonzero_usize)]
+        dense_top_k: Option<usize>,
+        /// Override BM25 candidate count for this request.
+        #[arg(long = "bm25-top-k", value_parser = parse_nonzero_usize)]
+        bm25_top_k: Option<usize>,
+        /// Override reranker top-n. Use 0 to disable reranking.
+        #[arg(long = "rerank-top-n")]
+        rerank_top_n: Option<usize>,
+        /// Include retrieval stage debug metadata in the response.
+        #[arg(long = "show-debug")]
+        show_debug: bool,
+        /// Include structured locator/provenance fields in the response.
+        #[arg(long = "show-locator")]
+        show_locator: bool,
+        /// Output format. JSON includes structured locator/provenance fields.
+        #[arg(long, value_enum, default_value = "text")]
+        format: RetrieveFormat,
         /// Question text.
         #[arg(required = true, num_args = 1..)]
         question: Vec<String>,
@@ -416,6 +522,12 @@ enum TaskCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RetrieveFormat {
+    Text,
+    Json,
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -424,10 +536,12 @@ mod tests {
     use serde_json::Value;
     use verbatim_core::api::{
         AddSourceResponse, CheckStaleResponse, CitationResponse, ConfigResponse, EvidenceResponse,
-        HealthResponse, IngestResponse, SourceResponse, TaskCreatedResponse, TaskEventsResponse,
-        TaskSummaryResponse,
+        HealthResponse, IngestResponse, RetrieveControlsResponse, RetrieveRequest,
+        RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
+        TaskCreatedResponse, TaskEventsResponse, TaskSummaryResponse,
     };
     use verbatim_core::task::{TaskEvent, TaskId, TaskKind, TaskSpan, TaskStatus, TaskSummary};
+    use verbatim_core::types::SourceLocator;
 
     use super::*;
 
@@ -452,6 +566,7 @@ mod tests {
             &["source", "check", "--help"],
             &["ingest", "--help"],
             &["ask", "--help"],
+            &["retrieve", "--help"],
             &["evidence", "--help"],
             &["config", "--help"],
             &["config", "init", "--help"],
@@ -608,6 +723,85 @@ mod tests {
     }
 
     #[test]
+    fn retrieve_context_pack_uses_retrieve_api_not_ask_generation() {
+        let (code, stdout, stderr, client, _) = run_mock([
+            "retrieve",
+            "--page-size",
+            "1",
+            "--page",
+            "2",
+            "--limit",
+            "3",
+            "--fast",
+            "--no-rerank",
+            "-s",
+            "src-1",
+            "What",
+            "is",
+            "cited?",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(client.calls.borrow().as_slice(), ["retrieve"]);
+        assert!(client.last_ask.borrow().is_none());
+        assert_eq!(
+            client.last_retrieve.borrow().as_ref().unwrap(),
+            &RetrieveRequest {
+                question: "What is cited?".into(),
+                source_id: Some("src-1".into()),
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(2),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: false,
+                include_locator: false,
+            }
+        );
+        assert!(stdout.contains("Context pack: task-1"));
+        assert!(stdout.contains("[0] E1 score=0.0310"));
+        assert!(stdout.contains("snippet: compact cited text"));
+    }
+
+    #[test]
+    fn retrieve_json_requests_structured_locator_and_debug() {
+        let (code, stdout, stderr, client, _) = run_mock([
+            "retrieve",
+            "--format",
+            "json",
+            "--show-debug",
+            "--rerank",
+            "--dense-top-k",
+            "5",
+            "--bm25-top-k",
+            "7",
+            "--rerank-top-n",
+            "2",
+            "What",
+            "is",
+            "cited?",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        let request = client.last_retrieve.borrow();
+        let request = request.as_ref().unwrap();
+        assert_eq!(request.rerank, Some(true));
+        assert_eq!(request.dense_top_k, Some(5));
+        assert_eq!(request.bm25_top_k, Some(7));
+        assert_eq!(request.rerank_top_n, Some(2));
+        assert!(request.include_debug);
+        assert!(request.include_locator);
+        assert!(stdout.contains("\"structured_locator\""));
+        assert!(stdout.contains("\"debug\""));
+    }
+
+    #[test]
     fn embedding_profile_flags_are_plumbed() {
         let (code, _, stderr, client, _) = run_mock([
             "ingest",
@@ -755,6 +949,7 @@ mod tests {
     struct MockDaemonClient {
         calls: RefCell<Vec<String>>,
         last_ask: RefCell<Option<AskRequest>>,
+        last_retrieve: RefCell<Option<RetrieveRequest>>,
         list_error: Option<CliError>,
         health_error: Option<CliError>,
     }
@@ -879,6 +1074,12 @@ mod tests {
             Ok(())
         }
 
+        fn retrieve(&self, request: &RetrieveRequest) -> client::CliResult<RetrieveResponse> {
+            self.calls.borrow_mut().push("retrieve".into());
+            self.last_retrieve.replace(Some(request.clone()));
+            Ok(sample_retrieve_response(request))
+        }
+
         fn get_evidence(&self, evidence_id: &str) -> client::CliResult<EvidenceResponse> {
             self.calls
                 .borrow_mut()
@@ -975,6 +1176,61 @@ mod tests {
         }
     }
 
+    fn sample_retrieve_response(request: &RetrieveRequest) -> RetrieveResponse {
+        RetrieveResponse {
+            task_id: "task-1".into(),
+            query: request.question.clone(),
+            source_id: request.source_id.clone(),
+            embedding_profile_id: request
+                .embedding_profile_id
+                .clone()
+                .unwrap_or_else(|| "default".into()),
+            limit: request.limit.unwrap_or(12),
+            page_size: request.page_size.unwrap_or(1),
+            page: request.page.unwrap_or(1),
+            total_results: 1,
+            returned_results: 1,
+            controls: RetrieveControlsResponse {
+                fast: request.fast,
+                rerank_enabled: request.rerank.unwrap_or(false),
+                dense_top_k: request.dense_top_k.unwrap_or(20),
+                bm25_top_k: request.bm25_top_k.unwrap_or(20),
+                rrf_k: 60,
+                rerank_top_n: request.rerank_top_n.unwrap_or(0),
+            },
+            timings: vec![RetrieveTimingResponse {
+                phase: "retrieval".into(),
+                duration_ms: 7,
+            }],
+            results: vec![RetrieveResultResponse {
+                index: 0,
+                rank: 1,
+                label: "E1".into(),
+                evidence_id: "ev-1".into(),
+                source_id: "src-1".into(),
+                source_path: Some("/tmp/doc.md".into()),
+                chunk_id: "chunk-1".into(),
+                kind: "text".into(),
+                role: "original_text".into(),
+                score: 0.031,
+                locator: "/tmp/doc.md L1".into(),
+                structured_locator: request.include_locator.then(|| SourceLocator::Document {
+                    path_or_url: "/tmp/doc.md".into(),
+                    line_start: 1,
+                    line_end: None,
+                }),
+                provenance: None,
+                derived_from: None,
+                snippet: "compact cited text".into(),
+            }],
+            debug: request.include_debug.then(sample_typed_debug),
+        }
+    }
+
+    fn sample_typed_debug() -> verbatim_core::types::RetrievalDebug {
+        serde_json::from_value(sample_debug_json()).unwrap()
+    }
+
     fn sample_task_response(status: TaskStatus) -> TaskSummaryResponse {
         TaskSummaryResponse {
             task: TaskSummary {
@@ -1051,11 +1307,30 @@ mod tests {
             "final_evidence_pack": [
                 {
                     "label": "E1",
+                    "result_rank": 1,
                     "chunk_id": "chunk-1",
+                    "score": 0.03,
                     "evidence_id": "ev-1",
+                    "source_id": "src-1",
                     "role": "original_text",
+                    "kind": "Text",
                     "locator": {
-                        "display": "PDF p.1 para.1"
+                        "display": "PDF p.1 para.1",
+                        "structured": {
+                            "type": "Document",
+                            "path_or_url": "/tmp/doc.md",
+                            "line_start": 1,
+                            "line_end": null
+                        }
+                    },
+                    "provenance": {
+                        "origin": "seed",
+                        "result_rank": 1,
+                        "seed_rank": 1,
+                        "seed_chunk_id": "chunk-1",
+                        "seed_source_id": "src-1",
+                        "hop_distance": 0,
+                        "graph_path": []
                     }
                 }
             ]
