@@ -47,6 +47,10 @@ pub struct TaskIngestRequest {
     pub source_id: Option<String>,
     #[serde(default)]
     pub force: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_profile_id: Option<String>,
+    #[serde(default)]
+    pub vectors_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +81,8 @@ pub struct AskRequest {
     pub question: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_profile_id: Option<String>,
     #[serde(default)]
     pub show_retrieval: bool,
 }

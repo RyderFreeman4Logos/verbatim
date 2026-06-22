@@ -9,8 +9,8 @@ use crate::provider::ProviderError;
 use crate::store::Store;
 use crate::traits::{EmbeddingClient, LexicalIndex, Reranker, VectorIndex};
 use crate::types::{
-    Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit,
-    GraphExpansionStep, GraphNodeId, GraphNodeKind, GraphTraversalDirection, ImageId,
+    Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
+    EvidenceUnit, GraphExpansionStep, GraphNodeId, GraphNodeKind, GraphTraversalDirection, ImageId,
     RetrievalDebug, RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalFusedHit,
     RetrievalGraphExpansionDebug, RetrievalLocatorDebug, RetrievalProvenance, RetrievalRerankDebug,
     RetrievalRerankScore, RetrievalResult, RetrievalStageHit, SourceId, SourceLocator,
@@ -29,6 +29,7 @@ pub struct RetrievalPipeline<'a> {
     graph_config: Option<&'a GraphConfig>,
     rerank_config: Option<&'a RerankConfig>,
     reranker: Option<&'a dyn Reranker>,
+    required_profile_id: Option<EmbeddingProfileId>,
     #[cfg(feature = "qdrant")]
     qdrant: Option<QdrantClient>,
 }
@@ -50,6 +51,7 @@ impl<'a> RetrievalPipeline<'a> {
             graph_config: None,
             rerank_config: None,
             reranker: None,
+            required_profile_id: None,
             #[cfg(feature = "qdrant")]
             qdrant: None,
         }
@@ -72,9 +74,15 @@ impl<'a> RetrievalPipeline<'a> {
             graph_config: Some(graph_config),
             rerank_config: None,
             reranker: None,
+            required_profile_id: None,
             #[cfg(feature = "qdrant")]
             qdrant: None,
         }
+    }
+
+    pub fn require_embedding_profile(mut self, profile_id: &EmbeddingProfileId) -> Self {
+        self.required_profile_id = Some(profile_id.clone());
+        self
     }
 
     pub fn with_reranker(mut self, config: &'a RerankConfig, reranker: &'a dyn Reranker) -> Self {
@@ -127,6 +135,7 @@ impl<'a> RetrievalPipeline<'a> {
         source_filter: Option<&SourceId>,
         include_debug: bool,
     ) -> Result<RetrievalSearchOutput> {
+        self.ensure_required_profile_vectors(source_filter)?;
         let query_text = self.embed_client.prepare_query(query);
         let query_vec = self
             .embed_client
@@ -225,6 +234,29 @@ impl<'a> RetrievalPipeline<'a> {
         Ok(RetrievalSearchOutput { results, debug })
     }
 
+    fn ensure_required_profile_vectors(&self, source_filter: Option<&SourceId>) -> Result<()> {
+        let Some(profile_id) = &self.required_profile_id else {
+            return Ok(());
+        };
+        let vector_count = self
+            .store
+            .count_vector_documents_for_profile(profile_id, source_filter)?;
+        if vector_count > 0 {
+            return Ok(());
+        }
+        let scope = source_filter
+            .map(|source_id| format!(" for source '{}'", source_id.0))
+            .unwrap_or_default();
+        Err(anyhow!(
+            "embedding profile '{}' has no vectors{scope}; build it with `verbatim ingest{} --embedding-profile {} --vectors-only` before asking, or request an explicit auto-build path when supported",
+            profile_id,
+            source_filter
+                .map(|source_id| format!(" {}", source_id.0))
+                .unwrap_or_default(),
+            profile_id,
+        ))
+    }
+
     async fn dense_search(
         &self,
         query_vec: &[f32],
@@ -234,7 +266,18 @@ impl<'a> RetrievalPipeline<'a> {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &self.qdrant {
             let local_results = self.local_dense_search(query_vec, top_k, source_filter);
-            return match qdrant.search(query_vec, top_k, source_filter).await {
+            let default_profile_id;
+            let profile_id = match &self.required_profile_id {
+                Some(profile_id) => profile_id,
+                None => {
+                    default_profile_id = EmbeddingProfileId::default_profile();
+                    &default_profile_id
+                }
+            };
+            return match qdrant
+                .search(profile_id, query_vec, top_k, source_filter)
+                .await
+            {
                 Ok(results) => {
                     self.merge_preferred_dense_hits(results, local_results, top_k, source_filter)
                 }
@@ -1981,6 +2024,37 @@ mod tests {
         assert_eq!(results[0].chunk_id.0, "chunk-beta");
         assert_eq!(results[0].chunk.source_id, second.id);
         assert_eq!(results[0].evidence_units.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn requested_profile_without_vectors_fails_clearly_before_bm25_fallback() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-missing-profile");
+        insert_child(&store, &source, "chunk-alpha", "alpha content");
+        let vector_index = StaticVectorIndex::new(Vec::new());
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let config = RetrievalConfig {
+            dense_top_k: 1,
+            bm25_top_k: 10,
+            rrf_k: 60,
+        };
+        let profile_id = EmbeddingProfileId::new("alt").unwrap();
+        let pipeline = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &config,
+        )
+        .require_embedding_profile(&profile_id);
+
+        let error = pipeline.search("alpha").await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("embedding profile 'alt' has no vectors"));
+        assert!(error.to_string().contains("--vectors-only"));
     }
 
     #[cfg(feature = "qdrant")]

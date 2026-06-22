@@ -17,18 +17,19 @@ use crate::image_limits::{
 };
 use crate::index::hnsw::HnswIndex;
 #[cfg(feature = "qdrant")]
-use crate::index::qdrant::{records_from_store, QdrantClient};
+use crate::index::qdrant::{records_from_store_for_profile, QdrantClient};
 use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
-use crate::store::{SourceContentsReplacement, Store};
+use crate::store::{EmbeddingProfileConfig, SourceContentsReplacement, Store};
 use crate::task::{PhaseTiming, TaskId};
 use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
 use crate::types::{
-    hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit,
-    GraphEdge, GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, ImageArtifact, ImageId,
-    ParsedImageArtifact, Source, SourceId, SourceLocator, SourceStatus,
+    hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
+    EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, ImageArtifact,
+    ImageId, ParsedImageArtifact, Source, SourceEmbeddingStatus, SourceId, SourceLocator,
+    SourceStatus,
 };
 use crate::vision_caption::{
     caption_derived_evidence, request_image_caption, vision_caption_prompt_hash, CaptionAttempt,
@@ -38,6 +39,9 @@ use crate::vision_caption::{
 pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     store: Store,
     hnsw: HnswIndex,
+    loaded_profile_id: EmbeddingProfileId,
+    active_profile_id: EmbeddingProfileId,
+    embedding_profile_spec: EmbeddingProfileSpec,
     embed_client: E,
     context_gen: Option<ContextGenerator>,
     vision_model: Option<Box<dyn VisionModel>>,
@@ -54,6 +58,29 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
 struct PreparedIndexes {
     hnsw: HnswIndex,
     vectors: Vec<VectorDocument>,
+}
+
+#[derive(Debug, Clone)]
+struct EmbeddingProfileSpec {
+    provider: String,
+    model: String,
+    dimension: usize,
+    normalize: bool,
+    query_instruction: String,
+    document_instruction: String,
+}
+
+impl EmbeddingProfileSpec {
+    fn as_store_config(&self) -> EmbeddingProfileConfig<'_> {
+        EmbeddingProfileConfig {
+            provider: &self.provider,
+            model: &self.model,
+            dimension: self.dimension,
+            normalize: self.normalize,
+            query_instruction: &self.query_instruction,
+            document_instruction: &self.document_instruction,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -103,9 +130,22 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         let store = Store::new(&db_path)?;
         SqliteFtsIndex::new(&store).rebuild_from_store(&store)?;
 
-        let hnsw = load_published_vector_index(data_dir, &store)?;
-
         let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+        let active_profile_id = config.embedding.profile_id.clone();
+        let embedding_profile_spec = EmbeddingProfileSpec {
+            provider: config.embedding.provider.clone(),
+            model: config.embedding.model.clone(),
+            dimension: config.embedding.dimension,
+            normalize: config.embedding.normalize,
+            query_instruction: config.embedding.query_instruction.clone(),
+            document_instruction: config.embedding.document_instruction.clone(),
+        };
+        store.ensure_embedding_profile(
+            &active_profile_id,
+            embedding_profile_spec.as_store_config(),
+        )?;
+
+        let hnsw = load_published_vector_index(data_dir, &store, &active_profile_id)?;
 
         let context_gen = if config.context.enabled {
             Some(ContextGenerator::new(&config.chat))
@@ -125,6 +165,9 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         Ok(Self {
             store,
             hnsw,
+            loaded_profile_id: active_profile_id.clone(),
+            active_profile_id,
+            embedding_profile_spec,
             embed_client,
             context_gen,
             vision_model,
@@ -152,19 +195,61 @@ where
         &self.hnsw
     }
 
+    pub fn active_embedding_profile_id(&self) -> &EmbeddingProfileId {
+        &self.active_profile_id
+    }
+
     pub fn vector_index(&self) -> &dyn VectorIndex {
         &self.hnsw
+    }
+
+    pub fn vector_index_for_profile(
+        &mut self,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<&dyn VectorIndex> {
+        self.select_embedding_profile(profile_id)?;
+        Ok(&self.hnsw)
+    }
+
+    pub fn select_embedding_profile(&mut self, profile_id: &EmbeddingProfileId) -> Result<()> {
+        self.ensure_embedding_profile(profile_id)?;
+        if self.loaded_profile_id == *profile_id {
+            return Ok(());
+        }
+        self.hnsw = load_published_vector_index(&self.data_dir, &self.store, profile_id)?;
+        self.loaded_profile_id = profile_id.clone();
+        Ok(())
     }
 
     pub fn lexical_index(&self) -> SqliteFtsIndex<'_> {
         SqliteFtsIndex::new(&self.store)
     }
 
+    fn ensure_embedding_profile(&self, profile_id: &EmbeddingProfileId) -> Result<()> {
+        self.store
+            .ensure_embedding_profile(profile_id, self.embedding_profile_spec.as_store_config())
+    }
+
     #[cfg(test)]
     fn from_parts(store: Store, hnsw: HnswIndex, embed_client: E, data_dir: PathBuf) -> Self {
+        let active_profile_id = EmbeddingProfileId::default_profile();
+        let embedding_profile_spec = EmbeddingProfileSpec {
+            provider: "test".to_string(),
+            model: "test-embedding".to_string(),
+            dimension: embed_client.dimension(),
+            normalize: true,
+            query_instruction: String::new(),
+            document_instruction: String::new(),
+        };
+        store
+            .ensure_embedding_profile(&active_profile_id, embedding_profile_spec.as_store_config())
+            .unwrap();
         Self {
             store,
             hnsw,
+            loaded_profile_id: active_profile_id.clone(),
+            active_profile_id,
+            embedding_profile_spec,
             embed_client,
             context_gen: None,
             vision_model: None,
@@ -228,20 +313,27 @@ where
         self.store
             .get_source(source_id)?
             .with_context(|| format!("source not found: {}", source_id.0))?;
-        let child_chunks = self.child_chunks_without_source(source_id)?;
-        let prepared = self.prepare_indexes_for_chunks(&child_chunks).await?;
-        let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
-        let generation = match self
+        let active_profile_id = self.active_profile_id.clone();
+        let remaining_vectors = self
             .store
-            .remove_source_and_replace_vectors(source_id, &prepared.vectors)
-        {
+            .list_vector_documents_for_profile(&active_profile_id)?
+            .into_iter()
+            .filter(|document| document.source_id != *source_id)
+            .collect::<Vec<_>>();
+        let prepared = self.prepare_indexes_from_vectors(remaining_vectors)?;
+        let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let generation = match self.store.remove_source_and_replace_vectors_for_profile(
+            &active_profile_id,
+            source_id,
+            &prepared.vectors,
+        ) {
             Ok(generation) => generation,
             Err(err) => {
                 let _ = remove_dir_if_exists(&staged);
                 return Err(err);
             }
         };
-        self.publish_committed_indexes(generation, staged, prepared)?;
+        self.publish_committed_indexes(&active_profile_id, generation, staged, prepared)?;
         #[cfg(feature = "qdrant")]
         self.sync_qdrant_delete_source(source_id).await;
         remove_source_image_artifacts(&self.data_dir, source_id).with_context(|| {
@@ -409,15 +501,16 @@ where
             }),
         );
 
-        let mut child_chunks = self.child_chunks_without_source(source_id)?;
-        child_chunks.extend(
-            chunks
-                .iter()
-                .filter(|chunk| chunk.chunk_type == ChunkType::Child)
-                .cloned(),
-        );
+        let child_chunks = chunks
+            .iter()
+            .filter(|chunk| chunk.chunk_type == ChunkType::Child)
+            .cloned()
+            .collect::<Vec<_>>();
         let phase = PhaseTiming::start("embedding");
-        let prepared = self.prepare_indexes_for_chunks(&child_chunks).await?;
+        let active_profile_id = self.active_profile_id.clone();
+        let prepared = self
+            .prepare_source_indexes_for_profile(&active_profile_id, source_id, &child_chunks)
+            .await?;
         self.record_task_phase(
             task_id,
             phase,
@@ -446,6 +539,7 @@ where
                 source: &new_source,
                 evidence: &evidence,
                 chunks: &chunks,
+                embedding_profile_id: &active_profile_id,
                 vectors: &prepared.vectors,
                 links: &links,
                 image_artifacts: &prepared_image_artifacts.artifacts,
@@ -465,15 +559,17 @@ where
             serde_json::json!({
                 "operation": "replace_source_contents",
                 "source_id": source_id.0,
+                "embedding_profile_id": active_profile_id.as_str(),
                 "index_generation": generation,
             }),
         );
-        self.publish_committed_indexes(generation, staged, prepared)?;
+        self.publish_committed_indexes(&active_profile_id, generation, staged, prepared)?;
         self.record_task_phase(
             task_id,
             phase,
             serde_json::json!({
                 "source_id": source_id.0,
+                "embedding_profile_id": active_profile_id.as_str(),
                 "index_generation": generation,
             }),
         );
@@ -604,27 +700,78 @@ where
 
     pub async fn rebuild_indexes_from_store(&mut self) -> Result<()> {
         let child_chunks = self.store.list_child_chunks()?;
-        tracing::info!(count = child_chunks.len(), "rebuilding local indexes");
-        let prepared = self.prepare_indexes_for_chunks(&child_chunks).await?;
-        self.store.replace_all_vector_documents(&prepared.vectors)?;
+        let active_profile_id = self.active_profile_id.clone();
+        tracing::info!(
+            count = child_chunks.len(),
+            embedding_profile_id = %active_profile_id,
+            "rebuilding local indexes"
+        );
+        let prepared = self.prepare_full_indexes_for_chunks(&child_chunks).await?;
+        self.store
+            .replace_all_vector_documents_for_profile(&active_profile_id, &prepared.vectors)?;
+        self.mark_profile_sources_embedded(&active_profile_id, &prepared.vectors)?;
         self.lexical_index().rebuild_from_store(&self.store)?;
-        self.publish_prepared_indexes(prepared)?;
+        self.publish_prepared_indexes(&active_profile_id, prepared)?;
         #[cfg(feature = "qdrant")]
         self.sync_qdrant_all().await;
 
         Ok(())
     }
 
-    fn child_chunks_without_source(&self, source_id: &SourceId) -> Result<Vec<Chunk>> {
-        Ok(self
-            .store
-            .list_child_chunks()?
-            .into_iter()
-            .filter(|chunk| chunk.source_id != *source_id)
-            .collect())
+    pub async fn build_embedding_profile(
+        &mut self,
+        profile_id: &EmbeddingProfileId,
+        source_id: Option<&SourceId>,
+    ) -> Result<usize> {
+        self.ensure_embedding_profile(profile_id)?;
+        if let Some(source_id) = source_id {
+            self.store
+                .get_source(source_id)?
+                .with_context(|| format!("source not found: {}", source_id.0))?;
+        }
+        let child_chunks = match source_id {
+            Some(source_id) => self
+                .store
+                .list_child_chunks()?
+                .into_iter()
+                .filter(|chunk| chunk.source_id == *source_id)
+                .collect::<Vec<_>>(),
+            None => self.store.list_child_chunks()?,
+        };
+        let prepared = match source_id {
+            Some(source_id) => {
+                self.prepare_source_indexes_for_profile(profile_id, source_id, &child_chunks)
+                    .await?
+            }
+            None => self.prepare_full_indexes_for_chunks(&child_chunks).await?,
+        };
+        let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let generation = match source_id {
+            Some(source_id) => self.store.replace_source_vector_documents_for_profile(
+                profile_id,
+                source_id,
+                &prepared.vectors,
+            )?,
+            None => {
+                self.store
+                    .replace_all_vector_documents_for_profile(profile_id, &prepared.vectors)?;
+                self.mark_profile_sources_embedded(profile_id, &prepared.vectors)?;
+                self.store.index_generation_for_profile(profile_id)?
+            }
+        };
+        self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
+        #[cfg(feature = "qdrant")]
+        match source_id {
+            Some(source_id) => self.sync_qdrant_profile_source(profile_id, source_id).await,
+            None => self.sync_qdrant_profile_all(profile_id).await,
+        }
+        Ok(child_chunks.len())
     }
 
-    async fn prepare_indexes_for_chunks(&self, child_chunks: &[Chunk]) -> Result<PreparedIndexes> {
+    async fn prepare_full_indexes_for_chunks(
+        &self,
+        child_chunks: &[Chunk],
+    ) -> Result<PreparedIndexes> {
         let mut hnsw = HnswIndex::new();
         let mut vectors = Vec::new();
         if !child_chunks.is_empty() {
@@ -655,26 +802,86 @@ where
         Ok(PreparedIndexes { hnsw, vectors })
     }
 
-    fn publish_prepared_indexes(&mut self, prepared: PreparedIndexes) -> Result<()> {
-        let generation = self.store.index_generation()?;
+    async fn prepare_source_indexes_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_id: &SourceId,
+        source_child_chunks: &[Chunk],
+    ) -> Result<PreparedIndexes> {
+        let mut all_vectors = self
+            .store
+            .list_vector_documents_for_profile(profile_id)?
+            .into_iter()
+            .filter(|document| document.source_id != *source_id)
+            .collect::<Vec<_>>();
+        let source_prepared = self
+            .prepare_full_indexes_for_chunks(source_child_chunks)
+            .await?;
+        all_vectors.extend(source_prepared.vectors.clone());
+        let hnsw = hnsw_from_vectors(&all_vectors)?;
+        Ok(PreparedIndexes {
+            hnsw,
+            vectors: source_prepared.vectors,
+        })
+    }
+
+    fn prepare_indexes_from_vectors(
+        &self,
+        vectors: Vec<VectorDocument>,
+    ) -> Result<PreparedIndexes> {
+        let hnsw = hnsw_from_vectors(&vectors)?;
+        Ok(PreparedIndexes { hnsw, vectors })
+    }
+
+    fn mark_profile_sources_embedded(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        vectors: &[VectorDocument],
+    ) -> Result<()> {
+        let mut counts: HashMap<&SourceId, usize> = HashMap::new();
+        for vector in vectors {
+            *counts.entry(&vector.source_id).or_default() += 1;
+        }
+        for (source_id, count) in counts {
+            self.store.set_source_embedding_status(
+                profile_id,
+                source_id,
+                SourceEmbeddingStatus::Embedded,
+                count,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn publish_prepared_indexes(
+        &mut self,
+        profile_id: &EmbeddingProfileId,
+        prepared: PreparedIndexes,
+    ) -> Result<()> {
+        let generation = self.store.index_generation_for_profile(profile_id)?;
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
-        self.publish_committed_indexes(generation, staged, prepared)
+        self.publish_committed_indexes(profile_id, generation, staged, prepared)
     }
 
     fn publish_committed_indexes(
         &mut self,
+        profile_id: &EmbeddingProfileId,
         generation: u64,
         staged: PathBuf,
         prepared: PreparedIndexes,
     ) -> Result<()> {
-        match publish_staged_index_artifacts(&self.data_dir, generation, &staged) {
+        match publish_staged_index_artifacts(&self.data_dir, profile_id, generation, &staged) {
             Ok(()) => {}
             Err(err) => {
                 self.invalidate_live_indexes()?;
                 return Err(err);
             }
         };
-        self.hnsw = prepared.hnsw;
+        if self.loaded_profile_id == *profile_id || self.active_profile_id == *profile_id {
+            self.hnsw = prepared.hnsw;
+            self.loaded_profile_id = profile_id.clone();
+        }
         Ok(())
     }
 
@@ -685,18 +892,31 @@ where
 
     #[cfg(feature = "qdrant")]
     async fn sync_qdrant_source(&self, source_id: &SourceId) {
+        self.sync_qdrant_profile_source(&self.active_profile_id, source_id)
+            .await;
+    }
+
+    #[cfg(feature = "qdrant")]
+    async fn sync_qdrant_profile_source(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_id: &SourceId,
+    ) {
         let Some(qdrant) = &self.qdrant else {
             return;
         };
         let result: Result<()> = async {
-            let records = records_from_store(&self.store, Some(source_id))?;
-            qdrant.delete_source(source_id).await?;
+            let records = records_from_store_for_profile(&self.store, profile_id, Some(source_id))?;
+            qdrant
+                .delete_source_for_profile(profile_id, source_id)
+                .await?;
             qdrant.upsert_records(&records).await?;
             Ok(())
         }
         .await;
         if let Err(err) = result {
             tracing::warn!(
+                embedding_profile_id = %profile_id,
                 source = %source_id.0,
                 error = %err,
                 "qdrant source sync failed; local ingest remains authoritative"
@@ -720,17 +940,24 @@ where
 
     #[cfg(feature = "qdrant")]
     async fn sync_qdrant_all(&self) {
+        self.sync_qdrant_profile_all(&self.active_profile_id).await;
+    }
+
+    #[cfg(feature = "qdrant")]
+    async fn sync_qdrant_profile_all(&self, profile_id: &EmbeddingProfileId) {
         let Some(qdrant) = &self.qdrant else {
             return;
         };
         let result: Result<()> = async {
-            let records = records_from_store(&self.store, None)?;
-            qdrant.recreate_with_records(&records).await?;
+            let records = records_from_store_for_profile(&self.store, profile_id, None)?;
+            qdrant.delete_profile(profile_id).await?;
+            qdrant.upsert_records(&records).await?;
             Ok(())
         }
         .await;
         if let Err(err) = result {
             tracing::warn!(
+                embedding_profile_id = %profile_id,
                 error = %err,
                 "qdrant full sync failed; local indexes remain authoritative"
             );
@@ -891,11 +1118,16 @@ fn configured_vision_model(config: &Config) -> (Option<Box<dyn VisionModel>>, St
     )
 }
 
-fn load_published_vector_index(data_dir: &Path, store: &Store) -> Result<HnswIndex> {
-    let store_generation = store.index_generation()?;
-    let manifest_generation = read_index_manifest(data_dir)?.map(|manifest| manifest.generation);
+fn load_published_vector_index(
+    data_dir: &Path,
+    store: &Store,
+    profile_id: &EmbeddingProfileId,
+) -> Result<HnswIndex> {
+    let store_generation = store.index_generation_for_profile(profile_id)?;
+    let manifest_generation =
+        read_index_manifest(data_dir, profile_id)?.map(|manifest| manifest.generation);
     if manifest_generation == Some(store_generation) {
-        let generation_dir = index_generation_dir(data_dir, store_generation);
+        let generation_dir = index_generation_dir(data_dir, profile_id, store_generation);
         let hnsw_path = generation_dir.join("vectors.hnsw");
         if hnsw_path.exists() {
             let mut hnsw = HnswIndex::new();
@@ -913,7 +1145,7 @@ fn load_published_vector_index(data_dir: &Path, store: &Store) -> Result<HnswInd
     }
 
     let mut hnsw = HnswIndex::new();
-    hnsw.rebuild_from_store(store)?;
+    hnsw.rebuild_from_store_for_profile(store, profile_id)?;
     Ok(hnsw)
 }
 
@@ -932,15 +1164,20 @@ fn stage_prepared_index_artifacts(data_dir: &Path, prepared: &PreparedIndexes) -
 
 fn publish_staged_index_artifacts(
     data_dir: &Path,
+    profile_id: &EmbeddingProfileId,
     generation: u64,
     staging_dir: &Path,
 ) -> Result<()> {
-    let generation_dir = index_generation_dir(data_dir, generation);
+    let generation_dir = index_generation_dir(data_dir, profile_id, generation);
     if generation_dir.exists() {
         remove_dir_if_exists(&generation_dir)?;
     }
-    fs::create_dir_all(index_root_dir(data_dir))
-        .with_context(|| format!("create index root: {}", index_root_dir(data_dir).display()))?;
+    fs::create_dir_all(profile_index_root_dir(data_dir, profile_id)).with_context(|| {
+        format!(
+            "create profile index root: {}",
+            profile_index_root_dir(data_dir, profile_id).display()
+        )
+    })?;
     fs::rename(staging_dir, &generation_dir).with_context(|| {
         format!(
             "publish staged index generation: {} -> {}",
@@ -949,12 +1186,30 @@ fn publish_staged_index_artifacts(
         )
     })?;
 
-    write_index_manifest(data_dir, generation)?;
+    write_index_manifest(data_dir, profile_id, generation)?;
     Ok(())
 }
 
-fn read_index_manifest(data_dir: &Path) -> Result<Option<IndexManifest>> {
-    let path = index_manifest_path(data_dir);
+fn read_index_manifest(
+    data_dir: &Path,
+    profile_id: &EmbeddingProfileId,
+) -> Result<Option<IndexManifest>> {
+    let path = index_manifest_path(data_dir, profile_id);
+    if !path.exists() {
+        if *profile_id == EmbeddingProfileId::default_profile() {
+            return read_legacy_index_manifest(data_dir);
+        }
+        return Ok(None);
+    }
+    let data =
+        fs::read(&path).with_context(|| format!("read index manifest: {}", path.display()))?;
+    serde_json::from_slice(&data)
+        .with_context(|| format!("parse index manifest: {}", path.display()))
+        .map(Some)
+}
+
+fn read_legacy_index_manifest(data_dir: &Path) -> Result<Option<IndexManifest>> {
+    let path = legacy_index_manifest_path(data_dir);
     if !path.exists() {
         return Ok(None);
     }
@@ -965,10 +1220,18 @@ fn read_index_manifest(data_dir: &Path) -> Result<Option<IndexManifest>> {
         .map(Some)
 }
 
-fn write_index_manifest(data_dir: &Path, generation: u64) -> Result<()> {
-    let path = index_manifest_path(data_dir);
+fn write_index_manifest(
+    data_dir: &Path,
+    profile_id: &EmbeddingProfileId,
+    generation: u64,
+) -> Result<()> {
+    let path = index_manifest_path(data_dir, profile_id);
     let tmp_path = path.with_extension("json.tmp");
     let data = serde_json::to_vec(&IndexManifest { generation })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create index manifest dir: {}", parent.display()))?;
+    }
     fs::write(&tmp_path, data)
         .with_context(|| format!("write index manifest temp: {}", tmp_path.display()))?;
     fs::rename(&tmp_path, &path).with_context(|| {
@@ -981,6 +1244,15 @@ fn write_index_manifest(data_dir: &Path, generation: u64) -> Result<()> {
     Ok(())
 }
 
+fn hnsw_from_vectors(vectors: &[VectorDocument]) -> Result<HnswIndex> {
+    let mut hnsw = HnswIndex::new();
+    for vector in vectors {
+        hnsw.upsert(vector.clone());
+    }
+    hnsw.build()?;
+    Ok(hnsw)
+}
+
 fn remove_dir_if_exists(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -989,7 +1261,11 @@ fn remove_dir_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn index_manifest_path(data_dir: &Path) -> PathBuf {
+fn index_manifest_path(data_dir: &Path, profile_id: &EmbeddingProfileId) -> PathBuf {
+    profile_index_root_dir(data_dir, profile_id).join("index-manifest.json")
+}
+
+fn legacy_index_manifest_path(data_dir: &Path) -> PathBuf {
     data_dir.join("index-manifest.json")
 }
 
@@ -997,8 +1273,18 @@ fn index_root_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("indexes")
 }
 
-fn index_generation_dir(data_dir: &Path, generation: u64) -> PathBuf {
-    index_root_dir(data_dir).join(format!("gen-{generation}"))
+fn profile_index_root_dir(data_dir: &Path, profile_id: &EmbeddingProfileId) -> PathBuf {
+    index_root_dir(data_dir)
+        .join("profiles")
+        .join(profile_id.as_str())
+}
+
+fn index_generation_dir(
+    data_dir: &Path,
+    profile_id: &EmbeddingProfileId,
+    generation: u64,
+) -> PathBuf {
+    profile_index_root_dir(data_dir, profile_id).join(format!("gen-{generation}"))
 }
 
 fn unique_staging_dir(data_dir: &Path) -> PathBuf {
@@ -2136,7 +2422,7 @@ mod tests {
 
     #[cfg(feature = "qdrant")]
     use crate::config::QdrantConfig;
-    use crate::config::{GraphConfig, RetrievalConfig};
+    use crate::config::{Config, GraphConfig, RetrievalConfig};
     use crate::image_limits::ImageArtifactLimitError;
     #[cfg(feature = "qdrant")]
     use crate::index::qdrant::QdrantClient;
@@ -2417,6 +2703,163 @@ mod tests {
         }
         hnsw.build().unwrap();
         hnsw
+    }
+
+    fn store_vectors_for_chunks(store: &Store, chunks: &[Chunk]) {
+        let vectors = chunks
+            .iter()
+            .enumerate()
+            .map(|(idx, chunk)| VectorDocument {
+                chunk_id: chunk.id.clone(),
+                source_id: chunk.source_id.clone(),
+                vector: vec![idx as f32, 1.0],
+            })
+            .collect::<Vec<_>>();
+        store.replace_all_vector_documents(&vectors).unwrap();
+    }
+
+    fn test_config() -> Config {
+        Config {
+            store: Default::default(),
+            parser: Default::default(),
+            embedding: Default::default(),
+            retrieval: Default::default(),
+            graph: Default::default(),
+            rerank: Default::default(),
+            context: Default::default(),
+            vision: Default::default(),
+            chat: Default::default(),
+            verifier: Default::default(),
+            qdrant: Default::default(),
+            daemon: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_embedding_profile_uses_existing_chunks_without_reparsing() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let first = test_source("src-1", PathBuf::from("/tmp/first.txt"));
+        let second = test_source("src-2", PathBuf::from("/tmp/second.txt"));
+        insert_source_with_child_text(&store, &first, "chunk-1", "alpha text").unwrap();
+        insert_source_with_child_text(&store, &second, "chunk-2", "beta text").unwrap();
+        let alt_profile = EmbeddingProfileId::new("alt").unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        let source_count = pipeline
+            .build_embedding_profile(&alt_profile, Some(&first.id))
+            .await
+            .unwrap();
+
+        assert_eq!(source_count, 1);
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(&alt_profile, Some(&first.id))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(&alt_profile, Some(&second.id))
+                .unwrap(),
+            0
+        );
+
+        let all_count = pipeline
+            .build_embedding_profile(&alt_profile, None)
+            .await
+            .unwrap();
+
+        assert_eq!(all_count, 2);
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(&alt_profile, None)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            pipeline
+                .store()
+                .get_source(&first.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SourceStatus::Indexed
+        );
+    }
+
+    #[test]
+    fn pipeline_loads_only_active_profile_index_until_profile_switch() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("verbatim.db");
+        let config = test_config();
+        let alt_profile = EmbeddingProfileId::new("alt").unwrap();
+        {
+            let store = Store::new(&db_path).unwrap();
+            let first = test_source("src-1", PathBuf::from("/tmp/first.txt"));
+            let second = test_source("src-2", PathBuf::from("/tmp/second.txt"));
+            let first_chunk =
+                insert_source_with_child_text(&store, &first, "chunk-1", "alpha text").unwrap();
+            let second_chunk =
+                insert_source_with_child_text(&store, &second, "chunk-2", "beta text").unwrap();
+            store
+                .ensure_embedding_profile(
+                    &alt_profile,
+                    EmbeddingProfileConfig {
+                        provider: &config.embedding.provider,
+                        model: &config.embedding.model,
+                        dimension: config.embedding.dimension,
+                        normalize: config.embedding.normalize,
+                        query_instruction: &config.embedding.query_instruction,
+                        document_instruction: &config.embedding.document_instruction,
+                    },
+                )
+                .unwrap();
+            store
+                .replace_all_vector_documents_for_profile(
+                    &EmbeddingProfileId::default_profile(),
+                    &[VectorDocument {
+                        chunk_id: first_chunk.id.clone(),
+                        source_id: first.id.clone(),
+                        vector: vec![1.0, 0.0],
+                    }],
+                )
+                .unwrap();
+            store
+                .replace_all_vector_documents_for_profile(
+                    &alt_profile,
+                    &[
+                        VectorDocument {
+                            chunk_id: first_chunk.id,
+                            source_id: first.id,
+                            vector: vec![0.0, 1.0],
+                        },
+                        VectorDocument {
+                            chunk_id: second_chunk.id,
+                            source_id: second.id,
+                            vector: vec![0.5, 0.5],
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+
+        let mut pipeline = IngestPipeline::new(&config, tempdir.path()).unwrap();
+
+        assert_eq!(pipeline.active_embedding_profile_id().as_str(), "default");
+        assert_eq!(pipeline.hnsw().len(), 1);
+
+        pipeline.select_embedding_profile(&alt_profile).unwrap();
+
+        assert_eq!(pipeline.hnsw().len(), 2);
     }
 
     #[derive(Debug)]
@@ -3234,7 +3677,9 @@ model = "local-vision"
             insert_source_with_child_text(&store, &first, "chunk-1", "deletedterm").unwrap();
         let second_chunk =
             insert_source_with_child_text(&store, &second, "chunk-2", "retainedterm").unwrap();
-        let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
+        let chunks = [first_chunk, second_chunk];
+        store_vectors_for_chunks(&store, &chunks);
+        let hnsw = hnsw_with_chunks(&chunks);
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
@@ -3274,7 +3719,9 @@ model = "local-vision"
         let second = test_source("src-2", tempdir.path().join("second.txt"));
         let first_chunk = insert_source_with_child(&store, &first, "chunk-1").unwrap();
         let second_chunk = insert_source_with_child(&store, &second, "chunk-2").unwrap();
-        let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
+        let chunks = [first_chunk, second_chunk];
+        store_vectors_for_chunks(&store, &chunks);
+        let hnsw = hnsw_with_chunks(&chunks);
         let qdrant = QdrantClient::new(qdrant_test_config(qdrant_url));
         let mut pipeline = IngestPipeline::from_parts(
             store,
@@ -3299,7 +3746,7 @@ model = "local-vision"
 
     #[cfg(feature = "qdrant")]
     #[tokio::test]
-    async fn force_ingest_recreates_qdrant_collection_after_local_ingest() {
+    async fn force_ingest_rewrites_active_qdrant_profile_after_local_ingest() {
         let (qdrant_url, handle) = spawn_qdrant_server(vec![
             (404, r#"{"status":{"error":"missing"},"result":null}"#),
             (404, r#"{"status":{"error":"missing"},"result":null}"#),
@@ -3309,10 +3756,14 @@ model = "local-vision"
                 r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
             ),
             (200, r#"{"status":"ok","result":true}"#),
-            (200, r#"{"status":"ok","result":true}"#),
             (
                 200,
                 r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
+            ),
+            (200, r#"{"status":"ok","result":true}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":3}}"#,
             ),
         ]);
         let tempdir = tempfile::tempdir().unwrap();
@@ -3334,18 +3785,79 @@ model = "local-vision"
 
         assert_eq!(ingested, 1);
         let requests = handle.join().unwrap();
-        assert_eq!(requests[4].line, "DELETE /collections/verbatim HTTP/1.1");
-        assert_eq!(requests[5].line, "PUT /collections/verbatim HTTP/1.1");
         assert_eq!(
-            requests[6].line,
+            requests[5].line,
+            "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        );
+        let delete_body: serde_json::Value = serde_json::from_str(&requests[5].body).unwrap();
+        assert_eq!(delete_body["filter"]["must"][0]["key"], "profile_id");
+        assert_eq!(
+            delete_body["filter"]["must"][0]["match"]["value"],
+            "default"
+        );
+        assert_eq!(
+            requests[7].line,
             "PUT /collections/verbatim/points?wait=true HTTP/1.1"
         );
-        let body: serde_json::Value = serde_json::from_str(&requests[6].body).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&requests[7].body).unwrap();
+        assert_eq!(body["points"][0]["payload"]["profile_id"], "default");
         assert_eq!(body["points"][0]["payload"]["source_id"], "src-force");
         assert!(body["points"][0]["payload"]["chunk_id"]
             .as_str()
             .unwrap()
             .contains("src-force"));
+    }
+
+    #[cfg(feature = "qdrant")]
+    #[tokio::test]
+    async fn vectors_only_profile_build_syncs_qdrant_with_profile_filter() {
+        let (qdrant_url, handle) = spawn_qdrant_server(vec![
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
+            ),
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
+            ),
+        ]);
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-alt", tempdir.path().join("alt.txt"));
+        insert_source_with_child_text(&store, &source, "chunk-alt", "alt profile text").unwrap();
+        let qdrant = QdrantClient::new(qdrant_test_config(qdrant_url));
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_qdrant_client(qdrant);
+        let alt_profile = EmbeddingProfileId::new("alt").unwrap();
+
+        let count = pipeline
+            .build_embedding_profile(&alt_profile, None)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+        let requests = handle.join().unwrap();
+        assert_eq!(
+            requests[1].line,
+            "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        );
+        let delete_body: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(delete_body["filter"]["must"][0]["key"], "profile_id");
+        assert_eq!(delete_body["filter"]["must"][0]["match"]["value"], "alt");
+        assert_eq!(
+            requests[3].line,
+            "PUT /collections/verbatim/points?wait=true HTTP/1.1"
+        );
+        let upsert_body: serde_json::Value = serde_json::from_str(&requests[3].body).unwrap();
+        assert_eq!(upsert_body["points"][0]["payload"]["profile_id"], "alt");
+        assert_eq!(upsert_body["points"][0]["payload"]["source_id"], "src-alt");
     }
 
     #[tokio::test]
@@ -4525,7 +5037,9 @@ model = "local-vision"
         let second = test_source("src-2", tempdir.path().join("second.txt"));
         let first_chunk = insert_source_with_child(&store, &first, "chunk-1").unwrap();
         let second_chunk = insert_source_with_child(&store, &second, "chunk-2").unwrap();
-        let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
+        let chunks = [first_chunk, second_chunk];
+        store_vectors_for_chunks(&store, &chunks);
+        let hnsw = hnsw_with_chunks(&chunks);
         write_blocking_image_artifact_path(tempdir.path(), &first.id);
         let mut pipeline = IngestPipeline::from_parts(
             store,
@@ -4587,14 +5101,16 @@ model = "local-vision"
     }
 
     #[tokio::test]
-    async fn remove_source_keeps_store_and_hnsw_when_embedding_rebuild_fails() {
+    async fn remove_source_does_not_call_embedding_client_and_keeps_remaining_vectors() {
         let tempdir = tempfile::tempdir().unwrap();
         let store = Store::in_memory().unwrap();
         let first = test_source("src-1", tempdir.path().join("first.txt"));
         let second = test_source("src-2", tempdir.path().join("second.txt"));
         let first_chunk = insert_source_with_child(&store, &first, "chunk-1").unwrap();
         let second_chunk = insert_source_with_child(&store, &second, "chunk-2").unwrap();
-        let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
+        let chunks = [first_chunk, second_chunk];
+        store_vectors_for_chunks(&store, &chunks);
+        let hnsw = hnsw_with_chunks(&chunks);
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
@@ -4602,13 +5118,13 @@ model = "local-vision"
             tempdir.path().to_path_buf(),
         );
 
-        let err = pipeline.remove_source(&first.id).await.unwrap_err();
+        pipeline.remove_source(&first.id).await.unwrap();
 
-        assert!(err.to_string().contains("embedding unavailable"));
-        assert!(pipeline.store().get_source(&first.id).unwrap().is_some());
+        assert!(pipeline.store().get_source(&first.id).unwrap().is_none());
         assert!(pipeline.store().get_source(&second.id).unwrap().is_some());
-        assert_eq!(pipeline.store().list_child_chunks().unwrap().len(), 2);
-        assert_eq!(pipeline.hnsw().len(), 2);
+        assert_eq!(pipeline.store().list_child_chunks().unwrap().len(), 1);
+        assert_eq!(pipeline.store().list_vector_documents().unwrap().len(), 1);
+        assert_eq!(pipeline.hnsw().len(), 1);
     }
 
     #[tokio::test]
@@ -4646,7 +5162,9 @@ model = "local-vision"
         let second = test_source("src-2", tempdir.path().join("second.txt"));
         let first_chunk = insert_source_with_child(&store, &first, "chunk-1").unwrap();
         let second_chunk = insert_source_with_child(&store, &second, "chunk-2").unwrap();
-        let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
+        let chunks = [first_chunk, second_chunk];
+        store_vectors_for_chunks(&store, &chunks);
+        let hnsw = hnsw_with_chunks(&chunks);
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
@@ -4692,29 +5210,42 @@ model = "local-vision"
     #[tokio::test]
     async fn remove_source_ignores_unmanifested_indexes_when_manifest_write_fails() {
         let tempdir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(index_manifest_path(tempdir.path()).with_extension("json.tmp"))
-            .unwrap();
+        let default_profile = EmbeddingProfileId::default_profile();
+        let manifest_tmp_path =
+            index_manifest_path(tempdir.path(), &default_profile).with_extension("json.tmp");
+        std::fs::create_dir_all(manifest_tmp_path.parent().unwrap()).unwrap();
+        std::fs::create_dir(&manifest_tmp_path).unwrap();
         let store = Store::in_memory().unwrap();
         let first = test_source("src-1", tempdir.path().join("first.txt"));
         let second = test_source("src-2", tempdir.path().join("second.txt"));
         let first_chunk = insert_source_with_child(&store, &first, "chunk-1").unwrap();
         let second_chunk = insert_source_with_child(&store, &second, "chunk-2").unwrap();
-        let hnsw = hnsw_with_chunks(&[first_chunk, second_chunk]);
+        let chunks = [first_chunk, second_chunk];
+        store_vectors_for_chunks(&store, &chunks);
+        let hnsw = hnsw_with_chunks(&chunks);
         let mut pipeline = IngestPipeline::from_parts(
             store,
             hnsw,
             StaticEmbeddingClient,
             tempdir.path().to_path_buf(),
         );
+        let before_generation = pipeline.store().index_generation().unwrap();
 
         let err = pipeline.remove_source(&first.id).await.unwrap_err();
 
         assert!(err.to_string().contains("write index manifest temp"));
         assert!(pipeline.store().get_source(&first.id).unwrap().is_none());
         assert!(pipeline.store().get_source(&second.id).unwrap().is_some());
-        assert_eq!(pipeline.store().index_generation().unwrap(), 1);
-        assert!(read_index_manifest(tempdir.path()).unwrap().is_none());
-        let loaded_hnsw = load_published_vector_index(tempdir.path(), pipeline.store()).unwrap();
+        assert_eq!(
+            pipeline.store().index_generation().unwrap(),
+            before_generation + 1
+        );
+        assert!(read_index_manifest(tempdir.path(), &default_profile)
+            .unwrap()
+            .is_none());
+        let loaded_hnsw =
+            load_published_vector_index(tempdir.path(), pipeline.store(), &default_profile)
+                .unwrap();
         assert_eq!(loaded_hnsw.len(), 1);
         assert!(pipeline.hnsw().is_empty());
     }
@@ -4722,8 +5253,11 @@ model = "local-vision"
     #[tokio::test]
     async fn ingest_source_ignores_unmanifested_indexes_when_manifest_write_fails() {
         let tempdir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(index_manifest_path(tempdir.path()).with_extension("json.tmp"))
-            .unwrap();
+        let default_profile = EmbeddingProfileId::default_profile();
+        let manifest_tmp_path =
+            index_manifest_path(tempdir.path(), &default_profile).with_extension("json.tmp");
+        std::fs::create_dir_all(manifest_tmp_path.parent().unwrap()).unwrap();
+        std::fs::create_dir(&manifest_tmp_path).unwrap();
         let path = tempdir.path().join("doc.txt");
         std::fs::write(&path, "new text for ingest\n").unwrap();
         let store = Store::in_memory().unwrap();
@@ -4741,11 +5275,15 @@ model = "local-vision"
 
         assert!(err.to_string().contains("write index manifest temp"));
         assert_eq!(pipeline.store().index_generation().unwrap(), 1);
-        assert!(read_index_manifest(tempdir.path()).unwrap().is_none());
+        assert!(read_index_manifest(tempdir.path(), &default_profile)
+            .unwrap()
+            .is_none());
         let chunks = pipeline.store().list_chunks_by_source(&source.id).unwrap();
         assert!(!chunks.is_empty());
         assert!(chunks.iter().all(|chunk| chunk.id.0 != "old-chunk"));
-        let loaded_hnsw = load_published_vector_index(tempdir.path(), pipeline.store()).unwrap();
+        let loaded_hnsw =
+            load_published_vector_index(tempdir.path(), pipeline.store(), &default_profile)
+                .unwrap();
         assert_eq!(
             loaded_hnsw.len(),
             chunks

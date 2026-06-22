@@ -1,7 +1,8 @@
+use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -61,6 +62,128 @@ impl ImageId {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ChunkId(pub String);
+
+pub const DEFAULT_EMBEDDING_PROFILE_ID: &str = "default";
+pub const MAX_EMBEDDING_PROFILE_ID_LEN: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingProfileIdError {
+    value: String,
+}
+
+impl EmbeddingProfileIdError {
+    fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+        }
+    }
+}
+
+impl fmt::Display for EmbeddingProfileIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "embedding profile id must be 1-{MAX_EMBEDDING_PROFILE_ID_LEN} characters of ASCII letters, digits, '.', '_', or '-' and must not be '.' or '..': {}",
+            self.value
+        )
+    }
+}
+
+impl Error for EmbeddingProfileIdError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct EmbeddingProfileId(String);
+
+impl EmbeddingProfileId {
+    pub fn new(value: impl Into<String>) -> Result<Self, EmbeddingProfileIdError> {
+        let value = value.into();
+        if is_valid_embedding_profile_id(&value) {
+            Ok(Self(value))
+        } else {
+            Err(EmbeddingProfileIdError::new(value))
+        }
+    }
+
+    pub fn default_profile() -> Self {
+        Self(DEFAULT_EMBEDDING_PROFILE_ID.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl Default for EmbeddingProfileId {
+    fn default() -> Self {
+        Self::default_profile()
+    }
+}
+
+impl fmt::Display for EmbeddingProfileId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<String> for EmbeddingProfileId {
+    type Error = EmbeddingProfileIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for EmbeddingProfileId {
+    type Error = EmbeddingProfileIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for EmbeddingProfileId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn is_valid_embedding_profile_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_EMBEDDING_PROFILE_ID_LEN
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SourceEmbeddingStatus {
+    Pending,
+    Embedded,
+    Failed,
+    Stale,
+}
+
+impl SourceEmbeddingStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Embedded => "Embedded",
+            Self::Failed => "Failed",
+            Self::Stale => "Stale",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GraphNodeId(pub String);

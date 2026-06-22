@@ -12,7 +12,7 @@ use url::form_urlencoded::byte_serialize;
 use crate::config::QdrantConfig;
 use crate::store::Store;
 use crate::traits::VectorDocument;
-use crate::types::{Chunk, ChunkId, SourceId};
+use crate::types::{Chunk, ChunkId, EmbeddingProfileId, SourceId};
 
 const DISTANCE: &str = "Cosine";
 const MAX_QDRANT_ERROR_BODY_BYTES: u64 = 4096;
@@ -21,14 +21,20 @@ const MAX_QDRANT_TEXT_PREVIEW_CHARS: usize = 240;
 /// One vector plus the Qdrant payload fields needed for remote search.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QdrantVectorRecord {
+    pub profile_id: EmbeddingProfileId,
     pub document: VectorDocument,
     pub heading_path: Vec<String>,
     pub text_preview: String,
 }
 
 impl QdrantVectorRecord {
-    pub fn from_chunk(document: VectorDocument, chunk: &Chunk) -> Self {
+    pub fn from_chunk(
+        profile_id: &EmbeddingProfileId,
+        document: VectorDocument,
+        chunk: &Chunk,
+    ) -> Self {
         Self {
+            profile_id: profile_id.clone(),
             document,
             heading_path: chunk.heading_path.clone(),
             text_preview: text_preview(chunk),
@@ -41,8 +47,17 @@ pub fn records_from_store(
     store: &Store,
     source_filter: Option<&SourceId>,
 ) -> Result<Vec<QdrantVectorRecord>> {
+    records_from_store_for_profile(store, &EmbeddingProfileId::default_profile(), source_filter)
+}
+
+/// Build Qdrant records for one embedding profile.
+pub fn records_from_store_for_profile(
+    store: &Store,
+    profile_id: &EmbeddingProfileId,
+    source_filter: Option<&SourceId>,
+) -> Result<Vec<QdrantVectorRecord>> {
     let mut records = Vec::new();
-    for document in store.list_vector_documents()? {
+    for document in store.list_vector_documents_for_profile(profile_id)? {
         if source_filter.is_some_and(|source_id| &document.source_id != source_id) {
             continue;
         }
@@ -53,7 +68,7 @@ pub fn records_from_store(
             );
             continue;
         };
-        records.push(QdrantVectorRecord::from_chunk(document, &chunk));
+        records.push(QdrantVectorRecord::from_chunk(profile_id, document, &chunk));
     }
     Ok(records)
 }
@@ -95,6 +110,46 @@ impl QdrantClient {
         Ok(())
     }
 
+    pub async fn delete_source_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_id: &SourceId,
+    ) -> Result<()> {
+        if !self.collection_exists().await? {
+            return Ok(());
+        }
+        let body = QdrantDeleteRequest {
+            filter: profile_source_filter(profile_id, Some(source_id)),
+        };
+        let _: QdrantEnvelope<Value> = self
+            .send_json(
+                Method::POST,
+                &self.collection_path("points/delete?wait=true"),
+                &body,
+                "delete qdrant points by embedding profile and source",
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_profile(&self, profile_id: &EmbeddingProfileId) -> Result<()> {
+        if !self.collection_exists().await? {
+            return Ok(());
+        }
+        let body = QdrantDeleteRequest {
+            filter: profile_source_filter(profile_id, None),
+        };
+        let _: QdrantEnvelope<Value> = self
+            .send_json(
+                Method::POST,
+                &self.collection_path("points/delete?wait=true"),
+                &body,
+                "delete qdrant points by embedding profile",
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn upsert_records(&self, records: &[QdrantVectorRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
@@ -104,18 +159,9 @@ impl QdrantClient {
         self.upsert_records_without_collection_check(records).await
     }
 
-    pub async fn recreate_with_records(&self, records: &[QdrantVectorRecord]) -> Result<()> {
-        self.delete_collection().await?;
-        if records.is_empty() {
-            return Ok(());
-        }
-        let dimension = records_dimension(records)?;
-        self.create_collection(dimension).await?;
-        self.upsert_records_without_collection_check(records).await
-    }
-
     pub async fn search(
         &self,
+        profile_id: &EmbeddingProfileId,
         query: &[f32],
         top_k: usize,
         source_filter: Option<&SourceId>,
@@ -126,7 +172,7 @@ impl QdrantClient {
         let body = QdrantSearchRequest {
             vector: query,
             limit: top_k,
-            filter: source_filter.map(source_id_filter),
+            filter: Some(profile_source_filter(profile_id, source_filter)),
             with_payload: ["chunk_id"],
             with_vector: false,
         };
@@ -182,22 +228,6 @@ impl QdrantClient {
                 &body,
                 "create qdrant collection",
             )
-            .await?;
-        Ok(())
-    }
-
-    async fn delete_collection(&self) -> Result<()> {
-        let response = self
-            .send_without_body(
-                Method::DELETE,
-                &self.collection_path(""),
-                "delete qdrant collection",
-            )
-            .await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(());
-        }
-        self.decode_response::<QdrantEnvelope<bool>>(response, "delete qdrant collection")
             .await?;
         Ok(())
     }
@@ -322,9 +352,10 @@ struct QdrantPoint {
 impl QdrantPoint {
     fn from_record(record: &QdrantVectorRecord) -> Self {
         Self {
-            id: point_id_for_chunk(&record.document.chunk_id),
+            id: point_id_for_profile_chunk(&record.profile_id, &record.document.chunk_id),
             vector: record.document.vector.clone(),
             payload: QdrantPayload {
+                profile_id: record.profile_id.as_str().to_string(),
                 chunk_id: record.document.chunk_id.0.clone(),
                 source_id: record.document.source_id.0.clone(),
                 heading_path: record.heading_path.clone(),
@@ -336,6 +367,7 @@ impl QdrantPoint {
 
 #[derive(Debug, Serialize)]
 struct QdrantPayload {
+    profile_id: String,
     chunk_id: String,
     source_id: String,
     heading_path: Vec<String>,
@@ -359,7 +391,7 @@ struct QdrantSearchRequest<'a> {
 
 #[derive(Debug, Serialize)]
 struct QdrantFilter<'a> {
-    must: [QdrantFieldCondition<'a>; 1],
+    must: Vec<QdrantFieldCondition<'a>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -387,13 +419,34 @@ struct QdrantScoredPoint {
 
 fn source_id_filter(source_id: &SourceId) -> QdrantFilter<'_> {
     QdrantFilter {
-        must: [QdrantFieldCondition {
+        must: vec![QdrantFieldCondition {
             key: "source_id",
             match_value: QdrantMatchValue {
                 value: &source_id.0,
             },
         }],
     }
+}
+
+fn profile_source_filter<'a>(
+    profile_id: &'a EmbeddingProfileId,
+    source_id: Option<&'a SourceId>,
+) -> QdrantFilter<'a> {
+    let mut must = vec![QdrantFieldCondition {
+        key: "profile_id",
+        match_value: QdrantMatchValue {
+            value: profile_id.as_str(),
+        },
+    }];
+    if let Some(source_id) = source_id {
+        must.push(QdrantFieldCondition {
+            key: "source_id",
+            match_value: QdrantMatchValue {
+                value: &source_id.0,
+            },
+        });
+    }
+    QdrantFilter { must }
 }
 
 fn chunk_id_from_payload(payload: Option<Value>) -> Option<ChunkId> {
@@ -425,8 +478,10 @@ fn text_preview(chunk: &Chunk) -> String {
     text.chars().take(MAX_QDRANT_TEXT_PREVIEW_CHARS).collect()
 }
 
-fn point_id_for_chunk(chunk_id: &ChunkId) -> String {
-    let digest = Sha256::digest(format!("verbatim:qdrant:{}", chunk_id.0).as_bytes());
+fn point_id_for_profile_chunk(profile_id: &EmbeddingProfileId, chunk_id: &ChunkId) -> String {
+    let digest = Sha256::digest(
+        format!("verbatim:qdrant:{}:{}", profile_id.as_str(), chunk_id.0).as_bytes(),
+    );
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
@@ -493,6 +548,7 @@ mod tests {
 
     fn record(source_id: &str, chunk_id: &str, vector: Vec<f32>) -> QdrantVectorRecord {
         QdrantVectorRecord {
+            profile_id: EmbeddingProfileId::default_profile(),
             document: VectorDocument {
                 chunk_id: ChunkId(chunk_id.into()),
                 source_id: SourceId(source_id.into()),
@@ -571,13 +627,19 @@ mod tests {
     }
 
     #[test]
-    fn point_id_is_deterministic_uuid_from_chunk_id() {
-        let first = point_id_for_chunk(&ChunkId("src-child-0".into()));
-        let second = point_id_for_chunk(&ChunkId("src-child-0".into()));
-        let different = point_id_for_chunk(&ChunkId("src-child-1".into()));
+    fn point_id_is_deterministic_uuid_from_profile_and_chunk_id() {
+        let default_profile = EmbeddingProfileId::default_profile();
+        let alt_profile = EmbeddingProfileId::new("alt").unwrap();
+        let first = point_id_for_profile_chunk(&default_profile, &ChunkId("src-child-0".into()));
+        let second = point_id_for_profile_chunk(&default_profile, &ChunkId("src-child-0".into()));
+        let different_chunk =
+            point_id_for_profile_chunk(&default_profile, &ChunkId("src-child-1".into()));
+        let different_profile =
+            point_id_for_profile_chunk(&alt_profile, &ChunkId("src-child-0".into()));
 
         assert_eq!(first, second);
-        assert_ne!(first, different);
+        assert_ne!(first, different_chunk);
+        assert_ne!(first, different_profile);
         assert_eq!(first.len(), 36);
         assert_eq!(first.as_bytes()[14], b'5');
     }
@@ -610,6 +672,7 @@ mod tests {
             "PUT /collections/verbatim/points?wait=true HTTP/1.1"
         );
         let upsert: Value = serde_json::from_str(&requests[2].body).unwrap();
+        assert_eq!(upsert["points"][0]["payload"]["profile_id"], "default");
         assert_eq!(upsert["points"][0]["payload"]["chunk_id"], "src-1-child-0");
         assert_eq!(upsert["points"][0]["payload"]["source_id"], "src-1");
         assert_eq!(upsert["points"][0]["payload"]["heading_path"][0], "Intro");
@@ -627,9 +690,15 @@ mod tests {
             r#"{"status":"ok","result":[{"id":"550e8400-e29b-41d4-a716-446655440000","score":0.75,"payload":{"chunk_id":"chunk-a"}}]}"#,
         )]);
         let client = QdrantClient::new(qdrant_config(url));
+        let alt_profile = EmbeddingProfileId::new("alt").unwrap();
 
         let hits = client
-            .search(&[0.3, 0.4], 7, Some(&SourceId("src-1".into())))
+            .search(
+                &alt_profile,
+                &[0.3, 0.4],
+                7,
+                Some(&SourceId("src-1".into())),
+            )
             .await
             .unwrap();
 
@@ -641,8 +710,10 @@ mod tests {
         );
         let body: Value = serde_json::from_str(&requests[0].body).unwrap();
         assert_eq!(body["limit"], 7);
-        assert_eq!(body["filter"]["must"][0]["key"], "source_id");
-        assert_eq!(body["filter"]["must"][0]["match"]["value"], "src-1");
+        assert_eq!(body["filter"]["must"][0]["key"], "profile_id");
+        assert_eq!(body["filter"]["must"][0]["match"]["value"], "alt");
+        assert_eq!(body["filter"]["must"][1]["key"], "source_id");
+        assert_eq!(body["filter"]["must"][1]["match"]["value"], "src-1");
         assert_eq!(body["with_payload"][0], "chunk_id");
         assert_eq!(body["with_vector"], false);
     }
@@ -671,5 +742,30 @@ mod tests {
         let body: Value = serde_json::from_str(&requests[1].body).unwrap();
         assert_eq!(body["filter"]["must"][0]["key"], "source_id");
         assert_eq!(body["filter"]["must"][0]["match"]["value"], "src-1");
+    }
+
+    #[tokio::test]
+    async fn delete_source_for_profile_uses_profile_and_source_filters() {
+        let (url, handle) = spawn_server(vec![
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":3}}"#,
+            ),
+        ]);
+        let client = QdrantClient::new(qdrant_config(url));
+        let alt_profile = EmbeddingProfileId::new("alt").unwrap();
+
+        client
+            .delete_source_for_profile(&alt_profile, &SourceId("src-1".into()))
+            .await
+            .unwrap();
+
+        let requests = handle.join().unwrap();
+        let body: Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(body["filter"]["must"][0]["key"], "profile_id");
+        assert_eq!(body["filter"]["must"][0]["match"]["value"], "alt");
+        assert_eq!(body["filter"]["must"][1]["key"], "source_id");
+        assert_eq!(body["filter"]["must"][1]["match"]["value"], "src-1");
     }
 }

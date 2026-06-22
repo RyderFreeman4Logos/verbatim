@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{
     params, params_from_iter,
     types::{Type, Value},
@@ -14,11 +14,13 @@ use crate::task::{
 };
 use crate::traits::VectorDocument;
 use crate::types::{
-    Chunk, ChunkId, ChunkType, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge,
-    GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, ImageArtifact, ImageId, Source, SourceId,
-    SourceStatus,
+    hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
+    EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, ImageArtifact,
+    ImageId, Source, SourceEmbeddingStatus, SourceId, SourceStatus, DEFAULT_EMBEDDING_PROFILE_ID,
 };
 use crate::vision_caption::{CaptionAttempt, ImageCaption, ImageCaptionRecord, ImageCaptionStatus};
+
+const LEGACY_EMBEDDING_PROFILE_CONFIG_HASH: &str = "legacy";
 
 pub struct Store {
     conn: Connection,
@@ -28,11 +30,23 @@ pub struct SourceContentsReplacement<'a> {
     pub source: &'a Source,
     pub evidence: &'a [EvidenceUnit],
     pub chunks: &'a [Chunk],
+    pub embedding_profile_id: &'a EmbeddingProfileId,
     pub vectors: &'a [VectorDocument],
     pub links: &'a [(ChunkId, EvidenceId)],
     pub image_artifacts: &'a [ImageArtifact],
     pub graph_nodes: &'a [GraphNode],
     pub graph_edges: &'a [GraphEdge],
+}
+
+/// Stable configuration that defines an embedding profile's vector semantics.
+#[derive(Clone, Copy, Debug)]
+pub struct EmbeddingProfileConfig<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub dimension: usize,
+    pub normalize: bool,
+    pub query_instruction: &'a str,
+    pub document_instruction: &'a str,
 }
 
 impl Store {
@@ -53,6 +67,7 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         self.conn.execute_batch(SCHEMA)?;
+        migrate_embedding_profile_tables(&self.conn)?;
         ensure_column(
             &self.conn,
             "evidence_units",
@@ -127,20 +142,21 @@ impl Store {
     pub fn remove_source(&self, id: &SourceId) -> Result<u64> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-        let generation = bump_index_generation(&tx)?;
+        let generation = bump_all_profile_index_generations(&tx)?;
         tx.commit()?;
         Ok(generation)
     }
 
-    pub fn remove_source_and_replace_vectors(
+    pub fn remove_source_and_replace_vectors_for_profile(
         &self,
+        profile_id: &EmbeddingProfileId,
         id: &SourceId,
         vectors: &[VectorDocument],
     ) -> Result<u64> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-        replace_vector_documents_tx(&tx, vectors)?;
-        let generation = bump_index_generation(&tx)?;
+        replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
+        let generation = bump_all_profile_index_generations(&tx)?;
         tx.commit()?;
         Ok(generation)
     }
@@ -153,6 +169,7 @@ impl Store {
             source,
             evidence,
             chunks,
+            embedding_profile_id,
             vectors,
             links,
             image_artifacts,
@@ -207,19 +224,36 @@ impl Store {
         insert_image_artifacts_tx(&tx, image_artifacts)?;
         upsert_graph_nodes_tx(&tx, graph_nodes)?;
         upsert_graph_edges_tx(&tx, graph_edges)?;
-        replace_vector_documents_tx(&tx, vectors)?;
+        replace_source_vector_documents_for_profile_tx(
+            &tx,
+            embedding_profile_id,
+            &source.id,
+            vectors,
+        )?;
+        set_source_embedding_status_tx(
+            &tx,
+            embedding_profile_id,
+            &source.id,
+            SourceEmbeddingStatus::Embedded,
+            vectors.len(),
+            None,
+        )?;
 
-        let generation = bump_index_generation(&tx)?;
+        let generation = bump_all_profile_index_generations(&tx)?;
         tx.commit()?;
         Ok(generation)
     }
 
     pub fn index_generation(&self) -> Result<u64> {
+        self.index_generation_for_profile(&EmbeddingProfileId::default_profile())
+    }
+
+    pub fn index_generation_for_profile(&self, profile_id: &EmbeddingProfileId) -> Result<u64> {
         let value: Option<String> = self
             .conn
             .query_row(
-                "SELECT value FROM index_meta WHERE key = 'generation'",
-                [],
+                "SELECT generation FROM embedding_profile_index_meta WHERE profile_id = ?1",
+                params![profile_id.as_str()],
                 |row| row.get(0),
             )
             .optional()?;
@@ -227,7 +261,7 @@ impl Store {
             .as_deref()
             .unwrap_or("0")
             .parse::<u64>()
-            .context("parse index generation")
+            .context("parse profile index generation")
     }
 
     pub fn update_source_status(&self, id: &SourceId, status: &SourceStatus) -> Result<()> {
@@ -713,6 +747,126 @@ impl Store {
 
     // --- EmbeddingsMeta ---
 
+    pub fn ensure_embedding_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        config: EmbeddingProfileConfig<'_>,
+    ) -> Result<()> {
+        let now = unix_timestamp_string();
+        let query_instruction_hash = embedding_instruction_hash(config.query_instruction);
+        let document_instruction_hash = embedding_instruction_hash(config.document_instruction);
+        let config_hash = embedding_profile_config_hash(
+            config.provider,
+            config.model,
+            config.dimension,
+            config.normalize,
+            &query_instruction_hash,
+            &document_instruction_hash,
+        );
+        self.conn.execute(
+            "INSERT INTO embedding_profiles
+                (id, provider, model, dimension, normalize, query_instruction_hash, document_instruction_hash, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9)
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                profile_id.as_str(),
+                config.provider,
+                config.model,
+                sql_usize(config.dimension),
+                config.normalize,
+                &query_instruction_hash,
+                &document_instruction_hash,
+                &config_hash,
+                &now,
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO embedding_profile_index_meta (profile_id, generation)
+             VALUES (?1, '0')",
+            params![profile_id.as_str()],
+        )?;
+
+        let existing: Option<(String, String, i64, bool, String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT provider, model, dimension, normalize, query_instruction_hash, document_instruction_hash, config_hash
+                 FROM embedding_profiles
+                 WHERE id = ?1",
+                params![profile_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            existing_provider,
+            existing_model,
+            existing_dimension,
+            existing_normalize,
+            existing_query_instruction_hash,
+            existing_document_instruction_hash,
+            existing_hash,
+        )) = existing
+        else {
+            bail!("embedding profile was not persisted: {profile_id}");
+        };
+        if existing_hash == LEGACY_EMBEDDING_PROFILE_CONFIG_HASH {
+            let now = unix_timestamp_string();
+            self.conn.execute(
+                "UPDATE embedding_profiles
+                 SET provider = ?2,
+                     model = ?3,
+                     dimension = ?4,
+                     normalize = ?5,
+                     query_instruction_hash = ?6,
+                     document_instruction_hash = ?7,
+                     config_hash = ?8,
+                     updated_at = ?9
+                 WHERE id = ?1",
+                params![
+                    profile_id.as_str(),
+                    config.provider,
+                    config.model,
+                    sql_usize(config.dimension),
+                    config.normalize,
+                    query_instruction_hash,
+                    document_instruction_hash,
+                    config_hash,
+                    now,
+                ],
+            )?;
+            return Ok(());
+        }
+        if existing_hash != config_hash {
+            bail!(
+                "embedding profile '{}' already exists for provider='{}', model='{}', dimension={}, normalize={}, query_instruction_hash='{}', document_instruction_hash='{}', but current config is provider='{}', model='{}', dimension={}, normalize={}, query_instruction_hash='{}', document_instruction_hash='{}'",
+                profile_id,
+                existing_provider,
+                existing_model,
+                existing_dimension,
+                existing_normalize,
+                existing_query_instruction_hash,
+                existing_document_instruction_hash,
+                config.provider,
+                config.model,
+                config.dimension,
+                config.normalize,
+                query_instruction_hash,
+                document_instruction_hash,
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn set_embedding_meta(
         &self,
         chunk_id: &ChunkId,
@@ -720,18 +874,53 @@ impl Store {
         embedding_model: &str,
         embedded_at: &str,
     ) -> Result<()> {
+        self.set_embedding_meta_for_profile(
+            &EmbeddingProfileId::default_profile(),
+            chunk_id,
+            hnsw_position,
+            embedding_model,
+            embedded_at,
+        )
+    }
+
+    pub fn set_embedding_meta_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        chunk_id: &ChunkId,
+        hnsw_position: i64,
+        embedding_model: &str,
+        embedded_at: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO embeddings_meta (chunk_id, hnsw_position, embedding_model, embedded_at) VALUES (?1, ?2, ?3, ?4)",
-            params![chunk_id.0, hnsw_position, embedding_model, embedded_at],
+            "INSERT OR REPLACE INTO embeddings_meta
+                (profile_id, chunk_id, hnsw_position, embedding_model, embedded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                profile_id.as_str(),
+                chunk_id.0,
+                hnsw_position,
+                embedding_model,
+                embedded_at
+            ],
         )?;
         Ok(())
     }
 
     pub fn get_embedding_meta(&self, chunk_id: &ChunkId) -> Result<Option<(i64, String, String)>> {
+        self.get_embedding_meta_for_profile(&EmbeddingProfileId::default_profile(), chunk_id)
+    }
+
+    pub fn get_embedding_meta_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        chunk_id: &ChunkId,
+    ) -> Result<Option<(i64, String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT hnsw_position, embedding_model, embedded_at FROM embeddings_meta WHERE chunk_id = ?1"
+            "SELECT hnsw_position, embedding_model, embedded_at
+             FROM embeddings_meta
+             WHERE profile_id = ?1 AND chunk_id = ?2",
         )?;
-        let mut rows = stmt.query_map(params![chunk_id.0], |row| {
+        let mut rows = stmt.query_map(params![profile_id.as_str(), chunk_id.0], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -745,17 +934,60 @@ impl Store {
     }
 
     pub fn replace_all_vector_documents(&self, vectors: &[VectorDocument]) -> Result<()> {
+        self.replace_all_vector_documents_for_profile(
+            &EmbeddingProfileId::default_profile(),
+            vectors,
+        )
+    }
+
+    pub fn replace_all_vector_documents_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        vectors: &[VectorDocument],
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        replace_vector_documents_tx(&tx, vectors)?;
+        replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
+        let _ = bump_profile_index_generation(&tx, profile_id)?;
         tx.commit()?;
         Ok(())
     }
 
-    pub fn list_vector_documents(&self) -> Result<Vec<VectorDocument>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT chunk_id, source_id, vector_json FROM chunk_vectors ORDER BY source_id, chunk_id",
+    pub fn replace_source_vector_documents_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_id: &SourceId,
+        vectors: &[VectorDocument],
+    ) -> Result<u64> {
+        let tx = self.conn.unchecked_transaction()?;
+        replace_source_vector_documents_for_profile_tx(&tx, profile_id, source_id, vectors)?;
+        set_source_embedding_status_tx(
+            &tx,
+            profile_id,
+            source_id,
+            SourceEmbeddingStatus::Embedded,
+            vectors.len(),
+            None,
         )?;
-        let rows = stmt.query_map([], |row| {
+        let generation = bump_profile_index_generation(&tx, profile_id)?;
+        tx.commit()?;
+        Ok(generation)
+    }
+
+    pub fn list_vector_documents(&self) -> Result<Vec<VectorDocument>> {
+        self.list_vector_documents_for_profile(&EmbeddingProfileId::default_profile())
+    }
+
+    pub fn list_vector_documents_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<Vec<VectorDocument>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_id, source_id, vector_json
+             FROM chunk_vectors
+             WHERE profile_id = ?1
+             ORDER BY source_id, chunk_id",
+        )?;
+        let rows = stmt.query_map(params![profile_id.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -773,6 +1005,47 @@ impl Store {
             });
         }
         Ok(result)
+    }
+
+    pub fn count_vector_documents_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_filter: Option<&SourceId>,
+    ) -> Result<usize> {
+        let count: i64 = match source_filter {
+            Some(source_id) => self.conn.query_row(
+                "SELECT COUNT(*) FROM chunk_vectors WHERE profile_id = ?1 AND source_id = ?2",
+                params![profile_id.as_str(), source_id.0],
+                |row| row.get(0),
+            )?,
+            None => self.conn.query_row(
+                "SELECT COUNT(*) FROM chunk_vectors WHERE profile_id = ?1",
+                params![profile_id.as_str()],
+                |row| row.get(0),
+            )?,
+        };
+        Ok(count.try_into().unwrap_or_default())
+    }
+
+    pub fn set_source_embedding_status(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_id: &SourceId,
+        status: SourceEmbeddingStatus,
+        vector_count: usize,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        set_source_embedding_status_tx(
+            &tx,
+            profile_id,
+            source_id,
+            status,
+            vector_count,
+            error_message,
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     // --- Task ---
@@ -1062,6 +1335,157 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) 
     Ok(())
 }
 
+fn migrate_embedding_profile_tables(conn: &Connection) -> Result<()> {
+    let now = unix_timestamp_string();
+    let had_query_instruction_hash =
+        table_has_column(conn, "embedding_profiles", "query_instruction_hash")?;
+    let had_document_instruction_hash =
+        table_has_column(conn, "embedding_profiles", "document_instruction_hash")?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "query_instruction_hash",
+        "ALTER TABLE embedding_profiles ADD COLUMN query_instruction_hash TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "document_instruction_hash",
+        "ALTER TABLE embedding_profiles ADD COLUMN document_instruction_hash TEXT NOT NULL DEFAULT ''",
+    )?;
+    if !had_query_instruction_hash || !had_document_instruction_hash {
+        backfill_embedding_profile_instruction_hashes(conn)?;
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO embedding_profiles
+            (id, provider, model, dimension, normalize, query_instruction_hash, document_instruction_hash, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
+         VALUES (?1, 'legacy', 'legacy', 0, 1, '', '', ?2, NULL, NULL, ?3, ?3)",
+        params![
+            DEFAULT_EMBEDDING_PROFILE_ID,
+            LEGACY_EMBEDDING_PROFILE_CONFIG_HASH,
+            now
+        ],
+    )?;
+
+    if !table_has_column(conn, "chunk_vectors", "profile_id")? {
+        conn.execute_batch(
+            "
+            ALTER TABLE chunk_vectors RENAME TO chunk_vectors_legacy_profile_migration;
+            CREATE TABLE chunk_vectors (
+                profile_id TEXT NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+                chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                vector_json TEXT NOT NULL,
+                PRIMARY KEY (profile_id, chunk_id)
+            );
+            INSERT INTO chunk_vectors (profile_id, chunk_id, source_id, vector_json)
+                SELECT 'default', chunk_id, source_id, vector_json
+                FROM chunk_vectors_legacy_profile_migration;
+            DROP TABLE chunk_vectors_legacy_profile_migration;
+            ",
+        )?;
+    }
+
+    if !table_has_column(conn, "embeddings_meta", "profile_id")? {
+        conn.execute_batch(
+            "
+            ALTER TABLE embeddings_meta RENAME TO embeddings_meta_legacy_profile_migration;
+            CREATE TABLE embeddings_meta (
+                profile_id TEXT NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+                chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+                hnsw_position INTEGER NOT NULL,
+                embedding_model TEXT NOT NULL,
+                embedded_at TEXT NOT NULL,
+                PRIMARY KEY (profile_id, chunk_id)
+            );
+            INSERT INTO embeddings_meta (profile_id, chunk_id, hnsw_position, embedding_model, embedded_at)
+                SELECT 'default', chunk_id, hnsw_position, embedding_model, embedded_at
+                FROM embeddings_meta_legacy_profile_migration;
+            DROP TABLE embeddings_meta_legacy_profile_migration;
+            ",
+        )?;
+    }
+
+    let legacy_generation: Option<String> = conn
+        .query_row(
+            "SELECT value FROM index_meta WHERE key = 'generation'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    conn.execute(
+        "INSERT OR IGNORE INTO embedding_profile_index_meta (profile_id, generation)
+         VALUES (?1, ?2)",
+        params![
+            DEFAULT_EMBEDDING_PROFILE_ID,
+            legacy_generation.as_deref().unwrap_or("0"),
+        ],
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS chunk_vectors_profile_source_idx
+            ON chunk_vectors(profile_id, source_id);",
+    )?;
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn backfill_embedding_profile_instruction_hashes(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT id, provider, model, dimension, normalize, config_hash
+             FROM embedding_profiles",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let empty_instruction_hash = embedding_instruction_hash("");
+    for (id, provider, model, dimension, normalize, old_config_hash) in rows {
+        if old_config_hash == LEGACY_EMBEDDING_PROFILE_CONFIG_HASH {
+            continue;
+        }
+        let dimension = usize::try_from(dimension).with_context(|| {
+            format!("invalid embedding profile dimension for profile '{id}': {dimension}")
+        })?;
+        let config_hash = embedding_profile_config_hash(
+            &provider,
+            &model,
+            dimension,
+            normalize,
+            &empty_instruction_hash,
+            &empty_instruction_hash,
+        );
+        conn.execute(
+            "UPDATE embedding_profiles
+             SET query_instruction_hash = ?2,
+                 document_instruction_hash = ?2,
+                 config_hash = ?3
+             WHERE id = ?1",
+            params![id, &empty_instruction_hash, config_hash],
+        )?;
+    }
+    Ok(())
+}
+
 fn insert_evidence_units_tx(tx: &Transaction<'_>, units: &[EvidenceUnit]) -> Result<()> {
     let mut stmt = tx.prepare(
         "INSERT INTO evidence_units (id, source_id, kind, locator_json, text, text_hash, heading_path_json, position, derived_from_evidence_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
@@ -1292,6 +1716,30 @@ fn sql_limit(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
+fn sql_usize(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn embedding_profile_config_hash(
+    provider: &str,
+    model: &str,
+    dimension: usize,
+    normalize: bool,
+    query_instruction_hash: &str,
+    document_instruction_hash: &str,
+) -> String {
+    hex_sha256(
+        format!(
+            "{provider}\0{model}\0{dimension}\0{normalize}\0{query_instruction_hash}\0{document_instruction_hash}"
+        )
+        .as_bytes(),
+    )
+}
+
+fn embedding_instruction_hash(instruction: &str) -> String {
+    hex_sha256(instruction.as_bytes())
+}
+
 fn row_to_image_caption_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageCaptionRecord> {
     let caption_json: Option<String> = row.get(5)?;
     let caption = match caption_json {
@@ -1378,15 +1826,53 @@ fn get_evidence_ids_for_chunk(conn: &Connection, chunk_id: &str) -> Result<Vec<E
     rows.map(|r| Ok(EvidenceId(r?))).collect()
 }
 
-fn replace_vector_documents_tx(tx: &Transaction<'_>, vectors: &[VectorDocument]) -> Result<()> {
-    tx.execute("DELETE FROM chunk_vectors", [])
-        .context("clear chunk vectors")?;
+fn replace_vector_documents_for_profile_tx(
+    tx: &Transaction<'_>,
+    profile_id: &EmbeddingProfileId,
+    vectors: &[VectorDocument],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM chunk_vectors WHERE profile_id = ?1",
+        params![profile_id.as_str()],
+    )
+    .with_context(|| format!("clear chunk vectors for embedding profile {profile_id}"))?;
+    insert_vector_documents_for_profile_tx(tx, profile_id, vectors)
+}
+
+fn replace_source_vector_documents_for_profile_tx(
+    tx: &Transaction<'_>,
+    profile_id: &EmbeddingProfileId,
+    source_id: &SourceId,
+    vectors: &[VectorDocument],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM chunk_vectors WHERE profile_id = ?1 AND source_id = ?2",
+        params![profile_id.as_str(), &source_id.0],
+    )
+    .with_context(|| {
+        format!(
+            "clear chunk vectors for embedding profile {profile_id} and source {}",
+            source_id.0
+        )
+    })?;
+    insert_vector_documents_for_profile_tx(tx, profile_id, vectors)
+}
+
+fn insert_vector_documents_for_profile_tx(
+    tx: &Transaction<'_>,
+    profile_id: &EmbeddingProfileId,
+    vectors: &[VectorDocument],
+) -> Result<()> {
     let mut stmt = tx
-        .prepare("INSERT INTO chunk_vectors (chunk_id, source_id, vector_json) VALUES (?1, ?2, ?3)")
+        .prepare(
+            "INSERT INTO chunk_vectors (profile_id, chunk_id, source_id, vector_json)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
         .context("prepare vector insert")?;
     for vector in vectors {
         let vector_json = serde_json::to_string(&vector.vector).context("serialize vector")?;
         stmt.execute(params![
+            profile_id.as_str(),
             &vector.chunk_id.0,
             &vector.source_id.0,
             vector_json,
@@ -1396,11 +1882,50 @@ fn replace_vector_documents_tx(tx: &Transaction<'_>, vectors: &[VectorDocument])
     Ok(())
 }
 
-fn bump_index_generation(tx: &Transaction<'_>) -> Result<u64> {
+fn set_source_embedding_status_tx(
+    tx: &Transaction<'_>,
+    profile_id: &EmbeddingProfileId,
+    source_id: &SourceId,
+    status: SourceEmbeddingStatus,
+    vector_count: usize,
+    error_message: Option<&str>,
+) -> Result<()> {
+    let now = unix_timestamp_string();
+    tx.execute(
+        "INSERT INTO source_embedding_status
+            (profile_id, source_id, status, vector_count, embedded_at, error_message, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5)
+         ON CONFLICT(profile_id, source_id) DO UPDATE SET
+            status = excluded.status,
+            vector_count = excluded.vector_count,
+            embedded_at = excluded.embedded_at,
+            error_message = excluded.error_message,
+            updated_at = excluded.updated_at",
+        params![
+            profile_id.as_str(),
+            &source_id.0,
+            status.as_str(),
+            sql_usize(vector_count),
+            &now,
+            error_message,
+        ],
+    )?;
+    Ok(())
+}
+
+fn bump_profile_index_generation(
+    tx: &Transaction<'_>,
+    profile_id: &EmbeddingProfileId,
+) -> Result<u64> {
+    tx.execute(
+        "INSERT OR IGNORE INTO embedding_profile_index_meta (profile_id, generation)
+         VALUES (?1, '0')",
+        params![profile_id.as_str()],
+    )?;
     let current: Option<String> = tx
         .query_row(
-            "SELECT value FROM index_meta WHERE key = 'generation'",
-            [],
+            "SELECT generation FROM embedding_profile_index_meta WHERE profile_id = ?1",
+            params![profile_id.as_str()],
             |row| row.get(0),
         )
         .optional()?;
@@ -1408,13 +1933,35 @@ fn bump_index_generation(tx: &Transaction<'_>) -> Result<u64> {
         .as_deref()
         .unwrap_or("0")
         .parse::<u64>()
-        .context("parse current index generation")?
+        .context("parse current profile index generation")?
         .saturating_add(1);
     tx.execute(
-        "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('generation', ?1)",
-        params![next.to_string()],
+        "INSERT OR REPLACE INTO embedding_profile_index_meta (profile_id, generation)
+         VALUES (?1, ?2)",
+        params![profile_id.as_str(), next.to_string()],
     )?;
     Ok(next)
+}
+
+fn bump_all_profile_index_generations(tx: &Transaction<'_>) -> Result<u64> {
+    tx.execute(
+        "INSERT OR IGNORE INTO embedding_profile_index_meta (profile_id, generation)
+         SELECT id, '0' FROM embedding_profiles",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE embedding_profile_index_meta
+         SET generation = CAST(generation AS INTEGER) + 1",
+        [],
+    )?;
+    let default_generation: String = tx.query_row(
+        "SELECT generation FROM embedding_profile_index_meta WHERE profile_id = ?1",
+        params![DEFAULT_EMBEDDING_PROFILE_ID],
+        |row| row.get(0),
+    )?;
+    default_generation
+        .parse::<u64>()
+        .context("parse default profile index generation")
 }
 
 fn status_to_str(s: &SourceStatus) -> &'static str {
@@ -1604,10 +2151,36 @@ CREATE TABLE IF NOT EXISTS chunk_evidence (
     evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
     PRIMARY KEY (chunk_id, evidence_unit_id)
 );
+CREATE TABLE IF NOT EXISTS embedding_profiles (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dimension INTEGER NOT NULL,
+    normalize INTEGER NOT NULL,
+    query_instruction_hash TEXT NOT NULL DEFAULT '',
+    document_instruction_hash TEXT NOT NULL DEFAULT '',
+    config_hash TEXT NOT NULL,
+    qdrant_collection TEXT,
+    qdrant_vector_name TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS chunk_vectors (
-    chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+    profile_id TEXT NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
     source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    vector_json TEXT NOT NULL
+    vector_json TEXT NOT NULL,
+    PRIMARY KEY (profile_id, chunk_id)
+);
+CREATE TABLE IF NOT EXISTS source_embedding_status (
+    profile_id TEXT NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    vector_count INTEGER NOT NULL,
+    embedded_at TEXT,
+    error_message TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, source_id)
 );
 CREATE TABLE IF NOT EXISTS graph_nodes (
     id TEXT PRIMARY KEY,
@@ -1680,14 +2253,20 @@ CREATE INDEX IF NOT EXISTS task_spans_task_id_idx
 CREATE INDEX IF NOT EXISTS task_spans_phase_idx
     ON task_spans(phase);
 CREATE TABLE IF NOT EXISTS embeddings_meta (
-    chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+    profile_id TEXT NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
     hnsw_position INTEGER NOT NULL,
     embedding_model TEXT NOT NULL,
-    embedded_at TEXT NOT NULL
+    embedded_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, chunk_id)
 );
 CREATE TABLE IF NOT EXISTS index_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS embedding_profile_index_meta (
+    profile_id TEXT PRIMARY KEY REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+    generation TEXT NOT NULL
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
     chunk_id UNINDEXED,
@@ -1750,6 +2329,7 @@ mod tests {
     };
     use crate::types::{BBox, SourceLocator};
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     fn sample_source() -> Source {
         Source {
@@ -1843,6 +2423,332 @@ mod tests {
                 y1: 4.0,
             }),
         }
+    }
+
+    fn profile_id(id: &str) -> EmbeddingProfileId {
+        EmbeddingProfileId::new(id).unwrap()
+    }
+
+    fn test_profile_config<'a>(
+        provider: &'a str,
+        model: &'a str,
+        dimension: usize,
+        normalize: bool,
+        query_instruction: &'a str,
+        document_instruction: &'a str,
+    ) -> EmbeddingProfileConfig<'a> {
+        EmbeddingProfileConfig {
+            provider,
+            model,
+            dimension,
+            normalize,
+            query_instruction,
+            document_instruction,
+        }
+    }
+
+    fn ensure_test_profile(store: &Store, profile_id: &EmbeddingProfileId) {
+        store
+            .ensure_embedding_profile(
+                profile_id,
+                test_profile_config("test", profile_id.as_str(), 2, true, "", ""),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_single_profile_vectors_migrate_to_default_profile() {
+        let tempdir = tempdir().unwrap();
+        let db_path = tempdir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE sources (
+                    id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    parser_used TEXT,
+                    last_ingested_at TEXT
+                );
+                CREATE TABLE chunks (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                    text TEXT NOT NULL,
+                    context_text TEXT,
+                    token_count INTEGER NOT NULL,
+                    chunk_type TEXT NOT NULL,
+                    parent_chunk_id TEXT REFERENCES chunks(id),
+                    heading_path_json TEXT
+                );
+                CREATE TABLE chunk_vectors (
+                    chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+                    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                    vector_json TEXT NOT NULL
+                );
+                CREATE TABLE embeddings_meta (
+                    chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+                    hnsw_position INTEGER NOT NULL,
+                    embedding_model TEXT NOT NULL,
+                    embedded_at TEXT NOT NULL
+                );
+                CREATE TABLE index_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at)
+                    VALUES ('src-1', '/tmp/test.pdf', 'abc', 'Indexed', 'pdf_oxide', NULL);
+                INSERT INTO chunks (id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json)
+                    VALUES ('child-1', 'src-1', 'text', NULL, 1, 'Child', NULL, '[]');
+                INSERT INTO chunk_vectors (chunk_id, source_id, vector_json)
+                    VALUES ('child-1', 'src-1', '[1.0,0.0]');
+                INSERT INTO embeddings_meta (chunk_id, hnsw_position, embedding_model, embedded_at)
+                    VALUES ('child-1', 3, 'legacy-model', '2025-01-01');
+                INSERT INTO index_meta (key, value) VALUES ('generation', '7');
+                ",
+            )
+            .unwrap();
+        }
+
+        let store = Store::new(&db_path).unwrap();
+        let default_profile = EmbeddingProfileId::default_profile();
+        let vectors = store
+            .list_vector_documents_for_profile(&default_profile)
+            .unwrap();
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].chunk_id.0, "child-1");
+        assert_eq!(vectors[0].vector, vec![1.0, 0.0]);
+        assert_eq!(
+            store
+                .get_embedding_meta_for_profile(&default_profile, &ChunkId("child-1".into()))
+                .unwrap(),
+            Some((3, "legacy-model".into(), "2025-01-01".into()))
+        );
+        assert_eq!(
+            store
+                .index_generation_for_profile(&default_profile)
+                .unwrap(),
+            7
+        );
+
+        store
+            .ensure_embedding_profile(
+                &default_profile,
+                test_profile_config(
+                    "custom",
+                    "custom-model",
+                    384,
+                    false,
+                    "query instruction",
+                    "document instruction",
+                ),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn embedding_profile_rejects_changed_document_instruction() {
+        let store = Store::in_memory().unwrap();
+        let profile = profile_id("instructional");
+        store
+            .ensure_embedding_profile(
+                &profile,
+                test_profile_config(
+                    "test",
+                    "model",
+                    2,
+                    true,
+                    "same query",
+                    "document instruction v1",
+                ),
+            )
+            .unwrap();
+
+        let query_err = store
+            .ensure_embedding_profile(
+                &profile,
+                test_profile_config(
+                    "test",
+                    "model",
+                    2,
+                    true,
+                    "changed query",
+                    "document instruction v1",
+                ),
+            )
+            .unwrap_err();
+        assert!(query_err.to_string().contains("query_instruction_hash"));
+
+        let err = store
+            .ensure_embedding_profile(
+                &profile,
+                test_profile_config(
+                    "test",
+                    "model",
+                    2,
+                    true,
+                    "same query",
+                    "document instruction v2",
+                ),
+            )
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("embedding profile 'instructional' already exists"));
+        assert!(err.to_string().contains("document_instruction_hash"));
+    }
+
+    #[test]
+    fn embedding_profile_migration_preserves_nonlegacy_config_compatibility() {
+        let tempdir = tempdir().unwrap();
+        let db_path = tempdir.path().join("profiles.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE embedding_profiles (
+                    id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    normalize INTEGER NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    qdrant_collection TEXT,
+                    qdrant_vector_name TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO embedding_profiles
+                    (id, provider, model, dimension, normalize, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
+                    VALUES ('custom', 'provider-a', 'model-a', 2, 1, 'pre-instruction-config', NULL, NULL, '2026-01-01', '2026-01-01');
+                ",
+            )
+            .unwrap();
+        }
+
+        let store = Store::new(&db_path).unwrap();
+        let profile = profile_id("custom");
+        let err = store
+            .ensure_embedding_profile(
+                &profile,
+                test_profile_config("provider-b", "model-a", 2, true, "", ""),
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("embedding profile 'custom' already exists"));
+
+        store
+            .ensure_embedding_profile(
+                &profile,
+                test_profile_config("provider-a", "model-a", 2, true, "", ""),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn stores_multiple_profile_vectors_for_same_chunk() {
+        let store = Store::in_memory().unwrap();
+        store.add_source(&sample_source()).unwrap();
+        store.bulk_insert_chunks(&sample_chunks("src-1")).unwrap();
+        let default_profile = EmbeddingProfileId::default_profile();
+        let alt_profile = profile_id("alt");
+        ensure_test_profile(&store, &alt_profile);
+
+        store
+            .replace_all_vector_documents_for_profile(
+                &default_profile,
+                &[VectorDocument {
+                    chunk_id: ChunkId("child-1".into()),
+                    source_id: SourceId("src-1".into()),
+                    vector: vec![1.0, 0.0],
+                }],
+            )
+            .unwrap();
+        store
+            .replace_all_vector_documents_for_profile(
+                &alt_profile,
+                &[VectorDocument {
+                    chunk_id: ChunkId("child-1".into()),
+                    source_id: SourceId("src-1".into()),
+                    vector: vec![0.0, 1.0],
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .list_vector_documents_for_profile(&default_profile)
+                .unwrap()[0]
+                .vector,
+            vec![1.0, 0.0]
+        );
+        assert_eq!(
+            store
+                .list_vector_documents_for_profile(&alt_profile)
+                .unwrap()[0]
+                .vector,
+            vec![0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn replacing_one_profile_does_not_delete_another_profiles_vectors() {
+        let store = Store::in_memory().unwrap();
+        store.add_source(&sample_source()).unwrap();
+        store.bulk_insert_chunks(&sample_chunks("src-1")).unwrap();
+        let default_profile = EmbeddingProfileId::default_profile();
+        let alt_profile = profile_id("alt");
+        ensure_test_profile(&store, &alt_profile);
+
+        store
+            .replace_all_vector_documents_for_profile(
+                &default_profile,
+                &[VectorDocument {
+                    chunk_id: ChunkId("child-1".into()),
+                    source_id: SourceId("src-1".into()),
+                    vector: vec![1.0, 0.0],
+                }],
+            )
+            .unwrap();
+        store
+            .replace_all_vector_documents_for_profile(
+                &alt_profile,
+                &[VectorDocument {
+                    chunk_id: ChunkId("child-1".into()),
+                    source_id: SourceId("src-1".into()),
+                    vector: vec![0.0, 1.0],
+                }],
+            )
+            .unwrap();
+
+        store
+            .replace_all_vector_documents_for_profile(
+                &alt_profile,
+                &[VectorDocument {
+                    chunk_id: ChunkId("child-1".into()),
+                    source_id: SourceId("src-1".into()),
+                    vector: vec![0.5, 0.5],
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .list_vector_documents_for_profile(&default_profile)
+                .unwrap()[0]
+                .vector,
+            vec![1.0, 0.0]
+        );
+        assert_eq!(
+            store
+                .list_vector_documents_for_profile(&alt_profile)
+                .unwrap()[0]
+                .vector,
+            vec![0.5, 0.5]
+        );
     }
 
     fn sample_graph_node(
