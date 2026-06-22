@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::task::{TaskEvent, TaskSpan, TaskSummary};
-use crate::types::{BBox, ImageArtifact, RetrievalDebug};
+use crate::types::{BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceLocator};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddSourceRequest {
@@ -98,6 +98,95 @@ pub struct AskResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveRequest {
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    #[serde(default)]
+    pub fast: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_top_k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_top_k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_top_n: Option<usize>,
+    #[serde(default)]
+    pub include_debug: bool,
+    #[serde(default)]
+    pub include_locator: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrieveResponse {
+    pub task_id: String,
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    pub embedding_profile_id: String,
+    pub limit: usize,
+    pub page_size: usize,
+    pub page: usize,
+    pub total_results: usize,
+    pub returned_results: usize,
+    pub controls: RetrieveControlsResponse,
+    #[serde(default)]
+    pub timings: Vec<RetrieveTimingResponse>,
+    #[serde(default)]
+    pub results: Vec<RetrieveResultResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<RetrievalDebug>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveControlsResponse {
+    pub fast: bool,
+    pub rerank_enabled: bool,
+    pub dense_top_k: usize,
+    pub bm25_top_k: usize,
+    pub rrf_k: usize,
+    pub rerank_top_n: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveTimingResponse {
+    pub phase: String,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrieveResultResponse {
+    pub index: usize,
+    pub rank: usize,
+    pub label: String,
+    pub evidence_id: String,
+    pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    pub chunk_id: String,
+    pub kind: String,
+    pub role: String,
+    pub score: f32,
+    pub locator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_locator: Option<SourceLocator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<RetrievalProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<String>,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CitationResponse {
     pub label: String,
     pub evidence_id: String,
@@ -178,3 +267,75 @@ pub struct AskErrorEvent {
 }
 
 pub type ConfigResponse = Value;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrieve_request_defaults_to_context_only_compact_output() {
+        let request: RetrieveRequest =
+            serde_json::from_value(serde_json::json!({"question": "What is cited?"})).unwrap();
+
+        assert_eq!(request.question, "What is cited?");
+        assert!(request.source_id.is_none());
+        assert!(request.limit.is_none());
+        assert!(request.page_size.is_none());
+        assert!(!request.fast);
+        assert!(request.rerank.is_none());
+        assert!(!request.include_debug);
+        assert!(!request.include_locator);
+    }
+
+    #[test]
+    fn retrieve_result_omits_structured_locator_until_requested() {
+        let response = RetrieveResponse {
+            task_id: "task-1".into(),
+            query: "What is cited?".into(),
+            source_id: None,
+            embedding_profile_id: "default".into(),
+            limit: 12,
+            page_size: 1,
+            page: 1,
+            total_results: 1,
+            returned_results: 1,
+            controls: RetrieveControlsResponse {
+                fast: false,
+                rerank_enabled: false,
+                dense_top_k: 80,
+                bm25_top_k: 50,
+                rrf_k: 60,
+                rerank_top_n: 12,
+            },
+            timings: vec![RetrieveTimingResponse {
+                phase: "retrieval".into(),
+                duration_ms: 7,
+            }],
+            results: vec![RetrieveResultResponse {
+                index: 0,
+                rank: 1,
+                label: "E1".into(),
+                evidence_id: "ev-1".into(),
+                source_id: "src-1".into(),
+                source_path: Some("/tmp/doc.md".into()),
+                chunk_id: "chunk-1".into(),
+                kind: "text".into(),
+                role: "original_text".into(),
+                score: 0.03,
+                locator: "/tmp/doc.md L1".into(),
+                structured_locator: None,
+                provenance: None,
+                derived_from: None,
+                snippet: "compact cited text".into(),
+            }],
+            debug: None,
+        };
+
+        let encoded = serde_json::to_string(&response).unwrap();
+
+        assert!(encoded.contains("\"locator\""));
+        assert!(!encoded.contains("structured_locator"));
+        assert!(!encoded.contains("provenance"));
+        assert!(!encoded.contains("debug"));
+    }
+}

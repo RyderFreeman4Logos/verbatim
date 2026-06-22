@@ -2038,6 +2038,7 @@ mod tests {
             dense_top_k: 1,
             bm25_top_k: 10,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let profile_id = EmbeddingProfileId::new("alt").unwrap();
         let pipeline = RetrievalPipeline::new(
@@ -2072,6 +2073,7 @@ mod tests {
             dense_top_k: 1,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let qdrant = qdrant_config(qdrant_url);
         let pipeline = RetrievalPipeline::new(
@@ -2116,6 +2118,7 @@ mod tests {
             dense_top_k: 1,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let qdrant = qdrant_config(qdrant_url);
         let pipeline = RetrievalPipeline::new(
@@ -2170,6 +2173,7 @@ mod tests {
             dense_top_k: 2,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let qdrant = qdrant_config(qdrant_url);
         let pipeline = RetrievalPipeline::new(
@@ -2234,6 +2238,7 @@ mod tests {
             dense_top_k: 2,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let qdrant = qdrant_config(qdrant_url);
         let pipeline = RetrievalPipeline::new(
@@ -2279,6 +2284,7 @@ mod tests {
             dense_top_k: 1,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let qdrant = qdrant_config(qdrant_url);
         let pipeline = RetrievalPipeline::new(
@@ -2319,6 +2325,7 @@ mod tests {
             dense_top_k: 3,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let rerank_config = RerankConfig {
             enabled: true,
@@ -2373,6 +2380,7 @@ mod tests {
             dense_top_k: 1,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let rerank_config = RerankConfig {
             enabled: true,
@@ -2417,6 +2425,7 @@ mod tests {
             dense_top_k: 2,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let rerank_config = RerankConfig {
             enabled: false,
@@ -2458,6 +2467,7 @@ mod tests {
             dense_top_k: 2,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let rerank_config = RerankConfig {
             enabled: true,
@@ -2506,6 +2516,7 @@ mod tests {
             dense_top_k: 3,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let rerank_config = RerankConfig {
             enabled: true,
@@ -2552,6 +2563,7 @@ mod tests {
             dense_top_k: 2,
             bm25_top_k: 0,
             rrf_k: 60,
+            ..RetrievalConfig::default()
         };
         let rerank_config = RerankConfig {
             enabled: true,

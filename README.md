@@ -27,3 +27,8 @@ See [docs/mvp.md](docs/mvp.md) for the full MVP release gate, local model
 configuration, daemon setup, manual smoke sequence, PDF image notes, reranker,
 graph retrieval toggles, optional Qdrant sync/search, and troubleshooting. See
 [docs/evals.md](docs/evals.md) for deterministic MVP regression fixtures.
+
+Use `verbatim retrieve "question"` for a compact ranked context/evidence pack
+without invoking the chat model. Use `verbatim ask "question"` when you want
+Verbatim to call the configured chat model and generate a natural-language
+answer.

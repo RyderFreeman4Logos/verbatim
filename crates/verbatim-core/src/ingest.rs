@@ -3197,6 +3197,7 @@ model = "local-vision"
                 dense_top_k: 5,
                 bm25_top_k: 5,
                 rrf_k: 60,
+                ..RetrievalConfig::default()
             };
             let retrieval = RetrievalPipeline::new(
                 pipeline.hnsw(),
@@ -3232,6 +3233,7 @@ model = "local-vision"
                 dense_top_k: 0,
                 bm25_top_k: 3,
                 rrf_k: 60,
+                ..RetrievalConfig::default()
             };
             let graph_config = GraphConfig {
                 enabled: true,

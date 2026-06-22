@@ -10,8 +10,9 @@ use serde::Serialize;
 use serde_json::Value;
 use verbatim_core::api::{
     AddSourceRequest, AddSourceResponse, AskRequest, CheckStaleResponse, ConfigResponse,
-    EvidenceResponse, HealthResponse, IngestResponse, SourceResponse, TaskCreatedResponse,
-    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse,
+    EvidenceResponse, HealthResponse, IngestResponse, RetrieveRequest, RetrieveResponse,
+    SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest,
+    TaskSummaryResponse,
 };
 use verbatim_core::config::{self, Config, DaemonConfig};
 
@@ -94,6 +95,7 @@ pub trait DaemonClient {
     fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> CliResult<()>
     where
         W: Write;
+    fn retrieve(&self, request: &RetrieveRequest) -> CliResult<RetrieveResponse>;
     fn get_evidence(&self, evidence_id: &str) -> CliResult<EvidenceResponse>;
     fn get_config(&self) -> CliResult<ConfigResponse>;
     fn health(&self) -> CliResult<HealthResponse>;
@@ -370,6 +372,10 @@ impl DaemonClient for HttpDaemonClient {
             return Err(http_error(status, response));
         }
         sse::consume_ask_sse(response, stdout)
+    }
+
+    fn retrieve(&self, request: &RetrieveRequest) -> CliResult<RetrieveResponse> {
+        self.request_json(Method::POST, "/api/retrieve", Some(request))
     }
 
     fn get_evidence(&self, evidence_id: &str) -> CliResult<EvidenceResponse> {

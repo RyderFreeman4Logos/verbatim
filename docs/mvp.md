@@ -124,6 +124,13 @@ model = "Qwen/Qwen3-Embedding-8B"
 dimension = 4096
 api_key = ""
 
+[retrieval]
+dense_top_k = 80
+bm25_top_k = 50
+rrf_k = 60
+default_limit = 12
+default_page_size = 1
+
 [chat]
 enabled = true
 provider = "openai_compatible"
@@ -204,10 +211,20 @@ cargo run -p verbatim-cli -- source list
 cargo run -p verbatim-cli -- source inspect <source-id>
 ```
 
-Ingest and ask:
+Ingest and retrieve a context pack without chat generation:
 
 ```sh
 cargo run -p verbatim-cli -- ingest <source-id>
+cargo run -p verbatim-cli -- retrieve \
+  --source-id <source-id> \
+  --page-size 1 \
+  "What does Verbatim answer with?"
+```
+
+Generate an answer with the configured chat model when you explicitly want
+Verbatim to synthesize natural language:
+
+```sh
 cargo run -p verbatim-cli -- ask \
   --source-id <source-id> \
   --show-retrieval \
@@ -225,7 +242,13 @@ Passing signal:
 - `daemon status` reports `ok`.
 - `source list` shows the added source.
 - `ingest` reports one ingested source.
-- `ask` returns an answer with `[E...]` citations.
+- `retrieve` returns a compact context pack with stable result indexes,
+  evidence ids, source identity, display locators, snippets, scores, controls,
+  and retrieval timing without calling the chat model.
+- `retrieve --format json --show-locator` returns structured locator and
+  provenance fields for API callers.
+- `ask` returns an answer with `[E...]` citations after invoking the configured
+  chat model.
 - `--show-retrieval` shows dense/BM25/RRF debug, graph hits when expansion adds
   results, reranker status, and the final evidence pack.
 - `evidence <eid>` prints the source id, evidence kind, locator, position, and
@@ -289,8 +312,11 @@ model = "Qwen/Qwen3-Reranker-4B"
 top_n = 12
 ```
 
-Use `verbatim ask --show-retrieval ...` to confirm whether rerank was skipped,
-disabled, or applied.
+Use `verbatim retrieve --show-debug ...` or
+`verbatim ask --show-retrieval ...` to confirm whether rerank was skipped,
+disabled, or applied. Per-request retrieval flags override config defaults, so
+`verbatim retrieve --fast`, `--no-rerank`, `--dense-top-k`, `--bm25-top-k`, and
+`--rerank-top-n` can trade quality for latency without editing the config.
 
 ## Graph Retrieval
 

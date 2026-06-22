@@ -152,6 +152,10 @@ pub struct RetrievalConfig {
     pub dense_top_k: usize,
     pub bm25_top_k: usize,
     pub rrf_k: usize,
+    #[serde(default = "default_retrieval_limit")]
+    pub default_limit: usize,
+    #[serde(default = "default_retrieval_page_size")]
+    pub default_page_size: usize,
 }
 
 impl Default for RetrievalConfig {
@@ -160,8 +164,18 @@ impl Default for RetrievalConfig {
             dense_top_k: 80,
             bm25_top_k: 50,
             rrf_k: 60,
+            default_limit: default_retrieval_limit(),
+            default_page_size: default_retrieval_page_size(),
         }
     }
+}
+
+fn default_retrieval_limit() -> usize {
+    12
+}
+
+fn default_retrieval_page_size() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -759,6 +773,8 @@ api_key = ""
 dense_top_k = 80
 bm25_top_k = 50
 rrf_k = 60
+default_limit = 12
+default_page_size = 1
 
 [graph]
 enabled = true
@@ -870,6 +886,8 @@ mod tests {
         assert!(config.embedding.normalize);
         assert_eq!(config.embedding.batch_size, 16);
         assert_eq!(config.retrieval.dense_top_k, 80);
+        assert_eq!(config.retrieval.default_limit, 12);
+        assert_eq!(config.retrieval.default_page_size, 1);
         assert!(config.graph.enabled);
         assert_eq!(config.graph.max_hops, 1);
         assert_eq!(config.graph.max_expanded_chunks, 30);
