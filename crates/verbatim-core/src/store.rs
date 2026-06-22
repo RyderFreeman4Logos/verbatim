@@ -572,6 +572,16 @@ impl Store {
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
+    pub fn list_graph_nodes(&self) -> Result<Vec<GraphNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, kind, external_id, label, locator_json, ordinal, metadata_json
+             FROM graph_nodes
+             ORDER BY source_id, kind, ordinal, id",
+        )?;
+        let rows = stmt.query_map([], row_to_graph_node)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
     pub fn list_graph_edges_by_source(&self, source_id: &SourceId) -> Result<Vec<GraphEdge>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, source_id, edge_type, from_node_id, to_node_id, ordinal, weight, metadata_json
@@ -580,6 +590,16 @@ impl Store {
              ORDER BY edge_type, ordinal, id",
         )?;
         let rows = stmt.query_map(params![source_id.0], row_to_graph_edge)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn list_graph_edges(&self) -> Result<Vec<GraphEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_id, edge_type, from_node_id, to_node_id, ordinal, weight, metadata_json
+             FROM graph_edges
+             ORDER BY source_id, edge_type, ordinal, id",
+        )?;
+        let rows = stmt.query_map([], row_to_graph_edge)?;
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 

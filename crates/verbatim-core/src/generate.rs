@@ -1313,6 +1313,61 @@ mod tests {
         }]
     }
 
+    fn sample_graphrag_report_results() -> Vec<RetrievalResult> {
+        let source_id = SourceId("src".into());
+        let report_id = EvidenceId("graphrag:report:community-test".into());
+        let source_evidence_id = EvidenceId("ev-text-1".into());
+        let chunk_id = ChunkId("graphrag:report-chunk:community-test".into());
+        vec![RetrievalResult {
+            chunk_id: chunk_id.clone(),
+            score: 2.0,
+            chunk: Chunk {
+                id: chunk_id.clone(),
+                source_id: source_id.clone(),
+                text: "Community report: Alpha\nGrounded claims:\n- Alpha is grounded.".into(),
+                context_text: None,
+                token_count: 8,
+                chunk_type: ChunkType::Child,
+                parent_chunk_id: None,
+                heading_path: vec!["GraphRAG global search".into()],
+                evidence_unit_ids: vec![report_id.clone(), source_evidence_id.clone()],
+            },
+            evidence_units: vec![
+                EvidenceUnit {
+                    id: report_id,
+                    source_id: source_id.clone(),
+                    kind: EvidenceKind::Generated,
+                    derived_from: None,
+                    locator: SourceLocator::Document {
+                        path_or_url: "graphrag://community/community-test".into(),
+                        line_start: 1,
+                        line_end: None,
+                    },
+                    text: "Community report: Alpha\nGrounded claims:\n- Alpha is grounded.".into(),
+                    text_hash: "graphrag-report-hash".into(),
+                    heading_path: vec!["GraphRAG global search".into()],
+                    position: 0,
+                },
+                EvidenceUnit {
+                    id: source_evidence_id,
+                    source_id: source_id.clone(),
+                    kind: EvidenceKind::Text,
+                    derived_from: None,
+                    locator: SourceLocator::Document {
+                        path_or_url: "doc.md".into(),
+                        line_start: 1,
+                        line_end: Some(2),
+                    },
+                    text: "Alpha source text.".into(),
+                    text_hash: "source-text-hash".into(),
+                    heading_path: vec![],
+                    position: 1,
+                },
+            ],
+            provenance: RetrievalProvenance::seed(1, chunk_id, source_id),
+        }]
+    }
+
     #[test]
     fn source_pack_includes_all_evidence() {
         let pack = build_source_pack(&sample_results(), &GenerationContext::default(), false);
@@ -1345,6 +1400,44 @@ mod tests {
             .text
             .contains("image_artifact_metadata: image_id=img-1"));
         assert!(pack.text.contains("vision_attachment: not_included"));
+    }
+
+    #[test]
+    fn graphrag_report_is_generic_generated_text() {
+        let results = sample_graphrag_report_results();
+        let pack = build_source_pack(&results, &GenerationContext::default(), true);
+
+        assert!(pack.text.contains("[E1 | generated |"));
+        assert!(pack
+            .text
+            .contains("generated_text:\nCommunity report: Alpha"));
+        assert!(!pack.text.contains("[E1 | image_caption_generated |"));
+        assert!(!pack.text.contains("derived_from=ev-text-1"));
+        assert!(!pack.text.contains("vision_attachment:"));
+        assert!(selected_image_evidence_ids(&results).is_empty());
+
+        let citations = extract_citations("Alpha is grounded [E1].", &pack.evidence_refs);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].kind, EvidenceKind::Generated);
+        assert_eq!(citations[0].derived_from, None);
+
+        let inputs = verifier_source_inputs(&citations, &[]);
+        let value = serde_json::to_value(&inputs).unwrap();
+        assert_eq!(value[0]["kind"], "generated");
+        assert_eq!(
+            value[0]["provenance"]["summary"],
+            "generated derived evidence"
+        );
+        assert!(value[0]["provenance"]["derived_from"].is_null());
+        assert_eq!(
+            value[0]["visual_support"]["support_level"],
+            "generated_text"
+        );
+        assert_eq!(
+            value[0]["visual_support"]["vision_attachment"],
+            "not_applicable"
+        );
+        assert!(value[0]["visual_support"]["image_evidence_id"].is_null());
     }
 
     #[test]

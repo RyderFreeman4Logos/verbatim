@@ -29,9 +29,10 @@ use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::{
     image_artifact_evidence_id, select_image_attachments, GenerationContext, Generator,
 };
+use verbatim_core::graphrag::GraphRagService;
 use verbatim_core::ingest::IngestPipeline;
 use verbatim_core::provider::openai_compatible::OpenAiCompatibleReranker;
-use verbatim_core::retrieve::RetrievalPipeline;
+use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
 use verbatim_core::store::Store;
 use verbatim_core::types::{
     CitationRef, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug, RetrievalResult, SourceId,
@@ -392,16 +393,22 @@ async fn prepare_generation_context(
         if let Some(reranker) = state2.reranker.as_ref() {
             retrieval = retrieval.with_reranker(&state2.config.rerank, reranker);
         }
-        let (results, retrieval_debug) = if show_retrieval {
-            let (results, debug) = runtime.block_on(
-                retrieval.search_filtered_with_debug(&question2, source_filter.as_ref()),
-            )?;
+        let source_filter_ref = source_filter.as_ref();
+        let (mut results, mut retrieval_debug) = if show_retrieval {
+            let (results, debug) = runtime
+                .block_on(retrieval.search_filtered_with_debug(&question2, source_filter_ref))?;
             (results, Some(debug))
         } else {
             let results =
-                runtime.block_on(retrieval.search_filtered(&question2, source_filter.as_ref()))?;
+                runtime.block_on(retrieval.search_filtered(&question2, source_filter_ref))?;
             (results, None)
         };
+        if state2.config.graph.global_search.enabled && source_filter_ref.is_none() {
+            let global_results =
+                GraphRagService::new(pipeline.store(), &state2.config.graph.global_search)
+                    .global_search_results(&question2, None)?;
+            prepend_global_results(&mut results, global_results, &mut retrieval_debug);
+        }
         let image_artifacts = collect_image_artifacts_for_results(&results, pipeline.store())?;
         let image_attachments = select_image_attachments(
             &results,
@@ -420,6 +427,29 @@ async fn prepare_generation_context(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok((results, generation_context, retrieval_debug))
+}
+
+fn prepend_global_results(
+    results: &mut Vec<RetrievalResult>,
+    mut global_results: Vec<RetrievalResult>,
+    retrieval_debug: &mut Option<RetrievalDebug>,
+) {
+    if global_results.is_empty() {
+        return;
+    }
+
+    global_results.extend(std::mem::take(results));
+    *results = global_results;
+    renumber_result_ranks(results);
+    if let Some(debug) = retrieval_debug.as_mut() {
+        refresh_final_evidence_pack_debug(debug, results);
+    }
+}
+
+fn renumber_result_ranks(results: &mut [RetrievalResult]) {
+    for (idx, result) in results.iter_mut().enumerate() {
+        result.provenance.result_rank = idx + 1;
+    }
 }
 
 fn collect_image_artifacts_for_results(
@@ -729,6 +759,10 @@ async fn run_daemon() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use verbatim_core::types::{
+        Chunk, ChunkId, ChunkType, EvidenceUnit, RetrievalEvidenceRole, RetrievalProvenance,
+        SourceLocator,
+    };
 
     #[test]
     fn version_flag_prints_package_version() {
@@ -821,6 +855,93 @@ mod tests {
         assert!(encoded.contains("disabled"));
         assert!(!encoded.contains("api_key"));
         assert!(!encoded.contains("secret full raw source text"));
+    }
+
+    #[test]
+    fn prepended_global_results_refresh_retrieval_debug_final_pack() {
+        let local = test_retrieval_result(1, "local-chunk", "ev-local", EvidenceKind::Text);
+        let global = test_retrieval_result(
+            1,
+            "graphrag:report-chunk:community-test",
+            "graphrag:report:community-test",
+            EvidenceKind::Generated,
+        );
+        let mut results = vec![local];
+        let mut debug = Some(RetrievalDebug {
+            bm25_hits: Vec::new(),
+            dense_hits: Vec::new(),
+            rrf_fused_hits: Vec::new(),
+            graph_expanded_hits: Vec::new(),
+            reranker: verbatim_core::types::RetrievalRerankDebug::disabled(),
+            final_evidence_pack: Vec::new(),
+        });
+
+        prepend_global_results(&mut results, vec![global], &mut debug);
+
+        assert_eq!(
+            results[0].chunk_id.0,
+            "graphrag:report-chunk:community-test"
+        );
+        assert_eq!(results[0].provenance.result_rank, 1);
+        assert_eq!(results[1].provenance.result_rank, 2);
+
+        let final_pack = debug.unwrap().final_evidence_pack;
+        assert_eq!(final_pack.len(), 2);
+        assert_eq!(final_pack[0].label, "E1");
+        assert_eq!(
+            final_pack[0].evidence_id.0,
+            "graphrag:report:community-test"
+        );
+        assert_eq!(final_pack[0].role, RetrievalEvidenceRole::Generated);
+        assert_eq!(final_pack[0].result_rank, 1);
+        assert_eq!(final_pack[1].label, "E2");
+        assert_eq!(final_pack[1].evidence_id.0, "ev-local");
+        assert_eq!(final_pack[1].role, RetrievalEvidenceRole::OriginalText);
+        assert_eq!(final_pack[1].result_rank, 2);
+    }
+
+    fn test_retrieval_result(
+        rank: usize,
+        chunk_id: &str,
+        evidence_id: &str,
+        kind: EvidenceKind,
+    ) -> RetrievalResult {
+        let source_id = SourceId("src".into());
+        let chunk_id = ChunkId(chunk_id.into());
+        let evidence = EvidenceUnit {
+            id: EvidenceId(evidence_id.into()),
+            source_id: source_id.clone(),
+            kind,
+            derived_from: None,
+            locator: SourceLocator::Document {
+                path_or_url: "doc.md".into(),
+                line_start: 1,
+                line_end: None,
+            },
+            text: format!("{evidence_id} text."),
+            text_hash: format!("{evidence_id}-hash"),
+            heading_path: Vec::new(),
+            position: 0,
+        };
+        let chunk = Chunk {
+            id: chunk_id.clone(),
+            source_id: source_id.clone(),
+            text: evidence.text.clone(),
+            context_text: None,
+            token_count: 2,
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path: Vec::new(),
+            evidence_unit_ids: vec![evidence.id.clone()],
+        };
+
+        RetrievalResult {
+            chunk_id: chunk_id.clone(),
+            score: 1.0,
+            chunk,
+            evidence_units: vec![evidence],
+            provenance: RetrievalProvenance::seed(rank, chunk_id, source_id),
+        }
     }
 
     #[tokio::test]

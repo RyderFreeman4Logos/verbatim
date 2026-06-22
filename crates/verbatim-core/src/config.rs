@@ -175,6 +175,8 @@ pub struct GraphConfig {
     pub edge_types: Vec<EdgeType>,
     #[serde(default)]
     pub extraction: GraphExtractionConfig,
+    #[serde(default)]
+    pub global_search: GraphGlobalSearchConfig,
 }
 
 impl Default for GraphConfig {
@@ -186,6 +188,7 @@ impl Default for GraphConfig {
             max_neighbors_per_seed: default_graph_max_neighbors_per_seed(),
             edge_types: default_graph_edge_types(),
             extraction: GraphExtractionConfig::default(),
+            global_search: GraphGlobalSearchConfig::default(),
         }
     }
 }
@@ -257,6 +260,79 @@ impl Default for GraphExtractionConfig {
             max_error_chars: default_graph_extraction_max_error_chars(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphGlobalSearchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_global_search_max_communities")]
+    pub max_communities: usize,
+    #[serde(default = "default_global_search_max_report_claims")]
+    pub max_report_claims: usize,
+    #[serde(default = "default_global_search_max_report_chars")]
+    pub max_report_chars: usize,
+    #[serde(default = "default_global_search_max_evidence_per_report")]
+    pub max_evidence_per_report: usize,
+    #[serde(default = "default_global_search_max_search_results")]
+    pub max_search_results: usize,
+    #[serde(default)]
+    pub drift: GraphDriftSearchConfig,
+}
+
+impl Default for GraphGlobalSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_communities: default_global_search_max_communities(),
+            max_report_claims: default_global_search_max_report_claims(),
+            max_report_chars: default_global_search_max_report_chars(),
+            max_evidence_per_report: default_global_search_max_evidence_per_report(),
+            max_search_results: default_global_search_max_search_results(),
+            drift: GraphDriftSearchConfig::default(),
+        }
+    }
+}
+
+fn default_global_search_max_communities() -> usize {
+    128
+}
+
+fn default_global_search_max_report_claims() -> usize {
+    12
+}
+
+fn default_global_search_max_report_chars() -> usize {
+    4_000
+}
+
+fn default_global_search_max_evidence_per_report() -> usize {
+    12
+}
+
+fn default_global_search_max_search_results() -> usize {
+    4
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphDriftSearchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_drift_max_subqueries")]
+    pub max_subqueries: usize,
+}
+
+impl Default for GraphDriftSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_subqueries: default_drift_max_subqueries(),
+        }
+    }
+}
+
+fn default_drift_max_subqueries() -> usize {
+    4
 }
 
 fn default_graph_extraction_max_chunks() -> usize {
@@ -687,6 +763,18 @@ max_output_tokens = 2048
 max_response_chars = 32768
 max_error_chars = 256
 
+[graph.global_search]
+enabled = false
+max_communities = 128
+max_report_claims = 12
+max_report_chars = 4000
+max_evidence_per_report = 12
+max_search_results = 4
+
+[graph.global_search.drift]
+enabled = false
+max_subqueries = 4
+
 [rerank]
 enabled = false
 provider = "vllm"              # vllm | cohere | jina
@@ -791,6 +879,14 @@ mod tests {
         assert_eq!(config.graph.extraction.max_output_tokens, 2_048);
         assert_eq!(config.graph.extraction.max_response_chars, 32 * 1024);
         assert_eq!(config.graph.extraction.max_error_chars, 256);
+        assert!(!config.graph.global_search.enabled);
+        assert_eq!(config.graph.global_search.max_communities, 128);
+        assert_eq!(config.graph.global_search.max_report_claims, 12);
+        assert_eq!(config.graph.global_search.max_report_chars, 4_000);
+        assert_eq!(config.graph.global_search.max_evidence_per_report, 12);
+        assert_eq!(config.graph.global_search.max_search_results, 4);
+        assert!(!config.graph.global_search.drift.enabled);
+        assert_eq!(config.graph.global_search.drift.max_subqueries, 4);
         assert!(!config.rerank.enabled);
         assert_eq!(config.rerank.provider, "vllm");
         assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
@@ -847,6 +943,8 @@ enabled = false
         assert!(config.graph.edge_types.contains(&EdgeType::Parent));
         assert!(!config.graph.extraction.enabled);
         assert_eq!(config.graph.extraction.max_chunks, 8);
+        assert!(!config.graph.global_search.enabled);
+        assert_eq!(config.graph.global_search.max_search_results, 4);
     }
 
     #[test]
@@ -870,6 +968,27 @@ max_chunks = 2
         assert_eq!(config.graph.extraction.max_output_tokens, 2_048);
         assert_eq!(config.graph.extraction.max_response_chars, 32 * 1024);
         assert_eq!(config.graph.extraction.max_error_chars, 256);
+    }
+
+    #[test]
+    fn partial_global_search_config_defaults_disabled_and_bounded() {
+        let config: Config = toml::from_str(
+            r#"
+[graph.global_search]
+enabled = true
+max_search_results = 2
+"#,
+        )
+        .unwrap();
+
+        assert!(config.graph.global_search.enabled);
+        assert_eq!(config.graph.global_search.max_search_results, 2);
+        assert_eq!(config.graph.global_search.max_communities, 128);
+        assert_eq!(config.graph.global_search.max_report_claims, 12);
+        assert_eq!(config.graph.global_search.max_report_chars, 4_000);
+        assert_eq!(config.graph.global_search.max_evidence_per_report, 12);
+        assert!(!config.graph.global_search.drift.enabled);
+        assert_eq!(config.graph.global_search.drift.max_subqueries, 4);
     }
 
     #[test]

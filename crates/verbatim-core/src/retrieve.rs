@@ -1020,6 +1020,11 @@ fn rerank_failure_reason(error: &anyhow::Error) -> String {
     }
 }
 
+/// Rebuild the final evidence-pack debug view after callers alter retrieval result order.
+pub fn refresh_final_evidence_pack_debug(debug: &mut RetrievalDebug, results: &[RetrievalResult]) {
+    debug.final_evidence_pack = final_evidence_pack_debug(results);
+}
+
 fn final_evidence_pack_debug(results: &[RetrievalResult]) -> Vec<RetrievalEvidencePackEntry> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
@@ -1713,6 +1718,7 @@ mod tests {
             max_neighbors_per_seed: 6,
             edge_types,
             extraction: Default::default(),
+            global_search: Default::default(),
         }
     }
 
