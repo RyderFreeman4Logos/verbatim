@@ -2,17 +2,22 @@ use std::env;
 use std::io::Write;
 use std::process::ExitCode;
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use verbatim_core::config::Config;
+use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
+use verbatim_core::api::AskRequest;
 
-const SUPPORTED_COMMANDS: &[&str] = &["source", "ingest", "ask", "evidence", "config", "daemon"];
+mod client;
+mod local;
+mod render;
+mod sse;
+
+use client::{CliError, DaemonClient, HttpDaemonClient};
+use local::{LocalActions, RealLocalActions};
 
 fn main() -> ExitCode {
+    let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
-    match run(env::args().skip(1), &mut std::io::stdout(), &mut stderr) {
-        Ok(code) => ExitCode::from(code),
-        Err(code) => ExitCode::from(code),
+    match run(env::args().skip(1), &mut stdout, &mut stderr) {
+        Ok(code) | Err(code) => ExitCode::from(code),
     }
 }
 
@@ -23,613 +28,641 @@ where
     W: Write,
     E: Write,
 {
-    run_with_ask_client(args, stdout, stderr, &HttpAskClient)
+    let client = HttpDaemonClient::new();
+    let local = RealLocalActions;
+    run_with(args, stdout, stderr, &client, &local)
 }
 
-fn run_with_ask_client<I, W, E, C>(
+fn run_with<I, W, E, C, L>(
     args: I,
     stdout: &mut W,
     stderr: &mut E,
-    ask_client: &C,
+    client: &C,
+    local: &L,
 ) -> Result<u8, u8>
 where
     I: IntoIterator,
     I::Item: Into<String>,
     W: Write,
     E: Write,
-    C: AskClient,
+    C: DaemonClient,
+    L: LocalActions,
 {
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
-    match args.first().map(String::as_str) {
-        None | Some("-h" | "--help") => {
-            write_help(stdout).map_err(|_| 1)?;
-            Ok(0)
+    if args.is_empty() {
+        let mut command = Cli::command();
+        command.write_help(stdout).map_err(|_| 1)?;
+        writeln!(stdout).map_err(|_| 1)?;
+        return Ok(0);
+    }
+
+    let argv = std::iter::once("verbatim".to_string())
+        .chain(args)
+        .collect::<Vec<_>>();
+    let cli = match Cli::try_parse_from(argv) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = clap_exit_code(&error);
+            if code == 0 {
+                write!(stdout, "{}", error.render()).map_err(|_| 1)?;
+                return Ok(0);
+            }
+            write!(stderr, "{}", error.render()).map_err(|_| 1)?;
+            return Err(code);
         }
-        Some("-V" | "--version") => {
-            writeln!(stdout, "verbatim {}", env!("CARGO_PKG_VERSION")).map_err(|_| 1)?;
-            Ok(0)
-        }
-        Some("ask") => run_ask(&args[1..], stdout, stderr, ask_client),
-        Some(command) if SUPPORTED_COMMANDS.contains(&command) => {
-            writeln!(
-                stderr,
-                "verbatim {command}: CLI thin-client command is not implemented in this MVP. Use verbatim-daemon's REST API directly until issue #14 implements the thin client."
-            )
-            .map_err(|_| 1)?;
-            Err(2)
-        }
-        Some(command) => {
-            writeln!(stderr, "unknown verbatim command: {command}").map_err(|_| 1)?;
-            write_help(stderr).map_err(|_| 1)?;
-            Err(2)
+    };
+
+    match dispatch(cli, stdout, client, local) {
+        Ok(code) => Ok(code),
+        Err(error) => {
+            writeln!(stderr, "{error}").map_err(|_| 1)?;
+            Err(error.exit_code())
         }
     }
 }
 
-fn run_ask<W, E, C>(
-    args: &[String],
-    stdout: &mut W,
-    stderr: &mut E,
-    ask_client: &C,
-) -> Result<u8, u8>
+fn clap_exit_code(error: &clap::Error) -> u8 {
+    match error.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+        _ => 2,
+    }
+}
+
+fn dispatch<W, C, L>(cli: Cli, stdout: &mut W, client: &C, local: &L) -> Result<u8, CliError>
 where
     W: Write,
-    E: Write,
-    C: AskClient,
+    C: DaemonClient,
+    L: LocalActions,
 {
-    let Some(command) = parse_ask_args(args).map_err(|message| {
-        let _ = writeln!(stderr, "verbatim ask: {message}");
-        let _ = write_ask_help(stderr);
-        2
-    })?
-    else {
-        write_ask_help(stdout).map_err(|_| 1)?;
-        return Ok(0);
-    };
+    match cli.command {
+        Commands::Source { command } => run_source(command, stdout, client),
+        Commands::Ingest { source_id, force } => {
+            let response = client.ingest(source_id.as_deref(), force)?;
+            render::write_ingest(stdout, &response)?;
+            Ok(0)
+        }
+        Commands::Ask {
+            question,
+            source_id,
+            show_retrieval,
+        } => {
+            let request = AskRequest {
+                question: question.join(" "),
+                source_id,
+                show_retrieval,
+            };
+            client.ask(&request, stdout)?;
+            writeln!(stdout)?;
+            Ok(0)
+        }
+        Commands::Evidence { eid } => {
+            let evidence = client.get_evidence(&eid)?;
+            render::write_evidence(stdout, &evidence)?;
+            Ok(0)
+        }
+        Commands::Config { command } => run_config(command, stdout, client, local),
+        Commands::Daemon { command } => run_daemon(command, stdout, client, local),
+    }
+}
 
-    let request = AskRequest {
-        question: command.question,
-        source_id: command.source_id,
-        show_retrieval: command.show_retrieval,
-    };
-    let response = ask_client.ask(&request).map_err(|message| {
-        let _ = writeln!(stderr, "verbatim ask: {message}");
-        1
-    })?;
-
-    write_ask_response(stdout, &response).map_err(|_| 1)?;
+fn run_source<W, C>(command: SourceCommand, stdout: &mut W, client: &C) -> Result<u8, CliError>
+where
+    W: Write,
+    C: DaemonClient,
+{
+    match command {
+        SourceCommand::Add { path } => {
+            let response = client.add_source(&path)?;
+            writeln!(stdout, "Added source: {}", response.id)?;
+        }
+        SourceCommand::List => {
+            let sources = client.list_sources()?;
+            render::write_sources(stdout, &sources)?;
+        }
+        SourceCommand::Inspect { id } => {
+            let source = client.get_source(&id)?;
+            render::write_source(stdout, &source)?;
+        }
+        SourceCommand::Remove { id } => {
+            client.remove_source(&id)?;
+            writeln!(stdout, "Removed source: {id}")?;
+        }
+        SourceCommand::Check => {
+            let response = client.check_sources()?;
+            render::write_check_stale(stdout, &response)?;
+        }
+    }
     Ok(0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AskCommand {
-    question: String,
-    source_id: Option<String>,
-    show_retrieval: bool,
-}
-
-fn parse_ask_args(args: &[String]) -> Result<Option<AskCommand>, String> {
-    let mut question_parts = Vec::new();
-    let mut source_id = None;
-    let mut show_retrieval = false;
-    let mut index = 0;
-
-    while index < args.len() {
-        let arg = &args[index];
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(None),
-            "--show-retrieval" => show_retrieval = true,
-            "-s" | "--source-id" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| format!("{arg} requires a source id"))?;
-                source_id = Some(value.clone());
-            }
-            value if value.starts_with("--source-id=") => {
-                source_id = Some(value.trim_start_matches("--source-id=").to_string());
-            }
-            value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
-            value => question_parts.push(value.to_string()),
-        }
-        index += 1;
-    }
-
-    if question_parts.is_empty() {
-        return Err("missing question".into());
-    }
-
-    Ok(Some(AskCommand {
-        question: question_parts.join(" "),
-        source_id,
-        show_retrieval,
-    }))
-}
-
-trait AskClient {
-    fn ask(&self, request: &AskRequest) -> Result<AskResponse, String>;
-}
-
-struct HttpAskClient;
-
-impl AskClient for HttpAskClient {
-    fn ask(&self, request: &AskRequest) -> Result<AskResponse, String> {
-        let config = Config::load().map_err(|error| format!("{error:#}"))?;
-        let url = ask_url(&config.daemon.bind);
-        let response = reqwest::blocking::Client::new()
-            .post(url)
-            .json(request)
-            .send()
-            .map_err(|error| format!("failed to call daemon: {error:#}"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().unwrap_or_default();
-            return Err(format!("daemon returned HTTP {status}: {body}"));
-        }
-
-        response
-            .json::<AskResponse>()
-            .map_err(|error| format!("daemon returned invalid ask response: {error:#}"))
-    }
-}
-
-fn ask_url(bind: &str) -> String {
-    let base = if bind.starts_with("http://") || bind.starts_with("https://") {
-        bind.trim_end_matches('/').to_string()
-    } else {
-        format!("http://{}", bind.trim_end_matches('/'))
-    };
-    format!("{base}/api/ask")
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct AskRequest {
-    question: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_id: Option<String>,
-    show_retrieval: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct AskResponse {
-    answer: String,
-    #[serde(default)]
-    citations: Vec<CitationResponse>,
-    verified: bool,
-    #[serde(default)]
-    retrieval: Option<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct CitationResponse {
-    label: String,
-    evidence_id: String,
-    kind: String,
-    derived_from: Option<String>,
-    locator: String,
-    text_preview: String,
-}
-
-fn write_ask_response<W>(writer: &mut W, response: &AskResponse) -> std::io::Result<()>
+fn run_config<W, C, L>(
+    command: ConfigCommand,
+    stdout: &mut W,
+    client: &C,
+    local: &L,
+) -> Result<u8, CliError>
 where
     W: Write,
+    C: DaemonClient,
+    L: LocalActions,
 {
-    writeln!(writer, "{}", response.answer)?;
-    if !response.citations.is_empty() {
-        writeln!(writer)?;
-        writeln!(writer, "Citations:")?;
-        for citation in &response.citations {
-            let derived = citation
-                .derived_from
-                .as_ref()
-                .map(|id| format!(" derived_from={id}"))
-                .unwrap_or_default();
-            writeln!(
-                writer,
-                "  [{}] evidence={} kind={} locator={}{}",
-                citation.label, citation.evidence_id, citation.kind, citation.locator, derived
-            )?;
+    match command {
+        ConfigCommand::Init => {
+            let path = local.config_init()?;
+            local::write_config_init(stdout, &path)?;
+        }
+        ConfigCommand::Show => {
+            let config = client.get_config()?;
+            render::write_config(stdout, &config)?;
+        }
+        ConfigCommand::Validate => {
+            let path = local.config_validate()?;
+            local::write_config_validate(stdout, &path)?;
         }
     }
-
-    if let Some(debug) = &response.retrieval {
-        write_retrieval_debug(writer, debug)?;
-    }
-
-    Ok(())
+    Ok(0)
 }
 
-fn write_retrieval_debug<W>(writer: &mut W, debug: &Value) -> std::io::Result<()>
+fn run_daemon<W, C, L>(
+    command: DaemonCommand,
+    stdout: &mut W,
+    client: &C,
+    local: &L,
+) -> Result<u8, CliError>
 where
     W: Write,
+    C: DaemonClient,
+    L: LocalActions,
 {
-    writeln!(writer)?;
-    writeln!(writer, "Retrieval Debug")?;
-    write_stage_hits(writer, "BM25 hits", debug.get("bm25_hits"))?;
-    write_stage_hits(writer, "Dense hits", debug.get("dense_hits"))?;
-    write_fused_hits(writer, debug.get("rrf_fused_hits"))?;
-    write_graph_hits(writer, debug.get("graph_expanded_hits"))?;
-    write_reranker(writer, debug.get("reranker"))?;
-    write_final_pack(writer, debug.get("final_evidence_pack"))?;
-    Ok(())
-}
-
-fn write_stage_hits<W>(writer: &mut W, title: &str, hits: Option<&Value>) -> std::io::Result<()>
-where
-    W: Write,
-{
-    writeln!(writer)?;
-    writeln!(writer, "{title}:")?;
-    let Some(items) = hits.and_then(Value::as_array) else {
-        return writeln!(writer, "  (none)");
-    };
-    if items.is_empty() {
-        return writeln!(writer, "  (none)");
-    }
-    for hit in items {
-        writeln!(
-            writer,
-            "  {}. chunk={} source={} score={} evidence={}",
-            value_usize(hit, "rank"),
-            value_string(hit, "chunk_id"),
-            value_string(hit, "source_id"),
-            value_score(hit, "score"),
-            value_string_list(hit.get("evidence_ids")),
-        )?;
-    }
-    Ok(())
-}
-
-fn write_fused_hits<W>(writer: &mut W, hits: Option<&Value>) -> std::io::Result<()>
-where
-    W: Write,
-{
-    writeln!(writer)?;
-    writeln!(writer, "RRF fused hits:")?;
-    let Some(items) = hits.and_then(Value::as_array) else {
-        return writeln!(writer, "  (none)");
-    };
-    if items.is_empty() {
-        return writeln!(writer, "  (none)");
-    }
-    for hit in items {
-        writeln!(
-            writer,
-            "  {}. chunk={} source={} score={} dense_rank={} bm25_rank={} evidence={}",
-            value_usize(hit, "rank"),
-            value_string(hit, "chunk_id"),
-            value_string(hit, "source_id"),
-            value_score(hit, "score"),
-            value_string(hit, "dense_rank"),
-            value_string(hit, "bm25_rank"),
-            value_string_list(hit.get("evidence_ids")),
-        )?;
-    }
-    Ok(())
-}
-
-fn write_graph_hits<W>(writer: &mut W, hits: Option<&Value>) -> std::io::Result<()>
-where
-    W: Write,
-{
-    writeln!(writer)?;
-    writeln!(writer, "Graph-expanded hits:")?;
-    let Some(items) = hits.and_then(Value::as_array) else {
-        return writeln!(writer, "  (none)");
-    };
-    if items.is_empty() {
-        return writeln!(writer, "  (none)");
-    }
-    for hit in items {
-        writeln!(
-            writer,
-            "  {}. expanded={} seed={} hop={} score={} path={}",
-            value_usize(hit, "result_rank"),
-            value_string(hit, "expanded_chunk_id"),
-            value_string(hit, "seed_chunk_id"),
-            value_usize(hit, "hop_distance"),
-            value_score(hit, "score"),
-            graph_path(hit.get("path")),
-        )?;
-    }
-    Ok(())
-}
-
-fn write_reranker<W>(writer: &mut W, reranker: Option<&Value>) -> std::io::Result<()>
-where
-    W: Write,
-{
-    writeln!(writer)?;
-    writeln!(writer, "Reranker:")?;
-    let Some(reranker) = reranker else {
-        return writeln!(writer, "  skipped");
-    };
-    let status = value_string(reranker, "status");
-    let reason = value_string(reranker, "reason");
-    if reason.is_empty() {
-        writeln!(writer, "  {status}")?;
-    } else {
-        writeln!(writer, "  {status}: {reason}")?;
-    }
-    let scores = reranker
-        .get("scores")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    for score in scores {
-        writeln!(
-            writer,
-            "  {}. chunk={} score={}",
-            value_usize(score, "rank"),
-            value_string(score, "chunk_id"),
-            value_score(score, "score"),
-        )?;
-    }
-    Ok(())
-}
-
-fn write_final_pack<W>(writer: &mut W, pack: Option<&Value>) -> std::io::Result<()>
-where
-    W: Write,
-{
-    writeln!(writer)?;
-    writeln!(writer, "Final evidence pack:")?;
-    let Some(items) = pack.and_then(Value::as_array) else {
-        return writeln!(writer, "  (none)");
-    };
-    if items.is_empty() {
-        return writeln!(writer, "  (none)");
-    }
-    for item in items {
-        let locator = item
-            .get("locator")
-            .map(|locator| value_string(locator, "display"))
-            .unwrap_or_default();
-        writeln!(
-            writer,
-            "  {} chunk={} evidence={} role={} locator={}",
-            value_string(item, "label"),
-            value_string(item, "chunk_id"),
-            value_string(item, "evidence_id"),
-            value_string(item, "role"),
-            locator,
-        )?;
-    }
-    Ok(())
-}
-
-fn graph_path(path: Option<&Value>) -> String {
-    let Some(steps) = path.and_then(Value::as_array) else {
-        return String::new();
-    };
-    steps
-        .iter()
-        .map(|step| {
-            format!(
-                "{}:{}:{}->{}",
-                value_string(step, "edge_type"),
-                value_string(step, "direction"),
-                value_string(step, "from_node_id"),
-                value_string(step, "to_node_id")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" | ")
-}
-
-fn value_string(value: &Value, key: &str) -> String {
-    match value.get(key) {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Number(number)) => number.to_string(),
-        Some(Value::Bool(value)) => value.to_string(),
-        Some(Value::Null) | None => String::new(),
-        Some(other) => other.to_string(),
+    match command {
+        DaemonCommand::Start => local.daemon_start(),
+        DaemonCommand::Status => {
+            let health = client.health()?;
+            render::write_health(stdout, &health)?;
+            Ok(0)
+        }
+        DaemonCommand::Install => {
+            let path = local.daemon_install()?;
+            local::write_daemon_install(stdout, &path)?;
+            Ok(0)
+        }
     }
 }
 
-fn value_usize(value: &Value, key: &str) -> usize {
-    value
-        .get(key)
-        .and_then(Value::as_u64)
-        .and_then(|value| value.try_into().ok())
-        .unwrap_or_default()
+#[derive(Debug, Parser)]
+#[command(
+    name = "verbatim",
+    version,
+    about = "Grounded document Q&A with traceable citations"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-fn value_score(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_f64)
-        .map(|score| format!("{score:.4}"))
-        .unwrap_or_default()
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Manage sources through the daemon API.
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
+    /// Trigger ingestion through the daemon API.
+    Ingest {
+        /// Optional source id. Omit to ingest all pending/stale sources.
+        source_id: Option<String>,
+        /// Re-ingest all sources, including already indexed sources.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Ask a question and stream the answer from the daemon.
+    Ask {
+        /// Restrict retrieval to one source.
+        #[arg(short = 's', long = "source-id")]
+        source_id: Option<String>,
+        /// Show retrieval provenance and ranking debug output.
+        #[arg(long)]
+        show_retrieval: bool,
+        /// Question text.
+        #[arg(required = true, num_args = 1..)]
+        question: Vec<String>,
+    },
+    /// Inspect one evidence unit through the daemon API.
+    Evidence {
+        /// Evidence id.
+        eid: String,
+    },
+    /// Inspect or update configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Manage daemon process/API helpers.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
 }
 
-fn value_string_list(value: Option<&Value>) -> String {
-    value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default()
+#[derive(Debug, Subcommand)]
+enum SourceCommand {
+    /// Add a source path.
+    Add {
+        /// File path to add.
+        path: String,
+    },
+    /// List sources.
+    List,
+    /// Inspect one source.
+    Inspect {
+        /// Source id.
+        id: String,
+    },
+    /// Remove one source.
+    Remove {
+        /// Source id.
+        id: String,
+    },
+    /// Mark and list stale sources.
+    Check,
 }
 
-fn write_help<W>(writer: &mut W) -> std::io::Result<()>
-where
-    W: Write,
-{
-    writeln!(
-        writer,
-        "verbatim {}\n\nUSAGE:\n    verbatim <COMMAND>\n\nCOMMANDS:\n    source     Manage sources (thin client pending #14)\n    ingest     Trigger ingestion (thin client pending #14)\n    ask        Ask the daemon\n    evidence   Inspect evidence (thin client pending #14)\n    config     Inspect or update config (thin client pending #14)\n    daemon     Manage daemon process/API (thin client pending #14)\n\nOPTIONS:\n    -h, --help       Print help\n    -V, --version    Print version\n\nUse `verbatim ask --help` for ask options. Other installable CLI commands intentionally fail explicitly until the thin daemon client is implemented.",
-        env!("CARGO_PKG_VERSION")
-    )
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Generate the default local config file.
+    Init,
+    /// Fetch redacted runtime config from the daemon.
+    Show,
+    /// Validate the local config file.
+    Validate,
 }
 
-fn write_ask_help<W>(writer: &mut W) -> std::io::Result<()>
-where
-    W: Write,
-{
-    writeln!(
-        writer,
-        "verbatim ask\n\nUSAGE:\n    verbatim ask [OPTIONS] <QUESTION>\n\nOPTIONS:\n    -s, --source-id <SOURCE_ID>    Restrict retrieval to one source\n        --show-retrieval          Show retrieval provenance and ranking debug output\n    -h, --help                    Print help"
-    )
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Start verbatim-daemon in the foreground.
+    Start,
+    /// Check daemon health through the daemon API.
+    Status,
+    /// Write a minimal systemd user unit.
+    Install,
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    use serde_json::Value;
+    use verbatim_core::api::{
+        AddSourceResponse, CheckStaleResponse, CitationResponse, ConfigResponse, EvidenceResponse,
+        HealthResponse, IngestResponse, SourceResponse,
+    };
 
     use super::*;
 
     #[test]
     fn version_prints_package_version() {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        let (code, stdout, stderr, _, _) = run_mock(["--version"]);
 
-        let code = run(["--version"], &mut stdout, &mut stderr).unwrap();
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(stdout, format!("verbatim {}\n", env!("CARGO_PKG_VERSION")));
+        assert!(stderr.is_empty());
+    }
 
-        assert_eq!(code, 0);
+    #[test]
+    fn help_is_available_for_every_command_path() {
+        let cases: &[&[&str]] = &[
+            &["--help"],
+            &["source", "--help"],
+            &["source", "add", "--help"],
+            &["source", "list", "--help"],
+            &["source", "inspect", "--help"],
+            &["source", "remove", "--help"],
+            &["source", "check", "--help"],
+            &["ingest", "--help"],
+            &["ask", "--help"],
+            &["evidence", "--help"],
+            &["config", "--help"],
+            &["config", "init", "--help"],
+            &["config", "show", "--help"],
+            &["config", "validate", "--help"],
+            &["daemon", "--help"],
+            &["daemon", "start", "--help"],
+            &["daemon", "status", "--help"],
+            &["daemon", "install", "--help"],
+        ];
+
+        for args in cases {
+            let (code, stdout, stderr, _, _) = run_mock(args.iter().copied());
+            assert_eq!(code.unwrap(), 0, "args: {args:?}");
+            assert!(stdout.contains("Usage:"), "stdout: {stdout}");
+            assert!(stderr.is_empty(), "stderr: {stderr}");
+        }
+    }
+
+    #[test]
+    fn source_add_and_list_call_daemon_client() {
+        let (code, stdout, stderr, client, _) = run_mock(["source", "add", "/tmp/doc.pdf"]);
+
+        assert_eq!(code.unwrap(), 0);
         assert_eq!(
-            String::from_utf8(stdout).unwrap(),
-            format!("verbatim {}\n", env!("CARGO_PKG_VERSION"))
+            client.calls.borrow().as_slice(),
+            ["add_source:/tmp/doc.pdf"]
         );
+        assert!(stdout.contains("Added source: src-1"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) = run_mock(["source", "list"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["list_sources"]);
+        assert!(stdout.contains("Sources:"));
+        assert!(stdout.contains("id=src-1"));
         assert!(stderr.is_empty());
     }
 
     #[test]
-    fn non_ask_documented_commands_fail_explicitly_until_thin_client_exists() {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+    fn ingest_evidence_config_and_status_call_daemon_client() {
+        let (code, _, _, client, _) = run_mock(["ingest", "--force"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["ingest:None:true"]);
 
-        let code = run(["source", "list"], &mut stdout, &mut stderr).unwrap_err();
+        let (code, stdout, _, client, _) = run_mock(["evidence", "ev-1"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["get_evidence:ev-1"]);
+        assert!(stdout.contains("Evidence:"));
 
-        assert_eq!(code, 2);
-        assert!(stdout.is_empty());
-        let error = String::from_utf8(stderr).unwrap();
-        assert!(error.contains("verbatim source"));
-        assert!(error.contains("not implemented"));
-        assert!(error.contains("#14"));
+        let (code, stdout, _, client, _) = run_mock(["config", "show"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["get_config"]);
+        assert!(stdout.contains("\"daemon\""));
+
+        let (code, stdout, _, client, _) = run_mock(["daemon", "status"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["health"]);
+        assert!(stdout.contains("Daemon status: ok"));
     }
 
     #[test]
-    fn ask_show_retrieval_posts_flag_and_renders_debug_sections() {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let client = MockAskClient::new(AskResponse {
-            answer: "Answer [E1].".into(),
-            citations: vec![CitationResponse {
-                label: "E1".into(),
-                evidence_id: "ev-1".into(),
-                kind: "original_text".into(),
-                derived_from: None,
-                locator: "/tmp/doc.txt L1".into(),
-                text_preview: "short preview".into(),
-            }],
-            verified: false,
-            retrieval: Some(sample_debug_json()),
-        });
+    fn ask_show_retrieval_remains_plumbed_and_rendered() {
+        let (code, stdout, stderr, client, _) = run_mock([
+            "ask",
+            "--show-retrieval",
+            "-s",
+            "src-1",
+            "What",
+            "is",
+            "cited?",
+        ]);
 
-        let code = run_with_ask_client(
-            [
-                "ask",
-                "--show-retrieval",
-                "-s",
-                "src-1",
-                "What",
-                "is",
-                "cited?",
-            ],
-            &mut stdout,
-            &mut stderr,
-            &client,
-        )
-        .unwrap();
-
-        assert_eq!(code, 0);
+        assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
         assert_eq!(
-            client.last_request.borrow().as_ref().unwrap(),
+            client.last_ask.borrow().as_ref().unwrap(),
             &AskRequest {
                 question: "What is cited?".into(),
                 source_id: Some("src-1".into()),
                 show_retrieval: true,
             }
         );
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(output.contains("Answer [E1]."));
-        assert!(output.contains("Retrieval Debug"));
-        assert!(output.contains("BM25 hits:"));
-        assert!(output.contains("Dense hits:"));
-        assert!(output.contains("RRF fused hits:"));
-        assert!(output.contains("Graph-expanded hits:"));
-        assert!(output.contains("Reranker:"));
-        assert!(output.contains("Final evidence pack:"));
-        assert!(!output.contains("secret full raw source text"));
+        assert!(stdout.contains("Answer [E1]."));
+        assert!(stdout.contains("Retrieval Debug"));
+        assert!(stdout.contains("Final evidence pack:"));
+        assert!(!stdout.contains("secret full raw source text"));
     }
 
     #[test]
-    fn ask_without_show_retrieval_keeps_output_clean() {
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let client = MockAskClient::new(AskResponse {
-            answer: "Answer [E1].".into(),
-            citations: Vec::new(),
-            verified: false,
-            retrieval: None,
-        });
-
-        let code =
-            run_with_ask_client(["ask", "What is cited?"], &mut stdout, &mut stderr, &client)
-                .unwrap();
-
-        assert_eq!(code, 0);
-        assert!(stderr.is_empty());
-        assert!(
-            !client
-                .last_request
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .show_retrieval
-        );
-        let output = String::from_utf8(stdout).unwrap();
-        assert_eq!(output, "Answer [E1].\n");
-    }
-
-    #[test]
-    fn unknown_commands_fail_instead_of_being_ignored() {
+    fn daemon_unreachable_maps_to_exit_code_two() {
+        let client = MockDaemonClient {
+            health_error: Some(CliError::DaemonUnreachable(
+                "could not reach daemon\nStart it with: systemctl --user start verbatim".into(),
+            )),
+            ..MockDaemonClient::default()
+        };
+        let local = MockLocalActions::default();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let code = run(["unknown"], &mut stdout, &mut stderr).unwrap_err();
+        let code = run_with(
+            ["daemon", "status"],
+            &mut stdout,
+            &mut stderr,
+            &client,
+            &local,
+        )
+        .unwrap_err();
 
         assert_eq!(code, 2);
         assert!(stdout.is_empty());
-        let error = String::from_utf8(stderr).unwrap();
-        assert!(error.contains("unknown verbatim command: unknown"));
-        assert!(error.contains("USAGE:"));
+        assert!(String::from_utf8(stderr)
+            .unwrap()
+            .contains("systemctl --user start verbatim"));
     }
 
-    struct MockAskClient {
-        response: AskResponse,
-        last_request: RefCell<Option<AskRequest>>,
+    #[test]
+    fn http_api_error_maps_to_exit_code_one() {
+        let client = MockDaemonClient {
+            list_error: Some(CliError::Api("daemon returned HTTP 500: body".into())),
+            ..MockDaemonClient::default()
+        };
+        let local = MockLocalActions::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(
+            ["source", "list"],
+            &mut stdout,
+            &mut stderr,
+            &client,
+            &local,
+        )
+        .unwrap_err();
+
+        assert_eq!(code, 1);
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr).unwrap().contains("HTTP 500"));
     }
 
-    impl MockAskClient {
-        fn new(response: AskResponse) -> Self {
-            Self {
-                response,
-                last_request: RefCell::new(None),
+    fn run_mock<I>(
+        args: I,
+    ) -> (
+        Result<u8, u8>,
+        String,
+        String,
+        MockDaemonClient,
+        MockLocalActions,
+    )
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(args, &mut stdout, &mut stderr, &client, &local);
+        (
+            code,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+            client,
+            local,
+        )
+    }
+
+    #[derive(Default)]
+    struct MockDaemonClient {
+        calls: RefCell<Vec<String>>,
+        last_ask: RefCell<Option<AskRequest>>,
+        list_error: Option<CliError>,
+        health_error: Option<CliError>,
+    }
+
+    impl DaemonClient for MockDaemonClient {
+        fn add_source(&self, path: &str) -> client::CliResult<AddSourceResponse> {
+            self.calls.borrow_mut().push(format!("add_source:{path}"));
+            Ok(AddSourceResponse { id: "src-1".into() })
+        }
+
+        fn list_sources(&self) -> client::CliResult<Vec<SourceResponse>> {
+            if let Some(error) = &self.list_error {
+                return Err(clone_cli_error(error));
             }
+            self.calls.borrow_mut().push("list_sources".into());
+            Ok(vec![sample_source()])
+        }
+
+        fn get_source(&self, id: &str) -> client::CliResult<SourceResponse> {
+            self.calls.borrow_mut().push(format!("get_source:{id}"));
+            Ok(sample_source())
+        }
+
+        fn remove_source(&self, id: &str) -> client::CliResult<()> {
+            self.calls.borrow_mut().push(format!("remove_source:{id}"));
+            Ok(())
+        }
+
+        fn check_sources(&self) -> client::CliResult<CheckStaleResponse> {
+            self.calls.borrow_mut().push("check_sources".into());
+            Ok(CheckStaleResponse {
+                stale: vec!["src-1".into()],
+            })
+        }
+
+        fn ingest(
+            &self,
+            source_id: Option<&str>,
+            force: bool,
+        ) -> client::CliResult<IngestResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("ingest:{source_id:?}:{force}"));
+            Ok(IngestResponse { ingested: 1 })
+        }
+
+        fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> client::CliResult<()>
+        where
+            W: Write,
+        {
+            self.last_ask.replace(Some(request.clone()));
+            write!(stdout, "Answer [E1].")?;
+            render::write_citations(stdout, &[sample_citation()])?;
+            if request.show_retrieval {
+                render::write_retrieval_debug(stdout, &sample_debug_json())?;
+            }
+            Ok(())
+        }
+
+        fn get_evidence(&self, evidence_id: &str) -> client::CliResult<EvidenceResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("get_evidence:{evidence_id}"));
+            Ok(sample_evidence())
+        }
+
+        fn get_config(&self) -> client::CliResult<ConfigResponse> {
+            self.calls.borrow_mut().push("get_config".into());
+            Ok(serde_json::json!({"daemon": {"bind": "127.0.0.1:7700"}}))
+        }
+
+        fn health(&self) -> client::CliResult<HealthResponse> {
+            if let Some(error) = &self.health_error {
+                return Err(clone_cli_error(error));
+            }
+            self.calls.borrow_mut().push("health".into());
+            Ok(HealthResponse {
+                status: "ok".into(),
+            })
         }
     }
 
-    impl AskClient for MockAskClient {
-        fn ask(&self, request: &AskRequest) -> Result<AskResponse, String> {
-            self.last_request.replace(Some(request.clone()));
-            Ok(self.response.clone())
+    #[derive(Default)]
+    struct MockLocalActions {
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl LocalActions for MockLocalActions {
+        fn config_init(&self) -> client::CliResult<PathBuf> {
+            self.calls.borrow_mut().push("config_init".into());
+            Ok(PathBuf::from("/tmp/config.toml"))
+        }
+
+        fn config_validate(&self) -> client::CliResult<PathBuf> {
+            self.calls.borrow_mut().push("config_validate".into());
+            Ok(PathBuf::from("/tmp/config.toml"))
+        }
+
+        fn daemon_start(&self) -> client::CliResult<u8> {
+            self.calls.borrow_mut().push("daemon_start".into());
+            Ok(0)
+        }
+
+        fn daemon_install(&self) -> client::CliResult<PathBuf> {
+            self.calls.borrow_mut().push("daemon_install".into());
+            Ok(PathBuf::from("/tmp/verbatim.service"))
+        }
+    }
+
+    fn clone_cli_error(error: &CliError) -> CliError {
+        match error {
+            CliError::Api(message) => CliError::Api(message.clone()),
+            CliError::DaemonUnreachable(message) => CliError::DaemonUnreachable(message.clone()),
+            CliError::Io(_) => CliError::Api(error.to_string()),
+        }
+    }
+
+    fn sample_source() -> SourceResponse {
+        SourceResponse {
+            id: "src-1".into(),
+            path: "/tmp/doc.pdf".into(),
+            status: "Pending".into(),
+            hash: "hash".into(),
+            parser_used: None,
+            last_ingested_at: None,
+        }
+    }
+
+    fn sample_evidence() -> EvidenceResponse {
+        EvidenceResponse {
+            id: "ev-1".into(),
+            source_id: "src-1".into(),
+            kind: "text".into(),
+            derived_from: None,
+            locator: "PDF p.1 para.1".into(),
+            text: "quoted".into(),
+            heading_path: Vec::new(),
+            position: 0,
+            image_artifact: None,
+        }
+    }
+
+    fn sample_citation() -> CitationResponse {
+        CitationResponse {
+            label: "E1".into(),
+            evidence_id: "ev-1".into(),
+            kind: "original_text".into(),
+            derived_from: None,
+            locator: "PDF p.1 para.1".into(),
+            text_preview: "preview".into(),
         }
     }
 
@@ -664,23 +697,7 @@ mod tests {
                     "evidence_ids": ["ev-1"]
                 }
             ],
-            "graph_expanded_hits": [
-                {
-                    "result_rank": 2,
-                    "seed_chunk_id": "chunk-1",
-                    "expanded_chunk_id": "chunk-2",
-                    "hop_distance": 1,
-                    "score": 0.01,
-                    "path": [
-                        {
-                            "edge_type": "next",
-                            "direction": "outgoing",
-                            "from_node_id": "node-1",
-                            "to_node_id": "node-2"
-                        }
-                    ]
-                }
-            ],
+            "graph_expanded_hits": [],
             "reranker": {
                 "status": "skipped",
                 "reason": "disabled",
@@ -693,7 +710,7 @@ mod tests {
                     "evidence_id": "ev-1",
                     "role": "original_text",
                     "locator": {
-                        "display": "/tmp/doc.txt L1"
+                        "display": "PDF p.1 para.1"
                     }
                 }
             ]

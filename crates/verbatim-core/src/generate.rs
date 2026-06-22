@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use base64::Engine;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ChatConfig, ChatVisionAttachmentConfig, VerifierConfig};
@@ -120,6 +121,50 @@ impl Generator {
                 .await;
         }
 
+        let answer = render_answer(&raw_answer, &citations);
+
+        Ok(GenerationResult {
+            answer,
+            citations,
+            verified: false,
+        })
+    }
+
+    /// Generate an answer while forwarding provider deltas to `on_delta`.
+    ///
+    /// Streaming emits raw model text before post-generation verification can
+    /// revise it, so this path intentionally returns `verified = false`.
+    /// Call `generate_with_context` when a verified final answer is required.
+    pub async fn generate_streaming_with_context<F>(
+        &self,
+        question: &str,
+        results: &[RetrievalResult],
+        context: &GenerationContext,
+        mut on_delta: F,
+    ) -> Result<GenerationResult>
+    where
+        F: FnMut(&str) -> Result<()> + Send,
+    {
+        let source_pack = build_source_pack(
+            results,
+            context,
+            self.vision_attachments.can_attach_images(),
+        );
+
+        let user_prompt = format!(
+            "SOURCE PACK:\n{}\n\nUSER QUESTION:\n{question}",
+            source_pack.text
+        );
+        let raw_answer = self
+            .stream_chat(
+                SYSTEM_PROMPT,
+                &user_prompt,
+                &source_pack.attachments,
+                |delta| on_delta(delta),
+            )
+            .await?;
+
+        let citations = extract_citations(&raw_answer, &source_pack.evidence_refs);
         let answer = render_answer(&raw_answer, &citations);
 
         Ok(GenerationResult {
@@ -291,6 +336,48 @@ impl Generator {
             .await
             .context("chat completion failed")?;
         Ok(response.content)
+    }
+
+    async fn stream_chat<F>(
+        &self,
+        system: &str,
+        user: &str,
+        attachments: &[SourcePackAttachment],
+        mut on_delta: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Result<()> + Send,
+    {
+        let user_message = if attachments.is_empty() {
+            ChatMessage::user(user)
+        } else {
+            ChatMessage::user_parts(chat_parts_with_images(
+                user,
+                attachments,
+                &self.vision_attachments,
+            ))
+        };
+
+        let mut stream = self
+            .chat_model
+            .stream_chat(ChatRequest::new(vec![
+                ChatMessage::system(system),
+                user_message,
+            ]))
+            .await
+            .context("streaming chat completion failed")?;
+
+        let mut answer = String::new();
+        while let Some(event) = stream.next().await {
+            let event = event.context("streaming chat completion failed")?;
+            if event.delta.is_empty() {
+                continue;
+            }
+            on_delta(&event.delta)?;
+            answer.push_str(&event.delta);
+        }
+
+        Ok(answer)
     }
 }
 
@@ -968,7 +1055,7 @@ mod tests {
 
     use crate::provider::{
         ChatContentPart, ChatMessageContent, ChatModel, ChatRequest, ChatResponse, ChatStream,
-        ProviderResult,
+        ChatStreamEvent, ProviderResult,
     };
     use crate::types::{
         BBox, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, ImageId, RetrievalProvenance,
@@ -1020,6 +1107,57 @@ mod tests {
 
         async fn stream_chat(&self, _req: ChatRequest) -> ProviderResult<ChatStream> {
             Ok(futures::stream::empty().boxed())
+        }
+    }
+
+    struct StreamingChatModel {
+        chunks: Mutex<VecDeque<Vec<String>>>,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl StreamingChatModel {
+        fn new<I, S>(chunks: I) -> Self
+        where
+            I: IntoIterator<Item = S>,
+            S: Into<String>,
+        {
+            Self {
+                chunks: Mutex::new(vec![chunks.into_iter().map(Into::into).collect()].into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChatModel for StreamingChatModel {
+        async fn chat(&self, req: ChatRequest) -> ProviderResult<ChatResponse> {
+            self.requests.lock().unwrap().push(req);
+            Ok(ChatResponse {
+                content: String::new(),
+                finish_reason: None,
+                usage: None,
+            })
+        }
+
+        async fn stream_chat(&self, req: ChatRequest) -> ProviderResult<ChatStream> {
+            self.requests.lock().unwrap().push(req);
+            let chunks = self
+                .chunks
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("streaming chat model chunks");
+            Ok(futures::stream::iter(chunks.into_iter().map(|delta| {
+                Ok(ChatStreamEvent {
+                    delta,
+                    finish_reason: None,
+                })
+            }))
+            .boxed())
         }
     }
 
@@ -1313,6 +1451,37 @@ mod tests {
         let rendered = render_answer("Answer text [E1].", &citations);
         assert!(rendered.contains("References:"));
         assert!(rendered.contains("[E1] original_text: PDF p.42"));
+    }
+
+    #[tokio::test]
+    async fn streaming_generation_forwards_deltas_and_extracts_citations() {
+        let model = Arc::new(StreamingChatModel::new([
+            "The document ",
+            "defines freedom [E1].",
+        ]));
+        let generator =
+            Generator::with_chat_model(model.clone(), true, ChatVisionAttachmentConfig::default());
+        let mut deltas = Vec::new();
+
+        let result = generator
+            .generate_streaming_with_context(
+                "What is freedom?",
+                &sample_results(),
+                &GenerationContext::default(),
+                |delta| {
+                    deltas.push(delta.to_string());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(deltas, vec!["The document ", "defines freedom [E1]."]);
+        assert_eq!(result.citations.len(), 1);
+        assert_eq!(result.citations[0].label, "E1");
+        assert!(result.answer.contains("References:"));
+        assert!(!result.verified);
+        assert_eq!(model.requests().len(), 1);
     }
 
     #[tokio::test]

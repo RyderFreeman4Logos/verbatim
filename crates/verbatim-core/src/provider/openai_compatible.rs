@@ -221,7 +221,7 @@ impl ChatModel for OpenAiCompatibleChatModel {
         let chunks = response
             .bytes_stream()
             .map(|result| match result {
-                Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+                Ok(bytes) => Ok(bytes.to_vec()),
                 Err(source) => Err(ProviderError::Transport {
                     operation: "streaming chat",
                     source,
@@ -560,9 +560,10 @@ fn truncate_message(message: &str, max_chars: usize) -> String {
     }
 }
 
-fn sse_chat_stream(chunks: BoxStream<'static, ProviderResult<String>>) -> ChatStream {
+fn sse_chat_stream(chunks: BoxStream<'static, ProviderResult<Vec<u8>>>) -> ChatStream {
     struct State {
-        chunks: BoxStream<'static, ProviderResult<String>>,
+        chunks: BoxStream<'static, ProviderResult<Vec<u8>>>,
+        pending_utf8: Vec<u8>,
         buffer: String,
         pending: VecDeque<ProviderResult<ChatStreamEvent>>,
         done: bool,
@@ -570,6 +571,7 @@ fn sse_chat_stream(chunks: BoxStream<'static, ProviderResult<String>>) -> ChatSt
 
     let state = State {
         chunks,
+        pending_utf8: Vec::new(),
         buffer: String::new(),
         pending: VecDeque::new(),
         done: false,
@@ -586,11 +588,26 @@ fn sse_chat_stream(chunks: BoxStream<'static, ProviderResult<String>>) -> ChatSt
 
             match state.chunks.next().await {
                 Some(Ok(chunk)) => {
-                    state.buffer.push_str(&chunk.replace("\r\n", "\n"));
+                    if let Err(error) =
+                        push_utf8_chunk(&chunk, &mut state.pending_utf8, &mut state.buffer)
+                    {
+                        return Some((Err(error), state));
+                    }
                     drain_sse_buffer(&mut state.buffer, &mut state.pending);
                 }
                 Some(Err(err)) => return Some((Err(err), state)),
                 None => {
+                    if !state.pending_utf8.is_empty() {
+                        state.pending_utf8.clear();
+                        state.done = true;
+                        return Some((
+                            Err(ProviderError::malformed(
+                                "streaming chat",
+                                "provider stream ended with partial UTF-8",
+                            )),
+                            state,
+                        ));
+                    }
                     if !state.buffer.trim().is_empty() {
                         parse_sse_frame(&state.buffer, &mut state.pending);
                         state.buffer.clear();
@@ -603,11 +620,64 @@ fn sse_chat_stream(chunks: BoxStream<'static, ProviderResult<String>>) -> ChatSt
     .boxed()
 }
 
+fn push_utf8_chunk(
+    chunk: &[u8],
+    pending_utf8: &mut Vec<u8>,
+    buffer: &mut String,
+) -> ProviderResult<()> {
+    pending_utf8.extend_from_slice(chunk);
+
+    loop {
+        match std::str::from_utf8(pending_utf8) {
+            Ok(text) => {
+                buffer.push_str(text);
+                pending_utf8.clear();
+                return Ok(());
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    let valid =
+                        std::str::from_utf8(&pending_utf8[..valid_up_to]).map_err(|_| {
+                            ProviderError::malformed(
+                                "streaming chat",
+                                "provider stream contained invalid UTF-8",
+                            )
+                        })?;
+                    buffer.push_str(valid);
+                    pending_utf8.drain(..valid_up_to);
+                    continue;
+                }
+
+                if error.error_len().is_none() {
+                    return Ok(());
+                }
+
+                return Err(ProviderError::malformed(
+                    "streaming chat",
+                    "provider stream contained invalid UTF-8",
+                ));
+            }
+        }
+    }
+}
+
 fn drain_sse_buffer(buffer: &mut String, pending: &mut VecDeque<ProviderResult<ChatStreamEvent>>) {
-    while let Some(idx) = buffer.find("\n\n") {
+    while let Some((idx, separator_len)) = find_sse_frame_separator(buffer) {
         let frame = buffer[..idx].to_string();
-        buffer.drain(..idx + 2);
+        buffer.drain(..idx + separator_len);
         parse_sse_frame(&frame, pending);
+    }
+}
+
+fn find_sse_frame_separator(buffer: &str) -> Option<(usize, usize)> {
+    let lf = buffer.find("\n\n").map(|idx| (idx, 2));
+    let crlf = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
+
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
     }
 }
 
@@ -773,9 +843,9 @@ mod tests {
     #[tokio::test]
     async fn parses_streaming_chat_chunks() {
         let chunks = stream::iter(vec![
-            Ok("data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n".to_string()),
-            Ok("data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n".to_string()),
-            Ok("data: [DONE]\n\n".to_string()),
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n".to_vec()),
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec()),
+            Ok(b"data: [DONE]\n\n".to_vec()),
         ])
         .boxed();
 
@@ -799,6 +869,37 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn parses_streaming_chat_chunk_split_inside_utf8_scalar() {
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"streamed 你好 π\"}}]}\n\n";
+        let split = frame
+            .find("你")
+            .expect("test frame contains multibyte text")
+            + 1;
+        let chunks = stream::iter(vec![
+            Ok(frame.as_bytes()[..split].to_vec()),
+            Ok(frame.as_bytes()[split..].to_vec()),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ])
+        .boxed();
+
+        let events = sse_chat_stream(chunks)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<ProviderResult<Vec<_>>>()
+            .expect("parse stream");
+
+        assert_eq!(
+            events,
+            vec![ChatStreamEvent {
+                delta: "streamed 你好 π".into(),
+                finish_reason: None,
+            }]
+        );
+        assert!(!events[0].delta.contains('\u{fffd}'));
     }
 
     #[test]
