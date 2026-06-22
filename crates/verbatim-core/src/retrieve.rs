@@ -266,7 +266,18 @@ impl<'a> RetrievalPipeline<'a> {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &self.qdrant {
             let local_results = self.local_dense_search(query_vec, top_k, source_filter);
-            return match qdrant.search(query_vec, top_k, source_filter).await {
+            let default_profile_id;
+            let profile_id = match &self.required_profile_id {
+                Some(profile_id) => profile_id,
+                None => {
+                    default_profile_id = EmbeddingProfileId::default_profile();
+                    &default_profile_id
+                }
+            };
+            return match qdrant
+                .search(profile_id, query_vec, top_k, source_filter)
+                .await
+            {
                 Ok(results) => {
                     self.merge_preferred_dense_hits(results, local_results, top_k, source_filter)
                 }

@@ -38,6 +38,17 @@ pub struct SourceContentsReplacement<'a> {
     pub graph_edges: &'a [GraphEdge],
 }
 
+/// Stable configuration that defines an embedding profile's vector semantics.
+#[derive(Clone, Copy, Debug)]
+pub struct EmbeddingProfileConfig<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub dimension: usize,
+    pub normalize: bool,
+    pub query_instruction: &'a str,
+    pub document_instruction: &'a str,
+}
+
 impl Store {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -739,24 +750,32 @@ impl Store {
     pub fn ensure_embedding_profile(
         &self,
         profile_id: &EmbeddingProfileId,
-        provider: &str,
-        model: &str,
-        dimension: usize,
-        normalize: bool,
+        config: EmbeddingProfileConfig<'_>,
     ) -> Result<()> {
         let now = unix_timestamp_string();
-        let config_hash = embedding_profile_config_hash(provider, model, dimension, normalize);
+        let query_instruction_hash = embedding_instruction_hash(config.query_instruction);
+        let document_instruction_hash = embedding_instruction_hash(config.document_instruction);
+        let config_hash = embedding_profile_config_hash(
+            config.provider,
+            config.model,
+            config.dimension,
+            config.normalize,
+            &query_instruction_hash,
+            &document_instruction_hash,
+        );
         self.conn.execute(
             "INSERT INTO embedding_profiles
-                (id, provider, model, dimension, normalize, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?7)
+                (id, provider, model, dimension, normalize, query_instruction_hash, document_instruction_hash, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9)
              ON CONFLICT(id) DO NOTHING",
             params![
                 profile_id.as_str(),
-                provider,
-                model,
-                sql_usize(dimension),
-                normalize,
+                config.provider,
+                config.model,
+                sql_usize(config.dimension),
+                config.normalize,
+                &query_instruction_hash,
+                &document_instruction_hash,
                 &config_hash,
                 &now,
             ],
@@ -767,10 +786,10 @@ impl Store {
             params![profile_id.as_str()],
         )?;
 
-        let existing: Option<(String, String, i64, bool, String)> = self
+        let existing: Option<(String, String, i64, bool, String, String, String)> = self
             .conn
             .query_row(
-                "SELECT provider, model, dimension, normalize, config_hash
+                "SELECT provider, model, dimension, normalize, query_instruction_hash, document_instruction_hash, config_hash
                  FROM embedding_profiles
                  WHERE id = ?1",
                 params![profile_id.as_str()],
@@ -781,6 +800,8 @@ impl Store {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -790,6 +811,8 @@ impl Store {
             existing_model,
             existing_dimension,
             existing_normalize,
+            existing_query_instruction_hash,
+            existing_document_instruction_hash,
             existing_hash,
         )) = existing
         else {
@@ -803,15 +826,19 @@ impl Store {
                      model = ?3,
                      dimension = ?4,
                      normalize = ?5,
-                     config_hash = ?6,
-                     updated_at = ?7
+                     query_instruction_hash = ?6,
+                     document_instruction_hash = ?7,
+                     config_hash = ?8,
+                     updated_at = ?9
                  WHERE id = ?1",
                 params![
                     profile_id.as_str(),
-                    provider,
-                    model,
-                    sql_usize(dimension),
-                    normalize,
+                    config.provider,
+                    config.model,
+                    sql_usize(config.dimension),
+                    config.normalize,
+                    query_instruction_hash,
+                    document_instruction_hash,
                     config_hash,
                     now,
                 ],
@@ -820,16 +847,20 @@ impl Store {
         }
         if existing_hash != config_hash {
             bail!(
-                "embedding profile '{}' already exists for provider='{}', model='{}', dimension={}, normalize={}, but current config is provider='{}', model='{}', dimension={}, normalize={}",
+                "embedding profile '{}' already exists for provider='{}', model='{}', dimension={}, normalize={}, query_instruction_hash='{}', document_instruction_hash='{}', but current config is provider='{}', model='{}', dimension={}, normalize={}, query_instruction_hash='{}', document_instruction_hash='{}'",
                 profile_id,
                 existing_provider,
                 existing_model,
                 existing_dimension,
                 existing_normalize,
-                provider,
-                model,
-                dimension,
-                normalize,
+                existing_query_instruction_hash,
+                existing_document_instruction_hash,
+                config.provider,
+                config.model,
+                config.dimension,
+                config.normalize,
+                query_instruction_hash,
+                document_instruction_hash,
             );
         }
 
@@ -1306,10 +1337,30 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) 
 
 fn migrate_embedding_profile_tables(conn: &Connection) -> Result<()> {
     let now = unix_timestamp_string();
+    let had_query_instruction_hash =
+        table_has_column(conn, "embedding_profiles", "query_instruction_hash")?;
+    let had_document_instruction_hash =
+        table_has_column(conn, "embedding_profiles", "document_instruction_hash")?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "query_instruction_hash",
+        "ALTER TABLE embedding_profiles ADD COLUMN query_instruction_hash TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "document_instruction_hash",
+        "ALTER TABLE embedding_profiles ADD COLUMN document_instruction_hash TEXT NOT NULL DEFAULT ''",
+    )?;
+    if !had_query_instruction_hash || !had_document_instruction_hash {
+        backfill_embedding_profile_instruction_hashes(conn)?;
+    }
+
     conn.execute(
         "INSERT OR IGNORE INTO embedding_profiles
-            (id, provider, model, dimension, normalize, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
-         VALUES (?1, 'legacy', 'legacy', 0, 1, ?2, NULL, NULL, ?3, ?3)",
+            (id, provider, model, dimension, normalize, query_instruction_hash, document_instruction_hash, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
+         VALUES (?1, 'legacy', 'legacy', 0, 1, '', '', ?2, NULL, NULL, ?3, ?3)",
         params![
             DEFAULT_EMBEDDING_PROFILE_ID,
             LEGACY_EMBEDDING_PROFILE_CONFIG_HASH,
@@ -1387,6 +1438,52 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
         }
     }
     Ok(false)
+}
+
+fn backfill_embedding_profile_instruction_hashes(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT id, provider, model, dimension, normalize, config_hash
+             FROM embedding_profiles",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let empty_instruction_hash = embedding_instruction_hash("");
+    for (id, provider, model, dimension, normalize, old_config_hash) in rows {
+        if old_config_hash == LEGACY_EMBEDDING_PROFILE_CONFIG_HASH {
+            continue;
+        }
+        let dimension = usize::try_from(dimension).with_context(|| {
+            format!("invalid embedding profile dimension for profile '{id}': {dimension}")
+        })?;
+        let config_hash = embedding_profile_config_hash(
+            &provider,
+            &model,
+            dimension,
+            normalize,
+            &empty_instruction_hash,
+            &empty_instruction_hash,
+        );
+        conn.execute(
+            "UPDATE embedding_profiles
+             SET query_instruction_hash = ?2,
+                 document_instruction_hash = ?2,
+                 config_hash = ?3
+             WHERE id = ?1",
+            params![id, &empty_instruction_hash, config_hash],
+        )?;
+    }
+    Ok(())
 }
 
 fn insert_evidence_units_tx(tx: &Transaction<'_>, units: &[EvidenceUnit]) -> Result<()> {
@@ -1628,8 +1725,19 @@ fn embedding_profile_config_hash(
     model: &str,
     dimension: usize,
     normalize: bool,
+    query_instruction_hash: &str,
+    document_instruction_hash: &str,
 ) -> String {
-    hex_sha256(format!("{provider}\0{model}\0{dimension}\0{normalize}").as_bytes())
+    hex_sha256(
+        format!(
+            "{provider}\0{model}\0{dimension}\0{normalize}\0{query_instruction_hash}\0{document_instruction_hash}"
+        )
+        .as_bytes(),
+    )
+}
+
+fn embedding_instruction_hash(instruction: &str) -> String {
+    hex_sha256(instruction.as_bytes())
 }
 
 fn row_to_image_caption_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageCaptionRecord> {
@@ -2049,6 +2157,8 @@ CREATE TABLE IF NOT EXISTS embedding_profiles (
     model TEXT NOT NULL,
     dimension INTEGER NOT NULL,
     normalize INTEGER NOT NULL,
+    query_instruction_hash TEXT NOT NULL DEFAULT '',
+    document_instruction_hash TEXT NOT NULL DEFAULT '',
     config_hash TEXT NOT NULL,
     qdrant_collection TEXT,
     qdrant_vector_name TEXT,
@@ -2319,9 +2429,30 @@ mod tests {
         EmbeddingProfileId::new(id).unwrap()
     }
 
+    fn test_profile_config<'a>(
+        provider: &'a str,
+        model: &'a str,
+        dimension: usize,
+        normalize: bool,
+        query_instruction: &'a str,
+        document_instruction: &'a str,
+    ) -> EmbeddingProfileConfig<'a> {
+        EmbeddingProfileConfig {
+            provider,
+            model,
+            dimension,
+            normalize,
+            query_instruction,
+            document_instruction,
+        }
+    }
+
     fn ensure_test_profile(store: &Store, profile_id: &EmbeddingProfileId) {
         store
-            .ensure_embedding_profile(profile_id, "test", profile_id.as_str(), 2, true)
+            .ensure_embedding_profile(
+                profile_id,
+                test_profile_config("test", profile_id.as_str(), 2, true, "", ""),
+            )
             .unwrap();
     }
 
@@ -2402,7 +2533,118 @@ mod tests {
         );
 
         store
-            .ensure_embedding_profile(&default_profile, "custom", "custom-model", 384, false)
+            .ensure_embedding_profile(
+                &default_profile,
+                test_profile_config(
+                    "custom",
+                    "custom-model",
+                    384,
+                    false,
+                    "query instruction",
+                    "document instruction",
+                ),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn embedding_profile_rejects_changed_document_instruction() {
+        let store = Store::in_memory().unwrap();
+        let profile = profile_id("instructional");
+        store
+            .ensure_embedding_profile(
+                &profile,
+                test_profile_config(
+                    "test",
+                    "model",
+                    2,
+                    true,
+                    "same query",
+                    "document instruction v1",
+                ),
+            )
+            .unwrap();
+
+        let query_err = store
+            .ensure_embedding_profile(
+                &profile,
+                test_profile_config(
+                    "test",
+                    "model",
+                    2,
+                    true,
+                    "changed query",
+                    "document instruction v1",
+                ),
+            )
+            .unwrap_err();
+        assert!(query_err.to_string().contains("query_instruction_hash"));
+
+        let err = store
+            .ensure_embedding_profile(
+                &profile,
+                test_profile_config(
+                    "test",
+                    "model",
+                    2,
+                    true,
+                    "same query",
+                    "document instruction v2",
+                ),
+            )
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("embedding profile 'instructional' already exists"));
+        assert!(err.to_string().contains("document_instruction_hash"));
+    }
+
+    #[test]
+    fn embedding_profile_migration_preserves_nonlegacy_config_compatibility() {
+        let tempdir = tempdir().unwrap();
+        let db_path = tempdir.path().join("profiles.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE embedding_profiles (
+                    id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    dimension INTEGER NOT NULL,
+                    normalize INTEGER NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    qdrant_collection TEXT,
+                    qdrant_vector_name TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO embedding_profiles
+                    (id, provider, model, dimension, normalize, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
+                    VALUES ('custom', 'provider-a', 'model-a', 2, 1, 'pre-instruction-config', NULL, NULL, '2026-01-01', '2026-01-01');
+                ",
+            )
+            .unwrap();
+        }
+
+        let store = Store::new(&db_path).unwrap();
+        let profile = profile_id("custom");
+        let err = store
+            .ensure_embedding_profile(
+                &profile,
+                test_profile_config("provider-b", "model-a", 2, true, "", ""),
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("embedding profile 'custom' already exists"));
+
+        store
+            .ensure_embedding_profile(
+                &profile,
+                test_profile_config("provider-a", "model-a", 2, true, "", ""),
+            )
             .unwrap();
     }
 

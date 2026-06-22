@@ -22,7 +22,7 @@ use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
-use crate::store::{SourceContentsReplacement, Store};
+use crate::store::{EmbeddingProfileConfig, SourceContentsReplacement, Store};
 use crate::task::{PhaseTiming, TaskId};
 use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
 use crate::types::{
@@ -66,6 +66,21 @@ struct EmbeddingProfileSpec {
     model: String,
     dimension: usize,
     normalize: bool,
+    query_instruction: String,
+    document_instruction: String,
+}
+
+impl EmbeddingProfileSpec {
+    fn as_store_config(&self) -> EmbeddingProfileConfig<'_> {
+        EmbeddingProfileConfig {
+            provider: &self.provider,
+            model: &self.model,
+            dimension: self.dimension,
+            normalize: self.normalize,
+            query_instruction: &self.query_instruction,
+            document_instruction: &self.document_instruction,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -122,13 +137,12 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             model: config.embedding.model.clone(),
             dimension: config.embedding.dimension,
             normalize: config.embedding.normalize,
+            query_instruction: config.embedding.query_instruction.clone(),
+            document_instruction: config.embedding.document_instruction.clone(),
         };
         store.ensure_embedding_profile(
             &active_profile_id,
-            &embedding_profile_spec.provider,
-            &embedding_profile_spec.model,
-            embedding_profile_spec.dimension,
-            embedding_profile_spec.normalize,
+            embedding_profile_spec.as_store_config(),
         )?;
 
         let hnsw = load_published_vector_index(data_dir, &store, &active_profile_id)?;
@@ -212,13 +226,8 @@ where
     }
 
     fn ensure_embedding_profile(&self, profile_id: &EmbeddingProfileId) -> Result<()> {
-        self.store.ensure_embedding_profile(
-            profile_id,
-            &self.embedding_profile_spec.provider,
-            &self.embedding_profile_spec.model,
-            self.embedding_profile_spec.dimension,
-            self.embedding_profile_spec.normalize,
-        )
+        self.store
+            .ensure_embedding_profile(profile_id, self.embedding_profile_spec.as_store_config())
     }
 
     #[cfg(test)]
@@ -229,15 +238,11 @@ where
             model: "test-embedding".to_string(),
             dimension: embed_client.dimension(),
             normalize: true,
+            query_instruction: String::new(),
+            document_instruction: String::new(),
         };
         store
-            .ensure_embedding_profile(
-                &active_profile_id,
-                &embedding_profile_spec.provider,
-                &embedding_profile_spec.model,
-                embedding_profile_spec.dimension,
-                embedding_profile_spec.normalize,
-            )
+            .ensure_embedding_profile(&active_profile_id, embedding_profile_spec.as_store_config())
             .unwrap();
         Self {
             store,
@@ -755,6 +760,11 @@ where
             }
         };
         self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
+        #[cfg(feature = "qdrant")]
+        match source_id {
+            Some(source_id) => self.sync_qdrant_profile_source(profile_id, source_id).await,
+            None => self.sync_qdrant_profile_all(profile_id).await,
+        }
         Ok(child_chunks.len())
     }
 
@@ -882,22 +892,31 @@ where
 
     #[cfg(feature = "qdrant")]
     async fn sync_qdrant_source(&self, source_id: &SourceId) {
+        self.sync_qdrant_profile_source(&self.active_profile_id, source_id)
+            .await;
+    }
+
+    #[cfg(feature = "qdrant")]
+    async fn sync_qdrant_profile_source(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_id: &SourceId,
+    ) {
         let Some(qdrant) = &self.qdrant else {
             return;
         };
         let result: Result<()> = async {
-            let records = records_from_store_for_profile(
-                &self.store,
-                &self.active_profile_id,
-                Some(source_id),
-            )?;
-            qdrant.delete_source(source_id).await?;
+            let records = records_from_store_for_profile(&self.store, profile_id, Some(source_id))?;
+            qdrant
+                .delete_source_for_profile(profile_id, source_id)
+                .await?;
             qdrant.upsert_records(&records).await?;
             Ok(())
         }
         .await;
         if let Err(err) = result {
             tracing::warn!(
+                embedding_profile_id = %profile_id,
                 source = %source_id.0,
                 error = %err,
                 "qdrant source sync failed; local ingest remains authoritative"
@@ -921,18 +940,24 @@ where
 
     #[cfg(feature = "qdrant")]
     async fn sync_qdrant_all(&self) {
+        self.sync_qdrant_profile_all(&self.active_profile_id).await;
+    }
+
+    #[cfg(feature = "qdrant")]
+    async fn sync_qdrant_profile_all(&self, profile_id: &EmbeddingProfileId) {
         let Some(qdrant) = &self.qdrant else {
             return;
         };
         let result: Result<()> = async {
-            let records =
-                records_from_store_for_profile(&self.store, &self.active_profile_id, None)?;
-            qdrant.recreate_with_records(&records).await?;
+            let records = records_from_store_for_profile(&self.store, profile_id, None)?;
+            qdrant.delete_profile(profile_id).await?;
+            qdrant.upsert_records(&records).await?;
             Ok(())
         }
         .await;
         if let Err(err) = result {
             tracing::warn!(
+                embedding_profile_id = %profile_id,
                 error = %err,
                 "qdrant full sync failed; local indexes remain authoritative"
             );
@@ -2788,10 +2813,14 @@ mod tests {
             store
                 .ensure_embedding_profile(
                     &alt_profile,
-                    &config.embedding.provider,
-                    &config.embedding.model,
-                    config.embedding.dimension,
-                    config.embedding.normalize,
+                    EmbeddingProfileConfig {
+                        provider: &config.embedding.provider,
+                        model: &config.embedding.model,
+                        dimension: config.embedding.dimension,
+                        normalize: config.embedding.normalize,
+                        query_instruction: &config.embedding.query_instruction,
+                        document_instruction: &config.embedding.document_instruction,
+                    },
                 )
                 .unwrap();
             store
@@ -3717,7 +3746,7 @@ model = "local-vision"
 
     #[cfg(feature = "qdrant")]
     #[tokio::test]
-    async fn force_ingest_recreates_qdrant_collection_after_local_ingest() {
+    async fn force_ingest_rewrites_active_qdrant_profile_after_local_ingest() {
         let (qdrant_url, handle) = spawn_qdrant_server(vec![
             (404, r#"{"status":{"error":"missing"},"result":null}"#),
             (404, r#"{"status":{"error":"missing"},"result":null}"#),
@@ -3727,10 +3756,14 @@ model = "local-vision"
                 r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
             ),
             (200, r#"{"status":"ok","result":true}"#),
-            (200, r#"{"status":"ok","result":true}"#),
             (
                 200,
                 r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
+            ),
+            (200, r#"{"status":"ok","result":true}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":3}}"#,
             ),
         ]);
         let tempdir = tempfile::tempdir().unwrap();
@@ -3752,18 +3785,79 @@ model = "local-vision"
 
         assert_eq!(ingested, 1);
         let requests = handle.join().unwrap();
-        assert_eq!(requests[4].line, "DELETE /collections/verbatim HTTP/1.1");
-        assert_eq!(requests[5].line, "PUT /collections/verbatim HTTP/1.1");
         assert_eq!(
-            requests[6].line,
+            requests[5].line,
+            "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        );
+        let delete_body: serde_json::Value = serde_json::from_str(&requests[5].body).unwrap();
+        assert_eq!(delete_body["filter"]["must"][0]["key"], "profile_id");
+        assert_eq!(
+            delete_body["filter"]["must"][0]["match"]["value"],
+            "default"
+        );
+        assert_eq!(
+            requests[7].line,
             "PUT /collections/verbatim/points?wait=true HTTP/1.1"
         );
-        let body: serde_json::Value = serde_json::from_str(&requests[6].body).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&requests[7].body).unwrap();
+        assert_eq!(body["points"][0]["payload"]["profile_id"], "default");
         assert_eq!(body["points"][0]["payload"]["source_id"], "src-force");
         assert!(body["points"][0]["payload"]["chunk_id"]
             .as_str()
             .unwrap()
             .contains("src-force"));
+    }
+
+    #[cfg(feature = "qdrant")]
+    #[tokio::test]
+    async fn vectors_only_profile_build_syncs_qdrant_with_profile_filter() {
+        let (qdrant_url, handle) = spawn_qdrant_server(vec![
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
+            ),
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
+            ),
+        ]);
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-alt", tempdir.path().join("alt.txt"));
+        insert_source_with_child_text(&store, &source, "chunk-alt", "alt profile text").unwrap();
+        let qdrant = QdrantClient::new(qdrant_test_config(qdrant_url));
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_qdrant_client(qdrant);
+        let alt_profile = EmbeddingProfileId::new("alt").unwrap();
+
+        let count = pipeline
+            .build_embedding_profile(&alt_profile, None)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+        let requests = handle.join().unwrap();
+        assert_eq!(
+            requests[1].line,
+            "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        );
+        let delete_body: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(delete_body["filter"]["must"][0]["key"], "profile_id");
+        assert_eq!(delete_body["filter"]["must"][0]["match"]["value"], "alt");
+        assert_eq!(
+            requests[3].line,
+            "PUT /collections/verbatim/points?wait=true HTTP/1.1"
+        );
+        let upsert_body: serde_json::Value = serde_json::from_str(&requests[3].body).unwrap();
+        assert_eq!(upsert_body["points"][0]["payload"]["profile_id"], "alt");
+        assert_eq!(upsert_body["points"][0]["payload"]["source_id"], "src-alt");
     }
 
     #[tokio::test]
