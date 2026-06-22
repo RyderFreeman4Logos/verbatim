@@ -131,7 +131,10 @@ fn build_children(
                 &current_heading,
             ));
 
-            let overlap_start = current_text.len().saturating_sub(overlap_chars);
+            let overlap_start = floor_char_boundary(
+                &current_text,
+                current_text.len().saturating_sub(overlap_chars),
+            );
             let overlap = current_text[overlap_start..].to_string();
             current_text = overlap;
             current_evidence.clear();
@@ -158,6 +161,14 @@ fn build_children(
     }
 
     children
+}
+
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut boundary = index.min(text.len());
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
 }
 
 fn make_child(
@@ -303,5 +314,23 @@ mod tests {
         for (chunk_id, _eid) in &output.links {
             assert!(output.chunks.iter().any(|c| c.id == *chunk_id));
         }
+    }
+
+    #[test]
+    fn unicode_overlap_starts_on_char_boundary() {
+        let mut evidence = make_evidence(2, "中文章节");
+        evidence[0].text = "份".repeat(380);
+        evidence[1].text = "额".repeat(101);
+
+        let output = chunk_evidence(
+            &SourceId("test".into()),
+            &evidence,
+            &ChunkerConfig::default(),
+        );
+
+        assert!(output
+            .chunks
+            .iter()
+            .any(|chunk| chunk.chunk_type == ChunkType::Child));
     }
 }
