@@ -2,6 +2,8 @@
 
 Verbatim keeps the MVP regression suite deterministic. Fast tests use small in-memory stores, tiny generated PDF fixtures, and mocked model providers for embedding, vision captioning, and verification. They do not require network access or local Qwen/vLLM endpoints.
 
+For the release checklist and manual model-backed smoke sequence, see [mvp.md](mvp.md).
+
 ## Fast Regression Suite
 
 Run the focused MVP fixture suite:
