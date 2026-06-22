@@ -125,6 +125,44 @@ mod tests {
     }
 
     #[test]
+    fn mvp_regression_pdf_text_fixture_extracts_page_locator() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let pdf_path = tempdir.path().join("text-fixture.pdf");
+        write_pdf_with_text(&pdf_path, "MVP PDF text evidence");
+
+        let units = PdfOxideParser
+            .parse(&pdf_path)
+            .expect("text PDF fixture should parse");
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].text, "MVP PDF text evidence");
+        assert!(matches!(
+            units[0].locator,
+            SourceLocator::Pdf {
+                page: 1,
+                paragraph: 0,
+                bbox: None
+            }
+        ));
+    }
+
+    #[test]
+    fn mvp_regression_pdf_diagram_image_fixture_extracts_artifact() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let pdf_path = tempdir.path().join("diagram-fixture.pdf");
+        write_pdf_with_image(&pdf_path);
+
+        let artifacts = PdfOxideParser
+            .extract_image_artifacts(&pdf_path)
+            .expect("diagram image fixture should parse");
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].mime_type, "image/png");
+        assert_eq!(artifacts[0].width, 8);
+        assert_eq!(artifacts[0].height, 8);
+    }
+
+    #[test]
     fn rejects_image_artifacts_over_byte_limit() {
         let tempdir = tempfile::tempdir().unwrap();
         let pdf_path = tempdir.path().join("image-fixture.pdf");
@@ -192,6 +230,22 @@ mod tests {
                 &image_bytes,
             ),
             stream_object(b"<<", content),
+        ];
+        std::fs::write(path, pdf_bytes(objects)).expect("fixture PDF should save");
+    }
+
+    fn write_pdf_with_text(path: &Path, text: &str) {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        let content = format!("BT\n/F1 12 Tf\n72 120 Td\n({escaped}) Tj\nET\n");
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            stream_object(b"<<", content.as_bytes()),
         ];
         std::fs::write(path, pdf_bytes(objects)).expect("fixture PDF should save");
     }

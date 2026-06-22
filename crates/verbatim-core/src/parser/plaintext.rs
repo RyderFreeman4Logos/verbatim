@@ -155,4 +155,31 @@ mod tests {
             _ => panic!("expected Document locator"),
         }
     }
+
+    #[test]
+    fn mvp_regression_plaintext_source_paragraphs_are_stable() {
+        let mut f = NamedTempFile::with_suffix(".txt").unwrap();
+        write!(
+            f,
+            "alpha plain text\ncontinues on line two\n\nbeta plain text\n"
+        )
+        .unwrap();
+
+        let units = PlaintextParser.parse(f.path()).unwrap();
+
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].text, "alpha plain text continues on line two");
+        assert_eq!(units[0].heading_path, Vec::<String>::new());
+        match &units[0].locator {
+            SourceLocator::Document {
+                line_start,
+                line_end,
+                ..
+            } => {
+                assert_eq!(*line_start, 1);
+                assert_eq!(*line_end, Some(2));
+            }
+            _ => panic!("expected Document locator"),
+        }
+    }
 }
