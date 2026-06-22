@@ -1,0 +1,273 @@
+use std::io::{BufRead, BufReader, Read, Write};
+
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use verbatim_core::api::{AskCitationEvent, AskErrorEvent, AskResponse, AskTokenEvent};
+
+use crate::client::{CliError, CliResult};
+use crate::render;
+
+pub fn consume_ask_sse<R, W>(reader: R, stdout: &mut W) -> CliResult<()>
+where
+    R: Read,
+    W: Write,
+{
+    let mut consumer = SseConsumer::new(stdout);
+    consumer.consume(reader)
+}
+
+struct SseConsumer<'a, W> {
+    stdout: &'a mut W,
+}
+
+impl<'a, W> SseConsumer<'a, W>
+where
+    W: Write,
+{
+    fn new(stdout: &'a mut W) -> Self {
+        Self { stdout }
+    }
+
+    fn consume<R>(&mut self, reader: R) -> CliResult<()>
+    where
+        R: Read,
+    {
+        let mut reader = BufReader::new(reader);
+        let mut frame = String::new();
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+
+            trim_line_ending(&mut line);
+            if line.is_empty() {
+                self.handle_frame(&frame)?;
+                frame.clear();
+            } else {
+                if !frame.is_empty() {
+                    frame.push('\n');
+                }
+                frame.push_str(&line);
+            }
+        }
+
+        if !frame.trim().is_empty() {
+            self.handle_frame(&frame)?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_frame(&mut self, frame: &str) -> CliResult<()> {
+        let Some(frame) = parse_frame(frame) else {
+            return Ok(());
+        };
+
+        match frame.event.as_deref().unwrap_or("message") {
+            "token" => {
+                let token: AskTokenEvent = decode_event("token", &frame.data)?;
+                write!(self.stdout, "{}", token.text)?;
+                self.stdout.flush()?;
+                Ok(())
+            }
+            "citation" => {
+                let citation: AskCitationEvent = decode_event("citation", &frame.data)?;
+                render::write_citations(self.stdout, &citation.citations)?;
+                Ok(())
+            }
+            "retrieval" => {
+                let debug: Value = decode_event("retrieval", &frame.data)?;
+                render::write_retrieval_debug(self.stdout, &debug)?;
+                Ok(())
+            }
+            "error" => Err(stream_error(&frame.data)),
+            "answer" => {
+                let response: AskResponse = decode_event("answer", &frame.data)?;
+                render::write_ask_response(self.stdout, &response)?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn trim_line_ending(line: &mut String) {
+    if line.ends_with('\n') {
+        line.pop();
+    }
+    if line.ends_with('\r') {
+        line.pop();
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SseFrame {
+    event: Option<String>,
+    data: String,
+}
+
+fn parse_frame(frame: &str) -> Option<SseFrame> {
+    let mut event = None;
+    let mut data = Vec::new();
+
+    for line in frame.lines() {
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            event = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.trim_start().to_string());
+        }
+    }
+
+    if event.is_none() && data.is_empty() {
+        return None;
+    }
+
+    Some(SseFrame {
+        event,
+        data: data.join("\n"),
+    })
+}
+
+fn decode_event<T>(event: &'static str, data: &str) -> CliResult<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str(data)
+        .map_err(|error| CliError::Api(format!("daemon sent invalid {event} event: {error}")))
+}
+
+fn stream_error(data: &str) -> CliError {
+    if let Ok(error) = serde_json::from_str::<AskErrorEvent>(data) {
+        let prefix = error
+            .status
+            .map(|status| format!("daemon stream returned HTTP {status}: "))
+            .unwrap_or_default();
+        return CliError::Api(format!("{prefix}{}", error.error));
+    }
+
+    CliError::Api(format!("daemon stream error: {data}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::io::{self, Cursor, Read, Write};
+
+    use super::*;
+
+    #[test]
+    fn parses_named_data_frame() {
+        let frame = parse_frame("event: token\ndata: {\"text\":\"hi\"}\n").unwrap();
+
+        assert_eq!(
+            frame,
+            SseFrame {
+                event: Some("token".into()),
+                data: "{\"text\":\"hi\"}".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn consumes_tokens_as_frames_arrive_and_renders_citations() {
+        let stream = concat!(
+            "event: token\n",
+            "data: {\"text\":\"Hel\"}\n\n",
+            "event: token\n",
+            "data: {\"text\":\"lo [E1].\"}\n\n",
+            "event: citation\n",
+            "data: {\"citations\":[{\"label\":\"E1\",\"evidence_id\":\"ev-1\",\"kind\":\"original_text\",\"derived_from\":null,\"locator\":\"PDF p.1 para.1\",\"text_preview\":\"preview\"}],\"verified\":false}\n\n",
+        );
+        let mut stdout = FlushRecorder::default();
+
+        consume_ask_sse(Cursor::new(stream), &mut stdout).unwrap();
+
+        assert_eq!(stdout.flushes, 2);
+        let output = String::from_utf8(stdout.bytes).unwrap();
+        assert!(output.starts_with("Hello [E1]."));
+        assert!(output.contains("Citations:"));
+        assert!(output.contains("[E1] evidence=ev-1"));
+    }
+
+    #[test]
+    fn consumes_split_utf8_code_points_without_replacement() {
+        let stream = concat!("event: token\n", "data: {\"text\":\"streamed 你好 π\"}\n\n",);
+        let split = stream
+            .find("你")
+            .expect("test stream contains multibyte text")
+            + 1;
+        let chunks = vec![
+            stream.as_bytes()[..split].to_vec(),
+            stream.as_bytes()[split..].to_vec(),
+        ];
+        let mut stdout = FlushRecorder::default();
+
+        consume_ask_sse(ChunkedReader::new(chunks), &mut stdout).unwrap();
+
+        let output = String::from_utf8(stdout.bytes).unwrap();
+        assert_eq!(output, "streamed 你好 π");
+        assert!(!output.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn error_event_returns_cli_error() {
+        let stream = "event: error\ndata: {\"status\":500,\"error\":\"model failed\"}\n\n";
+        let mut stdout = Vec::new();
+
+        let error = consume_ask_sse(Cursor::new(stream), &mut stdout).unwrap_err();
+
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().contains("HTTP 500"));
+        assert!(stdout.is_empty());
+    }
+
+    #[derive(Default)]
+    struct FlushRecorder {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FlushRecorder {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    struct ChunkedReader {
+        chunks: VecDeque<Vec<u8>>,
+    }
+
+    impl ChunkedReader {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into(),
+            }
+        }
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some(mut chunk) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            let len = chunk.len().min(buf.len());
+            buf[..len].copy_from_slice(&chunk[..len]);
+            if len < chunk.len() {
+                let rest = chunk.split_off(len);
+                self.chunks.push_front(rest);
+            }
+            Ok(len)
+        }
+    }
+}

@@ -1,0 +1,639 @@
+use std::fmt;
+use std::io::{Read, Write};
+
+use reqwest::blocking::Client;
+use reqwest::{Method, StatusCode};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::Value;
+use verbatim_core::api::{
+    AddSourceRequest, AddSourceResponse, AskRequest, CheckStaleResponse, ConfigResponse,
+    EvidenceResponse, HealthResponse, IngestResponse, SourceResponse,
+};
+use verbatim_core::config::{self, Config, DaemonConfig};
+
+use crate::sse;
+
+const MAX_HTTP_ERROR_BODY_BYTES: usize = 4096;
+const HTTP_ERROR_TRUNCATION_MARKER: &str = "...[truncated]";
+
+pub type CliResult<T> = Result<T, CliError>;
+
+#[derive(Debug)]
+pub enum CliError {
+    Api(String),
+    DaemonUnreachable(String),
+    Io(std::io::Error),
+}
+
+impl CliError {
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::DaemonUnreachable(_) => 2,
+            Self::Api(_) | Self::Io(_) => 1,
+        }
+    }
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Api(message) | Self::DaemonUnreachable(message) => f.write_str(message),
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Api(_) | Self::DaemonUnreachable(_) => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for CliError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+pub trait DaemonClient {
+    fn add_source(&self, path: &str) -> CliResult<AddSourceResponse>;
+    fn list_sources(&self) -> CliResult<Vec<SourceResponse>>;
+    fn get_source(&self, id: &str) -> CliResult<SourceResponse>;
+    fn remove_source(&self, id: &str) -> CliResult<()>;
+    fn check_sources(&self) -> CliResult<CheckStaleResponse>;
+    fn ingest(&self, source_id: Option<&str>, force: bool) -> CliResult<IngestResponse>;
+    fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> CliResult<()>
+    where
+        W: Write;
+    fn get_evidence(&self, evidence_id: &str) -> CliResult<EvidenceResponse>;
+    fn get_config(&self) -> CliResult<ConfigResponse>;
+    fn health(&self) -> CliResult<HealthResponse>;
+}
+
+pub struct HttpDaemonClient {
+    client: Client,
+    base_url: Option<String>,
+}
+
+impl HttpDaemonClient {
+    pub fn new() -> Self {
+        Self {
+            client: Client::new(),
+            base_url: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        Self {
+            client: Client::new(),
+            base_url: Some(base_url.into()),
+        }
+    }
+
+    fn base_url(&self) -> CliResult<String> {
+        if let Some(base_url) = &self.base_url {
+            return Ok(base_url.trim_end_matches('/').to_string());
+        }
+
+        let path = config::config_path();
+        let bind = if path.exists() {
+            Config::load_from(&path)
+                .map_err(|error| {
+                    CliError::Api(format!(
+                        "failed to load config {}: {error:#}",
+                        path.display()
+                    ))
+                })?
+                .daemon
+                .bind
+        } else {
+            DaemonConfig::default().bind
+        };
+
+        Ok(bind_to_base_url(&bind))
+    }
+
+    fn url(&self, path: &str) -> CliResult<String> {
+        Ok(format!("{}{}", self.base_url()?, path))
+    }
+
+    fn request_json<T, B>(&self, method: Method, path: &str, body: Option<&B>) -> CliResult<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let url = self.url(path)?;
+        let mut request = self.client.request(method, &url);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().map_err(|error| request_error(&url, error))?;
+        decode_response(response)
+    }
+}
+
+impl Default for HttpDaemonClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DaemonClient for HttpDaemonClient {
+    fn add_source(&self, path: &str) -> CliResult<AddSourceResponse> {
+        self.request_json(
+            Method::POST,
+            "/api/sources",
+            Some(&AddSourceRequest {
+                path: path.to_string(),
+            }),
+        )
+    }
+
+    fn list_sources(&self) -> CliResult<Vec<SourceResponse>> {
+        self.request_json::<Vec<SourceResponse>, ()>(Method::GET, "/api/sources", None)
+    }
+
+    fn get_source(&self, id: &str) -> CliResult<SourceResponse> {
+        self.request_json::<SourceResponse, ()>(Method::GET, &format!("/api/sources/{id}"), None)
+    }
+
+    fn remove_source(&self, id: &str) -> CliResult<()> {
+        let url = self.url(&format!("/api/sources/{id}"))?;
+        let response = self
+            .client
+            .delete(&url)
+            .send()
+            .map_err(|error| request_error(&url, error))?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        decode_response::<Value>(response).map(|_| ())
+    }
+
+    fn check_sources(&self) -> CliResult<CheckStaleResponse> {
+        self.request_json::<CheckStaleResponse, ()>(Method::POST, "/api/sources/check", None)
+    }
+
+    fn ingest(&self, source_id: Option<&str>, force: bool) -> CliResult<IngestResponse> {
+        let path = match (source_id, force) {
+            (Some(_), true) => {
+                return Err(CliError::Api(
+                    "--force is only supported for all-source ingest".into(),
+                ));
+            }
+            (Some(id), false) => format!("/api/ingest/{id}"),
+            (None, true) => "/api/ingest?force=true".into(),
+            (None, false) => "/api/ingest".into(),
+        };
+        self.request_json::<IngestResponse, ()>(Method::POST, &path, None)
+    }
+
+    fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> CliResult<()>
+    where
+        W: Write,
+    {
+        let url = self.url("/api/ask/stream")?;
+        let response = self
+            .client
+            .post(&url)
+            .json(request)
+            .send()
+            .map_err(|error| request_error(&url, error))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_error(status, response));
+        }
+        sse::consume_ask_sse(response, stdout)
+    }
+
+    fn get_evidence(&self, evidence_id: &str) -> CliResult<EvidenceResponse> {
+        self.request_json::<EvidenceResponse, ()>(
+            Method::GET,
+            &format!("/api/evidence/{evidence_id}"),
+            None,
+        )
+    }
+
+    fn get_config(&self) -> CliResult<ConfigResponse> {
+        self.request_json::<ConfigResponse, ()>(Method::GET, "/api/config", None)
+    }
+
+    fn health(&self) -> CliResult<HealthResponse> {
+        self.request_json::<HealthResponse, ()>(Method::GET, "/api/health", None)
+    }
+}
+
+pub fn bind_to_base_url(bind: &str) -> String {
+    if bind.starts_with("http://") || bind.starts_with("https://") {
+        bind.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}", bind.trim_end_matches('/'))
+    }
+}
+
+fn decode_response<T>(response: reqwest::blocking::Response) -> CliResult<T>
+where
+    T: DeserializeOwned,
+{
+    let status = response.status();
+    if !status.is_success() {
+        return Err(http_error(status, response));
+    }
+    response
+        .json::<T>()
+        .map_err(|error| CliError::Api(format!("daemon returned invalid JSON: {error}")))
+}
+
+fn http_error(status: StatusCode, mut response: reqwest::blocking::Response) -> CliError {
+    let (body, truncated) = read_bounded_error_body(&mut response)
+        .unwrap_or_else(|error| (format!("<failed to read response body: {error}>"), false));
+    CliError::Api(format!(
+        "daemon returned HTTP {status}: {}",
+        bounded_redacted_body(&body, truncated)
+    ))
+}
+
+fn request_error(url: &str, error: reqwest::Error) -> CliError {
+    if error.is_connect() || error.is_timeout() {
+        return CliError::DaemonUnreachable(format!(
+            "could not reach verbatim daemon at {url}: {error}\n\
+             Start it with: systemctl --user start verbatim\n\
+             If the address is wrong, check [daemon] bind in the config."
+        ));
+    }
+    CliError::Api(format!("failed to call daemon at {url}: {error}"))
+}
+
+fn read_bounded_error_body<R>(reader: &mut R) -> std::io::Result<(String, bool)>
+where
+    R: Read,
+{
+    let mut bytes = Vec::with_capacity(MAX_HTTP_ERROR_BODY_BYTES + 1);
+    let mut limited = reader.take((MAX_HTTP_ERROR_BODY_BYTES + 1) as u64);
+    limited.read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > MAX_HTTP_ERROR_BODY_BYTES;
+    if truncated {
+        bytes.truncate(MAX_HTTP_ERROR_BODY_BYTES);
+    }
+
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+}
+
+fn bounded_redacted_body(body: &str, truncated: bool) -> String {
+    let mut redacted = if let Ok(mut value) = serde_json::from_str::<Value>(body) {
+        redact_json(&mut value);
+        serde_json::to_string(&value).unwrap_or_else(|_| redact_json_like_text(body))
+    } else {
+        redact_json_like_text(body)
+    };
+
+    if truncated {
+        redacted.push_str(HTTP_ERROR_TRUNCATION_MARKER);
+    }
+    redacted
+}
+
+fn redact_json(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if is_secret_key(key) {
+                    *child = Value::String("<redacted>".into());
+                } else {
+                    redact_json(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    normalized.contains("apikey")
+        || normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("password")
+        || normalized.contains("authorization")
+        || normalized.contains("bearer")
+}
+
+fn redact_json_like_text(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0;
+
+    while let Some(relative_quote) = input[index..].find('"') {
+        let quote = index + relative_quote;
+        output.push_str(&input[index..quote]);
+
+        let Some((key, key_end)) = parse_json_string(input, quote) else {
+            output.push_str(&input[quote..]);
+            return output;
+        };
+        output.push_str(&input[quote..key_end]);
+
+        let Some(after_colon) = colon_after_key(input, key_end) else {
+            index = key_end;
+            continue;
+        };
+
+        if !is_secret_key(&key) {
+            index = key_end;
+            continue;
+        }
+
+        output.push_str(&input[key_end..after_colon]);
+        let value_start = skip_ascii_whitespace(input, after_colon);
+        output.push_str(&input[after_colon..value_start]);
+
+        if input[value_start..].starts_with('"') {
+            output.push_str("\"<redacted>\"");
+            if let Some((_, value_end)) = parse_json_string(input, value_start) {
+                index = value_end;
+                continue;
+            }
+            return output;
+        }
+
+        output.push_str("\"<redacted>\"");
+        index = next_json_value_boundary(input, value_start);
+    }
+
+    output.push_str(&input[index..]);
+    output
+}
+
+fn parse_json_string(input: &str, quote: usize) -> Option<(String, usize)> {
+    if !input[quote..].starts_with('"') {
+        return None;
+    }
+
+    let mut escaped = false;
+    let mut value = String::new();
+    for (offset, character) in input[quote + 1..].char_indices() {
+        let index = quote + 1 + offset;
+        if escaped {
+            value.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Some((value, index + 1));
+        } else {
+            value.push(character);
+        }
+    }
+    None
+}
+
+fn colon_after_key(input: &str, key_end: usize) -> Option<usize> {
+    let colon = skip_ascii_whitespace(input, key_end);
+    if input[colon..].starts_with(':') {
+        Some(colon + 1)
+    } else {
+        None
+    }
+}
+
+fn skip_ascii_whitespace(input: &str, mut index: usize) -> usize {
+    while let Some(character) = input[index..].chars().next() {
+        if !character.is_ascii_whitespace() {
+            break;
+        }
+        index += character.len_utf8();
+    }
+    index
+}
+
+fn next_json_value_boundary(input: &str, start: usize) -> usize {
+    input[start..]
+        .char_indices()
+        .find_map(|(offset, character)| {
+            matches!(character, ',' | '}' | ']' | '\n' | '\r').then_some(start + offset)
+        })
+        .unwrap_or(input.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn bind_to_base_url_adds_http_scheme() {
+        assert_eq!(bind_to_base_url("127.0.0.1:7700"), "http://127.0.0.1:7700");
+        assert_eq!(
+            bind_to_base_url("http://127.0.0.1:7700/"),
+            "http://127.0.0.1:7700"
+        );
+    }
+
+    #[test]
+    fn http_add_source_posts_json_to_daemon() {
+        let server = TestServer::respond_once(
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"src-1\"}",
+        );
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let response = client.add_source("/tmp/doc.pdf").unwrap();
+
+        assert_eq!(response.id, "src-1");
+        let request = server.request();
+        assert!(request.starts_with("POST /api/sources HTTP/1.1"));
+        assert!(request.contains("\"path\":\"/tmp/doc.pdf\""));
+    }
+
+    #[test]
+    fn http_ingest_force_uses_query_parameter() {
+        let server = TestServer::respond_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ingested\":2}",
+        );
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let response = client.ingest(None, true).unwrap();
+
+        assert_eq!(response.ingested, 2);
+        assert!(server
+            .request()
+            .starts_with("POST /api/ingest?force=true HTTP/1.1"));
+    }
+
+    #[test]
+    fn http_evidence_config_and_status_parse_json() {
+        let server = TestServer::respond_many([
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"ev-1\",\"source_id\":\"src-1\",\"kind\":\"text\",\"derived_from\":null,\"locator\":\"PDF p.1 para.1\",\"text\":\"quoted\",\"heading_path\":[],\"position\":0,\"image_artifact\":null}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"daemon\":{\"bind\":\"x\"}}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
+        ]);
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        assert_eq!(client.get_evidence("ev-1").unwrap().id, "ev-1");
+        assert_eq!(client.get_config().unwrap()["daemon"]["bind"], "x");
+        assert_eq!(client.health().unwrap().status, "ok");
+
+        let requests = server.requests();
+        assert!(requests[0].starts_with("GET /api/evidence/ev-1 HTTP/1.1"));
+        assert!(requests[1].starts_with("GET /api/config HTTP/1.1"));
+        assert!(requests[2].starts_with("GET /api/health HTTP/1.1"));
+    }
+
+    #[test]
+    fn http_error_reports_status_and_redacted_bounded_body() {
+        let server = TestServer::respond_once(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"bad\",\"api_key\":\"should-not-print\"}",
+        );
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let error = client.health().unwrap_err();
+
+        assert_eq!(error.exit_code(), 1);
+        let message = error.to_string();
+        assert!(message.contains("HTTP 500"));
+        assert!(message.contains("<redacted>"));
+        assert!(!message.contains("should-not-print"));
+    }
+
+    #[test]
+    fn long_error_body_redacts_secret_before_truncation_boundary() {
+        let body = format!(
+            "{{\"api_key\":\"should-not-print\",\"padding\":\"{}\"",
+            "x".repeat(MAX_HTTP_ERROR_BODY_BYTES * 2)
+        );
+        let (bounded, truncated) =
+            read_bounded_error_body(&mut Cursor::new(body.as_bytes())).unwrap();
+
+        let message = bounded_redacted_body(&bounded, truncated);
+
+        assert!(truncated);
+        assert!(message.contains("<redacted>"));
+        assert!(message.contains(HTTP_ERROR_TRUNCATION_MARKER));
+        assert!(!message.contains("should-not-print"));
+        assert!(message.len() <= MAX_HTTP_ERROR_BODY_BYTES + HTTP_ERROR_TRUNCATION_MARKER.len());
+    }
+
+    #[test]
+    fn long_error_body_does_not_read_secret_after_truncation_boundary() {
+        let body = format!(
+            "{{\"padding\":\"{}\",\"api_key\":\"after-boundary\"}}",
+            "x".repeat(MAX_HTTP_ERROR_BODY_BYTES + 100)
+        );
+        let (bounded, truncated) =
+            read_bounded_error_body(&mut Cursor::new(body.as_bytes())).unwrap();
+
+        let message = bounded_redacted_body(&bounded, truncated);
+
+        assert!(truncated);
+        assert!(message.contains(HTTP_ERROR_TRUNCATION_MARKER));
+        assert!(!message.contains("after-boundary"));
+        assert!(message.len() <= MAX_HTTP_ERROR_BODY_BYTES + HTTP_ERROR_TRUNCATION_MARKER.len());
+    }
+
+    #[test]
+    fn unreachable_daemon_uses_exit_code_two_with_hint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let client = HttpDaemonClient::with_base_url(base_url);
+
+        let error = client.health().unwrap_err();
+
+        assert_eq!(error.exit_code(), 2);
+        let message = error.to_string();
+        assert!(message.contains("systemctl --user start verbatim"));
+        assert!(message.contains("[daemon] bind"));
+    }
+
+    struct TestServer {
+        addr: std::net::SocketAddr,
+        requests: Arc<Mutex<Vec<String>>>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl TestServer {
+        fn respond_once(response: &'static str) -> Self {
+            Self::respond_many([response])
+        }
+
+        fn respond_many<const N: usize>(responses: [&'static str; N]) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = Arc::clone(&requests);
+            let handle = thread::spawn(move || {
+                for response in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_http_request(&mut stream);
+                    thread_requests.lock().unwrap().push(request);
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            });
+            Self {
+                addr,
+                requests,
+                handle,
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn request(self) -> String {
+            let mut requests = self.requests();
+            requests.remove(0)
+        }
+
+        fn requests(self) -> Vec<String> {
+            self.handle.join().unwrap();
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if request_complete(&buffer) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    fn request_complete(buffer: &[u8]) -> bool {
+        let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .or_else(|| {
+                headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or_default();
+        buffer.len() >= header_end + 4 + content_length
+    }
+}

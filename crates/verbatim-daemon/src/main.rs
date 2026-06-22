@@ -16,8 +16,14 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal;
+use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 
+use verbatim_core::api::{
+    AddSourceRequest, AddSourceResponse, AskCitationEvent, AskErrorEvent, AskRequest, AskResponse,
+    AskTokenEvent, CheckStaleResponse, CitationResponse, ErrorResponse, EvidenceResponse,
+    HealthResponse, ImageArtifactResponse, IngestResponse, SourceResponse,
+};
 use verbatim_core::config::{self, Config};
 use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::{
@@ -27,8 +33,8 @@ use verbatim_core::ingest::IngestPipeline;
 use verbatim_core::retrieve::RetrievalPipeline;
 use verbatim_core::store::Store;
 use verbatim_core::types::{
-    BBox, CitationRef, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug,
-    RetrievalRerankDebug, RetrievalResult, SourceId,
+    CitationRef, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug, RetrievalRerankDebug,
+    RetrievalResult, SourceId,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,108 +59,12 @@ struct AppState {
 
 type SharedState = Arc<AppState>;
 
-// ---------------------------------------------------------------------------
-// Request / response types
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct AddSourceRequest {
-    path: String,
-}
-
-#[derive(Serialize)]
-struct AddSourceResponse {
-    id: String,
-}
-
-#[derive(Serialize)]
-struct SourceResponse {
-    id: String,
-    path: String,
-    status: String,
-    hash: String,
-    parser_used: Option<String>,
-    last_ingested_at: Option<String>,
-}
-
-#[derive(Serialize)]
-struct CheckStaleResponse {
-    stale: Vec<String>,
-}
+const ASK_STREAM_EVENT_BUFFER: usize = 32;
 
 #[derive(Deserialize)]
 struct IngestQuery {
     #[serde(default)]
     force: bool,
-}
-
-#[derive(Serialize)]
-struct IngestResponse {
-    ingested: usize,
-}
-
-#[derive(Deserialize)]
-struct AskRequest {
-    question: String,
-    #[serde(default)]
-    source_id: Option<String>,
-    #[serde(default)]
-    show_retrieval: bool,
-}
-
-#[derive(Serialize)]
-struct AskResponse {
-    answer: String,
-    citations: Vec<CitationResponse>,
-    verified: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    retrieval: Option<RetrievalDebug>,
-}
-
-#[derive(Serialize)]
-struct CitationResponse {
-    label: String,
-    evidence_id: String,
-    kind: &'static str,
-    derived_from: Option<String>,
-    locator: String,
-    text_preview: String,
-}
-
-#[derive(Serialize)]
-struct EvidenceResponse {
-    id: String,
-    source_id: String,
-    kind: &'static str,
-    derived_from: Option<String>,
-    locator: String,
-    text: String,
-    heading_path: Vec<String>,
-    position: u32,
-    image_artifact: Option<ImageArtifactResponse>,
-}
-
-#[derive(Serialize)]
-struct ImageArtifactResponse {
-    image_id: String,
-    path: String,
-    content_hash: String,
-    mime_type: String,
-    width: u32,
-    height: u32,
-    page: u32,
-    image_index: u32,
-    bbox: Option<BBox>,
-}
-
-#[derive(Serialize)]
-struct HealthResponse {
-    status: String,
-}
-
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -331,21 +241,16 @@ async fn ask_stream(
     State(state): State<SharedState>,
     Json(req): Json<AskRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let event = match execute_ask(state, req).await {
-        Ok(response) => Event::default()
-            .event("answer")
-            .json_data(response)
-            .unwrap_or_else(|_| Event::default().event("error").data("serialize response")),
-        Err((status, Json(error))) => Event::default().event("error").data(
-            serde_json::json!({
-                "status": status.as_u16(),
-                "error": error.error,
-            })
-            .to_string(),
-        ),
-    };
+    let (tx, rx) = mpsc::channel::<Event>(ASK_STREAM_EVENT_BUFFER);
+    tokio::spawn(async move {
+        if let Err((status, Json(error))) = execute_ask_stream(state, req, tx.clone()).await {
+            let _ = tx.send(sse_error_event(status, error.error)).await;
+        }
+    });
 
-    Sse::new(stream::once(async move { Ok(event) }))
+    Sse::new(stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|event| (Ok(event), rx))
+    }))
 }
 
 async fn execute_ask(
@@ -356,9 +261,121 @@ async fn execute_ask(
     let source_filter = req.source_id.map(SourceId);
     let show_retrieval = req.show_retrieval;
 
-    // Step 1: retrieve (involves !Send store + async embed)
+    let (results, generation_context, retrieval_debug) =
+        prepare_generation_context(Arc::clone(&state), &question, source_filter, show_retrieval)
+            .await?;
+
+    // Step 2: generate (Send-safe, no store access)
+    let gen_result = state
+        .generator
+        .generate_with_context(&question, &results, &generation_context)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(AskResponse {
+        answer: gen_result.answer,
+        citations: gen_result
+            .citations
+            .into_iter()
+            .map(citation_response)
+            .collect(),
+        verified: gen_result.verified,
+        retrieval: retrieval_debug,
+    })
+}
+
+async fn execute_ask_stream(
+    state: SharedState,
+    req: AskRequest,
+    tx: mpsc::Sender<Event>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let question = req.question;
+    let source_filter = req.source_id.map(SourceId);
+    let show_retrieval = req.show_retrieval;
+
+    let (results, generation_context, retrieval_debug) =
+        prepare_generation_context(Arc::clone(&state), &question, source_filter, show_retrieval)
+            .await?;
+
+    let tx_tokens = tx.clone();
+    let gen_result = state
+        .generator
+        .generate_streaming_with_context(&question, &results, &generation_context, move |delta| {
+            try_send_stream_event(
+                &tx_tokens,
+                sse_json_event(
+                    "token",
+                    &AskTokenEvent {
+                        text: delta.to_string(),
+                    },
+                ),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    send_stream_event(
+        &tx,
+        sse_json_event(
+            "citation",
+            &AskCitationEvent {
+                citations: gen_result
+                    .citations
+                    .into_iter()
+                    .map(citation_response)
+                    .collect(),
+                verified: gen_result.verified,
+            },
+        ),
+    )
+    .await?;
+
+    if let Some(debug) = retrieval_debug {
+        send_stream_event(&tx, sse_json_event("retrieval", &debug)).await?;
+    }
+
+    Ok(())
+}
+
+fn try_send_stream_event(tx: &mpsc::Sender<Event>, event: Event) -> Result<()> {
+    match tx.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            bail!("client is not keeping up during ask stream")
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => bail!("client disconnected during ask stream"),
+    }
+}
+
+async fn send_stream_event(
+    tx: &mpsc::Sender<Event>,
+    event: Event,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    tx.send(event).await.map_err(|_| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("client disconnected"),
+        )
+    })
+}
+
+async fn prepare_generation_context(
+    state: SharedState,
+    question: &str,
+    source_filter: Option<SourceId>,
+    show_retrieval: bool,
+) -> Result<
+    (
+        Vec<RetrievalResult>,
+        GenerationContext,
+        Option<RetrievalDebug>,
+    ),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    // Retrieve first; this touches the !Send store and async embed client.
     let state2 = Arc::clone(&state);
-    let question2 = question.clone();
+    let question2 = question.to_string();
     let runtime = tokio::runtime::Handle::current();
     let (results, generation_context, retrieval_debug) = tokio::task::spawn_blocking(move || {
         let pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -405,33 +422,7 @@ async fn execute_ask(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // Step 2: generate (Send-safe, no store access)
-    let gen_result = state
-        .generator
-        .generate_with_context(&question, &results, &generation_context)
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(AskResponse {
-        answer: gen_result.answer,
-        citations: gen_result
-            .citations
-            .into_iter()
-            .map(|c| {
-                let kind = citation_kind_name(&c);
-                CitationResponse {
-                    label: c.label,
-                    evidence_id: c.evidence_id.0,
-                    kind,
-                    derived_from: c.derived_from.map(|id| id.0),
-                    locator: c.locator.to_string(),
-                    text_preview: c.text_preview,
-                }
-            })
-            .collect(),
-        verified: gen_result.verified,
-        retrieval: retrieval_debug,
-    })
+    Ok((results, generation_context, retrieval_debug))
 }
 
 fn collect_image_artifacts_for_results(
@@ -543,7 +534,7 @@ async fn get_evidence(
 
     match evidence {
         Some(eu) => Ok(Json(EvidenceResponse {
-            kind: evidence_kind_name(eu.kind),
+            kind: evidence_kind_name(eu.kind).to_string(),
             id: eu.id.0,
             source_id: eu.source_id.0,
             derived_from: eu.derived_from.map(|id| id.0),
@@ -577,20 +568,40 @@ fn citation_kind_name(citation: &CitationRef) -> &'static str {
     }
 }
 
-impl From<ImageArtifact> for ImageArtifactResponse {
-    fn from(artifact: ImageArtifact) -> Self {
-        Self {
-            image_id: artifact.image_id.0,
-            path: artifact.relative_path.display().to_string(),
-            content_hash: artifact.content_hash,
-            mime_type: artifact.mime_type,
-            width: artifact.width,
-            height: artifact.height,
-            page: artifact.page,
-            image_index: artifact.image_index,
-            bbox: artifact.bbox,
-        }
+fn citation_response(citation: CitationRef) -> CitationResponse {
+    let kind = citation_kind_name(&citation);
+    CitationResponse {
+        label: citation.label,
+        evidence_id: citation.evidence_id.0,
+        kind: kind.to_string(),
+        derived_from: citation.derived_from.map(|id| id.0),
+        locator: citation.locator.to_string(),
+        text_preview: citation.text_preview,
     }
+}
+
+fn sse_json_event<T>(name: &'static str, value: &T) -> Event
+where
+    T: Serialize,
+{
+    Event::default()
+        .event(name)
+        .json_data(value)
+        .unwrap_or_else(|error| {
+            Event::default()
+                .event("error")
+                .data(format!("failed to serialize {name} event: {error}"))
+        })
+}
+
+fn sse_error_event(status: StatusCode, error: String) -> Event {
+    sse_json_event(
+        "error",
+        &AskErrorEvent {
+            status: Some(status.as_u16()),
+            error,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -808,5 +819,16 @@ mod tests {
         assert!(encoded.contains("disabled"));
         assert!(!encoded.contains("api_key"));
         assert!(!encoded.contains("secret full raw source text"));
+    }
+
+    #[tokio::test]
+    async fn ask_stream_token_queue_is_bounded() {
+        let (tx, _rx) = mpsc::channel::<Event>(1);
+
+        try_send_stream_event(&tx, Event::default().event("token").data("one")).unwrap();
+        let error =
+            try_send_stream_event(&tx, Event::default().event("token").data("two")).unwrap_err();
+
+        assert!(error.to_string().contains("not keeping up"));
     }
 }
