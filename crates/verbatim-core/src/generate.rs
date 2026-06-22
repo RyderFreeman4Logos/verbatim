@@ -1578,6 +1578,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_generation_propagates_delta_callback_errors() {
+        let model = Arc::new(StreamingChatModel::new(["first ", "second [E1]."]));
+        let generator =
+            Generator::with_chat_model(model.clone(), true, ChatVisionAttachmentConfig::default());
+
+        let result = generator
+            .generate_streaming_with_context(
+                "What is freedom?",
+                &sample_results(),
+                &GenerationContext::default(),
+                |_delta| anyhow::bail!("token sink backpressure"),
+            )
+            .await;
+        let err = match result {
+            Ok(_) => panic!("streaming generation should stop on delta callback errors"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("token sink backpressure"));
+        assert_eq!(model.requests().len(), 1);
+    }
+
+    #[tokio::test]
     async fn mvp_regression_verifier_pass_revise_and_fail_paths_are_deterministic() {
         let pass_model = Arc::new(RecordingChatModel::with_responses([
             "The document defines freedom [E1].",

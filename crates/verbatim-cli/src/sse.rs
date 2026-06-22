@@ -2,7 +2,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use verbatim_core::api::{AskCitationEvent, AskErrorEvent, AskResponse, AskTokenEvent};
+use verbatim_core::api::{
+    AskCitationEvent, AskErrorEvent, AskResponse, AskTokenEvent, TaskWaitEvent,
+};
 
 use crate::client::{CliError, CliResult};
 use crate::render;
@@ -16,8 +18,89 @@ where
     consumer.consume(reader)
 }
 
+pub fn consume_task_sse<R, W>(reader: R, stdout: &mut W) -> CliResult<()>
+where
+    R: Read,
+    W: Write,
+{
+    let mut consumer = TaskSseConsumer::new(stdout);
+    consumer.consume(reader)
+}
+
 struct SseConsumer<'a, W> {
     stdout: &'a mut W,
+}
+
+struct TaskSseConsumer<'a, W> {
+    stdout: &'a mut W,
+    wrote_status: bool,
+}
+
+impl<'a, W> TaskSseConsumer<'a, W>
+where
+    W: Write,
+{
+    fn new(stdout: &'a mut W) -> Self {
+        Self {
+            stdout,
+            wrote_status: false,
+        }
+    }
+
+    fn consume<R>(&mut self, reader: R) -> CliResult<()>
+    where
+        R: Read,
+    {
+        let mut reader = BufReader::new(reader);
+        let mut frame = String::new();
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+
+            trim_line_ending(&mut line);
+            if line.is_empty() {
+                self.handle_frame(&frame)?;
+                frame.clear();
+            } else {
+                if !frame.is_empty() {
+                    frame.push('\n');
+                }
+                frame.push_str(&line);
+            }
+        }
+
+        if !frame.trim().is_empty() {
+            self.handle_frame(&frame)?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_frame(&mut self, frame: &str) -> CliResult<()> {
+        let Some(frame) = parse_frame(frame) else {
+            return Ok(());
+        };
+
+        match frame.event.as_deref().unwrap_or("message") {
+            "task" => {
+                let event: TaskWaitEvent = decode_event("task", &frame.data)?;
+                if event.events.is_empty() && !self.wrote_status {
+                    render::write_task_status_line(self.stdout, &event.task)?;
+                    self.wrote_status = true;
+                }
+                render::write_task_events(self.stdout, &event.events)?;
+                if event.terminal {
+                    render::write_task_summary(self.stdout, &event.task, &event.spans)?;
+                }
+                Ok(())
+            }
+            "error" => Err(stream_error(&frame.data)),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl<'a, W> SseConsumer<'a, W>
@@ -224,6 +307,25 @@ mod tests {
         assert_eq!(error.exit_code(), 1);
         assert!(error.to_string().contains("HTTP 500"));
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn consumes_task_wait_events_and_renders_terminal_summary() {
+        let stream = concat!(
+            "event: task\n",
+            "data: {\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"succeeded\",\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":\"2\",\"request\":{\"question_chars\":4},\"result\":{\"citation_count\":1},\"error\":null},",
+            "\"events\":[{\"sequence\":2,\"task_id\":\"task-1\",\"event_type\":\"phase\",\"message\":\"retrieval complete\",\"payload\":{\"result_count\":1},\"created_at\":\"2\"}],",
+            "\"spans\":[{\"sequence\":1,\"task_id\":\"task-1\",\"phase\":\"retrieval\",\"started_at\":\"1\",\"duration_ms\":8,\"metadata\":{\"result_count\":1}}],\"terminal\":true}\n\n",
+        );
+        let mut stdout = Vec::new();
+
+        consume_task_sse(Cursor::new(stream), &mut stdout).unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("[2] phase: retrieval complete"));
+        assert!(output.contains("Task: task-1"));
+        assert!(output.contains("retrieval 8ms"));
+        assert!(!output.contains("Raw answer"));
     }
 
     #[derive(Default)]

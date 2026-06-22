@@ -10,7 +10,8 @@ use serde::Serialize;
 use serde_json::Value;
 use verbatim_core::api::{
     AddSourceRequest, AddSourceResponse, AskRequest, CheckStaleResponse, ConfigResponse,
-    EvidenceResponse, HealthResponse, IngestResponse, SourceResponse,
+    EvidenceResponse, HealthResponse, IngestResponse, SourceResponse, TaskCreatedResponse,
+    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse,
 };
 use verbatim_core::config::{self, Config, DaemonConfig};
 
@@ -70,6 +71,18 @@ pub trait DaemonClient {
     fn remove_source(&self, id: &str) -> CliResult<()>;
     fn check_sources(&self) -> CliResult<CheckStaleResponse>;
     fn ingest(&self, source_id: Option<&str>, force: bool) -> CliResult<IngestResponse>;
+    fn submit_ask_task(&self, request: &AskRequest) -> CliResult<TaskCreatedResponse>;
+    fn submit_ingest_task(
+        &self,
+        source_id: Option<&str>,
+        force: bool,
+    ) -> CliResult<TaskCreatedResponse>;
+    fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
+    fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse>;
+    fn wait_task<W>(&self, task_id: &str, after: Option<i64>, stdout: &mut W) -> CliResult<()>
+    where
+        W: Write;
+    fn cancel_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
     fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> CliResult<()>
     where
         W: Write;
@@ -236,6 +249,71 @@ impl DaemonClient for HttpDaemonClient {
             (None, false) => "/api/ingest".into(),
         };
         self.request_json::<IngestResponse, ()>(Method::POST, &path, None)
+    }
+
+    fn submit_ask_task(&self, request: &AskRequest) -> CliResult<TaskCreatedResponse> {
+        self.request_json(Method::POST, "/api/tasks/ask", Some(request))
+    }
+
+    fn submit_ingest_task(
+        &self,
+        source_id: Option<&str>,
+        force: bool,
+    ) -> CliResult<TaskCreatedResponse> {
+        if source_id.is_some() && force {
+            return Err(CliError::Api(
+                "--force is only supported for all-source ingest".into(),
+            ));
+        }
+        let request = TaskIngestRequest {
+            source_id: source_id.map(str::to_string),
+            force,
+        };
+        self.request_json(Method::POST, "/api/tasks/ingest", Some(&request))
+    }
+
+    fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse> {
+        self.request_json::<TaskSummaryResponse, ()>(
+            Method::GET,
+            &format!("/api/tasks/{task_id}"),
+            None,
+        )
+    }
+
+    fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse> {
+        let path = match after {
+            Some(after) => format!("/api/tasks/{task_id}/events?after={after}"),
+            None => format!("/api/tasks/{task_id}/events"),
+        };
+        self.request_json::<TaskEventsResponse, ()>(Method::GET, &path, None)
+    }
+
+    fn wait_task<W>(&self, task_id: &str, after: Option<i64>, stdout: &mut W) -> CliResult<()>
+    where
+        W: Write,
+    {
+        let path = match after {
+            Some(after) => format!("/api/tasks/{task_id}/wait?after={after}"),
+            None => format!("/api/tasks/{task_id}/wait"),
+        };
+        let url = self.url(&path)?;
+        let response = self
+            .apply_timeout(self.client.get(&url), RequestTimeoutPolicy::LongRunning)?
+            .send()
+            .map_err(|error| request_error(&url, error))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_error(status, response));
+        }
+        sse::consume_task_sse(response, stdout)
+    }
+
+    fn cancel_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse> {
+        self.request_json::<TaskSummaryResponse, ()>(
+            Method::POST,
+            &format!("/api/tasks/{task_id}/cancel"),
+            None,
+        )
     }
 
     fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> CliResult<()>
@@ -651,6 +729,66 @@ mod tests {
     }
 
     #[test]
+    fn http_task_routes_are_plumbed() {
+        let task_summary = concat!(
+            "{\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"succeeded\",",
+            "\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":\"2\",",
+            "\"request\":{\"question_chars\":4},\"result\":{\"citation_count\":1},\"error\":null},",
+            "\"spans\":[{\"sequence\":1,\"task_id\":\"task-1\",\"phase\":\"chat\",",
+            "\"started_at\":\"1\",\"duration_ms\":5,\"metadata\":{\"citation_count\":1}}]}"
+        );
+        let server = TestServer::respond_many(vec![
+            "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"task_id\":\"task-1\"}".to_string(),
+            "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"task_id\":\"task-2\"}".to_string(),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_summary}"
+            ),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"events\":[{\"sequence\":2,\"task_id\":\"task-1\",\"event_type\":\"phase\",\"message\":\"done\",\"payload\":{},\"created_at\":\"2\"}]}".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: task\ndata: {\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"succeeded\",\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":\"2\",\"request\":{},\"result\":{},\"error\":null},\"events\":[],\"spans\":[],\"terminal\":true}\n\n".to_string(),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_summary}"
+            ),
+        ]);
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+        let ask = AskRequest {
+            question: "Why?".into(),
+            source_id: Some("src-1".into()),
+            show_retrieval: false,
+        };
+
+        assert_eq!(client.submit_ask_task(&ask).unwrap().task_id, "task-1");
+        assert_eq!(
+            client
+                .submit_ingest_task(Some("src-1"), false)
+                .unwrap()
+                .task_id,
+            "task-2"
+        );
+        assert_eq!(client.get_task("task-1").unwrap().task.id.0, "task-1");
+        assert_eq!(
+            client.get_task_events("task-1", Some(1)).unwrap().events[0].sequence,
+            2
+        );
+        let mut stdout = Vec::new();
+        client.wait_task("task-1", Some(2), &mut stdout).unwrap();
+        assert!(String::from_utf8(stdout).unwrap().contains("Task: task-1"));
+        assert_eq!(
+            client.cancel_task("task-1").unwrap().task.status.as_str(),
+            "succeeded"
+        );
+
+        let requests = server.requests();
+        assert!(requests[0].starts_with("POST /api/tasks/ask HTTP/1.1"));
+        assert!(requests[0].contains("\"question\":\"Why?\""));
+        assert!(requests[1].starts_with("POST /api/tasks/ingest HTTP/1.1"));
+        assert!(requests[1].contains("\"source_id\":\"src-1\""));
+        assert!(requests[2].starts_with("GET /api/tasks/task-1 HTTP/1.1"));
+        assert!(requests[3].starts_with("GET /api/tasks/task-1/events?after=1 HTTP/1.1"));
+        assert!(requests[4].starts_with("GET /api/tasks/task-1/wait?after=2 HTTP/1.1"));
+        assert!(requests[5].starts_with("POST /api/tasks/task-1/cancel HTTP/1.1"));
+    }
+
+    #[test]
     fn http_evidence_config_and_status_parse_json() {
         let server = TestServer::respond_many([
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"ev-1\",\"source_id\":\"src-1\",\"kind\":\"text\",\"derived_from\":null,\"locator\":\"PDF p.1 para.1\",\"text\":\"quoted\",\"heading_path\":[],\"position\":0,\"image_artifact\":null}",
@@ -746,7 +884,12 @@ mod tests {
             Self::respond_many([response])
         }
 
-        fn respond_many<const N: usize>(responses: [&'static str; N]) -> Self {
+        fn respond_many<I, S>(responses: I) -> Self
+        where
+            I: IntoIterator<Item = S>,
+            S: Into<String>,
+        {
+            let responses = responses.into_iter().map(Into::into).collect::<Vec<_>>();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
