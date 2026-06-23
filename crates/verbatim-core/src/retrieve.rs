@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 
@@ -19,6 +20,10 @@ use crate::types::{
 const GRAPH_EXPANSION_SCORE_DECAY: f32 = 0.5;
 const MAX_RERANK_CANDIDATE_CHUNKS: usize = 50;
 const MAX_RERANK_DOCUMENT_CHARS: usize = 8_000;
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
 
 pub struct RetrievalPipeline<'a> {
     vector_index: &'a dyn VectorIndex,
@@ -137,6 +142,7 @@ impl<'a> RetrievalPipeline<'a> {
     ) -> Result<RetrievalSearchOutput> {
         self.ensure_required_profile_vectors(source_filter)?;
         let query_text = self.embed_client.prepare_query(query);
+        let embedding_started = Instant::now();
         let query_vec = self
             .embed_client
             .embed(&[query_text])
@@ -144,6 +150,7 @@ impl<'a> RetrievalPipeline<'a> {
             .into_iter()
             .next()
             .unwrap_or_default();
+        let query_embedding_latency_ms = elapsed_ms(embedding_started);
 
         let all_child_count = if source_filter.is_some() {
             self.store.list_child_chunks()?.len()
@@ -220,6 +227,7 @@ impl<'a> RetrievalPipeline<'a> {
 
         let debug = if include_debug {
             Some(RetrievalDebug {
+                query_embedding_latency_ms: Some(query_embedding_latency_ms),
                 bm25_hits,
                 dense_hits,
                 rrf_fused_hits,
@@ -468,8 +476,10 @@ impl<'a> RetrievalPipeline<'a> {
             .map(|candidate| candidate.text.clone())
             .collect::<Vec<_>>();
 
+        let rerank_started = Instant::now();
         match reranker.rerank(query, &documents, top_n).await {
             Ok(hits) => {
+                let latency_ms = elapsed_ms(rerank_started);
                 let (reranked, scores) = validated_rerank_hits(&candidates, hits, top_n);
                 if reranked.is_empty() {
                     return Ok(RerankOutcome {
@@ -480,7 +490,8 @@ impl<'a> RetrievalPipeline<'a> {
                             top_n,
                             candidates.len(),
                             "no_usable_results",
-                        ),
+                        )
+                        .with_latency_ms(latency_ms),
                     });
                 }
                 Ok(RerankOutcome {
@@ -491,10 +502,12 @@ impl<'a> RetrievalPipeline<'a> {
                         top_n,
                         candidates.len(),
                         scores,
-                    ),
+                    )
+                    .with_latency_ms(latency_ms),
                 })
             }
             Err(error) => {
+                let latency_ms = elapsed_ms(rerank_started);
                 let reason = rerank_failure_reason(&error);
                 tracing::warn!(reason = %reason, "rerank failed; falling back to RRF ordering");
                 Ok(RerankOutcome {
@@ -505,7 +518,8 @@ impl<'a> RetrievalPipeline<'a> {
                         top_n,
                         candidates.len(),
                         reason,
-                    ),
+                    )
+                    .with_latency_ms(latency_ms),
                 })
             }
         }

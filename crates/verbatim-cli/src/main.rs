@@ -390,6 +390,9 @@ where
         TaskCommand::Wait { task_id, after } => {
             client.wait_task(&task_id, after, stdout)?;
         }
+        TaskCommand::Watch { task_id, after } => {
+            client.wait_task(&task_id, after, stdout)?;
+        }
         TaskCommand::Cancel { task_id } => {
             let response = client.cancel_task(&task_id)?;
             render::write_task_summary(stdout, &response.task, &response.spans)?;
@@ -624,6 +627,14 @@ enum TaskCommand {
         #[arg(long)]
         after: Option<i64>,
     },
+    /// Watch task progress until the task reaches a terminal status.
+    Watch {
+        /// Task id.
+        task_id: String,
+        /// Only stream events after this sequence.
+        #[arg(long)]
+        after: Option<i64>,
+    },
     /// Request best-effort task cancellation.
     Cancel {
         /// Task id.
@@ -650,7 +661,10 @@ mod tests {
         RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
         SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskSummaryResponse,
     };
-    use verbatim_core::task::{TaskEvent, TaskId, TaskKind, TaskSpan, TaskStatus, TaskSummary};
+    use verbatim_core::task::{
+        TaskEndpointSummary, TaskEvent, TaskId, TaskKind, TaskProgressSnapshot, TaskSpan,
+        TaskStatus, TaskSummary,
+    };
     use verbatim_core::types::SourceLocator;
 
     use super::*;
@@ -803,6 +817,7 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert_eq!(client.calls.borrow().as_slice(), ["get_task:task-1"]);
         assert!(stdout.contains("Task: task-1"));
+        assert!(stdout.contains("phase=embedding"));
         assert!(stdout.contains("spans:"));
 
         let (code, stdout, _, client, _) = run_mock(["task", "events", "task-1", "--after", "3"]);
@@ -816,6 +831,13 @@ mod tests {
         let (code, _, _, client, _) = run_mock(["task", "wait", "task-1"]);
         assert_eq!(code.unwrap(), 0);
         assert_eq!(client.calls.borrow().as_slice(), ["wait_task:task-1:None"]);
+
+        let (code, _, _, client, _) = run_mock(["task", "watch", "task-1", "--after", "4"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["wait_task:task-1:Some(4)"]
+        );
 
         let (code, stdout, _, client, _) = run_mock(["task", "cancel", "task-1"]);
         assert_eq!(code.unwrap(), 0);
@@ -1558,6 +1580,11 @@ mod tests {
                 error: None,
                 queue_position: None,
                 blocking_reason: None,
+                progress: Some(
+                    TaskProgressSnapshot::phase("embedding")
+                        .with_counter("embedding_vectors", 4, Some(8))
+                        .with_endpoint(TaskEndpointSummary::single_call("embedding", 12)),
+                ),
             },
             spans: vec![TaskSpan {
                 sequence: 1,

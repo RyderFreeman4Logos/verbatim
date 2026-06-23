@@ -10,8 +10,8 @@ use rusqlite::{
 };
 
 use crate::task::{
-    bounded_error, bounded_json, bounded_message, TaskEvent, TaskId, TaskKind, TaskSpan,
-    TaskStatus, TaskSummary,
+    bounded_error, bounded_json, bounded_message, TaskEvent, TaskId, TaskKind,
+    TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
 };
 use crate::traits::VectorDocument;
 use crate::types::{
@@ -83,6 +83,12 @@ impl Store {
             "evidence_units",
             "derived_from_evidence_id",
             "ALTER TABLE evidence_units ADD COLUMN derived_from_evidence_id TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "tasks",
+            "progress_json",
+            "ALTER TABLE tasks ADD COLUMN progress_json TEXT",
         )?;
         Ok(())
     }
@@ -1117,8 +1123,8 @@ impl Store {
         let request = bounded_json(request.clone());
         let request_json = serde_json::to_string(&request).context("serialize task request")?;
         self.conn.execute(
-            "INSERT INTO tasks (id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error)
-             VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL, ?5, NULL, NULL)",
+            "INSERT INTO tasks (id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json)
+             VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL, ?5, NULL, NULL, NULL)",
             params![
                 &task_id.0,
                 kind.as_str(),
@@ -1140,13 +1146,14 @@ impl Store {
             error: None,
             queue_position: None,
             blocking_reason: None,
+            progress: None,
         })
     }
 
     pub fn get_task(&self, task_id: &TaskId) -> Result<Option<TaskSummary>> {
         self.conn
             .prepare(
-                "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error
+                "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json
                  FROM tasks WHERE id = ?1",
             )?
             .query_row(params![&task_id.0], row_to_task_summary)
@@ -1193,6 +1200,35 @@ impl Store {
         Ok(changed > 0)
     }
 
+    pub fn update_task_progress(
+        &self,
+        task_id: &TaskId,
+        progress: TaskProgressSnapshot,
+    ) -> Result<Option<TaskProgressSnapshot>> {
+        let now = unix_timestamp_string();
+        let progress = progress.bounded().with_current_elapsed();
+        let progress_json =
+            serde_json::to_string(&progress).context("serialize task progress snapshot")?;
+        let changed = self.conn.execute(
+            "UPDATE tasks
+             SET progress_json = ?2, updated_at = ?3
+             WHERE id = ?1 AND status IN (?4, ?5)",
+            params![
+                &task_id.0,
+                progress_json,
+                now,
+                TaskStatus::Queued.as_str(),
+                TaskStatus::Running.as_str(),
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let payload = serde_json::to_value(&progress).context("serialize progress event")?;
+        self.insert_task_event(task_id, "progress", "task progress", &payload)?;
+        Ok(Some(progress))
+    }
+
     pub fn count_running_tasks(&self, kind: TaskKind) -> Result<usize> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tasks WHERE kind = ?1 AND status = ?2",
@@ -1205,7 +1241,7 @@ impl Store {
     pub fn next_queued_task(&self, kind: TaskKind) -> Result<Option<TaskSummary>> {
         self.conn
             .prepare(
-                "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error
+                "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json
                  FROM tasks
                  WHERE kind = ?1 AND status = ?2
                  ORDER BY created_at, id
@@ -1221,7 +1257,7 @@ impl Store {
 
     pub fn queued_tasks(&self, kind: TaskKind) -> Result<Vec<TaskSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error
+            "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json
              FROM tasks
              WHERE kind = ?1 AND status = ?2
              ORDER BY created_at, id",
@@ -1420,11 +1456,19 @@ fn row_to_task_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSummary>
     let status_text: String = row.get(2)?;
     let request_json: String = row.get(7)?;
     let result_json: Option<String> = row.get(8)?;
+    let progress_json: Option<String> = row.get(10)?;
     let request = serde_json::from_str(&request_json)
         .map_err(|err| from_json_error(7, "serde_json::Value", err))?;
     let result = result_json
         .map(|json| {
             serde_json::from_str(&json).map_err(|err| from_json_error(8, "serde_json::Value", err))
+        })
+        .transpose()?;
+    let progress = progress_json
+        .map(|json| {
+            serde_json::from_str::<TaskProgressSnapshot>(&json)
+                .map(TaskProgressSnapshot::with_current_elapsed)
+                .map_err(|err| from_json_error(10, "TaskProgressSnapshot", err))
         })
         .transpose()?;
     let kind = TaskKind::from_store_str(&kind_text)
@@ -1445,6 +1489,7 @@ fn row_to_task_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSummary>
         error: row.get(9)?,
         queue_position: None,
         blocking_reason: None,
+        progress,
     })
 }
 
@@ -2382,7 +2427,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     finished_at TEXT,
     request_json TEXT NOT NULL,
     result_json TEXT,
-    error TEXT
+    error TEXT,
+    progress_json TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_status_updated_idx
     ON tasks(status, updated_at);
@@ -2982,6 +3028,22 @@ mod tests {
         assert!(created.request.get("question_sha256").is_some());
 
         assert!(store.start_task(&task_id).unwrap());
+        let progress = store
+            .update_task_progress(
+                &task_id,
+                TaskProgressSnapshot::phase("embedding")
+                    .with_counter("vectors", 4, Some(8))
+                    .with_endpoint(crate::task::TaskEndpointSummary::single_call(
+                        "embedding",
+                        25,
+                    ))
+                    .with_active_worker_kind("ask")
+                    .with_recent_status("embedding query"),
+            )
+            .unwrap()
+            .expect("running task accepts progress");
+        assert_eq!(progress.counters[0].name, "vectors");
+
         let event = store
             .insert_task_event(
                 &task_id,
@@ -2990,7 +3052,7 @@ mod tests {
                 &serde_json::json!({"api_key": "should-not-print", "safe": "ok"}),
             )
             .unwrap();
-        assert_eq!(event.sequence, 1);
+        assert_eq!(event.sequence, 2);
         assert!(event.message.contains("...[truncated]"));
         assert_eq!(event.payload["api_key"], "<redacted>");
 
@@ -3015,14 +3077,23 @@ mod tests {
         assert!(summary.started_at.is_some());
         assert!(summary.finished_at.is_some());
         assert!(summary.result.unwrap().get("answer_sha256").is_some());
+        assert_eq!(
+            summary
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.phase.as_ref())
+                .map(|phase| phase.name.as_str()),
+            Some("embedding")
+        );
         assert!(!encoded.contains("Do not persist this raw prompt"));
         assert!(!encoded.contains("Do not persist this raw answer"));
         assert!(!encoded.contains("should-not-print"));
 
         let events = store.list_task_events(&task_id, None, 100).unwrap();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "progress");
         assert!(store
-            .list_task_events(&task_id, Some(events[0].sequence), 100)
+            .list_task_events(&task_id, Some(events[1].sequence), 100)
             .unwrap()
             .is_empty());
         let spans = store.list_task_spans(&task_id).unwrap();

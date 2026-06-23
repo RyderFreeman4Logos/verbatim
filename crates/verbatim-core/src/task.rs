@@ -123,6 +123,8 @@ pub struct TaskSummary {
     pub queue_position: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocking_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<TaskProgressSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -145,6 +147,232 @@ pub struct TaskSpan {
     pub metadata: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TaskProgressSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<TaskProgressPhase>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub counters: Vec<TaskProgressCounter>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<TaskEndpointSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<TaskQueueProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_worker_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_status: Option<String>,
+}
+
+impl TaskProgressSnapshot {
+    pub fn phase(name: impl Into<String>) -> Self {
+        Self {
+            phase: Some(TaskProgressPhase::start(name)),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_counter(
+        mut self,
+        name: impl Into<String>,
+        completed: u64,
+        total: Option<u64>,
+    ) -> Self {
+        self.set_counter(name, completed, total);
+        self
+    }
+
+    pub fn set_counter(&mut self, name: impl Into<String>, completed: u64, total: Option<u64>) {
+        let name = name.into();
+        if let Some(counter) = self
+            .counters
+            .iter_mut()
+            .find(|counter| counter.name == name)
+        {
+            counter.completed = completed;
+            counter.total = total;
+            return;
+        }
+        self.counters.push(TaskProgressCounter {
+            name,
+            completed,
+            total,
+        });
+    }
+
+    pub fn with_endpoint(mut self, endpoint: TaskEndpointSummary) -> Self {
+        self.set_endpoint(endpoint);
+        self
+    }
+
+    pub fn set_endpoint(&mut self, endpoint: TaskEndpointSummary) {
+        if let Some(existing) = self
+            .endpoints
+            .iter_mut()
+            .find(|existing| existing.name == endpoint.name)
+        {
+            *existing = endpoint;
+            return;
+        }
+        self.endpoints.push(endpoint);
+    }
+
+    pub fn with_active_worker_kind(mut self, worker_kind: impl Into<String>) -> Self {
+        self.active_worker_kind = Some(worker_kind.into());
+        self
+    }
+
+    pub fn with_recent_status(mut self, status: impl Into<String>) -> Self {
+        self.recent_status = Some(status.into());
+        self
+    }
+
+    pub fn with_queue(
+        mut self,
+        position: usize,
+        active_worker_kind: Option<String>,
+        blocking_reason: Option<String>,
+    ) -> Self {
+        self.queue = Some(TaskQueueProgress {
+            position,
+            active_worker_kind,
+            blocking_reason,
+        });
+        self
+    }
+
+    pub fn bounded(mut self) -> Self {
+        if let Some(phase) = &mut self.phase {
+            phase.name = bounded_chars(&phase.name, TASK_STRING_MAX_CHARS);
+            phase.started_at = bounded_chars(&phase.started_at, TASK_STRING_MAX_CHARS);
+        }
+        self.counters.truncate(TASK_ARRAY_MAX_ITEMS);
+        for counter in &mut self.counters {
+            counter.name = bounded_chars(&counter.name, TASK_STRING_MAX_CHARS);
+        }
+        self.endpoints.truncate(TASK_ARRAY_MAX_ITEMS);
+        for endpoint in &mut self.endpoints {
+            endpoint.name = bounded_chars(&endpoint.name, TASK_STRING_MAX_CHARS);
+            endpoint.latest_error = endpoint
+                .latest_error
+                .as_deref()
+                .map(|error| bounded_chars(error, TASK_EVENT_MESSAGE_MAX_CHARS));
+        }
+        if let Some(queue) = &mut self.queue {
+            queue.active_worker_kind = queue
+                .active_worker_kind
+                .as_deref()
+                .map(|worker| bounded_chars(worker, TASK_STRING_MAX_CHARS));
+            queue.blocking_reason = queue
+                .blocking_reason
+                .as_deref()
+                .map(|reason| bounded_chars(reason, TASK_EVENT_MESSAGE_MAX_CHARS));
+        }
+        self.active_worker_kind = self
+            .active_worker_kind
+            .as_deref()
+            .map(|worker| bounded_chars(worker, TASK_STRING_MAX_CHARS));
+        self.recent_status = self
+            .recent_status
+            .as_deref()
+            .map(|status| bounded_chars(status, TASK_EVENT_MESSAGE_MAX_CHARS));
+        self
+    }
+
+    pub fn with_current_elapsed(mut self) -> Self {
+        if let Some(phase) = &mut self.phase {
+            if let Some(elapsed_ms) = elapsed_ms_since_unix_seconds(&phase.started_at) {
+                phase.elapsed_ms = elapsed_ms;
+            }
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProgressPhase {
+    pub name: String,
+    pub started_at: String,
+    pub elapsed_ms: u64,
+}
+
+impl TaskProgressPhase {
+    pub fn start(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            started_at: unix_timestamp_string(),
+            elapsed_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProgressCounter {
+    pub name: String,
+    pub completed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEndpointSummary {
+    pub name: String,
+    pub calls: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_error: Option<String>,
+}
+
+impl TaskEndpointSummary {
+    pub fn single_call(name: impl Into<String>, latency_ms: u64) -> Self {
+        Self {
+            name: name.into(),
+            calls: 1,
+            latest_latency_ms: Some(latency_ms),
+            first_token_latency_ms: None,
+            p50_latency_ms: Some(latency_ms),
+            p95_latency_ms: Some(latency_ms),
+            latest_error: None,
+        }
+    }
+
+    pub fn failed_call(
+        name: impl Into<String>,
+        latency_ms: Option<u64>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            calls: 1,
+            latest_latency_ms: latency_ms,
+            first_token_latency_ms: None,
+            p50_latency_ms: latency_ms,
+            p95_latency_ms: latency_ms,
+            latest_error: Some(error.into()),
+        }
+    }
+
+    pub fn with_first_token_latency_ms(mut self, latency_ms: u64) -> Self {
+        self.first_token_latency_ms = Some(latency_ms);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskQueueProgress {
+    pub position: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_worker_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PhaseTiming {
     phase: String,
@@ -158,6 +386,22 @@ impl PhaseTiming {
             phase: phase.into(),
             started_at: unix_timestamp_string(),
             started: Instant::now(),
+        }
+    }
+
+    pub fn progress_snapshot(&self) -> TaskProgressSnapshot {
+        TaskProgressSnapshot {
+            phase: Some(TaskProgressPhase {
+                name: self.phase.clone(),
+                started_at: self.started_at.clone(),
+                elapsed_ms: self
+                    .started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            }),
+            ..TaskProgressSnapshot::default()
         }
     }
 
@@ -189,6 +433,21 @@ pub fn unix_timestamp_string() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+fn unix_timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn elapsed_ms_since_unix_seconds(started_at: &str) -> Option<u64> {
+    let started_ms = started_at.parse::<u128>().ok()?.saturating_mul(1000);
+    unix_timestamp_millis()
+        .saturating_sub(started_ms)
+        .try_into()
+        .ok()
 }
 
 pub fn ask_request_metadata(
@@ -465,5 +724,26 @@ mod tests {
                 .len(),
             1024
         );
+    }
+
+    #[test]
+    fn progress_snapshot_is_typed_bounded_and_elapsed() {
+        let snapshot = TaskProgressSnapshot::phase("embedding".repeat(200))
+            .with_counter("vectors", 12, Some(20))
+            .with_endpoint(TaskEndpointSummary::failed_call(
+                "embedding",
+                Some(42),
+                "remote timeout".repeat(100),
+            ))
+            .with_active_worker_kind("ingest")
+            .with_recent_status("embedding batch");
+
+        let bounded = snapshot.bounded().with_current_elapsed();
+        let encoded = serde_json::to_string(&bounded).unwrap();
+
+        assert!(encoded.contains("\"vectors\""));
+        assert!(encoded.contains("\"latest_error\""));
+        assert!(encoded.len() <= TASK_METADATA_MAX_BYTES);
+        assert!(bounded.phase.unwrap().elapsed_ms <= u64::MAX);
     }
 }

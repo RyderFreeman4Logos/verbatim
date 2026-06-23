@@ -92,6 +92,9 @@ where
                     self.wrote_status = true;
                 }
                 render::write_task_events(self.stdout, &event.events)?;
+                if !event.terminal && event.events.is_empty() {
+                    render::write_task_progress_line(self.stdout, &event.task)?;
+                }
                 if event.terminal {
                     render::write_task_summary(self.stdout, &event.task, &event.spans)?;
                 }
@@ -326,6 +329,25 @@ mod tests {
         assert!(output.contains("Task: task-1"));
         assert!(output.contains("retrieval 8ms"));
         assert!(!output.contains("Raw answer"));
+    }
+
+    #[test]
+    fn consumes_task_wait_tick_and_renders_live_progress() {
+        let stream = concat!(
+            "event: task\n",
+            "data: {\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"running\",\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":null,\"request\":{\"question_chars\":4},\"result\":null,\"error\":null,",
+            "\"progress\":{\"phase\":{\"name\":\"chat\",\"started_at\":\"1\",\"elapsed_ms\":2000},\"counters\":[{\"name\":\"chat_bytes_streamed\",\"completed\":12}],\"endpoints\":[{\"name\":\"chat\",\"calls\":1,\"latest_latency_ms\":2000,\"first_token_latency_ms\":300,\"p50_latency_ms\":2000,\"p95_latency_ms\":2000}],\"active_worker_kind\":\"ask\",\"recent_status\":\"streaming\"}},",
+            "\"events\":[],\"spans\":[],\"terminal\":false}\n\n",
+        );
+        let mut stdout = Vec::new();
+
+        consume_task_sse(Cursor::new(stream), &mut stdout).unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Task task-1 status=running"));
+        assert!(output.contains("progress: phase=chat elapsed=2000ms"));
+        assert!(output.contains("chat.first_token=300ms"));
+        assert!(!output.contains("Task: task-1"));
     }
 
     #[derive(Default)]
