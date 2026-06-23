@@ -459,11 +459,255 @@ where
     Ok(0)
 }
 
+const TOP_LEVEL_LONG_ABOUT: &str = "\
+Verbatim indexes local documents through a long-running daemon and exposes a \
+thin CLI for source management, ingestion, retrieval, citation-backed answers, \
+and persistent background tasks.";
+
+const TOP_LEVEL_AFTER_HELP: &str = r#"Examples:
+  verbatim config init
+  verbatim daemon install
+  verbatim source add ./paper.pdf
+  verbatim ingest <source-id>
+  verbatim retrieve --show-debug "What does the paper claim?"
+  verbatim ask --source-id <source-id> "What supports the conclusion?"
+
+Help:
+  verbatim <command> --help
+  verbatim source add --help
+  verbatim task wait --help
+"#;
+
+const SOURCE_AFTER_HELP: &str = r#"Examples:
+  verbatim source add ./paper.pdf
+  verbatim source list
+  verbatim source inspect <source-id>
+  verbatim source check
+
+Sources are daemon-registered paths. Add a source before ingesting it.
+"#;
+
+const SOURCE_ADD_AFTER_HELP: &str = r#"Examples:
+  verbatim source add ./paper.pdf
+  verbatim source add ./docs
+
+The daemon stores the path and returns a stable source id for later ingest,
+retrieve, ask, inspect, or remove commands.
+"#;
+
+const SOURCE_LIST_AFTER_HELP: &str = r#"Examples:
+  verbatim source list
+
+Use the printed source ids with ingest, retrieve, ask, and source inspect.
+"#;
+
+const SOURCE_INSPECT_AFTER_HELP: &str = r#"Examples:
+  verbatim source inspect <source-id>
+
+Inspect shows daemon metadata such as path, status, hash, parser, and diagnostics.
+"#;
+
+const SOURCE_REMOVE_AFTER_HELP: &str = r#"Examples:
+  verbatim source remove <source-id>
+
+Remove unregisters the source from the daemon catalog. It is not a shell rm for
+the original file path.
+"#;
+
+const SOURCE_CHECK_AFTER_HELP: &str = r#"Examples:
+  verbatim source check
+
+Check hashes registered sources and reports stale ids that should be ingested or
+reindexed.
+"#;
+
+const INGEST_AFTER_HELP: &str = r#"Examples:
+  verbatim ingest <source-id>
+  verbatim ingest --background <source-id>
+  verbatim ingest --force
+  verbatim ingest <source-id> --embedding-profile alt --vectors-only
+
+Caveats:
+  --force is only for all-source ingest. It is rejected when SOURCE_ID is set.
+  --force cannot be combined with --vectors-only.
+  --embedding-profile rebuilds vectors from existing chunks and requires
+  --vectors-only. For normal parsing ingest, set [embedding].profile_id in the
+  config instead.
+"#;
+
+const REINDEX_AFTER_HELP: &str = r#"Examples:
+  verbatim reindex --source-id <source-id>
+  verbatim reindex --all
+  verbatim reindex --stale
+  verbatim reindex --all --vectors-only
+  verbatim reindex --source-id <source-id> --embedding-profile alt --vectors-only
+
+Caveats:
+  Choose at most one target: --source-id, --all, or --stale.
+  --force is all-source reindex shorthand and is rejected with --source-id,
+  --stale, or vector-only profile rebuilds.
+  --embedding-profile selects a vector profile rebuild from existing chunks; use
+  --vectors-only as the explicit profile rebuild mode in scripts.
+"#;
+
+const ASK_AFTER_HELP: &str = r#"Examples:
+  verbatim ask "What does the report conclude?"
+  verbatim ask --source-id <source-id> --show-retrieval "What supports it?"
+  verbatim ask --context-only "What evidence is relevant?"
+  verbatim ask --no-generate --format json "What evidence is relevant?"
+
+Caveats:
+  Normal ask invokes the configured chat model after retrieval.
+  --context-only and --no-generate return retrieval context without chat
+  generation; --background is not supported in that mode.
+  --format only applies with --context-only or --no-generate.
+"#;
+
+const RETRIEVE_AFTER_HELP: &str = r#"Examples:
+  verbatim retrieve "What does the report conclude?"
+  verbatim retrieve --source-id <source-id> --page-size 1 "What supports it?"
+  verbatim retrieve --show-debug --show-locator "What evidence is relevant?"
+  verbatim retrieve --format json --show-debug "What evidence is relevant?"
+
+Debugging:
+  retrieve never invokes chat generation.
+  It returns evidence context without invoking chat generation.
+  --show-debug includes deterministic dense/BM25/RRF/rerank evidence ranking
+  details for debugging and agent workflows.
+  --show-locator and JSON output include structured locator/provenance fields
+  when available.
+"#;
+
+const EVIDENCE_AFTER_HELP: &str = r#"Examples:
+  verbatim evidence <evidence-id>
+
+Evidence ids come from retrieve output, ask citations, and retrieval debug packs.
+"#;
+
+const CONFIG_AFTER_HELP: &str = r#"Examples:
+  verbatim config init
+  verbatim config validate
+  verbatim config show
+
+The default config path is ~/.config/verbatim/config.toml. config show fetches
+redacted runtime config from the daemon.
+"#;
+
+const CONFIG_INIT_AFTER_HELP: &str = r#"Examples:
+  verbatim config init
+  $EDITOR ~/.config/verbatim/config.toml
+  verbatim config validate
+
+Initialize creates the local config file if it does not already exist.
+"#;
+
+const CONFIG_SHOW_AFTER_HELP: &str = r#"Examples:
+  verbatim daemon status
+  verbatim config show
+
+Show reads the active daemon config view and redacts secret-like values.
+"#;
+
+const CONFIG_VALIDATE_AFTER_HELP: &str = r#"Examples:
+  verbatim config validate
+
+Validate checks the local config file before the daemon loads it.
+"#;
+
+const DAEMON_AFTER_HELP: &str = r#"Examples:
+  verbatim daemon start
+  verbatim daemon install
+  systemctl --user daemon-reload
+  systemctl --user enable --now verbatim
+  verbatim daemon status
+
+The CLI talks to the daemon HTTP API. Start the daemon before source, ingest,
+retrieve, ask, evidence, config show, or task commands.
+"#;
+
+const DAEMON_START_AFTER_HELP: &str = r#"Examples:
+  verbatim daemon start
+
+Start runs verbatim-daemon in the foreground. For a persistent user service, use
+verbatim daemon install and systemctl --user enable --now verbatim.
+"#;
+
+const DAEMON_STATUS_AFTER_HELP: &str = r#"Examples:
+  verbatim daemon status
+
+Status checks daemon health through the HTTP API and fails if the daemon cannot
+be reached.
+"#;
+
+const DAEMON_INSTALL_AFTER_HELP: &str = r#"Examples:
+  verbatim daemon install
+  verbatim daemon install --force
+  systemctl --user daemon-reload
+  systemctl --user enable --now verbatim
+
+Install writes ~/.config/systemd/user/verbatim.service, or the equivalent path
+under XDG_CONFIG_HOME. Use --force only to replace an existing unit file.
+"#;
+
+const TASK_AFTER_HELP: &str = r#"Examples:
+  verbatim task show <task-id>
+  verbatim task events <task-id>
+  verbatim task wait --timeout 25m <task-id>
+  verbatim task cancel <task-id>
+
+Task ids are returned by --background ingest/reindex/ask commands.
+"#;
+
+const TASK_SHOW_AFTER_HELP: &str = r#"Examples:
+  verbatim task show <task-id>
+
+Show prints the current task status, request/result summary, progress snapshot,
+and phase spans.
+"#;
+
+const TASK_EVENTS_AFTER_HELP: &str = r#"Examples:
+  verbatim task events <task-id>
+  verbatim task events --after 42 <task-id>
+
+Events are ordered by sequence. Use --after to resume from the last sequence you
+already consumed.
+"#;
+
+const TASK_WAIT_AFTER_HELP: &str = r#"Examples:
+  verbatim task wait --timeout 25m <task-id>
+  verbatim task wait --no-timeout <task-id>
+  verbatim task wait --after 42 <task-id>
+
+Timeouts:
+  --timeout caps only this CLI wait call.
+  Without --timeout or --no-timeout, Verbatim uses cli.task_wait_timeout_seconds
+  from config.
+  This is separate from model timeout_seconds settings for embedding, rerank,
+  chat, vision, and OCR requests.
+"#;
+
+const TASK_WATCH_AFTER_HELP: &str = r#"Examples:
+  verbatim task watch <task-id>
+  verbatim task watch --after 42 <task-id>
+
+Watch is the unbounded wait form. Prefer task wait --timeout for scripts that
+need a bounded CLI call.
+"#;
+
+const TASK_CANCEL_AFTER_HELP: &str = r#"Examples:
+  verbatim task cancel <task-id>
+
+Cancel is best-effort. Use task show or task events to inspect the resulting
+terminal status.
+"#;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "verbatim",
     version,
-    about = "Grounded document Q&A with traceable citations"
+    about = "Grounded document retrieval and Q&A with traceable citations",
+    long_about = TOP_LEVEL_LONG_ABOUT,
+    after_help = TOP_LEVEL_AFTER_HELP
 )]
 struct Cli {
     #[command(subcommand)]
@@ -473,21 +717,37 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Manage sources through the daemon API.
+    #[command(
+        about = "Manage daemon-registered document sources.",
+        after_help = SOURCE_AFTER_HELP
+    )]
     Source {
         #[command(subcommand)]
         command: SourceCommand,
     },
     /// Trigger ingestion through the daemon API.
+    #[command(
+        about = "Parse sources and build retrieval indexes through the daemon.",
+        after_help = INGEST_AFTER_HELP
+    )]
     Ingest {
-        /// Optional source id. Omit to ingest all pending/stale sources.
+        /// Ingest this source only. Omit to ingest all pending/stale sources.
+        #[arg(value_name = "SOURCE_ID")]
         source_id: Option<String>,
         /// Re-ingest all sources, including already indexed sources.
+        ///
+        /// Only valid when SOURCE_ID is omitted; rejected with --vectors-only.
         #[arg(long)]
         force: bool,
-        /// Build vectors for this embedding profile from existing chunks.
+        /// Build vectors for this profile from existing chunks.
+        ///
+        /// Requires --vectors-only. For normal parsing ingest, set
+        /// [embedding].profile_id in the config.
         #[arg(long = "embedding-profile")]
         embedding_profile: Option<String>,
         /// Build only profile vectors/indexes without re-parsing sources.
+        ///
+        /// Use this with --embedding-profile for profile rebuilds.
         #[arg(long)]
         vectors_only: bool,
         /// Queue ingest as a persistent daemon task and return immediately.
@@ -495,6 +755,10 @@ enum Commands {
         background: bool,
     },
     /// Rebuild derived indexes for existing sources without adding sources.
+    #[command(
+        about = "Rebuild derived indexes for already registered sources.",
+        after_help = REINDEX_AFTER_HELP
+    )]
     Reindex {
         /// Reindex one existing source id.
         #[arg(long = "source-id", conflicts_with_all = ["all", "stale"])]
@@ -505,10 +769,13 @@ enum Commands {
         /// Reindex sources reported stale by source check.
         #[arg(long, conflicts_with_all = ["source_id", "all"])]
         stale: bool,
-        /// Force all-source reindex. Redundant with --all.
+        /// Force all-source reindex. Rejected with --source-id, --stale, or vector-only rebuilds.
         #[arg(long)]
         force: bool,
-        /// Build vectors for this embedding profile from existing chunks.
+        /// Build vectors for this profile from existing chunks.
+        ///
+        /// Selects a vector profile rebuild; use --vectors-only for explicit
+        /// profile rebuild scripts.
         #[arg(long = "embedding-profile")]
         embedding_profile: Option<String>,
         /// Build only profile vectors/indexes without re-parsing sources.
@@ -518,7 +785,11 @@ enum Commands {
         #[arg(long)]
         background: bool,
     },
-    /// Generate an answer through chat, or return a context pack with --context-only.
+    /// Generate a cited answer, or return a context pack with --context-only.
+    #[command(
+        about = "Generate a cited answer, or return retrieval context without generation.",
+        after_help = ASK_AFTER_HELP
+    )]
     Ask {
         /// Restrict retrieval to one source.
         #[arg(short = 's', long = "source-id")]
@@ -530,9 +801,12 @@ enum Commands {
         #[arg(long)]
         show_retrieval: bool,
         /// Return a retrieval context pack instead of invoking chat generation.
+        ///
+        /// This mode uses retrieve semantics and cannot be combined with
+        /// --background.
         #[arg(long = "context-only", action = ArgAction::SetTrue)]
         context_only: bool,
-        /// Alias for --context-only.
+        /// Alias for --context-only; no chat model is invoked.
         #[arg(long = "no-generate", action = ArgAction::SetTrue)]
         no_generate: bool,
         /// Context-only output format. JSON includes structured locator/provenance fields.
@@ -546,6 +820,10 @@ enum Commands {
         question: Vec<String>,
     },
     /// Retrieve a compact context/evidence pack without invoking chat generation.
+    #[command(
+        about = "Retrieve a ranked evidence/context pack without chat generation.",
+        after_help = RETRIEVE_AFTER_HELP
+    )]
     Retrieve {
         /// Restrict retrieval to one source.
         #[arg(short = 's', long = "source-id")]
@@ -580,7 +858,9 @@ enum Commands {
         /// Override reranker top-n. Use 0 to disable reranking.
         #[arg(long = "rerank-top-n")]
         rerank_top_n: Option<usize>,
-        /// Include retrieval stage debug metadata in the response.
+        /// Include deterministic retrieval stage debug metadata in the response.
+        ///
+        /// Useful for evidence/provenance debugging and agent workflows.
         #[arg(long = "show-debug")]
         show_debug: bool,
         /// Include structured locator/provenance fields in the response.
@@ -594,21 +874,38 @@ enum Commands {
         question: Vec<String>,
     },
     /// Inspect one evidence unit through the daemon API.
+    #[command(
+        about = "Inspect one evidence unit by stable evidence id.",
+        after_help = EVIDENCE_AFTER_HELP
+    )]
     Evidence {
         /// Evidence id.
+        #[arg(value_name = "EVIDENCE_ID")]
         eid: String,
     },
     /// Inspect or update configuration.
+    #[command(
+        about = "Initialize, validate, or inspect Verbatim configuration.",
+        after_help = CONFIG_AFTER_HELP
+    )]
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
     /// Manage daemon process/API helpers.
+    #[command(
+        about = "Start, check, or install the Verbatim daemon.",
+        after_help = DAEMON_AFTER_HELP
+    )]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
     /// Inspect and wait for persistent daemon tasks.
+    #[command(
+        about = "Inspect, stream, wait for, or cancel persistent daemon tasks.",
+        after_help = TASK_AFTER_HELP
+    )]
     Task {
         #[command(subcommand)]
         command: TaskCommand,
@@ -618,43 +915,90 @@ enum Commands {
 #[derive(Debug, Subcommand)]
 enum SourceCommand {
     /// Add a source path.
+    #[command(
+        about = "Register a file or directory path as a source.",
+        after_help = SOURCE_ADD_AFTER_HELP
+    )]
     Add {
-        /// File path to add.
+        /// File or directory path to register with the daemon.
+        #[arg(value_name = "PATH")]
         path: String,
     },
     /// List sources.
+    #[command(
+        about = "List daemon-registered sources.",
+        after_help = SOURCE_LIST_AFTER_HELP
+    )]
     List,
     /// Inspect one source.
+    #[command(
+        about = "Inspect metadata and diagnostics for one source.",
+        after_help = SOURCE_INSPECT_AFTER_HELP
+    )]
     Inspect {
         /// Source id.
+        #[arg(value_name = "SOURCE_ID")]
         id: String,
     },
     /// Remove one source.
+    #[command(
+        about = "Remove one source from the daemon catalog.",
+        after_help = SOURCE_REMOVE_AFTER_HELP
+    )]
     Remove {
         /// Source id.
+        #[arg(value_name = "SOURCE_ID")]
         id: String,
     },
     /// Mark and list stale sources.
+    #[command(
+        about = "Check registered sources for stale hashes.",
+        after_help = SOURCE_CHECK_AFTER_HELP
+    )]
     Check,
 }
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
     /// Generate the default local config file.
+    #[command(
+        about = "Create the default local config file.",
+        after_help = CONFIG_INIT_AFTER_HELP
+    )]
     Init,
     /// Fetch redacted runtime config from the daemon.
+    #[command(
+        about = "Show the daemon's redacted runtime config.",
+        after_help = CONFIG_SHOW_AFTER_HELP
+    )]
     Show,
     /// Validate the local config file.
+    #[command(
+        about = "Validate the local config file before daemon use.",
+        after_help = CONFIG_VALIDATE_AFTER_HELP
+    )]
     Validate,
 }
 
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
     /// Start verbatim-daemon in the foreground.
+    #[command(
+        about = "Start verbatim-daemon in the foreground.",
+        after_help = DAEMON_START_AFTER_HELP
+    )]
     Start,
     /// Check daemon health through the daemon API.
+    #[command(
+        about = "Check daemon health through the HTTP API.",
+        after_help = DAEMON_STATUS_AFTER_HELP
+    )]
     Status,
     /// Install the systemd user service.
+    #[command(
+        about = "Install the systemd user service unit.",
+        after_help = DAEMON_INSTALL_AFTER_HELP
+    )]
     Install {
         /// Overwrite an existing service file.
         #[arg(long)]
@@ -665,13 +1009,23 @@ enum DaemonCommand {
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
     /// Show task summary and phase spans.
+    #[command(
+        about = "Show task status, progress, result, and spans.",
+        after_help = TASK_SHOW_AFTER_HELP
+    )]
     Show {
         /// Task id.
+        #[arg(value_name = "TASK_ID")]
         task_id: String,
     },
     /// List bounded task events.
+    #[command(
+        about = "List task events with optional sequence resume.",
+        after_help = TASK_EVENTS_AFTER_HELP
+    )]
     Events {
         /// Task id.
+        #[arg(value_name = "TASK_ID")]
         task_id: String,
         /// Only show events after this sequence.
         #[arg(long)]
@@ -679,10 +1033,12 @@ enum TaskCommand {
     },
     /// Wait for task events until the task reaches a terminal status.
     #[command(
-        after_help = "Examples:\n  verbatim task wait --timeout 25m task-abc123\n  verbatim task wait --no-timeout task-abc123"
+        about = "Wait until a task reaches a terminal status.",
+        after_help = TASK_WAIT_AFTER_HELP
     )]
     Wait {
         /// Task id.
+        #[arg(value_name = "TASK_ID")]
         task_id: String,
         /// Only stream events after this sequence.
         #[arg(long)]
@@ -697,16 +1053,26 @@ enum TaskCommand {
         no_timeout: bool,
     },
     /// Watch task progress until the task reaches a terminal status.
+    #[command(
+        about = "Watch task progress without a CLI wait timeout.",
+        after_help = TASK_WATCH_AFTER_HELP
+    )]
     Watch {
         /// Task id.
+        #[arg(value_name = "TASK_ID")]
         task_id: String,
         /// Only stream events after this sequence.
         #[arg(long)]
         after: Option<i64>,
     },
     /// Request best-effort task cancellation.
+    #[command(
+        about = "Request best-effort cancellation for a task.",
+        after_help = TASK_CANCEL_AFTER_HELP
+    )]
     Cancel {
         /// Task id.
+        #[arg(value_name = "TASK_ID")]
         task_id: String,
     },
 }
@@ -775,6 +1141,7 @@ mod tests {
             &["task", "show", "--help"],
             &["task", "events", "--help"],
             &["task", "wait", "--help"],
+            &["task", "watch", "--help"],
             &["task", "cancel", "--help"],
         ];
 
@@ -787,11 +1154,124 @@ mod tests {
     }
 
     #[test]
+    fn help_examples_are_available_for_every_command_path() {
+        let cases: &[&[&str]] = &[
+            &["--help"],
+            &["source", "--help"],
+            &["source", "add", "--help"],
+            &["source", "list", "--help"],
+            &["source", "inspect", "--help"],
+            &["source", "remove", "--help"],
+            &["source", "check", "--help"],
+            &["ingest", "--help"],
+            &["reindex", "--help"],
+            &["ask", "--help"],
+            &["retrieve", "--help"],
+            &["evidence", "--help"],
+            &["config", "--help"],
+            &["config", "init", "--help"],
+            &["config", "show", "--help"],
+            &["config", "validate", "--help"],
+            &["daemon", "--help"],
+            &["daemon", "start", "--help"],
+            &["daemon", "status", "--help"],
+            &["daemon", "install", "--help"],
+            &["task", "--help"],
+            &["task", "show", "--help"],
+            &["task", "events", "--help"],
+            &["task", "wait", "--help"],
+            &["task", "watch", "--help"],
+            &["task", "cancel", "--help"],
+        ];
+
+        for args in cases {
+            let (code, stdout, stderr, _, _) = run_mock(args.iter().copied());
+            assert_eq!(code.unwrap(), 0, "args: {args:?}");
+            assert!(
+                stdout.contains("Examples:"),
+                "missing examples for args {args:?}: {stdout}"
+            );
+            assert!(stderr.is_empty(), "stderr: {stderr}");
+        }
+    }
+
+    #[test]
+    fn top_level_help_points_to_readme_quick_start_commands() {
+        let (code, help, stderr, _, _) = run_mock(["--help"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(help.contains("long-running daemon"));
+        assert!(help.contains("verbatim config init"));
+        assert!(help.contains("verbatim daemon install"));
+        assert!(help.contains("verbatim source add ./paper.pdf"));
+        assert!(help.contains("verbatim retrieve --show-debug"));
+        assert!(help.contains("verbatim task wait --help"));
+    }
+
+    #[test]
+    fn command_group_help_mentions_relationships_and_examples() {
+        let (code, source_help, stderr, _, _) = run_mock(["source", "--help"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(source_help.contains("Sources are daemon-registered paths"));
+        assert!(source_help.contains("verbatim source add ./paper.pdf"));
+
+        let (code, config_help, stderr, _, _) = run_mock(["config", "--help"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(config_help.contains("~/.config/verbatim/config.toml"));
+        assert!(config_help.contains("redacted runtime config"));
+
+        let (code, daemon_help, stderr, _, _) = run_mock(["daemon", "--help"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(daemon_help.contains("systemctl --user enable --now verbatim"));
+        assert!(daemon_help.contains("Start the daemon before source"));
+
+        let (code, task_help, stderr, _, _) = run_mock(["task", "--help"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(task_help.contains("Task ids are returned by --background"));
+        assert!(task_help.contains("verbatim task wait --timeout 25m"));
+    }
+
+    #[test]
+    fn ingest_help_documents_force_and_embedding_profile_caveats() {
+        let (code, help, stderr, _, _) = run_mock(["ingest", "--help"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(help.contains("verbatim ingest --force"));
+        assert!(help.contains("--force is only for all-source ingest"));
+        assert!(help.contains("rejected when SOURCE_ID is set"));
+        assert!(help.contains("--force cannot be combined with --vectors-only"));
+        assert!(help.contains("--embedding-profile rebuilds vectors"));
+        assert!(help.contains("--vectors-only"));
+        assert!(help.contains("set [embedding].profile_id"));
+    }
+
+    #[test]
+    fn retrieve_help_documents_debug_locator_and_generation_caveats() {
+        let (code, help, stderr, _, _) = run_mock(["retrieve", "--help"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(help.contains("retrieve never invokes chat generation"));
+        assert!(help.contains("--show-debug includes deterministic"));
+        assert!(help.contains("dense/BM25/RRF/rerank"));
+        assert!(help.contains("--show-locator"));
+        assert!(help.contains("structured locator/provenance"));
+        assert!(help.contains("verbatim retrieve --format json --show-debug"));
+    }
+
+    #[test]
     fn ask_and_retrieve_help_distinguish_generation_from_context_only() {
         let (code, ask_help, stderr, _, _) = run_mock(["ask", "--help"]);
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
-        assert!(ask_help.contains("Generate an answer through chat"));
+        assert!(ask_help.contains("Generate a cited answer"));
+        assert!(ask_help.contains("Normal ask invokes the configured chat model"));
         assert!(ask_help.contains("--context-only"));
         assert!(ask_help.contains("--no-generate"));
         assert!(ask_help.contains("--format"));
@@ -815,6 +1295,8 @@ mod tests {
         assert!(help.contains("verbatim task wait --timeout 25m"));
         assert!(help.contains("verbatim task wait --no-timeout"));
         assert!(help.contains("model timeout_seconds do not cap task streams"));
+        assert!(help.contains("cli.task_wait_timeout_seconds"));
+        assert!(help.contains("separate from model timeout_seconds"));
     }
 
     #[test]
