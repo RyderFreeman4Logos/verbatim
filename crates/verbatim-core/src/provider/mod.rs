@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
+use crate::upstream::UpstreamFailureDiagnostic;
+
 pub mod openai_compatible;
 
 /// Result type used by model providers.
@@ -29,17 +31,20 @@ pub enum ProviderError {
     Transport {
         operation: &'static str,
         source: reqwest::Error,
+        diagnostic: Box<UpstreamFailureDiagnostic>,
     },
     /// The provider returned a non-success HTTP status.
     HttpStatus {
         operation: &'static str,
         status: reqwest::StatusCode,
         message: String,
+        diagnostic: Box<UpstreamFailureDiagnostic>,
     },
     /// The provider response could not be decoded as the expected JSON shape.
     ResponseDecode {
         operation: &'static str,
-        source: reqwest::Error,
+        source: serde_json::Error,
+        diagnostic: Box<UpstreamFailureDiagnostic>,
     },
     /// A streaming event contained invalid JSON.
     StreamDecode {
@@ -67,6 +72,31 @@ impl ProviderError {
             message: message.into(),
         }
     }
+
+    pub fn diagnostic(&self) -> Option<&UpstreamFailureDiagnostic> {
+        match self {
+            Self::Transport { diagnostic, .. }
+            | Self::HttpStatus { diagnostic, .. }
+            | Self::ResponseDecode { diagnostic, .. } => Some(diagnostic.as_ref()),
+            Self::Configuration { .. }
+            | Self::StreamDecode { .. }
+            | Self::MalformedResponse { .. } => None,
+        }
+    }
+
+    pub fn with_retry_count(mut self, retry_count: u32) -> Self {
+        match &mut self {
+            Self::Transport { diagnostic, .. }
+            | Self::HttpStatus { diagnostic, .. }
+            | Self::ResponseDecode { diagnostic, .. } => {
+                diagnostic.retry_count = Some(retry_count);
+            }
+            Self::Configuration { .. }
+            | Self::StreamDecode { .. }
+            | Self::MalformedResponse { .. } => {}
+        }
+        self
+    }
 }
 
 impl fmt::Display for ProviderError {
@@ -78,16 +108,37 @@ impl fmt::Display for ProviderError {
                     "{operation} provider configuration is invalid: {message}"
                 )
             }
-            Self::Transport { operation, source } => {
-                write!(f, "{operation} request failed: {source}")
+            Self::Transport {
+                operation,
+                source,
+                diagnostic,
+            } => {
+                write!(
+                    f,
+                    "{operation} request failed: {source}; upstream diagnostic: {}",
+                    diagnostic.summary()
+                )
             }
             Self::HttpStatus {
                 operation,
                 status,
                 message,
-            } => write!(f, "{operation} provider returned HTTP {status}: {message}"),
-            Self::ResponseDecode { operation, source } => {
-                write!(f, "failed to decode {operation} response: {source}")
+                diagnostic,
+            } => write!(
+                f,
+                "{operation} provider returned HTTP {status}: {message}; upstream diagnostic: {}",
+                diagnostic.summary()
+            ),
+            Self::ResponseDecode {
+                operation,
+                source,
+                diagnostic,
+            } => {
+                write!(
+                    f,
+                    "failed to decode {operation} response: {source}; upstream diagnostic: {}",
+                    diagnostic.summary()
+                )
             }
             Self::StreamDecode { operation, source } => {
                 write!(f, "failed to parse {operation} stream event: {source}")
@@ -105,7 +156,8 @@ impl fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Transport { source, .. } | Self::ResponseDecode { source, .. } => Some(source),
+            Self::Transport { source, .. } => Some(source),
+            Self::ResponseDecode { source, .. } => Some(source),
             Self::StreamDecode { source, .. } => Some(source),
             Self::Configuration { .. }
             | Self::HttpStatus { .. }

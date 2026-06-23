@@ -2913,6 +2913,7 @@ mod tests {
         let request = ask_request_metadata(
             "Do not persist this raw prompt with password=secret.",
             Some("src-1"),
+            Some("default"),
             true,
         );
 

@@ -14,10 +14,11 @@ use crate::types::hex_sha256;
 
 static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-pub const TASK_METADATA_MAX_BYTES: usize = 2048;
+pub const TASK_METADATA_MAX_BYTES: usize = 8192;
 pub const TASK_EVENT_MESSAGE_MAX_CHARS: usize = 512;
 pub const TASK_ERROR_MAX_CHARS: usize = 2048;
 const TASK_STRING_MAX_CHARS: usize = 256;
+const TASK_UPSTREAM_BODY_PREFIX_MAX_CHARS: usize = 4096;
 const TASK_ARRAY_MAX_ITEMS: usize = 32;
 const TASK_OBJECT_MAX_KEYS: usize = 32;
 
@@ -193,12 +194,14 @@ pub fn unix_timestamp_string() -> String {
 pub fn ask_request_metadata(
     question: &str,
     source_id: Option<&str>,
+    embedding_profile_id: Option<&str>,
     show_retrieval: bool,
 ) -> Value {
     bounded_json(json!({
         "question_chars": question.chars().count(),
         "question_sha256": hex_sha256(question.as_bytes()),
         "source_id": source_id,
+        "embedding_profile_id": embedding_profile_id,
         "show_retrieval": show_retrieval,
     }))
 }
@@ -206,6 +209,7 @@ pub fn ask_request_metadata(
 pub fn retrieve_request_metadata(
     question: &str,
     source_id: Option<&str>,
+    embedding_profile_id: Option<&str>,
     limit: usize,
     page_size: usize,
     page: usize,
@@ -214,6 +218,7 @@ pub fn retrieve_request_metadata(
         "question_chars": question.chars().count(),
         "question_sha256": hex_sha256(question.as_bytes()),
         "source_id": source_id,
+        "embedding_profile_id": embedding_profile_id,
         "limit": limit,
         "page_size": page_size,
         "page": page,
@@ -331,6 +336,13 @@ fn sanitize_object(map: Map<String, Value>) -> Value {
     for (key, value) in map.into_iter().take(TASK_OBJECT_MAX_KEYS) {
         let sanitized = if is_sensitive_metadata_key(&key) {
             Value::String("<redacted>".into())
+        } else if key == "response_body_prefix" {
+            match value {
+                Value::String(text) => {
+                    Value::String(bounded_chars(&text, TASK_UPSTREAM_BODY_PREFIX_MAX_CHARS))
+                }
+                other => sanitize_value(other),
+            }
         } else {
             sanitize_value(value)
         };
@@ -380,8 +392,9 @@ mod tests {
     #[test]
     fn ask_metadata_does_not_store_raw_question_or_answer() {
         let question = "What is the secret launch password?";
-        let request = ask_request_metadata(question, Some("src-1"), true);
-        let retrieve = retrieve_request_metadata(question, Some("src-1"), 12, 1, 1);
+        let request = ask_request_metadata(question, Some("src-1"), Some("default"), true);
+        let retrieve =
+            retrieve_request_metadata(question, Some("src-1"), Some("default"), 12, 1, 1);
         let result = ask_result_metadata("Raw answer text [E1].", 1, true, false);
         let encoded = serde_json::to_string(&(request, retrieve, result)).unwrap();
 
@@ -404,5 +417,24 @@ mod tests {
         assert!(!encoded.contains("should-not-print"));
         assert!(encoded.contains("<redacted>"));
         assert!(encoded.len() <= TASK_METADATA_MAX_BYTES);
+    }
+
+    #[test]
+    fn bounded_json_preserves_upstream_body_prefix_budget() {
+        let prefix = "x".repeat(1024);
+        let bounded = bounded_json(json!({
+            "upstream_failure": {
+                "response_body_prefix": prefix,
+                "response_body_bytes": 1024,
+            }
+        }));
+
+        assert_eq!(
+            bounded["upstream_failure"]["response_body_prefix"]
+                .as_str()
+                .unwrap()
+                .len(),
+            1024
+        );
     }
 }

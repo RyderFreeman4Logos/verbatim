@@ -44,7 +44,7 @@ impl EmbeddingClient for OpenAiEmbeddingClient {
                     ))
                     .await;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e.with_retry_count(retries).into()),
             }
         }
     }
