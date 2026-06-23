@@ -323,6 +323,17 @@ pub enum SourceLocator {
         paragraph: u32,
         bbox: Option<BBox>,
     },
+    PdfOcr {
+        page: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page_label: Option<String>,
+        line_index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        word_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bbox: Option<BBox>,
+        ocr: Box<OcrLocatorMetadata>,
+    },
     PdfImage {
         page: u32,
         image_index: u32,
@@ -341,6 +352,27 @@ impl fmt::Display for SourceLocator {
             Self::Pdf {
                 page, paragraph, ..
             } => write!(f, "PDF p.{page}, para {paragraph}"),
+            Self::PdfOcr {
+                page,
+                line_index,
+                word_index: Some(word_index),
+                ocr,
+                ..
+            } => write!(
+                f,
+                "PDF p.{page}, OCR line {line_index}, word {word_index}, conf={}",
+                format_confidence(ocr.confidence)
+            ),
+            Self::PdfOcr {
+                page,
+                line_index,
+                ocr,
+                ..
+            } => write!(
+                f,
+                "PDF p.{page}, OCR line {line_index}, conf={}",
+                format_confidence(ocr.confidence)
+            ),
             Self::PdfImage {
                 page,
                 image_index,
@@ -367,6 +399,12 @@ impl fmt::Display for SourceLocator {
             } => write!(f, "{path_or_url} L{line_start}"),
         }
     }
+}
+
+fn format_confidence(confidence: Option<f32>) -> String {
+    confidence
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn canonical_bbox_key(bbox: Option<&BBox>) -> String {
@@ -420,8 +458,88 @@ pub struct Source {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceKind {
     Text,
+    Ocr,
     Image,
     Generated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OcrProfile {
+    pub provider: String,
+    pub engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    pub language: String,
+    pub profile: String,
+}
+
+impl OcrProfile {
+    pub fn profile_hash(&self) -> String {
+        let encoded = serde_json::to_vec(self).unwrap_or_default();
+        hex_sha256(&encoded)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OcrLocatorMetadata {
+    pub profile: OcrProfile,
+    pub profile_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    pub text_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PdfPageScanSummary {
+    pub page: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_label: Option<String>,
+    pub text_char_count: usize,
+    pub text_density: f32,
+    pub image_count: usize,
+    pub has_meaningful_text: bool,
+    pub image_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PdfScanSummary {
+    pub page_count: usize,
+    pub text_char_count: usize,
+    pub text_density: f32,
+    pub image_only_page_count: usize,
+    pub ocr_recommended: bool,
+    #[serde(default)]
+    pub pages: Vec<PdfPageScanSummary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrSourceStatus {
+    NotRequired,
+    Disabled,
+    Recommended,
+    Applied,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceOcrDiagnostics {
+    pub enabled: bool,
+    pub status: OcrSourceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_profile: Option<OcrProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_profile_hash: Option<String>,
+    pub evidence_count: usize,
+    #[serde(default)]
+    pub evidence_profile_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceIngestDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf: Option<PdfScanSummary>,
+    pub ocr: SourceOcrDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -783,6 +901,7 @@ pub struct RetrievalEvidencePackEntry {
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalEvidenceRole {
     OriginalText,
+    OcrText,
     ImageArtifact,
     ImageCaptionGenerated,
     Generated,

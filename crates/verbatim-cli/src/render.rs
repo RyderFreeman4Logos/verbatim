@@ -7,7 +7,7 @@ use verbatim_core::api::{
     TaskCreatedResponse,
 };
 use verbatim_core::task::{TaskEvent, TaskSpan, TaskStatus, TaskSummary};
-use verbatim_core::types::RetrievalDebug;
+use verbatim_core::types::{BBox, OcrSourceStatus, RetrievalDebug, SourceLocator};
 
 pub fn write_sources<W>(writer: &mut W, sources: &[SourceResponse]) -> std::io::Result<()>
 where
@@ -42,6 +42,21 @@ where
     }
     if let Some(ingested_at) = &source.last_ingested_at {
         writeln!(writer, "  last_ingested_at: {ingested_at}")?;
+    }
+    if let Some(diagnostics) = &source.diagnostics {
+        if let Some(pdf) = &diagnostics.pdf {
+            writeln!(
+                writer,
+                "  pdf: pages={} text_density={:.1} image_only_pages={}",
+                pdf.page_count, pdf.text_density, pdf.image_only_page_count
+            )?;
+        }
+        writeln!(
+            writer,
+            "  ocr: {} evidence_count={}",
+            ocr_status_name(diagnostics.ocr.status),
+            diagnostics.ocr.evidence_count
+        )?;
     }
     Ok(())
 }
@@ -191,6 +206,7 @@ where
         writeln!(writer, "  derived_from: {derived_from}")?;
     }
     writeln!(writer, "  locator: {}", evidence.locator)?;
+    write_structured_locator_details(writer, &evidence.structured_locator)?;
     writeln!(writer, "  position: {}", evidence.position)?;
     if !evidence.heading_path.is_empty() {
         writeln!(
@@ -216,6 +232,65 @@ where
     writeln!(writer)?;
     writeln!(writer, "Text:")?;
     writeln!(writer, "{}", evidence.text)
+}
+
+fn write_structured_locator_details<W>(
+    writer: &mut W,
+    locator: &SourceLocator,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if let SourceLocator::PdfOcr {
+        page_label,
+        line_index,
+        word_index,
+        bbox,
+        ocr,
+        ..
+    } = locator
+    {
+        writeln!(writer, "  ocr_locator:")?;
+        if let Some(page_label) = page_label {
+            writeln!(writer, "    page_label: {page_label}")?;
+        }
+        writeln!(writer, "    line_index: {line_index}")?;
+        if let Some(word_index) = word_index {
+            writeln!(writer, "    word_index: {word_index}")?;
+        }
+        if let Some(bbox) = bbox {
+            writeln!(writer, "    bbox: {}", display_bbox(bbox))?;
+        }
+        writeln!(writer, "    engine: {}", ocr.profile.engine)?;
+        if let Some(version) = &ocr.profile.engine_version {
+            writeln!(writer, "    engine_version: {version}")?;
+        }
+        writeln!(writer, "    language: {}", ocr.profile.language)?;
+        writeln!(writer, "    profile: {}", ocr.profile.profile)?;
+        writeln!(writer, "    profile_hash: {}", ocr.profile_hash)?;
+        if let Some(confidence) = ocr.confidence {
+            writeln!(writer, "    confidence: {confidence:.2}")?;
+        }
+        writeln!(writer, "    text_hash: {}", ocr.text_hash)?;
+    }
+    Ok(())
+}
+
+fn display_bbox(bbox: &BBox) -> String {
+    format!(
+        "[{:.2},{:.2},{:.2},{:.2}]",
+        bbox.x0, bbox.y0, bbox.x1, bbox.y1
+    )
+}
+
+fn ocr_status_name(status: OcrSourceStatus) -> &'static str {
+    match status {
+        OcrSourceStatus::NotRequired => "not_required",
+        OcrSourceStatus::Disabled => "disabled_recommended",
+        OcrSourceStatus::Recommended => "recommended",
+        OcrSourceStatus::Applied => "applied",
+        OcrSourceStatus::Stale => "stale",
+    }
 }
 
 pub fn write_config<W>(writer: &mut W, config: &ConfigResponse) -> std::io::Result<()>
@@ -593,4 +668,62 @@ fn value_string_list(value: Option<&Value>) -> String {
                 .join(",")
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use verbatim_core::api::EvidenceResponse;
+    use verbatim_core::types::{OcrLocatorMetadata, OcrProfile};
+
+    #[test]
+    fn ocr_evidence_lookup_renders_structured_locator_details() {
+        let profile = OcrProfile {
+            provider: "test".into(),
+            engine: "mock-ocr".into(),
+            engine_version: Some("1.0".into()),
+            language: "eng".into(),
+            profile: "default".into(),
+        };
+        let response = EvidenceResponse {
+            id: "ev-ocr".into(),
+            source_id: "src-1".into(),
+            kind: "ocr".into(),
+            derived_from: None,
+            locator: "PDF p.1, OCR line 1, conf=0.97".into(),
+            structured_locator: SourceLocator::PdfOcr {
+                page: 1,
+                page_label: Some("1".into()),
+                line_index: 1,
+                word_index: None,
+                bbox: Some(BBox {
+                    x0: 10.0,
+                    y0: 20.0,
+                    x1: 120.0,
+                    y1: 36.0,
+                }),
+                ocr: Box::new(OcrLocatorMetadata {
+                    profile,
+                    profile_hash: "profile-hash".into(),
+                    confidence: Some(0.97),
+                    text_hash: "text-hash".into(),
+                }),
+            },
+            text: "ocrneedle scanned invoice total".into(),
+            heading_path: Vec::new(),
+            position: 1,
+            image_artifact: None,
+        };
+        let mut output = Vec::new();
+
+        write_evidence(&mut output, &response).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("kind: ocr"));
+        assert!(output.contains("ocr_locator:"));
+        assert!(output.contains("engine: mock-ocr"));
+        assert!(output.contains("language: eng"));
+        assert!(output.contains("confidence: 0.97"));
+        assert!(output.contains("bbox: [10.00,20.00,120.00,36.00]"));
+    }
 }

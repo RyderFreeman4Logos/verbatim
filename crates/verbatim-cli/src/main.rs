@@ -1454,6 +1454,7 @@ mod tests {
             hash: "hash".into(),
             parser_used: None,
             last_ingested_at: None,
+            diagnostics: None,
         }
     }
 
@@ -1464,6 +1465,11 @@ mod tests {
             kind: "text".into(),
             derived_from: None,
             locator: "PDF p.1 para.1".into(),
+            structured_locator: SourceLocator::Pdf {
+                page: 1,
+                paragraph: 1,
+                bbox: None,
+            },
             text: "quoted".into(),
             heading_path: Vec::new(),
             position: 0,

@@ -200,6 +200,7 @@ impl Generator {
              Sources: {sources}\n\n\
              Verification rules:\n\
              - original_text supports claims grounded in document text.\n\
+             - ocr_text supports claims grounded in OCR-derived document text; consider OCR confidence and do not treat it as generated prose.\n\
              - image_caption_generated is generated derived evidence, not original PDF text; use it conservatively and revise over-strong wording when needed.\n\
              - image_artifact metadata supports image location/artifact facts; visual content claims need either caption support or an included vision_attachment.\n\
              - Prefer image_artifact with an included vision_attachment as the strongest visual citation when available.\n\
@@ -297,6 +298,7 @@ impl Generator {
              Unsupported claims to remove: {unsupported}\n\n\
              Sources: {sources}\n\n\
              Preserve citation labels only for sources still used in the revised answer. \
+             Treat ocr_text as OCR-derived source text, not generated prose. \
              Treat image_caption_generated as caption-only derived evidence unless a vision_attachment is included. \
              Remove visual claims that lack caption support or included image evidence.\n\n\
              If the sources are insufficient, output exactly: Evidence insufficient to answer this question.",
@@ -622,6 +624,7 @@ fn verifier_source_inputs(
 fn verifier_provenance(citation: &CitationRef) -> VerifierEvidenceProvenance {
     let summary = match (citation.kind, citation.derived_from.as_ref()) {
         (EvidenceKind::Text, _) => "original source text",
+        (EvidenceKind::Ocr, _) => "OCR-derived source text with structured locator",
         (EvidenceKind::Image, _) => "original image artifact locator",
         (EvidenceKind::Generated, Some(_)) => {
             "generated image caption derived from original image artifact"
@@ -680,6 +683,10 @@ fn verifier_visual_support(
             "text_only",
             "Use this source for document text claims, not visual content claims.",
         ),
+        (EvidenceKind::Ocr, _) => (
+            "ocr_text",
+            "OCR-derived text can support document text claims; consider OCR confidence for weak scans.",
+        ),
         (EvidenceKind::Image, _) if vision_attachment == "included" => (
             "image_pixels_available",
             "The verifier can inspect the cited image payload for visual claims.",
@@ -730,7 +737,7 @@ fn citation_image_artifact_evidence_id(citation: &CitationRef) -> Option<&Eviden
     match citation.kind {
         EvidenceKind::Image => Some(&citation.evidence_id),
         EvidenceKind::Generated => citation.derived_from.as_ref(),
-        EvidenceKind::Text => None,
+        EvidenceKind::Text | EvidenceKind::Ocr => None,
     }
 }
 
@@ -754,7 +761,7 @@ pub fn image_artifact_evidence_id(evidence: &EvidenceUnit) -> Option<&EvidenceId
     match evidence.kind {
         EvidenceKind::Image => Some(&evidence.id),
         EvidenceKind::Generated => evidence.derived_from.as_ref(),
-        EvidenceKind::Text => None,
+        EvidenceKind::Text | EvidenceKind::Ocr => None,
     }
 }
 
@@ -844,6 +851,14 @@ fn push_source_pack_entry(
             pack.push_str(&evidence.text);
             pack.push('\n');
         }
+        "ocr_text" => {
+            pack.push_str("ocr_text:\n");
+            pack.push_str(&evidence.text);
+            pack.push('\n');
+            pack.push_str(
+                "provenance: OCR-derived source text with structured OCR locator and confidence metadata; not generated text.\n",
+            );
+        }
         "image_caption_generated" => {
             pack.push_str("image_caption_generated:\n");
             pack.push_str(&evidence.text);
@@ -905,6 +920,7 @@ fn push_source_pack_entry(
 fn source_pack_kind_label(evidence: &EvidenceUnit) -> &'static str {
     match evidence.kind {
         EvidenceKind::Text => "original_text",
+        EvidenceKind::Ocr => "ocr_text",
         EvidenceKind::Image => "image_artifact",
         EvidenceKind::Generated if evidence.derived_from.is_some() => "image_caption_generated",
         EvidenceKind::Generated => "generated",
@@ -984,6 +1000,7 @@ fn is_evidence_label(token: &str) -> bool {
 fn citation_kind_label(kind: EvidenceKind, derived_from: Option<&EvidenceId>) -> &'static str {
     match kind {
         EvidenceKind::Text => "original_text",
+        EvidenceKind::Ocr => "ocr_text",
         EvidenceKind::Image => "image_artifact",
         EvidenceKind::Generated if derived_from.is_some() => "image_caption_generated",
         EvidenceKind::Generated => "generated",
@@ -1039,9 +1056,10 @@ Rules:
 4. If the SOURCE PACK does not contain enough evidence, say so.
 5. Do not use outside knowledge.
 6. Do not invent page numbers, paragraph numbers, quotations, or citations.
-7. Treat image_caption_generated entries as derived evidence, not original PDF text.
-8. Prefer original image_artifact locators for visual claims when an image artifact is available.
-9. Cite image_artifact entries only for image artifact facts or visual content actually attached in this request.";
+7. Treat ocr_text entries as OCR-derived source text with confidence caveats, not generated prose.
+8. Treat image_caption_generated entries as derived evidence, not original PDF text.
+9. Prefer original image_artifact locators for visual claims when an image artifact is available.
+10. Cite image_artifact entries only for image artifact facts or visual content actually attached in this request.";
 
 #[cfg(test)]
 mod tests {
@@ -1058,8 +1076,8 @@ mod tests {
         ChatStreamEvent, ProviderResult,
     };
     use crate::types::{
-        BBox, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, ImageId, RetrievalProvenance,
-        SourceId, SourceLocator,
+        BBox, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, ImageId, OcrLocatorMetadata,
+        OcrProfile, RetrievalProvenance, SourceId, SourceLocator,
     };
 
     struct RecordingChatModel {
@@ -1313,6 +1331,62 @@ mod tests {
         }]
     }
 
+    fn sample_ocr_results() -> Vec<RetrievalResult> {
+        let source_id = SourceId("src".into());
+        let evidence_id = EvidenceId("ocr-1".into());
+        let chunk_id = ChunkId("ocr-child".into());
+        vec![RetrievalResult {
+            chunk_id: chunk_id.clone(),
+            score: 0.99,
+            chunk: Chunk {
+                id: chunk_id.clone(),
+                source_id: source_id.clone(),
+                text: "ocrneedle scanned invoice total".into(),
+                context_text: None,
+                token_count: 5,
+                chunk_type: ChunkType::Child,
+                parent_chunk_id: None,
+                heading_path: vec![],
+                evidence_unit_ids: vec![evidence_id.clone()],
+            },
+            evidence_units: vec![EvidenceUnit {
+                id: evidence_id,
+                source_id: source_id.clone(),
+                kind: EvidenceKind::Ocr,
+                derived_from: None,
+                locator: SourceLocator::PdfOcr {
+                    page: 3,
+                    page_label: Some("iii".into()),
+                    line_index: 7,
+                    word_index: None,
+                    bbox: Some(BBox {
+                        x0: 10.0,
+                        y0: 20.0,
+                        x1: 120.0,
+                        y1: 36.0,
+                    }),
+                    ocr: Box::new(OcrLocatorMetadata {
+                        profile: OcrProfile {
+                            provider: "test".into(),
+                            engine: "fixture-ocr".into(),
+                            engine_version: Some("1.0".into()),
+                            language: "eng".into(),
+                            profile: "default".into(),
+                        },
+                        profile_hash: "ocr-profile-hash".into(),
+                        confidence: Some(0.91),
+                        text_hash: "ocr-text-hash".into(),
+                    }),
+                },
+                text: "ocrneedle scanned invoice total".into(),
+                text_hash: "ocr-text-hash".into(),
+                heading_path: vec!["OCR text".into()],
+                position: 3,
+            }],
+            provenance: RetrievalProvenance::seed(1, chunk_id, source_id),
+        }]
+    }
+
     fn sample_graphrag_report_results() -> Vec<RetrievalResult> {
         let source_id = SourceId("src".into());
         let report_id = EvidenceId("graphrag:report:community-test".into());
@@ -1400,6 +1474,27 @@ mod tests {
             .text
             .contains("image_artifact_metadata: image_id=img-1"));
         assert!(pack.text.contains("vision_attachment: not_included"));
+    }
+
+    #[test]
+    fn source_pack_distinguishes_ocr_text_from_generated_text() {
+        let pack = build_source_pack(&sample_ocr_results(), &GenerationContext::default(), false);
+
+        assert!(pack.text.contains("[E1 | ocr_text |"));
+        assert!(pack
+            .text
+            .contains("ocr_text:\nocrneedle scanned invoice total"));
+        assert!(pack.text.contains("OCR-derived source text"));
+        assert!(!pack.text.contains("generated_text:\n"));
+
+        let citations = extract_citations("The scan shows a total [E1].", &pack.evidence_refs);
+        let value = serde_json::to_value(verifier_source_inputs(&citations, &[])).unwrap();
+        assert_eq!(value[0]["kind"], "ocr_text");
+        assert_eq!(
+            value[0]["provenance"]["summary"],
+            "OCR-derived source text with structured locator"
+        );
+        assert_eq!(value[0]["visual_support"]["support_level"], "ocr_text");
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod graphrag;
 pub mod image_limits;
 pub mod index;
 pub mod ingest;
+pub mod ocr;
 pub mod parser;
 pub mod provider;
 pub mod retrieve;
