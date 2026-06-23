@@ -1,13 +1,11 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 
 use crate::image_limits::ImageArtifactLimits;
+use crate::parser::text_segments::pdf_page_evidence_units;
 use crate::traits::Parser;
-use crate::types::{
-    EvidenceId, EvidenceKind, EvidenceUnit, ParsedImageArtifact, SourceId, SourceLocator,
-};
+use crate::types::{EvidenceUnit, ParsedImageArtifact, SourceId};
 
 pub struct PdfPlumberParser;
 
@@ -37,31 +35,12 @@ impl Parser for PdfPlumberParser {
                 continue;
             }
 
-            let paragraphs = split_paragraphs(&text);
-            for (para_idx, para_text) in paragraphs.iter().enumerate() {
-                let trimmed = para_text.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let text_hash = hex_sha256(trimmed);
-                units.push(EvidenceUnit {
-                    id: EvidenceId(format!("{}:p{}:n{}", source_id.0, page_num, para_idx)),
-                    source_id: source_id.clone(),
-                    kind: EvidenceKind::Text,
-                    derived_from: None,
-                    locator: SourceLocator::Pdf {
-                        page: page_num,
-                        paragraph: para_idx as u32,
-                        bbox: None,
-                    },
-                    text: trimmed.to_string(),
-                    text_hash,
-                    heading_path: Vec::new(),
-                    position,
-                });
-                position += 1;
-            }
+            units.extend(pdf_page_evidence_units(
+                &source_id,
+                page_num,
+                &text,
+                &mut position,
+            ));
         }
 
         Ok(units)
@@ -74,19 +53,6 @@ impl Parser for PdfPlumberParser {
     ) -> Result<Vec<ParsedImageArtifact>> {
         crate::parser::bounded_pdf_images::extract_image_artifacts(path, limits)
     }
-}
-
-fn split_paragraphs(text: &str) -> Vec<String> {
-    text.split("\n\n")
-        .map(|s| s.replace('\n', " ").trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-fn hex_sha256(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 fn source_id_from_path(path: &Path) -> SourceId {
