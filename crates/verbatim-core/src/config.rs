@@ -610,6 +610,12 @@ pub struct OcrConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default = "default_ocr_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_ocr_max_stdout_bytes")]
+    pub max_stdout_bytes: usize,
+    #[serde(default = "default_ocr_max_stderr_bytes")]
+    pub max_stderr_bytes: usize,
 }
 
 impl Default for OcrConfig {
@@ -623,6 +629,9 @@ impl Default for OcrConfig {
             profile: default_ocr_profile(),
             command: String::new(),
             args: Vec::new(),
+            timeout_seconds: default_ocr_timeout_seconds(),
+            max_stdout_bytes: default_ocr_max_stdout_bytes(),
+            max_stderr_bytes: default_ocr_max_stderr_bytes(),
         }
     }
 }
@@ -653,6 +662,18 @@ fn default_ocr_language() -> String {
 
 fn default_ocr_profile() -> String {
     "default".into()
+}
+
+fn default_ocr_timeout_seconds() -> u64 {
+    120
+}
+
+fn default_ocr_max_stdout_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+fn default_ocr_max_stderr_bytes() -> usize {
+    64 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -901,6 +922,9 @@ language = "eng"
 profile = "default"
 command = ""
 args = []
+timeout_seconds = 120
+max_stdout_bytes = 4194304
+max_stderr_bytes = 65536
 
 [chat]
 enabled = true
@@ -1007,6 +1031,9 @@ mod tests {
         assert!(!config.ocr.enabled);
         assert_eq!(config.ocr.provider, "external_command");
         assert_eq!(config.ocr.language, "eng");
+        assert_eq!(config.ocr.timeout_seconds, 120);
+        assert_eq!(config.ocr.max_stdout_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.ocr.max_stderr_bytes, 64 * 1024);
         assert!(config.chat.enabled);
         assert_eq!(config.chat.base_url, "http://127.0.0.1:8000/v1");
         assert!(!config.chat.vision_attachments.enabled);
@@ -1077,6 +1104,9 @@ command = "fixture-ocr"
         assert_eq!(config.ocr.language, "eng");
         assert_eq!(config.ocr.profile, "default");
         assert_eq!(config.ocr.command, "fixture-ocr");
+        assert_eq!(config.ocr.timeout_seconds, 120);
+        assert_eq!(config.ocr.max_stdout_bytes, 4 * 1024 * 1024);
+        assert_eq!(config.ocr.max_stderr_bytes, 64 * 1024);
     }
 
     #[test]

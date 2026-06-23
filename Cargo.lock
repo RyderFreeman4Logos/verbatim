@@ -3512,6 +3512,7 @@ dependencies = [
  "futures",
  "image",
  "instant-distance",
+ "libc",
  "lopdf",
  "pdf_oxide",
  "pdfplumber",

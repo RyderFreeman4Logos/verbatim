@@ -13,6 +13,7 @@ qdrant = []
 [dependencies]
 anyhow.workspace = true
 base64 = "0.22"
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

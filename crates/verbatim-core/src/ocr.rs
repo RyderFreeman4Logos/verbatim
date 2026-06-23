@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::OcrConfig;
@@ -14,6 +18,8 @@ use crate::types::{
 };
 
 const MEANINGFUL_TEXT_MIN_CHARS: usize = 16;
+const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CHILD_TERMINATION_GRACE: Duration = Duration::from_millis(100);
 
 pub trait OcrProvider: Send + Sync {
     fn profile(&self) -> OcrProfile;
@@ -63,6 +69,9 @@ pub struct ExternalCommandOcrProvider {
     command: String,
     args: Vec<String>,
     profile: OcrProfile,
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
 }
 
 impl ExternalCommandOcrProvider {
@@ -70,10 +79,22 @@ impl ExternalCommandOcrProvider {
         if config.command.trim().is_empty() {
             bail!("OCR provider external_command requires [ocr].command");
         }
+        if config.timeout_seconds == 0 {
+            bail!("OCR provider external_command requires [ocr].timeout_seconds > 0");
+        }
+        if config.max_stdout_bytes == 0 {
+            bail!("OCR provider external_command requires [ocr].max_stdout_bytes > 0");
+        }
+        if config.max_stderr_bytes == 0 {
+            bail!("OCR provider external_command requires [ocr].max_stderr_bytes > 0");
+        }
         Ok(Self {
             command: config.command.clone(),
             args: config.args.clone(),
             profile: config.profile(),
+            timeout: Duration::from_secs(config.timeout_seconds),
+            max_stdout_bytes: config.max_stdout_bytes,
+            max_stderr_bytes: config.max_stderr_bytes,
         })
     }
 }
@@ -91,19 +112,14 @@ impl OcrProvider for ExternalCommandOcrProvider {
             profile: self.profile.clone(),
         };
         let input = serde_json::to_vec(&payload).context("serialize OCR command request")?;
-        let mut child = Command::new(&self.command)
-            .args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("spawn OCR command: {}", self.command))?;
-        if let Some(stdin) = &mut child.stdin {
-            stdin
-                .write_all(&input)
-                .context("write OCR command request")?;
-        }
-        let output = child.wait_with_output().context("wait for OCR command")?;
+        let output = run_external_ocr_command(
+            &self.command,
+            &self.args,
+            &input,
+            self.timeout,
+            self.max_stdout_bytes,
+            self.max_stderr_bytes,
+        )?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
@@ -114,6 +130,199 @@ impl OcrProvider for ExternalCommandOcrProvider {
         }
         serde_json::from_slice(&output.stdout).context("parse OCR command response")
     }
+}
+
+#[derive(Debug)]
+struct ExternalCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_external_ocr_command(
+    command_name: &str,
+    args: &[String],
+    input: &[u8],
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> Result<ExternalCommandOutput> {
+    let mut command = Command::new(command_name);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_ocr_command(&mut command);
+
+    let child = command
+        .spawn()
+        .with_context(|| format!("spawn OCR command: {command_name}"))?;
+    let mut child = GuardedChild::new(child);
+
+    let stdout = child
+        .child
+        .stdout
+        .take()
+        .context("open OCR command stdout")?;
+    let stderr = child
+        .child
+        .stderr
+        .take()
+        .context("open OCR command stderr")?;
+    let stdout_reader = spawn_limited_reader(stdout, max_stdout_bytes, "stdout");
+    let stderr_reader = spawn_limited_reader(stderr, max_stderr_bytes, "stderr");
+
+    let write_result = write_child_stdin(&mut child.child, input);
+    let status_result = match write_result {
+        Ok(()) => child.wait(timeout, command_name),
+        Err(error) => Err(error),
+    };
+    if status_result.is_err() {
+        child.kill_and_reap();
+    }
+
+    let stdout = join_limited_reader(stdout_reader, "stdout");
+    let stderr = join_limited_reader(stderr_reader, "stderr");
+    let status = status_result?;
+
+    Ok(ExternalCommandOutput {
+        status,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
+}
+
+#[cfg(unix)]
+fn configure_ocr_command(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_ocr_command(_command: &mut Command) {}
+
+fn write_child_stdin(child: &mut Child, input: &[u8]) -> Result<()> {
+    let mut stdin = child.stdin.take().context("open OCR command stdin")?;
+    stdin
+        .write_all(input)
+        .context("write OCR command request")?;
+    Ok(())
+}
+
+fn spawn_limited_reader<R>(
+    reader: R,
+    max_bytes: usize,
+    stream_name: &'static str,
+) -> JoinHandle<Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || read_limited(reader, max_bytes, stream_name))
+}
+
+fn read_limited<R>(mut reader: R, max_bytes: usize, stream_name: &str) -> Result<Vec<u8>>
+where
+    R: Read,
+{
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("read OCR command {stream_name}"))?;
+        if read == 0 {
+            return Ok(output);
+        }
+        if output.len().saturating_add(read) > max_bytes {
+            let remaining = max_bytes.saturating_sub(output.len());
+            output.extend_from_slice(&buffer[..remaining]);
+            bail!("OCR command {stream_name} exceeded {max_bytes} bytes");
+        }
+        output.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn join_limited_reader(handle: JoinHandle<Result<Vec<u8>>>, stream_name: &str) -> Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| anyhow!("OCR command {stream_name} reader panicked"))?
+}
+
+struct GuardedChild {
+    child: Child,
+    process_group_id: u32,
+    armed: bool,
+}
+
+impl GuardedChild {
+    fn new(child: Child) -> Self {
+        let process_group_id = child.id();
+        Self {
+            child,
+            process_group_id,
+            armed: true,
+        }
+    }
+
+    fn wait(&mut self, timeout: Duration, command_name: &str) -> Result<ExitStatus> {
+        let started_at = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().context("poll OCR command status")? {
+                self.armed = false;
+                return Ok(status);
+            }
+            if started_at.elapsed() >= timeout {
+                self.kill_and_reap();
+                bail!(
+                    "OCR command timed out after {}s: {command_name}",
+                    timeout.as_secs()
+                );
+            }
+            thread::sleep(CHILD_WAIT_POLL_INTERVAL);
+        }
+    }
+
+    fn kill_and_reap(&mut self) {
+        if !self.armed {
+            return;
+        }
+        terminate_child_process(&mut self.child, self.process_group_id);
+        let _ = self.child.wait();
+        self.armed = false;
+    }
+}
+
+impl Drop for GuardedChild {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
+#[cfg(unix)]
+fn terminate_child_process(child: &mut Child, process_group_id: u32) {
+    signal_process_group(process_group_id, libc::SIGTERM);
+    thread::sleep(CHILD_TERMINATION_GRACE);
+    signal_process_group(process_group_id, libc::SIGKILL);
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group_id: u32, signal: libc::c_int) {
+    let Ok(group_id) = i32::try_from(process_group_id) else {
+        return;
+    };
+    if group_id <= 0 {
+        return;
+    }
+    // SAFETY: group_id comes from the just-spawned child pid after placing that
+    // child in its own process group. Passing a negative pid_t to kill(2) sends
+    // the signal to that process group; ESRCH/EPERM are non-fatal cleanup cases.
+    let _ = unsafe { libc::kill(-(group_id as libc::pid_t), signal) };
+}
+
+#[cfg(not(unix))]
+fn terminate_child_process(child: &mut Child, _process_group_id: u32) {
+    let _ = child.kill();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,4 +572,93 @@ fn meaningful_char_count(text: &str) -> usize {
 struct PageAccumulator {
     text_char_count: usize,
     image_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn shell_config(script: &Path) -> OcrConfig {
+        OcrConfig {
+            enabled: true,
+            command: "sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            timeout_seconds: 2,
+            max_stdout_bytes: 1024,
+            max_stderr_bytes: 1024,
+            ..OcrConfig::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn request(pdf_path: PathBuf) -> OcrPageRequest {
+        OcrPageRequest {
+            source_id: SourceId("src-1".into()),
+            pdf_path,
+            page: 1,
+            page_label: Some("1".into()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_command_ocr_provider_parses_bounded_json_response() {
+        let tempdir = tempdir().unwrap();
+        let script = tempdir.path().join("fixture-ocr.sh");
+        fs::write(
+            &script,
+            "cat >/dev/null\nprintf '%s\\n' '{\"lines\":[{\"line_index\":1,\"text\":\"hello ocr\",\"confidence\":0.9}]}'\n",
+        )
+        .unwrap();
+        let provider = ExternalCommandOcrProvider::from_config(&shell_config(&script)).unwrap();
+
+        let output = provider
+            .recognize_page(&request(tempdir.path().join("source.pdf")))
+            .unwrap();
+
+        assert_eq!(output.lines.len(), 1);
+        assert_eq!(output.lines[0].text, "hello ocr");
+        assert_eq!(output.lines[0].confidence, Some(0.9));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_command_ocr_provider_rejects_oversized_stdout() {
+        let tempdir = tempdir().unwrap();
+        let script = tempdir.path().join("noisy-ocr.sh");
+        fs::write(&script, "cat >/dev/null\nprintf '%s' '0123456789abcdef'\n").unwrap();
+        let mut config = shell_config(&script);
+        config.max_stdout_bytes = 8;
+        let provider = ExternalCommandOcrProvider::from_config(&config).unwrap();
+
+        let error = provider
+            .recognize_page(&request(tempdir.path().join("source.pdf")))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("stdout exceeded 8 bytes"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_command_ocr_provider_times_out_and_reaps_child() {
+        let tempdir = tempdir().unwrap();
+        let script = tempdir.path().join("hung-ocr.sh");
+        fs::write(&script, "cat >/dev/null\nsleep 5\n").unwrap();
+        let mut config = shell_config(&script);
+        config.timeout_seconds = 1;
+        let provider = ExternalCommandOcrProvider::from_config(&config).unwrap();
+        let started_at = Instant::now();
+
+        let error = provider
+            .recognize_page(&request(tempdir.path().join("source.pdf")))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("timed out after 1s"), "{error}");
+        assert!(started_at.elapsed() < Duration::from_secs(3));
+    }
 }
