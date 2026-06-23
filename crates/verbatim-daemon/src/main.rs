@@ -37,6 +37,7 @@ use verbatim_core::generate::{
 use verbatim_core::graphrag::GraphRagService;
 use verbatim_core::ingest::IngestPipeline;
 use verbatim_core::provider::openai_compatible::OpenAiCompatibleReranker;
+use verbatim_core::provider::ProviderError;
 use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
 use verbatim_core::store::Store;
 use verbatim_core::task::{
@@ -48,6 +49,7 @@ use verbatim_core::types::{
     CitationRef, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug,
     RetrievalEvidenceRole, RetrievalResult, SourceId,
 };
+use verbatim_core::upstream::UpstreamFailureError;
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -509,6 +511,24 @@ async fn finish_task_failed(
     task_id: &TaskId,
     error_message: &str,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    finish_task_failed_with_upstream(state, task_id, error_message, None).await
+}
+
+async fn finish_task_failed_from_response(
+    state: &SharedState,
+    task_id: &TaskId,
+    error: &ErrorResponse,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    finish_task_failed_with_upstream(state, task_id, &error.error, error.upstream_failure.clone())
+        .await
+}
+
+async fn finish_task_failed_with_upstream(
+    state: &SharedState,
+    task_id: &TaskId,
+    error_message: &str,
+    upstream_failure: Option<serde_json::Value>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let state_for_task = Arc::clone(state);
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
@@ -519,17 +539,18 @@ async fn finish_task_failed(
             .lock()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let task = store.get_task(&task_id)?;
+        let upstream_failure = upstream_failure
+            .map(|failure| upstream_failure_with_task_context(failure, &task_id, task.as_ref()));
         let should_wake_ingest_queue = task
             .as_ref()
             .is_some_and(|task| task.kind == TaskKind::Ingest);
         let task_changed = store.finish_task_failed(&task_id, &error_message)?;
         if task_changed {
-            store.insert_task_event(
-                &task_id,
-                "failed",
-                "task failed",
-                &serde_json::json!({ "error": error_message }),
-            )?;
+            let mut payload = serde_json::json!({ "error": error_message });
+            if let Some(upstream_failure) = upstream_failure {
+                payload["upstream_failure"] = upstream_failure;
+            }
+            store.insert_task_event(&task_id, "failed", "task failed", &payload)?;
         }
         Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
     })
@@ -540,6 +561,42 @@ async fn finish_task_failed(
         schedule_ingest_queue(state_for_queue);
     }
     Ok(())
+}
+
+fn upstream_failure_with_task_context(
+    mut upstream_failure: serde_json::Value,
+    task_id: &TaskId,
+    task: Option<&verbatim_core::task::TaskSummary>,
+) -> serde_json::Value {
+    let Some(map) = upstream_failure.as_object_mut() else {
+        return upstream_failure;
+    };
+    map.insert(
+        "task_id".into(),
+        serde_json::Value::String(task_id.0.clone()),
+    );
+    if let Some(task) = task {
+        map.insert(
+            "task_kind".into(),
+            serde_json::Value::String(task.kind.as_str().into()),
+        );
+        copy_task_request_field(map, &task.request, "source_id");
+        copy_task_request_field(map, &task.request, "embedding_profile_id");
+    }
+    upstream_failure
+}
+
+fn copy_task_request_field(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    request: &serde_json::Value,
+    field: &'static str,
+) {
+    if map.contains_key(field) {
+        return;
+    }
+    if let Some(value) = request.get(field) {
+        map.insert(field.into(), value.clone());
+    }
 }
 
 async fn task_summary_response(
@@ -676,7 +733,12 @@ async fn ask(
     let task_id = create_persisted_task(
         &state,
         TaskKind::Ask,
-        ask_request_metadata(&req.question, req.source_id.as_deref(), req.show_retrieval),
+        ask_request_metadata(
+            &req.question,
+            req.source_id.as_deref(),
+            req.embedding_profile_id.as_deref(),
+            req.show_retrieval,
+        ),
     )
     .await?;
     execute_ask_task(state, task_id, req).await.map(Json)
@@ -690,7 +752,12 @@ async fn ask_stream(
     match create_persisted_task(
         &state,
         TaskKind::Ask,
-        ask_request_metadata(&req.question, req.source_id.as_deref(), req.show_retrieval),
+        ask_request_metadata(
+            &req.question,
+            req.source_id.as_deref(),
+            req.embedding_profile_id.as_deref(),
+            req.show_retrieval,
+        ),
     )
     .await
     {
@@ -720,7 +787,12 @@ async fn submit_ask_task(
     let task_id = create_persisted_task(
         &state,
         TaskKind::Ask,
-        ask_request_metadata(&req.question, req.source_id.as_deref(), req.show_retrieval),
+        ask_request_metadata(
+            &req.question,
+            req.source_id.as_deref(),
+            req.embedding_profile_id.as_deref(),
+            req.show_retrieval,
+        ),
     )
     .await?;
     spawn_ask_task(state, task_id.clone(), req);
@@ -739,6 +811,7 @@ async fn retrieve(
         retrieve_request_metadata(
             &req.question,
             req.source_id.as_deref(),
+            req.embedding_profile_id.as_deref(),
             controls.limit,
             controls.page_size,
             controls.page,
@@ -864,7 +937,7 @@ async fn execute_ask_task(
 ) -> Result<AskResponse, (StatusCode, Json<ErrorResponse>)> {
     let result = execute_ask_task_inner(Arc::clone(&state), &task_id, req).await;
     if let Err((_, Json(error))) = &result {
-        let _ = finish_task_failed(&state, &task_id, &error.error).await;
+        let _ = finish_task_failed_from_response(&state, &task_id, error).await;
     }
     result
 }
@@ -877,7 +950,7 @@ async fn execute_retrieve_task(
 ) -> Result<RetrieveResponse, (StatusCode, Json<ErrorResponse>)> {
     let result = execute_retrieve_task_inner(Arc::clone(&state), &task_id, req, controls).await;
     if let Err((_, Json(error))) = &result {
-        let _ = finish_task_failed(&state, &task_id, &error.error).await;
+        let _ = finish_task_failed_from_response(&state, &task_id, error).await;
     }
     result
 }
@@ -1055,7 +1128,7 @@ async fn execute_ask_stream_task(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let result = execute_ask_stream_task_inner(Arc::clone(&state), &task_id, req, tx).await;
     if let Err((_, Json(error))) = &result {
-        let _ = finish_task_failed(&state, &task_id, &error.error).await;
+        let _ = finish_task_failed_from_response(&state, &task_id, error).await;
     }
     result
 }
@@ -1300,7 +1373,7 @@ async fn drain_ingest_queue(state: SharedState) {
         )
         .await;
         if let Err((_, Json(error))) = &result {
-            let _ = finish_task_failed(&state, &task_id, &error.error).await;
+            let _ = finish_task_failed_from_response(&state, &task_id, error).await;
         }
     }
 }
@@ -1430,7 +1503,7 @@ async fn execute_ingest_task(
     }
     .await;
     if let Err((_, Json(error))) = &result {
-        let _ = finish_task_failed(&state, &task_id, &error.error).await;
+        let _ = finish_task_failed_from_response(&state, &task_id, error).await;
     }
     result
 }
@@ -2133,12 +2206,33 @@ fn sse_error_event(status: StatusCode, error: String) -> Event {
 // ---------------------------------------------------------------------------
 
 fn err(status: StatusCode, e: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    let upstream_failure = upstream_failure_value(&e);
+    if let Some(upstream_failure) = &upstream_failure {
+        tracing::warn!(
+            upstream_failure = %upstream_failure,
+            "upstream request failure diagnostic recorded"
+        );
+    }
     (
         status,
         Json(ErrorResponse {
             error: format!("{e:#}"),
+            upstream_failure,
         }),
     )
+}
+
+fn upstream_failure_value(error: &anyhow::Error) -> Option<serde_json::Value> {
+    let diagnostic = error.chain().find_map(|cause| {
+        if let Some(provider_error) = cause.downcast_ref::<ProviderError>() {
+            return provider_error.diagnostic();
+        }
+        if let Some(upstream_error) = cause.downcast_ref::<UpstreamFailureError>() {
+            return Some(upstream_error.diagnostic());
+        }
+        None
+    })?;
+    serde_json::to_value(diagnostic).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -2304,6 +2398,80 @@ mod tests {
 
         assert!(!handled);
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn err_response_includes_upstream_failure_diagnostic() {
+        let body = r#"{"error":"bad","token":"fixture-token","api_key":"fixture-api-key"}"#;
+        let diagnostic = verbatim_core::upstream::UpstreamFailureDiagnostic {
+            phase: "chat".into(),
+            client_kind: "chat".into(),
+            provider: Some("openai_compatible".into()),
+            model: Some("fixture-model".into()),
+            base_url_host: Some("example.test".into()),
+            http_method: "POST".into(),
+            endpoint_path: "/v1/chat/completions".into(),
+            status_code: Some(502),
+            response_content_type: Some("application/json".into()),
+            response_body_available: true,
+            response_body_prefix: Some(verbatim_core::upstream::sanitize_text(body)),
+            response_body_truncated: false,
+            response_body_bytes: Some(body.len() as u64),
+            transport_error_kind: Some("http_status_502".into()),
+            request_duration_ms: Some(12),
+            retry_count: None,
+            upstream_request_id: Some("req-fixture".into()),
+        };
+        let (_, Json(response)) = err(
+            StatusCode::BAD_GATEWAY,
+            verbatim_core::upstream::UpstreamFailureError::new("chat failed", diagnostic).into(),
+        );
+
+        let encoded = serde_json::to_string(&response).unwrap();
+        let upstream = response
+            .upstream_failure
+            .expect("upstream diagnostic is attached");
+        assert_eq!(upstream["client_kind"], "chat");
+        assert_eq!(upstream["endpoint_path"], "/v1/chat/completions");
+        let prefix = upstream["response_body_prefix"].as_str().unwrap();
+        let prefix: serde_json::Value = serde_json::from_str(prefix).unwrap();
+        assert_eq!(prefix["token"], "<redacted>");
+        assert_eq!(prefix["api_key"], "<redacted>");
+        assert!(!encoded.contains("fixture-token"));
+        assert!(!encoded.contains("fixture-api-key"));
+    }
+
+    #[test]
+    fn upstream_failure_context_adds_task_request_fields() {
+        let task_id = TaskId("task-fixture".into());
+        let task = verbatim_core::task::TaskSummary {
+            id: task_id.clone(),
+            kind: TaskKind::Ask,
+            status: TaskStatus::Running,
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            started_at: Some("1".into()),
+            finished_at: None,
+            request: serde_json::json!({
+                "source_id": "src-fixture",
+                "embedding_profile_id": "profile-fixture",
+            }),
+            result: None,
+            error: None,
+            queue_position: None,
+            blocking_reason: None,
+        };
+
+        let enriched = upstream_failure_with_task_context(
+            serde_json::json!({"client_kind": "embedding"}),
+            &task_id,
+            Some(&task),
+        );
+
+        assert_eq!(enriched["task_id"], "task-fixture");
+        assert_eq!(enriched["task_kind"], "ask");
+        assert_eq!(enriched["source_id"], "src-fixture");
+        assert_eq!(enriched["embedding_profile_id"], "profile-fixture");
     }
 
     #[test]

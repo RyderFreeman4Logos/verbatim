@@ -6,10 +6,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
-use reqwest::{Client, RequestBuilder, StatusCode};
+use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ChatConfig, EmbeddingConfig, RerankConfig, VisionConfig};
+use crate::upstream::{
+    capture_full_response, capture_response_prefix, sanitize_text, UpstreamRequestContext,
+    DEFAULT_BODY_PREFIX_MAX_BYTES,
+};
 
 use super::{
     ChatContentPart, ChatMessage, ChatModel, ChatRequest, ChatResponse, ChatStream,
@@ -23,7 +27,6 @@ const EMBEDDINGS_PATH: &str = "embeddings";
 const RERANK_PATH: &str = "rerank";
 const RERANK_V1_PATH: &str = "v1/rerank";
 const RERANK_V2_PATH: &str = "v2/rerank";
-const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 4096;
 
 /// OpenAI-compatible chat completion adapter.
 #[derive(Clone, Debug)]
@@ -133,7 +136,7 @@ impl OpenAiCompatibleEmbeddingModel {
 
             let response: OpenAiEmbeddingResponse = self
                 .endpoint
-                .post_json(EMBEDDINGS_PATH, &body, "embedding")
+                .post_json(EMBEDDINGS_PATH, &body, "embedding", "embedding")
                 .await?;
 
             if response.data.len() != batch.len() {
@@ -203,42 +206,65 @@ impl OpenAiCompatibleReranker {
 #[async_trait]
 impl ChatModel for OpenAiCompatibleChatModel {
     async fn chat(&self, req: ChatRequest) -> ProviderResult<ChatResponse> {
+        self.chat_with_operation(req, "chat", "chat").await
+    }
+
+    async fn stream_chat(&self, req: ChatRequest) -> ProviderResult<ChatStream> {
+        self.stream_chat_with_operation(req, "streaming chat", "chat")
+            .await
+    }
+}
+
+impl OpenAiCompatibleChatModel {
+    async fn chat_with_operation(
+        &self,
+        req: ChatRequest,
+        operation: &'static str,
+        client_kind: &'static str,
+    ) -> ProviderResult<ChatResponse> {
         let body = self.chat_body(req, false);
         let response: OpenAiChatResponse = self
             .endpoint
-            .post_json(CHAT_COMPLETIONS_PATH, &body, "chat")
+            .post_json(CHAT_COMPLETIONS_PATH, &body, operation, client_kind)
             .await?;
         chat_response_from_openai(response)
     }
 
-    async fn stream_chat(&self, req: ChatRequest) -> ProviderResult<ChatStream> {
+    async fn stream_chat_with_operation(
+        &self,
+        req: ChatRequest,
+        operation: &'static str,
+        client_kind: &'static str,
+    ) -> ProviderResult<ChatStream> {
         let body = self.chat_body(req, true);
-        let response = self
+        let (response, context) = self
             .endpoint
-            .post(CHAT_COMPLETIONS_PATH, &body, "streaming chat")
+            .post(CHAT_COMPLETIONS_PATH, &body, operation, client_kind)
             .await?;
 
         let status = response.status();
         if !status.is_success() {
-            return Err(http_status_error("streaming chat", status, response).await);
+            return Err(http_status_error(operation, &context, status, response).await);
         }
 
         let chunks = response
             .bytes_stream()
-            .map(|result| match result {
+            .map(move |result| match result {
                 Ok(bytes) => Ok(bytes.to_vec()),
-                Err(source) => Err(ProviderError::Transport {
-                    operation: "streaming chat",
-                    source,
-                }),
+                Err(source) => {
+                    let diagnostic = context.transport_failure(&source);
+                    Err(ProviderError::Transport {
+                        operation,
+                        source,
+                        diagnostic: Box::new(diagnostic),
+                    })
+                }
             })
             .boxed();
 
         Ok(sse_chat_stream(chunks))
     }
-}
 
-impl OpenAiCompatibleChatModel {
     fn chat_body(&self, req: ChatRequest, stream: bool) -> OpenAiChatRequest {
         OpenAiChatRequest {
             model: self.endpoint.model.clone(),
@@ -270,7 +296,10 @@ impl VisionModel for OpenAiCompatibleVisionModel {
 
         let mut chat_req = ChatRequest::new(vec![message]);
         chat_req.max_tokens = req.max_tokens;
-        let response = self.chat.chat(chat_req).await?;
+        let response = self
+            .chat
+            .chat_with_operation(chat_req, "vision", "vision")
+            .await?;
         Ok(ImageDescription {
             text: response.content,
         })
@@ -315,7 +344,7 @@ impl ProviderReranker for OpenAiCompatibleReranker {
         let paths = self.provider.rerank_paths(&self.endpoint.base_url);
         let response: OpenAiRerankResponse = self
             .endpoint
-            .post_json_paths(&paths, &body, "rerank")
+            .post_json_paths(&paths, &body, "rerank", "rerank")
             .await?;
         let results = response.into_hits();
         if results.is_empty() && !body.documents.is_empty() {
@@ -400,16 +429,14 @@ impl OpenAiEndpoint {
         path: &str,
         body: &B,
         operation: &'static str,
+        client_kind: &'static str,
     ) -> ProviderResult<T> {
-        let response = self.post(path, body, operation).await?;
+        let (response, context) = self.post(path, body, operation, client_kind).await?;
         let status = response.status();
         if !status.is_success() {
-            return Err(http_status_error(operation, status, response).await);
+            return Err(http_status_error(operation, &context, status, response).await);
         }
-        response
-            .json::<T>()
-            .await
-            .map_err(|source| ProviderError::ResponseDecode { operation, source })
+        decode_json_response(response, operation, &context).await
     }
 
     async fn post_json_paths<T: serde::de::DeserializeOwned, B: Serialize + ?Sized>(
@@ -417,10 +444,11 @@ impl OpenAiEndpoint {
         paths: &[&str],
         body: &B,
         operation: &'static str,
+        client_kind: &'static str,
     ) -> ProviderResult<T> {
         let mut last_variant_error = None;
         for (idx, path) in paths.iter().enumerate() {
-            match self.post_json(path, body, operation).await {
+            match self.post_json(path, body, operation, client_kind).await {
                 Ok(value) => return Ok(value),
                 Err(error @ ProviderError::HttpStatus { status, .. })
                     if idx + 1 < paths.len()
@@ -444,7 +472,8 @@ impl OpenAiEndpoint {
         path: &str,
         body: &B,
         operation: &'static str,
-    ) -> ProviderResult<reqwest::Response> {
+        client_kind: &'static str,
+    ) -> ProviderResult<(reqwest::Response, UpstreamRequestContext)> {
         if self.base_url.is_empty() {
             return Err(ProviderError::configuration(operation, "base_url is empty"));
         }
@@ -453,10 +482,26 @@ impl OpenAiEndpoint {
         }
 
         let url = format!("{}/{}", self.base_url, path);
+        let context = UpstreamRequestContext::new(
+            operation,
+            client_kind,
+            Some("openai_compatible".into()),
+            Some(self.model.clone()),
+            &Method::POST,
+            &url,
+        );
         self.auth(self.client.post(url).timeout(self.timeout).json(body))
             .send()
             .await
-            .map_err(|source| ProviderError::Transport { operation, source })
+            .map(|response| (response, context.clone()))
+            .map_err(|source| {
+                let diagnostic = context.transport_failure(&source);
+                ProviderError::Transport {
+                    operation,
+                    source,
+                    diagnostic: Box::new(diagnostic),
+                }
+            })
     }
 
     fn auth(&self, req: RequestBuilder) -> RequestBuilder {
@@ -596,33 +641,46 @@ fn normalize_vector(vector: &mut [f32]) {
 
 async fn http_status_error(
     operation: &'static str,
+    context: &UpstreamRequestContext,
     status: StatusCode,
     response: reqwest::Response,
 ) -> ProviderError {
-    let body = bounded_response_text(response, MAX_PROVIDER_ERROR_BODY_BYTES).await;
+    let captured = capture_response_prefix(response, DEFAULT_BODY_PREFIX_MAX_BYTES).await;
+    let body = String::from_utf8_lossy(&captured.body);
     let message = openai_error_message(&body)
         .unwrap_or_else(|| "provider returned a non-success response".to_string());
+    let diagnostic = captured.diagnostic_for_status(context);
     ProviderError::HttpStatus {
         operation,
         status,
         message,
+        diagnostic: Box::new(diagnostic),
     }
 }
 
-async fn bounded_response_text(mut response: reqwest::Response, max_bytes: usize) -> String {
-    let mut body = Vec::new();
-    while body.len() < max_bytes {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) | Err(_) => break,
-        };
-        let remaining = max_bytes - body.len();
-        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-        if chunk.len() > remaining {
-            break;
+async fn decode_json_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &'static str,
+    context: &UpstreamRequestContext,
+) -> ProviderResult<T> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let captured = capture_full_response(response).await.map_err(|source| {
+        let diagnostic = context.body_read_failure(Some(status), &headers, &source);
+        ProviderError::Transport {
+            operation,
+            source,
+            diagnostic: Box::new(diagnostic),
         }
-    }
-    String::from_utf8_lossy(&body).into_owned()
+    })?;
+    serde_json::from_slice::<T>(&captured.body).map_err(|source| {
+        let diagnostic = captured.diagnostic_for_decode(context, &source);
+        ProviderError::ResponseDecode {
+            operation,
+            source,
+            diagnostic: Box::new(diagnostic),
+        }
+    })
 }
 
 fn openai_error_message(body: &str) -> Option<String> {
@@ -632,7 +690,7 @@ fn openai_error_message(body: &str) -> Option<String> {
         .get("message")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("provider error");
-    Some(truncate_message(raw_message, 240))
+    Some(truncate_message(&sanitize_text(raw_message), 240))
 }
 
 fn truncate_message(message: &str, max_chars: usize) -> String {
@@ -824,12 +882,20 @@ mod tests {
         status: &'static str,
         response_body: &'static str,
     ) -> (String, thread::JoinHandle<RecordedRequest>) {
+        spawn_response_server(status, "application/json", response_body)
+    }
+
+    fn spawn_response_server(
+        status: &'static str,
+        content_type: &'static str,
+        response_body: &'static str,
+    ) -> (String, thread::JoinHandle<RecordedRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
             let request = read_http_request(&mut stream);
-            write_http_response(&mut stream, status, response_body);
+            write_http_response(&mut stream, status, content_type, response_body);
             request
         });
         (base_url, handle)
@@ -879,9 +945,9 @@ mod tests {
         buffer.windows(4).position(|window| window == b"\r\n\r\n")
     }
 
-    fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) {
+    fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
         let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nX-Request-Id: req-fixture-1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream
@@ -1097,6 +1163,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_invalid_json_error_includes_sanitized_response_diagnostic() {
+        let body = concat!(
+            "Authorization: Bearer fixturebearertoken\n",
+            "not json token=fixture12345 ",
+            "OPENAI_API_KEY=providerfixture12345 ",
+            "https://user:pass@example.test/path?token=fixture12345"
+        );
+        let (base_url, handle) = spawn_response_server("200 OK", "text/html", body);
+        let model = OpenAiCompatibleChatModel {
+            endpoint: OpenAiEndpoint::new(&base_url, "chat-model", "", 5),
+            temperature: 0.2,
+        };
+
+        let error = model
+            .chat(ChatRequest::new(vec![ChatMessage::user("question")]))
+            .await
+            .expect_err("invalid json response fails");
+        let request = handle.join().expect("server thread joins");
+
+        assert_eq!(request.path, "/chat/completions");
+        let ProviderError::ResponseDecode { diagnostic, .. } = error else {
+            panic!("expected response decode error");
+        };
+        assert_eq!(diagnostic.client_kind, "chat");
+        assert_eq!(diagnostic.phase, "chat");
+        assert_eq!(diagnostic.status_code, Some(200));
+        assert_eq!(
+            diagnostic.response_content_type.as_deref(),
+            Some("text/html")
+        );
+        assert_eq!(diagnostic.response_body_bytes, Some(body.len() as u64));
+        assert_eq!(
+            diagnostic.upstream_request_id.as_deref(),
+            Some("req-fixture-1")
+        );
+        let prefix = diagnostic
+            .response_body_prefix
+            .as_deref()
+            .expect("body prefix recorded");
+        assert!(prefix.contains("Authorization: <redacted>"));
+        assert_diagnostic_has_no_fixture_secrets(&diagnostic);
+    }
+
+    #[tokio::test]
+    async fn chat_empty_json_error_records_empty_body_metadata() {
+        let (base_url, handle) = spawn_response_server("200 OK", "application/json", "");
+        let model = OpenAiCompatibleChatModel {
+            endpoint: OpenAiEndpoint::new(&base_url, "chat-model", "", 5),
+            temperature: 0.2,
+        };
+
+        let error = model
+            .chat(ChatRequest::new(vec![ChatMessage::user("question")]))
+            .await
+            .expect_err("empty json response fails");
+        let _request = handle.join().expect("server thread joins");
+
+        let ProviderError::ResponseDecode { diagnostic, .. } = error else {
+            panic!("expected response decode error");
+        };
+        assert_eq!(diagnostic.status_code, Some(200));
+        assert_eq!(diagnostic.response_body_bytes, Some(0));
+        assert_eq!(diagnostic.response_body_prefix.as_deref(), Some(""));
+        assert_eq!(diagnostic.transport_error_kind.as_deref(), Some("eof"));
+        assert!(diagnostic.response_body_available);
+    }
+
+    #[tokio::test]
+    async fn embedding_invalid_json_error_includes_embedding_diagnostic() {
+        let (base_url, handle) = spawn_json_server("200 OK", "not-json");
+        let model = OpenAiCompatibleEmbeddingModel {
+            endpoint: OpenAiEndpoint::new(&base_url, "embedding-model", "", 5),
+            dimension: 3,
+            normalize: false,
+            batch_size: 16,
+            query_instruction: String::new(),
+            document_instruction: String::new(),
+        };
+
+        let error = model
+            .embed(vec!["document".into()], EmbeddingPurpose::Document)
+            .await
+            .expect_err("invalid embedding json fails");
+        let request = handle.join().expect("server thread joins");
+
+        assert_eq!(request.path, "/embeddings");
+        let ProviderError::ResponseDecode { diagnostic, .. } = error else {
+            panic!("expected response decode error");
+        };
+        assert_eq!(diagnostic.client_kind, "embedding");
+        assert_eq!(diagnostic.phase, "embedding");
+        assert_eq!(diagnostic.model.as_deref(), Some("embedding-model"));
+        assert_eq!(diagnostic.status_code, Some(200));
+        assert_eq!(diagnostic.response_body_prefix.as_deref(), Some("not-json"));
+    }
+
+    #[tokio::test]
+    async fn rerank_invalid_json_error_includes_rerank_diagnostic() {
+        let (base_url, handle) = spawn_json_server("200 OK", "not-json");
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "rerank-model".into(),
+            top_n: 1,
+            timeout_seconds: 5,
+            api_key: String::new(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+
+        let error = ProviderReranker::rerank(&reranker, "query", vec![RerankDoc::new("doc")], 1)
+            .await
+            .expect_err("invalid rerank json fails");
+        let request = handle.join().expect("server thread joins");
+
+        assert_eq!(request.path, "/v1/rerank");
+        let ProviderError::ResponseDecode { diagnostic, .. } = error else {
+            panic!("expected response decode error");
+        };
+        assert_eq!(diagnostic.client_kind, "rerank");
+        assert_eq!(diagnostic.phase, "rerank");
+        assert_eq!(diagnostic.model.as_deref(), Some("rerank-model"));
+        assert_eq!(diagnostic.endpoint_path, "/v1/rerank");
+        assert_eq!(diagnostic.status_code, Some(200));
+    }
+
+    #[tokio::test]
     async fn parses_streaming_chat_chunks() {
         let chunks = stream::iter(vec![
             Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n".to_vec()),
@@ -1163,6 +1356,13 @@ mod tests {
         let json = r#"{"error":{"message":"model not found","type":"invalid_request"}}"#;
         assert_eq!(openai_error_message(json), Some("model not found".into()));
         assert_eq!(openai_error_message("raw stack trace"), None);
+
+        let json =
+            r#"{"error":{"message":"OPENAI_API_KEY=providerfixture12345 token=fixture12345"}}"#;
+        let message = openai_error_message(json).expect("message parsed");
+        assert!(!message.contains("providerfixture12345"));
+        assert!(!message.contains("fixture12345"));
+        assert!(message.contains("<redacted>"));
     }
 
     #[test]
@@ -1170,5 +1370,16 @@ mod tests {
         let value = serde_json::to_value(ChatMessageContent::Text("hello".into()))
             .expect("serialize content");
         assert_eq!(value, serde_json::Value::String("hello".into()));
+    }
+
+    fn assert_diagnostic_has_no_fixture_secrets(
+        diagnostic: &crate::upstream::UpstreamFailureDiagnostic,
+    ) {
+        let encoded = serde_json::to_string(diagnostic).expect("serialize diagnostic");
+        assert!(!encoded.contains("fixturebearertoken"));
+        assert!(!encoded.contains("fixture12345"));
+        assert!(!encoded.contains("providerfixture12345"));
+        assert!(!encoded.contains("user:pass"));
+        assert!(encoded.contains("<redacted>"));
     }
 }

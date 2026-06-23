@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -13,9 +13,12 @@ use crate::config::QdrantConfig;
 use crate::store::Store;
 use crate::traits::VectorDocument;
 use crate::types::{Chunk, ChunkId, EmbeddingProfileId, SourceId};
+use crate::upstream::{
+    capture_full_response, capture_response_prefix, UpstreamFailureError, UpstreamRequestContext,
+    DEFAULT_BODY_PREFIX_MAX_BYTES,
+};
 
 const DISTANCE: &str = "Cosine";
-const MAX_QDRANT_ERROR_BODY_BYTES: u64 = 4096;
 const MAX_QDRANT_TEXT_PREVIEW_CHARS: usize = 240;
 
 /// One vector plus the Qdrant payload fields needed for remote search.
@@ -206,7 +209,7 @@ impl QdrantClient {
                 "check qdrant collection",
             )
             .await?;
-        if response.status() == StatusCode::NOT_FOUND {
+        if response.response.status() == StatusCode::NOT_FOUND {
             return Ok(false);
         }
         self.decode_response::<QdrantEnvelope<Value>>(response, "check qdrant collection")
@@ -263,13 +266,16 @@ impl QdrantClient {
         T: DeserializeOwned,
         B: Serialize + ?Sized,
     {
-        let response = self
-            .request(method, path, operation)?
+        let request = self.request(method, path, operation)?;
+        let context = request.context.clone();
+        let response = request
+            .builder
             .json(body)
             .send()
             .await
-            .with_context(|| format!("{operation}: request failed"))?;
-        self.decode_response(response, operation).await
+            .map_err(|source| qdrant_transport_error(operation, &context, source))?;
+        self.decode_response(QdrantRawResponse { response, context }, operation)
+            .await
     }
 
     async fn send_without_body(
@@ -277,43 +283,67 @@ impl QdrantClient {
         method: Method,
         path: &str,
         operation: &str,
-    ) -> Result<Response> {
-        self.request(method, path, operation)?
+    ) -> Result<QdrantRawResponse> {
+        let request = self.request(method, path, operation)?;
+        let context = request.context.clone();
+        let response = request
+            .builder
             .send()
             .await
-            .with_context(|| format!("{operation}: request failed"))
+            .map_err(|source| qdrant_transport_error(operation, &context, source))?;
+        Ok(QdrantRawResponse { response, context })
     }
 
-    fn request(
-        &self,
-        method: Method,
-        path: &str,
-        operation: &str,
-    ) -> Result<reqwest::RequestBuilder> {
+    fn request(&self, method: Method, path: &str, operation: &str) -> Result<QdrantRequest> {
         let base_url = self.config.url.trim_end_matches('/');
         if base_url.is_empty() {
             bail!("{operation}: qdrant url is empty");
         }
         let url = format!("{base_url}/{path}");
-        Ok(self
+        let context = UpstreamRequestContext::new(
+            operation,
+            "qdrant",
+            Some("qdrant".into()),
+            None,
+            &method,
+            &url,
+        );
+        let builder = self
             .client
             .request(method, url)
-            .timeout(Duration::from_secs(self.config.timeout_seconds.max(1))))
+            .timeout(Duration::from_secs(self.config.timeout_seconds.max(1)));
+        Ok(QdrantRequest { builder, context })
     }
 
-    async fn decode_response<T>(&self, response: Response, operation: &str) -> Result<T>
+    async fn decode_response<T>(&self, raw: QdrantRawResponse, operation: &str) -> Result<T>
     where
         T: DeserializeOwned,
     {
-        let status = response.status();
+        let status = raw.response.status();
         if !status.is_success() {
-            let body = bounded_response_text(response).await;
-            bail!("{operation}: qdrant returned {status}: {body}");
+            let captured =
+                capture_response_prefix(raw.response, DEFAULT_BODY_PREFIX_MAX_BYTES).await;
+            let diagnostic = captured.diagnostic_for_status(&raw.context);
+            let message = format!("{operation}: qdrant returned {status}");
+            return Err(UpstreamFailureError::new(message, diagnostic).into());
         }
-        response
-            .json::<T>()
+        let headers = raw.response.headers().clone();
+        let captured = capture_full_response(raw.response)
             .await
-            .with_context(|| format!("{operation}: decode qdrant response"))
+            .map_err(|source| {
+                let diagnostic = raw
+                    .context
+                    .body_read_failure(Some(status), &headers, &source);
+                UpstreamFailureError::new(
+                    format!("{operation}: read qdrant response body"),
+                    diagnostic,
+                )
+            })?;
+        serde_json::from_slice::<T>(&captured.body).map_err(|source| {
+            let diagnostic = captured.diagnostic_for_decode(&raw.context, &source);
+            UpstreamFailureError::new(format!("{operation}: decode qdrant response"), diagnostic)
+                .into()
+        })
     }
 
     fn collection_path(&self, suffix: &str) -> String {
@@ -324,6 +354,16 @@ impl QdrantClient {
             format!("collections/{encoded}/{}", suffix.trim_start_matches('/'))
         }
     }
+}
+
+struct QdrantRequest {
+    builder: reqwest::RequestBuilder,
+    context: UpstreamRequestContext,
+}
+
+struct QdrantRawResponse {
+    response: Response,
+    context: UpstreamRequestContext,
 }
 
 #[derive(Debug, Serialize)]
@@ -507,19 +547,13 @@ fn point_id_for_profile_chunk(profile_id: &EmbeddingProfileId, chunk_id: &ChunkI
     )
 }
 
-async fn bounded_response_text(mut response: Response) -> String {
-    let mut body = String::new();
-    while (body.len() as u64) < MAX_QDRANT_ERROR_BODY_BYTES {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) | Err(_) => break,
-        };
-        let remaining = (MAX_QDRANT_ERROR_BODY_BYTES as usize).saturating_sub(body.len());
-        body.push_str(&String::from_utf8_lossy(
-            &chunk[..chunk.len().min(remaining)],
-        ));
-    }
-    body
+fn qdrant_transport_error(
+    operation: &str,
+    context: &UpstreamRequestContext,
+    source: reqwest::Error,
+) -> anyhow::Error {
+    let diagnostic = context.transport_failure(&source);
+    UpstreamFailureError::new(format!("{operation}: request failed"), diagnostic).into()
 }
 
 #[cfg(test)]
@@ -716,6 +750,66 @@ mod tests {
         assert_eq!(body["filter"]["must"][1]["match"]["value"], "src-1");
         assert_eq!(body["with_payload"][0], "chunk_id");
         assert_eq!(body["with_vector"], false);
+    }
+
+    #[tokio::test]
+    async fn search_invalid_json_error_exposes_upstream_diagnostic() {
+        let (url, handle) = spawn_server(vec![(200, "not-json")]);
+        let client = QdrantClient::new(qdrant_config(url));
+
+        let error = client
+            .search(&EmbeddingProfileId::default_profile(), &[0.3, 0.4], 7, None)
+            .await
+            .expect_err("invalid qdrant json fails");
+        let _requests = handle.join().unwrap();
+
+        let diagnostic = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<UpstreamFailureError>())
+            .expect("upstream failure in error chain")
+            .diagnostic();
+        assert_eq!(diagnostic.client_kind, "qdrant");
+        assert_eq!(diagnostic.status_code, Some(200));
+        assert_eq!(
+            diagnostic.endpoint_path,
+            "/collections/verbatim/points/search"
+        );
+        assert_eq!(diagnostic.response_body_prefix.as_deref(), Some("not-json"));
+        assert_eq!(
+            diagnostic.transport_error_kind.as_deref(),
+            Some("invalid_json")
+        );
+    }
+
+    #[tokio::test]
+    async fn search_http_status_diagnostic_redacts_qdrant_body() {
+        let body = concat!(
+            "Authorization: Bearer fixturebearertoken\n",
+            "token=fixture12345 ",
+            "OPENAI_API_KEY=providerfixture12345 ",
+            "https://user:pass@example.test/path?token=fixture12345"
+        );
+        let (url, handle) = spawn_server(vec![(502, body)]);
+        let client = QdrantClient::new(qdrant_config(url));
+
+        let error = client
+            .search(&EmbeddingProfileId::default_profile(), &[0.3, 0.4], 7, None)
+            .await
+            .expect_err("qdrant status fails");
+        let _requests = handle.join().unwrap();
+
+        let diagnostic = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<UpstreamFailureError>())
+            .expect("upstream failure in error chain")
+            .diagnostic();
+        let encoded = serde_json::to_string(diagnostic).unwrap();
+        assert_eq!(diagnostic.status_code, Some(502));
+        assert!(encoded.contains("<redacted>"));
+        assert!(!encoded.contains("fixturebearertoken"));
+        assert!(!encoded.contains("fixture12345"));
+        assert!(!encoded.contains("providerfixture12345"));
+        assert!(!encoded.contains("user:pass"));
     }
 
     #[tokio::test]

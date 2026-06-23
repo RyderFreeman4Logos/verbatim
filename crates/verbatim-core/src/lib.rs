@@ -16,4 +16,5 @@ pub mod store;
 pub mod task;
 pub mod traits;
 pub mod types;
+pub mod upstream;
 pub mod vision_caption;
