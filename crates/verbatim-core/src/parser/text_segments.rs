@@ -1,6 +1,5 @@
-use sha2::{Digest, Sha256};
-
-use crate::types::{EvidenceId, EvidenceKind, EvidenceUnit, SourceId, SourceLocator};
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
+use crate::types::{hex_sha256, EvidenceId, EvidenceKind, EvidenceUnit, SourceId, SourceLocator};
 
 pub(crate) fn normalize_line_endings(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
@@ -20,6 +19,7 @@ pub(crate) fn normalize_line_endings(text: &str) -> String {
     normalized
 }
 
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
 pub(crate) fn pdf_page_evidence_units(
     source_id: &SourceId,
     page_num: u32,
@@ -30,7 +30,7 @@ pub(crate) fn pdf_page_evidence_units(
         .into_iter()
         .enumerate()
         .map(|(para_idx, text)| {
-            let text_hash = hex_sha256(&text);
+            let text_hash = hex_sha256(text.as_bytes());
             let unit = EvidenceUnit {
                 id: EvidenceId(format!("{}:p{}:n{}", source_id.0, page_num, para_idx)),
                 source_id: source_id.clone(),
@@ -52,6 +52,7 @@ pub(crate) fn pdf_page_evidence_units(
         .collect()
 }
 
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
 fn split_pdf_text_segments(text: &str) -> Vec<String> {
     let normalized = normalize_line_endings(text);
     let mut segments = Vec::new();
@@ -88,6 +89,7 @@ fn split_pdf_text_segments(text: &str) -> Vec<String> {
     segments
 }
 
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
 fn flush_segment(segments: &mut Vec<String>, current: &mut String) {
     let trimmed = current.trim();
     if !trimmed.is_empty() {
@@ -96,6 +98,7 @@ fn flush_segment(segments: &mut Vec<String>, current: &mut String) {
     current.clear();
 }
 
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
 fn starts_pdf_paragraph(
     previous_raw: &str,
     previous_trimmed: &str,
@@ -111,12 +114,14 @@ fn starts_pdf_paragraph(
             && !looks_like_visual_wrap(previous_raw, current_raw)
 }
 
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
 fn has_paragraph_indent(line: &str) -> bool {
     let mut chars = line.chars();
     matches!(chars.next(), Some('\t' | '\u{3000}'))
         || line.chars().take_while(|ch| *ch == ' ').take(2).count() >= 2
 }
 
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
 fn starts_with_list_marker(line: &str) -> bool {
     let mut chars = line.chars();
     match (chars.next(), chars.next()) {
@@ -126,6 +131,7 @@ fn starts_with_list_marker(line: &str) -> bool {
     }
 }
 
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
 fn ends_with_terminal_punctuation(line: &str) -> bool {
     line.chars()
         .rev()
@@ -156,25 +162,21 @@ fn ends_with_terminal_punctuation(line: &str) -> bool {
         })
 }
 
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
 fn looks_like_visual_wrap(previous_raw: &str, current_raw: &str) -> bool {
     !has_paragraph_indent(current_raw)
         && visual_width(previous_raw.trim()) >= 72
         && visual_width(current_raw.trim()) >= 24
 }
 
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
 fn visual_width(line: &str) -> usize {
     line.chars()
         .map(|ch| if ch.is_ascii() { 1 } else { 2 })
         .sum()
 }
 
-fn hex_sha256(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-#[cfg(test)]
+#[cfg(all(test, any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber")))]
 mod tests {
     use super::*;
 

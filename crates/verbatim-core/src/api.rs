@@ -106,6 +106,8 @@ pub struct AskRequest {
     pub embedding_profile_id: Option<String>,
     #[serde(default)]
     pub show_retrieval: bool,
+    #[serde(default)]
+    pub context_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,6 +118,8 @@ pub struct AskResponse {
     pub verified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalDebug>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<RetrieveResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +298,18 @@ pub type ConfigResponse = Value;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_request_accepts_context_only_flag() {
+        let request: AskRequest = serde_json::from_value(serde_json::json!({
+            "question": "What is cited?",
+            "context_only": true
+        }))
+        .unwrap();
+
+        assert!(request.context_only);
+        assert!(!request.show_retrieval);
+    }
 
     #[test]
     fn retrieve_request_defaults_to_context_only_compact_output() {

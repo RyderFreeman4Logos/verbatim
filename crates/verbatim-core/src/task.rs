@@ -196,6 +196,7 @@ pub fn ask_request_metadata(
     source_id: Option<&str>,
     embedding_profile_id: Option<&str>,
     show_retrieval: bool,
+    context_only: bool,
 ) -> Value {
     bounded_json(json!({
         "question_chars": question.chars().count(),
@@ -203,6 +204,7 @@ pub fn ask_request_metadata(
         "source_id": source_id,
         "embedding_profile_id": embedding_profile_id,
         "show_retrieval": show_retrieval,
+        "context_only": context_only,
     }))
 }
 
@@ -419,7 +421,7 @@ mod tests {
     #[test]
     fn ask_metadata_does_not_store_raw_question_or_answer() {
         let question = "What is the secret launch password?";
-        let request = ask_request_metadata(question, Some("src-1"), Some("default"), true);
+        let request = ask_request_metadata(question, Some("src-1"), Some("default"), true, false);
         let retrieve =
             retrieve_request_metadata(question, Some("src-1"), Some("default"), 12, 1, 1);
         let result = ask_result_metadata("Raw answer text [E1].", 1, true, false);

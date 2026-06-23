@@ -930,6 +930,7 @@ mod tests {
             source_id: Some("src-1".into()),
             embedding_profile_id: None,
             show_retrieval: false,
+            context_only: false,
         };
 
         assert_eq!(client.submit_ask_task(&ask).unwrap().task_id, "task-1");
