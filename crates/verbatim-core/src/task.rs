@@ -288,8 +288,35 @@ pub fn ingest_task_request_metadata_with_queue_claim(
     }))
 }
 
+pub fn reindex_task_request_metadata_with_queue_claim(
+    source_id: Option<&str>,
+    force: bool,
+    embedding_profile_id: Option<&str>,
+    vectors_only: bool,
+    queue_claimable: bool,
+) -> Value {
+    let mut metadata = ingest_task_request_metadata_with_queue_claim(
+        source_id,
+        force,
+        embedding_profile_id,
+        vectors_only,
+        queue_claimable,
+    );
+    if let Value::Object(map) = &mut metadata {
+        map.insert(
+            "operation".to_string(),
+            Value::String("reindex".to_string()),
+        );
+    }
+    bounded_json(metadata)
+}
+
 pub fn ingest_result_metadata(ingested: usize) -> Value {
     bounded_json(json!({ "ingested": ingested }))
+}
+
+pub fn reindex_result_metadata(reindexed: usize) -> Value {
+    bounded_json(json!({ "reindexed": reindexed }))
 }
 
 pub fn bounded_json(value: Value) -> Value {
