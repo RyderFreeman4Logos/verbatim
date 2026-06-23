@@ -16,12 +16,13 @@ use verbatim_core::api::{
 };
 use verbatim_core::config::{self, Config, DaemonConfig};
 
-use crate::sse;
+use crate::{render, sse};
 
 const MAX_HTTP_ERROR_BODY_BYTES: usize = 4096;
 const HTTP_ERROR_TRUNCATION_MARKER: &str = "...[truncated]";
 const DEFAULT_DAEMON_HTTP_TIMEOUT_SECONDS: u64 = 300;
 const DAEMON_HTTP_TIMEOUT_PADDING_SECONDS: u64 = 120;
+const TASK_WAIT_TIMEOUT_EXIT_CODE: u8 = 124;
 
 pub type CliResult<T> = Result<T, CliError>;
 
@@ -30,12 +31,14 @@ pub enum CliError {
     Api(String),
     DaemonUnreachable(String),
     Io(std::io::Error),
+    TaskWaitTimedOut { timeout: Duration },
 }
 
 impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::DaemonUnreachable(_) => 2,
+            Self::TaskWaitTimedOut { .. } => TASK_WAIT_TIMEOUT_EXIT_CODE,
             Self::Api(_) | Self::Io(_) => 1,
         }
     }
@@ -46,6 +49,9 @@ impl fmt::Display for CliError {
         match self {
             Self::Api(message) | Self::DaemonUnreachable(message) => f.write_str(message),
             Self::Io(error) => write!(f, "{error}"),
+            Self::TaskWaitTimedOut { timeout } => {
+                write!(f, "task wait timed out after {}", format_duration(*timeout))
+            }
         }
     }
 }
@@ -54,7 +60,7 @@ impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Api(_) | Self::DaemonUnreachable(_) => None,
+            Self::Api(_) | Self::DaemonUnreachable(_) | Self::TaskWaitTimedOut { .. } => None,
         }
     }
 }
@@ -90,7 +96,13 @@ pub trait DaemonClient {
     fn submit_reindex_task(&self, request: &ReindexRequest) -> CliResult<TaskCreatedResponse>;
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
     fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse>;
-    fn wait_task<W>(&self, task_id: &str, after: Option<i64>, stdout: &mut W) -> CliResult<()>
+    fn wait_task<W>(
+        &self,
+        task_id: &str,
+        after: Option<i64>,
+        timeout: TaskWaitTimeout,
+        stdout: &mut W,
+    ) -> CliResult<()>
     where
         W: Write;
     fn cancel_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
@@ -101,6 +113,13 @@ pub trait DaemonClient {
     fn get_evidence(&self, evidence_id: &str) -> CliResult<EvidenceResponse>;
     fn get_config(&self) -> CliResult<ConfigResponse>;
     fn health(&self) -> CliResult<HealthResponse>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskWaitTimeout {
+    ConfigDefault,
+    Bounded(Duration),
+    Unbounded,
 }
 
 pub struct HttpDaemonClient {
@@ -169,6 +188,35 @@ impl HttpDaemonClient {
             }
         };
         Ok(Duration::from_secs(seconds.max(1)))
+    }
+
+    fn task_wait_timeout(&self, timeout: TaskWaitTimeout) -> CliResult<Option<Duration>> {
+        match timeout {
+            TaskWaitTimeout::Bounded(duration) => Ok(Some(nonzero_duration(duration))),
+            TaskWaitTimeout::Unbounded => Ok(None),
+            TaskWaitTimeout::ConfigDefault => {
+                let config = self.task_wait_config()?;
+                Ok(resolve_task_wait_timeout(&config, timeout))
+            }
+        }
+    }
+
+    fn task_wait_config(&self) -> CliResult<Config> {
+        if self.base_url.is_some() {
+            return Ok(Config::default());
+        }
+
+        let path = config::config_path();
+        if path.exists() {
+            Config::load_from(&path).map_err(|error| {
+                CliError::Api(format!(
+                    "failed to load config {}: {error:#}",
+                    path.display()
+                ))
+            })
+        } else {
+            Ok(Config::default())
+        }
     }
 
     fn request_timeout_for_policy(
@@ -339,7 +387,13 @@ impl DaemonClient for HttpDaemonClient {
         self.request_json::<TaskEventsResponse, ()>(Method::GET, &path, None)
     }
 
-    fn wait_task<W>(&self, task_id: &str, after: Option<i64>, stdout: &mut W) -> CliResult<()>
+    fn wait_task<W>(
+        &self,
+        task_id: &str,
+        after: Option<i64>,
+        timeout: TaskWaitTimeout,
+        stdout: &mut W,
+    ) -> CliResult<()>
     where
         W: Write,
     {
@@ -348,15 +402,40 @@ impl DaemonClient for HttpDaemonClient {
             None => format!("/api/tasks/{task_id}/wait"),
         };
         let url = self.url(&path)?;
-        let response = self
-            .apply_timeout(self.client.get(&url), RequestTimeoutPolicy::LongRunning)?
-            .send()
-            .map_err(|error| request_error(&url, error))?;
+        let effective_timeout = self.task_wait_timeout(timeout)?;
+        let mut request = self.client.get(&url);
+        if let Some(timeout) = effective_timeout {
+            request = request.timeout(timeout);
+        }
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(error) => {
+                let error = wait_request_error(&url, error, effective_timeout);
+                if matches!(&error, CliError::TaskWaitTimedOut { .. }) {
+                    render::write_task_wait_timeout_summary(stdout, None)?;
+                }
+                return Err(error);
+            }
+        };
         let status = response.status();
         if !status.is_success() {
             return Err(http_error(status, response));
         }
-        sse::consume_task_sse(response, stdout)
+        match sse::consume_task_sse(response, stdout) {
+            Ok(report) => {
+                let _last_event = report.last_event;
+                Ok(())
+            }
+            Err(error) => {
+                let (source, last_event) = error.into_parts();
+                if let Some(timeout) = effective_timeout.filter(|_| is_read_timeout_error(&source))
+                {
+                    render::write_task_wait_timeout_summary(stdout, last_event.as_ref())?;
+                    return Err(CliError::TaskWaitTimedOut { timeout });
+                }
+                Err(source)
+            }
+        }
     }
 
     fn cancel_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse> {
@@ -466,6 +545,24 @@ fn daemon_http_timeout_seconds(config: &Config) -> u64 {
         .saturating_add(DAEMON_HTTP_TIMEOUT_PADDING_SECONDS)
 }
 
+fn resolve_task_wait_timeout(config: &Config, timeout: TaskWaitTimeout) -> Option<Duration> {
+    match timeout {
+        TaskWaitTimeout::Bounded(duration) => Some(nonzero_duration(duration)),
+        TaskWaitTimeout::Unbounded => None,
+        TaskWaitTimeout::ConfigDefault => Some(Duration::from_secs(
+            config.cli.task_wait_timeout_seconds.max(1),
+        )),
+    }
+}
+
+fn nonzero_duration(duration: Duration) -> Duration {
+    if duration.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        duration
+    }
+}
+
 fn ingest_path_with_query(
     base_path: &str,
     force: bool,
@@ -546,6 +643,50 @@ fn request_error(url: &str, error: reqwest::Error) -> CliError {
         ));
     }
     CliError::Api(format!("failed to call daemon at {url}: {error}"))
+}
+
+fn wait_request_error(url: &str, error: reqwest::Error, timeout: Option<Duration>) -> CliError {
+    if error.is_timeout() {
+        if let Some(timeout) = timeout {
+            return CliError::TaskWaitTimedOut { timeout };
+        }
+    }
+    request_error(url, error)
+}
+
+fn is_read_timeout_error(error: &CliError) -> bool {
+    match error {
+        CliError::Io(error) => {
+            let display = error.to_string().to_ascii_lowercase();
+            let debug = format!("{error:?}").to_ascii_lowercase();
+            error.kind() == std::io::ErrorKind::TimedOut
+                || display.contains("timed out")
+                || display.contains("timeout")
+                || display.contains("deadline")
+                || debug.contains("timedout")
+                || debug.contains("timed out")
+                || debug.contains("timeout")
+                || debug.contains("deadline")
+        }
+        CliError::Api(_) | CliError::DaemonUnreachable(_) | CliError::TaskWaitTimedOut { .. } => {
+            false
+        }
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds == 0 {
+        format!("{}ms", duration.as_millis().max(1))
+    } else if seconds.is_multiple_of(86_400) {
+        format!("{}d", seconds / 86_400)
+    } else if seconds.is_multiple_of(3_600) {
+        format!("{}h", seconds / 3_600)
+    } else if seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn read_bounded_error_body<R>(reader: &mut R) -> std::io::Result<(String, bool)>
@@ -813,6 +954,35 @@ mod tests {
     }
 
     #[test]
+    fn task_wait_timeout_resolution_uses_cli_config_and_overrides() {
+        let mut config = default_config();
+        config.cli.task_wait_timeout_seconds = 25;
+
+        assert_eq!(
+            resolve_task_wait_timeout(&config, TaskWaitTimeout::ConfigDefault),
+            Some(Duration::from_secs(25))
+        );
+        assert_eq!(
+            resolve_task_wait_timeout(&config, TaskWaitTimeout::Bounded(Duration::from_secs(1500))),
+            Some(Duration::from_secs(1500))
+        );
+        assert_eq!(
+            resolve_task_wait_timeout(&config, TaskWaitTimeout::Unbounded),
+            None
+        );
+    }
+
+    #[test]
+    fn task_wait_timeout_error_uses_distinct_exit_code() {
+        let error = CliError::TaskWaitTimedOut {
+            timeout: Duration::from_secs(1500),
+        };
+
+        assert_eq!(error.exit_code(), TASK_WAIT_TIMEOUT_EXIT_CODE);
+        assert_eq!(error.to_string(), "task wait timed out after 25m");
+    }
+
+    #[test]
     fn http_add_source_posts_json_to_daemon() {
         let server = TestServer::respond_once(
             "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"src-1\"}",
@@ -947,7 +1117,9 @@ mod tests {
             2
         );
         let mut stdout = Vec::new();
-        client.wait_task("task-1", Some(2), &mut stdout).unwrap();
+        client
+            .wait_task("task-1", Some(2), TaskWaitTimeout::Unbounded, &mut stdout)
+            .unwrap();
         assert!(String::from_utf8(stdout).unwrap().contains("Task: task-1"));
         assert_eq!(
             client.cancel_task("task-1").unwrap().task.status.as_str(),
@@ -963,6 +1135,69 @@ mod tests {
         assert!(requests[3].starts_with("GET /api/tasks/task-1/events?after=1 HTTP/1.1"));
         assert!(requests[4].starts_with("GET /api/tasks/task-1/wait?after=2 HTTP/1.1"));
         assert!(requests[5].starts_with("POST /api/tasks/task-1/cancel HTTP/1.1"));
+    }
+
+    #[test]
+    fn http_task_wait_send_timeout_returns_distinct_error_and_no_event_summary() {
+        let server = TestServer::respond_delayed_response(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+            Duration::from_millis(250),
+        );
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+        let mut stdout = Vec::new();
+
+        let error = client
+            .wait_task(
+                "task-1",
+                None,
+                TaskWaitTimeout::Bounded(Duration::from_millis(50)),
+                &mut stdout,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.exit_code(), TASK_WAIT_TIMEOUT_EXIT_CODE);
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Last known task state before timeout:"));
+        assert!(output.contains("unavailable: no task event received"));
+        assert!(server
+            .request()
+            .starts_with("GET /api/tasks/task-1/wait HTTP/1.1"));
+    }
+
+    #[test]
+    fn http_task_wait_read_timeout_returns_distinct_error_and_last_state() {
+        let server = TestServer::respond_slow_stream(
+            concat!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+                "event: task\n",
+                "data: {\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"running\",",
+                "\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":null,",
+                "\"request\":{},\"result\":null,\"error\":null,",
+                "\"progress\":{\"phase\":{\"name\":\"chat\",\"started_at\":\"1\",\"elapsed_ms\":100},",
+                "\"recent_status\":\"streaming\"}},\"events\":[],\"spans\":[],\"terminal\":false}\n\n",
+            ),
+            Duration::from_millis(250),
+        );
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+        let mut stdout = Vec::new();
+
+        let error = client
+            .wait_task(
+                "task-1",
+                None,
+                TaskWaitTimeout::Bounded(Duration::from_millis(50)),
+                &mut stdout,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.exit_code(), TASK_WAIT_TIMEOUT_EXIT_CODE);
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Task task-1 status=running"));
+        assert!(output.contains("progress: phase=chat elapsed=100ms"));
+        assert!(output.contains("Last known task state before timeout:"));
+        assert!(server
+            .request()
+            .starts_with("GET /api/tasks/task-1/wait HTTP/1.1"));
     }
 
     #[test]
@@ -1099,6 +1334,46 @@ mod tests {
                     thread_requests.lock().unwrap().push(request);
                     stream.write_all(response.as_bytes()).unwrap();
                 }
+            });
+            Self {
+                addr,
+                requests,
+                handle,
+            }
+        }
+
+        fn respond_slow_stream(response: &'static str, hold_open: Duration) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = Arc::clone(&requests);
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                thread_requests.lock().unwrap().push(request);
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                thread::sleep(hold_open);
+            });
+            Self {
+                addr,
+                requests,
+                handle,
+            }
+        }
+
+        fn respond_delayed_response(response: &'static str, response_delay: Duration) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = Arc::clone(&requests);
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                thread_requests.lock().unwrap().push(request);
+                thread::sleep(response_delay);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
             });
             Self {
                 addr,

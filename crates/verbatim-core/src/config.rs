@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::image_limits::ImageArtifactLimits;
 use crate::types::{EdgeType, EmbeddingProfileId, OcrProfile};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub store: StoreConfig,
@@ -34,8 +34,12 @@ pub struct Config {
     #[serde(default)]
     pub qdrant: QdrantConfig,
     #[serde(default)]
+    pub cli: CliConfig,
+    #[serde(default)]
     pub daemon: DaemonConfig,
 }
+
+pub const DEFAULT_TASK_WAIT_TIMEOUT_SECONDS: u64 = 1500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreConfig {
@@ -738,6 +742,24 @@ impl Default for DaemonConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliConfig {
+    #[serde(default = "default_task_wait_timeout_seconds")]
+    pub task_wait_timeout_seconds: u64,
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
+            task_wait_timeout_seconds: default_task_wait_timeout_seconds(),
+        }
+    }
+}
+
+fn default_task_wait_timeout_seconds() -> u64 {
+    DEFAULT_TASK_WAIT_TIMEOUT_SECONDS
+}
+
 pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -952,6 +974,11 @@ collection = "verbatim"
 prefer_for_search = false
 timeout_seconds = 5
 
+[cli]
+# Caps `verbatim task wait`. Model timeout_seconds values above bound provider
+# calls and finite daemon HTTP requests; they do not cap task wait streams.
+task_wait_timeout_seconds = 1500
+
 [daemon]
 bind = "127.0.0.1:7700"
 "#;
@@ -1050,7 +1077,33 @@ mod tests {
         assert_eq!(config.qdrant.collection, "verbatim");
         assert!(!config.qdrant.prefer_for_search);
         assert_eq!(config.qdrant.timeout_seconds, 5);
+        assert_eq!(config.cli.task_wait_timeout_seconds, 1500);
         assert_eq!(config.daemon.bind, "127.0.0.1:7700");
+    }
+
+    #[test]
+    fn partial_cli_config_defaults_task_wait_timeout() {
+        let config: Config = toml::from_str(
+            r#"
+[cli]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.cli.task_wait_timeout_seconds, 1500);
+    }
+
+    #[test]
+    fn absent_cli_config_uses_task_wait_timeout_default() {
+        let config: Config = toml::from_str(
+            r#"
+[daemon]
+bind = "127.0.0.1:7701"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.cli.task_wait_timeout_seconds, 1500);
     }
 
     #[test]

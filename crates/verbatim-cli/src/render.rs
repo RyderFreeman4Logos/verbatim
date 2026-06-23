@@ -4,7 +4,7 @@ use serde_json::Value;
 use verbatim_core::api::{
     AskResponse, CheckStaleResponse, CitationResponse, ConfigResponse, EvidenceResponse,
     HealthResponse, IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse,
-    TaskCreatedResponse,
+    TaskCreatedResponse, TaskWaitEvent,
 };
 use verbatim_core::task::{TaskEvent, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary};
 use verbatim_core::types::{BBox, OcrSourceStatus, RetrievalDebug, SourceLocator};
@@ -197,6 +197,36 @@ where
             )?;
         }
     }
+    Ok(())
+}
+
+pub fn write_task_wait_timeout_summary<W>(
+    writer: &mut W,
+    last_event: Option<&TaskWaitEvent>,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Last known task state before timeout:")?;
+    let Some(event) = last_event else {
+        return writeln!(writer, "  unavailable: no task event received");
+    };
+
+    if event.terminal {
+        write_task_summary(writer, &event.task, &event.spans)?;
+    } else {
+        write_task_status_line(writer, &event.task)?;
+        write_task_progress_line(writer, &event.task)?;
+        if !event.spans.is_empty() {
+            write_task_spans(writer, &event.spans)?;
+        }
+    }
+
+    if !event.events.is_empty() {
+        writeln!(writer, "Last task events:")?;
+        write_task_events(writer, &event.events)?;
+    }
+
     Ok(())
 }
 
