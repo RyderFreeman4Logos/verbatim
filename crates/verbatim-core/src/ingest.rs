@@ -27,7 +27,7 @@ use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
 use crate::store::{EmbeddingProfileConfig, SourceContentsReplacement, Store};
-use crate::task::{PhaseTiming, TaskId};
+use crate::task::{PhaseTiming, TaskEndpointSummary, TaskId, TaskProgressSnapshot};
 use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
 use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
@@ -447,6 +447,13 @@ where
         new_source.status = SourceStatus::Indexed;
         new_source.parser_used = Some(parser.name().to_string());
         let phase = PhaseTiming::start("ingest_parsing");
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status(format!("parsing source {}", source_id.0)),
+        );
         let mut evidence = parser.parse(&source.path)?;
         normalize_evidence_source_ids(&mut evidence, source_id);
         let parsed_image_artifacts = extract_image_artifacts_for_ingest(
@@ -473,6 +480,20 @@ where
             }),
         );
         let phase = PhaseTiming::start("ocr");
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_counter(
+                    "pages",
+                    pdf_scan
+                        .as_ref()
+                        .map(|scan| scan.pages.len() as u64)
+                        .unwrap_or(0),
+                    None,
+                )
+                .with_recent_status("checking OCR candidates"),
+        );
         let ocr_evidence = self
             .ocr_scanned_pdf_pages(
                 source_id,
@@ -520,6 +541,13 @@ where
 
         let chunker_config = ChunkerConfig::default();
         let phase = PhaseTiming::start("ingest_chunking");
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_counter("evidence", searchable_evidence.len() as u64, None)
+                .with_recent_status("chunking evidence"),
+        );
         let output = chunk_evidence(source_id, &searchable_evidence, &chunker_config);
         tracing::info!(chunk_count = output.chunks.len(), "chunked");
         self.record_task_phase(
@@ -603,18 +631,47 @@ where
             .cloned()
             .collect::<Vec<_>>();
         let phase = PhaseTiming::start("embedding");
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_counter("embedding_vectors", 0, Some(child_chunks.len() as u64))
+                .with_counter(
+                    "batches",
+                    usize::from(!child_chunks.is_empty()) as u64,
+                    Some(1),
+                )
+                .with_recent_status("embedding child chunks"),
+        );
         let active_profile_id = self.active_profile_id.clone();
         let prepared = self
             .prepare_source_indexes_for_profile(&active_profile_id, source_id, &child_chunks)
             .await?;
-        self.record_task_phase(
-            task_id,
-            phase,
-            serde_json::json!({
-                "child_chunk_count": child_chunks.len(),
-                "vector_count": prepared.vectors.len(),
-            }),
-        );
+        let mut embedding_progress = phase
+            .progress_snapshot()
+            .with_counter(
+                "embedding_vectors",
+                prepared.vectors.len() as u64,
+                Some(child_chunks.len() as u64),
+            )
+            .with_counter(
+                "batches",
+                usize::from(!child_chunks.is_empty()) as u64,
+                Some(1),
+            )
+            .with_recent_status("embedding complete");
+        let embedding_timing = phase.finish(serde_json::json!({
+            "child_chunk_count": child_chunks.len(),
+            "vector_count": prepared.vectors.len(),
+        }));
+        if !child_chunks.is_empty() {
+            embedding_progress.set_endpoint(TaskEndpointSummary::single_call(
+                "embedding",
+                embedding_timing.duration_ms,
+            ));
+        }
+        self.record_task_progress(task_id, embedding_progress);
+        self.record_finished_task_phase(task_id, embedding_timing);
 
         let phase = PhaseTiming::start("ingest_index_publishing");
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
@@ -758,7 +815,19 @@ where
         let total = to_ingest.len();
         for (i, source_id) in to_ingest.iter().enumerate() {
             tracing::info!(progress = format!("{}/{}", i + 1, total), source = %source_id.0);
+            self.record_task_progress(
+                task_id,
+                TaskProgressSnapshot::phase("ingest")
+                    .with_counter("sources", i as u64, Some(total as u64))
+                    .with_recent_status(format!("ingesting source {}", source_id.0)),
+            );
             self.ingest_source_inner(source_id, task_id).await?;
+            self.record_task_progress(
+                task_id,
+                TaskProgressSnapshot::phase("ingest")
+                    .with_counter("sources", (i + 1) as u64, Some(total as u64))
+                    .with_recent_status(format!("finished source {}", source_id.0)),
+            );
         }
         if force {
             #[cfg(feature = "qdrant")]
@@ -774,10 +843,17 @@ where
         phase: PhaseTiming,
         metadata: serde_json::Value,
     ) {
+        self.record_finished_task_phase(task_id, phase.finish(metadata));
+    }
+
+    fn record_finished_task_phase(
+        &self,
+        task_id: Option<&TaskId>,
+        finished: crate::task::FinishedPhaseTiming,
+    ) {
         let Some(task_id) = task_id else {
             return;
         };
-        let finished = phase.finish(metadata);
         if let Err(err) = self.store.insert_task_span(
             task_id,
             &finished.phase,
@@ -790,6 +866,19 @@ where
                 phase = %finished.phase,
                 error = %err,
                 "failed to persist task phase timing"
+            );
+        }
+    }
+
+    fn record_task_progress(&self, task_id: Option<&TaskId>, progress: TaskProgressSnapshot) {
+        let Some(task_id) = task_id else {
+            return;
+        };
+        if let Err(err) = self.store.update_task_progress(task_id, progress) {
+            tracing::warn!(
+                task_id = %task_id.0,
+                error = %err,
+                "failed to persist task progress"
             );
         }
     }

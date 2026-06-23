@@ -6,7 +6,7 @@ use verbatim_core::api::{
     HealthResponse, IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse,
     TaskCreatedResponse,
 };
-use verbatim_core::task::{TaskEvent, TaskSpan, TaskStatus, TaskSummary};
+use verbatim_core::task::{TaskEvent, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary};
 use verbatim_core::types::{BBox, OcrSourceStatus, RetrievalDebug, SourceLocator};
 
 pub fn write_sources<W>(writer: &mut W, sources: &[SourceResponse]) -> std::io::Result<()>
@@ -104,6 +104,16 @@ where
     writeln!(writer, "Task {} status={}", task.id.0, task.status.as_str())
 }
 
+pub fn write_task_progress_line<W>(writer: &mut W, task: &TaskSummary) -> std::io::Result<()>
+where
+    W: Write,
+{
+    let Some(progress) = &task.progress else {
+        return Ok(());
+    };
+    writeln!(writer, "progress: {}", task_progress_summary(progress))
+}
+
 pub fn write_task_summary<W>(
     writer: &mut W,
     task: &TaskSummary,
@@ -120,6 +130,9 @@ where
     }
     if let Some(reason) = &task.blocking_reason {
         writeln!(writer, "  blocking_reason: {reason}")?;
+    }
+    if let Some(progress) = &task.progress {
+        writeln!(writer, "  progress: {}", task_progress_summary(progress))?;
     }
     writeln!(writer, "  created_at: {}", task.created_at)?;
     if let Some(started_at) = &task.started_at {
@@ -150,6 +163,19 @@ where
     W: Write,
 {
     for event in events {
+        if event.event_type == "progress" {
+            if let Ok(progress) =
+                serde_json::from_value::<TaskProgressSnapshot>(event.payload.clone())
+            {
+                writeln!(
+                    writer,
+                    "[{}] progress: {}",
+                    event.sequence,
+                    task_progress_summary(&progress)
+                )?;
+                continue;
+            }
+        }
         if event
             .payload
             .as_object()
@@ -172,6 +198,59 @@ where
         }
     }
     Ok(())
+}
+
+fn task_progress_summary(progress: &TaskProgressSnapshot) -> String {
+    let mut parts = Vec::new();
+    if let Some(phase) = &progress.phase {
+        parts.push(format!(
+            "phase={} elapsed={}ms",
+            phase.name, phase.elapsed_ms
+        ));
+    }
+    if let Some(queue) = &progress.queue {
+        parts.push(format!("queue_position={}", queue.position));
+        if let Some(worker) = &queue.active_worker_kind {
+            parts.push(format!("active_worker={worker}"));
+        }
+        if let Some(reason) = &queue.blocking_reason {
+            parts.push(format!("blocked=\"{reason}\""));
+        }
+    }
+    if let Some(worker) = &progress.active_worker_kind {
+        parts.push(format!("active_worker={worker}"));
+    }
+    for counter in &progress.counters {
+        match counter.total {
+            Some(total) => parts.push(format!("{}={}/{}", counter.name, counter.completed, total)),
+            None => parts.push(format!("{}={}", counter.name, counter.completed)),
+        }
+    }
+    for endpoint in &progress.endpoints {
+        if let Some(latency_ms) = endpoint.latest_latency_ms {
+            parts.push(format!("{}.latest={}ms", endpoint.name, latency_ms));
+        }
+        if let Some(latency_ms) = endpoint.first_token_latency_ms {
+            parts.push(format!("{}.first_token={}ms", endpoint.name, latency_ms));
+        }
+        if let Some(latency_ms) = endpoint.p50_latency_ms {
+            parts.push(format!("{}.p50={}ms", endpoint.name, latency_ms));
+        }
+        if let Some(latency_ms) = endpoint.p95_latency_ms {
+            parts.push(format!("{}.p95={}ms", endpoint.name, latency_ms));
+        }
+        if let Some(error) = &endpoint.latest_error {
+            parts.push(format!("{}.error=\"{error}\"", endpoint.name));
+        }
+    }
+    if let Some(status) = &progress.recent_status {
+        parts.push(format!("status=\"{status}\""));
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 pub fn write_task_spans<W>(writer: &mut W, spans: &[TaskSpan]) -> std::io::Result<()>

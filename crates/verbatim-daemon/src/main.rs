@@ -3,9 +3,9 @@ use std::convert::Infallible;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use axum::extract::{Path, Query, State};
@@ -45,7 +45,8 @@ use verbatim_core::task::{
     ask_request_metadata, ask_result_metadata, bounded_error, ingest_result_metadata,
     ingest_task_request_metadata_with_queue_claim, reindex_result_metadata,
     reindex_task_request_metadata_with_queue_claim, retrieve_request_metadata,
-    retrieve_result_metadata, PhaseTiming, TaskId, TaskKind, TaskStatus,
+    retrieve_result_metadata, PhaseTiming, TaskEndpointSummary, TaskId, TaskKind,
+    TaskProgressSnapshot, TaskStatus,
 };
 use verbatim_core::types::{
     CitationRef, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug,
@@ -85,6 +86,10 @@ const TASK_WAIT_EVENT_LIMIT: usize = 100;
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FAST_RETRIEVAL_TOP_K: usize = 20;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
 
 #[derive(Deserialize)]
 struct IngestQuery {
@@ -344,6 +349,17 @@ fn with_queue_details(
     let running = store.count_running_tasks(task.kind)?;
     task.queue_position = Some(position);
     task.blocking_reason = queued_blocking_reason(task.kind, position, running);
+    task.progress = Some(
+        task.progress
+            .take()
+            .unwrap_or_else(|| TaskProgressSnapshot::phase("queued"))
+            .with_queue(
+                position,
+                (running > 0).then(|| task.kind.as_str().to_string()),
+                task.blocking_reason.clone(),
+            )
+            .with_recent_status("queued"),
+    );
     Ok(task)
 }
 
@@ -507,6 +523,35 @@ async fn record_task_span(
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn record_task_progress(
+    state: &SharedState,
+    task_id: &TaskId,
+    progress: TaskProgressSnapshot,
+) {
+    let state = Arc::clone(state);
+    let task_id = task_id.clone();
+    let task_id_for_log = task_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        store.update_task_progress(&task_id, progress)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(task_id = %task_id_for_log.0, error = %err, "failed to persist task progress");
+        }
+        Err(err) => {
+            tracing::warn!(task_id = %task_id_for_log.0, error = %err, "task progress writer panicked");
+        }
+    }
 }
 
 async fn finish_task_success(
@@ -1053,6 +1098,16 @@ async fn execute_retrieve_task_inner(
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     let timing = PhaseTiming::start("retrieval");
+    record_task_progress(
+        &state,
+        task_id,
+        timing
+            .progress_snapshot()
+            .with_counter("retrieval_candidates", 0, None)
+            .with_recent_status("retrieving evidence")
+            .with_active_worker_kind(TaskKind::Retrieve.as_str()),
+    )
+    .await;
     let RetrievedContext {
         results,
         debug,
@@ -1065,6 +1120,51 @@ async fn execute_retrieve_task_inner(
         &controls,
     )
     .await?;
+    let mut retrieval_progress = timing
+        .progress_snapshot()
+        .with_counter("dense_candidates", debug.dense_hits.len() as u64, None)
+        .with_counter("bm25_candidates", debug.bm25_hits.len() as u64, None)
+        .with_counter(
+            "retrieval_candidates",
+            debug.rrf_fused_hits.len() as u64,
+            None,
+        )
+        .with_counter("evidence", debug.final_evidence_pack.len() as u64, None)
+        .with_recent_status(format!(
+            "retrieved {} evidence entries",
+            debug.final_evidence_pack.len()
+        ))
+        .with_active_worker_kind(TaskKind::Retrieve.as_str());
+    if let Some(latency_ms) = debug.query_embedding_latency_ms {
+        retrieval_progress.set_endpoint(TaskEndpointSummary::single_call("embedding", latency_ms));
+    }
+    if let Some(top_n) = debug.reranker.top_n {
+        retrieval_progress.set_counter(
+            "rerank_top_n",
+            top_n as u64,
+            debug.reranker.candidate_count.map(|count| count as u64),
+        );
+    }
+    if let Some(latency_ms) = debug.reranker.latency_ms {
+        let endpoint = match debug.reranker.status {
+            verbatim_core::types::RetrievalRerankStatus::Fallback => {
+                TaskEndpointSummary::failed_call(
+                    "reranker",
+                    Some(latency_ms),
+                    debug
+                        .reranker
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "rerank fallback".into()),
+                )
+            }
+            verbatim_core::types::RetrievalRerankStatus::Succeeded => {
+                TaskEndpointSummary::single_call("reranker", latency_ms)
+            }
+            _ => TaskEndpointSummary::single_call("reranker", latency_ms),
+        };
+        retrieval_progress.set_endpoint(endpoint);
+    }
     let retrieval_timing = timing.finish(serde_json::json!({
         "result_count": results.len(),
         "returned_results": page_len(
@@ -1077,6 +1177,7 @@ async fn execute_retrieve_task_inner(
         "dense_top_k": controls.retrieval_config.dense_top_k,
         "bm25_top_k": controls.retrieval_config.bm25_top_k,
     }));
+    record_task_progress(&state, task_id, retrieval_progress).await;
     record_task_span(&state, task_id, retrieval_timing.clone()).await?;
     record_task_event(
         &state,
@@ -1135,6 +1236,16 @@ async fn execute_ask_task_inner(
     let show_retrieval = req.show_retrieval;
 
     let timing = PhaseTiming::start("retrieval");
+    record_task_progress(
+        &state,
+        task_id,
+        timing
+            .progress_snapshot()
+            .with_counter("retrieval_candidates", 0, None)
+            .with_recent_status("retrieving evidence")
+            .with_active_worker_kind(TaskKind::Ask.as_str()),
+    )
+    .await;
     let (results, generation_context, retrieval_debug) = prepare_generation_context(
         Arc::clone(&state),
         &question,
@@ -1143,6 +1254,29 @@ async fn execute_ask_task_inner(
         show_retrieval,
     )
     .await?;
+    let mut retrieval_progress = timing
+        .progress_snapshot()
+        .with_counter("evidence", results.len() as u64, None)
+        .with_recent_status(format!("retrieved {} result(s)", results.len()))
+        .with_active_worker_kind(TaskKind::Ask.as_str());
+    if let Some(debug) = &retrieval_debug {
+        retrieval_progress.set_counter("dense_candidates", debug.dense_hits.len() as u64, None);
+        retrieval_progress.set_counter("bm25_candidates", debug.bm25_hits.len() as u64, None);
+        retrieval_progress.set_counter(
+            "retrieval_candidates",
+            debug.rrf_fused_hits.len() as u64,
+            None,
+        );
+        if let Some(latency_ms) = debug.query_embedding_latency_ms {
+            retrieval_progress
+                .set_endpoint(TaskEndpointSummary::single_call("embedding", latency_ms));
+        }
+        if let Some(latency_ms) = debug.reranker.latency_ms {
+            retrieval_progress
+                .set_endpoint(TaskEndpointSummary::single_call("reranker", latency_ms));
+        }
+    }
+    record_task_progress(&state, task_id, retrieval_progress).await;
     record_task_span(
         &state,
         task_id,
@@ -1162,15 +1296,64 @@ async fn execute_ask_task_inner(
     .await?;
 
     let timing = PhaseTiming::start("chat");
-    let gen_result = state
+    record_task_progress(
+        &state,
+        task_id,
+        timing
+            .progress_snapshot()
+            .with_recent_status("waiting for chat model")
+            .with_active_worker_kind(TaskKind::Ask.as_str()),
+    )
+    .await;
+    let chat_started = Instant::now();
+    let gen_result = match state
         .generator
         .generate_with_context(&question, &results, &generation_context)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            record_task_progress(
+                &state,
+                task_id,
+                timing
+                    .progress_snapshot()
+                    .with_endpoint(TaskEndpointSummary::failed_call(
+                        "chat",
+                        Some(elapsed_ms(chat_started)),
+                        error.to_string(),
+                    ))
+                    .with_recent_status("chat model failed")
+                    .with_active_worker_kind(TaskKind::Ask.as_str()),
+            )
+            .await;
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, error));
+        }
+    };
     let chat_timing = timing.finish(serde_json::json!({
         "citation_count": gen_result.citations.len(),
         "verified": gen_result.verified,
     }));
+    record_task_progress(
+        &state,
+        task_id,
+        TaskProgressSnapshot {
+            phase: Some(verbatim_core::task::TaskProgressPhase {
+                name: "chat".into(),
+                started_at: chat_timing.started_at.clone(),
+                elapsed_ms: chat_timing.duration_ms,
+            }),
+            ..TaskProgressSnapshot::default()
+        }
+        .with_endpoint(TaskEndpointSummary::single_call(
+            "chat",
+            chat_timing.duration_ms,
+        ))
+        .with_counter("citations", gen_result.citations.len() as u64, None)
+        .with_recent_status("chat complete")
+        .with_active_worker_kind(TaskKind::Ask.as_str()),
+    )
+    .await;
     record_task_span(&state, task_id, chat_timing.clone()).await?;
     record_task_span(
         &state,
@@ -1244,6 +1427,16 @@ async fn execute_ask_stream_task_inner(
     let show_retrieval = req.show_retrieval;
 
     let timing = PhaseTiming::start("retrieval");
+    record_task_progress(
+        &state,
+        task_id,
+        timing
+            .progress_snapshot()
+            .with_counter("retrieval_candidates", 0, None)
+            .with_recent_status("retrieving evidence")
+            .with_active_worker_kind(TaskKind::Ask.as_str()),
+    )
+    .await;
     let (results, generation_context, retrieval_debug) = prepare_generation_context(
         Arc::clone(&state),
         &question,
@@ -1252,6 +1445,16 @@ async fn execute_ask_stream_task_inner(
         show_retrieval,
     )
     .await?;
+    record_task_progress(
+        &state,
+        task_id,
+        timing
+            .progress_snapshot()
+            .with_counter("evidence", results.len() as u64, None)
+            .with_recent_status(format!("retrieved {} result(s)", results.len()))
+            .with_active_worker_kind(TaskKind::Ask.as_str()),
+    )
+    .await;
     record_task_span(
         &state,
         task_id,
@@ -1264,9 +1467,33 @@ async fn execute_ask_stream_task_inner(
 
     let tx_tokens = tx.clone();
     let timing = PhaseTiming::start("chat");
-    let gen_result = state
+    record_task_progress(
+        &state,
+        task_id,
+        timing
+            .progress_snapshot()
+            .with_recent_status("waiting for streaming chat model")
+            .with_active_worker_kind(TaskKind::Ask.as_str()),
+    )
+    .await;
+    let chat_started = Instant::now();
+    let streamed_bytes = Arc::new(AtomicU64::new(0));
+    let streamed_chunks = Arc::new(AtomicU64::new(0));
+    let first_token_latency_ms = Arc::new(AtomicU64::new(0));
+    let streamed_bytes_for_callback = Arc::clone(&streamed_bytes);
+    let streamed_chunks_for_callback = Arc::clone(&streamed_chunks);
+    let first_token_for_callback = Arc::clone(&first_token_latency_ms);
+    let gen_result = match state
         .generator
         .generate_streaming_with_context(&question, &results, &generation_context, move |delta| {
+            streamed_bytes_for_callback.fetch_add(delta.len() as u64, Ordering::Relaxed);
+            streamed_chunks_for_callback.fetch_add(1, Ordering::Relaxed);
+            let _ = first_token_for_callback.compare_exchange(
+                0,
+                elapsed_ms(chat_started),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             try_send_stream_event(
                 &tx_tokens,
                 sse_json_event(
@@ -1279,12 +1506,78 @@ async fn execute_ask_stream_task_inner(
             Ok(())
         })
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    {
+        Ok(result) => result,
+        Err(error) => {
+            record_task_progress(
+                &state,
+                task_id,
+                timing
+                    .progress_snapshot()
+                    .with_endpoint(TaskEndpointSummary::failed_call(
+                        "chat",
+                        Some(elapsed_ms(chat_started)),
+                        error.to_string(),
+                    ))
+                    .with_counter(
+                        "chat_bytes_streamed",
+                        streamed_bytes.load(Ordering::Relaxed),
+                        None,
+                    )
+                    .with_counter(
+                        "chat_chunks_streamed",
+                        streamed_chunks.load(Ordering::Relaxed),
+                        None,
+                    )
+                    .with_recent_status("streaming chat model failed")
+                    .with_active_worker_kind(TaskKind::Ask.as_str()),
+            )
+            .await;
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, error));
+        }
+    };
     let chat_timing = timing.finish(serde_json::json!({
         "citation_count": gen_result.citations.len(),
         "verified": gen_result.verified,
         "streaming": true,
+        "streamed_bytes": streamed_bytes.load(Ordering::Relaxed),
+        "streamed_chunks": streamed_chunks.load(Ordering::Relaxed),
+        "first_token_latency_ms": first_token_latency_ms.load(Ordering::Relaxed),
     }));
+    let first_token_ms = first_token_latency_ms.load(Ordering::Relaxed);
+    let endpoint = if first_token_ms > 0 {
+        TaskEndpointSummary::single_call("chat", chat_timing.duration_ms)
+            .with_first_token_latency_ms(first_token_ms)
+    } else {
+        TaskEndpointSummary::single_call("chat", chat_timing.duration_ms)
+    };
+    record_task_progress(
+        &state,
+        task_id,
+        TaskProgressSnapshot {
+            phase: Some(verbatim_core::task::TaskProgressPhase {
+                name: "chat".into(),
+                started_at: chat_timing.started_at.clone(),
+                elapsed_ms: chat_timing.duration_ms,
+            }),
+            ..TaskProgressSnapshot::default()
+        }
+        .with_endpoint(endpoint)
+        .with_counter(
+            "chat_bytes_streamed",
+            streamed_bytes.load(Ordering::Relaxed),
+            None,
+        )
+        .with_counter(
+            "chat_chunks_streamed",
+            streamed_chunks.load(Ordering::Relaxed),
+            None,
+        )
+        .with_counter("citations", gen_result.citations.len() as u64, None)
+        .with_recent_status("streaming chat complete")
+        .with_active_worker_kind(TaskKind::Ask.as_str()),
+    )
+    .await;
     record_task_span(&state, task_id, chat_timing.clone()).await?;
     record_task_span(
         &state,
@@ -1805,6 +2098,16 @@ async fn run_indexing_operation(
     let vectors_only = controls.vectors_only;
     let runtime = tokio::runtime::Handle::current();
     let timing = PhaseTiming::start(phase_name);
+    record_task_progress(
+        &state,
+        task_id,
+        timing
+            .progress_snapshot()
+            .with_counter("sources", 0, controls.source_id.as_ref().map(|_| 1_u64))
+            .with_recent_status(format!("{phase_name} started"))
+            .with_active_worker_kind(TaskKind::Ingest.as_str()),
+    )
+    .await;
     let result = tokio::task::spawn_blocking(move || {
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         if vectors_only {
@@ -1824,18 +2127,30 @@ async fn run_indexing_operation(
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| indexing_operation_error(source_id_for_error.as_deref(), e))?;
-    record_task_span(
-        &state,
-        task_id,
-        timing.finish(serde_json::json!({
-            "rebuilt": result,
-            "force": controls.force,
-            "embedding_profile_id": profile_id.as_str(),
-            "vectors_only": controls.vectors_only,
-            "source_id": controls.source_id.as_deref(),
-        })),
-    )
-    .await?;
+    let mut progress = timing
+        .progress_snapshot()
+        .with_counter(
+            "sources",
+            result as u64,
+            controls.source_id.as_ref().map(|_| 1_u64),
+        )
+        .with_recent_status(format!("{phase_name} complete"))
+        .with_active_worker_kind(TaskKind::Ingest.as_str());
+    let finished = timing.finish(serde_json::json!({
+        "rebuilt": result,
+        "force": controls.force,
+        "embedding_profile_id": profile_id.as_str(),
+        "vectors_only": controls.vectors_only,
+        "source_id": controls.source_id.as_deref(),
+    }));
+    if controls.vectors_only {
+        progress.set_endpoint(TaskEndpointSummary::single_call(
+            "embedding",
+            finished.duration_ms,
+        ));
+    }
+    record_task_progress(&state, task_id, progress).await;
+    record_task_span(&state, task_id, finished).await?;
     Ok((result, profile_id))
 }
 
@@ -2014,6 +2329,7 @@ async fn prepare_retrieve_context(
 
 fn empty_retrieval_debug() -> RetrievalDebug {
     RetrievalDebug {
+        query_embedding_latency_ms: None,
         bm25_hits: Vec::new(),
         dense_hits: Vec::new(),
         rrf_fused_hits: Vec::new(),
@@ -2737,6 +3053,7 @@ mod tests {
             error: None,
             queue_position: None,
             blocking_reason: None,
+            progress: None,
         };
 
         let enriched = upstream_failure_with_task_context(
@@ -2749,6 +3066,48 @@ mod tests {
         assert_eq!(enriched["task_kind"], "ask");
         assert_eq!(enriched["source_id"], "src-fixture");
         assert_eq!(enriched["embedding_profile_id"], "profile-fixture");
+    }
+
+    #[tokio::test]
+    async fn task_wait_snapshot_includes_running_progress() {
+        let test_dir = TestDir::new("task-progress-snapshot");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
+
+        ensure_task_started(&state, &task_id).await.unwrap();
+        record_task_progress(
+            &state,
+            &task_id,
+            TaskProgressSnapshot::phase("chat")
+                .with_counter("chat_bytes_streamed", 16, None)
+                .with_endpoint(
+                    TaskEndpointSummary::single_call("chat", 1200).with_first_token_latency_ms(250),
+                )
+                .with_active_worker_kind("ask")
+                .with_recent_status("streaming"),
+        )
+        .await;
+
+        let wait = task_wait_snapshot(&state, task_id, None, 10).await.unwrap();
+
+        assert!(!wait.terminal);
+        assert!(wait.spans.is_empty());
+        assert!(wait
+            .events
+            .iter()
+            .any(|event| event.event_type == "progress"));
+        let progress = wait.task.progress.expect("running task progress");
+        assert_eq!(progress.phase.unwrap().name, "chat");
+        assert_eq!(progress.counters[0].name, "chat_bytes_streamed");
+        assert_eq!(progress.endpoints[0].first_token_latency_ms, Some(250));
     }
 
     #[test]
@@ -2791,6 +3150,7 @@ mod tests {
             citations: Vec::new(),
             verified: false,
             retrieval: Some(RetrievalDebug {
+                query_embedding_latency_ms: None,
                 bm25_hits: Vec::new(),
                 dense_hits: Vec::new(),
                 rrf_fused_hits: Vec::new(),
@@ -2822,6 +3182,7 @@ mod tests {
         );
         let mut results = vec![local];
         let mut debug = Some(RetrievalDebug {
+            query_embedding_latency_ms: None,
             bm25_hits: Vec::new(),
             dense_hits: Vec::new(),
             rrf_fused_hits: Vec::new(),

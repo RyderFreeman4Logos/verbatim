@@ -736,6 +736,8 @@ impl Default for RetrievalProvenance {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalDebug {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_embedding_latency_ms: Option<u64>,
     pub bm25_hits: Vec<RetrievalStageHit>,
     pub dense_hits: Vec<RetrievalStageHit>,
     pub rrf_fused_hits: Vec<RetrievalFusedHit>,
@@ -791,6 +793,8 @@ pub struct RetrievalRerankDebug {
     pub top_n: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
     pub scores: Vec<RetrievalRerankScore>,
 }
 
@@ -803,6 +807,7 @@ impl RetrievalRerankDebug {
             model: None,
             top_n: None,
             candidate_count: None,
+            latency_ms: None,
             scores: Vec::new(),
         }
     }
@@ -815,6 +820,7 @@ impl RetrievalRerankDebug {
             model: None,
             top_n: None,
             candidate_count: None,
+            latency_ms: None,
             scores: Vec::new(),
         }
     }
@@ -833,6 +839,7 @@ impl RetrievalRerankDebug {
             model: Some(bounded_debug_text(&model.into())),
             top_n: Some(top_n),
             candidate_count: Some(candidate_count),
+            latency_ms: None,
             scores,
         }
     }
@@ -851,8 +858,14 @@ impl RetrievalRerankDebug {
             model: Some(bounded_debug_text(&model.into())),
             top_n: Some(top_n),
             candidate_count: Some(candidate_count),
+            latency_ms: None,
             scores: Vec::new(),
         }
+    }
+
+    pub fn with_latency_ms(mut self, latency_ms: u64) -> Self {
+        self.latency_ms = Some(latency_ms);
+        self
     }
 }
 
@@ -995,6 +1008,7 @@ mod tests {
     #[test]
     fn retrieval_debug_serializes_without_raw_text_or_secrets() {
         let debug = RetrievalDebug {
+            query_embedding_latency_ms: None,
             bm25_hits: vec![RetrievalStageHit {
                 rank: 1,
                 chunk_id: ChunkId("chunk-1".into()),
