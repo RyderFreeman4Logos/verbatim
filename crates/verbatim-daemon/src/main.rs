@@ -217,15 +217,30 @@ async fn delete_source(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(&state);
     let runtime = tokio::runtime::Handle::current();
+    let source_id = SourceId(id.clone());
     tokio::task::spawn_blocking(move || {
         let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        runtime.block_on(pipeline.remove_source(&SourceId(id)))
+        runtime.block_on(pipeline.remove_source(&source_id))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(|e| source_remove_error(&id, e))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn source_remove_error(source_id: &str, error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    let status = if is_source_not_found_error(source_id, &error) {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    err(status, error)
+}
+
+fn is_source_not_found_error(source_id: &str, error: &anyhow::Error) -> bool {
+    let expected = format!("source not found: {source_id}");
+    error.chain().any(|cause| cause.to_string() == expected)
 }
 
 async fn check_stale(
@@ -2428,6 +2443,46 @@ mod tests {
         assert!(response.results[0].structured_locator.is_none());
         assert!(response.results[0].provenance.is_none());
         assert!(response.debug.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_source_missing_returns_not_found() {
+        let test_dir = TestDir::new("delete-missing-source");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let (status, Json(body)) = delete_source(
+            State(state),
+            Path("__missing_source_smoke_retest__".to_string()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body.error,
+            "source not found: __missing_source_smoke_retest__"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_source_existing_removes_source() {
+        let test_dir = TestDir::new("delete-existing-source");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(&source_path, "delete me").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let status = delete_source(State(Arc::clone(&state)), Path(source_id.0.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let pipeline = state.pipeline.lock().unwrap();
+        assert!(pipeline.store().get_source(&source_id).unwrap().is_none());
     }
 
     #[tokio::test]

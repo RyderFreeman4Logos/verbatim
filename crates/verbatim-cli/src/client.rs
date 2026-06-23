@@ -508,10 +508,21 @@ where
 fn http_error(status: StatusCode, mut response: reqwest::blocking::Response) -> CliError {
     let (body, truncated) = read_bounded_error_body(&mut response)
         .unwrap_or_else(|error| (format!("<failed to read response body: {error}>"), false));
+    if status == StatusCode::NOT_FOUND {
+        if let Some(message) = daemon_error_message(&body) {
+            return CliError::Api(message);
+        }
+    }
     CliError::Api(format!(
         "daemon returned HTTP {status}: {}",
         bounded_redacted_body(&body, truncated)
     ))
+}
+
+fn daemon_error_message(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    let message = value.get("error")?.as_str()?.trim();
+    (!message.is_empty()).then(|| message.to_string())
 }
 
 fn request_error(url: &str, error: reqwest::Error) -> CliError {
@@ -922,6 +933,27 @@ mod tests {
         assert!(message.contains("HTTP 500"));
         assert!(message.contains("<redacted>"));
         assert!(!message.contains("should-not-print"));
+    }
+
+    #[test]
+    fn http_remove_missing_source_reports_concise_not_found() {
+        let server = TestServer::respond_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"source not found: __missing_source_smoke_retest__\"}",
+        );
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let error = client
+            .remove_source("__missing_source_smoke_retest__")
+            .unwrap_err();
+
+        assert_eq!(error.exit_code(), 1);
+        let message = error.to_string();
+        assert_eq!(message, "source not found: __missing_source_smoke_retest__");
+        assert!(!message.contains("HTTP 500"));
+        assert!(!message.contains("Internal Server Error"));
+        assert!(server
+            .request()
+            .starts_with("DELETE /api/sources/__missing_source_smoke_retest__ HTTP/1.1"));
     }
 
     #[test]
