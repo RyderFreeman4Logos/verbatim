@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,9 +40,9 @@ use verbatim_core::provider::openai_compatible::OpenAiCompatibleReranker;
 use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
 use verbatim_core::store::Store;
 use verbatim_core::task::{
-    ask_request_metadata, ask_result_metadata, bounded_error, ingest_request_metadata,
-    ingest_result_metadata, retrieve_request_metadata, retrieve_result_metadata, PhaseTiming,
-    TaskId, TaskKind,
+    ask_request_metadata, ask_result_metadata, bounded_error, ingest_result_metadata,
+    ingest_task_request_metadata_with_queue_claim, retrieve_request_metadata,
+    retrieve_result_metadata, PhaseTiming, TaskId, TaskKind, TaskStatus,
 };
 use verbatim_core::types::{
     CitationRef, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug,
@@ -62,6 +63,9 @@ use verbatim_core::types::{
 struct AppState {
     /// Pipeline behind a std Mutex; accessed only inside `spawn_blocking`.
     pipeline: std::sync::Mutex<IngestPipeline>,
+    /// Independent task metadata connection so queue operations do not wait for long ingest work.
+    task_store: std::sync::Mutex<Store>,
+    ingest_queue_active: AtomicBool,
     generator: Generator,
     embed_client: OpenAiEmbeddingClient,
     reranker: Option<OpenAiCompatibleReranker>,
@@ -92,6 +96,28 @@ struct IngestQuery {
 struct TaskEventsQuery {
     after: Option<i64>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersistedIngestRequest {
+    ingest_request_version: Option<u64>,
+    #[serde(default)]
+    source_id: Option<String>,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    embedding_profile_id: Option<String>,
+    #[serde(default)]
+    vectors_only: bool,
+    #[serde(default)]
+    queue_claimable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskStartOutcome {
+    Started,
+    BlockedByRunningIngest,
+    NotQueued,
 }
 
 // ---------------------------------------------------------------------------
@@ -227,19 +253,63 @@ async fn create_persisted_task(
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         let task_id = TaskId::new();
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().create_task(&task_id, kind, &request)?;
-        pipeline.store().insert_task_event(
-            &task_id,
-            "queued",
-            "task queued",
-            &serde_json::json!({ "kind": kind.as_str() }),
-        )?;
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let task = store.create_task(&task_id, kind, &request)?;
+        let payload = queued_event_payload(&store, task)?;
+        store.insert_task_event(&task_id, "queued", "task queued", &payload)?;
         Ok::<_, anyhow::Error>(task_id)
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+fn queued_event_payload(
+    store: &Store,
+    task: verbatim_core::task::TaskSummary,
+) -> Result<serde_json::Value> {
+    let task = with_queue_details(store, task)?;
+    Ok(serde_json::json!({
+        "kind": task.kind.as_str(),
+        "queue_position": task.queue_position,
+        "blocking_reason": task.blocking_reason,
+    }))
+}
+
+fn with_queue_details(
+    store: &Store,
+    mut task: verbatim_core::task::TaskSummary,
+) -> Result<verbatim_core::task::TaskSummary> {
+    if task.status != TaskStatus::Queued {
+        return Ok(task);
+    }
+    let Some(position) = store.queued_task_position(&task.id)? else {
+        return Ok(task);
+    };
+    let running = store.count_running_tasks(task.kind)?;
+    task.queue_position = Some(position);
+    task.blocking_reason = queued_blocking_reason(task.kind, position, running);
+    Ok(task)
+}
+
+fn queued_blocking_reason(kind: TaskKind, position: usize, running: usize) -> Option<String> {
+    if position > 1 {
+        return Some(format!(
+            "waiting for {} queued {} task(s) ahead",
+            position - 1,
+            kind.as_str()
+        ));
+    }
+    if running > 0 {
+        return Some(format!(
+            "waiting for running {} task to finish",
+            kind.as_str()
+        ));
+    }
+    None
 }
 
 async fn mark_task_started(
@@ -249,17 +319,15 @@ async fn mark_task_started(
     let state = Arc::clone(state);
     let task_id = task_id.clone();
     tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let started = pipeline.store().start_task(&task_id)?;
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let started = store.start_task(&task_id)?;
         if !started {
             return Ok(false);
         }
-        pipeline.store().insert_task_event(
-            &task_id,
-            "started",
-            "task started",
-            &serde_json::json!({}),
-        )?;
+        store.insert_task_event(&task_id, "started", "task started", &serde_json::json!({}))?;
         Ok::<_, anyhow::Error>(true)
     })
     .await
@@ -280,6 +348,66 @@ async fn ensure_task_started(
     ))
 }
 
+async fn try_mark_ingest_task_started(
+    state: &SharedState,
+    task_id: &TaskId,
+) -> Result<TaskStartOutcome, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    let task_id = task_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let task = store
+            .get_task(&task_id)?
+            .with_context(|| format!("task not found: {}", task_id.0))?;
+        if task.kind != TaskKind::Ingest {
+            bail!("task is not an ingest task: {}", task_id.0);
+        }
+        if task.status != TaskStatus::Queued {
+            return Ok(TaskStartOutcome::NotQueued);
+        }
+        if store.count_running_tasks(TaskKind::Ingest)? > 0 {
+            return Ok(TaskStartOutcome::BlockedByRunningIngest);
+        }
+        if !store.start_task_if_no_running(&task_id, TaskKind::Ingest)? {
+            return Ok(TaskStartOutcome::BlockedByRunningIngest);
+        }
+        store.insert_task_event(&task_id, "started", "task started", &serde_json::json!({}))?;
+        Ok::<_, anyhow::Error>(TaskStartOutcome::Started)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| {
+        if e.to_string().contains("task not found") {
+            err(StatusCode::NOT_FOUND, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })
+}
+
+async fn ensure_ingest_task_started(
+    state: &SharedState,
+    task_id: &TaskId,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    loop {
+        match try_mark_ingest_task_started(state, task_id).await? {
+            TaskStartOutcome::Started => return Ok(()),
+            TaskStartOutcome::BlockedByRunningIngest => {
+                tokio::time::sleep(TASK_WAIT_POLL_INTERVAL).await;
+            }
+            TaskStartOutcome::NotQueued => {
+                return Err(err(
+                    StatusCode::CONFLICT,
+                    anyhow::anyhow!("task was cancelled or already started before it could start"),
+                ));
+            }
+        }
+    }
+}
+
 async fn record_task_event(
     state: &SharedState,
     task_id: &TaskId,
@@ -291,10 +419,11 @@ async fn record_task_event(
     let task_id = task_id.clone();
     let message = message.into();
     tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline
-            .store()
-            .insert_task_event(&task_id, event_type, &message, &payload)?;
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        store.insert_task_event(&task_id, event_type, &message, &payload)?;
         Ok::<_, anyhow::Error>(())
     })
     .await
@@ -310,8 +439,11 @@ async fn record_task_span(
     let state = Arc::clone(state);
     let task_id = task_id.clone();
     tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().insert_task_span(
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        store.insert_task_span(
             &task_id,
             &timing.phase,
             &timing.started_at,
@@ -330,20 +462,31 @@ async fn finish_task_success(
     task_id: &TaskId,
     result: serde_json::Value,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
+    let state_for_task = Arc::clone(state);
+    let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if pipeline.store().finish_task_success(&task_id, &result)? {
-            pipeline
-                .store()
-                .insert_task_event(&task_id, "succeeded", "task succeeded", &result)?;
+    let should_wake_ingest_queue = tokio::task::spawn_blocking(move || {
+        let store = state_for_task
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let task = store.get_task(&task_id)?;
+        let should_wake_ingest_queue = task
+            .as_ref()
+            .is_some_and(|task| task.kind == TaskKind::Ingest);
+        let task_changed = store.finish_task_success(&task_id, &result)?;
+        if task_changed {
+            store.insert_task_event(&task_id, "succeeded", "task succeeded", &result)?;
         }
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if should_wake_ingest_queue {
+        schedule_ingest_queue(state_for_queue);
+    }
+    Ok(())
 }
 
 async fn finish_task_failed(
@@ -351,27 +494,37 @@ async fn finish_task_failed(
     task_id: &TaskId,
     error_message: &str,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
+    let state_for_task = Arc::clone(state);
+    let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
     let error_message = bounded_error(error_message);
-    tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if pipeline
-            .store()
-            .finish_task_failed(&task_id, &error_message)?
-        {
-            pipeline.store().insert_task_event(
+    let should_wake_ingest_queue = tokio::task::spawn_blocking(move || {
+        let store = state_for_task
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let task = store.get_task(&task_id)?;
+        let should_wake_ingest_queue = task
+            .as_ref()
+            .is_some_and(|task| task.kind == TaskKind::Ingest);
+        let task_changed = store.finish_task_failed(&task_id, &error_message)?;
+        if task_changed {
+            store.insert_task_event(
                 &task_id,
                 "failed",
                 "task failed",
                 &serde_json::json!({ "error": error_message }),
             )?;
         }
-        Ok::<_, anyhow::Error>(())
+        Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if should_wake_ingest_queue {
+        schedule_ingest_queue(state_for_queue);
+    }
+    Ok(())
 }
 
 async fn task_summary_response(
@@ -380,12 +533,15 @@ async fn task_summary_response(
 ) -> Result<TaskSummaryResponse, (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let task = pipeline
-            .store()
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let spans = pipeline.store().list_task_spans(&task_id)?;
+        let task = with_queue_details(&store, task)?;
+        let spans = store.list_task_spans(&task_id)?;
         Ok::<_, anyhow::Error>(TaskSummaryResponse { task, spans })
     })
     .await
@@ -407,16 +563,15 @@ async fn task_events_response(
 ) -> Result<TaskEventsResponse, (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline
-            .store()
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let events = pipeline.store().list_task_events(
-            &task_id,
-            after,
-            limit.unwrap_or(TASK_WAIT_EVENT_LIMIT),
-        )?;
+        let events =
+            store.list_task_events(&task_id, after, limit.unwrap_or(TASK_WAIT_EVENT_LIMIT))?;
         Ok::<_, anyhow::Error>(TaskEventsResponse { events })
     })
     .await
@@ -443,7 +598,13 @@ async fn ingest_all(
     let task_id = create_persisted_task(
         &state,
         TaskKind::Ingest,
-        ingest_request_metadata(None, query.force),
+        ingest_task_request_metadata_with_queue_claim(
+            None,
+            query.force,
+            query.embedding_profile_id.as_deref(),
+            query.vectors_only,
+            false,
+        ),
     )
     .await?;
     execute_ingest_task(
@@ -472,7 +633,13 @@ async fn ingest_one(
     let task_id = create_persisted_task(
         &state,
         TaskKind::Ingest,
-        ingest_request_metadata(Some(&id), false),
+        ingest_task_request_metadata_with_queue_claim(
+            Some(&id),
+            false,
+            query.embedding_profile_id.as_deref(),
+            query.vectors_only,
+            false,
+        ),
     )
     .await?;
     execute_ingest_task(
@@ -587,17 +754,16 @@ async fn submit_ingest_task(
     let task_id = create_persisted_task(
         &state,
         TaskKind::Ingest,
-        ingest_request_metadata(req.source_id.as_deref(), req.force),
+        ingest_task_request_metadata_with_queue_claim(
+            req.source_id.as_deref(),
+            req.force,
+            req.embedding_profile_id.as_deref(),
+            req.vectors_only,
+            true,
+        ),
     )
     .await?;
-    spawn_ingest_task(
-        state,
-        task_id.clone(),
-        req.source_id,
-        req.force,
-        req.embedding_profile_id,
-        req.vectors_only,
-    );
+    schedule_ingest_queue(Arc::clone(&state));
     Ok(Json(TaskCreatedResponse { task_id: task_id.0 }))
 }
 
@@ -624,6 +790,9 @@ async fn cancel_task_handler(
 ) -> Result<Json<TaskSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
     let task_id = TaskId(id);
     let changed = cancel_task_record(&state, &task_id).await?;
+    if changed {
+        schedule_ingest_queue(Arc::clone(&state));
+    }
     if !changed {
         let response = task_summary_response(&state, task_id.clone()).await?;
         if response.task.status.is_terminal() {
@@ -1072,25 +1241,156 @@ fn nonzero_control(name: &str, value: usize) -> Result<usize> {
     Ok(value)
 }
 
-fn spawn_ingest_task(
-    state: SharedState,
-    task_id: TaskId,
-    source_id: Option<String>,
-    force: bool,
-    embedding_profile_id: Option<String>,
-    vectors_only: bool,
-) {
+fn schedule_ingest_queue(state: SharedState) {
+    if state.ingest_queue_active.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
     tokio::spawn(async move {
-        let _ = execute_ingest_task(
-            state,
-            task_id,
-            source_id,
-            force,
-            embedding_profile_id,
-            vectors_only,
+        drain_ingest_queue(Arc::clone(&state)).await;
+        state.ingest_queue_active.store(false, Ordering::Release);
+        match ingest_queue_ready_to_drain(&state).await {
+            Ok(true) => schedule_ingest_queue(state),
+            Ok(false) => {}
+            Err(err) => tracing::error!(error = %err, "failed to inspect ingest queue"),
+        }
+    });
+}
+
+async fn drain_ingest_queue(state: SharedState) {
+    loop {
+        let task = match claim_startable_ingest_task(&state).await {
+            Ok(Some(task)) => task,
+            Ok(None) => break,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to claim queued ingest task");
+                break;
+            }
+        };
+        let task_id = task.id.clone();
+        let request = match parse_persisted_ingest_request(task.request) {
+            Ok(request) => request,
+            Err(err) => {
+                let _ = finish_task_failed(&state, &task_id, &err.to_string()).await;
+                continue;
+            }
+        };
+        let result = execute_started_ingest_task(
+            Arc::clone(&state),
+            &task_id,
+            request.source_id,
+            request.force,
+            request.embedding_profile_id,
+            request.vectors_only,
         )
         .await;
-    });
+        if let Err((_, Json(error))) = &result {
+            let _ = finish_task_failed(&state, &task_id, &error.error).await;
+        }
+    }
+}
+
+async fn claim_startable_ingest_task(
+    state: &SharedState,
+) -> Result<Option<verbatim_core::task::TaskSummary>> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        claim_next_queue_claimable_ingest_task(&store)
+    })
+    .await
+    .context("join ingest queue claim task")?
+}
+
+async fn ingest_queue_ready_to_drain(state: &SharedState) -> Result<bool> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok::<_, anyhow::Error>(
+            store.count_running_tasks(TaskKind::Ingest)? == 0
+                && next_queue_claimable_ingest_task(&store)?.is_some(),
+        )
+    })
+    .await
+    .context("join ingest queue readiness task")?
+}
+
+fn parse_persisted_ingest_request(request: serde_json::Value) -> Result<PersistedIngestRequest> {
+    let request: PersistedIngestRequest =
+        serde_json::from_value(request).context("parse queued ingest request")?;
+    if request.ingest_request_version != Some(1) {
+        bail!("queued ingest task is missing resumable request metadata; resubmit ingest");
+    }
+    if !request.queue_claimable.unwrap_or(true) {
+        bail!("foreground ingest task is not claimable by the background queue");
+    }
+    validate_ingest_controls(
+        request.source_id.as_deref(),
+        request.force,
+        request.embedding_profile_id.as_deref(),
+        request.vectors_only,
+    )?;
+    Ok(request)
+}
+
+fn next_queue_claimable_ingest_task(
+    store: &Store,
+) -> Result<Option<verbatim_core::task::TaskSummary>> {
+    for task in store.queued_tasks(TaskKind::Ingest)? {
+        if ingest_task_can_be_claimed_by_queue(&task.request) {
+            return Ok(Some(task));
+        }
+    }
+    Ok(None)
+}
+
+fn claim_next_queue_claimable_ingest_task(
+    store: &Store,
+) -> Result<Option<verbatim_core::task::TaskSummary>> {
+    let Some(task) = next_queue_claimable_ingest_task(store)? else {
+        return Ok(None);
+    };
+    if !store.start_task_if_no_running(&task.id, TaskKind::Ingest)? {
+        return Ok(None);
+    }
+    store.insert_task_event(&task.id, "started", "task started", &serde_json::json!({}))?;
+    store
+        .get_task(&task.id)?
+        .with_context(|| format!("claimed ingest task disappeared: {}", task.id.0))
+        .map(Some)
+}
+
+fn ingest_task_can_be_claimed_by_queue(request: &serde_json::Value) -> bool {
+    match serde_json::from_value::<PersistedIngestRequest>(request.clone()) {
+        Ok(request) => {
+            request.ingest_request_version != Some(1) || request.queue_claimable.unwrap_or(true)
+        }
+        Err(_) => true,
+    }
+}
+
+fn validate_ingest_controls(
+    source_id: Option<&str>,
+    force: bool,
+    embedding_profile_id: Option<&str>,
+    vectors_only: bool,
+) -> Result<()> {
+    if source_id.is_some() && force {
+        bail!("force is only supported for all-source ingest");
+    }
+    if vectors_only && force {
+        bail!("force is not supported for vectors-only embedding profile builds");
+    }
+    if embedding_profile_id.is_some() && !vectors_only {
+        bail!("embedding_profile_id is supported for vectors-only builds; set [embedding].profile_id for parse ingest");
+    }
+    Ok(())
 }
 
 async fn execute_ingest_task(
@@ -1101,19 +1401,42 @@ async fn execute_ingest_task(
     embedding_profile_id: Option<String>,
     vectors_only: bool,
 ) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
-    let result = execute_ingest_task_inner(
-        Arc::clone(&state),
-        &task_id,
-        source_id,
-        force,
-        embedding_profile_id,
-        vectors_only,
-    )
+    let result = async {
+        ensure_ingest_task_started(&state, &task_id).await?;
+        execute_started_ingest_task(
+            Arc::clone(&state),
+            &task_id,
+            source_id,
+            force,
+            embedding_profile_id,
+            vectors_only,
+        )
+        .await
+    }
     .await;
     if let Err((_, Json(error))) = &result {
         let _ = finish_task_failed(&state, &task_id, &error.error).await;
     }
     result
+}
+
+async fn execute_started_ingest_task(
+    state: SharedState,
+    task_id: &TaskId,
+    source_id: Option<String>,
+    force: bool,
+    embedding_profile_id: Option<String>,
+    vectors_only: bool,
+) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
+    execute_ingest_task_inner(
+        Arc::clone(&state),
+        task_id,
+        source_id,
+        force,
+        embedding_profile_id,
+        vectors_only,
+    )
+    .await
 }
 
 async fn execute_ingest_task_inner(
@@ -1124,7 +1447,6 @@ async fn execute_ingest_task_inner(
     embedding_profile_id: Option<String>,
     vectors_only: bool,
 ) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
-    ensure_task_started(&state, task_id).await?;
     if embedding_profile_id.is_some() && !vectors_only {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -1185,14 +1507,16 @@ async fn cancel_task_record(
     let state = Arc::clone(state);
     let task_id = task_id.clone();
     tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline
-            .store()
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let changed = pipeline.store().cancel_task(&task_id)?;
+        let changed = store.cancel_task(&task_id)?;
         if changed {
-            pipeline.store().insert_task_event(
+            store.insert_task_event(
                 &task_id,
                 "cancelled",
                 "task cancelled",
@@ -1220,14 +1544,17 @@ async fn task_wait_snapshot(
 ) -> Result<TaskWaitEvent, (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let task = pipeline
-            .store()
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let events = pipeline.store().list_task_events(&task_id, after, limit)?;
+        let task = with_queue_details(&store, task)?;
+        let events = store.list_task_events(&task_id, after, limit)?;
         let spans = if task.status.is_terminal() {
-            pipeline.store().list_task_spans(&task_id)?
+            store.list_task_spans(&task_id)?
         } else {
             Vec::new()
         };
@@ -1863,6 +2190,7 @@ async fn run_daemon() -> Result<()> {
     let config = Config::load().context("failed to load config")?;
     let data_dir = config::data_dir(&config);
     let pipeline = IngestPipeline::new(&config, &data_dir)?;
+    let task_store = Store::new(&data_dir.join("verbatim.db"))?;
     let generator = Generator::new(&config.chat, &config.verifier);
     let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
     let reranker = Some(OpenAiCompatibleReranker::from_config(&config.rerank));
@@ -1871,12 +2199,15 @@ async fn run_daemon() -> Result<()> {
 
     let state: SharedState = Arc::new(AppState {
         pipeline: std::sync::Mutex::new(pipeline),
+        task_store: std::sync::Mutex::new(task_store),
+        ingest_queue_active: AtomicBool::new(false),
         generator,
         embed_client,
         reranker,
         config,
         data_dir,
     });
+    schedule_ingest_queue(Arc::clone(&state));
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -2116,14 +2447,7 @@ mod tests {
         let source_id = pipeline.add_source(&source_path).unwrap();
         pipeline.ingest_source(&source_id).await.unwrap();
 
-        let state = Arc::new(AppState {
-            pipeline: std::sync::Mutex::new(pipeline),
-            generator: Generator::new(&config.chat, &config.verifier),
-            embed_client: OpenAiEmbeddingClient::new(&config.embedding),
-            reranker: Some(OpenAiCompatibleReranker::from_config(&config.rerank)),
-            config,
-            data_dir: test_dir.path().to_path_buf(),
-        });
+        let state = test_state(config, test_dir.path(), pipeline);
         let response = retrieve(
             State(state),
             Json(RetrieveRequest {
@@ -2154,6 +2478,207 @@ mod tests {
             .contains("Alpha retrieval evidence"));
         assert!(model_server.embedding_requests() >= 2);
         assert_eq!(model_server.chat_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_background_ingest_drains_after_running_ingest_finishes() {
+        let test_dir = TestDir::new("ingest-queue-drain");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let (running_id, queued_id) = blocked_ingest_pair(&state).await;
+        assert_queued_ingest_waits_for_running(&state, &queued_id).await;
+        schedule_ingest_queue(Arc::clone(&state));
+        wait_for_ingest_queue_idle(&state).await;
+
+        finish_task_success(&state, &running_id, ingest_result_metadata(0))
+            .await
+            .unwrap();
+
+        wait_for_task_status(&state, &queued_id, TaskStatus::Succeeded).await;
+        let events = task_events_response(&state, queued_id, None, Some(10))
+            .await
+            .unwrap()
+            .events;
+        assert!(events.iter().any(|event| event.event_type == "started"));
+        assert!(events.iter().any(|event| event.event_type == "succeeded"));
+    }
+
+    #[tokio::test]
+    async fn queued_background_ingest_drains_after_running_ingest_fails() {
+        let test_dir = TestDir::new("ingest-queue-drain-after-failure");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let (running_id, queued_id) = blocked_ingest_pair(&state).await;
+        assert_queued_ingest_waits_for_running(&state, &queued_id).await;
+        schedule_ingest_queue(Arc::clone(&state));
+        wait_for_ingest_queue_idle(&state).await;
+
+        finish_task_failed(&state, &running_id, "foreground ingest failed")
+            .await
+            .unwrap();
+
+        wait_for_task_status(&state, &queued_id, TaskStatus::Succeeded).await;
+        let events = task_events_response(&state, queued_id, None, Some(10))
+            .await
+            .unwrap()
+            .events;
+        assert!(events.iter().any(|event| event.event_type == "started"));
+        assert!(events.iter().any(|event| event.event_type == "succeeded"));
+    }
+
+    #[tokio::test]
+    async fn background_queue_does_not_claim_foreground_ingest_task() {
+        let test_dir = TestDir::new("foreground-ingest-not-claimed");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let foreground_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+
+        schedule_ingest_queue(Arc::clone(&state));
+        wait_for_ingest_queue_idle(&state).await;
+
+        let foreground = task_summary_response(&state, foreground_id.clone())
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(foreground.status, TaskStatus::Queued);
+        let response = execute_ingest_task(
+            Arc::clone(&state),
+            foreground_id.clone(),
+            None,
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.ingested, 0);
+        wait_for_task_status(&state, &foreground_id, TaskStatus::Succeeded).await;
+    }
+
+    #[tokio::test]
+    async fn background_queue_skips_unclaimable_foreground_head() {
+        let test_dir = TestDir::new("foreground-head-does-not-starve-background");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let foreground_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        let background_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, true),
+        )
+        .await
+        .unwrap();
+
+        schedule_ingest_queue(Arc::clone(&state));
+
+        wait_for_task_status(&state, &background_id, TaskStatus::Succeeded).await;
+        let foreground = task_summary_response(&state, foreground_id)
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(foreground.status, TaskStatus::Queued);
+        assert_eq!(running_ingest_count(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn foreground_start_waits_when_background_claimed_behind_unclaimable_head() {
+        let test_dir = TestDir::new("foreground-start-waits-after-background-claim");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let foreground_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        let background_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, true),
+        )
+        .await
+        .unwrap();
+
+        let claimed = claim_startable_ingest_task(&state).await.unwrap().unwrap();
+        assert_eq!(claimed.id, background_id);
+        let foreground_start = try_mark_ingest_task_started(&state, &foreground_id)
+            .await
+            .unwrap();
+
+        assert_eq!(foreground_start, TaskStartOutcome::BlockedByRunningIngest);
+        assert_eq!(running_ingest_count(&state).await, 1);
+        assert_queued_ingest_waits_for_running(&state, &foreground_id).await;
+
+        finish_task_success(&state, &background_id, ingest_result_metadata(0))
+            .await
+            .unwrap();
+        ensure_ingest_task_started(&state, &foreground_id)
+            .await
+            .unwrap();
+
+        assert_eq!(running_ingest_count(&state).await, 1);
+        finish_task_success(&state, &foreground_id, ingest_result_metadata(0))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_queue_claim_waits_when_foreground_starts_after_candidate_selection() {
+        let test_dir = TestDir::new("foreground-starts-before-background-claim");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let background_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, true),
+        )
+        .await
+        .unwrap();
+        {
+            let store = state.task_store.lock().unwrap();
+            let candidate = next_queue_claimable_ingest_task(&store).unwrap().unwrap();
+            assert_eq!(candidate.id, background_id);
+        }
+        let foreground_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &foreground_id)
+            .await
+            .unwrap();
+
+        let claimed = claim_startable_ingest_task(&state).await.unwrap();
+        assert!(claimed.is_none());
+        assert_queued_ingest_waits_for_running(&state, &background_id).await;
+
+        finish_task_success(&state, &foreground_id, ingest_result_metadata(0))
+            .await
+            .unwrap();
+
+        wait_for_task_status(&state, &background_id, TaskStatus::Succeeded).await;
     }
 
     fn test_retrieval_result(
@@ -2228,6 +2753,90 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn test_state(config: Config, data_dir: &FsPath, pipeline: IngestPipeline) -> SharedState {
+        Arc::new(AppState {
+            pipeline: std::sync::Mutex::new(pipeline),
+            task_store: std::sync::Mutex::new(Store::new(&data_dir.join("verbatim.db")).unwrap()),
+            ingest_queue_active: AtomicBool::new(false),
+            generator: Generator::new(&config.chat, &config.verifier),
+            embed_client: OpenAiEmbeddingClient::new(&config.embedding),
+            reranker: Some(OpenAiCompatibleReranker::from_config(&config.rerank)),
+            config,
+            data_dir: data_dir.to_path_buf(),
+        })
+    }
+
+    async fn blocked_ingest_pair(state: &SharedState) -> (TaskId, TaskId) {
+        let running_id = create_persisted_task(
+            state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(state, &running_id)
+            .await
+            .unwrap();
+        let queued_id = create_persisted_task(
+            state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, true),
+        )
+        .await
+        .unwrap();
+        (running_id, queued_id)
+    }
+
+    async fn assert_queued_ingest_waits_for_running(state: &SharedState, queued_id: &TaskId) {
+        let queued = task_summary_response(state, queued_id.clone())
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(queued.status, TaskStatus::Queued);
+        assert_eq!(queued.queue_position, Some(1));
+        assert_eq!(
+            queued.blocking_reason.as_deref(),
+            Some("waiting for running ingest task to finish")
+        );
+    }
+
+    async fn running_ingest_count(state: &SharedState) -> usize {
+        let state = Arc::clone(state);
+        tokio::task::spawn_blocking(move || {
+            let store = state.task_store.lock().unwrap();
+            store.count_running_tasks(TaskKind::Ingest).unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn wait_for_ingest_queue_idle(state: &SharedState) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.ingest_queue_active.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn wait_for_task_status(state: &SharedState, task_id: &TaskId, status: TaskStatus) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let task = task_summary_response(state, task_id.clone())
+                    .await
+                    .unwrap()
+                    .task;
+                if task.status == status {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     struct MockModelServer {

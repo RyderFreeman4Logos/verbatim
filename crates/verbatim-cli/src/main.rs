@@ -1244,6 +1244,8 @@ mod tests {
                 request: serde_json::json!({"question_chars": 14}),
                 result: Some(serde_json::json!({"citation_count": 1})),
                 error: None,
+                queue_position: None,
+                blocking_reason: None,
             },
             spans: vec![TaskSpan {
                 sequence: 1,
