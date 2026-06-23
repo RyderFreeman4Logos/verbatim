@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{
@@ -21,6 +22,7 @@ use crate::types::{
 use crate::vision_caption::{CaptionAttempt, ImageCaption, ImageCaptionRecord, ImageCaptionStatus};
 
 const LEGACY_EMBEDDING_PROFILE_CONFIG_HASH: &str = "legacy";
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Store {
     conn: Connection,
@@ -52,6 +54,7 @@ pub struct EmbeddingProfileConfig<'a> {
 impl Store {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -59,6 +62,7 @@ impl Store {
 
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -1081,6 +1085,8 @@ impl Store {
             request,
             result: None,
             error: None,
+            queue_position: None,
+            blocking_reason: None,
         })
     }
 
@@ -1109,6 +1115,99 @@ impl Store {
             ],
         )?;
         Ok(changed > 0)
+    }
+
+    pub fn start_task_if_no_running(&self, task_id: &TaskId, kind: TaskKind) -> Result<bool> {
+        let now = unix_timestamp_string();
+        let changed = self.conn.execute(
+            "UPDATE tasks
+             SET status = ?2, started_at = COALESCE(started_at, ?3), updated_at = ?3
+             WHERE id = ?1
+               AND kind = ?4
+               AND status = ?5
+               AND NOT EXISTS (
+                   SELECT 1 FROM tasks
+                   WHERE kind = ?4 AND status = ?2
+               )",
+            params![
+                &task_id.0,
+                TaskStatus::Running.as_str(),
+                now,
+                kind.as_str(),
+                TaskStatus::Queued.as_str(),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn count_running_tasks(&self, kind: TaskKind) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE kind = ?1 AND status = ?2",
+            params![kind.as_str(), TaskStatus::Running.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(count.try_into().unwrap_or(usize::MAX))
+    }
+
+    pub fn next_queued_task(&self, kind: TaskKind) -> Result<Option<TaskSummary>> {
+        self.conn
+            .prepare(
+                "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error
+                 FROM tasks
+                 WHERE kind = ?1 AND status = ?2
+                 ORDER BY created_at, id
+                 LIMIT 1",
+            )?
+            .query_row(
+                params![kind.as_str(), TaskStatus::Queued.as_str()],
+                row_to_task_summary,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn queued_tasks(&self, kind: TaskKind) -> Result<Vec<TaskSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error
+             FROM tasks
+             WHERE kind = ?1 AND status = ?2
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(
+            params![kind.as_str(), TaskStatus::Queued.as_str()],
+            row_to_task_summary,
+        )?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn queued_task_position(&self, task_id: &TaskId) -> Result<Option<usize>> {
+        let task = self
+            .conn
+            .prepare("SELECT kind, status, created_at FROM tasks WHERE id = ?1")?
+            .query_row(params![&task_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?;
+        let Some((kind, status, created_at)) = task else {
+            return Ok(None);
+        };
+        if status != TaskStatus::Queued.as_str() {
+            return Ok(None);
+        }
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM tasks
+             WHERE kind = ?1
+               AND status = ?2
+               AND (created_at < ?3 OR (created_at = ?3 AND id <= ?4))",
+            params![kind, TaskStatus::Queued.as_str(), created_at, &task_id.0,],
+            |row| row.get(0),
+        )?;
+        Ok(Some(count.try_into().unwrap_or(usize::MAX)))
     }
 
     pub fn finish_task_success(
@@ -1291,6 +1390,8 @@ fn row_to_task_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSummary>
         request,
         result,
         error: row.get(9)?,
+        queue_position: None,
+        blocking_reason: None,
     })
 }
 

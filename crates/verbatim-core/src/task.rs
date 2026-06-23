@@ -118,6 +118,10 @@ pub struct TaskSummary {
     pub request: Value,
     pub result: Option<Value>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,9 +248,38 @@ pub fn retrieve_result_metadata(
 }
 
 pub fn ingest_request_metadata(source_id: Option<&str>, force: bool) -> Value {
+    ingest_task_request_metadata(source_id, force, None, false)
+}
+
+pub fn ingest_task_request_metadata(
+    source_id: Option<&str>,
+    force: bool,
+    embedding_profile_id: Option<&str>,
+    vectors_only: bool,
+) -> Value {
+    ingest_task_request_metadata_with_queue_claim(
+        source_id,
+        force,
+        embedding_profile_id,
+        vectors_only,
+        false,
+    )
+}
+
+pub fn ingest_task_request_metadata_with_queue_claim(
+    source_id: Option<&str>,
+    force: bool,
+    embedding_profile_id: Option<&str>,
+    vectors_only: bool,
+    queue_claimable: bool,
+) -> Value {
     bounded_json(json!({
+        "ingest_request_version": 1,
         "source_id": source_id,
         "force": force,
+        "embedding_profile_id": embedding_profile_id,
+        "vectors_only": vectors_only,
+        "queue_claimable": queue_claimable,
     }))
 }
 

@@ -92,6 +92,12 @@ where
     writeln!(writer, "Task: {}", task.id.0)?;
     writeln!(writer, "  kind: {}", task.kind.as_str())?;
     writeln!(writer, "  status: {}", task.status.as_str())?;
+    if let Some(position) = task.queue_position {
+        writeln!(writer, "  queue_position: {position}")?;
+    }
+    if let Some(reason) = &task.blocking_reason {
+        writeln!(writer, "  blocking_reason: {reason}")?;
+    }
     writeln!(writer, "  created_at: {}", task.created_at)?;
     if let Some(started_at) = &task.started_at {
         writeln!(writer, "  started_at: {started_at}")?;
