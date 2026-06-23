@@ -237,6 +237,10 @@ pub fn write_ask_response<W>(writer: &mut W, response: &AskResponse) -> std::io:
 where
     W: Write,
 {
+    if let Some(context) = &response.context {
+        return write_retrieve_response(writer, context);
+    }
+
     writeln!(writer, "{}", response.answer)?;
     write_citations(writer, &response.citations)?;
 
@@ -286,28 +290,32 @@ where
     }
 
     if response.results.is_empty() {
-        return writeln!(writer, "No retrieval results on this page.");
+        writeln!(writer, "No retrieval results on this page.")?;
+    } else {
+        writeln!(writer)?;
+        writeln!(writer, "Results:")?;
+        for result in &response.results {
+            writeln!(
+                writer,
+                "  [{}] {} score={:.4} evidence={} kind={} role={} source={}",
+                result.index,
+                result.label,
+                result.score,
+                result.evidence_id,
+                result.kind,
+                result.role,
+                result.source_id
+            )?;
+            if let Some(source_path) = &result.source_path {
+                writeln!(writer, "      source_path: {source_path}")?;
+            }
+            writeln!(writer, "      locator: {}", result.locator)?;
+            writeln!(writer, "      snippet: {}", result.snippet)?;
+        }
     }
 
-    writeln!(writer)?;
-    writeln!(writer, "Results:")?;
-    for result in &response.results {
-        writeln!(
-            writer,
-            "  [{}] {} score={:.4} evidence={} kind={} role={} source={}",
-            result.index,
-            result.label,
-            result.score,
-            result.evidence_id,
-            result.kind,
-            result.role,
-            result.source_id
-        )?;
-        if let Some(source_path) = &result.source_path {
-            writeln!(writer, "      source_path: {source_path}")?;
-        }
-        writeln!(writer, "      locator: {}", result.locator)?;
-        writeln!(writer, "      snippet: {}", result.snippet)?;
+    if let Some(debug) = &response.debug {
+        write_retrieval_debug_typed(writer, debug)?;
     }
 
     Ok(())

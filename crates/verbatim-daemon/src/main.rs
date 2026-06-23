@@ -771,6 +771,7 @@ async fn ask(
             req.source_id.as_deref(),
             req.embedding_profile_id.as_deref(),
             req.show_retrieval,
+            req.context_only,
         ),
     )
     .await?;
@@ -790,6 +791,7 @@ async fn ask_stream(
             req.source_id.as_deref(),
             req.embedding_profile_id.as_deref(),
             req.show_retrieval,
+            req.context_only,
         ),
     )
     .await
@@ -825,6 +827,7 @@ async fn submit_ask_task(
             req.source_id.as_deref(),
             req.embedding_profile_id.as_deref(),
             req.show_retrieval,
+            req.context_only,
         ),
     )
     .await?;
@@ -1093,6 +1096,10 @@ async fn execute_ask_task_inner(
     task_id: &TaskId,
     req: AskRequest,
 ) -> Result<AskResponse, (StatusCode, Json<ErrorResponse>)> {
+    if req.context_only {
+        return execute_context_only_ask_task_inner(state, task_id, req).await;
+    }
+
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
@@ -1160,6 +1167,7 @@ async fn execute_ask_task_inner(
             .collect(),
         verified: gen_result.verified,
         retrieval: retrieval_debug,
+        context: None,
     };
     finish_task_success(
         &state,
@@ -1194,6 +1202,13 @@ async fn execute_ask_stream_task_inner(
     req: AskRequest,
     tx: mpsc::Sender<Event>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if req.context_only {
+        let response =
+            execute_context_only_ask_task_inner(Arc::clone(&state), task_id, req).await?;
+        send_stream_event(&tx, sse_json_event("answer", &response)).await?;
+        return Ok(());
+    }
+
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
@@ -1291,6 +1306,42 @@ async fn execute_ask_stream_task_inner(
     )
     .await?;
     Ok(())
+}
+
+async fn execute_context_only_ask_task_inner(
+    state: SharedState,
+    task_id: &TaskId,
+    req: AskRequest,
+) -> Result<AskResponse, (StatusCode, Json<ErrorResponse>)> {
+    let retrieve_req = context_only_retrieve_request(req);
+    let controls = resolve_retrieve_controls(&retrieve_req, &state.config)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let context = execute_retrieve_task_inner(state, task_id, retrieve_req, controls).await?;
+    Ok(AskResponse {
+        answer: String::new(),
+        citations: Vec::new(),
+        verified: false,
+        retrieval: None,
+        context: Some(context),
+    })
+}
+
+fn context_only_retrieve_request(req: AskRequest) -> RetrieveRequest {
+    RetrieveRequest {
+        question: req.question,
+        source_id: req.source_id,
+        embedding_profile_id: req.embedding_profile_id,
+        limit: None,
+        page_size: None,
+        page: None,
+        fast: false,
+        rerank: None,
+        dense_top_k: None,
+        bm25_top_k: None,
+        rerank_top_n: None,
+        include_debug: req.show_retrieval,
+        include_locator: true,
+    }
 }
 
 fn spawn_ask_task(state: SharedState, task_id: TaskId, req: AskRequest) {
@@ -2671,6 +2722,7 @@ mod tests {
         assert_eq!(req.question, "What is cited?");
         assert!(req.source_id.is_none());
         assert!(!req.show_retrieval);
+        assert!(!req.context_only);
     }
 
     #[test]
@@ -2680,6 +2732,7 @@ mod tests {
             citations: Vec::new(),
             verified: false,
             retrieval: None,
+            context: None,
         };
 
         let encoded = serde_json::to_value(response).unwrap();
@@ -2708,6 +2761,7 @@ mod tests {
                 reranker: verbatim_core::types::RetrievalRerankDebug::disabled(),
                 final_evidence_pack: Vec::new(),
             }),
+            context: None,
         };
 
         let encoded = serde_json::to_string(&response).unwrap();
@@ -2888,6 +2942,54 @@ mod tests {
         assert!(response.results[0]
             .snippet
             .contains("Alpha retrieval evidence"));
+        assert!(model_server.embedding_requests() >= 2);
+        assert_eq!(model_server.chat_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn ask_context_only_returns_context_pack_when_chat_is_disabled_and_unavailable() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("ask-context-only-chat-disabled");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Beta retrieval evidence answers the context-only ask question.",
+        )
+        .unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        assert!(!config.chat.enabled);
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+
+        let state = test_state(config, test_dir.path(), pipeline);
+        let response = ask(
+            State(state),
+            Json(AskRequest {
+                question: "Beta context-only question?".into(),
+                source_id: Some(source_id.0.clone()),
+                embedding_profile_id: None,
+                show_retrieval: false,
+                context_only: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response.answer.is_empty());
+        assert!(response.citations.is_empty());
+        assert!(!response.verified);
+        assert!(response.retrieval.is_none());
+        let context = response.context.expect("context pack");
+        assert_eq!(context.source_id.as_deref(), Some(source_id.0.as_str()));
+        assert_eq!(context.returned_results, 1);
+        assert_eq!(context.results[0].label, "E1");
+        assert!(context.results[0]
+            .snippet
+            .contains("Beta retrieval evidence"));
+        assert!(context.results[0].structured_locator.is_some());
         assert!(model_server.embedding_requests() >= 2);
         assert_eq!(model_server.chat_requests(), 0);
     }

@@ -96,6 +96,20 @@ fn rerank_override(rerank: bool, no_rerank: bool) -> Option<bool> {
     }
 }
 
+fn write_retrieve_with_format<W>(
+    stdout: &mut W,
+    response: &verbatim_core::api::RetrieveResponse,
+    format: RetrieveFormat,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    match format {
+        RetrieveFormat::Markdown => render::write_retrieve_response(stdout, response),
+        RetrieveFormat::Json => render::write_retrieve_json(stdout, response),
+    }
+}
+
 fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -171,13 +185,52 @@ where
             source_id,
             embedding_profile,
             show_retrieval,
+            context_only,
+            no_generate,
+            format,
             background,
         } => {
+            let context_only = context_only || no_generate;
+            let question = question.join(" ");
+            if context_only {
+                if background {
+                    return Err(CliError::Api(
+                        "--background is not supported with --context-only".into(),
+                    ));
+                }
+                let format = format.unwrap_or(RetrieveFormat::Markdown);
+                let request = RetrieveRequest {
+                    question,
+                    source_id,
+                    embedding_profile_id: embedding_profile,
+                    limit: None,
+                    page_size: None,
+                    page: None,
+                    fast: false,
+                    rerank: None,
+                    dense_top_k: None,
+                    bm25_top_k: None,
+                    rerank_top_n: None,
+                    include_debug: show_retrieval,
+                    include_locator: format == RetrieveFormat::Json,
+                };
+                let response = client.retrieve(&request)?;
+                write_retrieve_with_format(stdout, &response, format)?;
+                return Ok(0);
+            }
+
+            if format.is_some() {
+                return Err(CliError::Api(
+                    "--format is only supported with --context-only or --no-generate".into(),
+                ));
+            }
+
             let request = AskRequest {
-                question: question.join(" "),
+                question,
                 source_id,
                 embedding_profile_id: embedding_profile,
                 show_retrieval,
+                context_only: false,
             };
             if background {
                 let response = client.submit_ask_task(&request)?;
@@ -222,10 +275,7 @@ where
                 include_locator,
             };
             let response = client.retrieve(&request)?;
-            match format {
-                RetrieveFormat::Text => render::write_retrieve_response(stdout, &response)?,
-                RetrieveFormat::Json => render::write_retrieve_json(stdout, &response)?,
-            }
+            write_retrieve_with_format(stdout, &response, format)?;
             Ok(0)
         }
         Commands::Evidence { eid } => {
@@ -407,7 +457,7 @@ enum Commands {
         #[arg(long)]
         background: bool,
     },
-    /// Generate an answer through the configured chat model and stream it.
+    /// Generate an answer through chat, or return a context pack with --context-only.
     Ask {
         /// Restrict retrieval to one source.
         #[arg(short = 's', long = "source-id")]
@@ -418,6 +468,15 @@ enum Commands {
         /// Show retrieval provenance and ranking debug output.
         #[arg(long)]
         show_retrieval: bool,
+        /// Return a retrieval context pack instead of invoking chat generation.
+        #[arg(long = "context-only", action = ArgAction::SetTrue)]
+        context_only: bool,
+        /// Alias for --context-only.
+        #[arg(long = "no-generate", action = ArgAction::SetTrue)]
+        no_generate: bool,
+        /// Context-only output format. JSON includes structured locator/provenance fields.
+        #[arg(long, value_enum)]
+        format: Option<RetrieveFormat>,
         /// Queue ask as a persistent daemon task and return immediately.
         #[arg(long)]
         background: bool,
@@ -467,7 +526,7 @@ enum Commands {
         #[arg(long = "show-locator")]
         show_locator: bool,
         /// Output format. JSON includes structured locator/provenance fields.
-        #[arg(long, value_enum, default_value = "text")]
+        #[arg(long, value_enum, default_value = "markdown")]
         format: RetrieveFormat,
         /// Question text.
         #[arg(required = true, num_args = 1..)]
@@ -574,7 +633,8 @@ enum TaskCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum RetrieveFormat {
-    Text,
+    #[value(alias = "text")]
+    Markdown,
     Json,
 }
 
@@ -640,6 +700,24 @@ mod tests {
             assert!(stdout.contains("Usage:"), "stdout: {stdout}");
             assert!(stderr.is_empty(), "stderr: {stderr}");
         }
+    }
+
+    #[test]
+    fn ask_and_retrieve_help_distinguish_generation_from_context_only() {
+        let (code, ask_help, stderr, _, _) = run_mock(["ask", "--help"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(ask_help.contains("Generate an answer through chat"));
+        assert!(ask_help.contains("--context-only"));
+        assert!(ask_help.contains("--no-generate"));
+        assert!(ask_help.contains("--format"));
+
+        let (code, retrieve_help, stderr, _, _) = run_mock(["retrieve", "--help"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(retrieve_help.contains("without invoking chat generation"));
+        assert!(retrieve_help.contains("markdown"));
+        assert!(retrieve_help.contains("json"));
     }
 
     #[test]
@@ -711,6 +789,7 @@ mod tests {
                 source_id: Some("src-1".into()),
                 embedding_profile_id: None,
                 show_retrieval: false,
+                context_only: false,
             }
         );
         assert_eq!(client.calls.borrow().as_slice(), ["submit_ask_task"]);
@@ -765,6 +844,7 @@ mod tests {
                 source_id: Some("src-1".into()),
                 embedding_profile_id: None,
                 show_retrieval: true,
+                context_only: false,
             }
         );
         assert!(stdout.contains("Answer [E1]."));
@@ -853,6 +933,98 @@ mod tests {
     }
 
     #[test]
+    fn retrieve_markdown_show_debug_renders_retrieval_debug() {
+        let (code, stdout, stderr, client, _) = run_mock([
+            "retrieve",
+            "--show-debug",
+            "--format",
+            "markdown",
+            "What",
+            "is",
+            "cited?",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(client.calls.borrow().as_slice(), ["retrieve"]);
+        assert!(
+            client
+                .last_retrieve
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .include_debug
+        );
+        assert!(stdout.contains("Context pack: task-1"));
+        assert!(stdout.contains("Retrieval Debug"));
+        assert!(stdout.contains("Final evidence pack:"));
+    }
+
+    #[test]
+    fn ask_context_only_renders_markdown_context_pack_without_generation() {
+        let (code, stdout, stderr, client, _) = run_mock([
+            "ask",
+            "--context-only",
+            "--show-retrieval",
+            "-s",
+            "src-1",
+            "What",
+            "is",
+            "cited?",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(client.calls.borrow().as_slice(), ["retrieve"]);
+        assert!(client.last_ask.borrow().is_none());
+        assert_eq!(
+            client.last_retrieve.borrow().as_ref().unwrap(),
+            &RetrieveRequest {
+                question: "What is cited?".into(),
+                source_id: Some("src-1".into()),
+                embedding_profile_id: None,
+                limit: None,
+                page_size: None,
+                page: None,
+                fast: false,
+                rerank: None,
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: true,
+                include_locator: false,
+            }
+        );
+        assert!(stdout.contains("Context pack: task-1"));
+        assert!(stdout.contains("snippet: compact cited text"));
+        assert!(stdout.contains("Retrieval Debug"));
+        assert!(stdout.contains("Final evidence pack:"));
+    }
+
+    #[test]
+    fn ask_no_generate_json_requests_structured_context_pack() {
+        let (code, stdout, stderr, client, _) = run_mock([
+            "ask",
+            "--no-generate",
+            "--format",
+            "json",
+            "What",
+            "is",
+            "cited?",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(client.calls.borrow().as_slice(), ["retrieve"]);
+        let request = client.last_retrieve.borrow();
+        let request = request.as_ref().unwrap();
+        assert!(request.include_locator);
+        assert!(!request.include_debug);
+        assert!(stdout.contains("\"results\""));
+        assert!(stdout.contains("\"structured_locator\""));
+    }
+
+    #[test]
     fn embedding_profile_flags_are_plumbed() {
         let (code, _, stderr, client, _) = run_mock([
             "ingest",
@@ -880,6 +1052,7 @@ mod tests {
                 source_id: None,
                 embedding_profile_id: Some("alt".into()),
                 show_retrieval: false,
+                context_only: false,
             }
         );
         assert!(stderr.is_empty());
