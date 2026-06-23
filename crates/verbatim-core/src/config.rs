@@ -770,6 +770,9 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("VERBATIM_CONFIG") {
+        return PathBuf::from(path);
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
         .join("verbatim")
@@ -802,6 +805,207 @@ impl Config {
         let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
         redact_secrets(&mut value);
         value
+    }
+
+    pub fn reload_plan(&self, candidate: &Self) -> Result<ConfigReloadPlan> {
+        let previous = serde_json::to_value(self).context("serialize active config")?;
+        let next = serde_json::to_value(candidate).context("serialize candidate config")?;
+        let mut changed_keys = Vec::new();
+        collect_changed_config_keys("", &previous, &next, &mut changed_keys);
+        changed_keys.sort();
+
+        let mut reload_safe_keys = Vec::new();
+        let mut restart_required_keys = Vec::new();
+        for key in changed_keys {
+            if is_reload_safe_key(&key) {
+                reload_safe_keys.push(key);
+            } else {
+                restart_required_keys.push(ConfigRestartRequiredKey {
+                    key: key.clone(),
+                    reason: restart_required_reason(&key).to_string(),
+                });
+            }
+        }
+
+        Ok(ConfigReloadPlan {
+            reload_safe_keys,
+            restart_required_keys,
+        })
+    }
+
+    pub fn apply_reload_safe_changes(&self, candidate: &Self) -> Self {
+        let mut next = self.clone();
+
+        next.embedding.base_url = candidate.embedding.base_url.clone();
+        next.embedding.batch_size = candidate.embedding.batch_size;
+        next.embedding.timeout_seconds = candidate.embedding.timeout_seconds;
+        next.embedding.api_key = candidate.embedding.api_key.clone();
+
+        next.retrieval = candidate.retrieval.clone();
+
+        next.graph.enabled = candidate.graph.enabled;
+        next.graph.max_hops = candidate.graph.max_hops;
+        next.graph.max_expanded_chunks = candidate.graph.max_expanded_chunks;
+        next.graph.max_neighbors_per_seed = candidate.graph.max_neighbors_per_seed;
+        next.graph.edge_types = candidate.graph.edge_types.clone();
+        next.graph.global_search = candidate.graph.global_search.clone();
+
+        next.rerank = candidate.rerank.clone();
+        next.context = candidate.context.clone();
+        next.vision = candidate.vision.clone();
+        next.chat = candidate.chat.clone();
+        next.verifier = candidate.verifier.clone();
+        next.cli = candidate.cli.clone();
+
+        next
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReloadPlan {
+    #[serde(default)]
+    pub reload_safe_keys: Vec<String>,
+    #[serde(default)]
+    pub restart_required_keys: Vec<ConfigRestartRequiredKey>,
+}
+
+impl ConfigReloadPlan {
+    pub fn has_reload_safe_changes(&self) -> bool {
+        !self.reload_safe_keys.is_empty()
+    }
+
+    pub fn has_restart_required_changes(&self) -> bool {
+        !self.restart_required_keys.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigRestartRequiredKey {
+    pub key: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReloadMetadata {
+    pub active_config_path: String,
+    pub loaded_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reload_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reload_error: Option<String>,
+    #[serde(default)]
+    pub last_applied_reload_safe_keys: Vec<String>,
+    #[serde(default)]
+    pub last_restart_required_keys: Vec<ConfigRestartRequiredKey>,
+}
+
+fn collect_changed_config_keys(
+    prefix: &str,
+    previous: &serde_json::Value,
+    next: &serde_json::Value,
+    changed_keys: &mut Vec<String>,
+) {
+    match (previous, next) {
+        (serde_json::Value::Object(previous_map), serde_json::Value::Object(next_map)) => {
+            let mut keys = previous_map
+                .keys()
+                .chain(next_map.keys())
+                .collect::<Vec<_>>();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                let child_prefix = if prefix.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                collect_changed_config_keys(
+                    &child_prefix,
+                    previous_map.get(key).unwrap_or(&serde_json::Value::Null),
+                    next_map.get(key).unwrap_or(&serde_json::Value::Null),
+                    changed_keys,
+                );
+            }
+        }
+        _ if previous != next => changed_keys.push(prefix.to_string()),
+        _ => {}
+    }
+}
+
+fn is_reload_safe_key(key: &str) -> bool {
+    matches!(
+        key,
+        "embedding.base_url"
+            | "embedding.batch_size"
+            | "embedding.timeout_seconds"
+            | "embedding.api_key"
+            | "retrieval.dense_top_k"
+            | "retrieval.bm25_top_k"
+            | "retrieval.rrf_k"
+            | "retrieval.default_limit"
+            | "retrieval.default_page_size"
+            | "graph.enabled"
+            | "graph.max_hops"
+            | "graph.max_expanded_chunks"
+            | "graph.max_neighbors_per_seed"
+            | "graph.edge_types"
+            | "graph.global_search.enabled"
+            | "graph.global_search.max_communities"
+            | "graph.global_search.max_report_claims"
+            | "graph.global_search.max_report_chars"
+            | "graph.global_search.max_evidence_per_report"
+            | "graph.global_search.max_search_results"
+            | "graph.global_search.drift.enabled"
+            | "graph.global_search.drift.max_subqueries"
+            | "rerank.enabled"
+            | "rerank.provider"
+            | "rerank.base_url"
+            | "rerank.model"
+            | "rerank.top_n"
+            | "rerank.timeout_seconds"
+            | "rerank.api_key"
+            | "context.enabled"
+            | "vision.enabled"
+            | "vision.provider"
+            | "vision.base_url"
+            | "vision.model"
+            | "vision.temperature"
+            | "vision.timeout_seconds"
+            | "vision.api_key"
+            | "chat.enabled"
+            | "chat.provider"
+            | "chat.base_url"
+            | "chat.model"
+            | "chat.temperature"
+            | "chat.timeout_seconds"
+            | "chat.api_key"
+            | "chat.vision_attachments.enabled"
+            | "chat.vision_attachments.model_supports_vision"
+            | "chat.vision_attachments.max_images"
+            | "chat.vision_attachments.max_total_bytes"
+            | "chat.vision_attachments.detail"
+            | "verifier.enabled"
+            | "cli.task_wait_timeout_seconds"
+    )
+}
+
+fn restart_required_reason(key: &str) -> &'static str {
+    if key == "daemon.bind" {
+        "daemon bind address is only read when the listener starts; restart verbatim-daemon to bind a new address"
+    } else if key.starts_with("store.") {
+        "store path selects persisted SQLite, vector, and lexical index data; restart with an explicit data migration or reindex plan"
+    } else if key.starts_with("embedding.") {
+        "embedding profile identity or vector semantics changed; rebuild vectors for a new profile before using this setting"
+    } else if key.starts_with("parser.") {
+        "parser and artifact settings affect persisted extracted data; reingest or restart with an explicit migration plan"
+    } else if key.starts_with("graph.extraction.") {
+        "graph extraction settings affect persisted graph data; reingest before treating the change as active"
+    } else if key.starts_with("ocr.") {
+        "OCR settings affect persisted OCR-derived text; reingest before treating the change as active"
+    } else if key.starts_with("qdrant.") {
+        "Qdrant settings affect external vector index integration; restart or reindex with the new target"
+    } else {
+        "setting is not reload-safe in this version; restart verbatim-daemon to apply it"
     }
 }
 
@@ -1322,5 +1526,58 @@ model_supports_vision = true
         assert_eq!(value["token"], "<redacted>");
         assert_eq!(value["headers"]["authorization"], "<redacted>");
         assert_eq!(value["headers"]["x_request_id"], "safe");
+    }
+
+    #[test]
+    fn reload_plan_classifies_runtime_safe_changes() {
+        let current: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        let mut candidate = current.clone();
+        candidate.retrieval.dense_top_k = 24;
+        candidate.chat.timeout_seconds = 30;
+        candidate.embedding.base_url = "http://127.0.0.1:18002/v1".into();
+
+        let plan = current.reload_plan(&candidate).unwrap();
+
+        assert_eq!(
+            plan.reload_safe_keys,
+            vec![
+                "chat.timeout_seconds",
+                "embedding.base_url",
+                "retrieval.dense_top_k"
+            ]
+        );
+        assert!(plan.restart_required_keys.is_empty());
+
+        let applied = current.apply_reload_safe_changes(&candidate);
+        assert_eq!(applied.retrieval.dense_top_k, 24);
+        assert_eq!(applied.chat.timeout_seconds, 30);
+        assert_eq!(applied.embedding.base_url, "http://127.0.0.1:18002/v1");
+    }
+
+    #[test]
+    fn reload_plan_classifies_restart_required_changes() {
+        let current: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        let mut candidate = current.clone();
+        candidate.daemon.bind = "127.0.0.1:9900".into();
+        candidate.store.path = "/srv/verbatim".into();
+        candidate.embedding.model = "other-embedding-model".into();
+
+        let plan = current.reload_plan(&candidate).unwrap();
+
+        assert!(plan.reload_safe_keys.is_empty());
+        let keys = plan
+            .restart_required_keys
+            .iter()
+            .map(|change| change.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["daemon.bind", "embedding.model", "store.path"]);
+        assert!(plan.restart_required_keys[0].reason.contains("listener"));
+        assert!(plan.restart_required_keys[1].reason.contains("vectors"));
+        assert!(plan.restart_required_keys[2].reason.contains("SQLite"));
+
+        let applied = current.apply_reload_safe_changes(&candidate);
+        assert_eq!(applied.daemon.bind, current.daemon.bind);
+        assert_eq!(applied.store.path, current.store.path);
+        assert_eq!(applied.embedding.model, current.embedding.model);
     }
 }

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::ConfigReloadMetadata;
 use crate::task::{TaskEvent, TaskSpan, TaskSummary};
 use crate::types::{
     BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceIngestDiagnostics,
@@ -299,7 +300,11 @@ pub struct AskErrorEvent {
     pub error: String,
 }
 
-pub type ConfigResponse = Value;
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigResponse {
+    pub config: Value,
+    pub reload: ConfigReloadMetadata,
+}
 
 #[cfg(test)]
 mod tests {

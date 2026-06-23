@@ -188,6 +188,24 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             image_artifact_limits: config.parser.image_artifacts,
         })
     }
+
+    pub fn reload_runtime_config(&mut self, config: &Config) -> Result<()> {
+        self.embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+        self.context_gen = if config.context.enabled {
+            Some(ContextGenerator::new(&config.chat))
+        } else {
+            None
+        };
+        let (vision_model, vision_caption_model) = configured_vision_model(config);
+        self.vision_model = vision_model;
+        self.vision_caption_model = vision_caption_model;
+        self.graph_extractor = if self.graph_extraction_config.enabled && config.chat.enabled {
+            Some(GraphExtractor::from_config(&config.chat))
+        } else {
+            None
+        };
+        Ok(())
+    }
 }
 
 impl<E> IngestPipeline<E>

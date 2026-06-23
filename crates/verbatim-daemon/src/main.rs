@@ -15,6 +15,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::stream;
 use futures::Stream;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -23,13 +24,15 @@ use tower_http::cors::CorsLayer;
 
 use verbatim_core::api::{
     AddSourceRequest, AddSourceResponse, AskCitationEvent, AskErrorEvent, AskRequest, AskResponse,
-    AskTokenEvent, CheckStaleResponse, CitationResponse, ErrorResponse, EvidenceResponse,
-    HealthResponse, ImageArtifactResponse, IngestResponse, ReindexRequest, ReindexResponse,
-    RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
-    RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEventsResponse,
-    TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
+    AskTokenEvent, CheckStaleResponse, CitationResponse, ConfigResponse, ErrorResponse,
+    EvidenceResponse, HealthResponse, ImageArtifactResponse, IngestResponse, ReindexRequest,
+    ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
+    RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
+    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
 };
-use verbatim_core::config::{self, Config, RerankConfig, RetrievalConfig};
+use verbatim_core::config::{
+    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, RerankConfig, RetrievalConfig,
+};
 use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::{
     image_artifact_evidence_id, select_image_attachments, GenerationContext, Generator,
@@ -52,7 +55,7 @@ use verbatim_core::types::{
     CitationRef, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug,
     RetrievalEvidenceRole, RetrievalResult, SourceId,
 };
-use verbatim_core::upstream::UpstreamFailureError;
+use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -71,14 +74,18 @@ struct AppState {
     /// Independent task metadata connection so queue operations do not wait for long ingest work.
     task_store: std::sync::Mutex<Store>,
     ingest_queue_active: AtomicBool,
-    generator: Generator,
-    embed_client: OpenAiEmbeddingClient,
-    reranker: Option<OpenAiCompatibleReranker>,
-    config: Config,
+    runtime_config: std::sync::RwLock<RuntimeConfigState>,
+    config_path: PathBuf,
     data_dir: PathBuf,
 }
 
 type SharedState = Arc<AppState>;
+
+#[derive(Clone)]
+struct RuntimeConfigState {
+    config: Config,
+    reload: ConfigReloadMetadata,
+}
 
 const ASK_STREAM_EVENT_BUFFER: usize = 32;
 const TASK_WAIT_EVENT_BUFFER: usize = 16;
@@ -86,9 +93,57 @@ const TASK_WAIT_EVENT_LIMIT: usize = 100;
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FAST_RETRIEVAL_TOP_K: usize = 20;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
+const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
+const CONFIG_RELOAD_ERROR_MAX_CHARS: usize = 1024;
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn unix_timestamp_string() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
+fn initial_reload_metadata(config_path: &FsPath) -> ConfigReloadMetadata {
+    ConfigReloadMetadata {
+        active_config_path: config_path.display().to_string(),
+        loaded_at: unix_timestamp_string(),
+        last_reload_at: None,
+        last_reload_error: None,
+        last_applied_reload_safe_keys: Vec::new(),
+        last_restart_required_keys: Vec::new(),
+    }
+}
+
+fn bounded_config_reload_error(error: &str) -> String {
+    error.chars().take(CONFIG_RELOAD_ERROR_MAX_CHARS).collect()
+}
+
+fn safe_config_reload_error(error: &str) -> String {
+    let sanitized_error = sanitize_text(error);
+    let safe_lines = sanitized_error
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('|')
+                && !trimmed
+                    .split_once(" | ")
+                    .is_some_and(|(prefix, _)| prefix.chars().all(|ch| ch.is_ascii_digit()))
+        })
+        .collect::<Vec<_>>();
+    bounded_config_reload_error(&safe_lines.join(" "))
+}
+
+fn runtime_config_snapshot(state: &SharedState) -> Result<RuntimeConfigState> {
+    state
+        .runtime_config
+        .read()
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .map(|guard| guard.clone())
 }
 
 #[derive(Deserialize)]
@@ -149,8 +204,15 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn get_config(State(state): State<SharedState>) -> Json<serde_json::Value> {
-    Json(state.config.redacted_json())
+async fn get_config(
+    State(state): State<SharedState>,
+) -> Result<Json<ConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let snapshot = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(ConfigResponse {
+        config: snapshot.config.redacted_json(),
+        reload: snapshot.reload,
+    }))
 }
 
 async fn add_source(
@@ -908,8 +970,11 @@ async fn retrieve(
     State(state): State<SharedState>,
     Json(req): Json<RetrieveRequest>,
 ) -> Result<Json<RetrieveResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let controls = resolve_retrieve_controls(&req, &state.config)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
+    let controls =
+        resolve_retrieve_controls(&req, &config).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let task_id = create_persisted_task(
         &state,
         TaskKind::Retrieve,
@@ -1093,7 +1158,7 @@ async fn execute_retrieve_task_inner(
     let source_filter = req.source_id.map(SourceId);
     let embedding_profile_id = parse_embedding_profile_id(
         req.embedding_profile_id.as_deref(),
-        &state.config.embedding.profile_id,
+        &controls.config.embedding.profile_id,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
@@ -1228,9 +1293,12 @@ async fn execute_ask_task_inner(
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
     let embedding_profile_id = parse_embedding_profile_id(
         req.embedding_profile_id.as_deref(),
-        &state.config.embedding.profile_id,
+        &config.embedding.profile_id,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let show_retrieval = req.show_retrieval;
@@ -1251,6 +1319,7 @@ async fn execute_ask_task_inner(
         &question,
         source_filter,
         &embedding_profile_id,
+        &config,
         show_retrieval,
     )
     .await?;
@@ -1306,8 +1375,8 @@ async fn execute_ask_task_inner(
     )
     .await;
     let chat_started = Instant::now();
-    let gen_result = match state
-        .generator
+    let generator = Generator::new(&config.chat, &config.verifier);
+    let gen_result = match generator
         .generate_with_context(&question, &results, &generation_context)
         .await
     {
@@ -1419,9 +1488,12 @@ async fn execute_ask_stream_task_inner(
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
     let source_filter = req.source_id.map(SourceId);
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
     let embedding_profile_id = parse_embedding_profile_id(
         req.embedding_profile_id.as_deref(),
-        &state.config.embedding.profile_id,
+        &config.embedding.profile_id,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let show_retrieval = req.show_retrieval;
@@ -1442,6 +1514,7 @@ async fn execute_ask_stream_task_inner(
         &question,
         source_filter,
         &embedding_profile_id,
+        &config,
         show_retrieval,
     )
     .await?;
@@ -1483,8 +1556,8 @@ async fn execute_ask_stream_task_inner(
     let streamed_bytes_for_callback = Arc::clone(&streamed_bytes);
     let streamed_chunks_for_callback = Arc::clone(&streamed_chunks);
     let first_token_for_callback = Arc::clone(&first_token_latency_ms);
-    let gen_result = match state
-        .generator
+    let generator = Generator::new(&config.chat, &config.verifier);
+    let gen_result = match generator
         .generate_streaming_with_context(&question, &results, &generation_context, move |delta| {
             streamed_bytes_for_callback.fetch_add(delta.len() as u64, Ordering::Relaxed);
             streamed_chunks_for_callback.fetch_add(1, Ordering::Relaxed);
@@ -1631,7 +1704,10 @@ async fn execute_context_only_ask_task_inner(
     req: AskRequest,
 ) -> Result<AskResponse, (StatusCode, Json<ErrorResponse>)> {
     let retrieve_req = context_only_retrieve_request(req);
-    let controls = resolve_retrieve_controls(&retrieve_req, &state.config)
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
+    let controls = resolve_retrieve_controls(&retrieve_req, &config)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let context = execute_retrieve_task_inner(state, task_id, retrieve_req, controls).await?;
     Ok(AskResponse {
@@ -1675,6 +1751,7 @@ struct EffectiveRetrieveControls {
     include_debug: bool,
     include_locator: bool,
     fast: bool,
+    config: Config,
     retrieval_config: RetrievalConfig,
     rerank_config: RerankConfig,
 }
@@ -1740,6 +1817,7 @@ fn resolve_retrieve_controls(
         include_debug: req.include_debug,
         include_locator: req.include_locator,
         fast: req.fast,
+        config: config.clone(),
         retrieval_config,
         rerank_config,
     })
@@ -2084,9 +2162,12 @@ async fn run_indexing_operation(
             ),
         ));
     }
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
     let profile_id = parse_embedding_profile_id(
         controls.embedding_profile_id.as_deref(),
-        &state.config.embedding.profile_id,
+        &config.embedding.profile_id,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let state2 = Arc::clone(&state);
@@ -2291,25 +2372,25 @@ async fn prepare_retrieve_context(
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         pipeline.select_embedding_profile(&embedding_profile_id)?;
         let lexical_index = pipeline.lexical_index();
-        let mut retrieval = RetrievalPipeline::new_with_graph(
+        let embed_client = OpenAiEmbeddingClient::new(&controls.config.embedding);
+        let reranker = OpenAiCompatibleReranker::from_config(&controls.rerank_config);
+        let retrieval = RetrievalPipeline::new_with_graph(
             pipeline.vector_index(),
             &lexical_index,
             pipeline.store(),
-            &state2.embed_client,
+            &embed_client,
             &controls.retrieval_config,
-            &state2.config.graph,
+            &controls.config.graph,
         )
         .require_embedding_profile(&embedding_profile_id)
-        .with_qdrant_search(&state2.config.qdrant);
-        if let Some(reranker) = state2.reranker.as_ref() {
-            retrieval = retrieval.with_reranker(&controls.rerank_config, reranker);
-        }
+        .with_qdrant_search(&controls.config.qdrant)
+        .with_reranker(&controls.rerank_config, &reranker);
         let source_filter_ref = source_filter.as_ref();
         let (mut results, mut debug) = runtime
             .block_on(retrieval.search_filtered_with_debug(&question2, source_filter_ref))?;
-        if state2.config.graph.global_search.enabled && source_filter_ref.is_none() {
+        if controls.config.graph.global_search.enabled && source_filter_ref.is_none() {
             let global_results =
-                GraphRagService::new(pipeline.store(), &state2.config.graph.global_search)
+                GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
                     .global_search_results(&question2, None)?;
             let mut debug_option = Some(debug);
             prepend_global_results(&mut results, global_results, &mut debug_option);
@@ -2344,6 +2425,7 @@ async fn prepare_generation_context(
     question: &str,
     source_filter: Option<SourceId>,
     embedding_profile_id: &EmbeddingProfileId,
+    config: &Config,
     show_retrieval: bool,
 ) -> Result<
     (
@@ -2357,24 +2439,25 @@ async fn prepare_generation_context(
     let state2 = Arc::clone(&state);
     let question2 = question.to_string();
     let embedding_profile_id = embedding_profile_id.clone();
+    let config = config.clone();
     let runtime = tokio::runtime::Handle::current();
     let (results, generation_context, retrieval_debug) = tokio::task::spawn_blocking(move || {
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         pipeline.select_embedding_profile(&embedding_profile_id)?;
         let lexical_index = pipeline.lexical_index();
-        let mut retrieval = RetrievalPipeline::new_with_graph(
+        let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+        let reranker = OpenAiCompatibleReranker::from_config(&config.rerank);
+        let retrieval = RetrievalPipeline::new_with_graph(
             pipeline.vector_index(),
             &lexical_index,
             pipeline.store(),
-            &state2.embed_client,
-            &state2.config.retrieval,
-            &state2.config.graph,
+            &embed_client,
+            &config.retrieval,
+            &config.graph,
         )
         .require_embedding_profile(&embedding_profile_id)
-        .with_qdrant_search(&state2.config.qdrant);
-        if let Some(reranker) = state2.reranker.as_ref() {
-            retrieval = retrieval.with_reranker(&state2.config.rerank, reranker);
-        }
+        .with_qdrant_search(&config.qdrant)
+        .with_reranker(&config.rerank, &reranker);
         let source_filter_ref = source_filter.as_ref();
         let (mut results, mut retrieval_debug) = if show_retrieval {
             let (results, debug) = runtime
@@ -2385,9 +2468,9 @@ async fn prepare_generation_context(
                 runtime.block_on(retrieval.search_filtered(&question2, source_filter_ref))?;
             (results, None)
         };
-        if state2.config.graph.global_search.enabled && source_filter_ref.is_none() {
+        if config.graph.global_search.enabled && source_filter_ref.is_none() {
             let global_results =
-                GraphRagService::new(pipeline.store(), &state2.config.graph.global_search)
+                GraphRagService::new(pipeline.store(), &config.graph.global_search)
                     .global_search_results(&question2, None)?;
             prepend_global_results(&mut results, global_results, &mut retrieval_debug);
         }
@@ -2395,7 +2478,7 @@ async fn prepare_generation_context(
         let image_attachments = select_image_attachments(
             &results,
             &image_artifacts,
-            &state2.config.chat.vision_attachments,
+            &config.chat.vision_attachments,
             |artifact| read_image_attachment_bytes(&state2.data_dir, artifact),
         )?;
         Ok::<_, anyhow::Error>((
@@ -2818,6 +2901,177 @@ fn upstream_failure_value(error: &anyhow::Error) -> Option<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Config reload
+// ---------------------------------------------------------------------------
+
+fn record_config_reload_error(state: &SharedState, error: &str) -> Result<ConfigReloadMetadata> {
+    let mut runtime = state
+        .runtime_config
+        .write()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    runtime.reload.last_reload_at = Some(unix_timestamp_string());
+    runtime.reload.last_reload_error = Some(safe_config_reload_error(error));
+    runtime.reload.last_applied_reload_safe_keys.clear();
+    runtime.reload.last_restart_required_keys.clear();
+    Ok(runtime.reload.clone())
+}
+
+fn config_reload_rejection(state: &SharedState, error: anyhow::Error) -> anyhow::Error {
+    let message = safe_config_reload_error(&format!("{error:#}"));
+    let _ = record_config_reload_error(state, &message);
+    anyhow::anyhow!("config reload rejected: {message}")
+}
+
+async fn reload_config_from_path(state: &SharedState) -> Result<ConfigReloadMetadata> {
+    let config_path = state.config_path.clone();
+    let candidate =
+        Config::load_from(&config_path).map_err(|error| config_reload_rejection(state, error))?;
+
+    let current = runtime_config_snapshot(state)
+        .map_err(|error| config_reload_rejection(state, error))?
+        .config;
+    let plan = current
+        .reload_plan(&candidate)
+        .map_err(|error| config_reload_rejection(state, error))?;
+    let next_config = current.apply_reload_safe_changes(&candidate);
+    let next_config_for_pipeline = next_config.clone();
+    let state_for_pipeline = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let mut pipeline = state_for_pipeline
+            .pipeline
+            .lock()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        pipeline.reload_runtime_config(&next_config_for_pipeline)
+    })
+    .await
+    .context("join config reload task")
+    .and_then(|result| result)
+    .map_err(|error| config_reload_rejection(state, error))?;
+
+    let restart_required_keys = plan.restart_required_keys;
+    let reload_error = restart_required_message(&restart_required_keys);
+    let metadata = ConfigReloadMetadata {
+        active_config_path: config_path.display().to_string(),
+        loaded_at: runtime_config_snapshot(state)
+            .map_err(|error| config_reload_rejection(state, error))?
+            .reload
+            .loaded_at,
+        last_reload_at: Some(unix_timestamp_string()),
+        last_reload_error: reload_error,
+        last_applied_reload_safe_keys: plan.reload_safe_keys,
+        last_restart_required_keys: restart_required_keys,
+    };
+
+    let mut runtime = state
+        .runtime_config
+        .write()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    runtime.config = next_config;
+    runtime.reload = metadata.clone();
+    Ok(metadata)
+}
+
+fn restart_required_message(keys: &[ConfigRestartRequiredKey]) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+    let key_list = keys
+        .iter()
+        .map(|change| change.key.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(safe_config_reload_error(&format!(
+        "restart or reindex required for config key(s): {key_list}; reload-safe keys were applied when present"
+    )))
+}
+
+fn start_config_watcher(state: SharedState) -> Result<RecommendedWatcher> {
+    let config_path = state.config_path.clone();
+    let watch_dir = config_path
+        .parent()
+        .map(FsPath::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = tx.send(event);
+    })
+    .context("create config watcher")?;
+    watcher
+        .watch(&watch_dir, RecursiveMode::NonRecursive)
+        .with_context(|| format!("watch config directory: {}", watch_dir.display()))?;
+
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if !config_watch_event_matches(&event, &config_path, &state) {
+                continue;
+            }
+            tokio::time::sleep(CONFIG_RELOAD_DEBOUNCE).await;
+            while let Ok(event) = rx.try_recv() {
+                let _ = config_watch_event_matches(&event, &config_path, &state);
+            }
+
+            match reload_config_from_path(&state).await {
+                Ok(metadata) => {
+                    if metadata.last_reload_error.is_some() {
+                        tracing::warn!(
+                            reload_safe_keys = ?metadata.last_applied_reload_safe_keys,
+                            restart_required_keys = ?metadata
+                                .last_restart_required_keys
+                                .iter()
+                                .map(|change| change.key.as_str())
+                                .collect::<Vec<_>>(),
+                            "config reload partially applied; restart or reindex required for some keys"
+                        );
+                    } else {
+                        tracing::info!(
+                            reload_safe_keys = ?metadata.last_applied_reload_safe_keys,
+                            "config reload applied"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %safe_config_reload_error(&error.to_string()),
+                        "config reload rejected"
+                    );
+                }
+            }
+        }
+    });
+
+    Ok(watcher)
+}
+
+fn config_watch_event_matches(
+    event: &notify::Result<notify::Event>,
+    config_path: &FsPath,
+    state: &SharedState,
+) -> bool {
+    match event {
+        Ok(event) => {
+            if !matches!(
+                event.kind,
+                EventKind::Any | EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+            ) {
+                return false;
+            }
+            let config_dir = config_path.parent();
+            event.paths.is_empty()
+                || event.paths.iter().any(|path| {
+                    path == config_path
+                        || config_dir.is_some_and(|config_dir| path.parent() == Some(config_dir))
+                })
+        }
+        Err(error) => {
+            let message = safe_config_reload_error(&format!("config watch error: {error}"));
+            let _ = record_config_reload_error(state, &message);
+            tracing::warn!(error = %message, "config watch error");
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shutdown signal
 // ---------------------------------------------------------------------------
 
@@ -2878,13 +3132,11 @@ where
 async fn run_daemon() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let config = Config::load().context("failed to load config")?;
+    let config_path = config::config_path();
+    let config = Config::load_from(&config_path).context("failed to load config")?;
     let data_dir = config::data_dir(&config);
     let pipeline = IngestPipeline::new(&config, &data_dir)?;
     let task_store = Store::new(&data_dir.join("verbatim.db"))?;
-    let generator = Generator::new(&config.chat, &config.verifier);
-    let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
-    let reranker = Some(OpenAiCompatibleReranker::from_config(&config.rerank));
 
     let bind_addr = config.daemon.bind.clone();
 
@@ -2892,12 +3144,14 @@ async fn run_daemon() -> Result<()> {
         pipeline: std::sync::Mutex::new(pipeline),
         task_store: std::sync::Mutex::new(task_store),
         ingest_queue_active: AtomicBool::new(false),
-        generator,
-        embed_client,
-        reranker,
-        config,
+        runtime_config: std::sync::RwLock::new(RuntimeConfigState {
+            config,
+            reload: initial_reload_metadata(&config_path),
+        }),
+        config_path,
         data_dir,
     });
+    let _config_watcher = start_config_watcher(Arc::clone(&state))?;
     schedule_ingest_queue(Arc::clone(&state));
 
     let app = Router::new()
@@ -2991,6 +3245,144 @@ mod tests {
 
         assert!(!handled);
         assert!(stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_reload_applies_safe_changes_and_reports_metadata() {
+        let test_dir = TestDir::new("config-reload-safe");
+        let config_path = test_dir.path().join("config.toml");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.retrieval.dense_top_k = 4;
+        config.chat.timeout_seconds = 1;
+        fs::write(&config_path, config.show().unwrap()).unwrap();
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state =
+            test_state_with_config_path(config.clone(), test_dir.path(), pipeline, config_path);
+
+        let mut candidate = config.clone();
+        candidate.retrieval.dense_top_k = 9;
+        candidate.chat.timeout_seconds = 8;
+        fs::write(&state.config_path, candidate.show().unwrap()).unwrap();
+
+        let metadata = reload_config_from_path(&state).await.unwrap();
+        let snapshot = runtime_config_snapshot(&state).unwrap();
+        let Json(response) = get_config(State(Arc::clone(&state))).await.unwrap();
+
+        assert_eq!(snapshot.config.retrieval.dense_top_k, 9);
+        assert_eq!(snapshot.config.chat.timeout_seconds, 8);
+        assert_eq!(
+            metadata.last_applied_reload_safe_keys,
+            vec!["chat.timeout_seconds", "retrieval.dense_top_k"]
+        );
+        assert!(metadata.last_reload_error.is_none());
+        assert_eq!(response.config["retrieval"]["dense_top_k"], 9);
+        assert_eq!(
+            response.reload.active_config_path,
+            state.config_path.display().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn config_reload_rejects_invalid_config_and_keeps_previous_good_config() {
+        const SECRET_SENTINEL: &str = "sk-verbatim-secret-reload-leak";
+
+        let test_dir = TestDir::new("config-reload-invalid");
+        let config_path = test_dir.path().join("config.toml");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.retrieval.dense_top_k = 4;
+        fs::write(&config_path, config.show().unwrap()).unwrap();
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state =
+            test_state_with_config_path(config.clone(), test_dir.path(), pipeline, config_path);
+
+        fs::write(
+            &state.config_path,
+            format!("[chat]\napi_key = \"{SECRET_SENTINEL}\n"),
+        )
+        .unwrap();
+
+        let error = reload_config_from_path(&state).await.unwrap_err();
+        let snapshot = runtime_config_snapshot(&state).unwrap();
+        let metadata_error = snapshot
+            .reload
+            .last_reload_error
+            .as_deref()
+            .unwrap_or_default();
+        let returned_error = error.to_string();
+
+        assert!(returned_error.contains("config reload rejected"));
+        assert!(!returned_error.contains(SECRET_SENTINEL));
+        assert!(!returned_error.contains("api_key"));
+        assert!(!metadata_error.contains(SECRET_SENTINEL));
+        assert!(!metadata_error.contains("api_key"));
+        assert!(!metadata_error.contains(" | "));
+        assert_eq!(snapshot.config.retrieval.dense_top_k, 4);
+        assert!(metadata_error.contains("failed to parse config TOML"));
+        assert!(snapshot.reload.last_applied_reload_safe_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_reload_reports_restart_required_changes_without_applying_them() {
+        let test_dir = TestDir::new("config-reload-restart-required");
+        let config_path = test_dir.path().join("config.toml");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.daemon.bind = "127.0.0.1:7700".into();
+        config.retrieval.dense_top_k = 4;
+        fs::write(&config_path, config.show().unwrap()).unwrap();
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state =
+            test_state_with_config_path(config.clone(), test_dir.path(), pipeline, config_path);
+
+        let mut candidate = config.clone();
+        candidate.daemon.bind = "127.0.0.1:9900".into();
+        candidate.retrieval.dense_top_k = 11;
+        fs::write(&state.config_path, candidate.show().unwrap()).unwrap();
+
+        let metadata = reload_config_from_path(&state).await.unwrap();
+        let snapshot = runtime_config_snapshot(&state).unwrap();
+
+        assert_eq!(snapshot.config.retrieval.dense_top_k, 11);
+        assert_eq!(snapshot.config.daemon.bind, "127.0.0.1:7700");
+        assert_eq!(
+            metadata.last_applied_reload_safe_keys,
+            vec!["retrieval.dense_top_k"]
+        );
+        assert_eq!(metadata.last_restart_required_keys[0].key, "daemon.bind");
+        assert!(metadata
+            .last_reload_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("restart or reindex required"));
+    }
+
+    #[test]
+    fn config_watch_event_ignores_access_events_for_active_config_path() {
+        let (_test_dir, state) = config_watch_test_state("config-watch-access");
+        let mut event = notify::Event::new(EventKind::Access(notify::event::AccessKind::Close(
+            notify::event::AccessMode::Read,
+        )));
+        event.paths.push(state.config_path.clone());
+
+        assert!(!config_watch_event_matches(
+            &Ok(event),
+            &state.config_path,
+            &state
+        ));
+    }
+
+    #[test]
+    fn config_watch_event_matches_modify_events_for_active_config_path() {
+        let (_test_dir, state) = config_watch_test_state("config-watch-modify");
+        let mut event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )));
+        event.paths.push(state.config_path.clone());
+
+        assert!(config_watch_event_matches(
+            &Ok(event),
+            &state.config_path,
+            &state
+        ));
     }
 
     #[test]
@@ -3236,6 +3628,7 @@ mod tests {
                 include_debug: false,
                 include_locator: false,
                 fast: false,
+                config: Config::default(),
                 retrieval_config: RetrievalConfig::default(),
                 rerank_config: RerankConfig::default(),
             },
@@ -3933,14 +4326,34 @@ mod tests {
     }
 
     fn test_state(config: Config, data_dir: &FsPath, pipeline: IngestPipeline) -> SharedState {
+        test_state_with_config_path(config, data_dir, pipeline, data_dir.join("config.toml"))
+    }
+
+    fn config_watch_test_state(name: &str) -> (TestDir, SharedState) {
+        let test_dir = TestDir::new(name);
+        let config_path = test_dir.path().join("config.toml");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        fs::write(&config_path, config.show().unwrap()).unwrap();
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state_with_config_path(config, test_dir.path(), pipeline, config_path);
+        (test_dir, state)
+    }
+
+    fn test_state_with_config_path(
+        config: Config,
+        data_dir: &FsPath,
+        pipeline: IngestPipeline,
+        config_path: PathBuf,
+    ) -> SharedState {
         Arc::new(AppState {
             pipeline: std::sync::Mutex::new(pipeline),
             task_store: std::sync::Mutex::new(Store::new(&data_dir.join("verbatim.db")).unwrap()),
             ingest_queue_active: AtomicBool::new(false),
-            generator: Generator::new(&config.chat, &config.verifier),
-            embed_client: OpenAiEmbeddingClient::new(&config.embedding),
-            reranker: Some(OpenAiCompatibleReranker::from_config(&config.rerank)),
-            config,
+            runtime_config: std::sync::RwLock::new(RuntimeConfigState {
+                reload: initial_reload_metadata(&config_path),
+                config,
+            }),
+            config_path,
             data_dir: data_dir.to_path_buf(),
         })
     }
