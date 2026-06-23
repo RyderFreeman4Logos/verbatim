@@ -730,6 +730,7 @@ mod tests {
         RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
         SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskSummaryResponse,
     };
+    use verbatim_core::config::ConfigReloadMetadata;
     use verbatim_core::task::{
         TaskEndpointSummary, TaskEvent, TaskId, TaskKind, TaskProgressSnapshot, TaskSpan,
         TaskStatus, TaskSummary,
@@ -1547,7 +1548,17 @@ mod tests {
 
         fn get_config(&self) -> client::CliResult<ConfigResponse> {
             self.calls.borrow_mut().push("get_config".into());
-            Ok(serde_json::json!({"daemon": {"bind": "127.0.0.1:7700"}}))
+            Ok(ConfigResponse {
+                config: serde_json::json!({"daemon": {"bind": "127.0.0.1:7700"}}),
+                reload: ConfigReloadMetadata {
+                    active_config_path: "/tmp/config.toml".into(),
+                    loaded_at: "1".into(),
+                    last_reload_at: None,
+                    last_reload_error: None,
+                    last_applied_reload_safe_keys: Vec::new(),
+                    last_restart_required_keys: Vec::new(),
+                },
+            })
         }
 
         fn health(&self) -> client::CliResult<HealthResponse> {
