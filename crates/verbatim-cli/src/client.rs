@@ -10,9 +10,9 @@ use serde::Serialize;
 use serde_json::Value;
 use verbatim_core::api::{
     AddSourceRequest, AddSourceResponse, AskRequest, CheckStaleResponse, ConfigResponse,
-    EvidenceResponse, HealthResponse, IngestResponse, RetrieveRequest, RetrieveResponse,
-    SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest,
-    TaskSummaryResponse,
+    EvidenceResponse, HealthResponse, IngestResponse, ReindexRequest, ReindexResponse,
+    RetrieveRequest, RetrieveResponse, SourceResponse, TaskCreatedResponse, TaskEventsResponse,
+    TaskIngestRequest, TaskSummaryResponse,
 };
 use verbatim_core::config::{self, Config, DaemonConfig};
 
@@ -78,6 +78,7 @@ pub trait DaemonClient {
         embedding_profile_id: Option<&str>,
         vectors_only: bool,
     ) -> CliResult<IngestResponse>;
+    fn reindex(&self, request: &ReindexRequest) -> CliResult<ReindexResponse>;
     fn submit_ask_task(&self, request: &AskRequest) -> CliResult<TaskCreatedResponse>;
     fn submit_ingest_task(
         &self,
@@ -86,6 +87,7 @@ pub trait DaemonClient {
         embedding_profile_id: Option<&str>,
         vectors_only: bool,
     ) -> CliResult<TaskCreatedResponse>;
+    fn submit_reindex_task(&self, request: &ReindexRequest) -> CliResult<TaskCreatedResponse>;
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
     fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse>;
     fn wait_task<W>(&self, task_id: &str, after: Option<i64>, stdout: &mut W) -> CliResult<()>
@@ -282,6 +284,10 @@ impl DaemonClient for HttpDaemonClient {
         self.request_json(Method::POST, "/api/tasks/ask", Some(request))
     }
 
+    fn reindex(&self, request: &ReindexRequest) -> CliResult<ReindexResponse> {
+        self.request_json(Method::POST, "/api/reindex", Some(request))
+    }
+
     fn submit_ingest_task(
         &self,
         source_id: Option<&str>,
@@ -311,6 +317,10 @@ impl DaemonClient for HttpDaemonClient {
             vectors_only,
         };
         self.request_json(Method::POST, "/api/tasks/ingest", Some(&request))
+    }
+
+    fn submit_reindex_task(&self, request: &ReindexRequest) -> CliResult<TaskCreatedResponse> {
+        self.request_json(Method::POST, "/api/tasks/reindex", Some(request))
     }
 
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse> {
@@ -423,7 +433,9 @@ fn is_long_running_mutation(method: &Method, path: &str) -> bool {
             || path == "/api/sources/check"
             || path == "/api/ingest"
             || path.starts_with("/api/ingest?")
-            || path.starts_with("/api/ingest/");
+            || path.starts_with("/api/ingest/")
+            || path == "/api/reindex"
+            || path == "/api/tasks/reindex";
     }
     false
 }
@@ -756,6 +768,14 @@ mod tests {
             json_timeout_policy(&Method::POST, "/api/ingest/src-1"),
             RequestTimeoutPolicy::LongRunning
         );
+        assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/reindex"),
+            RequestTimeoutPolicy::LongRunning
+        );
+        assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/tasks/reindex"),
+            RequestTimeoutPolicy::LongRunning
+        );
     }
 
     #[test]
@@ -837,6 +857,50 @@ mod tests {
         assert!(server.request().starts_with(
             "POST /api/ingest/src-1?embedding_profile_id=alt.profile&vectors_only=true HTTP/1.1"
         ));
+    }
+
+    #[test]
+    fn http_reindex_posts_json_to_daemon() {
+        let server = TestServer::respond_many(vec![
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"reindexed\":1}".to_string(),
+            "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"task_id\":\"task-1\"}".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"reindexed\":2}".to_string(),
+        ]);
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+        let request = ReindexRequest {
+            source_id: Some("src-1".into()),
+            all: false,
+            stale: false,
+            force: false,
+            embedding_profile_id: Some("alt.profile".into()),
+            vectors_only: true,
+        };
+
+        let response = client.reindex(&request).unwrap();
+        let task = client.submit_reindex_task(&request).unwrap();
+        let force_response = client
+            .reindex(&ReindexRequest {
+                source_id: None,
+                all: false,
+                stale: false,
+                force: true,
+                embedding_profile_id: None,
+                vectors_only: false,
+            })
+            .unwrap();
+
+        assert_eq!(response.reindexed, 1);
+        assert_eq!(task.task_id, "task-1");
+        assert_eq!(force_response.reindexed, 2);
+        let requests = server.requests();
+        assert!(requests[0].starts_with("POST /api/reindex HTTP/1.1"));
+        assert!(requests[0].contains("\"source_id\":\"src-1\""));
+        assert!(requests[0].contains("\"embedding_profile_id\":\"alt.profile\""));
+        assert!(requests[1].starts_with("POST /api/tasks/reindex HTTP/1.1"));
+        assert!(requests[2].starts_with("POST /api/reindex HTTP/1.1"));
+        assert!(requests[2].contains("\"force\":true"));
+        assert!(requests[2].contains("\"all\":false"));
+        assert!(!requests[2].contains("\"source_id\""));
     }
 
     #[test]

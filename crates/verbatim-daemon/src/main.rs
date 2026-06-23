@@ -24,10 +24,10 @@ use tower_http::cors::CorsLayer;
 use verbatim_core::api::{
     AddSourceRequest, AddSourceResponse, AskCitationEvent, AskErrorEvent, AskRequest, AskResponse,
     AskTokenEvent, CheckStaleResponse, CitationResponse, ErrorResponse, EvidenceResponse,
-    HealthResponse, ImageArtifactResponse, IngestResponse, RetrieveControlsResponse,
-    RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
-    SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest,
-    TaskSummaryResponse, TaskWaitEvent,
+    HealthResponse, ImageArtifactResponse, IngestResponse, ReindexRequest, ReindexResponse,
+    RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+    RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEventsResponse,
+    TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
 };
 use verbatim_core::config::{self, Config, RerankConfig, RetrievalConfig};
 use verbatim_core::embed::OpenAiEmbeddingClient;
@@ -42,7 +42,8 @@ use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeli
 use verbatim_core::store::Store;
 use verbatim_core::task::{
     ask_request_metadata, ask_result_metadata, bounded_error, ingest_result_metadata,
-    ingest_task_request_metadata_with_queue_claim, retrieve_request_metadata,
+    ingest_task_request_metadata_with_queue_claim, reindex_result_metadata,
+    reindex_task_request_metadata_with_queue_claim, retrieve_request_metadata,
     retrieve_result_metadata, PhaseTiming, TaskId, TaskKind, TaskStatus,
 };
 use verbatim_core::types::{
@@ -104,6 +105,8 @@ struct TaskEventsQuery {
 struct PersistedIngestRequest {
     ingest_request_version: Option<u64>,
     #[serde(default)]
+    operation: Option<String>,
+    #[serde(default)]
     source_id: Option<String>,
     #[serde(default)]
     force: bool,
@@ -113,6 +116,14 @@ struct PersistedIngestRequest {
     vectors_only: bool,
     #[serde(default)]
     queue_claimable: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct IndexingTaskControls {
+    source_id: Option<String>,
+    force: bool,
+    embedding_profile_id: Option<String>,
+    vectors_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -726,6 +737,28 @@ async fn ingest_one(
     .map(Json)
 }
 
+async fn reindex(
+    State(state): State<SharedState>,
+    Json(req): Json<ReindexRequest>,
+) -> Result<Json<ReindexResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let controls = resolve_reindex_controls(req).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let task_id = create_persisted_task(
+        &state,
+        TaskKind::Ingest,
+        reindex_task_request_metadata_with_queue_claim(
+            controls.source_id.as_deref(),
+            controls.force,
+            controls.embedding_profile_id.as_deref(),
+            controls.vectors_only,
+            false,
+        ),
+    )
+    .await?;
+    execute_reindex_task(state, task_id, controls)
+        .await
+        .map(Json)
+}
+
 async fn ask(
     State(state): State<SharedState>,
     Json(req): Json<AskRequest>,
@@ -847,6 +880,28 @@ async fn submit_ingest_task(
             req.force,
             req.embedding_profile_id.as_deref(),
             req.vectors_only,
+            true,
+        ),
+    )
+    .await?;
+    schedule_ingest_queue(Arc::clone(&state));
+    Ok(Json(TaskCreatedResponse { task_id: task_id.0 }))
+}
+
+async fn submit_reindex_task(
+    State(state): State<SharedState>,
+    Json(req): Json<ReindexRequest>,
+) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let controls = resolve_reindex_controls(req).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    validate_requested_source_exists(&state, controls.source_id.as_deref()).await?;
+    let task_id = create_persisted_task(
+        &state,
+        TaskKind::Ingest,
+        reindex_task_request_metadata_with_queue_claim(
+            controls.source_id.as_deref(),
+            controls.force,
+            controls.embedding_profile_id.as_deref(),
+            controls.vectors_only,
             true,
         ),
     )
@@ -1363,15 +1418,28 @@ async fn drain_ingest_queue(state: SharedState) {
                 continue;
             }
         };
-        let result = execute_started_ingest_task(
-            Arc::clone(&state),
-            &task_id,
-            request.source_id,
-            request.force,
-            request.embedding_profile_id,
-            request.vectors_only,
-        )
-        .await;
+        let controls = IndexingTaskControls {
+            source_id: request.source_id,
+            force: request.force,
+            embedding_profile_id: request.embedding_profile_id,
+            vectors_only: request.vectors_only,
+        };
+        let result = if request.operation.as_deref() == Some("reindex") {
+            execute_started_reindex_task(Arc::clone(&state), &task_id, controls)
+                .await
+                .map(|_| ())
+        } else {
+            execute_started_ingest_task(
+                Arc::clone(&state),
+                &task_id,
+                controls.source_id,
+                controls.force,
+                controls.embedding_profile_id,
+                controls.vectors_only,
+            )
+            .await
+            .map(|_| ())
+        };
         if let Err((_, Json(error))) = &result {
             let _ = finish_task_failed_from_response(&state, &task_id, error).await;
         }
@@ -1481,6 +1549,73 @@ fn validate_ingest_controls(
     Ok(())
 }
 
+fn resolve_reindex_controls(req: ReindexRequest) -> Result<IndexingTaskControls> {
+    let explicit_target_count =
+        usize::from(req.source_id.is_some()) + usize::from(req.all) + usize::from(req.stale);
+    if explicit_target_count > 1 {
+        bail!("choose exactly one reindex target: source_id, all, or stale");
+    }
+    if req.force && req.source_id.is_some() {
+        bail!("force is only supported for all-source reindex");
+    }
+    if req.force && req.stale {
+        bail!("force is not supported with stale reindex");
+    }
+
+    let vectors_only = req.vectors_only || req.embedding_profile_id.is_some();
+    if req.stale && vectors_only {
+        bail!("stale vector-only reindex is not supported; rebuild all vectors or run stale reindex without vectors_only");
+    }
+    if vectors_only && req.force {
+        bail!("force is not supported for vectors-only reindex");
+    }
+    if explicit_target_count == 0 && !req.force && !vectors_only {
+        bail!(
+            "reindex requires source_id, all, stale, force, vectors_only, or embedding_profile_id"
+        );
+    }
+
+    let force = if vectors_only {
+        false
+    } else {
+        req.all || req.force
+    };
+    Ok(IndexingTaskControls {
+        source_id: req.source_id,
+        force,
+        embedding_profile_id: req.embedding_profile_id,
+        vectors_only,
+    })
+}
+
+async fn validate_requested_source_exists(
+    state: &SharedState,
+    source_id: Option<&str>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(source_id) = source_id else {
+        return Ok(());
+    };
+    let source_id = source_id.to_string();
+    let lookup_id = SourceId(source_id.clone());
+    let state = Arc::clone(state);
+    let found = tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.store().get_source(&lookup_id)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .is_some();
+    if found {
+        Ok(())
+    } else {
+        Err(err(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("source not found: {source_id}"),
+        ))
+    }
+}
+
 async fn execute_ingest_task(
     state: SharedState,
     task_id: TaskId,
@@ -1516,26 +1651,64 @@ async fn execute_started_ingest_task(
     embedding_profile_id: Option<String>,
     vectors_only: bool,
 ) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
-    execute_ingest_task_inner(
-        Arc::clone(&state),
-        task_id,
+    let controls = IndexingTaskControls {
         source_id,
         force,
         embedding_profile_id,
         vectors_only,
-    )
-    .await
+    };
+    let (result, profile_id) =
+        run_indexing_operation(Arc::clone(&state), task_id, &controls, "ingest").await?;
+    let response = IngestResponse { ingested: result };
+    finish_task_success(&state, task_id, ingest_result_metadata(response.ingested)).await?;
+    tracing::debug!(
+        task_id = %task_id.0,
+        embedding_profile_id = %profile_id,
+        "ingest task completed"
+    );
+    Ok(response)
 }
 
-async fn execute_ingest_task_inner(
+async fn execute_reindex_task(
+    state: SharedState,
+    task_id: TaskId,
+    controls: IndexingTaskControls,
+) -> Result<ReindexResponse, (StatusCode, Json<ErrorResponse>)> {
+    let result = async {
+        ensure_ingest_task_started(&state, &task_id).await?;
+        execute_started_reindex_task(Arc::clone(&state), &task_id, controls).await
+    }
+    .await;
+    if let Err((_, Json(error))) = &result {
+        let _ = finish_task_failed_from_response(&state, &task_id, error).await;
+    }
+    result
+}
+
+async fn execute_started_reindex_task(
     state: SharedState,
     task_id: &TaskId,
-    source_id: Option<String>,
-    force: bool,
-    embedding_profile_id: Option<String>,
-    vectors_only: bool,
-) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
-    if embedding_profile_id.is_some() && !vectors_only {
+    controls: IndexingTaskControls,
+) -> Result<ReindexResponse, (StatusCode, Json<ErrorResponse>)> {
+    let (result, profile_id) =
+        run_indexing_operation(Arc::clone(&state), task_id, &controls, "reindex").await?;
+    let response = ReindexResponse { reindexed: result };
+    finish_task_success(&state, task_id, reindex_result_metadata(response.reindexed)).await?;
+    tracing::debug!(
+        task_id = %task_id.0,
+        embedding_profile_id = %profile_id,
+        "reindex task completed"
+    );
+    Ok(response)
+}
+
+async fn run_indexing_operation(
+    state: SharedState,
+    task_id: &TaskId,
+    controls: &IndexingTaskControls,
+    phase_name: &str,
+) -> Result<(usize, EmbeddingProfileId), (StatusCode, Json<ErrorResponse>)> {
+    if controls.embedding_profile_id.is_some() && !controls.vectors_only {
         return Err(err(
             StatusCode::BAD_REQUEST,
             anyhow::anyhow!(
@@ -1544,15 +1717,19 @@ async fn execute_ingest_task_inner(
         ));
     }
     let profile_id = parse_embedding_profile_id(
-        embedding_profile_id.as_deref(),
+        controls.embedding_profile_id.as_deref(),
         &state.config.embedding.profile_id,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let state2 = Arc::clone(&state);
     let task_id2 = task_id.clone();
     let profile_id_for_task = profile_id.clone();
+    let source_id = controls.source_id.clone();
+    let source_id_for_error = controls.source_id.clone();
+    let force = controls.force;
+    let vectors_only = controls.vectors_only;
     let runtime = tokio::runtime::Handle::current();
-    let timing = PhaseTiming::start("ingest");
+    let timing = PhaseTiming::start(phase_name);
     let result = tokio::task::spawn_blocking(move || {
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         if vectors_only {
@@ -1571,21 +1748,31 @@ async fn execute_ingest_task_inner(
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let response = IngestResponse { ingested: result };
+    .map_err(|e| indexing_operation_error(source_id_for_error.as_deref(), e))?;
     record_task_span(
         &state,
         task_id,
         timing.finish(serde_json::json!({
-            "ingested": response.ingested,
-            "force": force,
+            "rebuilt": result,
+            "force": controls.force,
             "embedding_profile_id": profile_id.as_str(),
-            "vectors_only": vectors_only,
+            "vectors_only": controls.vectors_only,
+            "source_id": controls.source_id.as_deref(),
         })),
     )
     .await?;
-    finish_task_success(&state, task_id, ingest_result_metadata(response.ingested)).await?;
-    Ok(response)
+    Ok((result, profile_id))
+}
+
+fn indexing_operation_error(
+    source_id: Option<&str>,
+    error: anyhow::Error,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let status = match source_id {
+        Some(source_id) if is_source_not_found_error(source_id, &error) => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(status, error)
 }
 
 async fn cancel_task_record(
@@ -2328,11 +2515,13 @@ async fn run_daemon() -> Result<()> {
         .route("/api/sources/check", post(check_stale))
         .route("/api/ingest", post(ingest_all))
         .route("/api/ingest/{id}", post(ingest_one))
+        .route("/api/reindex", post(reindex))
         .route("/api/ask", post(ask))
         .route("/api/ask/stream", post(ask_stream))
         .route("/api/retrieve", post(retrieve))
         .route("/api/tasks/ask", post(submit_ask_task))
         .route("/api/tasks/ingest", post(submit_ingest_task))
+        .route("/api/tasks/reindex", post(submit_reindex_task))
         .route("/api/tasks/{id}", get(show_task))
         .route("/api/tasks/{id}/events", get(list_task_events_handler))
         .route("/api/tasks/{id}/wait", get(wait_task))
@@ -2701,6 +2890,271 @@ mod tests {
             .contains("Alpha retrieval evidence"));
         assert!(model_server.embedding_requests() >= 2);
         assert_eq!(model_server.chat_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn reindex_one_source_preserves_canonical_source_record() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("reindex-one-source");
+        let source_path = test_dir.path().join("doc.txt");
+        fs::write(&source_path, "alpha beta evidence").unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let Json(response) = reindex(
+            State(Arc::clone(&state)),
+            Json(ReindexRequest {
+                source_id: Some(source_id.0.clone()),
+                all: false,
+                stale: false,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.reindexed, 1);
+        let sources = state
+            .pipeline
+            .lock()
+            .unwrap()
+            .store()
+            .list_sources()
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, source_id);
+        assert_eq!(model_server.embedding_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn reindex_force_without_target_reindexes_all_sources() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("reindex-force-all-source");
+        let source_path = test_dir.path().join("doc.txt");
+        fs::write(&source_path, "alpha beta evidence").unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let Json(response) = reindex(
+            State(Arc::clone(&state)),
+            Json(ReindexRequest {
+                source_id: None,
+                all: false,
+                stale: false,
+                force: true,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.reindexed, 1);
+        assert_eq!(model_server.embedding_requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn vector_only_reindex_and_ingest_report_source_count_for_multi_chunk_source() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("vector-only-counts-sources");
+        let source_path = test_dir.path().join("doc.txt");
+        let body = (0..8)
+            .map(|index| {
+                format!(
+                    "Paragraph {index}: {}\n\n",
+                    "alpha beta gamma delta ".repeat(50)
+                )
+            })
+            .collect::<String>();
+        fs::write(&source_path, body).unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        let child_count = pipeline
+            .store()
+            .list_child_chunks()
+            .unwrap()
+            .into_iter()
+            .filter(|chunk| chunk.source_id == source_id)
+            .count();
+        assert!(
+            child_count > 1,
+            "test fixture must create multiple child chunks"
+        );
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let Json(reindex_response) = reindex(
+            State(Arc::clone(&state)),
+            Json(ReindexRequest {
+                source_id: Some(source_id.0.clone()),
+                all: false,
+                stale: false,
+                force: false,
+                embedding_profile_id: Some("alt-reindex".into()),
+                vectors_only: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(ingest_response) = ingest_one(
+            State(Arc::clone(&state)),
+            Path(source_id.0.clone()),
+            Query(IngestQuery {
+                force: false,
+                embedding_profile_id: Some("alt-ingest".into()),
+                vectors_only: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reindex_response.reindexed, 1);
+        assert_eq!(ingest_response.ingested, 1);
+        let pipeline = state.pipeline.lock().unwrap();
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(
+                    &EmbeddingProfileId::new("alt-reindex").unwrap(),
+                    Some(&source_id),
+                )
+                .unwrap(),
+            child_count
+        );
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(
+                    &EmbeddingProfileId::new("alt-ingest").unwrap(),
+                    Some(&source_id),
+                )
+                .unwrap(),
+            child_count
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_missing_source_returns_not_found() {
+        let test_dir = TestDir::new("reindex-missing-source");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let (status, Json(body)) = reindex(
+            State(state),
+            Json(ReindexRequest {
+                source_id: Some("__missing_source_smoke_retest__".into()),
+                all: false,
+                stale: false,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body.error,
+            "source not found: __missing_source_smoke_retest__"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_reindex_task_can_be_cancelled_while_queued() {
+        let test_dir = TestDir::new("reindex-background-cancel");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+
+        let Json(created) = submit_reindex_task(
+            State(Arc::clone(&state)),
+            Json(ReindexRequest {
+                source_id: None,
+                all: true,
+                stale: false,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let task_id = TaskId(created.task_id);
+        wait_for_ingest_queue_idle(&state).await;
+
+        let queued = task_summary_response(&state, task_id.clone())
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(queued.status, TaskStatus::Queued);
+        assert_eq!(queued.request["operation"], "reindex");
+
+        let Json(cancelled) =
+            cancel_task_handler(State(Arc::clone(&state)), Path(task_id.clone().0))
+                .await
+                .unwrap();
+
+        assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn background_reindex_force_without_target_enqueues_all_source_reindex() {
+        let test_dir = TestDir::new("reindex-background-force");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+
+        let Json(created) = submit_reindex_task(
+            State(Arc::clone(&state)),
+            Json(ReindexRequest {
+                source_id: None,
+                all: false,
+                stale: false,
+                force: true,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let task_id = TaskId(created.task_id);
+        wait_for_ingest_queue_idle(&state).await;
+
+        let queued = task_summary_response(&state, task_id).await.unwrap().task;
+        assert_eq!(queued.status, TaskStatus::Queued);
+        assert_eq!(queued.request["operation"], "reindex");
+        assert_eq!(queued.request["force"], true);
+        assert!(queued.request["source_id"].is_null());
     }
 
     #[tokio::test]

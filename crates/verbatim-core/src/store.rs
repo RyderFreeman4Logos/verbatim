@@ -301,6 +301,59 @@ impl Store {
         Ok(stale)
     }
 
+    pub fn find_stale_sources_for_profile(
+        &self,
+        current_hashes: &HashMap<SourceId, String>,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<Vec<SourceId>> {
+        let sources = self.list_sources()?;
+        let mut stale = Vec::new();
+        for source in sources {
+            let file_stale = current_hashes
+                .get(&source.id)
+                .is_some_and(|current| *current != source.hash);
+            let source_status_stale = source.status != SourceStatus::Indexed;
+            let vectors_stale = self.source_vectors_stale_for_profile(profile_id, &source.id)?;
+            if file_stale || source_status_stale || vectors_stale {
+                stale.push(source.id);
+            }
+        }
+        Ok(stale)
+    }
+
+    fn source_vectors_stale_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_id: &SourceId,
+    ) -> Result<bool> {
+        let child_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE source_id = ?1 AND chunk_type = ?2",
+            params![&source_id.0, chunk_type_to_str(&ChunkType::Child)],
+            |row| row.get(0),
+        )?;
+        let vector_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunk_vectors WHERE profile_id = ?1 AND source_id = ?2",
+            params![profile_id.as_str(), &source_id.0],
+            |row| row.get(0),
+        )?;
+        let status: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT status, vector_count
+                 FROM source_embedding_status
+                 WHERE profile_id = ?1 AND source_id = ?2",
+                params![profile_id.as_str(), &source_id.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, recorded_vector_count)) = status else {
+            return Ok(true);
+        };
+        Ok(status != SourceEmbeddingStatus::Embedded.as_str()
+            || recorded_vector_count != child_count
+            || vector_count != child_count)
+    }
+
     // --- EvidenceUnit ---
 
     pub fn bulk_insert_evidence(&self, units: &[EvidenceUnit]) -> Result<()> {
@@ -3304,5 +3357,58 @@ mod tests {
         current.insert(SourceId("src-1".into()), "abc123".into());
         let stale = store.find_stale_sources(&current).unwrap();
         assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn profile_stale_detection_includes_vector_state() {
+        let store = Store::in_memory().unwrap();
+        let mut source = sample_source();
+        source.status = SourceStatus::Indexed;
+        store.add_source(&source).unwrap();
+        store
+            .bulk_insert_evidence(&sample_evidence("src-1"))
+            .unwrap();
+        store.bulk_insert_chunks(&sample_chunks("src-1")).unwrap();
+
+        let profile = EmbeddingProfileId::default_profile();
+        let mut current = HashMap::new();
+        current.insert(SourceId("src-1".into()), "abc123".into());
+
+        let stale = store
+            .find_stale_sources_for_profile(&current, &profile)
+            .unwrap();
+        assert_eq!(stale, vec![SourceId("src-1".into())]);
+
+        store
+            .replace_source_vector_documents_for_profile(
+                &profile,
+                &SourceId("src-1".into()),
+                &[VectorDocument {
+                    chunk_id: ChunkId("child-1".into()),
+                    source_id: SourceId("src-1".into()),
+                    vector: vec![1.0, 0.0],
+                }],
+            )
+            .unwrap();
+
+        let stale = store
+            .find_stale_sources_for_profile(&current, &profile)
+            .unwrap();
+        assert!(stale.is_empty());
+
+        store
+            .set_source_embedding_status(
+                &profile,
+                &SourceId("src-1".into()),
+                SourceEmbeddingStatus::Failed,
+                1,
+                Some("provider failed"),
+            )
+            .unwrap();
+
+        let stale = store
+            .find_stale_sources_for_profile(&current, &profile)
+            .unwrap();
+        assert_eq!(stale, vec![SourceId("src-1".into())]);
     }
 }

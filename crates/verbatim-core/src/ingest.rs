@@ -354,7 +354,9 @@ where
                 current_hashes.insert(source.id.clone(), hash);
             }
         }
-        let stale = self.store.find_stale_sources(&current_hashes)?;
+        let stale = self
+            .store
+            .find_stale_sources_for_profile(&current_hashes, &self.active_profile_id)?;
         for id in &stale {
             self.store.update_source_status(id, &SourceStatus::Stale)?;
         }
@@ -699,6 +701,12 @@ where
     }
 
     pub async fn rebuild_indexes_from_store(&mut self) -> Result<()> {
+        let source_ids = self
+            .store
+            .list_sources()?
+            .into_iter()
+            .map(|source| source.id)
+            .collect::<Vec<_>>();
         let child_chunks = self.store.list_child_chunks()?;
         let active_profile_id = self.active_profile_id.clone();
         tracing::info!(
@@ -709,7 +717,7 @@ where
         let prepared = self.prepare_full_indexes_for_chunks(&child_chunks).await?;
         self.store
             .replace_all_vector_documents_for_profile(&active_profile_id, &prepared.vectors)?;
-        self.mark_profile_sources_embedded(&active_profile_id, &prepared.vectors)?;
+        self.mark_profile_sources_embedded(&active_profile_id, &source_ids, &prepared.vectors)?;
         self.lexical_index().rebuild_from_store(&self.store)?;
         self.publish_prepared_indexes(&active_profile_id, prepared)?;
         #[cfg(feature = "qdrant")]
@@ -724,11 +732,20 @@ where
         source_id: Option<&SourceId>,
     ) -> Result<usize> {
         self.ensure_embedding_profile(profile_id)?;
-        if let Some(source_id) = source_id {
-            self.store
-                .get_source(source_id)?
-                .with_context(|| format!("source not found: {}", source_id.0))?;
-        }
+        let target_source_ids = match source_id {
+            Some(source_id) => {
+                self.store
+                    .get_source(source_id)?
+                    .with_context(|| format!("source not found: {}", source_id.0))?;
+                vec![source_id.clone()]
+            }
+            None => self
+                .store
+                .list_sources()?
+                .into_iter()
+                .map(|source| source.id)
+                .collect::<Vec<_>>(),
+        };
         let child_chunks = match source_id {
             Some(source_id) => self
                 .store
@@ -755,17 +772,51 @@ where
             None => {
                 self.store
                     .replace_all_vector_documents_for_profile(profile_id, &prepared.vectors)?;
-                self.mark_profile_sources_embedded(profile_id, &prepared.vectors)?;
+                self.mark_profile_sources_embedded(
+                    profile_id,
+                    &target_source_ids,
+                    &prepared.vectors,
+                )?;
                 self.store.index_generation_for_profile(profile_id)?
             }
         };
         self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
+        if *profile_id == self.active_profile_id {
+            self.clear_vector_only_stale_status(source_id)?;
+        }
         #[cfg(feature = "qdrant")]
         match source_id {
             Some(source_id) => self.sync_qdrant_profile_source(profile_id, source_id).await,
             None => self.sync_qdrant_profile_all(profile_id).await,
         }
-        Ok(child_chunks.len())
+        Ok(target_source_ids.len())
+    }
+
+    fn clear_vector_only_stale_status(&self, source_id: Option<&SourceId>) -> Result<()> {
+        let sources = match source_id {
+            Some(source_id) => self
+                .store
+                .get_source(source_id)?
+                .into_iter()
+                .collect::<Vec<_>>(),
+            None => self.store.list_sources()?,
+        };
+        for source in sources {
+            if source.status != SourceStatus::Stale {
+                continue;
+            }
+            if source.parser_used.is_none() {
+                continue;
+            }
+            if !source.path.exists() {
+                continue;
+            }
+            if file_hash(&source.path)? == source.hash {
+                self.store
+                    .update_source_status(&source.id, &SourceStatus::Indexed)?;
+            }
+        }
+        Ok(())
     }
 
     async fn prepare_full_indexes_for_chunks(
@@ -836,13 +887,15 @@ where
     fn mark_profile_sources_embedded(
         &self,
         profile_id: &EmbeddingProfileId,
+        source_ids: &[SourceId],
         vectors: &[VectorDocument],
     ) -> Result<()> {
-        let mut counts: HashMap<&SourceId, usize> = HashMap::new();
+        let mut counts: HashMap<SourceId, usize> = HashMap::new();
         for vector in vectors {
-            *counts.entry(&vector.source_id).or_default() += 1;
+            *counts.entry(vector.source_id.clone()).or_default() += 1;
         }
-        for (source_id, count) in counts {
+        for source_id in source_ids {
+            let count = counts.get(source_id).copied().unwrap_or(0);
             self.store.set_source_embedding_status(
                 profile_id,
                 source_id,
@@ -2687,9 +2740,18 @@ mod tests {
         chunk_id: &str,
         text: &str,
     ) -> Result<Chunk> {
-        let evidence = test_evidence(&source.id, &format!("evidence-{chunk_id}"), text);
-        let chunk = test_child(&source.id, chunk_id, &evidence.id, text);
         store.add_source(source)?;
+        insert_child_text(store, &source.id, chunk_id, text)
+    }
+
+    fn insert_child_text(
+        store: &Store,
+        source_id: &SourceId,
+        chunk_id: &str,
+        text: &str,
+    ) -> Result<Chunk> {
+        let evidence = test_evidence(source_id, &format!("evidence-{chunk_id}"), text);
+        let chunk = test_child(source_id, chunk_id, &evidence.id, text);
         store.bulk_insert_evidence(&[evidence])?;
         store.bulk_insert_chunks(std::slice::from_ref(&chunk))?;
         store.link_chunk_evidence(&[(chunk.id.clone(), chunk.evidence_unit_ids[0].clone())])?;
@@ -2789,6 +2851,207 @@ mod tests {
             pipeline
                 .store()
                 .get_source(&first.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SourceStatus::Indexed
+        );
+    }
+
+    #[tokio::test]
+    async fn build_embedding_profile_counts_sources_not_child_chunks() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-1", PathBuf::from("/tmp/first.txt"));
+        insert_source_with_child_text(&store, &source, "chunk-1", "alpha text").unwrap();
+        insert_child_text(&store, &source.id, "chunk-2", "beta text").unwrap();
+        let alt_profile = EmbeddingProfileId::new("alt").unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        let source_count = pipeline
+            .build_embedding_profile(&alt_profile, Some(&source.id))
+            .await
+            .unwrap();
+
+        assert_eq!(source_count, 1);
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(&alt_profile, Some(&source.id))
+                .unwrap(),
+            2
+        );
+
+        let all_count = pipeline
+            .build_embedding_profile(&alt_profile, None)
+            .await
+            .unwrap();
+
+        assert_eq!(all_count, 1);
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(&alt_profile, None)
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn build_embedding_profile_records_zero_vector_status_for_target_source() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let source_path = tempdir.path().join("empty.txt");
+        fs::write(&source_path, "").unwrap();
+        let mut source = test_source("src-empty", source_path.clone());
+        source.hash = file_hash(&source_path).unwrap();
+        source.status = SourceStatus::Stale;
+        store.add_source(&source).unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        let source_count = pipeline
+            .build_embedding_profile(&EmbeddingProfileId::default_profile(), Some(&source.id))
+            .await
+            .unwrap();
+
+        assert_eq!(source_count, 1);
+        assert_eq!(
+            pipeline
+                .store()
+                .get_source(&source.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SourceStatus::Indexed
+        );
+        assert!(pipeline.check_stale().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_embedding_profile_records_zero_vector_status_for_all_sources() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let source_path = tempdir.path().join("empty.txt");
+        fs::write(&source_path, "").unwrap();
+        let mut source = test_source("src-empty", source_path.clone());
+        source.hash = file_hash(&source_path).unwrap();
+        source.status = SourceStatus::Stale;
+        store.add_source(&source).unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        let source_count = pipeline
+            .build_embedding_profile(&EmbeddingProfileId::default_profile(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(source_count, 1);
+        assert_eq!(
+            pipeline
+                .store()
+                .get_source(&source.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SourceStatus::Indexed
+        );
+        assert!(pipeline.check_stale().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_specific_vector_only_rebuild_keeps_unparsed_source_stale() {
+        assert_unparsed_source_remains_stale_after_vector_only_rebuild(true).await;
+    }
+
+    #[tokio::test]
+    async fn all_source_vector_only_rebuild_keeps_unparsed_source_stale() {
+        assert_unparsed_source_remains_stale_after_vector_only_rebuild(false).await;
+    }
+
+    async fn assert_unparsed_source_remains_stale_after_vector_only_rebuild(source_specific: bool) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let source_path = tempdir.path().join("unparsed.txt");
+        fs::write(&source_path, "alpha text that still needs parse ingest").unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+
+        assert_eq!(pipeline.check_stale().unwrap(), vec![source_id.clone()]);
+
+        let source_filter = source_specific.then_some(source_id.clone());
+        let rebuilt = pipeline
+            .build_embedding_profile(
+                &EmbeddingProfileId::default_profile(),
+                source_filter.as_ref(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rebuilt, 1);
+        let source = pipeline.store().get_source(&source_id).unwrap().unwrap();
+        assert_eq!(source.status, SourceStatus::Stale);
+        assert!(source.parser_used.is_none());
+        assert_eq!(pipeline.check_stale().unwrap(), vec![source_id]);
+    }
+
+    #[tokio::test]
+    async fn check_stale_reports_missing_active_profile_vectors() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let source_path = tempdir.path().join("first.txt");
+        fs::write(&source_path, "alpha text").unwrap();
+        let mut source = test_source("src-1", source_path.clone());
+        source.hash = file_hash(&source_path).unwrap();
+        insert_source_with_child_text(&store, &source, "chunk-1", "alpha text").unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+
+        let stale = pipeline.check_stale().unwrap();
+
+        assert_eq!(stale, vec![source.id.clone()]);
+        assert_eq!(
+            pipeline
+                .store()
+                .get_source(&source.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SourceStatus::Stale
+        );
+
+        pipeline
+            .build_embedding_profile(&EmbeddingProfileId::default_profile(), Some(&source.id))
+            .await
+            .unwrap();
+
+        assert!(pipeline.check_stale().unwrap().is_empty());
+        assert_eq!(
+            pipeline
+                .store()
+                .get_source(&source.id)
                 .unwrap()
                 .unwrap()
                 .status,

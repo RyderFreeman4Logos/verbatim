@@ -37,6 +37,27 @@ pub struct IngestResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReindexRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub stale: bool,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_profile_id: Option<String>,
+    #[serde(default)]
+    pub vectors_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReindexResponse {
+    pub reindexed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskCreatedResponse {
     pub task_id: String,
 }

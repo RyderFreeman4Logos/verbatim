@@ -3,7 +3,8 @@ use std::io::{self, Write};
 use serde_json::Value;
 use verbatim_core::api::{
     AskResponse, CheckStaleResponse, CitationResponse, ConfigResponse, EvidenceResponse,
-    HealthResponse, IngestResponse, RetrieveResponse, SourceResponse, TaskCreatedResponse,
+    HealthResponse, IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse,
+    TaskCreatedResponse,
 };
 use verbatim_core::task::{TaskEvent, TaskSpan, TaskStatus, TaskSummary};
 use verbatim_core::types::RetrievalDebug;
@@ -64,6 +65,13 @@ where
     W: Write,
 {
     writeln!(writer, "Ingested {} source(s).", response.ingested)
+}
+
+pub fn write_reindex<W>(writer: &mut W, response: &ReindexResponse) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Reindexed {} source(s).", response.reindexed)
 }
 
 pub fn write_task_created<W>(writer: &mut W, response: &TaskCreatedResponse) -> std::io::Result<()>

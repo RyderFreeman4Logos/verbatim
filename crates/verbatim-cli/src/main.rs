@@ -3,7 +3,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
-use verbatim_core::api::{AskRequest, RetrieveRequest};
+use verbatim_core::api::{AskRequest, ReindexRequest, RetrieveRequest};
 
 mod client;
 mod local;
@@ -137,6 +137,32 @@ where
                     vectors_only,
                 )?;
                 render::write_ingest(stdout, &response)?;
+            }
+            Ok(0)
+        }
+        Commands::Reindex {
+            source_id,
+            all,
+            stale,
+            force,
+            background,
+            embedding_profile,
+            vectors_only,
+        } => {
+            let request = ReindexRequest {
+                source_id,
+                all,
+                stale,
+                force,
+                embedding_profile_id: embedding_profile,
+                vectors_only,
+            };
+            if background {
+                let response = client.submit_reindex_task(&request)?;
+                render::write_task_created(stdout, &response)?;
+            } else {
+                let response = client.reindex(&request)?;
+                render::write_reindex(stdout, &response)?;
             }
             Ok(0)
         }
@@ -357,6 +383,30 @@ enum Commands {
         #[arg(long)]
         background: bool,
     },
+    /// Rebuild derived indexes for existing sources without adding sources.
+    Reindex {
+        /// Reindex one existing source id.
+        #[arg(long = "source-id", conflicts_with_all = ["all", "stale"])]
+        source_id: Option<String>,
+        /// Reindex all existing sources.
+        #[arg(long, conflicts_with_all = ["source_id", "stale"])]
+        all: bool,
+        /// Reindex sources reported stale by source check.
+        #[arg(long, conflicts_with_all = ["source_id", "all"])]
+        stale: bool,
+        /// Force all-source reindex. Redundant with --all.
+        #[arg(long)]
+        force: bool,
+        /// Build vectors for this embedding profile from existing chunks.
+        #[arg(long = "embedding-profile")]
+        embedding_profile: Option<String>,
+        /// Build only profile vectors/indexes without re-parsing sources.
+        #[arg(long)]
+        vectors_only: bool,
+        /// Queue reindex as a persistent daemon task and return immediately.
+        #[arg(long)]
+        background: bool,
+    },
     /// Generate an answer through the configured chat model and stream it.
     Ask {
         /// Restrict retrieval to one source.
@@ -536,9 +586,9 @@ mod tests {
     use serde_json::Value;
     use verbatim_core::api::{
         AddSourceResponse, CheckStaleResponse, CitationResponse, ConfigResponse, EvidenceResponse,
-        HealthResponse, IngestResponse, RetrieveControlsResponse, RetrieveRequest,
-        RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
-        TaskCreatedResponse, TaskEventsResponse, TaskSummaryResponse,
+        HealthResponse, IngestResponse, ReindexRequest, ReindexResponse, RetrieveControlsResponse,
+        RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
+        SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskSummaryResponse,
     };
     use verbatim_core::task::{TaskEvent, TaskId, TaskKind, TaskSpan, TaskStatus, TaskSummary};
     use verbatim_core::types::SourceLocator;
@@ -565,6 +615,7 @@ mod tests {
             &["source", "remove", "--help"],
             &["source", "check", "--help"],
             &["ingest", "--help"],
+            &["reindex", "--help"],
             &["ask", "--help"],
             &["retrieve", "--help"],
             &["evidence", "--help"],
@@ -835,6 +886,70 @@ mod tests {
     }
 
     #[test]
+    fn reindex_flags_are_plumbed() {
+        let (code, stdout, stderr, client, _) = run_mock([
+            "reindex",
+            "--source-id",
+            "src-1",
+            "--embedding-profile",
+            "alt",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["reindex"]);
+        assert_eq!(
+            client.last_reindex.borrow().as_ref().unwrap(),
+            &ReindexRequest {
+                source_id: Some("src-1".into()),
+                all: false,
+                stale: false,
+                force: false,
+                embedding_profile_id: Some("alt".into()),
+                vectors_only: false,
+            }
+        );
+        assert!(stdout.contains("Reindexed 1 source(s)."));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) = run_mock(["reindex", "--force"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["reindex"]);
+        assert_eq!(
+            client.last_reindex.borrow().as_ref().unwrap(),
+            &ReindexRequest {
+                source_id: None,
+                all: false,
+                stale: false,
+                force: true,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }
+        );
+        assert!(stdout.contains("Reindexed 1 source(s)."));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) =
+            run_mock(["reindex", "--all", "--vectors-only", "--background"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["submit_reindex_task"]);
+        assert_eq!(
+            client.last_reindex.borrow().as_ref().unwrap(),
+            &ReindexRequest {
+                source_id: None,
+                all: true,
+                stale: false,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: true,
+            }
+        );
+        assert!(stdout.contains("Task queued: task-1"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
     fn daemon_unreachable_maps_to_exit_code_two() {
         let client = MockDaemonClient {
             health_error: Some(CliError::DaemonUnreachable(
@@ -950,6 +1065,7 @@ mod tests {
         calls: RefCell<Vec<String>>,
         last_ask: RefCell<Option<AskRequest>>,
         last_retrieve: RefCell<Option<RetrieveRequest>>,
+        last_reindex: RefCell<Option<ReindexRequest>>,
         list_error: Option<CliError>,
         health_error: Option<CliError>,
     }
@@ -998,6 +1114,12 @@ mod tests {
             Ok(IngestResponse { ingested: 1 })
         }
 
+        fn reindex(&self, request: &ReindexRequest) -> client::CliResult<ReindexResponse> {
+            self.calls.borrow_mut().push("reindex".into());
+            self.last_reindex.replace(Some(request.clone()));
+            Ok(ReindexResponse { reindexed: 1 })
+        }
+
         fn submit_ask_task(&self, request: &AskRequest) -> client::CliResult<TaskCreatedResponse> {
             self.calls.borrow_mut().push("submit_ask_task".into());
             self.last_ask.replace(Some(request.clone()));
@@ -1016,6 +1138,17 @@ mod tests {
             self.calls.borrow_mut().push(format!(
                 "submit_ingest_task:{source_id:?}:{force}:{embedding_profile_id:?}:{vectors_only}"
             ));
+            Ok(TaskCreatedResponse {
+                task_id: "task-1".into(),
+            })
+        }
+
+        fn submit_reindex_task(
+            &self,
+            request: &ReindexRequest,
+        ) -> client::CliResult<TaskCreatedResponse> {
+            self.calls.borrow_mut().push("submit_reindex_task".into());
+            self.last_reindex.replace(Some(request.clone()));
             Ok(TaskCreatedResponse {
                 task_id: "task-1".into(),
             })
