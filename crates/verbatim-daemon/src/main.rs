@@ -36,6 +36,7 @@ use verbatim_core::generate::{
 };
 use verbatim_core::graphrag::GraphRagService;
 use verbatim_core::ingest::IngestPipeline;
+use verbatim_core::ocr::source_ingest_diagnostics;
 use verbatim_core::provider::openai_compatible::OpenAiCompatibleReranker;
 use verbatim_core::provider::ProviderError;
 use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
@@ -173,25 +174,27 @@ async fn list_sources(
     let state = Arc::clone(&state);
     let sources = tokio::task::spawn_blocking(move || {
         let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().list_sources()
+        let sources = pipeline
+            .store()
+            .list_sources()?
+            .into_iter()
+            .map(|source| SourceResponse {
+                id: source.id.0,
+                path: source.path.to_string_lossy().into_owned(),
+                status: format!("{:?}", source.status),
+                hash: source.hash,
+                parser_used: source.parser_used,
+                last_ingested_at: source.last_ingested_at,
+                diagnostics: None,
+            })
+            .collect::<Vec<_>>();
+        Ok::<_, anyhow::Error>(sources)
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok(Json(
-        sources
-            .into_iter()
-            .map(|s| SourceResponse {
-                id: s.id.0,
-                path: s.path.to_string_lossy().into_owned(),
-                status: format!("{:?}", s.status),
-                hash: s.hash,
-                parser_used: s.parser_used,
-                last_ingested_at: s.last_ingested_at,
-            })
-            .collect(),
-    ))
+    Ok(Json(sources))
 }
 
 async fn get_source(
@@ -202,26 +205,47 @@ async fn get_source(
     let id_clone = id.clone();
     let source = tokio::task::spawn_blocking(move || {
         let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().get_source(&SourceId(id_clone))
+        let current_ocr_profile = pipeline.active_ocr_profile();
+        let source = pipeline.store().get_source(&SourceId(id_clone))?;
+        source
+            .map(|source| source_response(pipeline.store(), source, current_ocr_profile.as_ref()))
+            .transpose()
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match source {
-        Some(s) => Ok(Json(SourceResponse {
-            id: s.id.0,
-            path: s.path.to_string_lossy().into_owned(),
-            status: format!("{:?}", s.status),
-            hash: s.hash,
-            parser_used: s.parser_used,
-            last_ingested_at: s.last_ingested_at,
-        })),
+        Some(s) => Ok(Json(s)),
         None => Err(err(
             StatusCode::NOT_FOUND,
             anyhow::anyhow!("source not found: {id}"),
         )),
     }
+}
+
+fn source_response(
+    store: &Store,
+    source: verbatim_core::types::Source,
+    current_ocr_profile: Option<&verbatim_core::types::OcrProfile>,
+) -> Result<SourceResponse> {
+    let evidence = store.list_evidence_by_source(&source.id)?;
+    let image_artifacts = store.list_image_artifacts_by_source(&source.id)?;
+    let diagnostics = source_ingest_diagnostics(
+        &source.path,
+        &evidence,
+        &image_artifacts,
+        current_ocr_profile,
+    );
+    Ok(SourceResponse {
+        id: source.id.0,
+        path: source.path.to_string_lossy().into_owned(),
+        status: format!("{:?}", source.status),
+        hash: source.hash,
+        parser_used: source.parser_used,
+        last_ingested_at: source.last_ingested_at,
+        diagnostics: Some(diagnostics),
+    })
 }
 
 async fn delete_source(
@@ -2365,6 +2389,7 @@ async fn get_evidence(
             source_id: eu.source_id.0,
             derived_from: eu.derived_from.map(|id| id.0),
             locator: eu.locator.to_string(),
+            structured_locator: eu.locator,
             text: eu.text,
             heading_path: eu.heading_path,
             position: eu.position,
@@ -2380,6 +2405,7 @@ async fn get_evidence(
 fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Text => "text",
+        EvidenceKind::Ocr => "ocr",
         EvidenceKind::Image => "image",
         EvidenceKind::Generated => "generated",
     }
@@ -2388,6 +2414,7 @@ fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
 fn citation_kind_name(citation: &CitationRef) -> &'static str {
     match citation.kind {
         EvidenceKind::Text => "original_text",
+        EvidenceKind::Ocr => "ocr_text",
         EvidenceKind::Image => "image_artifact",
         EvidenceKind::Generated if citation.derived_from.is_some() => "image_caption_generated",
         EvidenceKind::Generated => "generated",
@@ -2397,6 +2424,7 @@ fn citation_kind_name(citation: &CitationRef) -> &'static str {
 fn retrieval_role_name(role: RetrievalEvidenceRole) -> &'static str {
     match role {
         RetrievalEvidenceRole::OriginalText => "original_text",
+        RetrievalEvidenceRole::OcrText => "ocr_text",
         RetrievalEvidenceRole::ImageArtifact => "image_artifact",
         RetrievalEvidenceRole::ImageCaptionGenerated => "image_caption_generated",
         RetrievalEvidenceRole::Generated => "generated",
@@ -2600,8 +2628,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use verbatim_core::types::{
-        Chunk, ChunkId, ChunkType, EvidenceUnit, RetrievalEvidenceRole, RetrievalProvenance,
-        SourceLocator,
+        Chunk, ChunkId, ChunkType, EvidenceKind, EvidenceUnit, RetrievalEvidenceRole,
+        RetrievalProvenance, SourceLocator,
     };
 
     #[test]
@@ -2627,6 +2655,15 @@ mod tests {
         assert_eq!(
             String::from_utf8(stdout).unwrap(),
             format!("verbatim-daemon {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn ocr_evidence_kind_and_retrieval_role_names_are_distinct() {
+        assert_eq!(evidence_kind_name(EvidenceKind::Ocr), "ocr");
+        assert_eq!(
+            retrieval_role_name(RetrievalEvidenceRole::OcrText),
+            "ocr_text"
         );
     }
 

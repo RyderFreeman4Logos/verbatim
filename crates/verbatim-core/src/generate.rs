@@ -622,6 +622,7 @@ fn verifier_source_inputs(
 fn verifier_provenance(citation: &CitationRef) -> VerifierEvidenceProvenance {
     let summary = match (citation.kind, citation.derived_from.as_ref()) {
         (EvidenceKind::Text, _) => "original source text",
+        (EvidenceKind::Ocr, _) => "OCR-derived source text with structured locator",
         (EvidenceKind::Image, _) => "original image artifact locator",
         (EvidenceKind::Generated, Some(_)) => {
             "generated image caption derived from original image artifact"
@@ -680,6 +681,10 @@ fn verifier_visual_support(
             "text_only",
             "Use this source for document text claims, not visual content claims.",
         ),
+        (EvidenceKind::Ocr, _) => (
+            "ocr_text",
+            "OCR-derived text can support document text claims; consider OCR confidence for weak scans.",
+        ),
         (EvidenceKind::Image, _) if vision_attachment == "included" => (
             "image_pixels_available",
             "The verifier can inspect the cited image payload for visual claims.",
@@ -730,7 +735,7 @@ fn citation_image_artifact_evidence_id(citation: &CitationRef) -> Option<&Eviden
     match citation.kind {
         EvidenceKind::Image => Some(&citation.evidence_id),
         EvidenceKind::Generated => citation.derived_from.as_ref(),
-        EvidenceKind::Text => None,
+        EvidenceKind::Text | EvidenceKind::Ocr => None,
     }
 }
 
@@ -754,7 +759,7 @@ pub fn image_artifact_evidence_id(evidence: &EvidenceUnit) -> Option<&EvidenceId
     match evidence.kind {
         EvidenceKind::Image => Some(&evidence.id),
         EvidenceKind::Generated => evidence.derived_from.as_ref(),
-        EvidenceKind::Text => None,
+        EvidenceKind::Text | EvidenceKind::Ocr => None,
     }
 }
 
@@ -905,6 +910,7 @@ fn push_source_pack_entry(
 fn source_pack_kind_label(evidence: &EvidenceUnit) -> &'static str {
     match evidence.kind {
         EvidenceKind::Text => "original_text",
+        EvidenceKind::Ocr => "ocr_text",
         EvidenceKind::Image => "image_artifact",
         EvidenceKind::Generated if evidence.derived_from.is_some() => "image_caption_generated",
         EvidenceKind::Generated => "generated",
@@ -984,6 +990,7 @@ fn is_evidence_label(token: &str) -> bool {
 fn citation_kind_label(kind: EvidenceKind, derived_from: Option<&EvidenceId>) -> &'static str {
     match kind {
         EvidenceKind::Text => "original_text",
+        EvidenceKind::Ocr => "ocr_text",
         EvidenceKind::Image => "image_artifact",
         EvidenceKind::Generated if derived_from.is_some() => "image_caption_generated",
         EvidenceKind::Generated => "generated",

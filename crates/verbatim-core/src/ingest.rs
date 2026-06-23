@@ -19,6 +19,10 @@ use crate::index::hnsw::HnswIndex;
 #[cfg(feature = "qdrant")]
 use crate::index::qdrant::{records_from_store_for_profile, QdrantClient};
 use crate::index::sqlite_fts::SqliteFtsIndex;
+use crate::ocr::{
+    configured_ocr_provider, ocr_evidence_from_output, ocr_profile_stale, ocr_required_pages,
+    pdf_scan_summary, source_ingest_diagnostics, OcrPageRequest, OcrProvider,
+};
 use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
@@ -51,6 +55,7 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     qdrant: Option<QdrantClient>,
     vision_caption_model: String,
     vision_caption_prompt_hash: String,
+    ocr_provider: Option<Box<dyn OcrProvider>>,
     data_dir: PathBuf,
     image_artifact_limits: ImageArtifactLimits,
 }
@@ -153,6 +158,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             None
         };
         let (vision_model, vision_caption_model) = configured_vision_model(config);
+        let ocr_provider = configured_ocr_provider(&config.ocr)?;
         let graph_extraction_config = config.graph.extraction.clone();
         let graph_extractor = if graph_extraction_config.enabled && config.chat.enabled {
             Some(GraphExtractor::from_config(&config.chat))
@@ -177,6 +183,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             qdrant,
             vision_caption_model,
             vision_caption_prompt_hash: vision_caption_prompt_hash(),
+            ocr_provider,
             data_dir: data_dir.to_path_buf(),
             image_artifact_limits: config.parser.image_artifacts,
         })
@@ -197,6 +204,12 @@ where
 
     pub fn active_embedding_profile_id(&self) -> &EmbeddingProfileId {
         &self.active_profile_id
+    }
+
+    pub fn active_ocr_profile(&self) -> Option<crate::types::OcrProfile> {
+        self.ocr_provider
+            .as_ref()
+            .map(|provider| provider.profile())
     }
 
     pub fn vector_index(&self) -> &dyn VectorIndex {
@@ -259,9 +272,19 @@ where
             qdrant: None,
             vision_caption_model: "vision-disabled".to_string(),
             vision_caption_prompt_hash: vision_caption_prompt_hash(),
+            ocr_provider: None,
             data_dir,
             image_artifact_limits: ImageArtifactLimits::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_ocr_provider<O>(mut self, provider: O) -> Self
+    where
+        O: OcrProvider + 'static,
+    {
+        self.ocr_provider = Some(Box::new(provider));
+        self
     }
 
     #[cfg(test)]
@@ -357,6 +380,28 @@ where
         let stale = self
             .store
             .find_stale_sources_for_profile(&current_hashes, &self.active_profile_id)?;
+        let mut stale_set = stale.into_iter().collect::<HashSet<_>>();
+        if let Some(provider) = &self.ocr_provider {
+            let profile = provider.profile();
+            for source in &sources {
+                if stale_set.contains(&source.id) {
+                    continue;
+                }
+                let evidence = self.store.list_evidence_by_source(&source.id)?;
+                let image_artifacts = self.store.list_image_artifacts_by_source(&source.id)?;
+                let diagnostics = source_ingest_diagnostics(
+                    &source.path,
+                    &evidence,
+                    &image_artifacts,
+                    Some(&profile),
+                );
+                if ocr_profile_stale(&diagnostics, Some(&profile)) {
+                    stale_set.insert(source.id.clone());
+                }
+            }
+        }
+        let mut stale = stale_set.into_iter().collect::<Vec<_>>();
+        stale.sort_by(|left, right| left.0.cmp(&right.0));
         for id in &stale {
             self.store.update_source_status(id, &SourceStatus::Stale)?;
         }
@@ -416,6 +461,7 @@ where
             parsed_image_artifacts,
             self.image_artifact_limits,
         )?;
+        let pdf_scan = pdf_scan_summary(&evidence, &prepared_image_artifacts.artifacts);
         self.record_task_phase(
             task_id,
             phase,
@@ -423,6 +469,27 @@ where
                 "source_id": source_id.0,
                 "evidence_count": evidence.len(),
                 "image_artifact_count": prepared_image_artifacts.artifacts.len(),
+                "pdf_scan": pdf_scan,
+            }),
+        );
+        let phase = PhaseTiming::start("ocr");
+        let ocr_evidence = self
+            .ocr_scanned_pdf_pages(
+                source_id,
+                &source.path,
+                pdf_scan.as_ref(),
+                evidence.len() as u32,
+                task_id,
+            )
+            .await?;
+        self.record_task_phase(
+            task_id,
+            phase,
+            serde_json::json!({
+                "source_id": source_id.0,
+                "ocr_evidence_count": ocr_evidence.len(),
+                "ocr_enabled": self.ocr_provider.is_some(),
+                "ocr_profile_hash": self.ocr_provider.as_ref().map(|provider| provider.profile().profile_hash()),
             }),
         );
         let phase = PhaseTiming::start("model_call");
@@ -430,7 +497,9 @@ where
             .caption_prepared_image_artifacts(
                 source_id,
                 &prepared_image_artifacts,
-                evidence.len() as u32 + prepared_image_artifacts.evidence.len() as u32,
+                evidence.len() as u32
+                    + ocr_evidence.len() as u32
+                    + prepared_image_artifacts.evidence.len() as u32,
             )
             .await?;
         self.record_task_phase(
@@ -441,12 +510,17 @@ where
                 "generated_evidence_count": caption_evidence.len(),
             }),
         );
-        evidence.extend(prepared_image_artifacts.evidence.clone());
-        tracing::info!(evidence_count = evidence.len(), "parsed");
+        let mut searchable_evidence = evidence.clone();
+        searchable_evidence.extend(ocr_evidence.clone());
+        tracing::info!(
+            evidence_count = searchable_evidence.len(),
+            ocr_evidence_count = ocr_evidence.len(),
+            "parsed searchable evidence"
+        );
 
         let chunker_config = ChunkerConfig::default();
         let phase = PhaseTiming::start("ingest_chunking");
-        let output = chunk_evidence(source_id, &evidence, &chunker_config);
+        let output = chunk_evidence(source_id, &searchable_evidence, &chunker_config);
         tracing::info!(chunk_count = output.chunks.len(), "chunked");
         self.record_task_phase(
             task_id,
@@ -481,7 +555,27 @@ where
         let caption_output = chunk_caption_evidence(source_id, &caption_evidence);
         chunks.extend(caption_output.chunks);
         links.extend(caption_output.links);
+        evidence = searchable_evidence;
+        evidence.extend(prepared_image_artifacts.evidence.clone());
         evidence.extend(caption_evidence);
+        let ingest_diagnostics = source_ingest_diagnostics(
+            &source.path,
+            &evidence,
+            &prepared_image_artifacts.artifacts,
+            self.ocr_provider
+                .as_ref()
+                .map(|provider| provider.profile())
+                .as_ref(),
+        );
+        self.record_task_event(
+            task_id,
+            "diagnostic",
+            "source ingest diagnostics",
+            serde_json::json!({
+                "source_id": source_id.0,
+                "diagnostics": ingest_diagnostics,
+            }),
+        );
         let (mut graph_nodes, mut graph_edges) = build_evidence_graph(
             &new_source,
             &evidence,
@@ -696,6 +790,29 @@ where
                 phase = %finished.phase,
                 error = %err,
                 "failed to persist task phase timing"
+            );
+        }
+    }
+
+    fn record_task_event(
+        &self,
+        task_id: Option<&TaskId>,
+        event_type: &str,
+        message: &str,
+        payload: serde_json::Value,
+    ) {
+        let Some(task_id) = task_id else {
+            return;
+        };
+        if let Err(err) = self
+            .store
+            .insert_task_event(task_id, event_type, message, &payload)
+        {
+            tracing::warn!(
+                task_id = %task_id.0,
+                event_type,
+                error = %err,
+                "failed to persist task event"
             );
         }
     }
@@ -1042,6 +1159,69 @@ where
                 evidence.push(unit);
             }
         }
+        Ok(evidence)
+    }
+
+    async fn ocr_scanned_pdf_pages(
+        &self,
+        source_id: &SourceId,
+        pdf_path: &Path,
+        scan: Option<&crate::types::PdfScanSummary>,
+        start_position: u32,
+        task_id: Option<&TaskId>,
+    ) -> Result<Vec<EvidenceUnit>> {
+        let Some(scan) = scan else {
+            return Ok(Vec::new());
+        };
+        if !scan.ocr_recommended {
+            return Ok(Vec::new());
+        }
+        let pages = ocr_required_pages(scan);
+        let Some(provider) = &self.ocr_provider else {
+            self.record_task_event(
+                task_id,
+                "warning",
+                "OCR disabled for image-only PDF pages",
+                serde_json::json!({
+                    "source_id": source_id.0,
+                    "image_only_page_count": pages.len(),
+                    "pages": pages.iter().map(|page| page.page).collect::<Vec<_>>(),
+                }),
+            );
+            return Ok(Vec::new());
+        };
+
+        let profile = provider.profile();
+        let mut evidence = Vec::new();
+        for page in pages {
+            let request = OcrPageRequest {
+                source_id: source_id.clone(),
+                pdf_path: pdf_path.to_path_buf(),
+                page: page.page,
+                page_label: page.page_label.clone(),
+            };
+            let output = provider
+                .recognize_page(&request)
+                .with_context(|| format!("OCR page {}", page.page))?;
+            let mut page_evidence = ocr_evidence_from_output(
+                source_id,
+                &page,
+                output,
+                &profile,
+                start_position + evidence.len() as u32,
+            );
+            evidence.append(&mut page_evidence);
+        }
+        self.record_task_event(
+            task_id,
+            "phase",
+            "OCR completed for image-only PDF pages",
+            serde_json::json!({
+                "source_id": source_id.0,
+                "ocr_evidence_count": evidence.len(),
+                "ocr_profile_hash": profile.profile_hash(),
+            }),
+        );
         Ok(evidence)
     }
 
@@ -1980,7 +2160,9 @@ impl GraphBuildState {
 
 fn locator_page(locator: &SourceLocator) -> Option<u32> {
     match locator {
-        SourceLocator::Pdf { page, .. } | SourceLocator::PdfImage { page, .. } => Some(*page),
+        SourceLocator::Pdf { page, .. }
+        | SourceLocator::PdfOcr { page, .. }
+        | SourceLocator::PdfImage { page, .. } => Some(*page),
         SourceLocator::Document { .. } => None,
     }
 }
@@ -2006,6 +2188,7 @@ fn evidence_matches_nearby_text(unit: &EvidenceUnit, nearby_text: &str) -> bool 
 fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Text => "text",
+        EvidenceKind::Ocr => "ocr",
         EvidenceKind::Image => "image",
         EvidenceKind::Generated => "generated",
     }
@@ -2479,14 +2662,18 @@ mod tests {
     use crate::image_limits::ImageArtifactLimitError;
     #[cfg(feature = "qdrant")]
     use crate::index::qdrant::QdrantClient;
+    use crate::ocr::{
+        source_ingest_diagnostics, OcrLine, OcrPageOutput, OcrPageRequest, OcrProvider,
+    };
     use crate::provider::{
         ChatMessageContent, ChatModel, ChatRequest, ChatResponse, ChatStream, ImageDescribeRequest,
         ImageDescription, ProviderError, ProviderResult, TokenUsage, VisionModel,
     };
     use crate::retrieve::RetrievalPipeline;
+    use crate::task::TaskKind;
     use crate::types::{
-        ChunkId, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge, GraphNode,
-        GraphNodeId, GraphNodeKind, RetrievalOrigin, SourceLocator,
+        BBox, ChunkId, EdgeType, EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge, GraphNode,
+        GraphNodeId, GraphNodeKind, OcrProfile, OcrSourceStatus, RetrievalOrigin, SourceLocator,
     };
     use crate::vision_caption::{vision_caption_prompt_hash, ImageCaptionStatus};
 
@@ -2581,6 +2768,61 @@ mod tests {
                 .pop_front()
                 .expect("mock vision response should be available");
             Ok(ImageDescription { text })
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockOcrProvider {
+        profile: OcrProfile,
+        calls: Arc<Mutex<Vec<OcrPageRequest>>>,
+    }
+
+    impl MockOcrProvider {
+        fn new(language: &str, profile: &str) -> Self {
+            Self {
+                profile: OcrProfile {
+                    provider: "test".into(),
+                    engine: "mock-ocr".into(),
+                    engine_version: Some("1.0".into()),
+                    language: language.into(),
+                    profile: profile.into(),
+                },
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls
+                .lock()
+                .expect("mock OCR calls lock should not be poisoned")
+                .len()
+        }
+    }
+
+    impl OcrProvider for MockOcrProvider {
+        fn profile(&self) -> OcrProfile {
+            self.profile.clone()
+        }
+
+        fn recognize_page(&self, request: &OcrPageRequest) -> Result<OcrPageOutput> {
+            self.calls
+                .lock()
+                .expect("mock OCR calls lock should not be poisoned")
+                .push(request.clone());
+            Ok(OcrPageOutput {
+                lines: vec![OcrLine {
+                    line_index: Some(1),
+                    text: "ocrneedle scanned invoice total".into(),
+                    bbox: Some(BBox {
+                        x0: 10.0,
+                        y0: 20.0,
+                        x1: 120.0,
+                        y1: 36.0,
+                    }),
+                    confidence: Some(0.97),
+                    words: Vec::new(),
+                }],
+            })
         }
     }
 
@@ -2790,6 +3032,7 @@ mod tests {
             rerank: Default::default(),
             context: Default::default(),
             vision: Default::default(),
+            ocr: Default::default(),
             chat: Default::default(),
             verifier: Default::default(),
             qdrant: Default::default(),
@@ -3247,6 +3490,18 @@ mod tests {
         fs::write(path, pdf_bytes(objects)).expect("fixture PDF should save");
     }
 
+    fn write_pdf_with_text(path: &Path, text: &str) {
+        let content = format!("BT\n/F1 12 Tf\n72 120 Td\n({text}) Tj\nET\n");
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            stream_object(b"<<", content.as_bytes()),
+        ];
+        fs::write(path, pdf_bytes(objects)).expect("fixture PDF should save");
+    }
+
     fn write_pdf_with_text_and_image_filter(path: &Path, filter: Option<&str>, image_bytes: &[u8]) {
         let mut image_prefix =
             b"<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8"
@@ -3311,6 +3566,191 @@ mod tests {
   "uncertainties": ["The small footer text is not legible."]
 }}"#
         )
+    }
+
+    #[tokio::test]
+    async fn born_digital_pdf_ingest_keeps_text_evidence_without_ocr() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let path = tempdir.path().join("born-digital.pdf");
+        write_pdf_with_text(&path, "Born digital alpha evidence");
+        let source_id = pipeline.add_source(&path).unwrap();
+
+        pipeline.ingest_source(&source_id).await.unwrap();
+
+        let evidence = pipeline
+            .store()
+            .list_evidence_by_source(&source_id)
+            .unwrap();
+        assert!(evidence.iter().any(|unit| {
+            unit.kind == EvidenceKind::Text
+                && unit.text == "Born digital alpha evidence"
+                && matches!(unit.locator, SourceLocator::Pdf { page: 1, .. })
+        }));
+        assert!(evidence.iter().all(|unit| unit.kind != EvidenceKind::Ocr));
+        let artifacts = pipeline
+            .store()
+            .list_image_artifacts_by_source(&source_id)
+            .unwrap();
+        let diagnostics = source_ingest_diagnostics(&path, &evidence, &artifacts, None);
+        assert_eq!(diagnostics.ocr.status, OcrSourceStatus::NotRequired);
+        assert_eq!(diagnostics.pdf.as_ref().unwrap().image_only_page_count, 0);
+    }
+
+    #[tokio::test]
+    async fn scanned_image_only_pdf_ingest_reports_ocr_disabled_warning_and_status() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let path = tempdir.path().join("scanned.pdf");
+        write_pdf_with_image(&path);
+        let source_id = pipeline.add_source(&path).unwrap();
+        let task_id = TaskId("task-ocr-disabled".into());
+        pipeline
+            .store()
+            .create_task(&task_id, TaskKind::Ingest, &serde_json::json!({}))
+            .unwrap();
+
+        pipeline
+            .ingest_source_with_task(&source_id, &task_id)
+            .await
+            .unwrap();
+
+        let evidence = pipeline
+            .store()
+            .list_evidence_by_source(&source_id)
+            .unwrap();
+        assert!(evidence.iter().any(|unit| unit.kind == EvidenceKind::Image));
+        assert!(evidence.iter().all(|unit| unit.kind != EvidenceKind::Ocr));
+        let artifacts = pipeline
+            .store()
+            .list_image_artifacts_by_source(&source_id)
+            .unwrap();
+        let diagnostics = source_ingest_diagnostics(&path, &evidence, &artifacts, None);
+        let pdf = diagnostics.pdf.as_ref().unwrap();
+        assert!(pdf.ocr_recommended);
+        assert_eq!(pdf.image_only_page_count, 1);
+        assert_eq!(diagnostics.ocr.status, OcrSourceStatus::Disabled);
+
+        let events = pipeline
+            .store()
+            .list_task_events(&task_id, None, 100)
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type == "warning" && event.message.contains("OCR disabled")
+        }));
+    }
+
+    #[tokio::test]
+    async fn scanned_pdf_ocr_enabled_indexes_locator_backed_evidence_and_marks_profile_change_stale(
+    ) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let ocr = MockOcrProvider::new("eng", "default");
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_ocr_provider(ocr.clone());
+        let path = tempdir.path().join("ocr-enabled.pdf");
+        write_pdf_with_image(&path);
+        let source_id = pipeline.add_source(&path).unwrap();
+
+        pipeline.ingest_source(&source_id).await.unwrap();
+
+        assert_eq!(ocr.call_count(), 1);
+        let evidence = pipeline
+            .store()
+            .list_evidence_by_source(&source_id)
+            .unwrap();
+        let ocr_evidence = evidence
+            .iter()
+            .find(|unit| unit.kind == EvidenceKind::Ocr)
+            .expect("OCR evidence should be stored");
+        assert_eq!(ocr_evidence.text, "ocrneedle scanned invoice total");
+        match &ocr_evidence.locator {
+            SourceLocator::PdfOcr {
+                page,
+                page_label,
+                line_index,
+                bbox: Some(bbox),
+                ocr,
+                ..
+            } => {
+                assert_eq!(*page, 1);
+                assert_eq!(page_label.as_deref(), Some("1"));
+                assert_eq!(*line_index, 1);
+                assert_eq!(bbox.x0, 10.0);
+                assert_eq!(ocr.profile.engine, "mock-ocr");
+                assert_eq!(ocr.profile.language, "eng");
+                assert_eq!(ocr.confidence, Some(0.97));
+                assert_eq!(ocr.text_hash, ocr_evidence.text_hash);
+            }
+            other => panic!("expected OCR locator, got {other:?}"),
+        }
+
+        assert!(!pipeline
+            .lexical_index()
+            .search("ocrneedle", 5)
+            .unwrap()
+            .is_empty());
+        let lexical_index = pipeline.lexical_index();
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 0,
+            bm25_top_k: 5,
+            ..RetrievalConfig::default()
+        };
+        let retrieval = RetrievalPipeline::new(
+            pipeline.hnsw(),
+            &lexical_index,
+            pipeline.store(),
+            &StaticEmbeddingClient,
+            &retrieval_config,
+        );
+        let results = retrieval
+            .search_filtered("ocrneedle", Some(&source_id))
+            .await
+            .unwrap();
+        assert!(results.iter().any(|result| {
+            result
+                .evidence_units
+                .iter()
+                .any(|unit| unit.kind == EvidenceKind::Ocr)
+        }));
+
+        let artifacts = pipeline
+            .store()
+            .list_image_artifacts_by_source(&source_id)
+            .unwrap();
+        let diagnostics =
+            source_ingest_diagnostics(&path, &evidence, &artifacts, Some(&ocr.profile()));
+        assert_eq!(diagnostics.ocr.status, OcrSourceStatus::Applied);
+
+        pipeline.ocr_provider = Some(Box::new(MockOcrProvider::new("deu", "default")));
+        let stale = pipeline.check_stale().unwrap();
+        assert_eq!(stale, vec![source_id.clone()]);
+        assert_eq!(
+            pipeline
+                .store()
+                .get_source(&source_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SourceStatus::Stale
+        );
     }
 
     #[test]

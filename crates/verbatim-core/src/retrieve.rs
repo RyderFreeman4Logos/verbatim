@@ -1257,6 +1257,7 @@ fn final_evidence_pack_debug(results: &[RetrievalResult]) -> Vec<RetrievalEviden
 fn evidence_debug_role(evidence: &EvidenceUnit) -> RetrievalEvidenceRole {
     match evidence.kind {
         EvidenceKind::Text => RetrievalEvidenceRole::OriginalText,
+        EvidenceKind::Ocr => RetrievalEvidenceRole::OcrText,
         EvidenceKind::Image => RetrievalEvidenceRole::ImageArtifact,
         EvidenceKind::Generated if evidence.derived_from.is_some() => {
             RetrievalEvidenceRole::ImageCaptionGenerated
@@ -1317,7 +1318,9 @@ fn direction_key(direction: &GraphTraversalDirection) -> &'static str {
 
 fn locator_page(locator: &SourceLocator) -> Option<u32> {
     match locator {
-        SourceLocator::Pdf { page, .. } | SourceLocator::PdfImage { page, .. } => Some(*page),
+        SourceLocator::Pdf { page, .. }
+        | SourceLocator::PdfOcr { page, .. }
+        | SourceLocator::PdfImage { page, .. } => Some(*page),
         SourceLocator::Document { .. } => None,
     }
 }

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::image_limits::ImageArtifactLimits;
-use crate::types::{EdgeType, EmbeddingProfileId};
+use crate::types::{EdgeType, EmbeddingProfileId, OcrProfile};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -25,6 +25,8 @@ pub struct Config {
     pub context: ContextConfig,
     #[serde(default)]
     pub vision: VisionConfig,
+    #[serde(default)]
+    pub ocr: OcrConfig,
     #[serde(default)]
     pub chat: ChatConfig,
     #[serde(default)]
@@ -591,6 +593,69 @@ fn default_vision_timeout_seconds() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ocr_provider")]
+    pub provider: String,
+    #[serde(default = "default_ocr_engine")]
+    pub engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    #[serde(default = "default_ocr_language")]
+    pub language: String,
+    #[serde(default = "default_ocr_profile")]
+    pub profile: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_ocr_provider(),
+            engine: default_ocr_engine(),
+            engine_version: None,
+            language: default_ocr_language(),
+            profile: default_ocr_profile(),
+            command: String::new(),
+            args: Vec::new(),
+        }
+    }
+}
+
+impl OcrConfig {
+    pub fn profile(&self) -> OcrProfile {
+        OcrProfile {
+            provider: self.provider.clone(),
+            engine: self.engine.clone(),
+            engine_version: self.engine_version.clone(),
+            language: self.language.clone(),
+            profile: self.profile.clone(),
+        }
+    }
+}
+
+fn default_ocr_provider() -> String {
+    "external_command".into()
+}
+
+fn default_ocr_engine() -> String {
+    "external".into()
+}
+
+fn default_ocr_language() -> String {
+    "eng".into()
+}
+
+fn default_ocr_profile() -> String {
+    "default".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifierConfig {
     pub enabled: bool,
 }
@@ -828,6 +893,15 @@ temperature = 0.0
 timeout_seconds = 180
 api_key = ""
 
+[ocr]
+enabled = false
+provider = "external_command"
+engine = "external"
+language = "eng"
+profile = "default"
+command = ""
+args = []
+
 [chat]
 enabled = true
 provider = "openai_compatible"
@@ -930,6 +1004,9 @@ mod tests {
         assert!(config.context.enabled);
         assert!(!config.vision.enabled);
         assert_eq!(config.vision.timeout_seconds, 180);
+        assert!(!config.ocr.enabled);
+        assert_eq!(config.ocr.provider, "external_command");
+        assert_eq!(config.ocr.language, "eng");
         assert!(config.chat.enabled);
         assert_eq!(config.chat.base_url, "http://127.0.0.1:8000/v1");
         assert!(!config.chat.vision_attachments.enabled);
@@ -981,6 +1058,25 @@ model = "Qwen/Qwen3.6-27B"
         assert_eq!(config.vision.model, "Qwen/Qwen3.6-27B");
         assert!(config.embedding.enabled);
         assert!(config.chat.enabled);
+    }
+
+    #[test]
+    fn partial_ocr_config_defaults_disabled_and_explicit() {
+        let config: Config = toml::from_str(
+            r#"
+[ocr]
+enabled = true
+command = "fixture-ocr"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.ocr.enabled);
+        assert_eq!(config.ocr.provider, "external_command");
+        assert_eq!(config.ocr.engine, "external");
+        assert_eq!(config.ocr.language, "eng");
+        assert_eq!(config.ocr.profile, "default");
+        assert_eq!(config.ocr.command, "fixture-ocr");
     }
 
     #[test]

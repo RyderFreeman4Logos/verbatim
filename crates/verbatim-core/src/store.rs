@@ -2137,6 +2137,7 @@ fn str_to_status(s: &str) -> SourceStatus {
 fn evidence_kind_to_str(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Text => "Text",
+        EvidenceKind::Ocr => "Ocr",
         EvidenceKind::Image => "Image",
         EvidenceKind::Generated => "Generated",
     }
@@ -2144,6 +2145,7 @@ fn evidence_kind_to_str(kind: EvidenceKind) -> &'static str {
 
 fn str_to_evidence_kind(kind: &str) -> EvidenceKind {
     match kind {
+        "Ocr" => EvidenceKind::Ocr,
         "Image" => EvidenceKind::Image,
         "Generated" => EvidenceKind::Generated,
         _ => EvidenceKind::Text,

@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::task::{TaskEvent, TaskSpan, TaskSummary};
-use crate::types::{BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceLocator};
+use crate::types::{
+    BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceIngestDiagnostics,
+    SourceLocator,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddSourceRequest {
@@ -16,7 +19,7 @@ pub struct AddSourceResponse {
     pub id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceResponse {
     pub id: String,
     pub path: String,
@@ -24,6 +27,8 @@ pub struct SourceResponse {
     pub hash: String,
     pub parser_used: Option<String>,
     pub last_ingested_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<SourceIngestDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +233,7 @@ pub struct EvidenceResponse {
     pub kind: String,
     pub derived_from: Option<String>,
     pub locator: String,
+    pub structured_locator: SourceLocator,
     pub text: String,
     pub heading_path: Vec<String>,
     pub position: u32,
