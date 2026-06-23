@@ -6,6 +6,7 @@ pub mod oxide;
 pub mod plaintext;
 #[cfg(feature = "parser-pdfplumber")]
 pub mod plumber;
+pub(crate) mod text_segments;
 
 use std::path::Path;
 

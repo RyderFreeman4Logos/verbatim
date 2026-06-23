@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::parser::text_segments::normalize_line_endings;
 use crate::traits::Parser;
 use crate::types::{EvidenceId, EvidenceKind, EvidenceUnit, SourceId, SourceLocator};
 
@@ -21,6 +22,7 @@ impl Parser for PlaintextParser {
     fn parse(&self, path: &Path) -> Result<Vec<EvidenceUnit>> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read: {}", path.display()))?;
+        let content = normalize_line_endings(&content);
         let path_str = path.to_string_lossy().to_string();
         let source_id = source_id_from_path(path);
 
@@ -178,6 +180,30 @@ mod tests {
             } => {
                 assert_eq!(*line_start, 1);
                 assert_eq!(*line_end, Some(2));
+            }
+            _ => panic!("expected Document locator"),
+        }
+    }
+
+    #[test]
+    fn legacy_cr_line_endings_preserve_blank_line_paragraphs() {
+        let mut f = NamedTempFile::with_suffix(".txt").unwrap();
+        f.write_all(b"First paragraph\r\rSecond paragraph\rContinued\r")
+            .unwrap();
+
+        let units = PlaintextParser.parse(f.path()).unwrap();
+
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].text, "First paragraph");
+        assert_eq!(units[1].text, "Second paragraph Continued");
+        match &units[1].locator {
+            SourceLocator::Document {
+                line_start,
+                line_end,
+                ..
+            } => {
+                assert_eq!(*line_start, 3);
+                assert_eq!(*line_end, Some(4));
             }
             _ => panic!("expected Document locator"),
         }
