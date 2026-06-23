@@ -3125,6 +3125,7 @@ mod tests {
             chat: Default::default(),
             verifier: Default::default(),
             qdrant: Default::default(),
+            cli: Default::default(),
             daemon: Default::default(),
         }
     }

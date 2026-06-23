@@ -18,7 +18,24 @@ where
     consumer.consume(reader)
 }
 
-pub fn consume_task_sse<R, W>(reader: R, stdout: &mut W) -> CliResult<()>
+#[derive(Debug, Default)]
+pub struct TaskSseReport {
+    pub last_event: Option<TaskWaitEvent>,
+}
+
+#[derive(Debug)]
+pub struct TaskSseError {
+    source: CliError,
+    last_event: Option<Box<TaskWaitEvent>>,
+}
+
+impl TaskSseError {
+    pub fn into_parts(self) -> (CliError, Option<TaskWaitEvent>) {
+        (self.source, self.last_event.map(|event| *event))
+    }
+}
+
+pub fn consume_task_sse<R, W>(reader: R, stdout: &mut W) -> Result<TaskSseReport, TaskSseError>
 where
     R: Read,
     W: Write,
@@ -34,6 +51,7 @@ struct SseConsumer<'a, W> {
 struct TaskSseConsumer<'a, W> {
     stdout: &'a mut W,
     wrote_status: bool,
+    last_event: Option<TaskWaitEvent>,
 }
 
 impl<'a, W> TaskSseConsumer<'a, W>
@@ -44,10 +62,11 @@ where
         Self {
             stdout,
             wrote_status: false,
+            last_event: None,
         }
     }
 
-    fn consume<R>(&mut self, reader: R) -> CliResult<()>
+    fn consume<R>(&mut self, reader: R) -> Result<TaskSseReport, TaskSseError>
     where
         R: Read,
     {
@@ -55,14 +74,17 @@ where
         let mut frame = String::new();
         loop {
             let mut line = String::new();
-            let read = reader.read_line(&mut line)?;
+            let read = reader
+                .read_line(&mut line)
+                .map_err(|error| self.consume_error(error.into()))?;
             if read == 0 {
                 break;
             }
 
             trim_line_ending(&mut line);
             if line.is_empty() {
-                self.handle_frame(&frame)?;
+                self.handle_frame(&frame)
+                    .map_err(|error| self.consume_error(error))?;
                 frame.clear();
             } else {
                 if !frame.is_empty() {
@@ -73,10 +95,13 @@ where
         }
 
         if !frame.trim().is_empty() {
-            self.handle_frame(&frame)?;
+            self.handle_frame(&frame)
+                .map_err(|error| self.consume_error(error))?;
         }
 
-        Ok(())
+        Ok(TaskSseReport {
+            last_event: self.last_event.clone(),
+        })
     }
 
     fn handle_frame(&mut self, frame: &str) -> CliResult<()> {
@@ -87,6 +112,7 @@ where
         match frame.event.as_deref().unwrap_or("message") {
             "task" => {
                 let event: TaskWaitEvent = decode_event("task", &frame.data)?;
+                self.last_event = Some(event.clone());
                 if event.events.is_empty() && !self.wrote_status {
                     render::write_task_status_line(self.stdout, &event.task)?;
                     self.wrote_status = true;
@@ -102,6 +128,13 @@ where
             }
             "error" => Err(stream_error(&frame.data)),
             _ => Ok(()),
+        }
+    }
+
+    fn consume_error(&self, source: CliError) -> TaskSseError {
+        TaskSseError {
+            source,
+            last_event: self.last_event.clone().map(Box::new),
         }
     }
 }

@@ -1,6 +1,7 @@
 use std::env;
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use verbatim_core::api::{AskRequest, ReindexRequest, RetrieveRequest};
@@ -10,7 +11,7 @@ mod local;
 mod render;
 mod sse;
 
-use client::{CliError, DaemonClient, HttpDaemonClient};
+use client::{CliError, DaemonClient, HttpDaemonClient, TaskWaitTimeout};
 use local::{LocalActions, RealLocalActions};
 
 fn main() -> ExitCode {
@@ -118,6 +119,57 @@ fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
         return Err("must be greater than zero".into());
     }
     Ok(parsed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HumanDuration(Duration);
+
+fn parse_task_wait_timeout(value: &str) -> Result<HumanDuration, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("must not be empty".into());
+    }
+
+    let number_end = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    if number_end == 0 {
+        return Err("must start with a positive integer".into());
+    }
+
+    let amount = value[..number_end]
+        .parse::<u64>()
+        .map_err(|error| format!("must start with a positive integer: {error}"))?;
+    if amount == 0 {
+        return Err("must be greater than zero".into());
+    }
+
+    let unit = &value[number_end..];
+    let multiplier = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        _ => return Err("use seconds or a duration suffix: s, m, h, d".into()),
+    };
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration is too large".to_string())?;
+
+    Ok(HumanDuration(Duration::from_secs(seconds)))
+}
+
+fn task_wait_timeout_selection(
+    timeout: Option<HumanDuration>,
+    no_timeout: bool,
+) -> TaskWaitTimeout {
+    if no_timeout {
+        TaskWaitTimeout::Unbounded
+    } else if let Some(HumanDuration(duration)) = timeout {
+        TaskWaitTimeout::Bounded(duration)
+    } else {
+        TaskWaitTimeout::ConfigDefault
+    }
 }
 
 fn dispatch<W, C, L>(cli: Cli, stdout: &mut W, client: &C, local: &L) -> Result<u8, CliError>
@@ -387,11 +439,17 @@ where
             let response = client.get_task_events(&task_id, after)?;
             render::write_task_events(stdout, &response.events)?;
         }
-        TaskCommand::Wait { task_id, after } => {
-            client.wait_task(&task_id, after, stdout)?;
+        TaskCommand::Wait {
+            task_id,
+            after,
+            timeout,
+            no_timeout,
+        } => {
+            let timeout = task_wait_timeout_selection(timeout, no_timeout);
+            client.wait_task(&task_id, after, timeout, stdout)?;
         }
         TaskCommand::Watch { task_id, after } => {
-            client.wait_task(&task_id, after, stdout)?;
+            client.wait_task(&task_id, after, TaskWaitTimeout::Unbounded, stdout)?;
         }
         TaskCommand::Cancel { task_id } => {
             let response = client.cancel_task(&task_id)?;
@@ -620,12 +678,23 @@ enum TaskCommand {
         after: Option<i64>,
     },
     /// Wait for task events until the task reaches a terminal status.
+    #[command(
+        after_help = "Examples:\n  verbatim task wait --timeout 25m task-abc123\n  verbatim task wait --no-timeout task-abc123"
+    )]
     Wait {
         /// Task id.
         task_id: String,
         /// Only stream events after this sequence.
         #[arg(long)]
         after: Option<i64>,
+        /// Cap only this task wait; model timeout_seconds do not cap task streams.
+        ///
+        /// Plain numbers are seconds; suffixes: s, m, h, d.
+        #[arg(long, value_name = "DURATION", value_parser = parse_task_wait_timeout, conflicts_with = "no_timeout")]
+        timeout: Option<HumanDuration>,
+        /// Wait without a CLI/config/default timeout.
+        #[arg(long = "no-timeout", action = ArgAction::SetTrue)]
+        no_timeout: bool,
     },
     /// Watch task progress until the task reaches a terminal status.
     Watch {
@@ -735,6 +804,37 @@ mod tests {
     }
 
     #[test]
+    fn task_wait_help_mentions_timeout_controls_and_examples() {
+        let (code, help, stderr, _, _) = run_mock(["task", "wait", "--help"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(help.contains("--timeout <DURATION>"));
+        assert!(help.contains("--no-timeout"));
+        assert!(help.contains("verbatim task wait --timeout 25m"));
+        assert!(help.contains("verbatim task wait --no-timeout"));
+        assert!(help.contains("model timeout_seconds do not cap task streams"));
+    }
+
+    #[test]
+    fn task_wait_timeout_parser_accepts_seconds_and_duration_suffixes() {
+        assert_eq!(
+            parse_task_wait_timeout("1500").unwrap().0,
+            Duration::from_secs(1500)
+        );
+        assert_eq!(
+            parse_task_wait_timeout("25m").unwrap().0,
+            Duration::from_secs(1500)
+        );
+        assert_eq!(
+            parse_task_wait_timeout("2h").unwrap().0,
+            Duration::from_secs(7200)
+        );
+        assert!(parse_task_wait_timeout("0s").is_err());
+        assert!(parse_task_wait_timeout("10ms").is_err());
+    }
+
+    #[test]
     fn source_add_and_list_call_daemon_client() {
         let (code, stdout, stderr, client, _) = run_mock(["source", "add", "/tmp/doc.pdf"]);
 
@@ -830,19 +930,47 @@ mod tests {
 
         let (code, _, _, client, _) = run_mock(["task", "wait", "task-1"]);
         assert_eq!(code.unwrap(), 0);
-        assert_eq!(client.calls.borrow().as_slice(), ["wait_task:task-1:None"]);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["wait_task:task-1:None:config"]
+        );
+
+        let (code, _, _, client, _) = run_mock(["task", "wait", "--timeout", "25m", "task-1"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["wait_task:task-1:None:bounded(1500s)"]
+        );
+
+        let (code, _, _, client, _) = run_mock(["task", "wait", "--no-timeout", "task-1"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["wait_task:task-1:None:unbounded"]
+        );
 
         let (code, _, _, client, _) = run_mock(["task", "watch", "task-1", "--after", "4"]);
         assert_eq!(code.unwrap(), 0);
         assert_eq!(
             client.calls.borrow().as_slice(),
-            ["wait_task:task-1:Some(4)"]
+            ["wait_task:task-1:Some(4):unbounded"]
         );
 
         let (code, stdout, _, client, _) = run_mock(["task", "cancel", "task-1"]);
         assert_eq!(code.unwrap(), 0);
         assert_eq!(client.calls.borrow().as_slice(), ["cancel_task:task-1"]);
         assert!(stdout.contains("status: cancelled"));
+    }
+
+    #[test]
+    fn task_wait_timeout_and_no_timeout_conflict() {
+        let (code, stdout, stderr, _, _) =
+            run_mock(["task", "wait", "--timeout", "1s", "--no-timeout", "task-1"]);
+
+        assert_eq!(code.unwrap_err(), 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("--timeout"));
+        assert!(stderr.contains("--no-timeout"));
     }
 
     #[test]
@@ -1371,14 +1499,16 @@ mod tests {
             &self,
             task_id: &str,
             after: Option<i64>,
+            timeout: TaskWaitTimeout,
             _stdout: &mut W,
         ) -> client::CliResult<()>
         where
             W: Write,
         {
-            self.calls
-                .borrow_mut()
-                .push(format!("wait_task:{task_id}:{after:?}"));
+            self.calls.borrow_mut().push(format!(
+                "wait_task:{task_id}:{after:?}:{}",
+                task_wait_timeout_label(timeout)
+            ));
             Ok(())
         }
 
@@ -1465,6 +1595,17 @@ mod tests {
             CliError::Api(message) => CliError::Api(message.clone()),
             CliError::DaemonUnreachable(message) => CliError::DaemonUnreachable(message.clone()),
             CliError::Io(_) => CliError::Api(error.to_string()),
+            CliError::TaskWaitTimedOut { timeout } => {
+                CliError::TaskWaitTimedOut { timeout: *timeout }
+            }
+        }
+    }
+
+    fn task_wait_timeout_label(timeout: TaskWaitTimeout) -> String {
+        match timeout {
+            TaskWaitTimeout::ConfigDefault => "config".into(),
+            TaskWaitTimeout::Bounded(duration) => format!("bounded({}s)", duration.as_secs()),
+            TaskWaitTimeout::Unbounded => "unbounded".into(),
         }
     }
 
