@@ -384,13 +384,25 @@ where
         path_inputs: &[CollectionSyncPathInput],
         max_depth: Option<usize>,
     ) -> Result<CollectionSyncReport> {
+        self.sync_collection_with_extra_ignores(collection_name, path_inputs, max_depth, &[])
+    }
+
+    pub fn sync_collection_with_extra_ignores(
+        &self,
+        collection_name: &str,
+        path_inputs: &[CollectionSyncPathInput],
+        max_depth: Option<usize>,
+        extra_ignore_patterns: &[String],
+    ) -> Result<CollectionSyncReport> {
         let collection = self
             .store
             .get_collection(collection_name)?
             .with_context(|| format!("collection not found: {collection_name}"))?;
         let roots = self.store.list_collection_roots(collection_name)?;
+        let mut ignore_patterns = collection.ignore_patterns;
+        ignore_patterns.extend(extra_ignore_patterns.iter().cloned());
         let settings = CollectionSyncSettings {
-            ignore_patterns: collection.ignore_patterns,
+            ignore_patterns,
             max_depth: max_depth.unwrap_or(DEFAULT_COLLECTION_SYNC_MAX_DEPTH),
         };
         let discovery = discover_collection_members(&roots, path_inputs, &settings);
@@ -3403,6 +3415,7 @@ mod tests {
             qdrant: Default::default(),
             cli: Default::default(),
             daemon: Default::default(),
+            collection_watcher: Default::default(),
         }
     }
 

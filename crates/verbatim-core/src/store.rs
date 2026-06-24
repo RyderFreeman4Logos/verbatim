@@ -134,6 +134,18 @@ impl Store {
             "embedding_input_hash",
             "ALTER TABLE chunks ADD COLUMN embedding_input_hash TEXT",
         )?;
+        ensure_column(
+            &self.conn,
+            "collections",
+            "watch_enabled",
+            "ALTER TABLE collections ADD COLUMN watch_enabled INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &self.conn,
+            "collections",
+            "auto_index_enabled",
+            "ALTER TABLE collections ADD COLUMN auto_index_enabled INTEGER NOT NULL DEFAULT 1",
+        )?;
         Ok(())
     }
 
@@ -213,8 +225,9 @@ impl Store {
         let ignore_patterns_json =
             serde_json::to_string(ignore_patterns).context("serialize collection ignore rules")?;
         self.conn.execute(
-            "INSERT INTO collections (name, ignore_patterns_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)",
+            "INSERT INTO collections
+                (name, ignore_patterns_json, watch_enabled, auto_index_enabled, created_at, updated_at)
+             VALUES (?1, ?2, 0, 1, ?3, ?3)",
             params![name, ignore_patterns_json, now],
         )?;
         self.get_collection(name)?
@@ -223,7 +236,7 @@ impl Store {
 
     pub fn list_collections(&self) -> Result<Vec<CollectionRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, ignore_patterns_json, created_at, updated_at, last_synced_at, last_sync_json
+            "SELECT name, ignore_patterns_json, created_at, updated_at, last_synced_at, last_sync_json, watch_enabled, auto_index_enabled
              FROM collections ORDER BY name",
         )?;
         let rows = stmt.query_map([], collection_record_from_row)?;
@@ -232,12 +245,31 @@ impl Store {
 
     pub fn get_collection(&self, name: &str) -> Result<Option<CollectionRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, ignore_patterns_json, created_at, updated_at, last_synced_at, last_sync_json
+            "SELECT name, ignore_patterns_json, created_at, updated_at, last_synced_at, last_sync_json, watch_enabled, auto_index_enabled
              FROM collections WHERE name = ?1",
         )?;
         stmt.query_row(params![name], collection_record_from_row)
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn update_collection_watch_settings(
+        &self,
+        name: &str,
+        watch_enabled: bool,
+        auto_index_enabled: bool,
+    ) -> Result<Option<CollectionRecord>> {
+        let now = unix_timestamp_string();
+        let changed = self.conn.execute(
+            "UPDATE collections
+             SET watch_enabled = ?2, auto_index_enabled = ?3, updated_at = ?4
+             WHERE name = ?1",
+            params![name, watch_enabled, auto_index_enabled, now],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_collection(name)
     }
 
     pub fn delete_collection(&self, name: &str) -> Result<bool> {
@@ -2682,6 +2714,8 @@ fn collection_record_from_row(row: &Row<'_>) -> rusqlite::Result<CollectionRecor
     Ok(CollectionRecord {
         name: row.get(0)?,
         ignore_patterns: json_from_sql(1, &ignore_patterns_json)?,
+        watch_enabled: row.get(6)?,
+        auto_index_enabled: row.get(7)?,
         created_at: row.get(2)?,
         updated_at: row.get(3)?,
         last_synced_at: row.get(4)?,
@@ -2734,6 +2768,8 @@ CREATE TABLE IF NOT EXISTS sources (
 CREATE TABLE IF NOT EXISTS collections (
     name TEXT PRIMARY KEY,
     ignore_patterns_json TEXT NOT NULL,
+    watch_enabled INTEGER NOT NULL DEFAULT 0,
+    auto_index_enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_synced_at TEXT,
@@ -3173,6 +3209,15 @@ mod tests {
         store
             .create_collection("articles", &["drafts/".to_string()])
             .unwrap();
+        let collection = store.get_collection("articles").unwrap().unwrap();
+        assert!(!collection.watch_enabled);
+        assert!(collection.auto_index_enabled);
+        let collection = store
+            .update_collection_watch_settings("articles", true, false)
+            .unwrap()
+            .unwrap();
+        assert!(collection.watch_enabled);
+        assert!(!collection.auto_index_enabled);
         store.create_collection("areskapitalon", &[]).unwrap();
         store.add_collection_root("articles", dir.path()).unwrap();
 

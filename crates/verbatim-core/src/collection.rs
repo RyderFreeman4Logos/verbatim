@@ -17,12 +17,20 @@ pub struct CollectionRecord {
     pub name: String,
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
+    #[serde(default)]
+    pub watch_enabled: bool,
+    #[serde(default = "default_collection_auto_index_enabled")]
+    pub auto_index_enabled: bool,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_synced_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<CollectionSyncReport>,
+}
+
+fn default_collection_auto_index_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +155,49 @@ pub struct CollectionStatus {
     pub collection: CollectionRecord,
     pub root_count: usize,
     pub member_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionMembershipDiff {
+    pub added: Vec<CollectionMemberCandidate>,
+    pub removed: Vec<CollectionMember>,
+    pub unchanged: Vec<CollectionMember>,
+}
+
+pub fn diff_collection_members(
+    old_members: &[CollectionMember],
+    new_candidates: &[CollectionMemberCandidate],
+) -> CollectionMembershipDiff {
+    let old_by_source = old_members
+        .iter()
+        .map(|member| (member.source_id.clone(), member.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let new_by_source = new_candidates
+        .iter()
+        .map(|candidate| (candidate.source_id.clone(), candidate.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let added = new_by_source
+        .iter()
+        .filter(|(source_id, _)| !old_by_source.contains_key(*source_id))
+        .map(|(_, candidate)| candidate.clone())
+        .collect();
+    let removed = old_by_source
+        .iter()
+        .filter(|(source_id, _)| !new_by_source.contains_key(*source_id))
+        .map(|(_, member)| member.clone())
+        .collect();
+    let unchanged = old_by_source
+        .iter()
+        .filter(|(source_id, _)| new_by_source.contains_key(*source_id))
+        .map(|(_, member)| member.clone())
+        .collect();
+
+    CollectionMembershipDiff {
+        added,
+        removed,
+        unchanged,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -712,6 +763,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn symlink_file_target_change_changes_candidate_source() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.md");
+        let second = dir.path().join("second.md");
+        let link = dir.path().join("linked.md");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        unix_fs::symlink(&first, &link).unwrap();
+        let first_discovery = discover(&link, &[]);
+        fs::remove_file(&link).unwrap();
+        unix_fs::symlink(&second, &link).unwrap();
+
+        let second_discovery = discover(&link, &[]);
+
+        assert_eq!(first_discovery.candidates.len(), 1);
+        assert_eq!(second_discovery.candidates.len(), 1);
+        assert_ne!(
+            first_discovery.candidates[0].source_id,
+            second_discovery.candidates[0].source_id
+        );
+        assert_eq!(
+            second_discovery.candidates[0].source_path,
+            fs::canonicalize(&second).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn follows_symlink_to_directory() {
         let dir = tempdir().unwrap();
         let target_dir = dir.path().join("target");
@@ -829,5 +908,43 @@ mod tests {
             .skipped
             .iter()
             .any(|skip| skip.reason == CollectionSyncSkipReason::MaxDepth));
+    }
+
+    #[test]
+    fn diffs_collection_members_by_source_id() {
+        let old = vec![
+            CollectionMember {
+                collection_name: "articles".into(),
+                source_id: SourceId("src-1".into()),
+                logical_path: "one.md".into(),
+                source_path: PathBuf::from("/tmp/one.md"),
+                updated_at: "1".into(),
+            },
+            CollectionMember {
+                collection_name: "articles".into(),
+                source_id: SourceId("src-2".into()),
+                logical_path: "two.md".into(),
+                source_path: PathBuf::from("/tmp/two.md"),
+                updated_at: "1".into(),
+            },
+        ];
+        let new = vec![
+            CollectionMemberCandidate {
+                source_id: SourceId("src-2".into()),
+                logical_path: "renamed.md".into(),
+                source_path: PathBuf::from("/tmp/two.md"),
+            },
+            CollectionMemberCandidate {
+                source_id: SourceId("src-3".into()),
+                logical_path: "three.md".into(),
+                source_path: PathBuf::from("/tmp/three.md"),
+            },
+        ];
+
+        let diff = diff_collection_members(&old, &new);
+
+        assert_eq!(diff.added[0].source_id, SourceId("src-3".into()));
+        assert_eq!(diff.removed[0].source_id, SourceId("src-1".into()));
+        assert_eq!(diff.unchanged[0].source_id, SourceId("src-2".into()));
     }
 }

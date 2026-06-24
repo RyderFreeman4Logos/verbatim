@@ -37,6 +37,8 @@ pub struct Config {
     pub cli: CliConfig,
     #[serde(default)]
     pub daemon: DaemonConfig,
+    #[serde(default)]
+    pub collection_watcher: CollectionWatcherConfig,
 }
 
 pub const DEFAULT_TASK_WAIT_TIMEOUT_SECONDS: u64 = 1500;
@@ -842,6 +844,47 @@ impl Default for DaemonConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionWatcherConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_collection_watcher_debounce_millis")]
+    pub debounce_millis: u64,
+    #[serde(default = "default_collection_watcher_max_depth")]
+    pub max_depth: usize,
+    #[serde(default = "default_collection_watcher_max_queued_tasks")]
+    pub max_queued_tasks: usize,
+    #[serde(default)]
+    pub ignore_collections: Vec<String>,
+    #[serde(default)]
+    pub ignore_paths: Vec<String>,
+}
+
+impl Default for CollectionWatcherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            debounce_millis: default_collection_watcher_debounce_millis(),
+            max_depth: default_collection_watcher_max_depth(),
+            max_queued_tasks: default_collection_watcher_max_queued_tasks(),
+            ignore_collections: Vec::new(),
+            ignore_paths: Vec::new(),
+        }
+    }
+}
+
+fn default_collection_watcher_debounce_millis() -> u64 {
+    500
+}
+
+fn default_collection_watcher_max_depth() -> usize {
+    crate::collection::DEFAULT_COLLECTION_SYNC_MAX_DEPTH
+}
+
+fn default_collection_watcher_max_queued_tasks() -> usize {
+    128
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliConfig {
     #[serde(default = "default_task_wait_timeout_seconds")]
     pub task_wait_timeout_seconds: u64,
@@ -956,6 +999,7 @@ impl Config {
         next.chat = candidate.chat.clone();
         next.verifier = candidate.verifier.clone();
         next.cli = candidate.cli.clone();
+        next.collection_watcher = candidate.collection_watcher.clone();
 
         next
     }
@@ -1106,6 +1150,12 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "chat.vision_attachments.detail"
             | "verifier.enabled"
             | "cli.task_wait_timeout_seconds"
+            | "collection_watcher.enabled"
+            | "collection_watcher.debounce_millis"
+            | "collection_watcher.max_depth"
+            | "collection_watcher.max_queued_tasks"
+            | "collection_watcher.ignore_collections"
+            | "collection_watcher.ignore_paths"
     )
 }
 
@@ -1333,6 +1383,14 @@ task_wait_timeout_seconds = 1500
 
 [daemon]
 bind = "127.0.0.1:7700"
+
+[collection_watcher]
+enabled = true
+debounce_millis = 500
+max_depth = 32
+max_queued_tasks = 128
+ignore_collections = []
+ignore_paths = []
 "#;
 
 #[cfg(test)]
@@ -1453,6 +1511,10 @@ mod tests {
         assert_eq!(config.qdrant.collection, "verbatim");
         assert!(!config.qdrant.prefer_for_search);
         assert_eq!(config.qdrant.timeout_seconds, 5);
+        assert!(config.collection_watcher.enabled);
+        assert_eq!(config.collection_watcher.debounce_millis, 500);
+        assert_eq!(config.collection_watcher.max_depth, 32);
+        assert_eq!(config.collection_watcher.max_queued_tasks, 128);
         assert_eq!(config.cli.task_wait_timeout_seconds, 1500);
         assert_eq!(config.daemon.bind, "127.0.0.1:7700");
     }

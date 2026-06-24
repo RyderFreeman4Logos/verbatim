@@ -7,7 +7,8 @@ use std::time::Duration;
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use verbatim_core::api::{
     AddCollectionRootRequest, AskRequest, CollectionFilterRequest, CollectionSyncPathRequest,
-    CollectionSyncRequest, CreateCollectionRequest, ReindexRequest, RetrieveRequest,
+    CollectionSyncRequest, CollectionWatcherUpdateRequest, CreateCollectionRequest, ReindexRequest,
+    RetrieveRequest,
 };
 
 mod client;
@@ -450,8 +451,66 @@ where
             let response = client.collection_status(&name)?;
             render::write_collection_status(stdout, &response.status)?;
         }
+        CollectionCommand::Watch { command } => {
+            run_collection_watch(command, stdout, client)?;
+        }
     }
     Ok(0)
+}
+
+fn run_collection_watch<W, C>(
+    command: CollectionWatchCommand,
+    stdout: &mut W,
+    client: &C,
+) -> Result<u8, CliError>
+where
+    W: Write,
+    C: DaemonClient,
+{
+    match command {
+        CollectionWatchCommand::Enable {
+            name,
+            auto_index,
+            no_auto_index,
+        } => {
+            let response = client.update_collection_watcher(
+                &name,
+                &CollectionWatcherUpdateRequest {
+                    enabled: true,
+                    auto_index_enabled: auto_index_setting(auto_index, no_auto_index),
+                },
+            )?;
+            render::write_collection_watcher_status(stdout, &response.watcher)?;
+        }
+        CollectionWatchCommand::Disable { name } => {
+            let response = client.update_collection_watcher(
+                &name,
+                &CollectionWatcherUpdateRequest {
+                    enabled: false,
+                    auto_index_enabled: None,
+                },
+            )?;
+            render::write_collection_watcher_status(stdout, &response.watcher)?;
+        }
+        CollectionWatchCommand::Status { name } => {
+            if let Some(name) = name {
+                let response = client.collection_watcher_status(&name)?;
+                render::write_collection_watcher_status(stdout, &response.watcher)?;
+            } else {
+                let response = client.list_collection_watcher_statuses()?;
+                render::write_collection_watcher_statuses(stdout, &response.watchers)?;
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn auto_index_setting(auto_index: bool, no_auto_index: bool) -> Option<bool> {
+    match (auto_index, no_auto_index) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
 }
 
 fn collection_sync_request(
@@ -719,6 +778,41 @@ const COLLECTION_STATUS_AFTER_HELP: &str = r#"Examples:
 
 Status reads the persisted sync summary and member count without scanning the
 filesystem.
+"#;
+
+const COLLECTION_WATCH_AFTER_HELP: &str = r#"Examples:
+  verbatim collection watch enable articles --auto-index
+  verbatim collection watch enable articles --no-auto-index
+  verbatim collection watch status
+  verbatim collection watch status articles
+  verbatim collection watch disable articles
+
+Watcher commands call daemon API operations. The CLI does not watch the
+filesystem itself.
+"#;
+
+const COLLECTION_WATCH_ENABLE_AFTER_HELP: &str = r#"Examples:
+  verbatim collection watch enable articles
+  verbatim collection watch enable articles --auto-index
+  verbatim collection watch enable articles --no-auto-index
+
+Enable persists the collection watcher setting in the daemon collection
+registry. Auto-index is left unchanged unless a flag is provided.
+"#;
+
+const COLLECTION_WATCH_DISABLE_AFTER_HELP: &str = r#"Examples:
+  verbatim collection watch disable articles
+
+Disable stops future auto-maintenance for this collection after the daemon
+refreshes its watch set.
+"#;
+
+const COLLECTION_WATCH_STATUS_AFTER_HELP: &str = r#"Examples:
+  verbatim collection watch status
+  verbatim collection watch status articles
+
+Status reads daemon watcher state, including active roots, pending debounced
+events, last sync diff, last task id, and last error.
 "#;
 
 const INGEST_AFTER_HELP: &str = r#"Examples:
@@ -1276,6 +1370,55 @@ enum CollectionCommand {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Manage daemon-side collection watcher maintenance.
+    #[command(
+        about = "Enable, disable, or inspect daemon-side collection watcher maintenance.",
+        after_help = COLLECTION_WATCH_AFTER_HELP
+    )]
+    Watch {
+        #[command(subcommand)]
+        command: CollectionWatchCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CollectionWatchCommand {
+    /// Enable watcher maintenance for one collection.
+    #[command(
+        about = "Enable watcher maintenance for one collection.",
+        after_help = COLLECTION_WATCH_ENABLE_AFTER_HELP
+    )]
+    Enable {
+        /// Collection name.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Enable auto-indexing queued from watcher maintenance.
+        #[arg(long = "auto-index", action = ArgAction::SetTrue, conflicts_with = "no_auto_index")]
+        auto_index: bool,
+        /// Disable auto-indexing while still refreshing materialized membership.
+        #[arg(long = "no-auto-index", action = ArgAction::SetTrue)]
+        no_auto_index: bool,
+    },
+    /// Disable watcher maintenance for one collection.
+    #[command(
+        about = "Disable watcher maintenance for one collection.",
+        after_help = COLLECTION_WATCH_DISABLE_AFTER_HELP
+    )]
+    Disable {
+        /// Collection name.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Show daemon-side watcher status.
+    #[command(
+        about = "Show daemon-side watcher status.",
+        after_help = COLLECTION_WATCH_STATUS_AFTER_HELP
+    )]
+    Status {
+        /// Collection name. Omit to list every collection watcher status.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1423,10 +1566,12 @@ mod tests {
     use verbatim_core::api::{
         AddCollectionRootRequest, AddSourceResponse, CheckStaleResponse, CitationResponse,
         CollectionResponse, CollectionStatusResponse, CollectionSyncRequest,
-        CollectionSyncResponse, ConfigResponse, CreateCollectionRequest, EvidenceResponse,
-        HealthResponse, IngestResponse, ReindexRequest, ReindexResponse, RetrieveControlsResponse,
-        RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
-        SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskSummaryResponse,
+        CollectionSyncResponse, CollectionWatcherResponse, CollectionWatcherStatus,
+        CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
+        CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse, ReindexRequest,
+        ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
+        RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
+        TaskEventsResponse, TaskSummaryResponse,
     };
     use verbatim_core::collection::{
         CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
@@ -1469,6 +1614,10 @@ mod tests {
             &["collection", "remove", "--help"],
             &["collection", "sync", "--help"],
             &["collection", "status", "--help"],
+            &["collection", "watch", "--help"],
+            &["collection", "watch", "enable", "--help"],
+            &["collection", "watch", "disable", "--help"],
+            &["collection", "watch", "status", "--help"],
             &["ingest", "--help"],
             &["reindex", "--help"],
             &["ask", "--help"],
@@ -1518,6 +1667,10 @@ mod tests {
             &["collection", "remove", "--help"],
             &["collection", "sync", "--help"],
             &["collection", "status", "--help"],
+            &["collection", "watch", "--help"],
+            &["collection", "watch", "enable", "--help"],
+            &["collection", "watch", "disable", "--help"],
+            &["collection", "watch", "status", "--help"],
             &["ingest", "--help"],
             &["reindex", "--help"],
             &["ask", "--help"],
@@ -1783,6 +1936,66 @@ mod tests {
             ["delete_collection:articles"]
         );
         assert!(stdout.contains("Deleted collection: articles"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn collection_watch_commands_call_daemon_client() {
+        let (code, stdout, stderr, client, _) = run_mock(["collection", "watch", "status"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["list_collection_watcher_statuses"]
+        );
+        assert!(stdout.contains("Collection watchers:"));
+        assert!(stdout.contains("name=articles"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) =
+            run_mock(["collection", "watch", "status", "articles"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["collection_watcher_status:articles"]
+        );
+        assert!(stdout.contains("Collection watcher:"));
+        assert!(stdout.contains("last_task_id: task-1"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) = run_mock([
+            "collection",
+            "watch",
+            "enable",
+            "articles",
+            "--no-auto-index",
+        ]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["update_collection_watcher:articles"]
+        );
+        assert_eq!(
+            client.last_watcher_update.borrow().as_ref().unwrap(),
+            &CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(false),
+            }
+        );
+        assert!(stdout.contains("watch_enabled: true"));
+        assert!(stdout.contains("auto_index_enabled: false"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) =
+            run_mock(["collection", "watch", "disable", "articles"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.last_watcher_update.borrow().as_ref().unwrap(),
+            &CollectionWatcherUpdateRequest {
+                enabled: false,
+                auto_index_enabled: None,
+            }
+        );
+        assert!(stdout.contains("watch_enabled: false"));
         assert!(stderr.is_empty());
     }
 
@@ -2387,6 +2600,7 @@ mod tests {
         last_collection_create: RefCell<Option<CreateCollectionRequest>>,
         last_collection_root: RefCell<Option<AddCollectionRootRequest>>,
         last_collection_sync: RefCell<Option<CollectionSyncRequest>>,
+        last_watcher_update: RefCell<Option<CollectionWatcherUpdateRequest>>,
         list_error: Option<CliError>,
         health_error: Option<CliError>,
     }
@@ -2485,6 +2699,49 @@ mod tests {
                     collection: sample_collection_record(),
                     root_count: 1,
                     member_count: 1,
+                },
+            })
+        }
+
+        fn list_collection_watcher_statuses(
+            &self,
+        ) -> client::CliResult<CollectionWatchersStatusResponse> {
+            self.calls
+                .borrow_mut()
+                .push("list_collection_watcher_statuses".into());
+            Ok(CollectionWatchersStatusResponse {
+                watchers: vec![sample_collection_watcher_status()],
+            })
+        }
+
+        fn collection_watcher_status(
+            &self,
+            name: &str,
+        ) -> client::CliResult<CollectionWatcherResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("collection_watcher_status:{name}"));
+            Ok(CollectionWatcherResponse {
+                collection: sample_collection_record(),
+                watcher: sample_collection_watcher_status(),
+            })
+        }
+
+        fn update_collection_watcher(
+            &self,
+            name: &str,
+            request: &CollectionWatcherUpdateRequest,
+        ) -> client::CliResult<CollectionWatcherResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("update_collection_watcher:{name}"));
+            self.last_watcher_update.replace(Some(request.clone()));
+            Ok(CollectionWatcherResponse {
+                collection: sample_collection_record(),
+                watcher: CollectionWatcherStatus {
+                    watch_enabled: request.enabled,
+                    auto_index_enabled: request.auto_index_enabled.unwrap_or(true),
+                    ..sample_collection_watcher_status()
                 },
             })
         }
@@ -2707,10 +2964,31 @@ mod tests {
         CollectionRecord {
             name: "articles".into(),
             ignore_patterns: vec!["drafts/".into()],
+            watch_enabled: true,
+            auto_index_enabled: true,
             created_at: "1".into(),
             updated_at: "2".into(),
             last_synced_at: Some("3".into()),
             last_sync: Some(sample_collection_sync_report()),
+        }
+    }
+
+    fn sample_collection_watcher_status() -> CollectionWatcherStatus {
+        CollectionWatcherStatus {
+            collection_name: "articles".into(),
+            watch_enabled: true,
+            auto_index_enabled: true,
+            active: true,
+            ignored_by_config: false,
+            watched_root_count: 1,
+            pending_event_count: 0,
+            last_event_at: Some("4".into()),
+            last_sync_at: Some("5".into()),
+            last_error: None,
+            last_added: 1,
+            last_removed: 0,
+            last_unchanged: 2,
+            last_task_id: Some("task-1".into()),
         }
     }
 

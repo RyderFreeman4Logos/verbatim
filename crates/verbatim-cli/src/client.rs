@@ -11,6 +11,7 @@ use serde_json::Value;
 use verbatim_core::api::{
     AddCollectionRootRequest, AddSourceRequest, AddSourceResponse, AskRequest, CheckStaleResponse,
     CollectionResponse, CollectionStatusResponse, CollectionSyncRequest, CollectionSyncResponse,
+    CollectionWatcherResponse, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
     ConfigResponse, CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse,
     ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse, SourceResponse,
     TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse,
@@ -95,6 +96,13 @@ pub trait DaemonClient {
         request: &CollectionSyncRequest,
     ) -> CliResult<CollectionSyncResponse>;
     fn collection_status(&self, name: &str) -> CliResult<CollectionStatusResponse>;
+    fn list_collection_watcher_statuses(&self) -> CliResult<CollectionWatchersStatusResponse>;
+    fn collection_watcher_status(&self, name: &str) -> CliResult<CollectionWatcherResponse>;
+    fn update_collection_watcher(
+        &self,
+        name: &str,
+        request: &CollectionWatcherUpdateRequest,
+    ) -> CliResult<CollectionWatcherResponse>;
     fn ingest(
         &self,
         source_id: Option<&str>,
@@ -376,6 +384,34 @@ impl DaemonClient for HttpDaemonClient {
             Method::GET,
             &format!("/api/collections/{name}/status"),
             None,
+        )
+    }
+
+    fn list_collection_watcher_statuses(&self) -> CliResult<CollectionWatchersStatusResponse> {
+        self.request_json::<CollectionWatchersStatusResponse, ()>(
+            Method::GET,
+            "/api/collections/watchers/status",
+            None,
+        )
+    }
+
+    fn collection_watcher_status(&self, name: &str) -> CliResult<CollectionWatcherResponse> {
+        self.request_json::<CollectionWatcherResponse, ()>(
+            Method::GET,
+            &format!("/api/collections/{name}/watcher"),
+            None,
+        )
+    }
+
+    fn update_collection_watcher(
+        &self,
+        name: &str,
+        request: &CollectionWatcherUpdateRequest,
+    ) -> CliResult<CollectionWatcherResponse> {
+        self.request_json(
+            Method::PUT,
+            &format!("/api/collections/{name}/watcher"),
+            Some(request),
         )
     }
 
