@@ -1,10 +1,14 @@
 use std::env;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
-use verbatim_core::api::{AskRequest, ReindexRequest, RetrieveRequest};
+use verbatim_core::api::{
+    AddCollectionRootRequest, AskRequest, CollectionSyncPathRequest, CollectionSyncRequest,
+    CreateCollectionRequest, ReindexRequest, RetrieveRequest,
+};
 
 mod client;
 mod local;
@@ -180,6 +184,7 @@ where
 {
     match cli.command {
         Commands::Source { command } => run_source(command, stdout, client),
+        Commands::Collection { command } => run_collection(command, stdout, client),
         Commands::Ingest {
             source_id,
             force,
@@ -371,6 +376,115 @@ where
     Ok(0)
 }
 
+fn run_collection<W, C>(
+    command: CollectionCommand,
+    stdout: &mut W,
+    client: &C,
+) -> Result<u8, CliError>
+where
+    W: Write,
+    C: DaemonClient,
+{
+    match command {
+        CollectionCommand::Create {
+            name,
+            ignore_patterns,
+        } => {
+            let response = client.create_collection(&CreateCollectionRequest {
+                name,
+                ignore_patterns,
+            })?;
+            render::write_collection(stdout, &response)?;
+        }
+        CollectionCommand::AddRoot { name, path } => {
+            let response = client.add_collection_root(
+                &name,
+                &AddCollectionRootRequest {
+                    path: absolute_cli_path(&path)?.display().to_string(),
+                },
+            )?;
+            render::write_collection(stdout, &response)?;
+        }
+        CollectionCommand::List => {
+            let collections = client.list_collections()?;
+            render::write_collections(stdout, &collections)?;
+        }
+        CollectionCommand::Get { name } => {
+            let response = client.get_collection(&name)?;
+            render::write_collection(stdout, &response)?;
+        }
+        CollectionCommand::Delete { name } => {
+            client.delete_collection(&name)?;
+            writeln!(stdout, "Deleted collection: {name}")?;
+        }
+        CollectionCommand::Sync {
+            name,
+            stdin,
+            max_depth,
+            paths,
+        } => {
+            let request = collection_sync_request(paths, stdin, max_depth)?;
+            let response = client.sync_collection(&name, &request)?;
+            render::write_collection_sync_report(stdout, &response.report)?;
+        }
+        CollectionCommand::Status { name } => {
+            let response = client.collection_status(&name)?;
+            render::write_collection_status(stdout, &response.status)?;
+        }
+    }
+    Ok(0)
+}
+
+fn collection_sync_request(
+    paths: Vec<String>,
+    read_stdin: bool,
+    max_depth: Option<usize>,
+) -> Result<CollectionSyncRequest, CliError> {
+    let mut request_paths = paths
+        .iter()
+        .map(|path| {
+            Ok(CollectionSyncPathRequest {
+                path: absolute_cli_path(path)?.display().to_string(),
+                logical_path: None,
+            })
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+
+    if read_stdin {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        request_paths.extend(collection_sync_stdin_paths(&input)?);
+    }
+
+    Ok(CollectionSyncRequest {
+        paths: request_paths,
+        max_depth,
+    })
+}
+
+fn collection_sync_stdin_paths(input: &str) -> Result<Vec<CollectionSyncPathRequest>, CliError> {
+    input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            Ok(CollectionSyncPathRequest {
+                path: absolute_cli_path(line)?.display().to_string(),
+                logical_path: Some(line.replace('\\', "/")),
+            })
+        })
+        .collect()
+}
+
+fn absolute_cli_path(path: &str) -> Result<PathBuf, CliError> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(env::current_dir()?.join(path))
+    }
+}
+
 fn run_config<W, C, L>(
     command: ConfigCommand,
     stdout: &mut W,
@@ -472,6 +586,7 @@ const TOP_LEVEL_AFTER_HELP: &str = r#"Examples:
   verbatim config init
   verbatim daemon install
   verbatim source add ./paper.pdf
+  verbatim collection create articles
   verbatim ingest <source-id>
   verbatim retrieve --show-debug "What does the paper claim?"
   verbatim ask --source-id <source-id> "What supports the conclusion?"
@@ -523,6 +638,68 @@ const SOURCE_CHECK_AFTER_HELP: &str = r#"Examples:
 
 Check hashes registered sources and reports stale ids that should be ingested or
 reindexed.
+"#;
+
+const COLLECTION_AFTER_HELP: &str = r#"Examples:
+  verbatim collection create articles
+  verbatim collection add-root articles ../drafts/articles/articles
+  verbatim collection sync articles
+  fd -e md . ../drafts/articles/articles | verbatim collection sync articles --stdin
+
+Collections materialize filesystem membership into the daemon catalog. Retrieval
+does not rescan collection directories per request.
+"#;
+
+const COLLECTION_CREATE_AFTER_HELP: &str = r#"Examples:
+  verbatim collection create articles
+  verbatim collection create areskapitalon --ignore drafts/
+
+Collection names are stable daemon identifiers. Ignore patterns are matched
+against collection logical paths during sync.
+"#;
+
+const COLLECTION_ADD_ROOT_AFTER_HELP: &str = r#"Examples:
+  verbatim collection add-root articles ../drafts/articles/articles
+  verbatim collection add-root articles ./linked-articles
+
+Roots may be files, directories, or symlinks. Sync follows symlinks with
+canonical path loop checks and bounded traversal depth.
+"#;
+
+const COLLECTION_LIST_AFTER_HELP: &str = r#"Examples:
+  verbatim collection list
+
+List shows collection records and last sync timestamps.
+"#;
+
+const COLLECTION_GET_AFTER_HELP: &str = r#"Examples:
+  verbatim collection get articles
+
+Get shows persistent roots and materialized members for one collection.
+"#;
+
+const COLLECTION_DELETE_AFTER_HELP: &str = r#"Examples:
+  verbatim collection delete articles
+  verbatim collection remove articles
+
+Delete removes the collection record and membership only; source records and
+filesystem files are left intact.
+"#;
+
+const COLLECTION_SYNC_AFTER_HELP: &str = r#"Examples:
+  verbatim collection sync articles
+  fd -e md . ../drafts/articles/articles | verbatim collection sync articles --stdin
+  fd 'Areskapitalon.*\.md' ../drafts/articles/articles | verbatim collection sync areskapitalon --stdin
+
+Sync materializes membership from stored roots plus optional one-shot paths.
+stdin lines preserve their text as collection logical paths.
+"#;
+
+const COLLECTION_STATUS_AFTER_HELP: &str = r#"Examples:
+  verbatim collection status articles
+
+Status reads the persisted sync summary and member count without scanning the
+filesystem.
 "#;
 
 const INGEST_AFTER_HELP: &str = r#"Examples:
@@ -736,6 +913,15 @@ enum Commands {
     Source {
         #[command(subcommand)]
         command: SourceCommand,
+    },
+    /// Manage filesystem-backed source collections through the daemon API.
+    #[command(
+        about = "Manage materialized filesystem collections.",
+        after_help = COLLECTION_AFTER_HELP
+    )]
+    Collection {
+        #[command(subcommand)]
+        command: CollectionCommand,
     },
     /// Trigger ingestion through the daemon API.
     #[command(
@@ -971,6 +1157,92 @@ enum SourceCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum CollectionCommand {
+    /// Create a collection record.
+    #[command(
+        about = "Create a collection record.",
+        after_help = COLLECTION_CREATE_AFTER_HELP
+    )]
+    Create {
+        /// Collection name.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Collection-level ignore pattern. Repeatable.
+        #[arg(long = "ignore", value_name = "PATTERN")]
+        ignore_patterns: Vec<String>,
+    },
+    /// Add a persistent filesystem root to a collection.
+    #[command(
+        about = "Add a persistent filesystem root to a collection.",
+        after_help = COLLECTION_ADD_ROOT_AFTER_HELP
+    )]
+    AddRoot {
+        /// Collection name.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// File, directory, or symlink path.
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    /// List collections.
+    #[command(
+        about = "List collection records.",
+        after_help = COLLECTION_LIST_AFTER_HELP
+    )]
+    List,
+    /// Inspect one collection, including materialized roots and members.
+    #[command(
+        about = "Inspect one collection.",
+        after_help = COLLECTION_GET_AFTER_HELP
+    )]
+    Get {
+        /// Collection name.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Delete one collection record and its membership.
+    #[command(
+        alias = "remove",
+        about = "Delete one collection record and its membership.",
+        after_help = COLLECTION_DELETE_AFTER_HELP
+    )]
+    Delete {
+        /// Collection name.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Sync materialized collection membership from roots and optional path inputs.
+    #[command(
+        about = "Sync materialized collection membership.",
+        after_help = COLLECTION_SYNC_AFTER_HELP
+    )]
+    Sync {
+        /// Collection name.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Read newline-delimited file or directory paths from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// Override safe traversal depth for this sync.
+        #[arg(long = "max-depth", value_parser = parse_nonzero_usize)]
+        max_depth: Option<usize>,
+        /// Extra one-shot file, directory, or symlink paths for this sync.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+    },
+    /// Show persisted collection sync status without rescanning the filesystem.
+    #[command(
+        about = "Show persisted collection sync status.",
+        after_help = COLLECTION_STATUS_AFTER_HELP
+    )]
+    Status {
+        /// Collection name.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ConfigCommand {
     /// Generate the default local config file.
     #[command(
@@ -1113,17 +1385,23 @@ mod tests {
 
     use serde_json::Value;
     use verbatim_core::api::{
-        AddSourceResponse, CheckStaleResponse, CitationResponse, ConfigResponse, EvidenceResponse,
+        AddCollectionRootRequest, AddSourceResponse, CheckStaleResponse, CitationResponse,
+        CollectionResponse, CollectionStatusResponse, CollectionSyncRequest,
+        CollectionSyncResponse, ConfigResponse, CreateCollectionRequest, EvidenceResponse,
         HealthResponse, IngestResponse, ReindexRequest, ReindexResponse, RetrieveControlsResponse,
         RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
         SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskSummaryResponse,
+    };
+    use verbatim_core::collection::{
+        CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
+        CollectionSyncReport,
     };
     use verbatim_core::config::ConfigReloadMetadata;
     use verbatim_core::task::{
         TaskEndpointSummary, TaskEvent, TaskId, TaskKind, TaskProgressSnapshot, TaskSpan,
         TaskStatus, TaskSummary,
     };
-    use verbatim_core::types::SourceLocator;
+    use verbatim_core::types::{SourceId, SourceLocator};
 
     use super::*;
 
@@ -1146,6 +1424,15 @@ mod tests {
             &["source", "inspect", "--help"],
             &["source", "remove", "--help"],
             &["source", "check", "--help"],
+            &["collection", "--help"],
+            &["collection", "create", "--help"],
+            &["collection", "add-root", "--help"],
+            &["collection", "list", "--help"],
+            &["collection", "get", "--help"],
+            &["collection", "delete", "--help"],
+            &["collection", "remove", "--help"],
+            &["collection", "sync", "--help"],
+            &["collection", "status", "--help"],
             &["ingest", "--help"],
             &["reindex", "--help"],
             &["ask", "--help"],
@@ -1186,6 +1473,15 @@ mod tests {
             &["source", "inspect", "--help"],
             &["source", "remove", "--help"],
             &["source", "check", "--help"],
+            &["collection", "--help"],
+            &["collection", "create", "--help"],
+            &["collection", "add-root", "--help"],
+            &["collection", "list", "--help"],
+            &["collection", "get", "--help"],
+            &["collection", "delete", "--help"],
+            &["collection", "remove", "--help"],
+            &["collection", "sync", "--help"],
+            &["collection", "status", "--help"],
             &["ingest", "--help"],
             &["reindex", "--help"],
             &["ask", "--help"],
@@ -1240,6 +1536,12 @@ mod tests {
         assert!(stderr.is_empty());
         assert!(source_help.contains("Sources are daemon-registered paths"));
         assert!(source_help.contains("verbatim source add ./paper.pdf"));
+
+        let (code, collection_help, stderr, _, _) = run_mock(["collection", "--help"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(collection_help.contains("materialize filesystem membership"));
+        assert!(collection_help.contains("verbatim collection add-root articles"));
 
         let (code, config_help, stderr, _, _) = run_mock(["config", "--help"]);
         assert_eq!(code.unwrap(), 0);
@@ -1360,6 +1662,107 @@ mod tests {
         assert!(stdout.contains("Sources:"));
         assert!(stdout.contains("id=src-1"));
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn collection_commands_call_daemon_client() {
+        let (code, stdout, stderr, client, _) =
+            run_mock(["collection", "create", "articles", "--ignore", "drafts/"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["create_collection"]);
+        assert_eq!(
+            client
+                .last_collection_create
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .ignore_patterns,
+            vec!["drafts/".to_string()]
+        );
+        assert!(stdout.contains("Collection:"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) =
+            run_mock(["collection", "add-root", "articles", "/tmp/articles"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["add_collection_root:articles"]
+        );
+        assert_eq!(
+            client.last_collection_root.borrow().as_ref().unwrap().path,
+            "/tmp/articles"
+        );
+        assert!(stdout.contains("Roots:"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) = run_mock(["collection", "list"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["list_collections"]);
+        assert!(stdout.contains("Collections:"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) = run_mock(["collection", "get", "articles"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["get_collection:articles"]
+        );
+        assert!(stdout.contains("Members:"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) = run_mock([
+            "collection",
+            "sync",
+            "articles",
+            "--max-depth",
+            "7",
+            "/tmp/articles/one.md",
+        ]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["sync_collection:articles"]
+        );
+        let request = client.last_collection_sync.borrow();
+        let request = request.as_ref().unwrap();
+        assert_eq!(request.max_depth, Some(7));
+        assert_eq!(request.paths[0].path, "/tmp/articles/one.md");
+        assert!(stdout.contains("Synced 1 member"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) = run_mock(["collection", "status", "articles"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["collection_status:articles"]
+        );
+        assert!(stdout.contains("Collection status:"));
+        assert!(stderr.is_empty());
+
+        let (code, stdout, stderr, client, _) = run_mock(["collection", "remove", "articles"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["delete_collection:articles"]
+        );
+        assert!(stdout.contains("Deleted collection: articles"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn collection_stdin_path_builder_preserves_logical_lines() {
+        let paths = collection_sync_stdin_paths("../drafts/articles/articles/Areskapitalon.md\n\n")
+            .unwrap();
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0]
+            .path
+            .ends_with("../drafts/articles/articles/Areskapitalon.md"));
+        assert_eq!(
+            paths[0].logical_path.as_deref(),
+            Some("../drafts/articles/articles/Areskapitalon.md")
+        );
     }
 
     #[test]
@@ -1902,6 +2305,9 @@ mod tests {
         last_ask: RefCell<Option<AskRequest>>,
         last_retrieve: RefCell<Option<RetrieveRequest>>,
         last_reindex: RefCell<Option<ReindexRequest>>,
+        last_collection_create: RefCell<Option<CreateCollectionRequest>>,
+        last_collection_root: RefCell<Option<AddCollectionRootRequest>>,
+        last_collection_sync: RefCell<Option<CollectionSyncRequest>>,
         list_error: Option<CliError>,
         health_error: Option<CliError>,
     }
@@ -1934,6 +2340,73 @@ mod tests {
             self.calls.borrow_mut().push("check_sources".into());
             Ok(CheckStaleResponse {
                 stale: vec!["src-1".into()],
+            })
+        }
+
+        fn create_collection(
+            &self,
+            request: &CreateCollectionRequest,
+        ) -> client::CliResult<CollectionResponse> {
+            self.calls.borrow_mut().push("create_collection".into());
+            self.last_collection_create.replace(Some(request.clone()));
+            Ok(sample_collection_response())
+        }
+
+        fn add_collection_root(
+            &self,
+            name: &str,
+            request: &AddCollectionRootRequest,
+        ) -> client::CliResult<CollectionResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("add_collection_root:{name}"));
+            self.last_collection_root.replace(Some(request.clone()));
+            Ok(sample_collection_response())
+        }
+
+        fn list_collections(&self) -> client::CliResult<Vec<CollectionRecord>> {
+            self.calls.borrow_mut().push("list_collections".into());
+            Ok(vec![sample_collection_record()])
+        }
+
+        fn get_collection(&self, name: &str) -> client::CliResult<CollectionResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("get_collection:{name}"));
+            Ok(sample_collection_response())
+        }
+
+        fn delete_collection(&self, name: &str) -> client::CliResult<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("delete_collection:{name}"));
+            Ok(())
+        }
+
+        fn sync_collection(
+            &self,
+            name: &str,
+            request: &CollectionSyncRequest,
+        ) -> client::CliResult<CollectionSyncResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("sync_collection:{name}"));
+            self.last_collection_sync.replace(Some(request.clone()));
+            Ok(CollectionSyncResponse {
+                report: sample_collection_sync_report(),
+            })
+        }
+
+        fn collection_status(&self, name: &str) -> client::CliResult<CollectionStatusResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("collection_status:{name}"));
+            Ok(CollectionStatusResponse {
+                status: CollectionStatus {
+                    collection: sample_collection_record(),
+                    root_count: 1,
+                    member_count: 1,
+                },
             })
         }
 
@@ -2148,6 +2621,50 @@ mod tests {
             parser_used: None,
             last_ingested_at: None,
             diagnostics: None,
+        }
+    }
+
+    fn sample_collection_record() -> CollectionRecord {
+        CollectionRecord {
+            name: "articles".into(),
+            ignore_patterns: vec!["drafts/".into()],
+            created_at: "1".into(),
+            updated_at: "2".into(),
+            last_synced_at: Some("3".into()),
+            last_sync: Some(sample_collection_sync_report()),
+        }
+    }
+
+    fn sample_collection_response() -> CollectionResponse {
+        CollectionResponse {
+            collection: sample_collection_record(),
+            roots: vec![CollectionRoot {
+                collection_name: "articles".into(),
+                path: PathBuf::from("/tmp/articles"),
+                canonical_path: Some(PathBuf::from("/tmp/articles")),
+                kind: CollectionRootKind::Directory,
+                added_at: "1".into(),
+                updated_at: "2".into(),
+            }],
+            members: vec![verbatim_core::collection::CollectionMember {
+                collection_name: "articles".into(),
+                source_id: SourceId("src-1".into()),
+                logical_path: "one.md".into(),
+                source_path: PathBuf::from("/tmp/articles/one.md"),
+                updated_at: "3".into(),
+            }],
+        }
+    }
+
+    fn sample_collection_sync_report() -> CollectionSyncReport {
+        CollectionSyncReport {
+            member_count: 1,
+            added: 1,
+            removed: 0,
+            unchanged: 0,
+            scanned_roots: 1,
+            max_depth: 32,
+            skipped: Vec::new(),
         }
     }
 

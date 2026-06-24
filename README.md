@@ -74,6 +74,18 @@ verbatim source list
 verbatim ingest <source-id>
 ```
 
+Create a collection from filesystem roots or shell-selected files:
+
+```sh
+verbatim collection create articles
+verbatim collection add-root articles ../drafts/articles/articles
+verbatim collection sync articles
+
+verbatim collection create areskapitalon
+fd 'Areskapitalon.*\.md' ../drafts/articles/articles \
+  | verbatim collection sync areskapitalon --stdin
+```
+
 Ask with citations:
 
 ```sh
@@ -133,6 +145,12 @@ captions are model-derived descriptions, not OCR.
 listed by stable source ID, and can be inspected, removed, or checked for stale
 state.
 
+**Collection**: A daemon-registered filesystem grouping. Collections can store
+file, directory, and symlink roots; sync safely follows symlinks, materializes
+membership in SQLite, and records both collection logical path and canonical
+source path. Collection sync creates or reuses canonical-path source IDs, so one
+physical file can belong to multiple collections without duplicate indexing.
+
 **Evidence**: The citation unit returned by retrieval and answer generation.
 Evidence has a stable ID, source ID, kind, locator, snippet/text, and optional
 structured locator/provenance fields.
@@ -172,6 +190,7 @@ The high-level command shape is:
 
 ```sh
 verbatim source {add|list|inspect|remove|check}
+verbatim collection {create|add-root|list|get|delete|sync|status}
 verbatim ingest [source-id] [--force] [--background]
 verbatim reindex {--source-id <id>|--all|--stale|--force|--vectors-only}
 verbatim retrieve [options] "question"

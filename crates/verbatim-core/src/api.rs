@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::collection::{
+    CollectionMember, CollectionRecord, CollectionRoot, CollectionStatus, CollectionSyncReport,
+};
 use crate::config::ConfigReloadMetadata;
 use crate::task::{TaskEvent, TaskSpan, TaskSummary};
 use crate::types::{
@@ -35,6 +38,52 @@ pub struct SourceResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckStaleResponse {
     pub stale: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateCollectionRequest {
+    pub name: String,
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddCollectionRootRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionSyncPathRequest {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionSyncRequest {
+    #[serde(default)]
+    pub paths: Vec<CollectionSyncPathRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectionResponse {
+    pub collection: CollectionRecord,
+    #[serde(default)]
+    pub roots: Vec<CollectionRoot>,
+    #[serde(default)]
+    pub members: Vec<CollectionMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectionStatusResponse {
+    pub status: CollectionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionSyncResponse {
+    pub report: CollectionSyncReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

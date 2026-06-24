@@ -11,6 +11,10 @@ use crate::chunker::{
     chunk_evidence, deterministic_chunk_hash, estimate_tokens, ChunkOutput, ChunkerConfig,
     CHUNKER_VERSION,
 };
+use crate::collection::{
+    discover_collection_members, CollectionSyncPathInput, CollectionSyncReport,
+    CollectionSyncSettings, DEFAULT_COLLECTION_SYNC_MAX_DEPTH,
+};
 use crate::config::{Config, GraphExtractionConfig};
 use crate::context::ContextGenerator;
 use crate::embed::OpenAiEmbeddingClient;
@@ -372,6 +376,36 @@ where
         };
         self.store.add_source(&source)?;
         Ok(id)
+    }
+
+    pub fn sync_collection(
+        &self,
+        collection_name: &str,
+        path_inputs: &[CollectionSyncPathInput],
+        max_depth: Option<usize>,
+    ) -> Result<CollectionSyncReport> {
+        let collection = self
+            .store
+            .get_collection(collection_name)?
+            .with_context(|| format!("collection not found: {collection_name}"))?;
+        let roots = self.store.list_collection_roots(collection_name)?;
+        let settings = CollectionSyncSettings {
+            ignore_patterns: collection.ignore_patterns,
+            max_depth: max_depth.unwrap_or(DEFAULT_COLLECTION_SYNC_MAX_DEPTH),
+        };
+        let discovery = discover_collection_members(&roots, path_inputs, &settings);
+        for candidate in &discovery.candidates {
+            let source_id = self.add_source(&candidate.source_path)?;
+            if source_id != candidate.source_id {
+                bail!(
+                    "collection sync source id mismatch for {}",
+                    candidate.source_path.display()
+                );
+            }
+        }
+        let report = CollectionSyncReport::from_discovery(&discovery, settings.max_depth);
+        self.store
+            .replace_collection_members(collection_name, &discovery.candidates, report)
     }
 
     pub async fn remove_source(&mut self, source_id: &SourceId) -> Result<()> {
