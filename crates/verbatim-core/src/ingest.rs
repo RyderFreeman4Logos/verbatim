@@ -34,7 +34,7 @@ use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
 use crate::store::{EmbeddingCacheEntry, EmbeddingProfileConfig, SourceContentsReplacement, Store};
-use crate::task::{PhaseTiming, TaskEndpointSummary, TaskId, TaskProgressSnapshot};
+use crate::task::{PhaseTiming, TaskEndpointSummary, TaskId, TaskProgressSnapshot, TaskStatus};
 use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
 use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingCacheStats, EmbeddingProfileId,
@@ -940,6 +940,7 @@ where
             embedding_cache: EmbeddingCacheStats::default(),
         };
         for (i, source_id) in to_ingest.iter().enumerate() {
+            self.ensure_task_not_cancelled(task_id, i, total, Some(source_id))?;
             tracing::info!(progress = format!("{}/{}", i + 1, total), source = %source_id.0);
             self.record_task_progress(
                 task_id,
@@ -948,6 +949,7 @@ where
                     .with_recent_status(format!("ingesting source {}", source_id.0)),
             );
             let cache_stats = self.ingest_source_inner(source_id, task_id).await?;
+            self.ensure_task_not_cancelled(task_id, i + 1, total, Some(source_id))?;
             outcome.embedding_cache.add(&cache_stats);
             self.record_task_progress(
                 task_id,
@@ -972,6 +974,38 @@ where
         }
 
         Ok(outcome)
+    }
+
+    fn ensure_task_not_cancelled(
+        &self,
+        task_id: Option<&TaskId>,
+        completed_sources: usize,
+        total_sources: usize,
+        source_id: Option<&SourceId>,
+    ) -> Result<()> {
+        let Some(task_id) = task_id else {
+            return Ok(());
+        };
+        if self.store.task_status(task_id)? != Some(TaskStatus::Cancelled) {
+            return Ok(());
+        }
+        let payload = serde_json::json!({
+            "completed_sources": completed_sources,
+            "total_sources": total_sources,
+            "source_id": source_id.map(|source_id| source_id.0.as_str()),
+        });
+        self.record_task_event(
+            Some(task_id),
+            "cancelled",
+            "ingest cancellation observed at source boundary",
+            payload.clone(),
+        );
+        self.record_task_phase(
+            Some(task_id),
+            PhaseTiming::start("ingest_cancelled"),
+            payload,
+        );
+        bail!("ingest task cancelled");
     }
 
     fn record_task_phase(

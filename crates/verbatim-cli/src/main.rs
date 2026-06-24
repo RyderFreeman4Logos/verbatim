@@ -997,8 +997,8 @@ need a bounded CLI call.
 const TASK_CANCEL_AFTER_HELP: &str = r#"Examples:
   verbatim task cancel <task-id>
 
-Cancel is best-effort. Use task show or task events to inspect the resulting
-terminal status.
+Cancel is cooperative. Ingest batch parents also cancel queued batch children.
+Use task show or task events to inspect the resulting terminal status.
 "#;
 
 const TASK_RESUME_AFTER_HELP: &str = r#"Examples:
@@ -1528,9 +1528,9 @@ enum TaskCommand {
         #[arg(long)]
         after: Option<i64>,
     },
-    /// Request best-effort task cancellation.
+    /// Request cooperative task cancellation.
     #[command(
-        about = "Request best-effort cancellation for a task.",
+        about = "Request cooperative cancellation for a task.",
         after_help = TASK_CANCEL_AFTER_HELP
     )]
     Cancel {
