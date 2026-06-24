@@ -335,9 +335,12 @@ where
     pub fn add_source(&self, path: &Path) -> Result<SourceId> {
         let abs_path = std::fs::canonicalize(path)
             .with_context(|| format!("resolve path: {}", path.display()))?;
-        let hash = file_hash(&abs_path)?;
         let id = SourceId::from_path(&abs_path);
+        if self.store.get_source(&id)?.is_some() {
+            return Ok(id);
+        }
 
+        let hash = file_hash(&abs_path)?;
         let source = Source {
             id: id.clone(),
             path: abs_path,
@@ -3146,6 +3149,34 @@ mod tests {
             cli: Default::default(),
             daemon: Default::default(),
         }
+    }
+
+    #[test]
+    fn add_source_returns_existing_id_for_duplicate_path_without_resetting_status() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let source_path = tempdir.path().join("duplicate.txt");
+        fs::write(&source_path, "same source text").unwrap();
+
+        let first_id = pipeline.add_source(&source_path).unwrap();
+        pipeline
+            .store()
+            .update_source_status(&first_id, &SourceStatus::Indexed)
+            .unwrap();
+
+        let second_id = pipeline.add_source(&source_path).unwrap();
+        let sources = pipeline.store().list_sources().unwrap();
+        let stored_source = pipeline.store().get_source(&first_id).unwrap().unwrap();
+
+        assert_eq!(second_id, first_id);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(stored_source.status, SourceStatus::Indexed);
     }
 
     #[tokio::test]
