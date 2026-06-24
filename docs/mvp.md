@@ -245,6 +245,18 @@ cargo run -p verbatim-cli -- source list
 cargo run -p verbatim-cli -- source inspect <source-id>
 ```
 
+Create and sync example collections without depending on local paths in tests:
+
+```sh
+cargo run -p verbatim-cli -- collection create articles
+cargo run -p verbatim-cli -- collection add-root articles ../drafts/articles/articles
+cargo run -p verbatim-cli -- collection sync articles
+
+cargo run -p verbatim-cli -- collection create areskapitalon
+fd 'Areskapitalon.*\.md' ../drafts/articles/articles \
+  | cargo run -p verbatim-cli -- collection sync areskapitalon --stdin
+```
+
 Ingest and retrieve a context pack without chat generation:
 
 ```sh

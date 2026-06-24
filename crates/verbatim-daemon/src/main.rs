@@ -23,13 +23,16 @@ use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 
 use verbatim_core::api::{
-    AddSourceRequest, AddSourceResponse, AskCitationEvent, AskErrorEvent, AskRequest, AskResponse,
-    AskTokenEvent, CheckStaleResponse, CitationResponse, ConfigResponse, ErrorResponse,
+    AddCollectionRootRequest, AddSourceRequest, AddSourceResponse, AskCitationEvent, AskErrorEvent,
+    AskRequest, AskResponse, AskTokenEvent, CheckStaleResponse, CitationResponse,
+    CollectionResponse, CollectionStatusResponse, CollectionSyncPathRequest, CollectionSyncRequest,
+    CollectionSyncResponse, ConfigResponse, CreateCollectionRequest, ErrorResponse,
     EvidenceResponse, HealthResponse, ImageArtifactResponse, IngestResponse, ReindexRequest,
     ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
     RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
     TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
 };
+use verbatim_core::collection::{CollectionRecord, CollectionSyncPathInput};
 use verbatim_core::config::{
     self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, RerankConfig, RetrievalConfig,
 };
@@ -385,6 +388,194 @@ async fn check_stale(
     Ok(Json(CheckStaleResponse {
         stale: ids.into_iter().map(|id| id.0).collect(),
     }))
+}
+
+async fn create_collection(
+    State(state): State<SharedState>,
+    Json(req): Json<CreateCollectionRequest>,
+) -> Result<(StatusCode, Json<CollectionResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(&state);
+    let response = tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let collection = pipeline
+            .store()
+            .create_collection(&req.name, &req.ignore_patterns)?;
+        collection_response(pipeline.store(), collection)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn list_collections(
+    State(state): State<SharedState>,
+) -> Result<Json<Vec<CollectionRecord>>, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(&state);
+    let collections = tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.store().list_collections()
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(collections))
+}
+
+async fn get_collection(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<CollectionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(&state);
+    let name_for_lookup = name.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let collection = pipeline.store().get_collection(&name_for_lookup)?;
+        collection
+            .map(|collection| collection_response(pipeline.store(), collection))
+            .transpose()
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    match response {
+        Some(response) => Ok(Json(response)),
+        None => Err(err(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("collection not found: {name}"),
+        )),
+    }
+}
+
+async fn delete_collection(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(&state);
+    let name_for_error = name.clone();
+    let deleted = tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.store().delete_collection(&name)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(err(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("collection not found: {name_for_error}"),
+        ))
+    }
+}
+
+async fn add_collection_root(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<AddCollectionRootRequest>,
+) -> Result<Json<CollectionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(&state);
+    let name_for_error = name.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let path = PathBuf::from(req.path);
+        pipeline.store().add_collection_root(&name, &path)?;
+        let collection = pipeline
+            .store()
+            .get_collection(&name)?
+            .with_context(|| format!("collection not found: {name}"))?;
+        collection_response(pipeline.store(), collection)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| collection_error(&name_for_error, e))?;
+
+    Ok(Json(response))
+}
+
+async fn sync_collection(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<CollectionSyncRequest>,
+) -> Result<Json<CollectionSyncResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(&state);
+    let name_for_error = name.clone();
+    let inputs = req
+        .paths
+        .into_iter()
+        .map(collection_sync_path_input)
+        .collect::<Vec<_>>();
+    let report = tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.sync_collection(&name, &inputs, req.max_depth)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| collection_error(&name_for_error, e))?;
+
+    Ok(Json(CollectionSyncResponse { report }))
+}
+
+async fn collection_status(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<CollectionStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(&state);
+    let name_for_lookup = name.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.store().collection_status(&name_for_lookup)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    match status {
+        Some(status) => Ok(Json(CollectionStatusResponse { status })),
+        None => Err(err(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("collection not found: {name}"),
+        )),
+    }
+}
+
+fn collection_response(store: &Store, collection: CollectionRecord) -> Result<CollectionResponse> {
+    let roots = store.list_collection_roots(&collection.name)?;
+    let members = store.list_collection_members(&collection.name)?;
+    Ok(CollectionResponse {
+        collection,
+        roots,
+        members,
+    })
+}
+
+fn collection_sync_path_input(request: CollectionSyncPathRequest) -> CollectionSyncPathInput {
+    CollectionSyncPathInput {
+        path: PathBuf::from(request.path),
+        logical_path: request.logical_path,
+    }
+}
+
+fn collection_error(
+    collection_name: &str,
+    error: anyhow::Error,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let status = if is_collection_not_found_error(collection_name, &error) {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    err(status, error)
+}
+
+fn is_collection_not_found_error(collection_name: &str, error: &anyhow::Error) -> bool {
+    let expected = format!("collection not found: {collection_name}");
+    error.chain().any(|cause| cause.to_string() == expected)
 }
 
 async fn create_persisted_task(
@@ -3403,6 +3594,13 @@ async fn run_daemon() -> Result<()> {
         .route("/api/sources/{id}", get(get_source))
         .route("/api/sources/{id}", delete(delete_source))
         .route("/api/sources/check", post(check_stale))
+        .route("/api/collections", post(create_collection))
+        .route("/api/collections", get(list_collections))
+        .route("/api/collections/{name}", get(get_collection))
+        .route("/api/collections/{name}", delete(delete_collection))
+        .route("/api/collections/{name}/roots", post(add_collection_root))
+        .route("/api/collections/{name}/sync", post(sync_collection))
+        .route("/api/collections/{name}/status", get(collection_status))
         .route("/api/ingest", post(ingest_all))
         .route("/api/ingest/{id}", post(ingest_one))
         .route("/api/reindex", post(reindex))
@@ -3927,6 +4125,65 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let pipeline = state.pipeline.lock().unwrap();
         assert!(pipeline.store().get_source(&source_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn collection_handlers_create_root_sync_and_status() {
+        let test_dir = TestDir::new("collection-sync");
+        let root = test_dir.path().join("articles");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("one.md"), "one").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let (status, Json(created)) = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.collection.name, "articles");
+
+        let Json(with_root) = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(with_root.roots.len(), 1);
+
+        let Json(sync) = sync_collection(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionSyncRequest {
+                paths: Vec::new(),
+                max_depth: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync.report.member_count, 1);
+        assert_eq!(sync.report.added, 1);
+
+        let Json(collection) = get_collection(State(Arc::clone(&state)), Path("articles".into()))
+            .await
+            .unwrap();
+        assert_eq!(collection.members.len(), 1);
+        assert_eq!(collection.members[0].logical_path, "one.md");
+
+        let Json(status) = collection_status(State(Arc::clone(&state)), Path("articles".into()))
+            .await
+            .unwrap();
+        assert_eq!(status.status.member_count, 1);
+        assert_eq!(status.status.root_count, 1);
     }
 
     #[tokio::test]

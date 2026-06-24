@@ -9,11 +9,13 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use verbatim_core::api::{
-    AddSourceRequest, AddSourceResponse, AskRequest, CheckStaleResponse, ConfigResponse,
-    EvidenceResponse, HealthResponse, IngestResponse, ReindexRequest, ReindexResponse,
-    RetrieveRequest, RetrieveResponse, SourceResponse, TaskCreatedResponse, TaskEventsResponse,
-    TaskIngestRequest, TaskSummaryResponse,
+    AddCollectionRootRequest, AddSourceRequest, AddSourceResponse, AskRequest, CheckStaleResponse,
+    CollectionResponse, CollectionStatusResponse, CollectionSyncRequest, CollectionSyncResponse,
+    ConfigResponse, CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse,
+    ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse, SourceResponse,
+    TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse,
 };
+use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
 
 use crate::{render, sse};
@@ -77,6 +79,22 @@ pub trait DaemonClient {
     fn get_source(&self, id: &str) -> CliResult<SourceResponse>;
     fn remove_source(&self, id: &str) -> CliResult<()>;
     fn check_sources(&self) -> CliResult<CheckStaleResponse>;
+    fn create_collection(&self, request: &CreateCollectionRequest)
+        -> CliResult<CollectionResponse>;
+    fn add_collection_root(
+        &self,
+        name: &str,
+        request: &AddCollectionRootRequest,
+    ) -> CliResult<CollectionResponse>;
+    fn list_collections(&self) -> CliResult<Vec<CollectionRecord>>;
+    fn get_collection(&self, name: &str) -> CliResult<CollectionResponse>;
+    fn delete_collection(&self, name: &str) -> CliResult<()>;
+    fn sync_collection(
+        &self,
+        name: &str,
+        request: &CollectionSyncRequest,
+    ) -> CliResult<CollectionSyncResponse>;
+    fn collection_status(&self, name: &str) -> CliResult<CollectionStatusResponse>;
     fn ingest(
         &self,
         source_id: Option<&str>,
@@ -296,6 +314,69 @@ impl DaemonClient for HttpDaemonClient {
 
     fn check_sources(&self) -> CliResult<CheckStaleResponse> {
         self.request_json::<CheckStaleResponse, ()>(Method::POST, "/api/sources/check", None)
+    }
+
+    fn create_collection(
+        &self,
+        request: &CreateCollectionRequest,
+    ) -> CliResult<CollectionResponse> {
+        self.request_json(Method::POST, "/api/collections", Some(request))
+    }
+
+    fn add_collection_root(
+        &self,
+        name: &str,
+        request: &AddCollectionRootRequest,
+    ) -> CliResult<CollectionResponse> {
+        self.request_json(
+            Method::POST,
+            &format!("/api/collections/{name}/roots"),
+            Some(request),
+        )
+    }
+
+    fn list_collections(&self) -> CliResult<Vec<CollectionRecord>> {
+        self.request_json::<Vec<CollectionRecord>, ()>(Method::GET, "/api/collections", None)
+    }
+
+    fn get_collection(&self, name: &str) -> CliResult<CollectionResponse> {
+        self.request_json::<CollectionResponse, ()>(
+            Method::GET,
+            &format!("/api/collections/{name}"),
+            None,
+        )
+    }
+
+    fn delete_collection(&self, name: &str) -> CliResult<()> {
+        let url = self.url(&format!("/api/collections/{name}"))?;
+        let response = self
+            .apply_timeout(self.client.delete(&url), RequestTimeoutPolicy::LongRunning)?
+            .send()
+            .map_err(|error| request_error(&url, error))?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        decode_response::<Value>(response).map(|_| ())
+    }
+
+    fn sync_collection(
+        &self,
+        name: &str,
+        request: &CollectionSyncRequest,
+    ) -> CliResult<CollectionSyncResponse> {
+        self.request_json(
+            Method::POST,
+            &format!("/api/collections/{name}/sync"),
+            Some(request),
+        )
+    }
+
+    fn collection_status(&self, name: &str) -> CliResult<CollectionStatusResponse> {
+        self.request_json::<CollectionStatusResponse, ()>(
+            Method::GET,
+            &format!("/api/collections/{name}/status"),
+            None,
+        )
     }
 
     fn ingest(
@@ -523,7 +604,8 @@ fn is_long_running_mutation(method: &Method, path: &str) -> bool {
             || path.starts_with("/api/ingest?")
             || path.starts_with("/api/ingest/")
             || path == "/api/reindex"
-            || path == "/api/tasks/reindex";
+            || path == "/api/tasks/reindex"
+            || (path.starts_with("/api/collections/") && path.ends_with("/sync"));
     }
     false
 }

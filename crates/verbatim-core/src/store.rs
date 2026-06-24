@@ -6,9 +6,14 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{
     params, params_from_iter,
     types::{Type, Value},
-    Connection, OptionalExtension, Transaction,
+    Connection, OptionalExtension, Row, Transaction,
 };
+use serde::de::DeserializeOwned;
 
+use crate::collection::{
+    resolve_collection_root, validate_collection_name, CollectionMember, CollectionMemberCandidate,
+    CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus, CollectionSyncReport,
+};
 use crate::task::{
     bounded_error, bounded_json, bounded_message, TaskEvent, TaskId, TaskKind,
     TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
@@ -194,6 +199,203 @@ impl Store {
         let generation = bump_all_profile_index_generations(&tx)?;
         tx.commit()?;
         Ok(generation)
+    }
+
+    // --- Collections ---
+
+    pub fn create_collection(
+        &self,
+        name: &str,
+        ignore_patterns: &[String],
+    ) -> Result<CollectionRecord> {
+        validate_collection_name(name)?;
+        let now = unix_timestamp_string();
+        let ignore_patterns_json =
+            serde_json::to_string(ignore_patterns).context("serialize collection ignore rules")?;
+        self.conn.execute(
+            "INSERT INTO collections (name, ignore_patterns_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![name, ignore_patterns_json, now],
+        )?;
+        self.get_collection(name)?
+            .with_context(|| format!("collection not found after create: {name}"))
+    }
+
+    pub fn list_collections(&self) -> Result<Vec<CollectionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, ignore_patterns_json, created_at, updated_at, last_synced_at, last_sync_json
+             FROM collections ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], collection_record_from_row)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn get_collection(&self, name: &str) -> Result<Option<CollectionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, ignore_patterns_json, created_at, updated_at, last_synced_at, last_sync_json
+             FROM collections WHERE name = ?1",
+        )?;
+        stmt.query_row(params![name], collection_record_from_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_collection(&self, name: &str) -> Result<bool> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM collections WHERE name = ?1", params![name])?;
+        Ok(deleted > 0)
+    }
+
+    pub fn add_collection_root(
+        &self,
+        collection_name: &str,
+        path: &Path,
+    ) -> Result<CollectionRoot> {
+        self.get_collection(collection_name)?
+            .with_context(|| format!("collection not found: {collection_name}"))?;
+        let (kind, canonical_path) = resolve_collection_root(path)?;
+        let now = unix_timestamp_string();
+        self.conn.execute(
+            "INSERT INTO collection_roots
+                (collection_name, path, canonical_path, kind, added_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(collection_name, path) DO UPDATE SET
+                canonical_path = excluded.canonical_path,
+                kind = excluded.kind,
+                updated_at = excluded.updated_at",
+            params![
+                collection_name,
+                path.to_string_lossy(),
+                canonical_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                kind.as_str(),
+                now,
+            ],
+        )?;
+        self.get_collection_root(collection_name, path)?
+            .with_context(|| format!("collection root not found after insert: {}", path.display()))
+    }
+
+    pub fn list_collection_roots(&self, collection_name: &str) -> Result<Vec<CollectionRoot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT collection_name, path, canonical_path, kind, added_at, updated_at
+             FROM collection_roots WHERE collection_name = ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![collection_name], collection_root_from_row)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn get_collection_root(
+        &self,
+        collection_name: &str,
+        path: &Path,
+    ) -> Result<Option<CollectionRoot>> {
+        let path_text = path.to_string_lossy();
+        let mut stmt = self.conn.prepare(
+            "SELECT collection_name, path, canonical_path, kind, added_at, updated_at
+             FROM collection_roots WHERE collection_name = ?1 AND path = ?2",
+        )?;
+        stmt.query_row(
+            params![collection_name, path_text.as_ref()],
+            collection_root_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn collection_status(&self, name: &str) -> Result<Option<CollectionStatus>> {
+        let Some(collection) = self.get_collection(name)? else {
+            return Ok(None);
+        };
+        let root_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM collection_roots WHERE collection_name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        let member_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM collection_members WHERE collection_name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        Ok(Some(CollectionStatus {
+            collection,
+            root_count: root_count as usize,
+            member_count: member_count as usize,
+        }))
+    }
+
+    pub fn list_collection_members(&self, collection_name: &str) -> Result<Vec<CollectionMember>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT collection_name, source_id, logical_path, source_path, updated_at
+             FROM collection_members WHERE collection_name = ?1 ORDER BY logical_path",
+        )?;
+        let rows = stmt.query_map(params![collection_name], collection_member_from_row)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn replace_collection_members(
+        &self,
+        collection_name: &str,
+        candidates: &[CollectionMemberCandidate],
+        mut report: CollectionSyncReport,
+    ) -> Result<CollectionSyncReport> {
+        self.get_collection(collection_name)?
+            .with_context(|| format!("collection not found: {collection_name}"))?;
+        let old_source_ids = self.collection_source_ids(collection_name)?;
+        let new_source_ids = candidates
+            .iter()
+            .map(|candidate| candidate.source_id.0.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        report.member_count = candidates.len();
+        report.added = new_source_ids.difference(&old_source_ids).count();
+        report.removed = old_source_ids.difference(&new_source_ids).count();
+        report.unchanged = old_source_ids.intersection(&new_source_ids).count();
+
+        let now = unix_timestamp_string();
+        let report_json =
+            serde_json::to_string(&report).context("serialize collection sync report")?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM collection_members WHERE collection_name = ?1",
+            params![collection_name],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO collection_members
+                    (collection_name, source_id, logical_path, source_path, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for candidate in candidates {
+                stmt.execute(params![
+                    collection_name,
+                    &candidate.source_id.0,
+                    &candidate.logical_path,
+                    candidate.source_path.to_string_lossy(),
+                    &now,
+                ])?;
+            }
+        }
+        tx.execute(
+            "UPDATE collections
+             SET updated_at = ?2, last_synced_at = ?2, last_sync_json = ?3
+             WHERE name = ?1",
+            params![collection_name, now, report_json],
+        )?;
+        tx.commit()?;
+        Ok(report)
+    }
+
+    fn collection_source_ids(
+        &self,
+        collection_name: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_id FROM collection_members WHERE collection_name = ?1 ORDER BY source_id",
+        )?;
+        let rows = stmt.query_map(params![collection_name], |row| row.get::<_, String>(0))?;
+        rows.map(|row| row.map_err(Into::into)).collect()
     }
 
     pub fn remove_source_and_replace_vectors_for_profile(
@@ -2463,6 +2665,52 @@ fn invalid_text_value(column: usize, message: String) -> rusqlite::Error {
     )
 }
 
+fn collection_record_from_row(row: &Row<'_>) -> rusqlite::Result<CollectionRecord> {
+    let ignore_patterns_json: String = row.get(1)?;
+    let last_sync_json: Option<String> = row.get(5)?;
+    Ok(CollectionRecord {
+        name: row.get(0)?,
+        ignore_patterns: json_from_sql(1, &ignore_patterns_json)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+        last_synced_at: row.get(4)?,
+        last_sync: last_sync_json
+            .as_deref()
+            .map(|value| json_from_sql(5, value))
+            .transpose()?,
+    })
+}
+
+fn collection_root_from_row(row: &Row<'_>) -> rusqlite::Result<CollectionRoot> {
+    let canonical_path: Option<String> = row.get(2)?;
+    let kind: String = row.get(3)?;
+    Ok(CollectionRoot {
+        collection_name: row.get(0)?,
+        path: PathBuf::from(row.get::<_, String>(1)?),
+        canonical_path: canonical_path.map(PathBuf::from),
+        kind: CollectionRootKind::from_storage_str(&kind),
+        added_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn collection_member_from_row(row: &Row<'_>) -> rusqlite::Result<CollectionMember> {
+    Ok(CollectionMember {
+        collection_name: row.get(0)?,
+        source_id: SourceId(row.get(1)?),
+        logical_path: row.get(2)?,
+        source_path: PathBuf::from(row.get::<_, String>(3)?),
+        updated_at: row.get(4)?,
+    })
+}
+
+fn json_from_sql<T>(column: usize, value: &str) -> rusqlite::Result<T>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str(value).map_err(|error| invalid_text_value(column, error.to_string()))
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sources (
     id TEXT PRIMARY KEY,
@@ -2472,6 +2720,37 @@ CREATE TABLE IF NOT EXISTS sources (
     parser_used TEXT,
     last_ingested_at TEXT
 );
+CREATE TABLE IF NOT EXISTS collections (
+    name TEXT PRIMARY KEY,
+    ignore_patterns_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_synced_at TEXT,
+    last_sync_json TEXT
+);
+CREATE TABLE IF NOT EXISTS collection_roots (
+    collection_name TEXT NOT NULL REFERENCES collections(name) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    canonical_path TEXT,
+    kind TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (collection_name, path)
+);
+CREATE INDEX IF NOT EXISTS collection_roots_collection_idx
+    ON collection_roots(collection_name);
+CREATE TABLE IF NOT EXISTS collection_members (
+    collection_name TEXT NOT NULL REFERENCES collections(name) ON DELETE CASCADE,
+    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    logical_path TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (collection_name, source_id)
+);
+CREATE INDEX IF NOT EXISTS collection_members_collection_idx
+    ON collection_members(collection_name);
+CREATE INDEX IF NOT EXISTS collection_members_source_idx
+    ON collection_members(source_id);
 CREATE TABLE IF NOT EXISTS evidence_units (
     id TEXT PRIMARY KEY,
     source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -2847,6 +3126,90 @@ mod tests {
                 test_profile_config("test", profile_id.as_str(), 2, true, "", ""),
             )
             .unwrap();
+    }
+
+    fn empty_collection_report() -> CollectionSyncReport {
+        CollectionSyncReport {
+            member_count: 0,
+            added: 0,
+            removed: 0,
+            unchanged: 0,
+            scanned_roots: 1,
+            max_depth: 32,
+            skipped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn collection_memberships_are_materialized_and_source_shared() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("article.md");
+        std::fs::write(&source_path, "article").unwrap();
+        let canonical_source_path = std::fs::canonicalize(&source_path).unwrap();
+        let source_id = SourceId::from_path(&canonical_source_path);
+        let store = Store::in_memory().unwrap();
+        store
+            .add_source(&Source {
+                id: source_id.clone(),
+                path: canonical_source_path.clone(),
+                hash: "hash".into(),
+                status: SourceStatus::Pending,
+                parser_used: None,
+                last_ingested_at: None,
+            })
+            .unwrap();
+
+        store
+            .create_collection("articles", &["drafts/".to_string()])
+            .unwrap();
+        store.create_collection("areskapitalon", &[]).unwrap();
+        store.add_collection_root("articles", dir.path()).unwrap();
+
+        let candidate = CollectionMemberCandidate {
+            source_id: source_id.clone(),
+            logical_path: "article.md".into(),
+            source_path: canonical_source_path,
+        };
+        let articles_report = store
+            .replace_collection_members(
+                "articles",
+                std::slice::from_ref(&candidate),
+                empty_collection_report(),
+            )
+            .unwrap();
+        store
+            .replace_collection_members("areskapitalon", &[candidate], empty_collection_report())
+            .unwrap();
+
+        assert_eq!(articles_report.added, 1);
+        assert_eq!(
+            store.list_collection_members("articles").unwrap()[0].source_id,
+            source_id
+        );
+        assert_eq!(
+            store.list_collection_members("areskapitalon").unwrap()[0].source_id,
+            source_id
+        );
+
+        assert!(store.delete_collection("articles").unwrap());
+        assert!(store.get_source(&source_id).unwrap().is_some());
+        assert!(store
+            .list_collection_members("articles")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_collection_members("areskapitalon")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        store.remove_source(&source_id).unwrap();
+        assert!(store
+            .list_collection_members("areskapitalon")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

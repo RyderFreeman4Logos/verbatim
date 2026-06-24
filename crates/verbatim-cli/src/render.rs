@@ -6,6 +6,7 @@ use verbatim_core::api::{
     HealthResponse, IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse,
     TaskCreatedResponse, TaskWaitEvent,
 };
+use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::task::{TaskEvent, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary};
 use verbatim_core::types::{BBox, OcrSourceStatus, RetrievalDebug, SourceLocator};
 
@@ -56,6 +57,130 @@ where
             "  ocr: {} evidence_count={}",
             ocr_status_name(diagnostics.ocr.status),
             diagnostics.ocr.evidence_count
+        )?;
+    }
+    Ok(())
+}
+
+pub fn write_collections<W>(writer: &mut W, collections: &[CollectionRecord]) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if collections.is_empty() {
+        return writeln!(writer, "No collections.");
+    }
+
+    writeln!(writer, "Collections:")?;
+    for collection in collections {
+        let synced = collection.last_synced_at.as_deref().unwrap_or("never");
+        writeln!(
+            writer,
+            "  name={} synced_at={} ignore_patterns={}",
+            collection.name,
+            synced,
+            collection.ignore_patterns.len()
+        )?;
+    }
+    Ok(())
+}
+
+pub fn write_collection<W>(
+    writer: &mut W,
+    response: &verbatim_core::api::CollectionResponse,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Collection:")?;
+    writeln!(writer, "  name: {}", response.collection.name)?;
+    writeln!(writer, "  roots: {}", response.roots.len())?;
+    writeln!(writer, "  members: {}", response.members.len())?;
+    if !response.collection.ignore_patterns.is_empty() {
+        writeln!(
+            writer,
+            "  ignore_patterns: {}",
+            response.collection.ignore_patterns.join(", ")
+        )?;
+    }
+    if let Some(last_synced_at) = &response.collection.last_synced_at {
+        writeln!(writer, "  last_synced_at: {last_synced_at}")?;
+    }
+    if !response.roots.is_empty() {
+        writeln!(writer, "Roots:")?;
+        for root in &response.roots {
+            let canonical = root
+                .canonical_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            writeln!(
+                writer,
+                "  kind={} path={} canonical={}",
+                root.kind.as_str(),
+                root.path.display(),
+                canonical
+            )?;
+        }
+    }
+    if !response.members.is_empty() {
+        writeln!(writer, "Members:")?;
+        for member in &response.members {
+            writeln!(
+                writer,
+                "  logical={} source_id={} source_path={}",
+                member.logical_path,
+                member.source_id.0,
+                member.source_path.display()
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub fn write_collection_status<W>(writer: &mut W, status: &CollectionStatus) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Collection status:")?;
+    writeln!(writer, "  name: {}", status.collection.name)?;
+    writeln!(writer, "  roots: {}", status.root_count)?;
+    writeln!(writer, "  members: {}", status.member_count)?;
+    writeln!(
+        writer,
+        "  last_synced_at: {}",
+        status
+            .collection
+            .last_synced_at
+            .as_deref()
+            .unwrap_or("never")
+    )?;
+    if let Some(report) = &status.collection.last_sync {
+        write_collection_sync_report(writer, report)?;
+    }
+    Ok(())
+}
+
+pub fn write_collection_sync_report<W>(
+    writer: &mut W,
+    report: &CollectionSyncReport,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        writer,
+        "Synced {} member(s): added={} removed={} unchanged={} skipped={}.",
+        report.member_count,
+        report.added,
+        report.removed,
+        report.unchanged,
+        report.skipped.len()
+    )?;
+    for skip in &report.skipped {
+        writeln!(
+            writer,
+            "  skipped reason={:?} path={} message={}",
+            skip.reason, skip.path, skip.message
         )?;
     }
     Ok(())
