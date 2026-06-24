@@ -313,8 +313,8 @@ fn flush_block(
         return;
     }
 
-    let start_byte = block.start_byte.min(document.content.len());
-    let end_byte = block.end_byte.max(start_byte).min(document.content.len());
+    let start_byte = floor_char_boundary(document.content, block.start_byte);
+    let end_byte = ceil_char_boundary(document.content, block.end_byte.max(start_byte));
     let line_start = line_number(document.content, start_byte);
     let line_end = end_line_number(document.content, end_byte);
     let heading_level = heading_stack.last().map(|heading| heading.level);
@@ -433,8 +433,24 @@ fn end_line_number(content: &str, byte_end: usize) -> u32 {
 }
 
 fn byte_to_line(content: &str, byte_offset: usize) -> usize {
-    let clamped = byte_offset.min(content.len());
+    let clamped = floor_char_boundary(content, byte_offset);
     content[..clamped].matches('\n').count()
+}
+
+fn floor_char_boundary(content: &str, byte_offset: usize) -> usize {
+    let mut boundary = byte_offset.min(content.len());
+    while boundary > 0 && !content.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+fn ceil_char_boundary(content: &str, byte_offset: usize) -> usize {
+    let mut boundary = byte_offset.min(content.len());
+    while boundary < content.len() && !content.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    boundary
 }
 
 fn source_id_from_path(path: &Path) -> SourceId {
@@ -473,6 +489,34 @@ mod tests {
                 }
                 _ => panic!("expected Markdown locator"),
             }
+        }
+    }
+
+    #[test]
+    fn terminal_multibyte_character_keeps_locator_boundaries_valid() {
+        let markdown = "Quote ends with a right double quotation mark ”";
+
+        let units = parse_str(markdown);
+
+        assert_eq!(units.len(), 1);
+        match &units[0].locator {
+            SourceLocator::Markdown {
+                line_start,
+                line_end,
+                byte_start,
+                byte_end,
+                ..
+            } => {
+                assert_eq!(*line_start, 1);
+                assert_eq!(*line_end, 1);
+                assert!(markdown.is_char_boundary(*byte_start as usize));
+                assert!(markdown.is_char_boundary(*byte_end as usize));
+                assert_eq!(
+                    &markdown[*byte_start as usize..*byte_end as usize],
+                    markdown
+                );
+            }
+            _ => panic!("expected Markdown locator"),
         }
     }
 
