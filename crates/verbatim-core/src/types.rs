@@ -315,6 +315,40 @@ pub struct BBox {
     pub y1: f64,
 }
 
+/// Markdown block category used by structured locators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkdownBlockKind {
+    Paragraph,
+    BlockQuote,
+    ListItem,
+    CodeBlock,
+}
+
+impl MarkdownBlockKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Paragraph => "paragraph",
+            Self::BlockQuote => "block_quote",
+            Self::ListItem => "list_item",
+            Self::CodeBlock => "code_block",
+        }
+    }
+}
+
+/// One heading in a Markdown heading hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkdownHeadingLocator {
+    /// Heading level from one to six.
+    pub level: u32,
+    /// Heading text after inline Markdown is rendered to plain text.
+    pub text: String,
+    /// Deterministic document-local slug. Duplicate headings receive numeric suffixes.
+    pub slug: String,
+    /// One-based source line containing the heading marker.
+    pub line: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SourceLocator {
@@ -343,6 +377,22 @@ pub enum SourceLocator {
         path_or_url: String,
         line_start: u32,
         line_end: Option<u32>,
+    },
+    Markdown {
+        path: String,
+        line_start: u32,
+        line_end: u32,
+        byte_start: u64,
+        byte_end: u64,
+        block_kind: MarkdownBlockKind,
+        block_index: u32,
+        block_hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        heading_level: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        heading_slug: Option<String>,
+        #[serde(default)]
+        heading_path: Vec<MarkdownHeadingLocator>,
     },
 }
 
@@ -397,6 +447,28 @@ impl fmt::Display for SourceLocator {
                 line_start,
                 line_end: None,
             } => write!(f, "{path_or_url} L{line_start}"),
+            Self::Markdown {
+                path,
+                line_start,
+                line_end,
+                block_kind,
+                heading_slug,
+                ..
+            } => {
+                if line_start == line_end {
+                    write!(f, "{path} L{line_start} markdown:{}", block_kind.as_str())?;
+                } else {
+                    write!(
+                        f,
+                        "{path} L{line_start}-{line_end} markdown:{}",
+                        block_kind.as_str()
+                    )?;
+                }
+                if let Some(slug) = heading_slug {
+                    write!(f, " #{slug}")?;
+                }
+                Ok(())
+            }
         }
     }
 }

@@ -350,37 +350,83 @@ fn write_structured_locator_details<W>(
 where
     W: Write,
 {
-    if let SourceLocator::PdfOcr {
-        page_label,
-        line_index,
-        word_index,
-        bbox,
-        ocr,
-        ..
-    } = locator
-    {
-        writeln!(writer, "  ocr_locator:")?;
-        if let Some(page_label) = page_label {
-            writeln!(writer, "    page_label: {page_label}")?;
+    write_structured_locator_details_with_indent(writer, locator, "  ")
+}
+
+fn write_structured_locator_details_with_indent<W>(
+    writer: &mut W,
+    locator: &SourceLocator,
+    indent: &str,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    match locator {
+        SourceLocator::PdfOcr {
+            page_label,
+            line_index,
+            word_index,
+            bbox,
+            ocr,
+            ..
+        } => {
+            writeln!(writer, "{indent}ocr_locator:")?;
+            if let Some(page_label) = page_label {
+                writeln!(writer, "{indent}  page_label: {page_label}")?;
+            }
+            writeln!(writer, "{indent}  line_index: {line_index}")?;
+            if let Some(word_index) = word_index {
+                writeln!(writer, "{indent}  word_index: {word_index}")?;
+            }
+            if let Some(bbox) = bbox {
+                writeln!(writer, "{indent}  bbox: {}", display_bbox(bbox))?;
+            }
+            writeln!(writer, "{indent}  engine: {}", ocr.profile.engine)?;
+            if let Some(version) = &ocr.profile.engine_version {
+                writeln!(writer, "{indent}  engine_version: {version}")?;
+            }
+            writeln!(writer, "{indent}  language: {}", ocr.profile.language)?;
+            writeln!(writer, "{indent}  profile: {}", ocr.profile.profile)?;
+            writeln!(writer, "{indent}  profile_hash: {}", ocr.profile_hash)?;
+            if let Some(confidence) = ocr.confidence {
+                writeln!(writer, "{indent}  confidence: {confidence:.2}")?;
+            }
+            writeln!(writer, "{indent}  text_hash: {}", ocr.text_hash)?;
         }
-        writeln!(writer, "    line_index: {line_index}")?;
-        if let Some(word_index) = word_index {
-            writeln!(writer, "    word_index: {word_index}")?;
+        SourceLocator::Markdown {
+            line_start,
+            line_end,
+            byte_start,
+            byte_end,
+            block_kind,
+            block_index,
+            block_hash,
+            heading_level,
+            heading_slug,
+            heading_path,
+            ..
+        } => {
+            writeln!(writer, "{indent}markdown_locator:")?;
+            writeln!(writer, "{indent}  block_kind: {}", block_kind.as_str())?;
+            writeln!(writer, "{indent}  block_index: {block_index}")?;
+            writeln!(writer, "{indent}  line_range: {line_start}-{line_end}")?;
+            writeln!(writer, "{indent}  byte_range: {byte_start}-{byte_end}")?;
+            writeln!(writer, "{indent}  block_hash: {block_hash}")?;
+            if let Some(level) = heading_level {
+                writeln!(writer, "{indent}  heading_level: {level}")?;
+            }
+            if let Some(slug) = heading_slug {
+                writeln!(writer, "{indent}  heading_slug: {slug}")?;
+            }
+            for heading in heading_path {
+                writeln!(
+                    writer,
+                    "{indent}  heading: level={} line={} slug={} text={}",
+                    heading.level, heading.line, heading.slug, heading.text
+                )?;
+            }
         }
-        if let Some(bbox) = bbox {
-            writeln!(writer, "    bbox: {}", display_bbox(bbox))?;
-        }
-        writeln!(writer, "    engine: {}", ocr.profile.engine)?;
-        if let Some(version) = &ocr.profile.engine_version {
-            writeln!(writer, "    engine_version: {version}")?;
-        }
-        writeln!(writer, "    language: {}", ocr.profile.language)?;
-        writeln!(writer, "    profile: {}", ocr.profile.profile)?;
-        writeln!(writer, "    profile_hash: {}", ocr.profile_hash)?;
-        if let Some(confidence) = ocr.confidence {
-            writeln!(writer, "    confidence: {confidence:.2}")?;
-        }
-        writeln!(writer, "    text_hash: {}", ocr.text_hash)?;
+        _ => {}
     }
     Ok(())
 }
@@ -494,6 +540,9 @@ where
                 writeln!(writer, "      source_path: {source_path}")?;
             }
             writeln!(writer, "      locator: {}", result.locator)?;
+            if let Some(locator) = &result.structured_locator {
+                write_structured_locator_details_with_indent(writer, locator, "      ")?;
+            }
             writeln!(writer, "      snippet: {}", result.snippet)?;
         }
     }
@@ -782,8 +831,12 @@ fn value_string_list(value: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use verbatim_core::api::EvidenceResponse;
-    use verbatim_core::types::{OcrLocatorMetadata, OcrProfile};
+    use verbatim_core::api::{
+        EvidenceResponse, RetrieveControlsResponse, RetrieveResponse, RetrieveResultResponse,
+    };
+    use verbatim_core::types::{
+        MarkdownBlockKind, MarkdownHeadingLocator, OcrLocatorMetadata, OcrProfile,
+    };
 
     #[test]
     fn ocr_evidence_lookup_renders_structured_locator_details() {
@@ -834,5 +887,117 @@ mod tests {
         assert!(output.contains("language: eng"));
         assert!(output.contains("confidence: 0.97"));
         assert!(output.contains("bbox: [10.00,20.00,120.00,36.00]"));
+    }
+
+    #[test]
+    fn markdown_evidence_lookup_renders_structured_locator_details() {
+        let response = EvidenceResponse {
+            id: "ev-md".into(),
+            source_id: "src-1".into(),
+            kind: "text".into(),
+            derived_from: None,
+            locator: "/tmp/doc.md L3 markdown:paragraph #intro".into(),
+            structured_locator: SourceLocator::Markdown {
+                path: "/tmp/doc.md".into(),
+                line_start: 3,
+                line_end: 4,
+                byte_start: 24,
+                byte_end: 86,
+                block_kind: MarkdownBlockKind::Paragraph,
+                block_index: 2,
+                block_hash: "block-hash".into(),
+                heading_level: Some(1),
+                heading_slug: Some("intro".into()),
+                heading_path: vec![MarkdownHeadingLocator {
+                    level: 1,
+                    text: "Intro".into(),
+                    slug: "intro".into(),
+                    line: 1,
+                }],
+            },
+            text: "markdown evidence text".into(),
+            heading_path: vec!["Intro".into()],
+            position: 2,
+            image_artifact: None,
+        };
+        let mut output = Vec::new();
+
+        write_evidence(&mut output, &response).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("markdown_locator:"));
+        assert!(output.contains("block_kind: paragraph"));
+        assert!(output.contains("line_range: 3-4"));
+        assert!(output.contains("byte_range: 24-86"));
+        assert!(output.contains("block_hash: block-hash"));
+        assert!(output.contains("heading_slug: intro"));
+        assert!(output.contains("heading: level=1 line=1 slug=intro text=Intro"));
+    }
+
+    #[test]
+    fn retrieve_output_renders_markdown_structured_locator_when_present() {
+        let response = RetrieveResponse {
+            task_id: "task-1".into(),
+            query: "markdown".into(),
+            source_id: None,
+            embedding_profile_id: "default".into(),
+            limit: 1,
+            page_size: 1,
+            page: 1,
+            total_results: 1,
+            returned_results: 1,
+            controls: RetrieveControlsResponse {
+                fast: false,
+                rerank_enabled: false,
+                dense_top_k: 10,
+                bm25_top_k: 10,
+                rrf_k: 60,
+                rerank_top_n: 1,
+            },
+            timings: Vec::new(),
+            results: vec![RetrieveResultResponse {
+                index: 0,
+                rank: 1,
+                label: "E1".into(),
+                evidence_id: "ev-md".into(),
+                source_id: "src-1".into(),
+                source_path: Some("/tmp/doc.md".into()),
+                chunk_id: "chunk-1".into(),
+                kind: "text".into(),
+                role: "original_text".into(),
+                score: 0.42,
+                locator: "/tmp/doc.md L3 markdown:paragraph #intro".into(),
+                structured_locator: Some(SourceLocator::Markdown {
+                    path: "/tmp/doc.md".into(),
+                    line_start: 3,
+                    line_end: 3,
+                    byte_start: 24,
+                    byte_end: 48,
+                    block_kind: MarkdownBlockKind::Paragraph,
+                    block_index: 0,
+                    block_hash: "block-hash".into(),
+                    heading_level: Some(1),
+                    heading_slug: Some("intro".into()),
+                    heading_path: vec![MarkdownHeadingLocator {
+                        level: 1,
+                        text: "Intro".into(),
+                        slug: "intro".into(),
+                        line: 1,
+                    }],
+                }),
+                provenance: None,
+                derived_from: None,
+                snippet: "markdown evidence".into(),
+            }],
+            debug: None,
+        };
+        let mut output = Vec::new();
+
+        write_retrieve_response(&mut output, &response).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("locator: /tmp/doc.md L3 markdown:paragraph #intro"));
+        assert!(output.contains("markdown_locator:"));
+        assert!(output.contains("block_hash: block-hash"));
     }
 }
