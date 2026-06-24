@@ -7,6 +7,7 @@ use crate::collection::{
     CollectionMember, CollectionRecord, CollectionRoot, CollectionStatus, CollectionSyncReport,
 };
 use crate::config::ConfigReloadMetadata;
+use crate::index_gc::{IndexGcApplyReport, IndexGcConfig, IndexGcPlan};
 use crate::task::{TaskEvent, TaskSpan, TaskSummary};
 use crate::types::{
     BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceIngestDiagnostics,
@@ -337,6 +338,20 @@ pub struct ReindexRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReindexResponse {
     pub reindexed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexGcRequest {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexGcResponse {
+    pub dry_run: bool,
+    pub policy: IndexGcConfig,
+    pub plan: IndexGcPlan,
+    pub apply: IndexGcApplyReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

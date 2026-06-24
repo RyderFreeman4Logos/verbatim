@@ -26,6 +26,7 @@ use crate::index::hnsw::HnswIndex;
 #[cfg(feature = "qdrant")]
 use crate::index::qdrant::{records_from_store_for_profile, QdrantClient};
 use crate::index::sqlite_fts::SqliteFtsIndex;
+use crate::index_gc::{apply_index_gc, IndexGcPolicy};
 use crate::ocr::{
     configured_ocr_provider, ocr_evidence_from_output, ocr_profile_stale, ocr_required_pages,
     pdf_scan_summary, source_ingest_diagnostics, OcrPageRequest, OcrProvider,
@@ -65,6 +66,7 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     ocr_provider: Option<Box<dyn OcrProvider>>,
     data_dir: PathBuf,
     image_artifact_limits: ImageArtifactLimits,
+    index_gc_policy: IndexGcPolicy,
 }
 
 struct PreparedIndexes {
@@ -211,6 +213,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             ocr_provider,
             data_dir: data_dir.to_path_buf(),
             image_artifact_limits: config.parser.image_artifacts,
+            index_gc_policy: config.index_gc.policy(),
         })
     }
 
@@ -224,6 +227,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         let (vision_model, vision_caption_model) = configured_vision_model(config);
         self.vision_model = vision_model;
         self.vision_caption_model = vision_caption_model;
+        self.index_gc_policy = config.index_gc.policy();
         self.graph_extractor = if self.graph_extraction_config.enabled && config.chat.enabled {
             Some(GraphExtractor::from_config(&config.chat))
         } else {
@@ -318,6 +322,7 @@ where
             ocr_provider: None,
             data_dir,
             image_artifact_limits: ImageArtifactLimits::default(),
+            index_gc_policy: IndexGcPolicy::default(),
         }
     }
 
@@ -1385,6 +1390,14 @@ where
         if self.loaded_profile_id == *profile_id || self.active_profile_id == *profile_id {
             self.hnsw = prepared.hnsw;
             self.loaded_profile_id = profile_id.clone();
+        }
+        if let Err(error) = apply_index_gc(&self.data_dir, &self.store, self.index_gc_policy) {
+            tracing::warn!(
+                error = %error,
+                embedding_profile_id = %profile_id,
+                generation,
+                "index generation garbage collection failed after publish"
+            );
         }
         Ok(())
     }
@@ -3023,6 +3036,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     #[cfg(feature = "qdrant")]
     use std::thread;
+    use std::time::Duration;
 
     #[cfg(feature = "qdrant")]
     use crate::config::QdrantConfig;
@@ -3447,6 +3461,7 @@ mod tests {
             chat: Default::default(),
             verifier: Default::default(),
             qdrant: Default::default(),
+            index_gc: Default::default(),
             cli: Default::default(),
             daemon: Default::default(),
             collection_watcher: Default::default(),
@@ -6503,6 +6518,58 @@ model = "local-vision"
                 .count()
         );
         assert!(pipeline.hnsw().is_empty());
+    }
+
+    #[test]
+    fn post_publish_gc_removes_old_generations_after_successful_publish() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let default_profile = EmbeddingProfileId::default_profile();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        pipeline.index_gc_policy = IndexGcPolicy {
+            retain_previous_generations: 0,
+            stale_staging_age: Duration::from_secs(60),
+        };
+
+        pipeline
+            .store()
+            .replace_all_vector_documents_for_profile(&default_profile, &[])
+            .unwrap();
+        pipeline
+            .publish_prepared_indexes(
+                &default_profile,
+                PreparedIndexes {
+                    hnsw: HnswIndex::new(),
+                    vectors: Vec::new(),
+                    cache_stats: EmbeddingCacheStats::default(),
+                },
+            )
+            .unwrap();
+        let first_generation_dir = index_generation_dir(tempdir.path(), &default_profile, 1);
+        assert!(first_generation_dir.exists());
+
+        pipeline
+            .store()
+            .replace_all_vector_documents_for_profile(&default_profile, &[])
+            .unwrap();
+        pipeline
+            .publish_prepared_indexes(
+                &default_profile,
+                PreparedIndexes {
+                    hnsw: HnswIndex::new(),
+                    vectors: Vec::new(),
+                    cache_stats: EmbeddingCacheStats::default(),
+                },
+            )
+            .unwrap();
+
+        assert!(!first_generation_dir.exists());
+        assert!(index_generation_dir(tempdir.path(), &default_profile, 2).exists());
     }
 
     #[tokio::test]

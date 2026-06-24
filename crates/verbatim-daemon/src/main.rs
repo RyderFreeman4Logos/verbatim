@@ -30,10 +30,10 @@ use verbatim_core::api::{
     CollectionSyncPathRequest, CollectionSyncRequest, CollectionSyncResponse,
     CollectionWatcherResponse, CollectionWatcherStatus, CollectionWatcherUpdateRequest,
     CollectionWatchersStatusResponse, ConfigResponse, CreateCollectionRequest, ErrorResponse,
-    EvidenceResponse, HealthResponse, ImageArtifactResponse, IngestResponse, ReindexRequest,
-    ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
-    RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
-    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
+    EvidenceResponse, HealthResponse, ImageArtifactResponse, IndexGcRequest, IndexGcResponse,
+    IngestResponse, ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest,
+    RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
+    TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -47,6 +47,7 @@ use verbatim_core::generate::{
     image_artifact_evidence_id, select_image_attachments, GenerationContext, Generator,
 };
 use verbatim_core::graphrag::GraphRagService;
+use verbatim_core::index_gc::{apply_index_gc, plan_index_gc, IndexGcApplyReport};
 use verbatim_core::ingest::{IndexingOutcome, IngestPipeline};
 use verbatim_core::ocr::source_ingest_diagnostics;
 use verbatim_core::provider::openai_compatible::OpenAiCompatibleReranker;
@@ -400,6 +401,38 @@ async fn get_config(
     Ok(Json(ConfigResponse {
         config: snapshot.config.redacted_json(),
         reload: snapshot.reload,
+    }))
+}
+
+async fn index_gc(
+    State(state): State<SharedState>,
+    Json(req): Json<IndexGcRequest>,
+) -> Result<Json<IndexGcResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
+    let policy_config = config.index_gc;
+    let policy = policy_config.policy();
+    let state = Arc::clone(&state);
+    let dry_run = req.dry_run;
+    let (plan, apply) = tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if dry_run {
+            let plan = plan_index_gc(&state.data_dir, pipeline.store(), policy)?;
+            Ok::<_, anyhow::Error>((plan, IndexGcApplyReport::default()))
+        } else {
+            apply_index_gc(&state.data_dir, pipeline.store(), policy)
+        }
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(IndexGcResponse {
+        dry_run,
+        policy: policy_config,
+        plan,
+        apply,
     }))
 }
 
@@ -5136,6 +5169,9 @@ async fn run_daemon() -> Result<()> {
     let config = Config::load_from(&config_path).context("failed to load config")?;
     let data_dir = config::data_dir(&config);
     let pipeline = IngestPipeline::new(&config, &data_dir)?;
+    if let Err(error) = apply_index_gc(&data_dir, pipeline.store(), config.index_gc.policy()) {
+        tracing::warn!(error = %error, "startup index generation garbage collection failed");
+    }
     let task_store = Store::new(&data_dir.join("verbatim.db"))?;
 
     let bind_addr = config.daemon.bind.clone();
@@ -5204,6 +5240,7 @@ async fn run_daemon() -> Result<()> {
         .route("/api/ingest", post(ingest_all))
         .route("/api/ingest/{id}", post(ingest_one))
         .route("/api/reindex", post(reindex))
+        .route("/api/index/gc", post(index_gc))
         .route("/api/ask", post(ask))
         .route("/api/ask/stream", post(ask_stream))
         .route("/api/retrieve", post(retrieve))
@@ -6512,6 +6549,59 @@ mod tests {
             body.error,
             "source not found: __missing_source_smoke_retest__"
         );
+    }
+
+    #[tokio::test]
+    async fn index_gc_dry_run_and_apply_use_daemon_data_dir() {
+        let test_dir = TestDir::new("index-gc");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.index_gc.retain_previous_generations = 0;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+        pipeline
+            .store()
+            .replace_all_vector_documents_for_profile(&profile, &[])
+            .unwrap();
+        let old_generation = test_dir
+            .path()
+            .join("indexes")
+            .join("profiles")
+            .join("default")
+            .join("gen-1");
+        fs::create_dir_all(&old_generation).unwrap();
+        fs::write(old_generation.join("vectors.hnsw"), b"old").unwrap();
+        pipeline
+            .store()
+            .replace_all_vector_documents_for_profile(&profile, &[])
+            .unwrap();
+        let current_generation = test_dir
+            .path()
+            .join("indexes")
+            .join("profiles")
+            .join("default")
+            .join("gen-2");
+        fs::create_dir_all(&current_generation).unwrap();
+        fs::write(current_generation.join("vectors.hnsw"), b"current").unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let Json(dry_run) = index_gc(
+            State(Arc::clone(&state)),
+            Json(IndexGcRequest { dry_run: true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dry_run.plan.entries.len(), 1);
+        assert!(old_generation.exists());
+
+        let Json(applied) = index_gc(
+            State(Arc::clone(&state)),
+            Json(IndexGcRequest { dry_run: false }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied.apply.removed.len(), 1);
+        assert!(!old_generation.exists());
+        assert!(current_generation.exists());
     }
 
     #[tokio::test]

@@ -5,10 +5,12 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+#[cfg(test)]
+use verbatim_core::api::IndexGcResponse;
 use verbatim_core::api::{
     AddCollectionRootRequest, AskRequest, CollectionFilterRequest, CollectionSyncPathRequest,
-    CollectionSyncRequest, CollectionWatcherUpdateRequest, CreateCollectionRequest, ReindexRequest,
-    RetrieveRequest,
+    CollectionSyncRequest, CollectionWatcherUpdateRequest, CreateCollectionRequest, IndexGcRequest,
+    ReindexRequest, RetrieveRequest,
 };
 
 mod client;
@@ -197,6 +199,7 @@ where
     match cli.command {
         Commands::Source { command } => run_source(command, stdout, client),
         Commands::Collection { command } => run_collection(command, stdout, client),
+        Commands::Index { command } => run_index(command, stdout, client),
         Commands::Ingest {
             source_id,
             force,
@@ -505,6 +508,20 @@ where
     Ok(0)
 }
 
+fn run_index<W, C>(command: IndexCommand, stdout: &mut W, client: &C) -> Result<u8, CliError>
+where
+    W: Write,
+    C: DaemonClient,
+{
+    match command {
+        IndexCommand::Gc { dry_run } => {
+            let response = client.index_gc(&IndexGcRequest { dry_run })?;
+            render::write_index_gc(stdout, &response)?;
+        }
+    }
+    Ok(0)
+}
+
 fn auto_index_setting(auto_index: bool, no_auto_index: bool) -> Option<bool> {
     match (auto_index, no_auto_index) {
         (true, false) => Some(true),
@@ -666,6 +683,7 @@ const TOP_LEVEL_AFTER_HELP: &str = r#"Examples:
   verbatim source add ./paper.pdf
   verbatim collection create articles
   verbatim ingest <source-id>
+  verbatim index gc --dry-run
   verbatim retrieve --show-debug "What does the paper claim?"
   verbatim ask --source-id <source-id> "What supports the conclusion?"
 
@@ -813,6 +831,22 @@ const COLLECTION_WATCH_STATUS_AFTER_HELP: &str = r#"Examples:
 
 Status reads daemon watcher state, including active roots, pending debounced
 events, last sync diff, last task id, and last error.
+"#;
+
+const INDEX_AFTER_HELP: &str = r#"Examples:
+  verbatim index gc --dry-run
+  verbatim index gc
+
+Index maintenance operates on daemon-managed index artifacts only.
+"#;
+
+const INDEX_GC_AFTER_HELP: &str = r#"Examples:
+  verbatim index gc --dry-run
+  verbatim index gc
+
+GC removes old per-profile gen-* index generations and stale staging-*
+directories according to [index_gc] policy. It does not delete sources, SQLite
+data, embedding cache, or image artifacts.
 "#;
 
 const INGEST_AFTER_HELP: &str = r#"Examples:
@@ -1040,6 +1074,15 @@ enum Commands {
     Collection {
         #[command(subcommand)]
         command: CollectionCommand,
+    },
+    /// Maintain daemon-managed retrieval index artifacts.
+    #[command(
+        about = "Inspect or clean daemon-managed retrieval index artifacts.",
+        after_help = INDEX_AFTER_HELP
+    )]
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
     },
     /// Trigger ingestion through the daemon API.
     #[command(
@@ -1422,6 +1465,20 @@ enum CollectionWatchCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum IndexCommand {
+    /// Garbage collect old index generations and stale staging directories.
+    #[command(
+        about = "Garbage collect old index generations and stale staging directories.",
+        after_help = INDEX_GC_AFTER_HELP
+    )]
+    Gc {
+        /// Show what would be removed without deleting anything.
+        #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ConfigCommand {
     /// Generate the default local config file.
     #[command(
@@ -1618,6 +1675,8 @@ mod tests {
             &["collection", "watch", "enable", "--help"],
             &["collection", "watch", "disable", "--help"],
             &["collection", "watch", "status", "--help"],
+            &["index", "--help"],
+            &["index", "gc", "--help"],
             &["ingest", "--help"],
             &["reindex", "--help"],
             &["ask", "--help"],
@@ -1671,6 +1730,8 @@ mod tests {
             &["collection", "watch", "enable", "--help"],
             &["collection", "watch", "disable", "--help"],
             &["collection", "watch", "status", "--help"],
+            &["index", "--help"],
+            &["index", "gc", "--help"],
             &["ingest", "--help"],
             &["reindex", "--help"],
             &["ask", "--help"],
@@ -1869,6 +1930,32 @@ mod tests {
         assert_eq!(client.calls.borrow().as_slice(), ["list_sources"]);
         assert!(stdout.contains("Sources:"));
         assert!(stdout.contains("id=src-1"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn index_gc_dry_run_calls_daemon_and_reports_plan() {
+        let (code, stdout, stderr, client, _) = run_mock(["index", "gc", "--dry-run"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["index_gc:true"]);
+        assert!(stdout.contains("Index GC dry-run"));
+        assert!(stdout.contains("planned: 1 artifact(s), 2.0KiB approximate reclaimable"));
+        assert!(stdout.contains("Planned removals:"));
+        assert!(stdout.contains("kind=generation profile=default generation=1"));
+        assert!(stdout.contains("Skipped:"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn index_gc_apply_calls_daemon_and_reports_removed_artifacts() {
+        let (code, stdout, stderr, client, _) = run_mock(["index", "gc"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["index_gc:false"]);
+        assert!(stdout.contains("Index GC:"));
+        assert!(stdout.contains("removed: 1 artifact(s), 2.0KiB reclaimed"));
+        assert!(stdout.contains("Removed artifacts:"));
         assert!(stderr.is_empty());
     }
 
@@ -2818,6 +2905,13 @@ mod tests {
             })
         }
 
+        fn index_gc(&self, request: &IndexGcRequest) -> client::CliResult<IndexGcResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("index_gc:{}", request.dry_run));
+            Ok(sample_index_gc_response(request.dry_run))
+        }
+
         fn get_task(&self, task_id: &str) -> client::CliResult<TaskSummaryResponse> {
             self.calls.borrow_mut().push(format!("get_task:{task_id}"));
             Ok(sample_task_response(TaskStatus::Succeeded))
@@ -3041,6 +3135,44 @@ mod tests {
             scanned_roots: 1,
             max_depth: 32,
             skipped: Vec::new(),
+        }
+    }
+
+    fn sample_index_gc_response(dry_run: bool) -> IndexGcResponse {
+        let entry = verbatim_core::index_gc::IndexGcPlanEntry {
+            path: PathBuf::from("/tmp/verbatim/indexes/profiles/default/gen-1"),
+            kind: verbatim_core::index_gc::IndexGcArtifactKind::Generation,
+            profile_id: Some("default".into()),
+            generation: Some(1),
+            approximate_bytes: 2048,
+            reason: "older than current generation 3 plus 1 retained previous generation(s)".into(),
+        };
+        let skipped = verbatim_core::index_gc::IndexGcSkippedEntry {
+            path: PathBuf::from("/tmp/verbatim/indexes/staging-1-fresh"),
+            kind: Some(verbatim_core::index_gc::IndexGcArtifactKind::Staging),
+            profile_id: None,
+            generation: None,
+            reason: "staging directory age 0s is below stale threshold 86400s".into(),
+        };
+        IndexGcResponse {
+            dry_run,
+            policy: verbatim_core::index_gc::IndexGcConfig {
+                retain_previous_generations: 1,
+                stale_staging_seconds: 86_400,
+            },
+            plan: verbatim_core::index_gc::IndexGcPlan {
+                entries: vec![entry.clone()],
+                skipped: vec![skipped],
+                approximate_reclaim_bytes: entry.approximate_bytes,
+            },
+            apply: if dry_run {
+                verbatim_core::index_gc::IndexGcApplyReport::default()
+            } else {
+                verbatim_core::index_gc::IndexGcApplyReport {
+                    removed: vec![entry.clone()],
+                    reclaimed_bytes: entry.approximate_bytes,
+                }
+            },
         }
     }
 

@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::image_limits::ImageArtifactLimits;
+use crate::index_gc::IndexGcConfig;
 use crate::types::{EdgeType, EmbeddingProfileId, OcrProfile};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -33,6 +34,8 @@ pub struct Config {
     pub verifier: VerifierConfig,
     #[serde(default)]
     pub qdrant: QdrantConfig,
+    #[serde(default)]
+    pub index_gc: IndexGcConfig,
     #[serde(default)]
     pub cli: CliConfig,
     #[serde(default)]
@@ -998,6 +1001,7 @@ impl Config {
         next.vision = candidate.vision.clone();
         next.chat = candidate.chat.clone();
         next.verifier = candidate.verifier.clone();
+        next.index_gc = candidate.index_gc.clone();
         next.cli = candidate.cli.clone();
         next.collection_watcher = candidate.collection_watcher.clone();
 
@@ -1149,6 +1153,8 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "chat.vision_attachments.max_total_bytes"
             | "chat.vision_attachments.detail"
             | "verifier.enabled"
+            | "index_gc.retain_previous_generations"
+            | "index_gc.stale_staging_seconds"
             | "cli.task_wait_timeout_seconds"
             | "collection_watcher.enabled"
             | "collection_watcher.debounce_millis"
@@ -1376,6 +1382,10 @@ collection = "verbatim"
 prefer_for_search = false
 timeout_seconds = 5
 
+[index_gc]
+retain_previous_generations = 2
+stale_staging_seconds = 86400
+
 [cli]
 # Caps `verbatim task wait`. Model timeout_seconds values above bound provider
 # calls and finite daemon HTTP requests; they do not cap task wait streams.
@@ -1511,6 +1521,8 @@ mod tests {
         assert_eq!(config.qdrant.collection, "verbatim");
         assert!(!config.qdrant.prefer_for_search);
         assert_eq!(config.qdrant.timeout_seconds, 5);
+        assert_eq!(config.index_gc.retain_previous_generations, 2);
+        assert_eq!(config.index_gc.stale_staging_seconds, 86_400);
         assert!(config.collection_watcher.enabled);
         assert_eq!(config.collection_watcher.debounce_millis, 500);
         assert_eq!(config.collection_watcher.max_depth, 32);
@@ -1772,6 +1784,8 @@ model_supports_vision = true
         candidate.chat.endpoint_runtime.retry.max_retries = 1;
         candidate.embedding.base_url = "http://127.0.0.1:18002/v1".into();
         candidate.embedding.endpoint_runtime.queue_timeout_seconds = 60;
+        candidate.index_gc.retain_previous_generations = 1;
+        candidate.index_gc.stale_staging_seconds = 3_600;
 
         let plan = current.reload_plan(&candidate).unwrap();
 
@@ -1783,6 +1797,8 @@ model_supports_vision = true
                 "chat.timeout_seconds",
                 "embedding.base_url",
                 "embedding.queue_timeout_seconds",
+                "index_gc.retain_previous_generations",
+                "index_gc.stale_staging_seconds",
                 "retrieval.dense_top_k"
             ]
         );
@@ -1795,6 +1811,8 @@ model_supports_vision = true
         assert_eq!(applied.chat.endpoint_runtime.retry.max_retries, 1);
         assert_eq!(applied.embedding.base_url, "http://127.0.0.1:18002/v1");
         assert_eq!(applied.embedding.endpoint_runtime.queue_timeout_seconds, 60);
+        assert_eq!(applied.index_gc.retain_previous_generations, 1);
+        assert_eq!(applied.index_gc.stale_staging_seconds, 3_600);
     }
 
     #[test]

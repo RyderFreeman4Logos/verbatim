@@ -83,6 +83,12 @@ pub struct EmbeddingCacheEntry {
     pub vector: Vec<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingProfileIndexGeneration {
+    pub profile_id: EmbeddingProfileId,
+    pub generation: u64,
+}
+
 impl Store {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -558,6 +564,34 @@ impl Store {
             .unwrap_or("0")
             .parse::<u64>()
             .context("parse profile index generation")
+    }
+
+    pub fn profile_index_generations(&self) -> Result<Vec<EmbeddingProfileIndexGeneration>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT profile_id, generation
+             FROM embedding_profile_index_meta
+             ORDER BY profile_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let profile_id_text: String = row.get(0)?;
+            let generation_text: String = row.get(1)?;
+            Ok((profile_id_text, generation_text))
+        })?;
+
+        let mut generations = Vec::new();
+        for row in rows {
+            let (profile_id_text, generation_text) = row?;
+            let profile_id = EmbeddingProfileId::new(profile_id_text.clone())
+                .map_err(|err| anyhow::anyhow!("parse profile index metadata id: {err}"))?;
+            let generation = generation_text
+                .parse::<u64>()
+                .with_context(|| format!("parse profile index generation for {profile_id_text}"))?;
+            generations.push(EmbeddingProfileIndexGeneration {
+                profile_id,
+                generation,
+            });
+        }
+        Ok(generations)
     }
 
     pub fn update_source_status(&self, id: &SourceId, status: &SourceStatus) -> Result<()> {
