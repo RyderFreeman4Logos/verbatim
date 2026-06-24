@@ -82,6 +82,50 @@ pub struct CollectionStatusResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionWatcherUpdateRequest {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_index_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionWatcherResponse {
+    pub collection: CollectionRecord,
+    pub watcher: CollectionWatcherStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionWatchersStatusResponse {
+    #[serde(default)]
+    pub watchers: Vec<CollectionWatcherStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionWatcherStatus {
+    pub collection_name: String,
+    pub watch_enabled: bool,
+    pub auto_index_enabled: bool,
+    pub active: bool,
+    pub ignored_by_config: bool,
+    pub watched_root_count: usize,
+    pub pending_event_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_added: usize,
+    #[serde(default)]
+    pub last_removed: usize,
+    #[serde(default)]
+    pub last_unchanged: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionSyncResponse {
     pub report: CollectionSyncReport,
 }

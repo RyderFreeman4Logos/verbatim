@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
 use std::io::Write;
@@ -27,14 +27,17 @@ use verbatim_core::api::{
     AskCitationEvent, AskErrorEvent, AskRequest, AskResponse, AskTokenEvent, CheckStaleResponse,
     CitationResponse, CollectionFilterRequest, CollectionFilterResponse, CollectionResponse,
     CollectionResultProvenance, CollectionStatusResponse, CollectionSyncPathRequest,
-    CollectionSyncRequest, CollectionSyncResponse, ConfigResponse, CreateCollectionRequest,
-    ErrorResponse, EvidenceResponse, HealthResponse, ImageArtifactResponse, IngestResponse,
-    ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
-    RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
-    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
+    CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
+    CollectionWatcherStatus, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
+    ConfigResponse, CreateCollectionRequest, ErrorResponse, EvidenceResponse, HealthResponse,
+    ImageArtifactResponse, IngestResponse, ReindexRequest, ReindexResponse,
+    RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+    RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEventsResponse,
+    TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{
-    validate_collection_name, CollectionMember, CollectionRecord, CollectionSyncPathInput,
+    diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
+    CollectionMemberCandidate, CollectionRecord, CollectionSyncPathInput,
 };
 use verbatim_core::config::{
     self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, RerankConfig, RetrievalConfig,
@@ -80,6 +83,7 @@ struct AppState {
     /// Independent task metadata connection so queue operations do not wait for long ingest work.
     task_store: std::sync::Mutex<Store>,
     ingest_queue_active: AtomicBool,
+    collection_watcher: CollectionWatcherRuntime,
     runtime_config: std::sync::RwLock<RuntimeConfigState>,
     config_path: PathBuf,
     data_dir: PathBuf,
@@ -101,6 +105,60 @@ const FAST_RETRIEVAL_TOP_K: usize = 20;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
 const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
 const CONFIG_RELOAD_ERROR_MAX_CHARS: usize = 1024;
+const COLLECTION_WATCHER_EVENT_BUFFER: usize = 512;
+const COLLECTION_WATCHER_STATUS_ERROR_MAX_CHARS: usize = 1024;
+
+#[derive(Default)]
+struct CollectionWatcherRuntime {
+    tx: std::sync::Mutex<Option<mpsc::Sender<CollectionWatcherCommand>>>,
+    statuses: std::sync::Mutex<HashMap<String, CollectionWatcherStatusState>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CollectionWatcherStatusState {
+    active: bool,
+    ignored_by_config: bool,
+    watched_root_count: usize,
+    pending_event_count: usize,
+    last_event_at: Option<String>,
+    last_sync_at: Option<String>,
+    last_error: Option<String>,
+    last_added: usize,
+    last_removed: usize,
+    last_unchanged: usize,
+    last_task_id: Option<String>,
+}
+
+#[derive(Debug)]
+enum CollectionWatcherCommand {
+    FilesystemEvent { paths: Vec<PathBuf> },
+    NotifyError { error: String },
+    Refresh,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DebouncedCollectionSet {
+    pending: BTreeSet<String>,
+}
+
+impl DebouncedCollectionSet {
+    fn insert_many<I>(&mut self, names: I) -> bool
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let before = self.pending.len();
+        self.pending.extend(names);
+        self.pending.len() != before
+    }
+
+    fn drain(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending).into_iter().collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
@@ -150,6 +208,92 @@ fn runtime_config_snapshot(state: &SharedState) -> Result<RuntimeConfigState> {
         .read()
         .map_err(|error| anyhow::anyhow!("{error}"))
         .map(|guard| guard.clone())
+}
+
+fn set_collection_watcher_sender(state: &SharedState, tx: mpsc::Sender<CollectionWatcherCommand>) {
+    match state.collection_watcher.tx.lock() {
+        Ok(mut guard) => {
+            *guard = Some(tx);
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to install collection watcher command sender");
+        }
+    }
+}
+
+fn send_collection_watcher_command(state: &SharedState, command: CollectionWatcherCommand) {
+    let tx = match state.collection_watcher.tx.lock() {
+        Ok(guard) => guard.clone(),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to lock collection watcher command sender");
+            None
+        }
+    };
+    if let Some(tx) = tx {
+        if let Err(error) = tx.try_send(command) {
+            tracing::warn!(error = %error, "collection watcher command queue is full");
+        }
+    }
+}
+
+fn update_collection_watcher_status<F>(state: &SharedState, collection_name: &str, update: F)
+where
+    F: FnOnce(&mut CollectionWatcherStatusState),
+{
+    match state.collection_watcher.statuses.lock() {
+        Ok(mut statuses) => {
+            let status = statuses.entry(collection_name.to_string()).or_default();
+            update(status);
+        }
+        Err(error) => {
+            tracing::warn!(
+                collection = %collection_name,
+                error = %error,
+                "failed to update collection watcher status"
+            );
+        }
+    }
+}
+
+fn record_collection_watcher_error(
+    state: &SharedState,
+    collection_name: &str,
+    error: impl std::fmt::Display,
+) {
+    let error = bounded_collection_watcher_error(&error.to_string());
+    update_collection_watcher_status(state, collection_name, |status| {
+        status.last_error = Some(error);
+    });
+}
+
+fn bounded_collection_watcher_error(error: &str) -> String {
+    sanitize_text(error)
+        .chars()
+        .take(COLLECTION_WATCHER_STATUS_ERROR_MAX_CHARS)
+        .collect()
+}
+
+fn collection_watcher_status_from_parts(
+    collection: &CollectionRecord,
+    state: Option<CollectionWatcherStatusState>,
+) -> CollectionWatcherStatus {
+    let state = state.unwrap_or_default();
+    CollectionWatcherStatus {
+        collection_name: collection.name.clone(),
+        watch_enabled: collection.watch_enabled,
+        auto_index_enabled: collection.auto_index_enabled,
+        active: state.active,
+        ignored_by_config: state.ignored_by_config,
+        watched_root_count: state.watched_root_count,
+        pending_event_count: state.pending_event_count,
+        last_event_at: state.last_event_at,
+        last_sync_at: state.last_sync_at,
+        last_error: state.last_error,
+        last_added: state.last_added,
+        last_removed: state.last_removed,
+        last_unchanged: state.last_unchanged,
+        last_task_id: state.last_task_id,
+    }
 }
 
 #[derive(Deserialize)]
@@ -457,10 +601,13 @@ async fn delete_collection(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
+    let state_for_store = Arc::clone(&state);
     let name_for_error = name.clone();
     let deleted = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pipeline = state_for_store
+            .pipeline
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         pipeline.store().delete_collection(&name)
     })
     .await
@@ -468,6 +615,7 @@ async fn delete_collection(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if deleted {
+        send_collection_watcher_command(&state, CollectionWatcherCommand::Refresh);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(err(
@@ -482,10 +630,13 @@ async fn add_collection_root(
     Path(name): Path<String>,
     Json(req): Json<AddCollectionRootRequest>,
 ) -> Result<Json<CollectionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
+    let state_for_store = Arc::clone(&state);
     let name_for_error = name.clone();
     let response = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pipeline = state_for_store
+            .pipeline
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let path = PathBuf::from(req.path);
         pipeline.store().add_collection_root(&name, &path)?;
         let collection = pipeline
@@ -498,6 +649,7 @@ async fn add_collection_root(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| collection_error(&name_for_error, e))?;
 
+    send_collection_watcher_command(&state, CollectionWatcherCommand::Refresh);
     Ok(Json(response))
 }
 
@@ -545,6 +697,121 @@ async fn collection_status(
             anyhow::anyhow!("collection not found: {name}"),
         )),
     }
+}
+
+async fn list_collection_watcher_statuses(
+    State(state): State<SharedState>,
+) -> Result<Json<CollectionWatchersStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let state_for_store = Arc::clone(&state);
+    let collections = tokio::task::spawn_blocking(move || {
+        let pipeline = state_for_store
+            .pipeline
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.store().list_collections()
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let statuses = state
+        .collection_watcher
+        .statuses
+        .lock()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, anyhow::anyhow!("{e}")))?
+        .clone();
+    let watchers = collections
+        .iter()
+        .map(|collection| {
+            collection_watcher_status_from_parts(
+                collection,
+                statuses.get(&collection.name).cloned(),
+            )
+        })
+        .collect();
+    Ok(Json(CollectionWatchersStatusResponse { watchers }))
+}
+
+async fn collection_watcher_status(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<CollectionWatcherResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let state_for_store = Arc::clone(&state);
+    let name_for_lookup = name.clone();
+    let collection = tokio::task::spawn_blocking(move || {
+        let pipeline = state_for_store
+            .pipeline
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipeline.store().get_collection(&name_for_lookup)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let Some(collection) = collection else {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("collection not found: {name}"),
+        ));
+    };
+    let status = state
+        .collection_watcher
+        .statuses
+        .lock()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, anyhow::anyhow!("{e}")))?
+        .get(&collection.name)
+        .cloned();
+    let watcher = collection_watcher_status_from_parts(&collection, status);
+    Ok(Json(CollectionWatcherResponse {
+        collection,
+        watcher,
+    }))
+}
+
+async fn update_collection_watcher(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<CollectionWatcherUpdateRequest>,
+) -> Result<Json<CollectionWatcherResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let state_for_store = Arc::clone(&state);
+    let name_for_lookup = name.clone();
+    let collection = tokio::task::spawn_blocking(move || {
+        let pipeline = state_for_store
+            .pipeline
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let current = pipeline
+            .store()
+            .get_collection(&name_for_lookup)?
+            .with_context(|| format!("collection not found: {name_for_lookup}"))?;
+        let auto_index_enabled = req.auto_index_enabled.unwrap_or(current.auto_index_enabled);
+        pipeline.store().update_collection_watch_settings(
+            &name_for_lookup,
+            req.enabled,
+            auto_index_enabled,
+        )
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| collection_error(&name, e))?;
+    let Some(collection) = collection else {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("collection not found: {name}"),
+        ));
+    };
+    send_collection_watcher_command(&state, CollectionWatcherCommand::Refresh);
+    let status = state
+        .collection_watcher
+        .statuses
+        .lock()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, anyhow::anyhow!("{e}")))?
+        .get(&collection.name)
+        .cloned();
+    let watcher = collection_watcher_status_from_parts(&collection, status);
+    Ok(Json(CollectionWatcherResponse {
+        collection,
+        watcher,
+    }))
 }
 
 fn collection_response(store: &Store, collection: CollectionRecord) -> Result<CollectionResponse> {
@@ -3543,6 +3810,510 @@ fn sse_error_event(status: StatusCode, error: String) -> Event {
 }
 
 // ---------------------------------------------------------------------------
+// Collection watcher
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct CollectionWatchPlan {
+    roots: BTreeMap<PathBuf, CollectionWatchRoot>,
+}
+
+#[derive(Clone)]
+struct CollectionWatchRoot {
+    recursive: RecursiveMode,
+    collections: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct CollectionMaintenanceOutcome {
+    added: usize,
+    removed: usize,
+    unchanged: usize,
+    queued_task_ids: Vec<String>,
+}
+
+fn start_collection_watcher(state: SharedState) -> Result<tokio::task::JoinHandle<()>> {
+    let (tx, rx) = mpsc::channel(COLLECTION_WATCHER_EVENT_BUFFER);
+    set_collection_watcher_sender(&state, tx.clone());
+    let callback_tx = tx;
+    let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let command = match event {
+            Ok(event) if collection_notify_event_is_relevant(&event.kind) => {
+                Some(CollectionWatcherCommand::FilesystemEvent { paths: event.paths })
+            }
+            Ok(_) => None,
+            Err(error) => Some(CollectionWatcherCommand::NotifyError {
+                error: error.to_string(),
+            }),
+        };
+        if let Some(command) = command {
+            let _ = callback_tx.try_send(command);
+        }
+    })
+    .context("create collection watcher")?;
+
+    Ok(tokio::spawn(async move {
+        run_collection_watcher(state, watcher, rx).await;
+    }))
+}
+
+fn collection_notify_event_is_relevant(kind: &EventKind) -> bool {
+    !matches!(kind, EventKind::Access(_))
+}
+
+async fn run_collection_watcher(
+    state: SharedState,
+    mut watcher: RecommendedWatcher,
+    mut rx: mpsc::Receiver<CollectionWatcherCommand>,
+) {
+    let mut plan = CollectionWatchPlan::default();
+    let mut watched_paths: BTreeMap<PathBuf, RecursiveMode> = BTreeMap::new();
+    if let Err(error) =
+        refresh_collection_watches(&state, &mut watcher, &mut watched_paths, &mut plan).await
+    {
+        tracing::warn!(error = %error, "initial collection watcher refresh failed");
+    }
+
+    let mut debounced = DebouncedCollectionSet::default();
+    let mut deadline: Option<tokio::time::Instant> = None;
+
+    loop {
+        if let Some(instant) = deadline {
+            tokio::select! {
+                command = rx.recv() => {
+                    let Some(command) = command else {
+                        break;
+                    };
+                    handle_collection_watcher_command(
+                        &state,
+                        &mut watcher,
+                        &mut watched_paths,
+                        &mut plan,
+                        &mut debounced,
+                        &mut deadline,
+                        command,
+                    )
+                    .await;
+                }
+                () = tokio::time::sleep_until(instant) => {
+                    flush_collection_watcher_debounce(&state, &mut debounced).await;
+                    deadline = None;
+                }
+            }
+        } else {
+            let Some(command) = rx.recv().await else {
+                break;
+            };
+            handle_collection_watcher_command(
+                &state,
+                &mut watcher,
+                &mut watched_paths,
+                &mut plan,
+                &mut debounced,
+                &mut deadline,
+                command,
+            )
+            .await;
+        }
+    }
+}
+
+async fn handle_collection_watcher_command(
+    state: &SharedState,
+    watcher: &mut RecommendedWatcher,
+    watched_paths: &mut BTreeMap<PathBuf, RecursiveMode>,
+    plan: &mut CollectionWatchPlan,
+    debounced: &mut DebouncedCollectionSet,
+    deadline: &mut Option<tokio::time::Instant>,
+    command: CollectionWatcherCommand,
+) {
+    match command {
+        CollectionWatcherCommand::FilesystemEvent { paths } => {
+            let names = collection_names_for_event_paths(plan, &paths);
+            if names.is_empty() {
+                return;
+            }
+            let now = unix_timestamp_string();
+            for name in &names {
+                update_collection_watcher_status(state, name, |status| {
+                    status.pending_event_count = status.pending_event_count.saturating_add(1);
+                    status.last_event_at = Some(now.clone());
+                });
+            }
+            debounced.insert_many(names);
+            let debounce = collection_watcher_debounce(state);
+            *deadline = Some(tokio::time::Instant::now() + debounce);
+        }
+        CollectionWatcherCommand::NotifyError { error } => {
+            tracing::warn!(error = %error, "collection watcher notify error");
+            mark_active_collection_watchers_error(state, &error);
+        }
+        CollectionWatcherCommand::Refresh => {
+            if let Err(error) =
+                refresh_collection_watches(state, watcher, watched_paths, plan).await
+            {
+                tracing::warn!(error = %error, "collection watcher refresh failed");
+                mark_active_collection_watchers_error(state, &error.to_string());
+            }
+        }
+    }
+}
+
+fn collection_watcher_debounce(state: &SharedState) -> Duration {
+    runtime_config_snapshot(state)
+        .ok()
+        .map(|snapshot| snapshot.config.collection_watcher.debounce_millis.max(1))
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(500))
+}
+
+async fn flush_collection_watcher_debounce(
+    state: &SharedState,
+    debounced: &mut DebouncedCollectionSet,
+) {
+    if debounced.is_empty() {
+        return;
+    }
+    let names = debounced.drain();
+    for name in names {
+        update_collection_watcher_status(state, &name, |status| {
+            status.pending_event_count = 0;
+        });
+        match maintain_collection_after_watch_event(state, &name).await {
+            Ok(outcome) => {
+                let last_task_id = outcome.queued_task_ids.last().cloned();
+                update_collection_watcher_status(state, &name, |status| {
+                    status.last_sync_at = Some(unix_timestamp_string());
+                    status.last_error = None;
+                    status.last_added = outcome.added;
+                    status.last_removed = outcome.removed;
+                    status.last_unchanged = outcome.unchanged;
+                    if last_task_id.is_some() {
+                        status.last_task_id = last_task_id;
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::warn!(collection = %name, error = %error, "collection watcher maintenance failed");
+                record_collection_watcher_error(state, &name, error);
+            }
+        }
+    }
+}
+
+async fn refresh_collection_watches(
+    state: &SharedState,
+    watcher: &mut RecommendedWatcher,
+    watched_paths: &mut BTreeMap<PathBuf, RecursiveMode>,
+    plan: &mut CollectionWatchPlan,
+) -> Result<()> {
+    let next_plan = build_collection_watch_plan(state).await?;
+    for path in watched_paths.keys().cloned().collect::<Vec<_>>() {
+        if !next_plan.roots.contains_key(&path) {
+            if let Err(error) = watcher.unwatch(&path) {
+                tracing::warn!(path = %path.display(), error = %error, "failed to unwatch collection root");
+            }
+            watched_paths.remove(&path);
+        }
+    }
+    for (path, root) in &next_plan.roots {
+        if watched_paths.contains_key(path) {
+            continue;
+        }
+        match watcher.watch(path, root.recursive) {
+            Ok(()) => {
+                watched_paths.insert(path.clone(), root.recursive);
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), error = %error, "failed to watch collection root");
+                for collection in &root.collections {
+                    record_collection_watcher_error(state, collection, &error);
+                }
+            }
+        }
+    }
+    *plan = next_plan;
+    Ok(())
+}
+
+async fn build_collection_watch_plan(state: &SharedState) -> Result<CollectionWatchPlan> {
+    let snapshot = runtime_config_snapshot(state)?;
+    let watcher_config = snapshot.config.collection_watcher;
+    let ignored_collections = watcher_config
+        .ignore_collections
+        .iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect::<BTreeSet<_>>();
+    let state_for_store = Arc::clone(state);
+    let plan = tokio::task::spawn_blocking(move || {
+        let pipeline = state_for_store
+            .pipeline
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let collections = pipeline.store().list_collections()?;
+        let mut plan = CollectionWatchPlan::default();
+        for collection in collections {
+            let ignored_by_config =
+                !watcher_config.enabled || ignored_collections.contains(&collection.name);
+            let mut watched_root_count = 0_usize;
+            if collection.watch_enabled && !ignored_by_config {
+                let roots = pipeline.store().list_collection_roots(&collection.name)?;
+                for root in roots {
+                    for path in
+                        watch_paths_for_collection_root(&root.path, root.canonical_path.as_ref())
+                    {
+                        if collection_watcher_path_ignored(&path, &watcher_config.ignore_paths) {
+                            continue;
+                        }
+                        watched_root_count += 1;
+                        let recursive = if path.is_dir() {
+                            RecursiveMode::Recursive
+                        } else {
+                            RecursiveMode::NonRecursive
+                        };
+                        plan.roots
+                            .entry(path)
+                            .and_modify(|root: &mut CollectionWatchRoot| {
+                                root.collections.insert(collection.name.clone());
+                                if recursive == RecursiveMode::Recursive {
+                                    root.recursive = RecursiveMode::Recursive;
+                                }
+                            })
+                            .or_insert_with(|| CollectionWatchRoot {
+                                recursive,
+                                collections: BTreeSet::from([collection.name.clone()]),
+                            });
+                    }
+                }
+            }
+            update_collection_watcher_status(&state_for_store, &collection.name, |status| {
+                status.active =
+                    collection.watch_enabled && !ignored_by_config && watched_root_count > 0;
+                status.ignored_by_config = ignored_by_config;
+                status.watched_root_count = watched_root_count;
+            });
+        }
+        Ok::<_, anyhow::Error>(plan)
+    })
+    .await
+    .context("join collection watch plan task")??;
+    Ok(plan)
+}
+
+fn watch_paths_for_collection_root(
+    path: &FsPath,
+    canonical_path: Option<&PathBuf>,
+) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    paths.insert(path.to_path_buf());
+    if let Some(canonical_path) = canonical_path {
+        paths.insert(canonical_path.clone());
+    }
+    paths.into_iter().collect()
+}
+
+fn collection_watcher_path_ignored(path: &FsPath, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_string();
+    let rules = CollectionIgnoreRules::new(patterns);
+    rules.is_ignored(&normalized, path.is_dir()) || rules.is_ignored(&normalized, true)
+}
+
+fn collection_names_for_event_paths(plan: &CollectionWatchPlan, paths: &[PathBuf]) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for path in paths {
+        for (root, watch_root) in &plan.roots {
+            if path_starts_with(path, root) {
+                names.extend(watch_root.collections.iter().cloned());
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn path_starts_with(path: &FsPath, root: &FsPath) -> bool {
+    path == root || path.starts_with(root)
+}
+
+fn mark_active_collection_watchers_error(state: &SharedState, error: &str) {
+    match state.collection_watcher.statuses.lock() {
+        Ok(mut statuses) => {
+            let error = bounded_collection_watcher_error(error);
+            for status in statuses.values_mut().filter(|status| status.active) {
+                status.last_error = Some(error.clone());
+            }
+        }
+        Err(lock_error) => {
+            tracing::warn!(error = %lock_error, "failed to record collection watcher notify error");
+        }
+    }
+}
+
+async fn maintain_collection_after_watch_event(
+    state: &SharedState,
+    collection_name: &str,
+) -> Result<CollectionMaintenanceOutcome> {
+    let snapshot = runtime_config_snapshot(state)?;
+    let watcher_config = snapshot.config.collection_watcher;
+    let watcher_config_for_sync = watcher_config.clone();
+    let collection_name = collection_name.to_string();
+    let state_for_sync = Arc::clone(state);
+    let collection_name_for_sync = collection_name.clone();
+    let sync_outcome = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Handle::current();
+        let mut pipeline = state_for_sync
+            .pipeline
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let collection = pipeline
+            .store()
+            .get_collection(&collection_name_for_sync)?
+            .with_context(|| format!("collection not found: {collection_name_for_sync}"))?;
+        if !collection.watch_enabled || !watcher_config_for_sync.enabled {
+            return Ok::<_, anyhow::Error>(CollectionMaintenanceSyncOutcome::default());
+        }
+        if watcher_config_for_sync
+            .ignore_collections
+            .iter()
+            .any(|name| name == &collection.name)
+        {
+            return Ok(CollectionMaintenanceSyncOutcome::default());
+        }
+        let old_members = pipeline
+            .store()
+            .list_collection_members(&collection_name_for_sync)?;
+        let report = pipeline.sync_collection_with_extra_ignores(
+            &collection_name_for_sync,
+            &[],
+            Some(watcher_config_for_sync.max_depth.max(1)),
+            &watcher_config_for_sync.ignore_paths,
+        )?;
+        let new_members = pipeline
+            .store()
+            .list_collection_members(&collection_name_for_sync)?;
+        let new_candidates = new_members
+            .iter()
+            .map(|member| CollectionMemberCandidate {
+                source_id: member.source_id.clone(),
+                logical_path: member.logical_path.clone(),
+                source_path: member.source_path.clone(),
+            })
+            .collect::<Vec<_>>();
+        let diff = diff_collection_members(&old_members, &new_candidates);
+        let stale = pipeline.check_stale()?;
+        let member_source_ids = new_members
+            .iter()
+            .map(|member| member.source_id.clone())
+            .collect::<HashSet<_>>();
+        let mut source_ids_to_ingest = diff
+            .added
+            .iter()
+            .map(|candidate| candidate.source_id.clone())
+            .chain(
+                stale
+                    .into_iter()
+                    .filter(|source_id| member_source_ids.contains(source_id)),
+            )
+            .collect::<BTreeSet<_>>();
+        for removed in &diff.removed {
+            if !removed.source_path.exists()
+                && pipeline.store().get_source(&removed.source_id)?.is_some()
+            {
+                runtime.block_on(pipeline.remove_source(&removed.source_id))?;
+                source_ids_to_ingest.remove(&removed.source_id);
+            }
+        }
+        Ok(CollectionMaintenanceSyncOutcome {
+            added: report.added,
+            removed: report.removed,
+            unchanged: report.unchanged,
+            auto_index_enabled: collection.auto_index_enabled,
+            source_ids_to_ingest: source_ids_to_ingest.into_iter().collect(),
+        })
+    })
+    .await
+    .context("join collection watcher sync task")??;
+
+    let mut outcome = CollectionMaintenanceOutcome {
+        added: sync_outcome.added,
+        removed: sync_outcome.removed,
+        unchanged: sync_outcome.unchanged,
+        queued_task_ids: Vec::new(),
+    };
+    if !sync_outcome.auto_index_enabled {
+        return Ok(outcome);
+    }
+    for source_id in sync_outcome
+        .source_ids_to_ingest
+        .into_iter()
+        .take(watcher_config.max_queued_tasks.max(1))
+    {
+        if source_has_pending_ingest_task(state, &source_id).await? {
+            continue;
+        }
+        let task_id = create_persisted_task(
+            state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some(&source_id.0),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .map_err(|(_, Json(error))| anyhow::anyhow!(error.error))?;
+        outcome.queued_task_ids.push(task_id.0);
+    }
+    if !outcome.queued_task_ids.is_empty() {
+        schedule_ingest_queue(Arc::clone(state));
+    }
+    Ok(outcome)
+}
+
+#[derive(Default)]
+struct CollectionMaintenanceSyncOutcome {
+    added: usize,
+    removed: usize,
+    unchanged: usize,
+    auto_index_enabled: bool,
+    source_ids_to_ingest: Vec<SourceId>,
+}
+
+async fn source_has_pending_ingest_task(state: &SharedState, source_id: &SourceId) -> Result<bool> {
+    let state = Arc::clone(state);
+    let source_id = source_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for task in store.queued_tasks(TaskKind::Ingest)? {
+            let request: PersistedIngestRequest = match serde_json::from_value(task.request) {
+                Ok(request) => request,
+                Err(_) => continue,
+            };
+            if request.operation.as_deref().unwrap_or("ingest") == "ingest"
+                && request.source_id.as_deref() == Some(source_id.0.as_str())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+    .await
+    .context("join pending ingest task lookup")?
+}
+
+// ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
 
@@ -3820,6 +4591,7 @@ async fn run_daemon() -> Result<()> {
         pipeline: std::sync::Mutex::new(pipeline),
         task_store: std::sync::Mutex::new(task_store),
         ingest_queue_active: AtomicBool::new(false),
+        collection_watcher: CollectionWatcherRuntime::default(),
         runtime_config: std::sync::RwLock::new(RuntimeConfigState {
             config,
             reload: initial_reload_metadata(&config_path),
@@ -3828,6 +4600,7 @@ async fn run_daemon() -> Result<()> {
         data_dir,
     });
     let _config_watcher = start_config_watcher(Arc::clone(&state))?;
+    let _collection_watcher = start_collection_watcher(Arc::clone(&state))?;
     schedule_ingest_queue(Arc::clone(&state));
 
     let app = Router::new()
@@ -3845,6 +4618,14 @@ async fn run_daemon() -> Result<()> {
         .route("/api/collections/{name}/roots", post(add_collection_root))
         .route("/api/collections/{name}/sync", post(sync_collection))
         .route("/api/collections/{name}/status", get(collection_status))
+        .route(
+            "/api/collections/watchers/status",
+            get(list_collection_watcher_statuses),
+        )
+        .route(
+            "/api/collections/{name}/watcher",
+            get(collection_watcher_status).put(update_collection_watcher),
+        )
         .route("/api/ingest", post(ingest_all))
         .route("/api/ingest/{id}", post(ingest_one))
         .route("/api/reindex", post(reindex))
@@ -4434,6 +5215,155 @@ mod tests {
             .unwrap();
         assert_eq!(status.status.member_count, 1);
         assert_eq!(status.status.root_count, 1);
+    }
+
+    #[tokio::test]
+    async fn collection_watcher_api_persists_settings_and_reports_status() {
+        let test_dir = TestDir::new("collection-watcher-api");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let Json(response) = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(false),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(response.collection.watch_enabled);
+        assert!(!response.collection.auto_index_enabled);
+        assert!(response.watcher.watch_enabled);
+        assert!(!response.watcher.auto_index_enabled);
+
+        let Json(single) =
+            collection_watcher_status(State(Arc::clone(&state)), Path("articles".into()))
+                .await
+                .unwrap();
+        assert!(single.collection.watch_enabled);
+
+        let Json(all) = list_collection_watcher_statuses(State(Arc::clone(&state)))
+            .await
+            .unwrap();
+        assert_eq!(all.watchers.len(), 1);
+        assert_eq!(all.watchers[0].collection_name, "articles");
+    }
+
+    #[tokio::test]
+    async fn collection_watcher_maintenance_syncs_members_and_queues_ingest() {
+        let test_dir = TestDir::new("collection-watcher-maintenance");
+        let root = test_dir.path().join("articles");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("one.md"), "one").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+
+        let outcome = maintain_collection_after_watch_event(&state, "articles")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.added, 1);
+        assert_eq!(outcome.queued_task_ids.len(), 1);
+        let pipeline = state.pipeline.lock().unwrap();
+        assert_eq!(
+            pipeline
+                .store()
+                .list_collection_members("articles")
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(pipeline);
+        let store = state.task_store.lock().unwrap();
+        let queued = store.queued_tasks(TaskKind::Ingest).unwrap();
+        assert!(queued.iter().any(|task| {
+            task.request
+                .get("source_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        }));
+    }
+
+    #[test]
+    fn collection_watcher_debounce_coalesces_collection_names() {
+        let mut debounced = DebouncedCollectionSet::default();
+
+        assert!(debounced.insert_many(vec!["b".to_string(), "a".to_string()]));
+        assert!(!debounced.insert_many(vec!["a".to_string()]));
+        assert_eq!(debounced.drain(), vec!["a".to_string(), "b".to_string()]);
+        assert!(debounced.is_empty());
+    }
+
+    #[test]
+    fn collection_watcher_ignores_configured_paths() {
+        let patterns = vec!["ignored/".to_string(), "*.tmp".to_string()];
+
+        assert!(collection_watcher_path_ignored(
+            FsPath::new("/tmp/root/ignored/file.md"),
+            &patterns
+        ));
+        assert!(collection_watcher_path_ignored(
+            FsPath::new("/tmp/root/scratch.tmp"),
+            &patterns
+        ));
+        assert!(!collection_watcher_path_ignored(
+            FsPath::new("/tmp/root/keep.md"),
+            &patterns
+        ));
     }
 
     #[tokio::test]
@@ -5442,6 +6372,7 @@ mod tests {
             pipeline: std::sync::Mutex::new(pipeline),
             task_store: std::sync::Mutex::new(Store::new(&data_dir.join("verbatim.db")).unwrap()),
             ingest_queue_active: AtomicBool::new(false),
+            collection_watcher: CollectionWatcherRuntime::default(),
             runtime_config: std::sync::RwLock::new(RuntimeConfigState {
                 reload: initial_reload_metadata(&config_path),
                 config,

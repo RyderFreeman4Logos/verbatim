@@ -3,8 +3,9 @@ use std::io::{self, Write};
 use serde_json::Value;
 use verbatim_core::api::{
     AskResponse, CheckStaleResponse, CitationResponse, CollectionFilterResponse,
-    CollectionResultProvenance, ConfigResponse, EvidenceResponse, HealthResponse, IngestResponse,
-    ReindexResponse, RetrieveResponse, SourceResponse, TaskCreatedResponse, TaskWaitEvent,
+    CollectionResultProvenance, CollectionWatcherStatus, ConfigResponse, EvidenceResponse,
+    HealthResponse, IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse,
+    TaskCreatedResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::task::{TaskEvent, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary};
@@ -75,8 +76,10 @@ where
         let synced = collection.last_synced_at.as_deref().unwrap_or("never");
         writeln!(
             writer,
-            "  name={} synced_at={} ignore_patterns={}",
+            "  name={} watch={} auto_index={} synced_at={} ignore_patterns={}",
             collection.name,
+            collection.watch_enabled,
+            collection.auto_index_enabled,
             synced,
             collection.ignore_patterns.len()
         )?;
@@ -93,6 +96,16 @@ where
 {
     writeln!(writer, "Collection:")?;
     writeln!(writer, "  name: {}", response.collection.name)?;
+    writeln!(
+        writer,
+        "  watch_enabled: {}",
+        response.collection.watch_enabled
+    )?;
+    writeln!(
+        writer,
+        "  auto_index_enabled: {}",
+        response.collection.auto_index_enabled
+    )?;
     writeln!(writer, "  roots: {}", response.roots.len())?;
     writeln!(writer, "  members: {}", response.members.len())?;
     if !response.collection.ignore_patterns.is_empty() {
@@ -135,6 +148,76 @@ where
         }
     }
     Ok(())
+}
+
+pub fn write_collection_watcher_statuses<W>(
+    writer: &mut W,
+    statuses: &[CollectionWatcherStatus],
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if statuses.is_empty() {
+        return writeln!(writer, "No collection watchers.");
+    }
+
+    writeln!(writer, "Collection watchers:")?;
+    for status in statuses {
+        writeln!(
+            writer,
+            "  name={} watch={} auto_index={} active={} ignored={} roots={} pending={} last_task={}",
+            status.collection_name,
+            status.watch_enabled,
+            status.auto_index_enabled,
+            status.active,
+            status.ignored_by_config,
+            status.watched_root_count,
+            status.pending_event_count,
+            status.last_task_id.as_deref().unwrap_or("-")
+        )?;
+        if let Some(error) = &status.last_error {
+            writeln!(writer, "    last_error: {error}")?;
+        }
+    }
+    Ok(())
+}
+
+pub fn write_collection_watcher_status<W>(
+    writer: &mut W,
+    status: &CollectionWatcherStatus,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Collection watcher:")?;
+    writeln!(writer, "  name: {}", status.collection_name)?;
+    writeln!(writer, "  watch_enabled: {}", status.watch_enabled)?;
+    writeln!(
+        writer,
+        "  auto_index_enabled: {}",
+        status.auto_index_enabled
+    )?;
+    writeln!(writer, "  active: {}", status.active)?;
+    writeln!(writer, "  ignored_by_config: {}", status.ignored_by_config)?;
+    writeln!(writer, "  watched_roots: {}", status.watched_root_count)?;
+    writeln!(writer, "  pending_events: {}", status.pending_event_count)?;
+    if let Some(last_event_at) = &status.last_event_at {
+        writeln!(writer, "  last_event_at: {last_event_at}")?;
+    }
+    if let Some(last_sync_at) = &status.last_sync_at {
+        writeln!(writer, "  last_sync_at: {last_sync_at}")?;
+    }
+    if let Some(last_task_id) = &status.last_task_id {
+        writeln!(writer, "  last_task_id: {last_task_id}")?;
+    }
+    if let Some(error) = &status.last_error {
+        writeln!(writer, "  last_error: {error}")?;
+    }
+    writeln!(
+        writer,
+        "  last_sync_diff: added={} removed={} unchanged={}",
+        status.last_added, status.last_removed, status.last_unchanged
+    )
 }
 
 pub fn write_collection_status<W>(writer: &mut W, status: &CollectionStatus) -> std::io::Result<()>
