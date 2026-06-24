@@ -162,7 +162,7 @@ struct TaskEventsQuery {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct PersistedIngestRequest {
     ingest_request_version: Option<u64>,
     #[serde(default)]
@@ -185,6 +185,29 @@ struct IndexingTaskControls {
     force: bool,
     embedding_profile_id: Option<String>,
     vectors_only: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ResumeTaskPlan {
+    task_id: TaskId,
+    operation: ResumableIngestOperation,
+    controls: IndexingTaskControls,
+    queue_claimable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumableIngestOperation {
+    Ingest,
+    Reindex,
+}
+
+impl ResumableIngestOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ingest => "ingest",
+            Self::Reindex => "reindex",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -686,11 +709,23 @@ async fn finish_task_failed_with_upstream(
         let should_wake_ingest_queue = task
             .as_ref()
             .is_some_and(|task| task.kind == TaskKind::Ingest);
-        let task_changed = store.finish_task_failed(&task_id, &error_message)?;
+        let resumability = task.as_ref().and_then(|task| {
+            task_failure_resumability_metadata(task, Some(&error_message))
+                .ok()
+                .flatten()
+        });
+        let task_changed = store.finish_task_failed_with_result(
+            &task_id,
+            &error_message,
+            resumability.as_ref(),
+        )?;
         if task_changed {
             let mut payload = serde_json::json!({ "error": error_message });
             if let Some(upstream_failure) = upstream_failure {
                 payload["upstream_failure"] = upstream_failure;
+            }
+            if let Some(resumability) = resumability {
+                payload["resumability"] = resumability;
             }
             store.insert_task_event(&task_id, "failed", "task failed", &payload)?;
         }
@@ -703,6 +738,39 @@ async fn finish_task_failed_with_upstream(
         schedule_ingest_queue(state_for_queue);
     }
     Ok(())
+}
+
+fn task_failure_resumability_metadata(
+    task: &verbatim_core::task::TaskSummary,
+    previous_error: Option<&str>,
+) -> Result<Option<serde_json::Value>> {
+    let Some(plan) = resumable_task_plan(task)? else {
+        return Ok(None);
+    };
+    Ok(Some(resumability_payload(
+        &plan,
+        previous_error.or(task.error.as_deref()),
+        "failed task can be resumed by task id",
+    )))
+}
+
+fn resumability_payload(
+    plan: &ResumeTaskPlan,
+    previous_error: Option<&str>,
+    message: &'static str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "resumable": true,
+        "message": message,
+        "operation": plan.operation.as_str(),
+        "resume_command": format!("verbatim task resume {}", plan.task_id.0),
+        "queue_claimable": plan.queue_claimable,
+        "source_id": plan.controls.source_id.clone(),
+        "embedding_profile_id": plan.controls.embedding_profile_id.clone(),
+        "vectors_only": plan.controls.vectors_only,
+        "force": plan.controls.force,
+        "previous_error": previous_error.map(bounded_error),
+    })
 }
 
 fn upstream_failure_with_task_context(
@@ -1080,6 +1148,102 @@ async fn cancel_task_handler(
         }
     }
     task_summary_response(&state, task_id).await.map(Json)
+}
+
+async fn resume_task_handler(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let task_id = TaskId(id);
+    let plan = resume_task_record(&state, &task_id).await?;
+    if plan.queue_claimable {
+        schedule_ingest_queue(Arc::clone(&state));
+    } else {
+        spawn_resumed_indexing_task(Arc::clone(&state), plan);
+    }
+    task_summary_response(&state, task_id).await.map(Json)
+}
+
+async fn resume_task_record(
+    state: &SharedState,
+    task_id: &TaskId,
+) -> Result<ResumeTaskPlan, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(state);
+    let task_id = task_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let task = store
+            .get_task(&task_id)?
+            .with_context(|| format!("task not found: {}", task_id.0))?;
+        if task.status != TaskStatus::Failed {
+            bail!(
+                "task is not resumable from status {}; only failed ingest/reindex tasks can be resumed",
+                task.status.as_str()
+            );
+        }
+        let Some(plan) = resumable_task_plan(&task)? else {
+            bail!(
+                "task is not resumable; ask/retrieve task metadata intentionally omits raw question text, and this task has no executable ingest/reindex request"
+            );
+        };
+        let previous_error = task.error.as_deref();
+        if !store.resume_failed_task(&task_id)? {
+            bail!("task changed before it could be resumed: {}", task_id.0);
+        }
+        let payload = resumability_payload(
+            &plan,
+            previous_error,
+            "task resumed and requeued by task id",
+        );
+        store.insert_task_event(&task_id, "resumed", "task resumed", &payload)?;
+        Ok::<_, anyhow::Error>(plan)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| {
+        let message = e.to_string();
+        if message.contains("task not found") {
+            err(StatusCode::NOT_FOUND, e)
+        } else if message.contains("not resumable") || message.contains("changed before") {
+            err(StatusCode::CONFLICT, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })
+}
+
+fn spawn_resumed_indexing_task(state: SharedState, plan: ResumeTaskPlan) {
+    tokio::spawn(async move {
+        let task_id = plan.task_id.clone();
+        let result = match plan.operation {
+            ResumableIngestOperation::Ingest => execute_ingest_task(
+                Arc::clone(&state),
+                task_id.clone(),
+                plan.controls.source_id,
+                plan.controls.force,
+                plan.controls.embedding_profile_id,
+                plan.controls.vectors_only,
+            )
+            .await
+            .map(|_| ()),
+            ResumableIngestOperation::Reindex => {
+                execute_reindex_task(Arc::clone(&state), task_id.clone(), plan.controls)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        if let Err((status, Json(error))) = result {
+            tracing::warn!(
+                task_id = %task_id.0,
+                status = %status,
+                error = %error.error,
+                "resumed task execution failed"
+            );
+        }
+    });
 }
 
 async fn wait_task(
@@ -1939,6 +2103,39 @@ fn parse_persisted_ingest_request(request: serde_json::Value) -> Result<Persiste
         request.vectors_only,
     )?;
     Ok(request)
+}
+
+fn resumable_task_plan(task: &verbatim_core::task::TaskSummary) -> Result<Option<ResumeTaskPlan>> {
+    if task.kind != TaskKind::Ingest {
+        return Ok(None);
+    }
+    let request: PersistedIngestRequest = serde_json::from_value(task.request.clone())
+        .context("parse resumable ingest task request")?;
+    if request.ingest_request_version != Some(1) {
+        return Ok(None);
+    }
+    let operation = match request.operation.as_deref().unwrap_or("ingest") {
+        "ingest" => ResumableIngestOperation::Ingest,
+        "reindex" => ResumableIngestOperation::Reindex,
+        _ => return Ok(None),
+    };
+    validate_ingest_controls(
+        request.source_id.as_deref(),
+        request.force,
+        request.embedding_profile_id.as_deref(),
+        request.vectors_only,
+    )?;
+    Ok(Some(ResumeTaskPlan {
+        task_id: task.id.clone(),
+        operation,
+        controls: IndexingTaskControls {
+            source_id: request.source_id,
+            force: request.force,
+            embedding_profile_id: request.embedding_profile_id,
+            vectors_only: request.vectors_only,
+        },
+        queue_claimable: request.queue_claimable.unwrap_or(false),
+    }))
 }
 
 fn next_queue_claimable_ingest_task(
@@ -3175,6 +3372,7 @@ async fn run_daemon() -> Result<()> {
         .route("/api/tasks/{id}/events", get(list_task_events_handler))
         .route("/api/tasks/{id}/wait", get(wait_task))
         .route("/api/tasks/{id}/cancel", post(cancel_task_handler))
+        .route("/api/tasks/{id}/resume", post(resume_task_handler))
         .route("/api/evidence/{eid}", get(get_evidence))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -4096,6 +4294,127 @@ mod tests {
             .events;
         assert!(events.iter().any(|event| event.event_type == "started"));
         assert!(events.iter().any(|event| event.event_type == "succeeded"));
+    }
+
+    #[tokio::test]
+    async fn failed_background_ingest_task_can_resume_by_same_task_id() {
+        let test_dir = TestDir::new("resume-background-ingest");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+        let failed_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-1"),
+                false,
+                Some("profile-a"),
+                true,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        finish_task_failed(&state, &failed_id, "embedding provider failed")
+            .await
+            .unwrap();
+
+        let failed = task_summary_response(&state, failed_id.clone())
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(failed.status, TaskStatus::Failed);
+        let resume_command = failed
+            .result
+            .as_ref()
+            .and_then(|result| result.get("resume_command"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        assert_eq!(
+            resume_command,
+            Some(format!("verbatim task resume {}", failed_id.0))
+        );
+
+        let Json(resumed) =
+            resume_task_handler(State(Arc::clone(&state)), Path(failed_id.clone().0))
+                .await
+                .unwrap();
+
+        assert_eq!(resumed.task.id, failed_id);
+        assert_eq!(resumed.task.status, TaskStatus::Queued);
+        assert_eq!(resumed.task.request["source_id"], "src-1");
+        assert!(resumed.task.result.is_none());
+        assert!(resumed.task.error.is_none());
+        let events = task_events_response(&state, failed_id.clone(), None, Some(10))
+            .await
+            .unwrap()
+            .events;
+        let failed_event = events
+            .iter()
+            .find(|event| event.event_type == "failed")
+            .expect("failed event exists");
+        assert_eq!(failed_event.payload["resumability"]["resumable"], true);
+        assert_eq!(failed_event.payload["resumability"]["operation"], "ingest");
+        let resumed_event = events
+            .iter()
+            .find(|event| event.event_type == "resumed")
+            .expect("resumed event exists");
+        assert_eq!(resumed_event.payload["resume_command"], {
+            serde_json::Value::String(format!("verbatim task resume {}", failed_id.0))
+        });
+
+        let running = task_summary_response(&state, running_id)
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(running.status, TaskStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn failed_ask_task_resume_returns_conflict_without_mutation() {
+        let test_dir = TestDir::new("resume-ask-conflict");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
+        finish_task_failed(&state, &task_id, "chat provider failed")
+            .await
+            .unwrap();
+
+        let (status, Json(error)) =
+            resume_task_handler(State(Arc::clone(&state)), Path(task_id.clone().0))
+                .await
+                .unwrap_err();
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(error.error.contains("task is not resumable"));
+        let task = task_summary_response(&state, task_id.clone())
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(task.result.is_none());
+        let events = task_events_response(&state, task_id, None, Some(10))
+            .await
+            .unwrap()
+            .events;
+        assert!(!events.iter().any(|event| event.event_type == "resumed"));
     }
 
     #[tokio::test]

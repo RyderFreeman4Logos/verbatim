@@ -40,6 +40,93 @@ pub struct Config {
 }
 
 pub const DEFAULT_TASK_WAIT_TIMEOUT_SECONDS: u64 = 1500;
+pub const DEFAULT_MODEL_ENDPOINT_MAX_CONCURRENT_REQUESTS: usize = 4;
+pub const DEFAULT_MODEL_ENDPOINT_QUEUE_TIMEOUT_SECONDS: u64 = 300;
+pub const DEFAULT_MODEL_RETRY_MAX_RETRIES: u32 = 3;
+pub const DEFAULT_MODEL_RETRY_INITIAL_BACKOFF_MILLIS: u64 = 500;
+pub const DEFAULT_MODEL_RETRY_MAX_BACKOFF_MILLIS: u64 = 5_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelEndpointRuntimeConfig {
+    #[serde(default = "default_model_endpoint_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    #[serde(default = "default_model_endpoint_queue_timeout_seconds")]
+    pub queue_timeout_seconds: u64,
+    #[serde(default)]
+    pub retry: ModelRetryConfig,
+}
+
+impl Default for ModelEndpointRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: default_model_endpoint_max_concurrent_requests(),
+            queue_timeout_seconds: default_model_endpoint_queue_timeout_seconds(),
+            retry: ModelRetryConfig::default(),
+        }
+    }
+}
+
+impl ModelEndpointRuntimeConfig {
+    pub fn bounded(&self) -> Self {
+        Self {
+            max_concurrent_requests: self.max_concurrent_requests.max(1),
+            queue_timeout_seconds: self.queue_timeout_seconds.max(1),
+            retry: self.retry.bounded(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRetryConfig {
+    #[serde(default = "default_model_retry_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_model_retry_initial_backoff_millis")]
+    pub initial_backoff_millis: u64,
+    #[serde(default = "default_model_retry_max_backoff_millis")]
+    pub max_backoff_millis: u64,
+}
+
+impl Default for ModelRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_model_retry_max_retries(),
+            initial_backoff_millis: default_model_retry_initial_backoff_millis(),
+            max_backoff_millis: default_model_retry_max_backoff_millis(),
+        }
+    }
+}
+
+impl ModelRetryConfig {
+    pub fn bounded(&self) -> Self {
+        Self {
+            max_retries: self.max_retries,
+            initial_backoff_millis: self.initial_backoff_millis.max(1),
+            max_backoff_millis: self
+                .max_backoff_millis
+                .max(self.initial_backoff_millis.max(1)),
+        }
+    }
+}
+
+fn default_model_endpoint_max_concurrent_requests() -> usize {
+    DEFAULT_MODEL_ENDPOINT_MAX_CONCURRENT_REQUESTS
+}
+
+fn default_model_endpoint_queue_timeout_seconds() -> u64 {
+    DEFAULT_MODEL_ENDPOINT_QUEUE_TIMEOUT_SECONDS
+}
+
+fn default_model_retry_max_retries() -> u32 {
+    DEFAULT_MODEL_RETRY_MAX_RETRIES
+}
+
+fn default_model_retry_initial_backoff_millis() -> u64 {
+    DEFAULT_MODEL_RETRY_INITIAL_BACKOFF_MILLIS
+}
+
+fn default_model_retry_max_backoff_millis() -> u64 {
+    DEFAULT_MODEL_RETRY_MAX_BACKOFF_MILLIS
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreConfig {
@@ -96,6 +183,8 @@ pub struct EmbeddingConfig {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default, flatten)]
+    pub endpoint_runtime: ModelEndpointRuntimeConfig,
 }
 
 impl Default for EmbeddingConfig {
@@ -113,6 +202,7 @@ impl Default for EmbeddingConfig {
             batch_size: default_batch_size(),
             timeout_seconds: default_embedding_timeout_seconds(),
             api_key: String::new(),
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         }
     }
 }
@@ -410,6 +500,8 @@ pub struct RerankConfig {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default, flatten)]
+    pub endpoint_runtime: ModelEndpointRuntimeConfig,
 }
 
 impl Default for RerankConfig {
@@ -422,6 +514,7 @@ impl Default for RerankConfig {
             top_n: 12,
             timeout_seconds: default_rerank_timeout_seconds(),
             api_key: String::new(),
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         }
     }
 }
@@ -475,6 +568,8 @@ pub struct ChatConfig {
     pub api_key: String,
     #[serde(default)]
     pub vision_attachments: ChatVisionAttachmentConfig,
+    #[serde(default, flatten)]
+    pub endpoint_runtime: ModelEndpointRuntimeConfig,
 }
 
 impl Default for ChatConfig {
@@ -488,6 +583,7 @@ impl Default for ChatConfig {
             timeout_seconds: default_chat_timeout_seconds(),
             api_key: String::new(),
             vision_attachments: ChatVisionAttachmentConfig::default(),
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         }
     }
 }
@@ -576,6 +672,8 @@ pub struct VisionConfig {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default, flatten)]
+    pub endpoint_runtime: ModelEndpointRuntimeConfig,
 }
 
 impl Default for VisionConfig {
@@ -588,6 +686,7 @@ impl Default for VisionConfig {
             temperature: 0.0,
             timeout_seconds: default_vision_timeout_seconds(),
             api_key: String::new(),
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         }
     }
 }
@@ -840,6 +939,7 @@ impl Config {
         next.embedding.batch_size = candidate.embedding.batch_size;
         next.embedding.timeout_seconds = candidate.embedding.timeout_seconds;
         next.embedding.api_key = candidate.embedding.api_key.clone();
+        next.embedding.endpoint_runtime = candidate.embedding.endpoint_runtime.clone();
 
         next.retrieval = candidate.retrieval.clone();
 
@@ -939,6 +1039,11 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "embedding.batch_size"
             | "embedding.timeout_seconds"
             | "embedding.api_key"
+            | "embedding.max_concurrent_requests"
+            | "embedding.queue_timeout_seconds"
+            | "embedding.retry.max_retries"
+            | "embedding.retry.initial_backoff_millis"
+            | "embedding.retry.max_backoff_millis"
             | "retrieval.dense_top_k"
             | "retrieval.bm25_top_k"
             | "retrieval.rrf_k"
@@ -964,6 +1069,11 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "rerank.top_n"
             | "rerank.timeout_seconds"
             | "rerank.api_key"
+            | "rerank.max_concurrent_requests"
+            | "rerank.queue_timeout_seconds"
+            | "rerank.retry.max_retries"
+            | "rerank.retry.initial_backoff_millis"
+            | "rerank.retry.max_backoff_millis"
             | "context.enabled"
             | "vision.enabled"
             | "vision.provider"
@@ -972,6 +1082,11 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "vision.temperature"
             | "vision.timeout_seconds"
             | "vision.api_key"
+            | "vision.max_concurrent_requests"
+            | "vision.queue_timeout_seconds"
+            | "vision.retry.max_retries"
+            | "vision.retry.initial_backoff_millis"
+            | "vision.retry.max_backoff_millis"
             | "chat.enabled"
             | "chat.provider"
             | "chat.base_url"
@@ -979,6 +1094,11 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "chat.temperature"
             | "chat.timeout_seconds"
             | "chat.api_key"
+            | "chat.max_concurrent_requests"
+            | "chat.queue_timeout_seconds"
+            | "chat.retry.max_retries"
+            | "chat.retry.initial_backoff_millis"
+            | "chat.retry.max_backoff_millis"
             | "chat.vision_attachments.enabled"
             | "chat.vision_attachments.model_supports_vision"
             | "chat.vision_attachments.max_images"
@@ -1080,6 +1200,13 @@ document_instruction = ""
 batch_size = 16
 timeout_seconds = 120
 api_key = ""
+max_concurrent_requests = 4
+queue_timeout_seconds = 300
+
+[embedding.retry]
+max_retries = 3
+initial_backoff_millis = 500
+max_backoff_millis = 5000
 
 [retrieval]
 dense_top_k = 80
@@ -1127,6 +1254,13 @@ model = "Qwen/Qwen3-Reranker-4B"
 top_n = 12
 timeout_seconds = 120
 api_key = ""
+max_concurrent_requests = 4
+queue_timeout_seconds = 300
+
+[rerank.retry]
+max_retries = 3
+initial_backoff_millis = 500
+max_backoff_millis = 5000
 
 [context]
 enabled = true
@@ -1139,6 +1273,13 @@ model = "Qwen/Qwen3.6-27B"
 temperature = 0.0
 timeout_seconds = 180
 api_key = ""
+max_concurrent_requests = 4
+queue_timeout_seconds = 300
+
+[vision.retry]
+max_retries = 3
+initial_backoff_millis = 500
+max_backoff_millis = 5000
 
 [ocr]
 enabled = false
@@ -1160,6 +1301,13 @@ model = "Qwen/Qwen3.6-27B"
 temperature = 0.0
 timeout_seconds = 120
 api_key = ""
+max_concurrent_requests = 4
+queue_timeout_seconds = 300
+
+[chat.retry]
+max_retries = 3
+initial_backoff_millis = 500
+max_backoff_millis = 5000
 
 [chat.vision_attachments]
 enabled = false
@@ -1214,6 +1362,18 @@ mod tests {
         assert_eq!(config.embedding.dimension, 4096);
         assert!(config.embedding.normalize);
         assert_eq!(config.embedding.batch_size, 16);
+        assert_eq!(
+            config.embedding.endpoint_runtime.max_concurrent_requests,
+            DEFAULT_MODEL_ENDPOINT_MAX_CONCURRENT_REQUESTS
+        );
+        assert_eq!(
+            config.embedding.endpoint_runtime.queue_timeout_seconds,
+            DEFAULT_MODEL_ENDPOINT_QUEUE_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            config.embedding.endpoint_runtime.retry.max_retries,
+            DEFAULT_MODEL_RETRY_MAX_RETRIES
+        );
         assert_eq!(config.retrieval.dense_top_k, 80);
         assert_eq!(config.retrieval.default_limit, 12);
         assert_eq!(config.retrieval.default_page_size, 1);
@@ -1256,9 +1416,17 @@ mod tests {
         assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
         assert_eq!(config.rerank.model, "Qwen/Qwen3-Reranker-4B");
         assert_eq!(config.rerank.top_n, 12);
+        assert_eq!(
+            config.rerank.endpoint_runtime.max_concurrent_requests,
+            DEFAULT_MODEL_ENDPOINT_MAX_CONCURRENT_REQUESTS
+        );
         assert!(config.context.enabled);
         assert!(!config.vision.enabled);
         assert_eq!(config.vision.timeout_seconds, 180);
+        assert_eq!(
+            config.vision.endpoint_runtime.queue_timeout_seconds,
+            DEFAULT_MODEL_ENDPOINT_QUEUE_TIMEOUT_SECONDS
+        );
         assert!(!config.ocr.enabled);
         assert_eq!(config.ocr.provider, "external_command");
         assert_eq!(config.ocr.language, "eng");
@@ -1267,6 +1435,10 @@ mod tests {
         assert_eq!(config.ocr.max_stderr_bytes, 64 * 1024);
         assert!(config.chat.enabled);
         assert_eq!(config.chat.base_url, "http://127.0.0.1:8000/v1");
+        assert_eq!(
+            config.chat.endpoint_runtime.retry.initial_backoff_millis,
+            DEFAULT_MODEL_RETRY_INITIAL_BACKOFF_MILLIS
+        );
         assert!(!config.chat.vision_attachments.enabled);
         assert!(!config.chat.vision_attachments.model_supports_vision);
         assert_eq!(config.chat.vision_attachments.max_images, 2);
@@ -1534,15 +1706,21 @@ model_supports_vision = true
         let mut candidate = current.clone();
         candidate.retrieval.dense_top_k = 24;
         candidate.chat.timeout_seconds = 30;
+        candidate.chat.endpoint_runtime.max_concurrent_requests = 2;
+        candidate.chat.endpoint_runtime.retry.max_retries = 1;
         candidate.embedding.base_url = "http://127.0.0.1:18002/v1".into();
+        candidate.embedding.endpoint_runtime.queue_timeout_seconds = 60;
 
         let plan = current.reload_plan(&candidate).unwrap();
 
         assert_eq!(
             plan.reload_safe_keys,
             vec![
+                "chat.max_concurrent_requests",
+                "chat.retry.max_retries",
                 "chat.timeout_seconds",
                 "embedding.base_url",
+                "embedding.queue_timeout_seconds",
                 "retrieval.dense_top_k"
             ]
         );
@@ -1551,7 +1729,10 @@ model_supports_vision = true
         let applied = current.apply_reload_safe_changes(&candidate);
         assert_eq!(applied.retrieval.dense_top_k, 24);
         assert_eq!(applied.chat.timeout_seconds, 30);
+        assert_eq!(applied.chat.endpoint_runtime.max_concurrent_requests, 2);
+        assert_eq!(applied.chat.endpoint_runtime.retry.max_retries, 1);
         assert_eq!(applied.embedding.base_url, "http://127.0.0.1:18002/v1");
+        assert_eq!(applied.embedding.endpoint_runtime.queue_timeout_seconds, 60);
     }
 
     #[test]

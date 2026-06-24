@@ -46,6 +46,11 @@ pub enum ProviderError {
         source: serde_json::Error,
         diagnostic: Box<UpstreamFailureDiagnostic>,
     },
+    /// The application endpoint limiter did not admit the request in time.
+    QueueTimeout {
+        operation: &'static str,
+        timeout_seconds: u64,
+    },
     /// A streaming event contained invalid JSON.
     StreamDecode {
         operation: &'static str,
@@ -79,8 +84,31 @@ impl ProviderError {
             | Self::HttpStatus { diagnostic, .. }
             | Self::ResponseDecode { diagnostic, .. } => Some(diagnostic.as_ref()),
             Self::Configuration { .. }
+            | Self::QueueTimeout { .. }
             | Self::StreamDecode { .. }
             | Self::MalformedResponse { .. } => None,
+        }
+    }
+
+    pub fn is_retryable_provider_failure(&self) -> bool {
+        match self {
+            Self::Transport { .. } => true,
+            Self::HttpStatus { status, .. } => {
+                matches!(
+                    *status,
+                    reqwest::StatusCode::REQUEST_TIMEOUT
+                        | reqwest::StatusCode::TOO_MANY_REQUESTS
+                        | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                        | reqwest::StatusCode::BAD_GATEWAY
+                        | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        | reqwest::StatusCode::GATEWAY_TIMEOUT
+                ) || status.is_server_error()
+            }
+            Self::Configuration { .. }
+            | Self::ResponseDecode { .. }
+            | Self::QueueTimeout { .. }
+            | Self::StreamDecode { .. }
+            | Self::MalformedResponse { .. } => false,
         }
     }
 
@@ -92,6 +120,7 @@ impl ProviderError {
                 diagnostic.retry_count = Some(retry_count);
             }
             Self::Configuration { .. }
+            | Self::QueueTimeout { .. }
             | Self::StreamDecode { .. }
             | Self::MalformedResponse { .. } => {}
         }
@@ -140,6 +169,15 @@ impl fmt::Display for ProviderError {
                     diagnostic.summary()
                 )
             }
+            Self::QueueTimeout {
+                operation,
+                timeout_seconds,
+            } => {
+                write!(
+                    f,
+                    "{operation} request timed out after waiting {timeout_seconds}s for model endpoint capacity"
+                )
+            }
             Self::StreamDecode { operation, source } => {
                 write!(f, "failed to parse {operation} stream event: {source}")
             }
@@ -161,6 +199,7 @@ impl std::error::Error for ProviderError {
             Self::StreamDecode { source, .. } => Some(source),
             Self::Configuration { .. }
             | Self::HttpStatus { .. }
+            | Self::QueueTimeout { .. }
             | Self::MalformedResponse { .. } => None,
         }
     }

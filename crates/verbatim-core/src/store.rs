@@ -1323,17 +1323,49 @@ impl Store {
     }
 
     pub fn finish_task_failed(&self, task_id: &TaskId, error: &str) -> Result<bool> {
+        self.finish_task_failed_with_result(task_id, error, None)
+    }
+
+    pub fn finish_task_failed_with_result(
+        &self,
+        task_id: &TaskId,
+        error: &str,
+        result: Option<&serde_json::Value>,
+    ) -> Result<bool> {
         let now = unix_timestamp_string();
+        let result = result
+            .cloned()
+            .map(bounded_json)
+            .map(|result| serde_json::to_string(&result))
+            .transpose()
+            .context("serialize task failure result metadata")?;
         let changed = self.conn.execute(
             "UPDATE tasks
-             SET status = ?2, updated_at = ?3, finished_at = COALESCE(finished_at, ?3), error = ?4
-             WHERE id = ?1 AND status != ?5",
+             SET status = ?2, updated_at = ?3, finished_at = COALESCE(finished_at, ?3), error = ?4, result_json = ?5
+             WHERE id = ?1 AND status != ?6",
             params![
                 &task_id.0,
                 TaskStatus::Failed.as_str(),
                 now,
                 bounded_error(error),
+                result,
                 TaskStatus::Cancelled.as_str(),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn resume_failed_task(&self, task_id: &TaskId) -> Result<bool> {
+        let now = unix_timestamp_string();
+        let changed = self.conn.execute(
+            "UPDATE tasks
+             SET status = ?2, updated_at = ?3, started_at = NULL, finished_at = NULL, result_json = NULL, error = NULL, progress_json = NULL
+             WHERE id = ?1 AND status = ?4",
+            params![
+                &task_id.0,
+                TaskStatus::Queued.as_str(),
+                now,
+                TaskStatus::Failed.as_str(),
             ],
         )?;
         Ok(changed > 0)
@@ -2526,8 +2558,8 @@ END;
 mod tests {
     use super::*;
     use crate::task::{
-        ask_request_metadata, ask_result_metadata, ingest_request_metadata, PhaseTiming,
-        TASK_EVENT_MESSAGE_MAX_CHARS,
+        ask_request_metadata, ask_result_metadata, ingest_request_metadata,
+        ingest_task_request_metadata_with_queue_claim, PhaseTiming, TASK_EVENT_MESSAGE_MAX_CHARS,
     };
     use crate::types::{BBox, SourceLocator};
     use std::path::PathBuf;
@@ -3151,6 +3183,50 @@ mod tests {
         assert!(!work_called);
         assert_eq!(summary.status, TaskStatus::Cancelled);
         assert!(summary.result.is_none());
+    }
+
+    #[test]
+    fn failed_task_resume_requeues_without_losing_request_or_events() {
+        let store = Store::in_memory().unwrap();
+        let task_id = TaskId("task-resume".into());
+        let request = ingest_task_request_metadata_with_queue_claim(
+            Some("src-1"),
+            false,
+            Some("profile-a"),
+            true,
+            true,
+        );
+        store
+            .create_task(&task_id, TaskKind::Ingest, &request)
+            .unwrap();
+        store.start_task(&task_id).unwrap();
+        store
+            .insert_task_event(
+                &task_id,
+                "progress",
+                "durable chunks written",
+                &serde_json::json!({"chunks": 3}),
+            )
+            .unwrap();
+        store
+            .finish_task_failed(&task_id, "embedding provider unavailable")
+            .unwrap();
+
+        assert!(store.resume_failed_task(&task_id).unwrap());
+        assert!(!store.resume_failed_task(&task_id).unwrap());
+
+        let summary = store.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(summary.status, TaskStatus::Queued);
+        assert_eq!(summary.request, request);
+        assert!(summary.started_at.is_none());
+        assert!(summary.finished_at.is_none());
+        assert!(summary.error.is_none());
+        assert!(summary.result.is_none());
+        assert!(summary.progress.is_none());
+
+        let events = store.list_task_events(&task_id, None, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "progress");
     }
 
     #[test]
