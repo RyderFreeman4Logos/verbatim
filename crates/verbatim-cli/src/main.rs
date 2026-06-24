@@ -1571,7 +1571,7 @@ mod tests {
         CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse, ReindexRequest,
         ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
         RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
-        TaskEventsResponse, TaskSummaryResponse,
+        TaskEventsResponse, TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
     };
     use verbatim_core::collection::{
         CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
@@ -1702,6 +1702,25 @@ mod tests {
             );
             assert!(stderr.is_empty(), "stderr: {stderr}");
         }
+    }
+
+    #[test]
+    fn collection_cli_api_parity_inventory_matches_clap_commands() {
+        let mut actual = collection_leaf_command_paths_from_clap();
+        actual.sort();
+        let mut expected = COLLECTION_CLI_API_PARITY
+            .iter()
+            .map(|entry| entry.cli_path)
+            .filter(|path| !path.contains(" <name>"))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        expected.sort();
+
+        assert_eq!(actual, expected);
+        assert!(COLLECTION_CLI_API_PARITY.iter().all(|entry| entry
+            .endpoint
+            .path_template()
+            .starts_with("/api/collections")));
     }
 
     #[test]
@@ -3022,6 +3041,29 @@ mod tests {
             scanned_roots: 1,
             max_depth: 32,
             skipped: Vec::new(),
+        }
+    }
+
+    fn collection_leaf_command_paths_from_clap() -> Vec<String> {
+        let command = Cli::command();
+        let collection = command
+            .find_subcommand("collection")
+            .expect("collection command exists");
+        let mut paths = Vec::new();
+        collect_leaf_command_paths(collection, "collection", &mut paths);
+        paths
+    }
+
+    fn collect_leaf_command_paths(command: &clap::Command, prefix: &str, paths: &mut Vec<String>) {
+        let subcommands = command.get_subcommands().collect::<Vec<_>>();
+        if subcommands.is_empty() {
+            paths.push(prefix.to_string());
+            return;
+        }
+
+        for subcommand in subcommands {
+            let path = format!("{prefix} {}", subcommand.get_name());
+            collect_leaf_command_paths(subcommand, &path, paths);
         }
     }
 

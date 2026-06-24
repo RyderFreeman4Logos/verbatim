@@ -13,6 +13,137 @@ use crate::types::{
     SourceLocator,
 };
 
+/// HTTP methods used by shared daemon API route metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiHttpMethod {
+    Delete,
+    Get,
+    Post,
+    Put,
+}
+
+impl ApiHttpMethod {
+    /// Returns the wire-format method name used in request lines and docs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delete => "DELETE",
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+        }
+    }
+}
+
+/// Daemon endpoints that back collection-era CLI and GUI workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionApiEndpoint {
+    CreateCollection,
+    ListCollections,
+    GetCollection,
+    DeleteCollection,
+    AddCollectionRoot,
+    SyncCollection,
+    CollectionStatus,
+    ListCollectionWatcherStatuses,
+    CollectionWatcherStatus,
+    UpdateCollectionWatcher,
+}
+
+impl CollectionApiEndpoint {
+    /// HTTP method for this endpoint.
+    pub const fn method(self) -> ApiHttpMethod {
+        match self {
+            Self::CreateCollection | Self::AddCollectionRoot | Self::SyncCollection => {
+                ApiHttpMethod::Post
+            }
+            Self::ListCollections
+            | Self::GetCollection
+            | Self::CollectionStatus
+            | Self::ListCollectionWatcherStatuses
+            | Self::CollectionWatcherStatus => ApiHttpMethod::Get,
+            Self::DeleteCollection => ApiHttpMethod::Delete,
+            Self::UpdateCollectionWatcher => ApiHttpMethod::Put,
+        }
+    }
+
+    /// Axum-style route template registered by the daemon.
+    pub const fn path_template(self) -> &'static str {
+        match self {
+            Self::CreateCollection | Self::ListCollections => "/api/collections",
+            Self::GetCollection | Self::DeleteCollection => "/api/collections/{name}",
+            Self::AddCollectionRoot => "/api/collections/{name}/roots",
+            Self::SyncCollection => "/api/collections/{name}/sync",
+            Self::CollectionStatus => "/api/collections/{name}/status",
+            Self::ListCollectionWatcherStatuses => "/api/collections/watchers/status",
+            Self::CollectionWatcherStatus | Self::UpdateCollectionWatcher => {
+                "/api/collections/{name}/watcher"
+            }
+        }
+    }
+
+    /// Builds the client path for endpoints with a `{name}` placeholder.
+    pub fn path(self, collection_name: &str) -> String {
+        self.path_template().replace("{name}", collection_name)
+    }
+}
+
+/// Mechanical mapping from a collection CLI leaf command to its daemon API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionCliApiParity {
+    /// Canonical CLI command path without the binary name.
+    pub cli_path: &'static str,
+    /// Daemon endpoint that implements the command's stateful behavior.
+    pub endpoint: CollectionApiEndpoint,
+}
+
+/// Canonical collection CLI/API parity inventory.
+pub const COLLECTION_CLI_API_PARITY: &[CollectionCliApiParity] = &[
+    CollectionCliApiParity {
+        cli_path: "collection create",
+        endpoint: CollectionApiEndpoint::CreateCollection,
+    },
+    CollectionCliApiParity {
+        cli_path: "collection add-root",
+        endpoint: CollectionApiEndpoint::AddCollectionRoot,
+    },
+    CollectionCliApiParity {
+        cli_path: "collection list",
+        endpoint: CollectionApiEndpoint::ListCollections,
+    },
+    CollectionCliApiParity {
+        cli_path: "collection get",
+        endpoint: CollectionApiEndpoint::GetCollection,
+    },
+    CollectionCliApiParity {
+        cli_path: "collection delete",
+        endpoint: CollectionApiEndpoint::DeleteCollection,
+    },
+    CollectionCliApiParity {
+        cli_path: "collection sync",
+        endpoint: CollectionApiEndpoint::SyncCollection,
+    },
+    CollectionCliApiParity {
+        cli_path: "collection status",
+        endpoint: CollectionApiEndpoint::CollectionStatus,
+    },
+    CollectionCliApiParity {
+        cli_path: "collection watch enable",
+        endpoint: CollectionApiEndpoint::UpdateCollectionWatcher,
+    },
+    CollectionCliApiParity {
+        cli_path: "collection watch disable",
+        endpoint: CollectionApiEndpoint::UpdateCollectionWatcher,
+    },
+    CollectionCliApiParity {
+        cli_path: "collection watch status",
+        endpoint: CollectionApiEndpoint::ListCollectionWatcherStatuses,
+    },
+    CollectionCliApiParity {
+        cli_path: "collection watch status <name>",
+        endpoint: CollectionApiEndpoint::CollectionWatcherStatus,
+    },
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddSourceRequest {
     pub path: String,
@@ -478,6 +609,57 @@ mod tests {
 
         assert!(request.context_only);
         assert!(!request.show_retrieval);
+    }
+
+    #[test]
+    fn collection_cli_api_parity_inventory_is_daemon_backed() {
+        let entries = COLLECTION_CLI_API_PARITY
+            .iter()
+            .map(|entry| {
+                (
+                    entry.cli_path,
+                    entry.endpoint.method().as_str(),
+                    entry.endpoint.path_template(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            vec![
+                ("collection create", "POST", "/api/collections"),
+                (
+                    "collection add-root",
+                    "POST",
+                    "/api/collections/{name}/roots"
+                ),
+                ("collection list", "GET", "/api/collections"),
+                ("collection get", "GET", "/api/collections/{name}"),
+                ("collection delete", "DELETE", "/api/collections/{name}"),
+                ("collection sync", "POST", "/api/collections/{name}/sync"),
+                ("collection status", "GET", "/api/collections/{name}/status"),
+                (
+                    "collection watch enable",
+                    "PUT",
+                    "/api/collections/{name}/watcher"
+                ),
+                (
+                    "collection watch disable",
+                    "PUT",
+                    "/api/collections/{name}/watcher"
+                ),
+                (
+                    "collection watch status",
+                    "GET",
+                    "/api/collections/watchers/status"
+                ),
+                (
+                    "collection watch status <name>",
+                    "GET",
+                    "/api/collections/{name}/watcher"
+                ),
+            ]
+        );
     }
 
     #[test]

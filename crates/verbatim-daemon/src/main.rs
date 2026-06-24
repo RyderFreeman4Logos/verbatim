@@ -25,15 +25,15 @@ use tower_http::cors::CorsLayer;
 use verbatim_core::api::{
     AddCollectionRootRequest, AddSourceRequest, AddSourceResponse, AppliedCollectionFilterResponse,
     AskCitationEvent, AskErrorEvent, AskRequest, AskResponse, AskTokenEvent, CheckStaleResponse,
-    CitationResponse, CollectionFilterRequest, CollectionFilterResponse, CollectionResponse,
-    CollectionResultProvenance, CollectionStatusResponse, CollectionSyncPathRequest,
-    CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
-    CollectionWatcherStatus, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
-    ConfigResponse, CreateCollectionRequest, ErrorResponse, EvidenceResponse, HealthResponse,
-    ImageArtifactResponse, IngestResponse, ReindexRequest, ReindexResponse,
-    RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
-    RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEventsResponse,
-    TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
+    CitationResponse, CollectionApiEndpoint, CollectionFilterRequest, CollectionFilterResponse,
+    CollectionResponse, CollectionResultProvenance, CollectionStatusResponse,
+    CollectionSyncPathRequest, CollectionSyncRequest, CollectionSyncResponse,
+    CollectionWatcherResponse, CollectionWatcherStatus, CollectionWatcherUpdateRequest,
+    CollectionWatchersStatusResponse, ConfigResponse, CreateCollectionRequest, ErrorResponse,
+    EvidenceResponse, HealthResponse, ImageArtifactResponse, IngestResponse, ReindexRequest,
+    ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
+    RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
+    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -4670,19 +4670,40 @@ async fn run_daemon() -> Result<()> {
         .route("/api/sources/{id}", get(get_source))
         .route("/api/sources/{id}", delete(delete_source))
         .route("/api/sources/check", post(check_stale))
-        .route("/api/collections", post(create_collection))
-        .route("/api/collections", get(list_collections))
-        .route("/api/collections/{name}", get(get_collection))
-        .route("/api/collections/{name}", delete(delete_collection))
-        .route("/api/collections/{name}/roots", post(add_collection_root))
-        .route("/api/collections/{name}/sync", post(sync_collection))
-        .route("/api/collections/{name}/status", get(collection_status))
         .route(
-            "/api/collections/watchers/status",
+            CollectionApiEndpoint::CreateCollection.path_template(),
+            post(create_collection),
+        )
+        .route(
+            CollectionApiEndpoint::ListCollections.path_template(),
+            get(list_collections),
+        )
+        .route(
+            CollectionApiEndpoint::GetCollection.path_template(),
+            get(get_collection),
+        )
+        .route(
+            CollectionApiEndpoint::DeleteCollection.path_template(),
+            delete(delete_collection),
+        )
+        .route(
+            CollectionApiEndpoint::AddCollectionRoot.path_template(),
+            post(add_collection_root),
+        )
+        .route(
+            CollectionApiEndpoint::SyncCollection.path_template(),
+            post(sync_collection),
+        )
+        .route(
+            CollectionApiEndpoint::CollectionStatus.path_template(),
+            get(collection_status),
+        )
+        .route(
+            CollectionApiEndpoint::ListCollectionWatcherStatuses.path_template(),
             get(list_collection_watcher_statuses),
         )
         .route(
-            "/api/collections/{name}/watcher",
+            CollectionApiEndpoint::CollectionWatcherStatus.path_template(),
             get(collection_watcher_status).put(update_collection_watcher),
         )
         .route("/api/ingest", post(ingest_all))
