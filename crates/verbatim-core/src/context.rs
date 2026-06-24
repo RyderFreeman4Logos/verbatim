@@ -108,6 +108,8 @@ mod tests {
         let chunk = Chunk {
             id: ChunkId("c1".into()),
             source_id: SourceId("test".into()),
+            chunk_hash: "hash-c1".into(),
+            embedding_input_hash: None,
             text: "Some important text.".into(),
             context_text: None,
             token_count: 5,

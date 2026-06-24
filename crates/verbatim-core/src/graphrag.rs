@@ -635,9 +635,12 @@ fn community_hit_to_retrieval_result(hit: &GlobalSearchHit) -> Option<RetrievalR
         .split_whitespace()
         .count()
         .min(u32::MAX as usize) as u32;
+    let chunk_hash = hex_sha256(report_text.as_bytes());
     let chunk = Chunk {
         id: chunk_id.clone(),
         source_id: source_id.clone(),
+        chunk_hash,
+        embedding_input_hash: None,
         text: report_text,
         context_text: None,
         token_count,
@@ -1301,6 +1304,8 @@ mod tests {
         let chunk = Chunk {
             id: ChunkId(chunk_id.into()),
             source_id: source.id.clone(),
+            chunk_hash: format!("hash-{chunk_id}"),
+            embedding_input_hash: None,
             text: text.into(),
             context_text: None,
             token_count: 4,

@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::types::hex_sha256;
+use crate::types::{hex_sha256, EmbeddingCacheStats};
 
 static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -572,12 +572,18 @@ pub fn reindex_task_request_metadata_with_queue_claim(
     bounded_json(metadata)
 }
 
-pub fn ingest_result_metadata(ingested: usize) -> Value {
-    bounded_json(json!({ "ingested": ingested }))
+pub fn ingest_result_metadata(ingested: usize, embedding_cache: &EmbeddingCacheStats) -> Value {
+    bounded_json(json!({
+        "ingested": ingested,
+        "embedding_cache": embedding_cache,
+    }))
 }
 
-pub fn reindex_result_metadata(reindexed: usize) -> Value {
-    bounded_json(json!({ "reindexed": reindexed }))
+pub fn reindex_result_metadata(reindexed: usize, embedding_cache: &EmbeddingCacheStats) -> Value {
+    bounded_json(json!({
+        "reindexed": reindexed,
+        "embedding_cache": embedding_cache,
+    }))
 }
 
 pub fn bounded_json(value: Value) -> Value {
@@ -745,5 +751,25 @@ mod tests {
         assert!(encoded.contains("\"latest_error\""));
         assert!(encoded.len() <= TASK_METADATA_MAX_BYTES);
         assert!(bounded.phase.unwrap().elapsed_ms <= u64::MAX);
+    }
+
+    #[test]
+    fn reindex_result_metadata_includes_embedding_cache_stats() {
+        let stats = EmbeddingCacheStats {
+            cache_hits: 2,
+            cache_misses: 1,
+            embedded_chunks: 1,
+            reused_chunks: 2,
+            changed_chunks: 1,
+        };
+
+        let result = reindex_result_metadata(1, &stats);
+
+        assert_eq!(result["reindexed"], 1);
+        assert_eq!(result["embedding_cache"]["cache_hits"], 2);
+        assert_eq!(result["embedding_cache"]["cache_misses"], 1);
+        assert_eq!(result["embedding_cache"]["embedded_chunks"], 1);
+        assert_eq!(result["embedding_cache"]["reused_chunks"], 2);
+        assert_eq!(result["embedding_cache"]["changed_chunks"], 1);
     }
 }

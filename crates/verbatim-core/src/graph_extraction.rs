@@ -846,6 +846,8 @@ mod tests {
         Chunk {
             id: ChunkId(id.to_string()),
             source_id: SourceId("src".to_string()),
+            chunk_hash: format!("hash-{id}"),
+            embedding_input_hash: None,
             text: text.to_string(),
             context_text: None,
             token_count: 4,
