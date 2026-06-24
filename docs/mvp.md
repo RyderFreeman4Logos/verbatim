@@ -94,6 +94,40 @@ verbatim-daemon --help
 `just install` builds `verbatim` and `verbatim-daemon` with all features and
 installs them to `/usr/local/bin`.
 
+For this repository's local `systemd --user` daemon workflow, use the explicit
+user-daemon deploy recipe after merging a binary change:
+
+```sh
+just install-local-daemon
+```
+
+It builds release `verbatim` and `verbatim-daemon`, installs them to
+`~/.local/bin` by default, reloads the user systemd manager, restarts
+`verbatim.service`, and verifies the installed versions plus `verbatim daemon
+status`. Use `VERBATIM_LOCAL_BIN_DIR=/path/to/bin` or
+`VERBATIM_SYSTEMD_USER_SERVICE=name` for non-default local setups; the service
+name selects both `~/.config/systemd/user/<name>.service` and the
+`systemctl --user` target. If the selected unit is missing and unit writes are
+disabled, or if the selected unit points at a different `verbatim-daemon`, the
+recipe fails before installing binaries instead of silently installing to the
+wrong path; set
+`VERBATIM_LOCAL_DAEMON_WRITE_UNIT=1` when you intentionally want to regenerate
+the user unit.
+
+Developers who want local automation can opt in to git hooks; hooks are not
+installed by default:
+
+```sh
+just install-local-daemon-hook post-merge
+# optional, more aggressive: just install-local-daemon-hook post-push
+just remove-local-daemon-hook post-merge
+```
+
+Use these hooks only for local clones where automatically replacing the running
+daemon after a merge or push is desired. Config-only reload-safe changes should
+still be verified through daemon hot reload; binary replacement is the case that
+requires a restart.
+
 ## Config
 
 Create the local config:

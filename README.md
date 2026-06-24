@@ -48,9 +48,23 @@ systemctl --user enable --now verbatim
 verbatim daemon status
 ```
 
-The generated unit is written to
+After merging a binary change in a local clone, deploy the new user-daemon
+binary explicitly:
+
+```sh
+just install-local-daemon
+```
+
+This installs release binaries to `~/.local/bin` by default, restarts the
+`systemd --user` daemon, and verifies health. `VERBATIM_SYSTEMD_USER_SERVICE`
+selects both the user unit name and the service restarted. Optional local hooks
+can be installed with `just install-local-daemon-hook post-merge` or
+`post-push`; they are opt-in because they restart the local daemon.
+
+The default generated unit is written to
 `~/.config/systemd/user/verbatim.service` unless `XDG_CONFIG_HOME` changes that
-base path. For foreground development, run `verbatim daemon start` instead.
+base path; custom service names use `<name>.service` under the same directory.
+For foreground development, run `verbatim daemon start` instead.
 
 Add a source and ingest it:
 
