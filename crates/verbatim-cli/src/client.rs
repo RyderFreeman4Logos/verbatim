@@ -106,6 +106,7 @@ pub trait DaemonClient {
     where
         W: Write;
     fn cancel_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
+    fn resume_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
     fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> CliResult<()>
     where
         W: Write;
@@ -442,6 +443,14 @@ impl DaemonClient for HttpDaemonClient {
         self.request_json::<TaskSummaryResponse, ()>(
             Method::POST,
             &format!("/api/tasks/{task_id}/cancel"),
+            None,
+        )
+    }
+
+    fn resume_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse> {
+        self.request_json::<TaskSummaryResponse, ()>(
+            Method::POST,
+            &format!("/api/tasks/{task_id}/resume"),
             None,
         )
     }
@@ -1093,6 +1102,9 @@ mod tests {
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_summary}"
             ),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_summary}"
+            ),
         ]);
         let client = HttpDaemonClient::with_base_url(server.base_url());
         let ask = AskRequest {
@@ -1125,6 +1137,10 @@ mod tests {
             client.cancel_task("task-1").unwrap().task.status.as_str(),
             "succeeded"
         );
+        assert_eq!(
+            client.resume_task("task-1").unwrap().task.status.as_str(),
+            "succeeded"
+        );
 
         let requests = server.requests();
         assert!(requests[0].starts_with("POST /api/tasks/ask HTTP/1.1"));
@@ -1135,6 +1151,7 @@ mod tests {
         assert!(requests[3].starts_with("GET /api/tasks/task-1/events?after=1 HTTP/1.1"));
         assert!(requests[4].starts_with("GET /api/tasks/task-1/wait?after=2 HTTP/1.1"));
         assert!(requests[5].starts_with("POST /api/tasks/task-1/cancel HTTP/1.1"));
+        assert!(requests[6].starts_with("POST /api/tasks/task-1/resume HTTP/1.1"));
     }
 
     #[test]

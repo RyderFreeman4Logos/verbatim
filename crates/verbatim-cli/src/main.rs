@@ -455,6 +455,10 @@ where
             let response = client.cancel_task(&task_id)?;
             render::write_task_summary(stdout, &response.task, &response.spans)?;
         }
+        TaskCommand::Resume { task_id } => {
+            let response = client.resume_task(&task_id)?;
+            render::write_task_summary(stdout, &response.task, &response.spans)?;
+        }
     }
     Ok(0)
 }
@@ -654,6 +658,7 @@ const TASK_AFTER_HELP: &str = r#"Examples:
   verbatim task events <task-id>
   verbatim task wait --timeout 25m <task-id>
   verbatim task cancel <task-id>
+  verbatim task resume <task-id>
 
 Task ids are returned by --background ingest/reindex/ask commands.
 "#;
@@ -699,6 +704,13 @@ const TASK_CANCEL_AFTER_HELP: &str = r#"Examples:
 
 Cancel is best-effort. Use task show or task events to inspect the resulting
 terminal status.
+"#;
+
+const TASK_RESUME_AFTER_HELP: &str = r#"Examples:
+  verbatim task resume <task-id>
+
+Resume requeues a failed ingest/reindex task by the same task id when its
+stored request metadata is executable. Ask/retrieve tasks are not resumable.
 "#;
 
 #[derive(Debug, Parser)]
@@ -1075,6 +1087,16 @@ enum TaskCommand {
         #[arg(value_name = "TASK_ID")]
         task_id: String,
     },
+    /// Resume a failed resumable task by id.
+    #[command(
+        about = "Resume a failed ingest/reindex task by the same task id.",
+        after_help = TASK_RESUME_AFTER_HELP
+    )]
+    Resume {
+        /// Task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1143,6 +1165,7 @@ mod tests {
             &["task", "wait", "--help"],
             &["task", "watch", "--help"],
             &["task", "cancel", "--help"],
+            &["task", "resume", "--help"],
         ];
 
         for args in cases {
@@ -1182,6 +1205,7 @@ mod tests {
             &["task", "wait", "--help"],
             &["task", "watch", "--help"],
             &["task", "cancel", "--help"],
+            &["task", "resume", "--help"],
         ];
 
         for args in cases {
@@ -1234,6 +1258,7 @@ mod tests {
         assert!(stderr.is_empty());
         assert!(task_help.contains("Task ids are returned by --background"));
         assert!(task_help.contains("verbatim task wait --timeout 25m"));
+        assert!(task_help.contains("verbatim task resume"));
     }
 
     #[test]
@@ -1443,6 +1468,11 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert_eq!(client.calls.borrow().as_slice(), ["cancel_task:task-1"]);
         assert!(stdout.contains("status: cancelled"));
+
+        let (code, stdout, _, client, _) = run_mock(["task", "resume", "task-1"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["resume_task:task-1"]);
+        assert!(stdout.contains("Task: task-1"));
     }
 
     #[test]
@@ -2000,6 +2030,13 @@ mod tests {
                 .borrow_mut()
                 .push(format!("cancel_task:{task_id}"));
             Ok(sample_task_response(TaskStatus::Cancelled))
+        }
+
+        fn resume_task(&self, task_id: &str) -> client::CliResult<TaskSummaryResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("resume_task:{task_id}"));
+            Ok(sample_task_response(TaskStatus::Queued))
         }
 
         fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> client::CliResult<()>

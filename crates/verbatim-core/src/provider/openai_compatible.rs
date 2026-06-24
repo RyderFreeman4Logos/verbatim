@@ -1,15 +1,20 @@
 //! OpenAI-compatible provider adapters for local model servers.
 
-use std::collections::VecDeque;
-use std::time::Duration;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
-use reqwest::{Client, Method, RequestBuilder, StatusCode};
+use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ChatConfig, EmbeddingConfig, RerankConfig, VisionConfig};
+use crate::config::{
+    ChatConfig, EmbeddingConfig, ModelEndpointRuntimeConfig, ModelRetryConfig, RerankConfig,
+    VisionConfig,
+};
 use crate::upstream::{
     capture_full_response, capture_response_prefix, sanitize_text, UpstreamRequestContext,
     DEFAULT_BODY_PREFIX_MAX_BYTES,
@@ -38,11 +43,12 @@ pub struct OpenAiCompatibleChatModel {
 impl OpenAiCompatibleChatModel {
     pub fn from_config(config: &ChatConfig) -> Self {
         Self {
-            endpoint: OpenAiEndpoint::new(
+            endpoint: OpenAiEndpoint::new_with_options(
                 &config.base_url,
                 &config.model,
                 &config.api_key,
                 config.timeout_seconds,
+                &config.endpoint_runtime,
             ),
             temperature: config.temperature,
         }
@@ -59,11 +65,12 @@ impl OpenAiCompatibleVisionModel {
     pub fn from_config(config: &VisionConfig) -> Self {
         Self {
             chat: OpenAiCompatibleChatModel {
-                endpoint: OpenAiEndpoint::new(
+                endpoint: OpenAiEndpoint::new_with_options(
                     &config.base_url,
                     &config.model,
                     &config.api_key,
                     config.timeout_seconds,
+                    &config.endpoint_runtime,
                 ),
                 temperature: config.temperature,
             },
@@ -85,11 +92,12 @@ pub struct OpenAiCompatibleEmbeddingModel {
 impl OpenAiCompatibleEmbeddingModel {
     pub fn from_config(config: &EmbeddingConfig) -> Self {
         Self {
-            endpoint: OpenAiEndpoint::new(
+            endpoint: OpenAiEndpoint::new_with_options(
                 &config.base_url,
                 &config.model,
                 &config.api_key,
                 config.timeout_seconds,
+                &config.endpoint_runtime,
             ),
             dimension: config.dimension,
             normalize: config.normalize,
@@ -191,11 +199,12 @@ pub struct OpenAiCompatibleReranker {
 impl OpenAiCompatibleReranker {
     pub fn from_config(config: &RerankConfig) -> Self {
         Self {
-            endpoint: OpenAiEndpoint::new(
+            endpoint: OpenAiEndpoint::new_with_options(
                 &config.base_url,
                 &config.model,
                 &config.api_key,
                 config.timeout_seconds,
+                &config.endpoint_runtime,
             ),
             provider: RerankProviderKind::from_provider(&config.provider),
             default_top_n: config.top_n,
@@ -237,9 +246,9 @@ impl OpenAiCompatibleChatModel {
         client_kind: &'static str,
     ) -> ProviderResult<ChatStream> {
         let body = self.chat_body(req, true);
-        let (response, context) = self
+        let (response, context, permit) = self
             .endpoint
-            .post(CHAT_COMPLETIONS_PATH, &body, operation, client_kind)
+            .post_stream(CHAT_COMPLETIONS_PATH, &body, operation, client_kind)
             .await?;
 
         let status = response.status();
@@ -262,7 +271,7 @@ impl OpenAiCompatibleChatModel {
             })
             .boxed();
 
-        Ok(sse_chat_stream(chunks))
+        Ok(sse_chat_stream(chunks, permit))
     }
 
     fn chat_body(&self, req: ChatRequest, stream: bool) -> OpenAiChatRequest {
@@ -406,21 +415,38 @@ impl crate::traits::Reranker for OpenAiCompatibleReranker {
 
 #[derive(Clone, Debug)]
 struct OpenAiEndpoint {
-    client: Client,
+    runtime: Arc<ModelEndpointRuntime>,
     base_url: String,
     model: String,
     api_key: String,
     timeout: Duration,
+    retry: ModelRetryPolicy,
 }
 
 impl OpenAiEndpoint {
+    #[cfg(test)]
     fn new(base_url: &str, model: &str, api_key: &str, timeout_seconds: u64) -> Self {
+        let config = ModelEndpointRuntimeConfig::default();
+        Self::new_with_options(base_url, model, api_key, timeout_seconds, &config)
+    }
+
+    fn new_with_options(
+        base_url: &str,
+        model: &str,
+        api_key: &str,
+        timeout_seconds: u64,
+        config: &ModelEndpointRuntimeConfig,
+    ) -> Self {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let config = config.bounded();
+        let runtime = endpoint_runtime_registry().runtime_for(&base_url, &config);
         Self {
-            client: Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            runtime,
+            base_url,
             model: model.to_string(),
             api_key: api_key.to_string(),
             timeout: Duration::from_secs(timeout_seconds.max(1)),
+            retry: ModelRetryPolicy::from_config(&config.retry),
         }
     }
 
@@ -431,12 +457,27 @@ impl OpenAiEndpoint {
         operation: &'static str,
         client_kind: &'static str,
     ) -> ProviderResult<T> {
-        let (response, context) = self.post(path, body, operation, client_kind).await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(http_status_error(operation, &context, status, response).await);
+        let mut retry_count = 0;
+        loop {
+            match self
+                .post_json_once(path, body, operation, client_kind)
+                .await
+            {
+                Ok(value) => return Ok(value),
+                Err(error) if self.retry.should_retry(&error, retry_count) => {
+                    retry_count += 1;
+                    tracing::warn!(
+                        operation,
+                        client_kind,
+                        retry_count,
+                        error = %error,
+                        "provider request failed, retrying"
+                    );
+                    tokio::time::sleep(self.retry.backoff(retry_count)).await;
+                }
+                Err(error) => return Err(error.with_retry_count(retry_count)),
+            }
         }
-        decode_json_response(response, operation, &context).await
     }
 
     async fn post_json_paths<T: serde::de::DeserializeOwned, B: Serialize + ?Sized>(
@@ -467,13 +508,76 @@ impl OpenAiEndpoint {
         }))
     }
 
-    async fn post<B: Serialize + ?Sized>(
+    async fn post_json_once<T: serde::de::DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         path: &str,
         body: &B,
         operation: &'static str,
         client_kind: &'static str,
-    ) -> ProviderResult<(reqwest::Response, UpstreamRequestContext)> {
+    ) -> ProviderResult<T> {
+        let (response, context, _permit) =
+            self.post_once(path, body, operation, client_kind).await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_status_error(operation, &context, status, response).await);
+        }
+        decode_json_response(response, operation, &context).await
+    }
+
+    async fn post_stream<B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+        operation: &'static str,
+        client_kind: &'static str,
+    ) -> ProviderResult<(reqwest::Response, UpstreamRequestContext, EndpointPermit)> {
+        let mut retry_count = 0;
+        loop {
+            match self.post_once(path, body, operation, client_kind).await {
+                Ok((response, context, permit)) if response.status().is_success() => {
+                    return Ok((response, context, permit));
+                }
+                Ok((response, context, permit)) => {
+                    let status = response.status();
+                    let error = http_status_error(operation, &context, status, response).await;
+                    drop(permit);
+                    if self.retry.should_retry(&error, retry_count) {
+                        retry_count += 1;
+                        tracing::warn!(
+                            operation,
+                            client_kind,
+                            retry_count,
+                            error = %error,
+                            "provider streaming request failed before body stream, retrying"
+                        );
+                        tokio::time::sleep(self.retry.backoff(retry_count)).await;
+                    } else {
+                        return Err(error.with_retry_count(retry_count));
+                    }
+                }
+                Err(error) if self.retry.should_retry(&error, retry_count) => {
+                    retry_count += 1;
+                    tracing::warn!(
+                        operation,
+                        client_kind,
+                        retry_count,
+                        error = %error,
+                        "provider streaming request failed, retrying"
+                    );
+                    tokio::time::sleep(self.retry.backoff(retry_count)).await;
+                }
+                Err(error) => return Err(error.with_retry_count(retry_count)),
+            }
+        }
+    }
+
+    async fn post_once<B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+        operation: &'static str,
+        client_kind: &'static str,
+    ) -> ProviderResult<(reqwest::Response, UpstreamRequestContext, EndpointPermit)> {
         if self.base_url.is_empty() {
             return Err(ProviderError::configuration(operation, "base_url is empty"));
         }
@@ -490,18 +594,25 @@ impl OpenAiEndpoint {
             &Method::POST,
             &url,
         );
-        self.auth(self.client.post(url).timeout(self.timeout).json(body))
-            .send()
-            .await
-            .map(|response| (response, context.clone()))
-            .map_err(|source| {
-                let diagnostic = context.transport_failure(&source);
-                ProviderError::Transport {
-                    operation,
-                    source,
-                    diagnostic: Box::new(diagnostic),
-                }
-            })
+        let permit = self.runtime.acquire(operation).await?;
+        self.auth(
+            self.runtime
+                .client
+                .post(url)
+                .timeout(self.timeout)
+                .json(body),
+        )
+        .send()
+        .await
+        .map(|response| (response, context.clone(), permit))
+        .map_err(|source| {
+            let diagnostic = context.transport_failure(&source);
+            ProviderError::Transport {
+                operation,
+                source,
+                diagnostic: Box::new(diagnostic),
+            }
+        })
     }
 
     fn auth(&self, req: RequestBuilder) -> RequestBuilder {
@@ -511,6 +622,231 @@ impl OpenAiEndpoint {
             req.bearer_auth(&self.api_key)
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct ModelEndpointRuntime {
+    client: Client,
+    limiter: Arc<EndpointLimiter>,
+}
+
+impl ModelEndpointRuntime {
+    async fn acquire(&self, operation: &'static str) -> ProviderResult<EndpointPermit> {
+        self.limiter.acquire(operation).await
+    }
+
+    fn configure(&self, config: &ModelEndpointRuntimeConfig) {
+        self.limiter.configure(config);
+    }
+}
+
+#[derive(Debug)]
+struct EndpointLimiterRegistry {
+    runtimes: Mutex<HashMap<EndpointKey, Arc<ModelEndpointRuntime>>>,
+}
+
+impl EndpointLimiterRegistry {
+    fn runtime_for(
+        &self,
+        base_url: &str,
+        config: &ModelEndpointRuntimeConfig,
+    ) -> Arc<ModelEndpointRuntime> {
+        let key = EndpointKey::new(base_url);
+        let mut runtimes = lock_unpoisoned(&self.runtimes);
+        let runtime = runtimes
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(ModelEndpointRuntime {
+                    client: Client::new(),
+                    limiter: Arc::new(EndpointLimiter::new(config)),
+                })
+            })
+            .clone();
+        runtime.configure(config);
+        runtime
+    }
+}
+
+fn endpoint_runtime_registry() -> &'static EndpointLimiterRegistry {
+    static REGISTRY: OnceLock<EndpointLimiterRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| EndpointLimiterRegistry {
+        runtimes: Mutex::new(HashMap::new()),
+    })
+}
+
+#[derive(Clone, Debug, Eq)]
+struct EndpointKey(String);
+
+impl EndpointKey {
+    fn new(base_url: &str) -> Self {
+        Self(normalized_endpoint_key(base_url))
+    }
+}
+
+impl PartialEq for EndpointKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Hash for EndpointKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+fn normalized_endpoint_key(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let Ok(mut url) = Url::parse(trimmed) else {
+        return trimmed.to_ascii_lowercase();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    let scheme = url.scheme().to_ascii_lowercase();
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let port = url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    let path = url.path().trim_end_matches('/');
+    format!("{scheme}://{host}{port}{path}")
+}
+
+#[derive(Debug)]
+struct EndpointLimiter {
+    state: Mutex<EndpointLimiterState>,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Debug)]
+struct EndpointLimiterState {
+    capacity: usize,
+    in_flight: usize,
+    queue_timeout: Duration,
+}
+
+impl EndpointLimiter {
+    fn new(config: &ModelEndpointRuntimeConfig) -> Self {
+        let config = config.bounded();
+        Self {
+            state: Mutex::new(EndpointLimiterState {
+                capacity: config.max_concurrent_requests,
+                in_flight: 0,
+                queue_timeout: Duration::from_secs(config.queue_timeout_seconds),
+            }),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn configure(&self, config: &ModelEndpointRuntimeConfig) {
+        let config = config.bounded();
+        {
+            let mut state = lock_unpoisoned(&self.state);
+            state.capacity = config.max_concurrent_requests;
+            state.queue_timeout = Duration::from_secs(config.queue_timeout_seconds);
+        }
+        self.notify.notify_waiters();
+    }
+
+    async fn acquire(self: &Arc<Self>, operation: &'static str) -> ProviderResult<EndpointPermit> {
+        let timeout = {
+            let state = lock_unpoisoned(&self.state);
+            state.queue_timeout
+        };
+        let acquire = async {
+            loop {
+                let notified = self.notify.notified();
+                {
+                    let mut state = lock_unpoisoned(&self.state);
+                    if state.in_flight < state.capacity {
+                        state.in_flight += 1;
+                        return EndpointPermit {
+                            limiter: Arc::clone(self),
+                        };
+                    }
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, acquire)
+            .await
+            .map_err(|_| ProviderError::QueueTimeout {
+                operation,
+                timeout_seconds: timeout.as_secs(),
+            })
+    }
+
+    fn release(&self) {
+        {
+            let mut state = lock_unpoisoned(&self.state);
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+        self.notify.notify_one();
+    }
+}
+
+#[derive(Debug)]
+struct EndpointPermit {
+    limiter: Arc<EndpointLimiter>,
+}
+
+impl Drop for EndpointPermit {
+    fn drop(&mut self) {
+        self.limiter.release();
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ModelRetryPolicy {
+    max_retries: u32,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl ModelRetryPolicy {
+    fn from_config(config: &ModelRetryConfig) -> Self {
+        let config = config.bounded();
+        Self {
+            max_retries: config.max_retries,
+            initial_backoff: Duration::from_millis(config.initial_backoff_millis),
+            max_backoff: Duration::from_millis(config.max_backoff_millis),
+        }
+    }
+
+    fn should_retry(&self, error: &ProviderError, retry_count: u32) -> bool {
+        retry_count < self.max_retries && error.is_retryable_provider_failure()
+    }
+
+    fn backoff(&self, retry_count: u32) -> Duration {
+        let exponent = retry_count.saturating_sub(1).min(16);
+        let multiplier = 1_u128 << exponent;
+        let base_millis = self
+            .initial_backoff
+            .as_millis()
+            .saturating_mul(multiplier)
+            .min(self.max_backoff.as_millis());
+        let jitter_window = (base_millis / 4).max(1);
+        let jitter = current_time_nanos() % jitter_window;
+        duration_from_millis(base_millis.saturating_add(jitter))
+    }
+}
+
+fn duration_from_millis(value: u128) -> Duration {
+    Duration::from_millis(value.min(u128::from(u64::MAX)) as u64)
+}
+
+fn current_time_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Serialize)]
@@ -703,13 +1039,17 @@ fn truncate_message(message: &str, max_chars: usize) -> String {
     }
 }
 
-fn sse_chat_stream(chunks: BoxStream<'static, ProviderResult<Vec<u8>>>) -> ChatStream {
+fn sse_chat_stream(
+    chunks: BoxStream<'static, ProviderResult<Vec<u8>>>,
+    permit: EndpointPermit,
+) -> ChatStream {
     struct State {
         chunks: BoxStream<'static, ProviderResult<Vec<u8>>>,
         pending_utf8: Vec<u8>,
         buffer: String,
         pending: VecDeque<ProviderResult<ChatStreamEvent>>,
         done: bool,
+        _permit: EndpointPermit,
     }
 
     let state = State {
@@ -718,6 +1058,7 @@ fn sse_chat_stream(chunks: BoxStream<'static, ProviderResult<Vec<u8>>>) -> ChatS
         buffer: String::new(),
         pending: VecDeque::new(),
         done: false,
+        _permit: permit,
     };
 
     stream::unfold(state, |mut state| async move {
@@ -870,6 +1211,7 @@ mod tests {
     use futures::stream;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
 
     #[derive(Debug)]
@@ -899,6 +1241,170 @@ mod tests {
             request
         });
         (base_url, handle)
+    }
+
+    fn spawn_blocking_first_embedding_server() -> (
+        String,
+        Arc<Mutex<mpsc::Receiver<RecordedRequest>>>,
+        mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept first request");
+            let request = read_http_request(&mut stream);
+            request_tx.send(request).expect("record first request");
+            release_rx.recv().expect("release first response");
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                embedding_response_body(),
+            );
+
+            let (mut stream, _) = listener.accept().expect("accept second request");
+            let request = read_http_request(&mut stream);
+            request_tx.send(request).expect("record second request");
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                embedding_response_body(),
+            );
+        });
+        (
+            base_url,
+            Arc::new(Mutex::new(request_rx)),
+            release_tx,
+            handle,
+        )
+    }
+
+    fn spawn_embedding_sequence_server(
+        statuses: Vec<&'static str>,
+    ) -> (
+        String,
+        Arc<Mutex<mpsc::Receiver<RecordedRequest>>>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let request = read_http_request(&mut stream);
+                request_tx.send(request).expect("record request");
+                let body = if status.starts_with('2') {
+                    embedding_response_body()
+                } else {
+                    r#"{"error":{"message":"fixture provider failure"}}"#
+                };
+                write_http_response(&mut stream, status, "application/json", body);
+            }
+        });
+        (base_url, Arc::new(Mutex::new(request_rx)), handle)
+    }
+
+    fn spawn_chat_stream_sequence_server(
+        statuses: Vec<&'static str>,
+    ) -> (
+        String,
+        Arc<Mutex<mpsc::Receiver<RecordedRequest>>>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for status in statuses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let request = read_http_request(&mut stream);
+                request_tx.send(request).expect("record request");
+                let (content_type, body) = if status.starts_with('2') {
+                    ("text/event-stream", chat_stream_response_body())
+                } else {
+                    (
+                        "application/json",
+                        r#"{"error":{"message":"fixture provider failure"}}"#,
+                    )
+                };
+                write_http_response(&mut stream, status, content_type, body);
+            }
+        });
+        (base_url, Arc::new(Mutex::new(request_rx)), handle)
+    }
+
+    async fn recv_recorded_request(
+        rx: Arc<Mutex<mpsc::Receiver<RecordedRequest>>>,
+        timeout: Duration,
+    ) -> Option<RecordedRequest> {
+        tokio::task::spawn_blocking(move || {
+            let rx = rx.lock().expect("request receiver lock");
+            rx.recv_timeout(timeout).ok()
+        })
+        .await
+        .expect("request receiver task joins")
+    }
+
+    fn embedding_response_body() -> &'static str {
+        r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#
+    }
+
+    fn chat_stream_response_body() -> &'static str {
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+    }
+
+    fn test_runtime_config(
+        max_concurrent_requests: usize,
+        max_retries: u32,
+        initial_backoff_millis: u64,
+    ) -> ModelEndpointRuntimeConfig {
+        ModelEndpointRuntimeConfig {
+            max_concurrent_requests,
+            queue_timeout_seconds: 1,
+            retry: ModelRetryConfig {
+                max_retries,
+                initial_backoff_millis,
+                max_backoff_millis: initial_backoff_millis,
+            },
+        }
+    }
+
+    fn embedding_model_with_runtime(
+        base_url: &str,
+        runtime: &ModelEndpointRuntimeConfig,
+    ) -> OpenAiCompatibleEmbeddingModel {
+        OpenAiCompatibleEmbeddingModel {
+            endpoint: OpenAiEndpoint::new_with_options(base_url, "embedding-model", "", 5, runtime),
+            dimension: 3,
+            normalize: false,
+            batch_size: 16,
+            query_instruction: String::new(),
+            document_instruction: String::new(),
+        }
+    }
+
+    fn chat_model_with_runtime(
+        base_url: &str,
+        runtime: &ModelEndpointRuntimeConfig,
+    ) -> OpenAiCompatibleChatModel {
+        OpenAiCompatibleChatModel {
+            endpoint: OpenAiEndpoint::new_with_options(base_url, "chat-model", "", 5, runtime),
+            temperature: 0.0,
+        }
+    }
+
+    fn test_stream_permit() -> EndpointPermit {
+        let limiter = Arc::new(EndpointLimiter::new(&test_runtime_config(1, 0, 1)));
+        {
+            let mut state = lock_unpoisoned(&limiter.state);
+            state.in_flight += 1;
+        }
+        EndpointPermit { limiter }
     }
 
     fn read_http_request(stream: &mut TcpStream) -> RecordedRequest {
@@ -953,6 +1459,203 @@ mod tests {
         stream
             .write_all(response.as_bytes())
             .expect("write response");
+    }
+
+    #[tokio::test]
+    async fn endpoints_with_same_normalized_base_url_share_capacity() {
+        let (base_url, request_rx, release_first, handle) = spawn_blocking_first_embedding_server();
+        let runtime = test_runtime_config(1, 0, 1);
+        let first_model = embedding_model_with_runtime(&base_url, &runtime);
+        let second_model = embedding_model_with_runtime(&format!("{base_url}/"), &runtime);
+
+        let first =
+            tokio::spawn(async move { first_model.embed_prepared(vec!["first".into()]).await });
+        let first_request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("first request reaches server");
+        assert!(first_request.body.contains("first"));
+
+        let second =
+            tokio::spawn(async move { second_model.embed_prepared(vec!["second".into()]).await });
+        assert!(
+            recv_recorded_request(Arc::clone(&request_rx), Duration::from_millis(75))
+                .await
+                .is_none(),
+            "second request must wait for shared endpoint capacity"
+        );
+
+        release_first.send(()).expect("release first response");
+        let second_request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("second request reaches server after release");
+        assert!(second_request.body.contains("second"));
+        first
+            .await
+            .expect("first task joins")
+            .expect("first succeeds");
+        second
+            .await
+            .expect("second task joins")
+            .expect("second succeeds");
+        handle.join().expect("server thread joins");
+    }
+
+    #[tokio::test]
+    async fn retry_releases_endpoint_capacity_before_backoff_sleep() {
+        let (base_url, request_rx, handle) =
+            spawn_embedding_sequence_server(vec!["500 Internal Server Error", "200 OK", "200 OK"]);
+        let runtime = test_runtime_config(1, 1, 250);
+        let first_model = embedding_model_with_runtime(&base_url, &runtime);
+        let competing_model = embedding_model_with_runtime(&base_url, &runtime);
+
+        let first =
+            tokio::spawn(async move { first_model.embed_prepared(vec!["first".into()]).await });
+        let first_request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("first request reaches server");
+        assert!(first_request.body.contains("first"));
+
+        let competing = tokio::spawn(async move {
+            competing_model
+                .embed_prepared(vec!["competing".into()])
+                .await
+        });
+        let competing_request =
+            recv_recorded_request(Arc::clone(&request_rx), Duration::from_millis(120))
+                .await
+                .expect("competing request acquires during first retry backoff");
+        assert!(competing_request.body.contains("competing"));
+
+        let retry_request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("first retry reaches server");
+        assert!(retry_request.body.contains("first"));
+        competing
+            .await
+            .expect("competing task joins")
+            .expect("competing request succeeds");
+        first
+            .await
+            .expect("first task joins")
+            .expect("first retry succeeds");
+        handle.join().expect("server thread joins");
+    }
+
+    #[tokio::test]
+    async fn streaming_retry_releases_endpoint_capacity_before_backoff_sleep() {
+        let (base_url, request_rx, handle) = spawn_chat_stream_sequence_server(vec![
+            "500 Internal Server Error",
+            "200 OK",
+            "200 OK",
+        ]);
+        let runtime = test_runtime_config(1, 1, 250);
+        let first_model = chat_model_with_runtime(&base_url, &runtime);
+        let competing_model = chat_model_with_runtime(&base_url, &runtime);
+
+        let first = tokio::spawn(async move {
+            let stream = first_model
+                .stream_chat(ChatRequest::new(vec![ChatMessage::user("first")]))
+                .await?;
+            stream
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<ProviderResult<Vec<_>>>()
+        });
+        let first_request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("first streaming request reaches server");
+        assert!(first_request.body.contains("first"));
+
+        let competing = tokio::spawn(async move {
+            let stream = competing_model
+                .stream_chat(ChatRequest::new(vec![ChatMessage::user("competing")]))
+                .await?;
+            stream
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<ProviderResult<Vec<_>>>()
+        });
+        let competing_request =
+            recv_recorded_request(Arc::clone(&request_rx), Duration::from_millis(120))
+                .await
+                .expect("competing streaming request acquires during first retry backoff");
+        assert!(competing_request.body.contains("competing"));
+
+        let retry_request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("first streaming retry reaches server");
+        assert!(retry_request.body.contains("first"));
+        competing
+            .await
+            .expect("competing task joins")
+            .expect("competing request succeeds");
+        first
+            .await
+            .expect("first task joins")
+            .expect("first retry succeeds");
+        handle.join().expect("server thread joins");
+    }
+
+    #[tokio::test]
+    async fn retryable_status_codes_are_retried() {
+        let (base_url, request_rx, handle) =
+            spawn_embedding_sequence_server(vec!["429 Too Many Requests", "200 OK"]);
+        let runtime = test_runtime_config(1, 1, 1);
+        let model = embedding_model_with_runtime(&base_url, &runtime);
+
+        let embeddings = model
+            .embed_prepared(vec!["document".into()])
+            .await
+            .expect("retry succeeds");
+
+        assert_eq!(embeddings, vec![vec![1.0, 0.0, 0.0]]);
+        assert!(
+            recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+                .await
+                .is_some()
+        );
+        assert!(
+            recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+                .await
+                .is_some()
+        );
+        handle.join().expect("server thread joins");
+    }
+
+    #[tokio::test]
+    async fn non_retryable_client_status_is_not_retried() {
+        let (base_url, request_rx, handle) =
+            spawn_embedding_sequence_server(vec!["400 Bad Request"]);
+        let runtime = test_runtime_config(1, 3, 1);
+        let model = embedding_model_with_runtime(&base_url, &runtime);
+
+        let error = model
+            .embed_prepared(vec!["document".into()])
+            .await
+            .expect_err("400 response fails without retry");
+
+        let ProviderError::HttpStatus {
+            status, diagnostic, ..
+        } = error
+        else {
+            panic!("expected HTTP status error");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(diagnostic.retry_count, Some(0));
+        assert!(
+            recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+                .await
+                .is_some()
+        );
+        assert!(
+            recv_recorded_request(Arc::clone(&request_rx), Duration::from_millis(75))
+                .await
+                .is_none(),
+            "400 response must not be retried"
+        );
+        handle.join().expect("server thread joins");
     }
 
     #[test]
@@ -1096,6 +1799,7 @@ mod tests {
             top_n: 2,
             timeout_seconds: 5,
             api_key: String::new(),
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
 
@@ -1139,6 +1843,7 @@ mod tests {
             top_n: 1,
             timeout_seconds: 5,
             api_key: String::new(),
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
 
@@ -1270,6 +1975,7 @@ mod tests {
             top_n: 1,
             timeout_seconds: 5,
             api_key: String::new(),
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
 
@@ -1298,7 +2004,7 @@ mod tests {
         ])
         .boxed();
 
-        let events = sse_chat_stream(chunks)
+        let events = sse_chat_stream(chunks, test_stream_permit())
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -1334,7 +2040,7 @@ mod tests {
         ])
         .boxed();
 
-        let events = sse_chat_stream(chunks)
+        let events = sse_chat_stream(chunks, test_stream_permit())
             .collect::<Vec<_>>()
             .await
             .into_iter()

@@ -28,25 +28,10 @@ impl OpenAiEmbeddingClient {
 #[async_trait]
 impl EmbeddingClient for OpenAiEmbeddingClient {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut retries = 0;
-        loop {
-            match self.model.embed_prepared(texts.to_vec()).await {
-                Ok(embeddings) => return Ok(embeddings),
-                Err(e) if retries < 3 => {
-                    retries += 1;
-                    tracing::warn!(
-                        retry = retries,
-                        error = %e,
-                        "embedding batch failed, retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        500 * 2u64.pow(retries - 1),
-                    ))
-                    .await;
-                }
-                Err(e) => return Err(e.with_retry_count(retries).into()),
-            }
-        }
+        self.model
+            .embed_prepared(texts.to_vec())
+            .await
+            .map_err(Into::into)
     }
 
     fn dimension(&self) -> usize {
