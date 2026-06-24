@@ -3818,6 +3818,15 @@ struct CollectionWatchPlan {
     roots: BTreeMap<PathBuf, CollectionWatchRoot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CollectionWatchPathChange {
+    Unwatch(PathBuf),
+    Watch {
+        path: PathBuf,
+        recursive: RecursiveMode,
+    },
+}
+
 #[derive(Clone)]
 struct CollectionWatchRoot {
     recursive: RecursiveMode,
@@ -4008,32 +4017,64 @@ async fn refresh_collection_watches(
     plan: &mut CollectionWatchPlan,
 ) -> Result<()> {
     let next_plan = build_collection_watch_plan(state).await?;
-    for path in watched_paths.keys().cloned().collect::<Vec<_>>() {
-        if !next_plan.roots.contains_key(&path) {
-            if let Err(error) = watcher.unwatch(&path) {
-                tracing::warn!(path = %path.display(), error = %error, "failed to unwatch collection root");
+    for change in collection_watch_path_changes(watched_paths, &next_plan) {
+        match change {
+            CollectionWatchPathChange::Unwatch(path) => {
+                if let Err(error) = watcher.unwatch(&path) {
+                    tracing::warn!(path = %path.display(), error = %error, "failed to unwatch collection root");
+                }
+                watched_paths.remove(&path);
             }
-            watched_paths.remove(&path);
-        }
-    }
-    for (path, root) in &next_plan.roots {
-        if watched_paths.contains_key(path) {
-            continue;
-        }
-        match watcher.watch(path, root.recursive) {
-            Ok(()) => {
-                watched_paths.insert(path.clone(), root.recursive);
-            }
-            Err(error) => {
-                tracing::warn!(path = %path.display(), error = %error, "failed to watch collection root");
-                for collection in &root.collections {
-                    record_collection_watcher_error(state, collection, &error);
+            CollectionWatchPathChange::Watch { path, recursive } => {
+                match watcher.watch(&path, recursive) {
+                    Ok(()) => {
+                        watched_paths.insert(path.clone(), recursive);
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), error = %error, "failed to watch collection root");
+                        if let Some(root) = next_plan.roots.get(&path) {
+                            for collection in &root.collections {
+                                record_collection_watcher_error(state, collection, &error);
+                            }
+                        }
+                    }
                 }
             }
-        }
+        };
     }
     *plan = next_plan;
     Ok(())
+}
+
+fn collection_watch_path_changes(
+    watched_paths: &BTreeMap<PathBuf, RecursiveMode>,
+    next_plan: &CollectionWatchPlan,
+) -> Vec<CollectionWatchPathChange> {
+    let mut changes = Vec::new();
+    for (path, watched_recursive) in watched_paths {
+        match next_plan.roots.get(path) {
+            Some(root) if root.recursive == *watched_recursive => {}
+            Some(root) => {
+                changes.push(CollectionWatchPathChange::Unwatch(path.clone()));
+                changes.push(CollectionWatchPathChange::Watch {
+                    path: path.clone(),
+                    recursive: root.recursive,
+                });
+            }
+            None => {
+                changes.push(CollectionWatchPathChange::Unwatch(path.clone()));
+            }
+        }
+    }
+    for (path, root) in &next_plan.roots {
+        if !watched_paths.contains_key(path) {
+            changes.push(CollectionWatchPathChange::Watch {
+                path: path.clone(),
+                recursive: root.recursive,
+            });
+        }
+    }
+    changes
 }
 
 async fn build_collection_watch_plan(state: &SharedState) -> Result<CollectionWatchPlan> {
@@ -4380,6 +4421,8 @@ async fn reload_config_from_path(state: &SharedState) -> Result<ConfigReloadMeta
     let plan = current
         .reload_plan(&candidate)
         .map_err(|error| config_reload_rejection(state, error))?;
+    let collection_watcher_plan_changed =
+        collection_watcher_plan_reload_keys_changed(&plan.reload_safe_keys);
     let next_config = current.apply_reload_safe_changes(&candidate);
     let next_config_for_pipeline = next_config.clone();
     let state_for_pipeline = Arc::clone(state);
@@ -4409,13 +4452,29 @@ async fn reload_config_from_path(state: &SharedState) -> Result<ConfigReloadMeta
         last_restart_required_keys: restart_required_keys,
     };
 
-    let mut runtime = state
-        .runtime_config
-        .write()
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    runtime.config = next_config;
-    runtime.reload = metadata.clone();
+    {
+        let mut runtime = state
+            .runtime_config
+            .write()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        runtime.config = next_config;
+        runtime.reload = metadata.clone();
+    }
+    if collection_watcher_plan_changed {
+        send_collection_watcher_command(state, CollectionWatcherCommand::Refresh);
+    }
     Ok(metadata)
+}
+
+fn collection_watcher_plan_reload_keys_changed(keys: &[String]) -> bool {
+    keys.iter().any(|key| {
+        matches!(
+            key.as_str(),
+            "collection_watcher.enabled"
+                | "collection_watcher.ignore_collections"
+                | "collection_watcher.ignore_paths"
+        )
+    })
 }
 
 fn restart_required_message(keys: &[ConfigRestartRequiredKey]) -> Option<String> {
@@ -4745,6 +4804,72 @@ mod tests {
             response.reload.active_config_path,
             state.config_path.display().to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn config_reload_refreshes_collection_watcher_plan() {
+        let test_dir = TestDir::new("config-reload-collection-watcher");
+        let config_path = test_dir.path().join("config.toml");
+        let root = test_dir.path().join("articles");
+        fs::create_dir_all(&root).unwrap();
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.collection_watcher.enabled = false;
+        fs::write(&config_path, config.show().unwrap()).unwrap();
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state =
+            test_state_with_config_path(config.clone(), test_dir.path(), pipeline, config_path);
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let _watcher = start_collection_watcher(Arc::clone(&state)).unwrap();
+
+        let status = wait_for_collection_watcher_status(&state, "articles", |status| {
+            status.ignored_by_config && !status.active
+        })
+        .await;
+        assert_eq!(status.watched_root_count, 0);
+
+        let mut candidate = config.clone();
+        candidate.collection_watcher.enabled = true;
+        fs::write(&state.config_path, candidate.show().unwrap()).unwrap();
+
+        let metadata = reload_config_from_path(&state).await.unwrap();
+        assert_eq!(
+            metadata.last_applied_reload_safe_keys,
+            vec!["collection_watcher.enabled"]
+        );
+        let status = wait_for_collection_watcher_status(&state, "articles", |status| {
+            !status.ignored_by_config && status.active && status.watched_root_count > 0
+        })
+        .await;
+
+        assert!(status.active);
+        assert!(status.watched_root_count > 0);
     }
 
     #[tokio::test]
@@ -5346,6 +5471,33 @@ mod tests {
         assert!(!debounced.insert_many(vec!["a".to_string()]));
         assert_eq!(debounced.drain(), vec!["a".to_string(), "b".to_string()]);
         assert!(debounced.is_empty());
+    }
+
+    #[test]
+    fn collection_watch_path_changes_rewatch_mode_changes() {
+        let path = PathBuf::from("/tmp/verbatim/articles");
+        let watched_paths = BTreeMap::from([(path.clone(), RecursiveMode::NonRecursive)]);
+        let mut plan = CollectionWatchPlan::default();
+        plan.roots.insert(
+            path.clone(),
+            CollectionWatchRoot {
+                recursive: RecursiveMode::Recursive,
+                collections: BTreeSet::from(["articles".to_string()]),
+            },
+        );
+
+        let changes = collection_watch_path_changes(&watched_paths, &plan);
+
+        assert_eq!(
+            changes,
+            vec![
+                CollectionWatchPathChange::Unwatch(path.clone()),
+                CollectionWatchPathChange::Watch {
+                    path,
+                    recursive: RecursiveMode::Recursive,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -6451,6 +6603,30 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    async fn wait_for_collection_watcher_status<F>(
+        state: &SharedState,
+        name: &str,
+        is_ready: F,
+    ) -> CollectionWatcherStatus
+    where
+        F: Fn(&CollectionWatcherStatus) -> bool,
+    {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Json(response) =
+                    collection_watcher_status(State(Arc::clone(state)), Path(name.to_string()))
+                        .await
+                        .unwrap();
+                if is_ready(&response.watcher) {
+                    return response.watcher;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
     }
 
     struct MockModelServer {
