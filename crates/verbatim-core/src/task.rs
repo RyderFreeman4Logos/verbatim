@@ -539,6 +539,24 @@ pub fn ingest_task_request_metadata_with_queue_claim(
     vectors_only: bool,
     queue_claimable: bool,
 ) -> Value {
+    ingest_task_request_metadata_with_queue_claim_and_batch(
+        source_id,
+        force,
+        embedding_profile_id,
+        vectors_only,
+        queue_claimable,
+        None,
+    )
+}
+
+pub fn ingest_task_request_metadata_with_queue_claim_and_batch(
+    source_id: Option<&str>,
+    force: bool,
+    embedding_profile_id: Option<&str>,
+    vectors_only: bool,
+    queue_claimable: bool,
+    ingest_batch_id: Option<&str>,
+) -> Value {
     bounded_json(json!({
         "ingest_request_version": 1,
         "source_id": source_id,
@@ -546,6 +564,7 @@ pub fn ingest_task_request_metadata_with_queue_claim(
         "embedding_profile_id": embedding_profile_id,
         "vectors_only": vectors_only,
         "queue_claimable": queue_claimable,
+        "ingest_batch_id": ingest_batch_id,
     }))
 }
 
@@ -556,12 +575,31 @@ pub fn reindex_task_request_metadata_with_queue_claim(
     vectors_only: bool,
     queue_claimable: bool,
 ) -> Value {
-    let mut metadata = ingest_task_request_metadata_with_queue_claim(
+    reindex_task_request_metadata_with_queue_claim_and_batch(
         source_id,
         force,
         embedding_profile_id,
         vectors_only,
         queue_claimable,
+        None,
+    )
+}
+
+pub fn reindex_task_request_metadata_with_queue_claim_and_batch(
+    source_id: Option<&str>,
+    force: bool,
+    embedding_profile_id: Option<&str>,
+    vectors_only: bool,
+    queue_claimable: bool,
+    ingest_batch_id: Option<&str>,
+) -> Value {
+    let mut metadata = ingest_task_request_metadata_with_queue_claim_and_batch(
+        source_id,
+        force,
+        embedding_profile_id,
+        vectors_only,
+        queue_claimable,
+        ingest_batch_id,
     );
     if let Value::Object(map) = &mut metadata {
         map.insert(
@@ -750,7 +788,7 @@ mod tests {
         assert!(encoded.contains("\"vectors\""));
         assert!(encoded.contains("\"latest_error\""));
         assert!(encoded.len() <= TASK_METADATA_MAX_BYTES);
-        assert!(bounded.phase.unwrap().elapsed_ms <= u64::MAX);
+        assert!(bounded.phase.unwrap().elapsed_ms < 5_000);
     }
 
     #[test]
@@ -771,5 +809,20 @@ mod tests {
         assert_eq!(result["embedding_cache"]["embedded_chunks"], 1);
         assert_eq!(result["embedding_cache"]["reused_chunks"], 2);
         assert_eq!(result["embedding_cache"]["changed_chunks"], 1);
+    }
+
+    #[test]
+    fn ingest_request_metadata_can_persist_batch_id() {
+        let request = ingest_task_request_metadata_with_queue_claim_and_batch(
+            Some("src-1"),
+            false,
+            None,
+            false,
+            true,
+            Some("task-batch"),
+        );
+
+        assert_eq!(request["ingest_batch_id"], "task-batch");
+        assert_eq!(request["queue_claimable"], true);
     }
 }

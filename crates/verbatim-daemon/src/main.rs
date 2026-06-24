@@ -55,14 +55,16 @@ use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeli
 use verbatim_core::store::Store;
 use verbatim_core::task::{
     ask_request_metadata, ask_result_metadata, bounded_error, ingest_result_metadata,
-    ingest_task_request_metadata_with_queue_claim, reindex_result_metadata,
-    reindex_task_request_metadata_with_queue_claim, retrieve_request_metadata,
+    ingest_task_request_metadata_with_queue_claim,
+    ingest_task_request_metadata_with_queue_claim_and_batch, reindex_result_metadata,
+    reindex_task_request_metadata_with_queue_claim,
+    reindex_task_request_metadata_with_queue_claim_and_batch, retrieve_request_metadata,
     retrieve_result_metadata, PhaseTiming, TaskEndpointSummary, TaskId, TaskKind,
     TaskProgressSnapshot, TaskStatus,
 };
 use verbatim_core::types::{
-    CitationRef, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug,
-    RetrievalEvidenceRole, RetrievalResult, SourceId, SourceStatus,
+    CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact,
+    RetrievalDebug, RetrievalEvidenceRole, RetrievalResult, SourceId, SourceStatus,
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
@@ -83,6 +85,8 @@ struct AppState {
     /// Independent task metadata connection so queue operations do not wait for long ingest work.
     task_store: std::sync::Mutex<Store>,
     ingest_queue_active: AtomicBool,
+    /// Actual indexing worker occupancy, independent from persisted task status.
+    ingest_worker_active: AtomicBool,
     collection_watcher: CollectionWatcherRuntime,
     runtime_config: std::sync::RwLock<RuntimeConfigState>,
     config_path: PathBuf,
@@ -327,6 +331,8 @@ struct PersistedIngestRequest {
     vectors_only: bool,
     #[serde(default)]
     queue_claimable: Option<bool>,
+    #[serde(default)]
+    ingest_batch_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +341,7 @@ struct IndexingTaskControls {
     force: bool,
     embedding_profile_id: Option<String>,
     vectors_only: bool,
+    ingest_batch_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +372,14 @@ enum TaskStartOutcome {
     Started,
     BlockedByRunningIngest,
     NotQueued,
+}
+
+#[derive(Debug, Clone)]
+struct IngestBatchExpansionCandidate {
+    task_id: TaskId,
+    force: bool,
+    embedding_profile_id: Option<String>,
+    vectors_only: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -853,9 +868,17 @@ async fn create_persisted_task(
     kind: TaskKind,
     request: serde_json::Value,
 ) -> Result<TaskId, (StatusCode, Json<ErrorResponse>)> {
+    create_persisted_task_with_id(state, TaskId::new(), kind, request).await
+}
+
+async fn create_persisted_task_with_id(
+    state: &SharedState,
+    task_id: TaskId,
+    kind: TaskKind,
+    request: serde_json::Value,
+) -> Result<TaskId, (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
-        let task_id = TaskId::new();
         let store = state
             .task_store
             .lock()
@@ -868,6 +891,61 @@ async fn create_persisted_task(
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn create_background_ingest_batch(
+    state: &SharedState,
+    req: TaskIngestRequest,
+) -> Result<TaskId, (StatusCode, Json<ErrorResponse>)> {
+    let parent_id = TaskId::new();
+    let state = Arc::clone(state);
+    let parent_id_for_task = parent_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let parent_request = ingest_task_request_metadata_with_queue_claim_and_batch(
+            None,
+            req.force,
+            req.embedding_profile_id.as_deref(),
+            req.vectors_only,
+            false,
+            Some(&parent_id_for_task.0),
+        );
+        let parent = store.create_task(&parent_id_for_task, TaskKind::Ingest, &parent_request)?;
+        let payload = queued_event_payload(&store, parent)?;
+        store.insert_task_event(&parent_id_for_task, "queued", "task queued", &payload)?;
+
+        Ok::<_, anyhow::Error>(parent_id_for_task)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn background_ingest_batch_source_ids(
+    state: &SharedState,
+    force: bool,
+    vectors_only: bool,
+) -> Result<Vec<SourceId>> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !force && !vectors_only {
+            pipeline.check_stale()?;
+        }
+        let sources = pipeline.store().list_sources()?;
+        Ok::<_, anyhow::Error>(
+            sources
+                .into_iter()
+                .filter(|source| vectors_only || force || source.status != SourceStatus::Indexed)
+                .map(|source| source.id)
+                .collect(),
+        )
+    })
+    .await
+    .context("join ingest batch source expansion task")?
 }
 
 fn queued_event_payload(
@@ -982,7 +1060,9 @@ async fn try_mark_ingest_task_started(
         if task.status != TaskStatus::Queued {
             return Ok(TaskStartOutcome::NotQueued);
         }
-        if store.count_running_tasks(TaskKind::Ingest)? > 0 {
+        if state.ingest_worker_active.load(Ordering::Acquire)
+            || store.count_running_tasks(TaskKind::Ingest)? > 0
+        {
             return Ok(TaskStartOutcome::BlockedByRunningIngest);
         }
         if !store.start_task_if_no_running(&task_id, TaskKind::Ingest)? {
@@ -1002,6 +1082,7 @@ async fn try_mark_ingest_task_started(
     })
 }
 
+#[cfg(test)]
 async fn ensure_ingest_task_started(
     state: &SharedState,
     task_id: &TaskId,
@@ -1019,6 +1100,25 @@ async fn ensure_ingest_task_started(
                 ));
             }
         }
+    }
+}
+
+async fn start_foreground_ingest_task(
+    state: &SharedState,
+    task_id: &TaskId,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    match try_mark_ingest_task_started(state, task_id).await? {
+        TaskStartOutcome::Started => Ok(()),
+        TaskStartOutcome::BlockedByRunningIngest => Err(err(
+            StatusCode::CONFLICT,
+            anyhow::anyhow!(
+                "ingest queue busy: another ingest task is running; retry later or use `verbatim ingest --background` to queue persistent work"
+            ),
+        )),
+        TaskStartOutcome::NotQueued => Err(err(
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("ingest task was cancelled or already started before it could start"),
+        )),
     }
 }
 
@@ -1120,6 +1220,7 @@ async fn finish_task_success(
         let task_changed = store.finish_task_success(&task_id, &result)?;
         if task_changed {
             store.insert_task_event(&task_id, "succeeded", "task succeeded", &result)?;
+            finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
         }
         Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
     })
@@ -1189,6 +1290,7 @@ async fn finish_task_failed_with_upstream(
                 payload["resumability"] = resumability;
             }
             store.insert_task_event(&task_id, "failed", "task failed", &payload)?;
+            finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
         }
         Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
     })
@@ -1230,6 +1332,7 @@ fn resumability_payload(
         "embedding_profile_id": plan.controls.embedding_profile_id.clone(),
         "vectors_only": plan.controls.vectors_only,
         "force": plan.controls.force,
+        "ingest_batch_id": plan.controls.ingest_batch_id.clone(),
         "previous_error": previous_error.map(bounded_error),
     })
 }
@@ -1353,10 +1456,13 @@ async fn ingest_all(
     execute_ingest_task(
         state,
         task_id,
-        None,
-        query.force,
-        query.embedding_profile_id.clone(),
-        query.vectors_only,
+        IndexingTaskControls {
+            source_id: None,
+            force: query.force,
+            embedding_profile_id: query.embedding_profile_id.clone(),
+            vectors_only: query.vectors_only,
+            ingest_batch_id: None,
+        },
     )
     .await
     .map(Json)
@@ -1388,10 +1494,13 @@ async fn ingest_one(
     execute_ingest_task(
         state,
         task_id,
-        Some(id),
-        false,
-        query.embedding_profile_id.clone(),
-        query.vectors_only,
+        IndexingTaskControls {
+            source_id: Some(id),
+            force: false,
+            embedding_profile_id: query.embedding_profile_id.clone(),
+            vectors_only: query.vectors_only,
+            ingest_batch_id: None,
+        },
     )
     .await
     .map(Json)
@@ -1538,15 +1647,23 @@ async fn submit_ingest_task(
             anyhow::anyhow!("force is not supported for vectors-only embedding profile builds"),
         ));
     }
-    let task_id = create_persisted_task(
+    if req.source_id.is_none() {
+        let task_id = create_background_ingest_batch(&state, req).await?;
+        schedule_ingest_queue(Arc::clone(&state));
+        return Ok(Json(TaskCreatedResponse { task_id: task_id.0 }));
+    }
+    let task_id = TaskId::new();
+    let task_id = create_persisted_task_with_id(
         &state,
+        task_id,
         TaskKind::Ingest,
-        ingest_task_request_metadata_with_queue_claim(
+        ingest_task_request_metadata_with_queue_claim_and_batch(
             req.source_id.as_deref(),
             req.force,
             req.embedding_profile_id.as_deref(),
             req.vectors_only,
             true,
+            None,
         ),
     )
     .await?;
@@ -1560,15 +1677,19 @@ async fn submit_reindex_task(
 ) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
     let controls = resolve_reindex_controls(req).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     validate_requested_source_exists(&state, controls.source_id.as_deref()).await?;
-    let task_id = create_persisted_task(
+    let task_id = TaskId::new();
+    let ingest_batch_id = controls.source_id.is_none().then(|| task_id.0.clone());
+    let task_id = create_persisted_task_with_id(
         &state,
+        task_id,
         TaskKind::Ingest,
-        reindex_task_request_metadata_with_queue_claim(
+        reindex_task_request_metadata_with_queue_claim_and_batch(
             controls.source_id.as_deref(),
             controls.force,
             controls.embedding_profile_id.as_deref(),
             controls.vectors_only,
             true,
+            ingest_batch_id.as_deref(),
         ),
     )
     .await?;
@@ -1680,16 +1801,11 @@ fn spawn_resumed_indexing_task(state: SharedState, plan: ResumeTaskPlan) {
     tokio::spawn(async move {
         let task_id = plan.task_id.clone();
         let result = match plan.operation {
-            ResumableIngestOperation::Ingest => execute_ingest_task(
-                Arc::clone(&state),
-                task_id.clone(),
-                plan.controls.source_id,
-                plan.controls.force,
-                plan.controls.embedding_profile_id,
-                plan.controls.vectors_only,
-            )
-            .await
-            .map(|_| ()),
+            ResumableIngestOperation::Ingest => {
+                execute_ingest_task(Arc::clone(&state), task_id.clone(), plan.controls)
+                    .await
+                    .map(|_| ())
+            }
             ResumableIngestOperation::Reindex => {
                 execute_reindex_task(Arc::clone(&state), task_id.clone(), plan.controls)
                     .await
@@ -2683,8 +2799,47 @@ fn schedule_ingest_queue(state: SharedState) {
     });
 }
 
+struct IngestWorkerLease {
+    state: SharedState,
+}
+
+impl Drop for IngestWorkerLease {
+    fn drop(&mut self) {
+        self.state
+            .ingest_worker_active
+            .store(false, Ordering::Release);
+        schedule_ingest_queue(Arc::clone(&self.state));
+    }
+}
+
+fn acquire_ingest_worker(
+    state: &SharedState,
+) -> Result<IngestWorkerLease, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .ingest_worker_active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| {
+            err(
+                StatusCode::CONFLICT,
+                anyhow::anyhow!(
+                    "ingest queue busy: another ingest task is running; retry later or use `verbatim ingest --background` to queue persistent work"
+                ),
+            )
+        })?;
+    Ok(IngestWorkerLease {
+        state: Arc::clone(state),
+    })
+}
+
 async fn drain_ingest_queue(state: SharedState) {
     loop {
+        match expand_next_unexpanded_ingest_batch(&state).await {
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!(error = %err, "failed to expand queued ingest batch");
+                break;
+            }
+        }
         let task = match claim_startable_ingest_task(&state).await {
             Ok(Some(task)) => task,
             Ok(None) => break,
@@ -2706,22 +2861,16 @@ async fn drain_ingest_queue(state: SharedState) {
             force: request.force,
             embedding_profile_id: request.embedding_profile_id,
             vectors_only: request.vectors_only,
+            ingest_batch_id: request.ingest_batch_id,
         };
         let result = if request.operation.as_deref() == Some("reindex") {
             execute_started_reindex_task(Arc::clone(&state), &task_id, controls)
                 .await
                 .map(|_| ())
         } else {
-            execute_started_ingest_task(
-                Arc::clone(&state),
-                &task_id,
-                controls.source_id,
-                controls.force,
-                controls.embedding_profile_id,
-                controls.vectors_only,
-            )
-            .await
-            .map(|_| ())
+            execute_started_ingest_task(Arc::clone(&state), &task_id, controls)
+                .await
+                .map(|_| ())
         };
         if let Err((_, Json(error))) = &result {
             let _ = finish_task_failed_from_response(&state, &task_id, error).await;
@@ -2732,6 +2881,9 @@ async fn drain_ingest_queue(state: SharedState) {
 async fn claim_startable_ingest_task(
     state: &SharedState,
 ) -> Result<Option<verbatim_core::task::TaskSummary>> {
+    if state.ingest_worker_active.load(Ordering::Acquire) {
+        return Ok(None);
+    }
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         let store = state
@@ -2745,6 +2897,9 @@ async fn claim_startable_ingest_task(
 }
 
 async fn ingest_queue_ready_to_drain(state: &SharedState) -> Result<bool> {
+    if state.ingest_worker_active.load(Ordering::Acquire) {
+        return Ok(false);
+    }
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         let store = state
@@ -2753,11 +2908,116 @@ async fn ingest_queue_ready_to_drain(state: &SharedState) -> Result<bool> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok::<_, anyhow::Error>(
             store.count_running_tasks(TaskKind::Ingest)? == 0
-                && next_queue_claimable_ingest_task(&store)?.is_some(),
+                && (next_unexpanded_ingest_batch_parent(&store)?.is_some()
+                    || next_queue_claimable_ingest_task(&store)?.is_some()),
         )
     })
     .await
     .context("join ingest queue readiness task")?
+}
+
+async fn expand_next_unexpanded_ingest_batch(state: &SharedState) -> Result<bool> {
+    if state.ingest_worker_active.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+
+    let Some(candidate) = next_unexpanded_ingest_batch_parent_async(state).await? else {
+        return Ok(false);
+    };
+
+    let source_ids =
+        match background_ingest_batch_source_ids(state, candidate.force, candidate.vectors_only)
+            .await
+        {
+            Ok(source_ids) => source_ids,
+            Err(error) => {
+                finish_task_failed(state, &candidate.task_id, &error.to_string())
+                    .await
+                    .map_err(|(_, Json(error))| anyhow::anyhow!(error.error))?;
+                return Ok(true);
+            }
+        };
+
+    persist_ingest_batch_children(state, candidate, source_ids).await
+}
+
+async fn next_unexpanded_ingest_batch_parent_async(
+    state: &SharedState,
+) -> Result<Option<IngestBatchExpansionCandidate>> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        next_unexpanded_ingest_batch_parent(&store)
+    })
+    .await
+    .context("join ingest batch parent lookup task")?
+}
+
+async fn persist_ingest_batch_children(
+    state: &SharedState,
+    candidate: IngestBatchExpansionCandidate,
+    source_ids: Vec<SourceId>,
+) -> Result<bool> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if store.count_running_tasks(TaskKind::Ingest)? > 0 {
+            return Ok(false);
+        }
+        let Some(parent) = store.get_task(&candidate.task_id)? else {
+            return Ok(false);
+        };
+        let Some(candidate) = ingest_batch_expansion_candidate(&store, &parent)? else {
+            return Ok(false);
+        };
+
+        for source_id in &source_ids {
+            let child_id = TaskId::new();
+            let child_request = ingest_task_request_metadata_with_queue_claim_and_batch(
+                Some(source_id.0.as_str()),
+                false,
+                candidate.embedding_profile_id.as_deref(),
+                candidate.vectors_only,
+                true,
+                Some(&candidate.task_id.0),
+            );
+            let child = store.create_task(&child_id, TaskKind::Ingest, &child_request)?;
+            let payload = queued_event_payload(&store, child)?;
+            store.insert_task_event(&child_id, "queued", "task queued", &payload)?;
+        }
+
+        if source_ids.is_empty() {
+            let result = ingest_result_metadata(0, &EmbeddingCacheStats::default());
+            if store.finish_task_success(&candidate.task_id, &result)? {
+                store.insert_task_event(
+                    &candidate.task_id,
+                    "succeeded",
+                    "task succeeded",
+                    &result,
+                )?;
+            }
+            return Ok(true);
+        }
+
+        store.insert_task_event(
+            &candidate.task_id,
+            "batch_expanded",
+            "ingest batch children queued",
+            &serde_json::json!({
+                "ingest_batch_id": candidate.task_id.0,
+                "children": source_ids.len(),
+            }),
+        )?;
+        Ok::<_, anyhow::Error>(true)
+    })
+    .await
+    .context("join ingest batch child persistence task")?
 }
 
 fn parse_persisted_ingest_request(request: serde_json::Value) -> Result<PersistedIngestRequest> {
@@ -2806,6 +3066,7 @@ fn resumable_task_plan(task: &verbatim_core::task::TaskSummary) -> Result<Option
             force: request.force,
             embedding_profile_id: request.embedding_profile_id,
             vectors_only: request.vectors_only,
+            ingest_batch_id: request.ingest_batch_id,
         },
         queue_claimable: request.queue_claimable.unwrap_or(false),
     }))
@@ -2816,10 +3077,61 @@ fn next_queue_claimable_ingest_task(
 ) -> Result<Option<verbatim_core::task::TaskSummary>> {
     for task in store.queued_tasks(TaskKind::Ingest)? {
         if ingest_task_can_be_claimed_by_queue(&task.request) {
+            if let Some(batch_id) = cancelled_parent_batch_id(store, &task)? {
+                cancel_ingest_batch_child(store, &task.id, &batch_id)?;
+                continue;
+            }
             return Ok(Some(task));
         }
     }
     Ok(None)
+}
+
+fn next_unexpanded_ingest_batch_parent(
+    store: &Store,
+) -> Result<Option<IngestBatchExpansionCandidate>> {
+    if store.count_running_tasks(TaskKind::Ingest)? > 0 {
+        return Ok(None);
+    }
+    for task in store.queued_tasks(TaskKind::Ingest)? {
+        if let Some(candidate) = ingest_batch_expansion_candidate(store, &task)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn ingest_batch_expansion_candidate(
+    store: &Store,
+    task: &verbatim_core::task::TaskSummary,
+) -> Result<Option<IngestBatchExpansionCandidate>> {
+    if task.status != TaskStatus::Queued {
+        return Ok(None);
+    }
+    let Some(request) = parse_ingest_request_lossy(&task.request) else {
+        return Ok(None);
+    };
+    if request.operation.as_deref().unwrap_or("ingest") != "ingest" {
+        return Ok(None);
+    }
+    if request.source_id.is_some() {
+        return Ok(None);
+    }
+    if request.queue_claimable.unwrap_or(true) {
+        return Ok(None);
+    }
+    if request.ingest_batch_id.as_deref() != Some(task.id.0.as_str()) {
+        return Ok(None);
+    }
+    if !ingest_batch_children(store, &task.id.0)?.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(IngestBatchExpansionCandidate {
+        task_id: task.id.clone(),
+        force: request.force,
+        embedding_profile_id: request.embedding_profile_id,
+        vectors_only: request.vectors_only,
+    }))
 }
 
 fn claim_next_queue_claimable_ingest_task(
@@ -2845,6 +3157,22 @@ fn ingest_task_can_be_claimed_by_queue(request: &serde_json::Value) -> bool {
         }
         Err(_) => true,
     }
+}
+
+fn cancelled_parent_batch_id(
+    store: &Store,
+    task: &verbatim_core::task::TaskSummary,
+) -> Result<Option<String>> {
+    let Some(batch_id) = ingest_request_batch_id(&task.request) else {
+        return Ok(None);
+    };
+    if batch_id == task.id.0 {
+        return Ok(None);
+    }
+    let Some(parent) = store.get_task(&TaskId(batch_id.clone()))? else {
+        return Ok(None);
+    };
+    Ok((parent.status == TaskStatus::Cancelled).then_some(batch_id))
 }
 
 fn validate_ingest_controls(
@@ -2901,6 +3229,7 @@ fn resolve_reindex_controls(req: ReindexRequest) -> Result<IndexingTaskControls>
         force,
         embedding_profile_id: req.embedding_profile_id,
         vectors_only,
+        ingest_batch_id: None,
     })
 }
 
@@ -2935,22 +3264,11 @@ async fn validate_requested_source_exists(
 async fn execute_ingest_task(
     state: SharedState,
     task_id: TaskId,
-    source_id: Option<String>,
-    force: bool,
-    embedding_profile_id: Option<String>,
-    vectors_only: bool,
+    controls: IndexingTaskControls,
 ) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
     let result = async {
-        ensure_ingest_task_started(&state, &task_id).await?;
-        execute_started_ingest_task(
-            Arc::clone(&state),
-            &task_id,
-            source_id,
-            force,
-            embedding_profile_id,
-            vectors_only,
-        )
-        .await
+        start_foreground_ingest_task(&state, &task_id).await?;
+        execute_started_ingest_task(Arc::clone(&state), &task_id, controls).await
     }
     .await;
     if let Err((_, Json(error))) = &result {
@@ -2962,17 +3280,8 @@ async fn execute_ingest_task(
 async fn execute_started_ingest_task(
     state: SharedState,
     task_id: &TaskId,
-    source_id: Option<String>,
-    force: bool,
-    embedding_profile_id: Option<String>,
-    vectors_only: bool,
+    controls: IndexingTaskControls,
 ) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
-    let controls = IndexingTaskControls {
-        source_id,
-        force,
-        embedding_profile_id,
-        vectors_only,
-    };
     let (outcome, profile_id) =
         run_indexing_operation(Arc::clone(&state), task_id, &controls, "ingest").await?;
     let response = IngestResponse {
@@ -2998,7 +3307,7 @@ async fn execute_reindex_task(
     controls: IndexingTaskControls,
 ) -> Result<ReindexResponse, (StatusCode, Json<ErrorResponse>)> {
     let result = async {
-        ensure_ingest_task_started(&state, &task_id).await?;
+        start_foreground_ingest_task(&state, &task_id).await?;
         execute_started_reindex_task(Arc::clone(&state), &task_id, controls).await
     }
     .await;
@@ -3054,6 +3363,7 @@ async fn run_indexing_operation(
         &config.embedding.profile_id,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let _worker = acquire_ingest_worker(&state)?;
     let state2 = Arc::clone(&state);
     let task_id2 = task_id.clone();
     let profile_id_for_task = profile_id.clone();
@@ -3136,6 +3446,7 @@ async fn run_indexing_operation(
         "embedding_profile_id": profile_id.as_str(),
         "vectors_only": controls.vectors_only,
         "source_id": controls.source_id.as_deref(),
+        "ingest_batch_id": controls.ingest_batch_id.as_deref(),
         "embedding_cache": &outcome.embedding_cache,
     }));
     if controls.vectors_only {
@@ -3171,7 +3482,7 @@ async fn cancel_task_record(
             .task_store
             .lock()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        store
+        let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
         let changed = store.cancel_task(&task_id)?;
@@ -3182,6 +3493,19 @@ async fn cancel_task_record(
                 "task cancelled",
                 &serde_json::json!({}),
             )?;
+            if let Some(batch_id) = task_controlled_ingest_batch_id(&task) {
+                let cancelled_children =
+                    cancel_active_ingest_batch_children(&store, &task_id, &batch_id)?;
+                store.insert_task_event(
+                    &task_id,
+                    "batch_cancelled",
+                    "ingest batch children cancelled",
+                    &serde_json::json!({
+                        "ingest_batch_id": batch_id,
+                        "cancelled_children": cancelled_children,
+                    }),
+                )?;
+            }
         }
         Ok::<_, anyhow::Error>(changed)
     })
@@ -3194,6 +3518,176 @@ async fn cancel_task_record(
             err(StatusCode::INTERNAL_SERVER_ERROR, e)
         }
     })
+}
+
+fn task_controlled_ingest_batch_id(task: &verbatim_core::task::TaskSummary) -> Option<String> {
+    if task.kind != TaskKind::Ingest {
+        return None;
+    }
+    let request = parse_ingest_request_lossy(&task.request)?;
+    let batch_id = request.ingest_batch_id?;
+    (batch_id == task.id.0).then_some(batch_id)
+}
+
+fn parse_ingest_request_lossy(request: &serde_json::Value) -> Option<PersistedIngestRequest> {
+    serde_json::from_value(request.clone()).ok()
+}
+
+fn cancel_active_ingest_batch_children(
+    store: &Store,
+    parent_id: &TaskId,
+    batch_id: &str,
+) -> Result<usize> {
+    let mut cancelled = 0;
+    for task in store.active_tasks(TaskKind::Ingest)? {
+        if task.id == *parent_id {
+            continue;
+        }
+        if ingest_request_batch_id(&task.request).as_deref() != Some(batch_id) {
+            continue;
+        }
+        if cancel_ingest_batch_child(store, &task.id, batch_id)? {
+            cancelled += 1;
+        }
+    }
+    Ok(cancelled)
+}
+
+fn cancel_ingest_batch_child(store: &Store, task_id: &TaskId, batch_id: &str) -> Result<bool> {
+    let changed = store.cancel_task(task_id)?;
+    if changed {
+        store.insert_task_event(
+            task_id,
+            "cancelled",
+            "task cancelled because ingest batch was cancelled",
+            &serde_json::json!({ "ingest_batch_id": batch_id }),
+        )?;
+    }
+    Ok(changed)
+}
+
+fn ingest_request_batch_id(request: &serde_json::Value) -> Option<String> {
+    parse_ingest_request_lossy(request)?.ingest_batch_id
+}
+
+fn task_child_ingest_batch_id(task: &verbatim_core::task::TaskSummary) -> Option<String> {
+    if task.kind != TaskKind::Ingest {
+        return None;
+    }
+    let batch_id = ingest_request_batch_id(&task.request)?;
+    (batch_id != task.id.0).then_some(batch_id)
+}
+
+fn ingest_batch_children(
+    store: &Store,
+    batch_id: &str,
+) -> Result<Vec<verbatim_core::task::TaskSummary>> {
+    let children = store
+        .tasks(TaskKind::Ingest)?
+        .into_iter()
+        .filter(|task| {
+            task.id.0 != batch_id
+                && ingest_request_batch_id(&task.request).as_deref() == Some(batch_id)
+        })
+        .collect::<Vec<_>>();
+    Ok(children)
+}
+
+fn finalize_ingest_batch_parent_if_complete(
+    store: &Store,
+    completed_task: Option<&verbatim_core::task::TaskSummary>,
+) -> Result<()> {
+    let Some(batch_id) = completed_task.and_then(task_child_ingest_batch_id) else {
+        return Ok(());
+    };
+    let parent_id = TaskId(batch_id.clone());
+    let Some(parent) = store.get_task(&parent_id)? else {
+        return Ok(());
+    };
+    if parent.status.is_terminal() {
+        return Ok(());
+    }
+
+    let children = ingest_batch_children(store, &batch_id)?;
+    if children.is_empty() || children.iter().any(|task| !task.status.is_terminal()) {
+        return Ok(());
+    }
+
+    let result = ingest_batch_result_metadata(&batch_id, &children);
+    let has_failed_or_cancelled = children
+        .iter()
+        .any(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled));
+    if has_failed_or_cancelled {
+        let error = "one or more ingest batch children did not succeed";
+        if store.finish_task_failed_with_result(&parent_id, error, Some(&result))? {
+            store.insert_task_event(
+                &parent_id,
+                "failed",
+                "task failed",
+                &serde_json::json!({
+                    "error": bounded_error(error),
+                    "ingest_batch": result,
+                }),
+            )?;
+        }
+        return Ok(());
+    }
+
+    if store.finish_task_success(&parent_id, &result)? {
+        store.insert_task_event(&parent_id, "succeeded", "task succeeded", &result)?;
+    }
+    Ok(())
+}
+
+fn ingest_batch_result_metadata(
+    batch_id: &str,
+    children: &[verbatim_core::task::TaskSummary],
+) -> serde_json::Value {
+    let mut embedding_cache = EmbeddingCacheStats::default();
+    let mut ingested = 0;
+    let mut succeeded = 0;
+    let mut failed = 0;
+    let mut cancelled = 0;
+
+    for child in children {
+        match child.status {
+            TaskStatus::Succeeded => {
+                succeeded += 1;
+                ingested += child
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("ingested"))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(1);
+                if let Some(stats) = child
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("embedding_cache"))
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<EmbeddingCacheStats>(value).ok())
+                {
+                    embedding_cache.add(&stats);
+                }
+            }
+            TaskStatus::Failed => failed += 1,
+            TaskStatus::Cancelled => cancelled += 1,
+            TaskStatus::Queued | TaskStatus::Running => {}
+        }
+    }
+
+    let mut result = ingest_result_metadata(ingested, &embedding_cache);
+    if let serde_json::Value::Object(map) = &mut result {
+        map.insert(
+            "ingest_batch_id".into(),
+            serde_json::Value::String(batch_id.into()),
+        );
+        map.insert("total_children".into(), serde_json::json!(children.len()));
+        map.insert("succeeded_children".into(), serde_json::json!(succeeded));
+        map.insert("failed_children".into(), serde_json::json!(failed));
+        map.insert("cancelled_children".into(), serde_json::json!(cancelled));
+    }
+    result
 }
 
 async fn task_wait_snapshot(
@@ -4650,6 +5144,7 @@ async fn run_daemon() -> Result<()> {
         pipeline: std::sync::Mutex::new(pipeline),
         task_store: std::sync::Mutex::new(task_store),
         ingest_queue_active: AtomicBool::new(false),
+        ingest_worker_active: AtomicBool::new(false),
         collection_watcher: CollectionWatcherRuntime::default(),
         runtime_config: std::sync::RwLock::new(RuntimeConfigState {
             config,
@@ -6108,6 +6603,415 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_ingest_batch_parent_cancels_queued_children() {
+        let test_dir = TestDir::new("ingest-batch-cancel-children");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let parent_id = TaskId::new();
+        create_persisted_task_with_id(
+            &state,
+            parent_id.clone(),
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(&parent_id.0),
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &parent_id)
+            .await
+            .unwrap();
+        let child_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                Some("src-child"),
+                false,
+                None,
+                false,
+                true,
+                Some(&parent_id.0),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let Json(cancelled) =
+            cancel_task_handler(State(Arc::clone(&state)), Path(parent_id.clone().0))
+                .await
+                .unwrap();
+
+        assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+        let child = task_summary_response(&state, child_id.clone())
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(child.status, TaskStatus::Cancelled);
+        let events = task_events_response(&state, parent_id, None, Some(10))
+            .await
+            .unwrap()
+            .events;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "batch_cancelled"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_ingest_batch_children_are_not_claimed_after_restart() {
+        let test_dir = TestDir::new("ingest-batch-restart-skip");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let parent_id = TaskId::new();
+        create_persisted_task_with_id(
+            &state,
+            parent_id.clone(),
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                None,
+                false,
+                None,
+                false,
+                true,
+                Some(&parent_id.0),
+            ),
+        )
+        .await
+        .unwrap();
+        let child_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                Some("src-after-restart"),
+                false,
+                None,
+                false,
+                true,
+                Some(&parent_id.0),
+            ),
+        )
+        .await
+        .unwrap();
+        {
+            let store = state.task_store.lock().unwrap();
+            assert!(store.cancel_task(&parent_id).unwrap());
+        }
+
+        let claimed = claim_startable_ingest_task(&state).await.unwrap();
+
+        assert!(claimed.is_none());
+        let child = task_summary_response(&state, child_id).await.unwrap().task;
+        assert_eq!(child.status, TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn all_source_background_ingest_submit_returns_while_pipeline_locked() {
+        let test_dir = TestDir::new("ingest-batch-submit-immediate");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let state_for_lock = Arc::clone(&state);
+        let lock_handle = tokio::task::spawn_blocking(move || {
+            let _pipeline = state_for_lock.pipeline.lock().unwrap();
+            let _ = locked_tx.send(());
+            release_rx.recv().unwrap();
+        });
+        locked_rx.await.unwrap();
+
+        let submitted = tokio::time::timeout(
+            Duration::from_secs(1),
+            submit_ingest_task(
+                State(Arc::clone(&state)),
+                Json(TaskIngestRequest {
+                    source_id: None,
+                    force: false,
+                    embedding_profile_id: None,
+                    vectors_only: false,
+                }),
+            ),
+        )
+        .await;
+        release_tx.send(()).unwrap();
+        lock_handle.await.unwrap();
+        let Json(created) = submitted
+            .expect("background all-source ingest submit should not wait for pipeline")
+            .unwrap();
+
+        assert!(!created.task_id.is_empty());
+        wait_for_ingest_queue_idle(&state).await;
+    }
+
+    #[tokio::test]
+    async fn public_background_ingest_batch_tags_children_and_restart_skip_cancels_them() {
+        let test_dir = TestDir::new("ingest-batch-public-restart-skip");
+        let first_path = test_dir.path().join("first.md");
+        let second_path = test_dir.path().join("second.md");
+        fs::write(&first_path, "first batch source").unwrap();
+        fs::write(&second_path, "second batch source").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let first_id = pipeline.add_source(&first_path).unwrap();
+        let second_id = pipeline.add_source(&second_path).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        state.ingest_queue_active.store(true, Ordering::Release);
+
+        let Json(created) = submit_ingest_task(
+            State(Arc::clone(&state)),
+            Json(TaskIngestRequest {
+                source_id: None,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+        state.ingest_queue_active.store(false, Ordering::Release);
+        let parent_id = TaskId(created.task_id);
+        assert!(ingest_batch_children_for_test(&state, &parent_id).is_empty());
+        assert!(expand_next_unexpanded_ingest_batch(&state).await.unwrap());
+        let children = ingest_batch_children_for_test(&state, &parent_id);
+
+        assert_eq!(children.len(), 2);
+        let child_source_ids = children
+            .iter()
+            .map(|task| task.request["source_id"].as_str().unwrap().to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            child_source_ids,
+            BTreeSet::from([first_id.0.clone(), second_id.0.clone()])
+        );
+        assert!(children.iter().all(|task| {
+            task.status == TaskStatus::Queued
+                && task.request["ingest_batch_id"] == parent_id.0
+                && task.request["queue_claimable"] == true
+        }));
+
+        let Json(cancelled) =
+            cancel_task_handler(State(Arc::clone(&state)), Path(parent_id.clone().0))
+                .await
+                .unwrap();
+        assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+
+        let claimed = claim_startable_ingest_task(&state).await.unwrap();
+
+        assert!(claimed.is_none());
+        let children = ingest_batch_children_for_test(&state, &parent_id);
+        assert!(children
+            .iter()
+            .all(|task| task.status == TaskStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn public_background_ingest_batch_parent_succeeds_after_children_succeed() {
+        let test_dir = TestDir::new("ingest-batch-public-parent-success");
+        let first_path = test_dir.path().join("first.md");
+        let second_path = test_dir.path().join("second.md");
+        fs::write(&first_path, "first batch source").unwrap();
+        fs::write(&second_path, "second batch source").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        pipeline.add_source(&first_path).unwrap();
+        pipeline.add_source(&second_path).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        state.ingest_queue_active.store(true, Ordering::Release);
+
+        let Json(created) = submit_ingest_task(
+            State(Arc::clone(&state)),
+            Json(TaskIngestRequest {
+                source_id: None,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+        state.ingest_queue_active.store(false, Ordering::Release);
+        let parent_id = TaskId(created.task_id);
+        assert!(expand_next_unexpanded_ingest_batch(&state).await.unwrap());
+        let children = ingest_batch_children_for_test(&state, &parent_id);
+        assert_eq!(children.len(), 2);
+
+        finish_task_success(
+            &state,
+            &children[0].id,
+            ingest_result_metadata(1, &EmbeddingCacheStats::default()),
+        )
+        .await
+        .unwrap();
+        let parent = task_summary_response(&state, parent_id.clone())
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(parent.status, TaskStatus::Queued);
+
+        finish_task_success(
+            &state,
+            &children[1].id,
+            ingest_result_metadata(1, &EmbeddingCacheStats::default()),
+        )
+        .await
+        .unwrap();
+
+        let parent = task_summary_response(&state, parent_id).await.unwrap().task;
+        assert_eq!(parent.status, TaskStatus::Succeeded);
+        assert_eq!(parent.result.unwrap()["ingested"], 2);
+    }
+
+    #[tokio::test]
+    async fn foreground_single_source_ingest_returns_busy_when_ingest_running() {
+        let test_dir = TestDir::new("foreground-ingest-busy");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+
+        let (status, Json(error)) = ingest_one(
+            State(Arc::clone(&state)),
+            Path("src-priority".into()),
+            Query(IngestQuery {
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(error.error.contains("ingest queue busy"));
+        let active = {
+            let store = state.task_store.lock().unwrap();
+            store.active_tasks(TaskKind::Ingest).unwrap()
+        };
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, running_id);
+    }
+
+    #[tokio::test]
+    async fn cancelling_running_batch_child_keeps_foreground_ingest_busy_until_worker_exits() {
+        let test_dir = TestDir::new("batch-child-cancel-worker-busy");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let parent_id = TaskId::new();
+        create_persisted_task_with_id(
+            &state,
+            parent_id.clone(),
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(&parent_id.0),
+            ),
+        )
+        .await
+        .unwrap();
+        let child_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                Some("src-child"),
+                false,
+                None,
+                false,
+                true,
+                Some(&parent_id.0),
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &child_id).await.unwrap();
+        state.ingest_worker_active.store(true, Ordering::Release);
+
+        let Json(cancelled) =
+            cancel_task_handler(State(Arc::clone(&state)), Path(parent_id.clone().0))
+                .await
+                .unwrap();
+        assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+        assert_eq!(running_ingest_count(&state).await, 0);
+
+        let (status, Json(error)) = ingest_one(
+            State(Arc::clone(&state)),
+            Path("src-priority".into()),
+            Query(IngestQuery {
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(error.error.contains("ingest queue busy"));
+        state.ingest_worker_active.store(false, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn cancelling_running_ingest_keeps_foreground_ingest_busy_until_worker_exits() {
+        let test_dir = TestDir::new("running-ingest-cancel-worker-busy");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+        state.ingest_worker_active.store(true, Ordering::Release);
+
+        let Json(cancelled) =
+            cancel_task_handler(State(Arc::clone(&state)), Path(running_id.clone().0))
+                .await
+                .unwrap();
+        assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+        assert_eq!(running_ingest_count(&state).await, 0);
+
+        let (status, Json(error)) = ingest_one(
+            State(Arc::clone(&state)),
+            Path("src-priority".into()),
+            Query(IngestQuery {
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(error.error.contains("ingest queue busy"));
+        state.ingest_worker_active.store(false, Ordering::Release);
+    }
+
+    #[tokio::test]
     async fn queued_background_ingest_drains_after_running_ingest_finishes() {
         let test_dir = TestDir::new("ingest-queue-drain");
         let config = retrieve_test_config("http://127.0.0.1:9/v1");
@@ -6305,10 +7209,13 @@ mod tests {
         let response = execute_ingest_task(
             Arc::clone(&state),
             foreground_id.clone(),
-            None,
-            false,
-            None,
-            false,
+            IndexingTaskControls {
+                source_id: None,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+                ingest_batch_id: None,
+            },
         )
         .await
         .unwrap();
@@ -6545,6 +7452,7 @@ mod tests {
             pipeline: std::sync::Mutex::new(pipeline),
             task_store: std::sync::Mutex::new(Store::new(&data_dir.join("verbatim.db")).unwrap()),
             ingest_queue_active: AtomicBool::new(false),
+            ingest_worker_active: AtomicBool::new(false),
             collection_watcher: CollectionWatcherRuntime::default(),
             runtime_config: std::sync::RwLock::new(RuntimeConfigState {
                 reload: initial_reload_metadata(&config_path),
@@ -6574,6 +7482,14 @@ mod tests {
         .await
         .unwrap();
         (running_id, queued_id)
+    }
+
+    fn ingest_batch_children_for_test(
+        state: &SharedState,
+        parent_id: &TaskId,
+    ) -> Vec<verbatim_core::task::TaskSummary> {
+        let store = state.task_store.lock().unwrap();
+        ingest_batch_children(&store, &parent_id.0).unwrap()
     }
 
     async fn assert_queued_ingest_waits_for_running(state: &SharedState, queued_id: &TaskId) {

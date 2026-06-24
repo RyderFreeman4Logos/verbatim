@@ -1531,6 +1531,23 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn task_status(&self, task_id: &TaskId) -> Result<Option<TaskStatus>> {
+        self.conn
+            .prepare("SELECT status FROM tasks WHERE id = ?1")?
+            .query_row(params![&task_id.0], |row| {
+                let status: String = row.get(0)?;
+                TaskStatus::from_store_str(&status).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        Type::Text,
+                        format!("invalid task status: {status}").into(),
+                    )
+                })
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn start_task(&self, task_id: &TaskId) -> Result<bool> {
         let now = unix_timestamp_string();
         let changed = self.conn.execute(
@@ -1634,6 +1651,35 @@ impl Store {
         )?;
         let rows = stmt.query_map(
             params![kind.as_str(), TaskStatus::Queued.as_str()],
+            row_to_task_summary,
+        )?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn tasks(&self, kind: TaskKind) -> Result<Vec<TaskSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json
+             FROM tasks
+             WHERE kind = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![kind.as_str()], row_to_task_summary)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn active_tasks(&self, kind: TaskKind) -> Result<Vec<TaskSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json
+             FROM tasks
+             WHERE kind = ?1 AND status IN (?2, ?3)
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                kind.as_str(),
+                TaskStatus::Queued.as_str(),
+                TaskStatus::Running.as_str(),
+            ],
             row_to_task_summary,
         )?;
         rows.map(|row| row.map_err(Into::into)).collect()
