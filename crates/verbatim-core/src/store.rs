@@ -335,6 +335,17 @@ impl Store {
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
+    pub fn list_collection_members_for_collections(
+        &self,
+        collection_names: &[String],
+    ) -> Result<Vec<CollectionMember>> {
+        let mut members = Vec::new();
+        for name in collection_names {
+            members.extend(self.list_collection_members(name)?);
+        }
+        Ok(members)
+    }
+
     pub fn replace_collection_members(
         &self,
         collection_name: &str,
@@ -3190,6 +3201,18 @@ mod tests {
             store.list_collection_members("areskapitalon").unwrap()[0].source_id,
             source_id
         );
+        let collection_members = store
+            .list_collection_members_for_collections(&[
+                "articles".to_string(),
+                "areskapitalon".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(collection_members.len(), 2);
+        let unique_source_ids = collection_members
+            .iter()
+            .map(|member| member.source_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique_source_ids.len(), 1);
 
         assert!(store.delete_collection("articles").unwrap());
         assert!(store.get_source(&source_id).unwrap().is_some());

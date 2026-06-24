@@ -2,9 +2,9 @@ use std::io::{self, Write};
 
 use serde_json::Value;
 use verbatim_core::api::{
-    AskResponse, CheckStaleResponse, CitationResponse, ConfigResponse, EvidenceResponse,
-    HealthResponse, IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse,
-    TaskCreatedResponse, TaskWaitEvent,
+    AskResponse, CheckStaleResponse, CitationResponse, CollectionFilterResponse,
+    CollectionResultProvenance, ConfigResponse, EvidenceResponse, HealthResponse, IngestResponse,
+    ReindexResponse, RetrieveResponse, SourceResponse, TaskCreatedResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::task::{TaskEvent, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary};
@@ -614,6 +614,9 @@ where
 
     writeln!(writer, "{}", response.answer)?;
     write_citations(writer, &response.citations)?;
+    if let Some(collection_filter) = &response.collection_filter {
+        write_collection_filter_summary(writer, collection_filter)?;
+    }
 
     if let Some(debug) = &response.retrieval {
         write_retrieval_debug_typed(writer, debug)?;
@@ -633,6 +636,9 @@ where
     writeln!(writer, "  query: {}", response.query)?;
     if let Some(source_id) = &response.source_id {
         writeln!(writer, "  source_id: {source_id}")?;
+    }
+    if let Some(collection_filter) = &response.collection_filter {
+        write_collection_filter_summary(writer, collection_filter)?;
     }
     writeln!(
         writer,
@@ -680,6 +686,7 @@ where
             if let Some(source_path) = &result.source_path {
                 writeln!(writer, "      source_path: {source_path}")?;
             }
+            write_collection_provenance(writer, &result.collections, "      ")?;
             writeln!(writer, "      locator: {}", result.locator)?;
             if let Some(locator) = &result.structured_locator {
                 write_structured_locator_details_with_indent(writer, locator, "      ")?;
@@ -723,6 +730,54 @@ where
             writer,
             "  [{}] evidence={} kind={} locator={}{}",
             citation.label, citation.evidence_id, citation.kind, citation.locator, derived
+        )?;
+        write_collection_provenance(writer, &citation.collections, "      ")?;
+    }
+    Ok(())
+}
+
+fn write_collection_filter_summary<W>(
+    writer: &mut W,
+    filter: &CollectionFilterResponse,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        writer,
+        "  collections: stale={} union_sources={}",
+        filter.stale, filter.union_source_count
+    )?;
+    for collection in &filter.applied {
+        writeln!(
+            writer,
+            "    - {} members={} indexed={} stale_members={} last_synced={}",
+            collection.name,
+            collection.member_count,
+            collection.indexed_member_count,
+            collection.stale_member_count,
+            collection.last_synced_at.as_deref().unwrap_or("never")
+        )?;
+    }
+    for warning in &filter.warnings {
+        writeln!(writer, "    warning: {warning}")?;
+    }
+    Ok(())
+}
+
+fn write_collection_provenance<W>(
+    writer: &mut W,
+    collections: &[CollectionResultProvenance],
+    indent: &str,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    for collection in collections {
+        writeln!(
+            writer,
+            "{indent}collection: {} logical_path={} member_updated_at={}",
+            collection.name, collection.logical_path, collection.member_updated_at
         )?;
     }
     Ok(())
@@ -1117,6 +1172,7 @@ mod tests {
             task_id: "task-1".into(),
             query: "markdown".into(),
             source_id: None,
+            collection_filter: None,
             embedding_profile_id: "default".into(),
             limit: 1,
             page_size: 1,
@@ -1139,6 +1195,7 @@ mod tests {
                 evidence_id: "ev-md".into(),
                 source_id: "src-1".into(),
                 source_path: Some("/tmp/doc.md".into()),
+                collections: Vec::new(),
                 chunk_id: "chunk-1".into(),
                 kind: "text".into(),
                 role: "original_text".into(),

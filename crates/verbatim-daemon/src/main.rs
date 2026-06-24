@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
 use std::io::Write;
@@ -23,16 +23,19 @@ use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 
 use verbatim_core::api::{
-    AddCollectionRootRequest, AddSourceRequest, AddSourceResponse, AskCitationEvent, AskErrorEvent,
-    AskRequest, AskResponse, AskTokenEvent, CheckStaleResponse, CitationResponse,
-    CollectionResponse, CollectionStatusResponse, CollectionSyncPathRequest, CollectionSyncRequest,
-    CollectionSyncResponse, ConfigResponse, CreateCollectionRequest, ErrorResponse,
-    EvidenceResponse, HealthResponse, ImageArtifactResponse, IngestResponse, ReindexRequest,
-    ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
+    AddCollectionRootRequest, AddSourceRequest, AddSourceResponse, AppliedCollectionFilterResponse,
+    AskCitationEvent, AskErrorEvent, AskRequest, AskResponse, AskTokenEvent, CheckStaleResponse,
+    CitationResponse, CollectionFilterRequest, CollectionFilterResponse, CollectionResponse,
+    CollectionResultProvenance, CollectionStatusResponse, CollectionSyncPathRequest,
+    CollectionSyncRequest, CollectionSyncResponse, ConfigResponse, CreateCollectionRequest,
+    ErrorResponse, EvidenceResponse, HealthResponse, ImageArtifactResponse, IngestResponse,
+    ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
     RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
     TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
 };
-use verbatim_core::collection::{CollectionRecord, CollectionSyncPathInput};
+use verbatim_core::collection::{
+    validate_collection_name, CollectionMember, CollectionRecord, CollectionSyncPathInput,
+};
 use verbatim_core::config::{
     self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, RerankConfig, RetrievalConfig,
 };
@@ -56,7 +59,7 @@ use verbatim_core::task::{
 };
 use verbatim_core::types::{
     CitationRef, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact, RetrievalDebug,
-    RetrievalEvidenceRole, RetrievalResult, SourceId,
+    RetrievalEvidenceRole, RetrievalResult, SourceId, SourceStatus,
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
@@ -1510,12 +1513,14 @@ async fn execute_retrieve_task_inner(
 ) -> Result<RetrieveResponse, (StatusCode, Json<ErrorResponse>)> {
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
-    let source_filter = req.source_id.map(SourceId);
+    let source_id = req.source_id.map(SourceId);
+    let collection_filter = req.collection_filter;
     let embedding_profile_id = parse_embedding_profile_id(
         req.embedding_profile_id.as_deref(),
         &controls.config.embedding.profile_id,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let query_scope = resolve_query_scope(&state, source_id, collection_filter).await?;
 
     let timing = PhaseTiming::start("retrieval");
     record_task_progress(
@@ -1535,7 +1540,7 @@ async fn execute_retrieve_task_inner(
     } = prepare_retrieve_context(
         Arc::clone(&state),
         &question,
-        source_filter.clone(),
+        query_scope.source_filter.clone(),
         &embedding_profile_id,
         &controls,
     )
@@ -1614,7 +1619,9 @@ async fn execute_retrieve_task_inner(
     let response = retrieve_response(RetrieveResponseInput {
         task_id: task_id.clone(),
         query: question,
-        source_filter,
+        source_filter: query_scope.source_id,
+        collection_filter: query_scope.collection_filter,
+        collection_provenance: query_scope.collection_provenance,
         embedding_profile_id,
         controls,
         results,
@@ -1647,7 +1654,8 @@ async fn execute_ask_task_inner(
 
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
-    let source_filter = req.source_id.map(SourceId);
+    let source_id = req.source_id.map(SourceId);
+    let collection_filter = req.collection_filter;
     let config = runtime_config_snapshot(&state)
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .config;
@@ -1657,6 +1665,7 @@ async fn execute_ask_task_inner(
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let show_retrieval = req.show_retrieval;
+    let query_scope = resolve_query_scope(&state, source_id, collection_filter).await?;
 
     let timing = PhaseTiming::start("retrieval");
     record_task_progress(
@@ -1672,7 +1681,7 @@ async fn execute_ask_task_inner(
     let (results, generation_context, retrieval_debug) = prepare_generation_context(
         Arc::clone(&state),
         &question,
-        source_filter,
+        query_scope.source_filter.clone(),
         &embedding_profile_id,
         &config,
         show_retrieval,
@@ -1794,11 +1803,14 @@ async fn execute_ask_task_inner(
         citations: gen_result
             .citations
             .into_iter()
-            .map(citation_response)
+            .map(|citation| {
+                citation_response_with_collections(citation, &query_scope.collection_provenance)
+            })
             .collect(),
         verified: gen_result.verified,
         retrieval: retrieval_debug,
         context: None,
+        collection_filter: query_scope.collection_filter,
     };
     finish_task_success(
         &state,
@@ -1842,7 +1854,8 @@ async fn execute_ask_stream_task_inner(
 
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
-    let source_filter = req.source_id.map(SourceId);
+    let source_id = req.source_id.map(SourceId);
+    let collection_filter = req.collection_filter;
     let config = runtime_config_snapshot(&state)
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .config;
@@ -1852,6 +1865,7 @@ async fn execute_ask_stream_task_inner(
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let show_retrieval = req.show_retrieval;
+    let query_scope = resolve_query_scope(&state, source_id, collection_filter).await?;
 
     let timing = PhaseTiming::start("retrieval");
     record_task_progress(
@@ -1867,7 +1881,7 @@ async fn execute_ask_stream_task_inner(
     let (results, generation_context, retrieval_debug) = prepare_generation_context(
         Arc::clone(&state),
         &question,
-        source_filter,
+        query_scope.source_filter.clone(),
         &embedding_profile_id,
         &config,
         show_retrieval,
@@ -2027,7 +2041,12 @@ async fn execute_ask_stream_task_inner(
                     .citations
                     .iter()
                     .cloned()
-                    .map(citation_response)
+                    .map(|citation| {
+                        citation_response_with_collections(
+                            citation,
+                            &query_scope.collection_provenance,
+                        )
+                    })
                     .collect(),
                 verified: gen_result.verified,
             },
@@ -2037,6 +2056,9 @@ async fn execute_ask_stream_task_inner(
 
     if let Some(debug) = retrieval_debug {
         send_stream_event(&tx, sse_json_event("retrieval", &debug)).await?;
+    }
+    if let Some(collection_filter) = &query_scope.collection_filter {
+        send_stream_event(&tx, sse_json_event("collection_filter", collection_filter)).await?;
     }
 
     finish_task_success(
@@ -2065,12 +2087,14 @@ async fn execute_context_only_ask_task_inner(
     let controls = resolve_retrieve_controls(&retrieve_req, &config)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let context = execute_retrieve_task_inner(state, task_id, retrieve_req, controls).await?;
+    let collection_filter = context.collection_filter.clone();
     Ok(AskResponse {
         answer: String::new(),
         citations: Vec::new(),
         verified: false,
         retrieval: None,
         context: Some(context),
+        collection_filter,
     })
 }
 
@@ -2078,6 +2102,7 @@ fn context_only_retrieve_request(req: AskRequest) -> RetrieveRequest {
     RetrieveRequest {
         question: req.question,
         source_id: req.source_id,
+        collection_filter: req.collection_filter,
         embedding_profile_id: req.embedding_profile_id,
         limit: None,
         page_size: None,
@@ -2117,10 +2142,20 @@ struct RetrievedContext {
     source_paths: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+struct QueryScope {
+    source_id: Option<SourceId>,
+    source_filter: Option<HashSet<SourceId>>,
+    collection_filter: Option<CollectionFilterResponse>,
+    collection_provenance: HashMap<String, Vec<CollectionResultProvenance>>,
+}
+
 struct RetrieveResponseInput {
     task_id: TaskId,
     query: String,
     source_filter: Option<SourceId>,
+    collection_filter: Option<CollectionFilterResponse>,
+    collection_provenance: HashMap<String, Vec<CollectionResultProvenance>>,
     embedding_profile_id: EmbeddingProfileId,
     controls: EffectiveRetrieveControls,
     results: Vec<RetrievalResult>,
@@ -2176,6 +2211,186 @@ fn resolve_retrieve_controls(
         retrieval_config,
         rerank_config,
     })
+}
+
+async fn resolve_query_scope(
+    state: &SharedState,
+    source_id: Option<SourceId>,
+    collection_filter: CollectionFilterRequest,
+) -> Result<QueryScope, (StatusCode, Json<ErrorResponse>)> {
+    if !collection_filter.has_filters() {
+        return Ok(QueryScope {
+            source_filter: source_id.clone().map(single_source_set),
+            source_id,
+            collection_filter: None,
+            collection_provenance: HashMap::new(),
+        });
+    }
+
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        resolve_query_scope_from_store(pipeline.store(), source_id, collection_filter)
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(collection_filter_error)
+}
+
+fn resolve_query_scope_from_store(
+    store: &Store,
+    source_id: Option<SourceId>,
+    requested: CollectionFilterRequest,
+) -> Result<QueryScope> {
+    let collection_names = collection_filter_names(&requested)?;
+    let mut union_source_ids = HashSet::new();
+    let mut applied = Vec::new();
+    let mut warnings = Vec::new();
+    let mut collection_provenance: HashMap<String, Vec<CollectionResultProvenance>> =
+        HashMap::new();
+
+    for name in collection_names {
+        validate_collection_name(&name)?;
+        let collection = store
+            .get_collection(&name)?
+            .with_context(|| format!("collection not found: {name}"))?;
+        let members = store.list_collection_members(&name)?;
+        let mut indexed_member_count = 0usize;
+        let mut stale_member_count = 0usize;
+
+        if collection.last_synced_at.is_none() {
+            warnings.push(format!(
+                "collection '{name}' has never been synced; retrieval uses materialized membership and does not scan roots"
+            ));
+        }
+        if members.is_empty() {
+            warnings.push(format!("collection '{name}' has no materialized members"));
+        }
+
+        for member in &members {
+            union_source_ids.insert(member.source_id.clone());
+            collection_provenance
+                .entry(member.source_id.0.clone())
+                .or_default()
+                .push(collection_result_provenance(member));
+            match store.get_source(&member.source_id)? {
+                Some(source) if source.status == SourceStatus::Indexed => {
+                    indexed_member_count += 1;
+                }
+                Some(source) => {
+                    stale_member_count += 1;
+                    tracing::debug!(
+                        collection = %name,
+                        source_id = %source.id.0,
+                        status = source_status_name(&source.status),
+                        "collection member source is not indexed"
+                    );
+                }
+                None => {
+                    stale_member_count += 1;
+                }
+            }
+        }
+
+        if stale_member_count > 0 {
+            warnings.push(format!(
+                "collection '{name}' has {stale_member_count} member source(s) that are not currently indexed; retrieval does not run indexing automatically"
+            ));
+        }
+
+        let stale = collection.last_synced_at.is_none() || stale_member_count > 0;
+        applied.push(AppliedCollectionFilterResponse {
+            collection_id: collection.name.clone(),
+            name: collection.name,
+            member_count: members.len(),
+            indexed_member_count,
+            stale_member_count,
+            last_synced_at: collection.last_synced_at,
+            stale,
+        });
+    }
+
+    let stale = applied.iter().any(|collection| collection.stale);
+    if requested.require_fresh && stale {
+        bail!(
+            "collection filter requires fresh membership; resolve warnings with `verbatim collection sync <name>` or ingest stale member sources"
+        );
+    }
+
+    let effective_source_filter = match &source_id {
+        Some(source_id) if union_source_ids.contains(source_id) => {
+            Some(single_source_set(source_id.clone()))
+        }
+        Some(source_id) => {
+            warnings.push(format!(
+                "source '{}' is not a member of the selected collection filter",
+                source_id.0
+            ));
+            Some(HashSet::new())
+        }
+        None => Some(union_source_ids.clone()),
+    };
+
+    let response = CollectionFilterResponse {
+        requested,
+        union_source_count: union_source_ids.len(),
+        applied,
+        warnings,
+        stale,
+    };
+
+    Ok(QueryScope {
+        source_id,
+        source_filter: effective_source_filter,
+        collection_filter: Some(response),
+        collection_provenance,
+    })
+}
+
+fn collection_filter_names(filter: &CollectionFilterRequest) -> Result<Vec<String>> {
+    let mut names = BTreeSet::new();
+    for raw_name in filter.collection_ids.iter().chain(&filter.names) {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            bail!("collection filter values must not be empty");
+        }
+        validate_collection_name(name)?;
+        names.insert(name.to_string());
+    }
+    Ok(names.into_iter().collect())
+}
+
+fn collection_result_provenance(member: &CollectionMember) -> CollectionResultProvenance {
+    CollectionResultProvenance {
+        collection_id: member.collection_name.clone(),
+        name: member.collection_name.clone(),
+        logical_path: member.logical_path.clone(),
+        source_path: member.source_path.display().to_string(),
+        member_updated_at: member.updated_at.clone(),
+    }
+}
+
+fn single_source_set(source_id: SourceId) -> HashSet<SourceId> {
+    let mut source_ids = HashSet::new();
+    source_ids.insert(source_id);
+    source_ids
+}
+
+fn collection_filter_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    let status = if error.to_string().contains("collection not found") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    err(status, error)
+}
+
+fn source_status_name(status: &SourceStatus) -> &'static str {
+    match status {
+        SourceStatus::Pending => "Pending",
+        SourceStatus::Indexed => "Indexed",
+        SourceStatus::Stale => "Stale",
+    }
 }
 
 fn nonzero_control(name: &str, value: usize) -> Result<usize> {
@@ -2791,7 +3006,7 @@ fn parse_embedding_profile_id(
 async fn prepare_retrieve_context(
     state: SharedState,
     question: &str,
-    source_filter: Option<SourceId>,
+    source_filter: Option<HashSet<SourceId>>,
     embedding_profile_id: &EmbeddingProfileId,
     controls: &EffectiveRetrieveControls,
 ) -> Result<RetrievedContext, (StatusCode, Json<ErrorResponse>)> {
@@ -2819,7 +3034,7 @@ async fn prepare_retrieve_context(
         .with_reranker(&controls.rerank_config, &reranker);
         let source_filter_ref = source_filter.as_ref();
         let (mut results, mut debug) = runtime
-            .block_on(retrieval.search_filtered_with_debug(&question2, source_filter_ref))?;
+            .block_on(retrieval.search_source_set_with_debug(&question2, source_filter_ref))?;
         if controls.config.graph.global_search.enabled && source_filter_ref.is_none() {
             let global_results =
                 GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
@@ -2855,7 +3070,7 @@ fn empty_retrieval_debug() -> RetrievalDebug {
 async fn prepare_generation_context(
     state: SharedState,
     question: &str,
-    source_filter: Option<SourceId>,
+    source_filter: Option<HashSet<SourceId>>,
     embedding_profile_id: &EmbeddingProfileId,
     config: &Config,
     show_retrieval: bool,
@@ -2893,11 +3108,11 @@ async fn prepare_generation_context(
         let source_filter_ref = source_filter.as_ref();
         let (mut results, mut retrieval_debug) = if show_retrieval {
             let (results, debug) = runtime
-                .block_on(retrieval.search_filtered_with_debug(&question2, source_filter_ref))?;
+                .block_on(retrieval.search_source_set_with_debug(&question2, source_filter_ref))?;
             (results, Some(debug))
         } else {
             let results =
-                runtime.block_on(retrieval.search_filtered(&question2, source_filter_ref))?;
+                runtime.block_on(retrieval.search_source_set(&question2, source_filter_ref))?;
             (results, None)
         };
         if config.graph.global_search.enabled && source_filter_ref.is_none() {
@@ -3031,6 +3246,8 @@ fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
         task_id,
         query,
         source_filter,
+        collection_filter,
+        collection_provenance,
         embedding_profile_id,
         controls,
         results,
@@ -3045,21 +3262,23 @@ fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
         controls.page_size,
         controls.page,
     );
-    let results_page = retrieve_result_page(
-        &results,
-        &debug,
-        &source_paths,
-        controls.limit,
-        controls.page_size,
-        controls.page,
-        controls.include_locator,
-    );
+    let results_page = retrieve_result_page(RetrieveResultPageInput {
+        results: &results,
+        debug: &debug,
+        source_paths: &source_paths,
+        collection_provenance: &collection_provenance,
+        limit: controls.limit,
+        page_size: controls.page_size,
+        page: controls.page,
+        include_locator: controls.include_locator,
+    });
     let debug = controls.include_debug.then_some(debug);
 
     RetrieveResponse {
         task_id: task_id.0,
         query,
         source_id: source_filter.map(|source_id| source_id.0),
+        collection_filter,
         embedding_profile_id: embedding_profile_id.into_string(),
         limit: controls.limit,
         page_size: controls.page_size,
@@ -3093,15 +3312,28 @@ fn page_len(total_results: usize, limit: usize, page_size: usize, page: usize) -
     }
 }
 
-fn retrieve_result_page(
-    results: &[RetrievalResult],
-    debug: &RetrievalDebug,
-    source_paths: &HashMap<String, String>,
+struct RetrieveResultPageInput<'a> {
+    results: &'a [RetrievalResult],
+    debug: &'a RetrievalDebug,
+    source_paths: &'a HashMap<String, String>,
+    collection_provenance: &'a HashMap<String, Vec<CollectionResultProvenance>>,
     limit: usize,
     page_size: usize,
     page: usize,
     include_locator: bool,
-) -> Vec<RetrieveResultResponse> {
+}
+
+fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Vec<RetrieveResultResponse> {
+    let RetrieveResultPageInput {
+        results,
+        debug,
+        source_paths,
+        collection_provenance,
+        limit,
+        page_size,
+        page,
+        include_locator,
+    } = input;
     let start = page_start(page, page_size);
     let end = debug.final_evidence_pack.len().min(limit);
     if start >= end {
@@ -3122,6 +3354,10 @@ fn retrieve_result_page(
             evidence_id: entry.evidence_id.0.clone(),
             source_id: entry.source_id.0.clone(),
             source_path: source_paths.get(&entry.source_id.0).cloned(),
+            collections: collection_provenance
+                .get(&entry.source_id.0)
+                .cloned()
+                .unwrap_or_default(),
             chunk_id: entry.chunk_id.0.clone(),
             kind: evidence_kind_name(entry.kind).to_string(),
             role: retrieval_role_name(entry.role).to_string(),
@@ -3262,13 +3498,21 @@ fn retrieval_role_name(role: RetrievalEvidenceRole) -> &'static str {
     }
 }
 
-fn citation_response(citation: CitationRef) -> CitationResponse {
+fn citation_response_with_collections(
+    citation: CitationRef,
+    collection_provenance: &HashMap<String, Vec<CollectionResultProvenance>>,
+) -> CitationResponse {
     let kind = citation_kind_name(&citation);
+    let collections = collection_provenance
+        .get(&citation.source_id.0)
+        .cloned()
+        .unwrap_or_default();
     CitationResponse {
         label: citation.label,
         evidence_id: citation.evidence_id.0,
         kind: kind.to_string(),
         derived_from: citation.derived_from.map(|id| id.0),
+        collections,
         locator: citation.locator.to_string(),
         text_preview: citation.text_preview,
     }
@@ -3949,6 +4193,7 @@ mod tests {
 
         assert_eq!(req.question, "What is cited?");
         assert!(req.source_id.is_none());
+        assert!(req.collection_filter.is_empty());
         assert!(!req.show_retrieval);
         assert!(!req.context_only);
     }
@@ -3961,6 +4206,7 @@ mod tests {
             verified: false,
             retrieval: None,
             context: None,
+            collection_filter: None,
         };
 
         let encoded = serde_json::to_value(response).unwrap();
@@ -3973,6 +4219,7 @@ mod tests {
                 "verified": false,
             })
         );
+        assert!(encoded.get("collection_filter").is_none());
     }
 
     #[test]
@@ -3991,6 +4238,7 @@ mod tests {
                 final_evidence_pack: Vec::new(),
             }),
             context: None,
+            collection_filter: None,
         };
 
         let encoded = serde_json::to_string(&response).unwrap();
@@ -4060,6 +4308,8 @@ mod tests {
             task_id: TaskId("task-1".into()),
             query: "What is cited?".into(),
             source_filter: Some(SourceId("src".into())),
+            collection_filter: None,
+            collection_provenance: HashMap::new(),
             embedding_profile_id: EmbeddingProfileId::default_profile(),
             controls: EffectiveRetrieveControls {
                 limit: 2,
@@ -4209,6 +4459,7 @@ mod tests {
             Json(RetrieveRequest {
                 question: "Alpha context-only question?".into(),
                 source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
                 embedding_profile_id: None,
                 limit: Some(3),
                 page_size: Some(1),
@@ -4237,6 +4488,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retrieve_handler_filters_by_materialized_collections_with_provenance() {
+        use verbatim_core::collection::{CollectionMemberCandidate, CollectionSyncReport};
+
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("retrieve-collection-filter");
+        let root = test_dir.path().join("articles");
+        fs::create_dir_all(&root).unwrap();
+        let ares_path = root.join("Areskapitalon-notes.md");
+        let other_path = root.join("general.md");
+        let outside_path = test_dir.path().join("outside.md");
+        fs::write(&ares_path, "Areskapitalon alpha evidence inside articles.").unwrap();
+        fs::write(&other_path, "General beta article evidence.").unwrap();
+        fs::write(
+            &outside_path,
+            "Areskapitalon alpha evidence outside collections.",
+        )
+        .unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let ares_id = pipeline.add_source(&ares_path).unwrap();
+        let other_id = pipeline.add_source(&other_path).unwrap();
+        let outside_id = pipeline.add_source(&outside_path).unwrap();
+        pipeline.ingest_source(&ares_id).await.unwrap();
+        pipeline.ingest_source(&other_id).await.unwrap();
+        pipeline.ingest_source(&outside_id).await.unwrap();
+        let report = || CollectionSyncReport {
+            member_count: 0,
+            added: 0,
+            removed: 0,
+            unchanged: 0,
+            scanned_roots: 1,
+            max_depth: 32,
+            skipped: Vec::new(),
+        };
+        let ares_candidate = CollectionMemberCandidate {
+            source_id: ares_id.clone(),
+            logical_path: "Areskapitalon-notes.md".into(),
+            source_path: fs::canonicalize(&ares_path).unwrap(),
+        };
+        let other_candidate = CollectionMemberCandidate {
+            source_id: other_id.clone(),
+            logical_path: "general.md".into(),
+            source_path: fs::canonicalize(&other_path).unwrap(),
+        };
+        pipeline.store().create_collection("articles", &[]).unwrap();
+        pipeline
+            .store()
+            .create_collection("areskapitalon", &[])
+            .unwrap();
+        pipeline
+            .store()
+            .replace_collection_members(
+                "articles",
+                &[ares_candidate.clone(), other_candidate],
+                report(),
+            )
+            .unwrap();
+        pipeline
+            .store()
+            .replace_collection_members("areskapitalon", &[ares_candidate], report())
+            .unwrap();
+        pipeline
+            .store()
+            .update_source_status(&other_id, &SourceStatus::Stale)
+            .unwrap();
+        let ares_id_text = ares_id.0.clone();
+        let outside_id_text = outside_id.0.clone();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let response = retrieve(
+            State(state),
+            Json(RetrieveRequest {
+                question: "Areskapitalon alpha evidence?".into(),
+                source_id: None,
+                collection_filter: CollectionFilterRequest {
+                    collection_ids: Vec::new(),
+                    names: vec!["articles".into(), "areskapitalon".into()],
+                    require_fresh: false,
+                },
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(3),
+                page: Some(1),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: false,
+                include_locator: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let collection_filter = response.collection_filter.as_ref().unwrap();
+        assert_eq!(collection_filter.applied.len(), 2);
+        assert_eq!(collection_filter.union_source_count, 2);
+        assert!(collection_filter.stale);
+        assert!(collection_filter
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not currently indexed")));
+        assert!(response
+            .results
+            .iter()
+            .all(|result| result.source_id != outside_id_text));
+        let ares_result = response
+            .results
+            .iter()
+            .find(|result| result.source_id == ares_id_text)
+            .expect("Areskapitalon result");
+        assert_eq!(ares_result.collections.len(), 2);
+        assert!(ares_result
+            .collections
+            .iter()
+            .any(|collection| collection.name == "articles"));
+        assert!(ares_result
+            .collections
+            .iter()
+            .any(|collection| collection.name == "areskapitalon"));
+    }
+
+    #[tokio::test]
+    async fn ask_context_only_handler_uses_collection_filter() {
+        use verbatim_core::collection::{CollectionMemberCandidate, CollectionSyncReport};
+
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("ask-context-only-collection-filter");
+        let inside_path = test_dir.path().join("inside.md");
+        let outside_path = test_dir.path().join("outside.md");
+        fs::write(&inside_path, "Alpha collection-scoped ask evidence.").unwrap();
+        fs::write(
+            &outside_path,
+            "Alpha outside evidence must not appear in collection ask.",
+        )
+        .unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let inside_id = pipeline.add_source(&inside_path).unwrap();
+        let outside_id = pipeline.add_source(&outside_path).unwrap();
+        pipeline.ingest_source(&inside_id).await.unwrap();
+        pipeline.ingest_source(&outside_id).await.unwrap();
+        pipeline.store().create_collection("articles", &[]).unwrap();
+        pipeline
+            .store()
+            .replace_collection_members(
+                "articles",
+                &[CollectionMemberCandidate {
+                    source_id: inside_id.clone(),
+                    logical_path: "inside.md".into(),
+                    source_path: fs::canonicalize(&inside_path).unwrap(),
+                }],
+                CollectionSyncReport {
+                    member_count: 0,
+                    added: 0,
+                    removed: 0,
+                    unchanged: 0,
+                    scanned_roots: 1,
+                    max_depth: 32,
+                    skipped: Vec::new(),
+                },
+            )
+            .unwrap();
+        let inside_id_text = inside_id.0.clone();
+        let outside_id_text = outside_id.0.clone();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let response = ask(
+            State(state),
+            Json(AskRequest {
+                question: "Alpha ask evidence?".into(),
+                source_id: None,
+                collection_filter: CollectionFilterRequest {
+                    collection_ids: Vec::new(),
+                    names: vec!["articles".into()],
+                    require_fresh: false,
+                },
+                embedding_profile_id: None,
+                show_retrieval: false,
+                context_only: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response.collection_filter.is_some());
+        let context = response.context.expect("context pack");
+        assert!(context
+            .results
+            .iter()
+            .all(|result| result.source_id != outside_id_text));
+        let result = context
+            .results
+            .iter()
+            .find(|result| result.source_id == inside_id_text)
+            .expect("inside collection result");
+        assert_eq!(result.collections[0].name, "articles");
+    }
+
+    #[tokio::test]
     async fn ask_context_only_returns_context_pack_when_chat_is_disabled_and_unavailable() {
         let model_server = MockModelServer::start(3).await;
         let test_dir = TestDir::new("ask-context-only-chat-disabled");
@@ -4259,6 +4713,7 @@ mod tests {
             Json(AskRequest {
                 question: "Beta context-only question?".into(),
                 source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
                 embedding_profile_id: None,
                 show_retrieval: false,
                 context_only: true,

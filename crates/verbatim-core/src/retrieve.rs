@@ -118,6 +118,19 @@ impl<'a> RetrievalPipeline<'a> {
         query: &str,
         source_filter: Option<&SourceId>,
     ) -> Result<Vec<RetrievalResult>> {
+        let source_filter = source_filter.cloned().map(|source_id| {
+            let mut source_ids = HashSet::new();
+            source_ids.insert(source_id);
+            source_ids
+        });
+        self.search_source_set(query, source_filter.as_ref()).await
+    }
+
+    pub async fn search_source_set(
+        &self,
+        query: &str,
+        source_filter: Option<&HashSet<SourceId>>,
+    ) -> Result<Vec<RetrievalResult>> {
         Ok(self
             .search_filtered_internal(query, source_filter, false)
             .await?
@@ -129,6 +142,20 @@ impl<'a> RetrievalPipeline<'a> {
         query: &str,
         source_filter: Option<&SourceId>,
     ) -> Result<(Vec<RetrievalResult>, RetrievalDebug)> {
+        let source_filter = source_filter.cloned().map(|source_id| {
+            let mut source_ids = HashSet::new();
+            source_ids.insert(source_id);
+            source_ids
+        });
+        self.search_source_set_with_debug(query, source_filter.as_ref())
+            .await
+    }
+
+    pub async fn search_source_set_with_debug(
+        &self,
+        query: &str,
+        source_filter: Option<&HashSet<SourceId>>,
+    ) -> Result<(Vec<RetrievalResult>, RetrievalDebug)> {
         self.search_filtered_internal(query, source_filter, true)
             .await?
             .into_results_with_debug()
@@ -137,9 +164,12 @@ impl<'a> RetrievalPipeline<'a> {
     async fn search_filtered_internal(
         &self,
         query: &str,
-        source_filter: Option<&SourceId>,
+        source_filter: Option<&HashSet<SourceId>>,
         include_debug: bool,
     ) -> Result<RetrievalSearchOutput> {
+        if source_filter.is_some_and(HashSet::is_empty) {
+            return Ok(empty_search_output(include_debug));
+        }
         self.ensure_required_profile_vectors(source_filter)?;
         let query_text = self.embed_client.prepare_query(query);
         let embedding_started = Instant::now();
@@ -180,13 +210,13 @@ impl<'a> RetrievalPipeline<'a> {
         let bm25_results = self.lexical_index.search(query, bm25_top_k)?;
 
         let mut fused = rrf_fusion(&dense_results, &bm25_results, self.config.rrf_k);
-        if let Some(source_id) = source_filter {
+        if let Some(source_ids) = source_filter {
             fused.retain(|(chunk_id, _)| {
                 self.store
                     .get_chunk(chunk_id)
                     .ok()
                     .flatten()
-                    .is_some_and(|chunk| chunk.source_id == *source_id)
+                    .is_some_and(|chunk| source_ids.contains(&chunk.source_id))
             });
         }
 
@@ -242,25 +272,31 @@ impl<'a> RetrievalPipeline<'a> {
         Ok(RetrievalSearchOutput { results, debug })
     }
 
-    fn ensure_required_profile_vectors(&self, source_filter: Option<&SourceId>) -> Result<()> {
+    fn ensure_required_profile_vectors(
+        &self,
+        source_filter: Option<&HashSet<SourceId>>,
+    ) -> Result<()> {
         let Some(profile_id) = &self.required_profile_id else {
             return Ok(());
         };
-        let vector_count = self
-            .store
-            .count_vector_documents_for_profile(profile_id, source_filter)?;
+        let vector_count = match source_filter {
+            Some(source_ids) => source_ids.iter().try_fold(0usize, |count, source_id| {
+                self.store
+                    .count_vector_documents_for_profile(profile_id, Some(source_id))
+                    .map(|source_count| count + source_count)
+            })?,
+            None => self
+                .store
+                .count_vector_documents_for_profile(profile_id, None)?,
+        };
         if vector_count > 0 {
             return Ok(());
         }
-        let scope = source_filter
-            .map(|source_id| format!(" for source '{}'", source_id.0))
-            .unwrap_or_default();
+        let scope = source_filter_scope(source_filter);
         Err(anyhow!(
             "embedding profile '{}' has no vectors{scope}; build it with `verbatim ingest{} --embedding-profile {} --vectors-only` before asking, or request an explicit auto-build path when supported",
             profile_id,
-            source_filter
-                .map(|source_id| format!(" {}", source_id.0))
-                .unwrap_or_default(),
+            source_filter_ingest_hint(source_filter),
             profile_id,
         ))
     }
@@ -269,7 +305,7 @@ impl<'a> RetrievalPipeline<'a> {
         &self,
         query_vec: &[f32],
         top_k: usize,
-        source_filter: Option<&SourceId>,
+        source_filter: Option<&HashSet<SourceId>>,
     ) -> Result<Vec<(ChunkId, f32)>> {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &self.qdrant {
@@ -282,8 +318,9 @@ impl<'a> RetrievalPipeline<'a> {
                     &default_profile_id
                 }
             };
+            let qdrant_source_filter = single_source_filter(source_filter);
             return match qdrant
-                .search(profile_id, query_vec, top_k, source_filter)
+                .search(profile_id, query_vec, top_k, qdrant_source_filter)
                 .await
             {
                 Ok(results) => {
@@ -305,15 +342,16 @@ impl<'a> RetrievalPipeline<'a> {
         &self,
         query_vec: &[f32],
         top_k: usize,
-        source_filter: Option<&SourceId>,
+        source_filter: Option<&HashSet<SourceId>>,
     ) -> Vec<(ChunkId, f32)> {
         let fallback_top_k = if source_filter.is_some() {
             self.vector_index.len().max(top_k)
         } else {
             top_k
         };
+        let index_source_filter = single_source_filter(source_filter);
         self.vector_index
-            .search_filtered(query_vec, fallback_top_k, source_filter)
+            .search_filtered(query_vec, fallback_top_k, index_source_filter)
     }
 
     #[cfg(feature = "qdrant")]
@@ -321,7 +359,7 @@ impl<'a> RetrievalPipeline<'a> {
         &self,
         hits: Vec<(ChunkId, f32)>,
         top_k: usize,
-        source_filter: Option<&SourceId>,
+        source_filter: Option<&HashSet<SourceId>>,
     ) -> Result<Vec<(ChunkId, f32)>> {
         let mut valid = Vec::new();
         let mut seen = HashSet::new();
@@ -339,7 +377,7 @@ impl<'a> RetrievalPipeline<'a> {
         preferred_hits: Vec<(ChunkId, f32)>,
         fallback_hits: Vec<(ChunkId, f32)>,
         top_k: usize,
-        source_filter: Option<&SourceId>,
+        source_filter: Option<&HashSet<SourceId>>,
     ) -> Result<Vec<(ChunkId, f32)>> {
         let mut merged = Vec::new();
         let mut seen = HashSet::new();
@@ -376,7 +414,7 @@ impl<'a> RetrievalPipeline<'a> {
         target: &mut Vec<(ChunkId, f32)>,
         seen: &mut HashSet<ChunkId>,
         hits: &mut I,
-        source_filter: Option<&SourceId>,
+        source_filter: Option<&HashSet<SourceId>>,
     ) -> Result<bool>
     where
         I: Iterator<Item = (ChunkId, f32)>,
@@ -388,7 +426,7 @@ impl<'a> RetrievalPipeline<'a> {
             let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
                 continue;
             };
-            if source_filter.is_some_and(|source_id| chunk.source_id != *source_id) {
+            if source_filter_excludes(source_filter, &chunk.source_id) {
                 continue;
             }
             target.push((chunk_id, score));
@@ -549,16 +587,16 @@ impl<'a> RetrievalPipeline<'a> {
     fn stage_debug_hits(
         &self,
         hits: &[(ChunkId, f32)],
-        source_filter: Option<&SourceId>,
+        source_filter: Option<&HashSet<SourceId>>,
     ) -> Result<Vec<RetrievalStageHit>> {
         let mut debug_hits = Vec::new();
 
         for (rank, (chunk_id, score)) in hits.iter().enumerate() {
             let chunk = self.store.get_chunk(chunk_id)?;
-            if source_filter.is_some_and(|source_id| {
+            if source_filter.is_some_and(|source_ids| {
                 chunk
                     .as_ref()
-                    .is_none_or(|chunk| chunk.source_id != *source_id)
+                    .is_none_or(|chunk| !source_ids.contains(&chunk.source_id))
             }) {
                 continue;
             }
@@ -608,7 +646,7 @@ impl<'a> RetrievalPipeline<'a> {
     fn expand_graph_results(
         &self,
         results: &mut Vec<RetrievalResult>,
-        source_filter: Option<&SourceId>,
+        source_filter: Option<&HashSet<SourceId>>,
     ) -> Result<()> {
         let Some(config) = self.graph_config else {
             return Ok(());
@@ -969,10 +1007,7 @@ impl<'a> RetrievalPipeline<'a> {
         else {
             return Ok(());
         };
-        if state
-            .source_filter
-            .is_some_and(|source_id| result.chunk.source_id != *source_id)
-        {
+        if source_filter_excludes(state.source_filter, &result.chunk.source_id) {
             return Ok(());
         }
         if !state.seen_chunks.insert(result.chunk_id.0.clone()) {
@@ -1078,7 +1113,7 @@ struct GraphExpansionState<'a> {
     seen_chunks: &'a mut HashSet<String>,
     expanded_count: &'a mut usize,
     seed_expanded_count: usize,
-    source_filter: Option<&'a SourceId>,
+    source_filter: Option<&'a HashSet<SourceId>>,
 }
 
 impl GraphExpansionState<'_> {
@@ -1122,6 +1157,57 @@ fn rank_by_chunk_id(hits: &[(ChunkId, f32)]) -> HashMap<ChunkId, usize> {
         .enumerate()
         .map(|(rank, (chunk_id, _))| (chunk_id.clone(), rank + 1))
         .collect()
+}
+
+fn empty_search_output(include_debug: bool) -> RetrievalSearchOutput {
+    RetrievalSearchOutput {
+        results: Vec::new(),
+        debug: include_debug.then(|| RetrievalDebug {
+            query_embedding_latency_ms: None,
+            bm25_hits: Vec::new(),
+            dense_hits: Vec::new(),
+            rrf_fused_hits: Vec::new(),
+            graph_expanded_hits: Vec::new(),
+            reranker: RetrievalRerankDebug::disabled(),
+            final_evidence_pack: Vec::new(),
+        }),
+    }
+}
+
+fn single_source_filter(source_filter: Option<&HashSet<SourceId>>) -> Option<&SourceId> {
+    let source_ids = source_filter?;
+    if source_ids.len() == 1 {
+        source_ids.iter().next()
+    } else {
+        None
+    }
+}
+
+fn source_filter_excludes(source_filter: Option<&HashSet<SourceId>>, source_id: &SourceId) -> bool {
+    source_filter.is_some_and(|source_ids| !source_ids.contains(source_id))
+}
+
+fn source_filter_scope(source_filter: Option<&HashSet<SourceId>>) -> String {
+    match source_filter {
+        Some(source_ids) if source_ids.len() == 1 => source_ids
+            .iter()
+            .next()
+            .map(|source_id| format!(" for source '{}'", source_id.0))
+            .unwrap_or_default(),
+        Some(source_ids) => format!(" for {} selected sources", source_ids.len()),
+        None => String::new(),
+    }
+}
+
+fn source_filter_ingest_hint(source_filter: Option<&HashSet<SourceId>>) -> String {
+    match source_filter {
+        Some(source_ids) if source_ids.len() == 1 => source_ids
+            .iter()
+            .next()
+            .map(|source_id| format!(" {}", source_id.0))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 fn graph_expansion_debug_hits(results: &[RetrievalResult]) -> Vec<RetrievalGraphExpansionDebug> {
@@ -2050,6 +2136,59 @@ mod tests {
         assert_eq!(results[0].chunk_id.0, "chunk-beta");
         assert_eq!(results[0].chunk.source_id, second.id);
         assert_eq!(results[0].evidence_units.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retrieval_source_set_filter_includes_union_and_excludes_non_members() {
+        let store = Store::in_memory().unwrap();
+        let first = source("src-articles");
+        let second = source("src-areskapitalon");
+        let outside = source("src-outside");
+        let alpha = insert_child(&store, &first, "chunk-alpha", "alpha content");
+        let beta = insert_child(&store, &second, "chunk-beta", "beta content");
+        let outside_beta = insert_child(&store, &outside, "chunk-outside", "beta outside");
+        store
+            .replace_all_vector_documents(&[
+                VectorDocument {
+                    chunk_id: alpha.id.clone(),
+                    source_id: first.id.clone(),
+                    vector: keyword_vector(&alpha.text),
+                },
+                VectorDocument {
+                    chunk_id: beta.id.clone(),
+                    source_id: second.id.clone(),
+                    vector: keyword_vector(&beta.text),
+                },
+                VectorDocument {
+                    chunk_id: outside_beta.id.clone(),
+                    source_id: outside.id.clone(),
+                    vector: keyword_vector(&outside_beta.text),
+                },
+            ])
+            .unwrap();
+        let mut hnsw = HnswIndex::new();
+        hnsw.rebuild_from_store(&store).unwrap();
+        let lexical_index = SqliteFtsIndex::new(&store);
+        let embed_client = KeywordEmbeddingClient;
+        let config = RetrievalConfig::default();
+        let pipeline =
+            RetrievalPipeline::new(&hnsw, &lexical_index, &store, &embed_client, &config);
+        let source_filter = HashSet::from([first.id.clone(), second.id.clone()]);
+
+        let results = pipeline
+            .search_source_set("beta", Some(&source_filter))
+            .await
+            .unwrap();
+
+        assert!(results
+            .iter()
+            .any(|result| result.chunk_id.0 == "chunk-beta"));
+        assert!(results
+            .iter()
+            .all(|result| source_filter.contains(&result.chunk.source_id)));
+        assert!(results
+            .iter()
+            .all(|result| result.chunk_id.0 != "chunk-outside"));
     }
 
     #[tokio::test]
