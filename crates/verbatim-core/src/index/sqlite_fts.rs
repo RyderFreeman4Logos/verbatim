@@ -209,6 +209,8 @@ mod tests {
         Chunk {
             id: ChunkId(id.into()),
             source_id: source_id.clone(),
+            chunk_hash: format!("hash-{id}"),
+            embedding_input_hash: None,
             text: text.into(),
             context_text: None,
             token_count: 4,

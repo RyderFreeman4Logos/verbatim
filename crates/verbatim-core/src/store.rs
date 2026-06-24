@@ -51,6 +51,33 @@ pub struct EmbeddingProfileConfig<'a> {
     pub document_instruction: &'a str,
 }
 
+impl EmbeddingProfileConfig<'_> {
+    pub fn query_instruction_hash(&self) -> String {
+        embedding_instruction_hash(self.query_instruction)
+    }
+
+    pub fn document_instruction_hash(&self) -> String {
+        embedding_instruction_hash(self.document_instruction)
+    }
+
+    pub fn config_hash(&self) -> String {
+        embedding_profile_config_hash(
+            self.provider,
+            self.model,
+            self.dimension,
+            self.normalize,
+            &self.query_instruction_hash(),
+            &self.document_instruction_hash(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingCacheEntry {
+    pub embedding_input_hash: String,
+    pub vector: Vec<f32>,
+}
+
 impl Store {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -89,6 +116,18 @@ impl Store {
             "tasks",
             "progress_json",
             "ALTER TABLE tasks ADD COLUMN progress_json TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "chunks",
+            "chunk_hash",
+            "ALTER TABLE chunks ADD COLUMN chunk_hash TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &self.conn,
+            "chunks",
+            "embedding_input_hash",
+            "ALTER TABLE chunks ADD COLUMN embedding_input_hash TEXT",
         )?;
         Ok(())
     }
@@ -204,7 +243,7 @@ impl Store {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO chunks (id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                "INSERT INTO chunks (id, source_id, chunk_hash, embedding_input_hash, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
             )?;
             for chunk in chunks {
                 let heading_json =
@@ -212,6 +251,8 @@ impl Store {
                 stmt.execute(params![
                     &chunk.id.0,
                     &chunk.source_id.0,
+                    &chunk.chunk_hash,
+                    &chunk.embedding_input_hash,
                     &chunk.text,
                     &chunk.context_text,
                     chunk.token_count,
@@ -534,16 +575,18 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO chunks (id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                "INSERT INTO chunks (id, source_id, chunk_hash, embedding_input_hash, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
             )?;
             for c in chunks {
                 let heading_json =
                     serde_json::to_string(&c.heading_path).context("serialize heading_path")?;
                 stmt.execute(params![
-                    c.id.0,
-                    c.source_id.0,
-                    c.text,
-                    c.context_text,
+                    &c.id.0,
+                    &c.source_id.0,
+                    &c.chunk_hash,
+                    &c.embedding_input_hash,
+                    &c.text,
+                    &c.context_text,
                     c.token_count,
                     chunk_type_to_str(&c.chunk_type),
                     c.parent_chunk_id.as_ref().map(|id| &id.0),
@@ -557,7 +600,7 @@ impl Store {
 
     pub fn get_chunk(&self, id: &ChunkId) -> Result<Option<Chunk>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json FROM chunks WHERE id = ?1"
+            "SELECT id, source_id, chunk_hash, embedding_input_hash, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json FROM chunks WHERE id = ?1"
         )?;
         let mut rows = stmt.query_map(params![id.0], row_to_chunk_tuple)?;
         match rows.next() {
@@ -571,7 +614,7 @@ impl Store {
 
     pub fn list_chunks_by_source(&self, source_id: &SourceId) -> Result<Vec<Chunk>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json FROM chunks WHERE source_id = ?1"
+            "SELECT id, source_id, chunk_hash, embedding_input_hash, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json FROM chunks WHERE source_id = ?1"
         )?;
         let rows = stmt.query_map(params![source_id.0], row_to_chunk_tuple)?;
         let mut result = Vec::new();
@@ -583,7 +626,7 @@ impl Store {
 
     pub fn list_child_chunks(&self) -> Result<Vec<Chunk>> {
         let mut stmt = self.conn.prepare(
-        "SELECT id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json FROM chunks WHERE chunk_type = 'Child' ORDER BY source_id, id"
+        "SELECT id, source_id, chunk_hash, embedding_input_hash, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json FROM chunks WHERE chunk_type = 'Child' ORDER BY source_id, id"
         )?;
         let rows = stmt.query_map([], row_to_chunk_tuple)?;
         let mut result = Vec::new();
@@ -619,7 +662,7 @@ impl Store {
 
     pub fn list_chunks_for_evidence(&self, evidence_id: &EvidenceId) -> Result<Vec<Chunk>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.source_id, c.text, c.context_text, c.token_count, c.chunk_type, c.parent_chunk_id, c.heading_path_json
+            "SELECT c.id, c.source_id, c.chunk_hash, c.embedding_input_hash, c.text, c.context_text, c.token_count, c.chunk_type, c.parent_chunk_id, c.heading_path_json
              FROM chunks c
              INNER JOIN chunk_evidence ce ON ce.chunk_id = c.id
              WHERE ce.evidence_unit_id = ?1
@@ -816,16 +859,9 @@ impl Store {
         config: EmbeddingProfileConfig<'_>,
     ) -> Result<()> {
         let now = unix_timestamp_string();
-        let query_instruction_hash = embedding_instruction_hash(config.query_instruction);
-        let document_instruction_hash = embedding_instruction_hash(config.document_instruction);
-        let config_hash = embedding_profile_config_hash(
-            config.provider,
-            config.model,
-            config.dimension,
-            config.normalize,
-            &query_instruction_hash,
-            &document_instruction_hash,
-        );
+        let query_instruction_hash = config.query_instruction_hash();
+        let document_instruction_hash = config.document_instruction_hash();
+        let config_hash = config.config_hash();
         self.conn.execute(
             "INSERT INTO embedding_profiles
                 (id, provider, model, dimension, normalize, query_instruction_hash, document_instruction_hash, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
@@ -1088,6 +1124,95 @@ impl Store {
             )?,
         };
         Ok(count.try_into().unwrap_or_default())
+    }
+
+    pub fn get_embedding_cache_vector(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        profile_config_hash: &str,
+        embedding_input_hash: &str,
+    ) -> Result<Option<Vec<f32>>> {
+        let vector_json = self
+            .conn
+            .query_row(
+                "SELECT vector_json
+                 FROM embedding_cache
+                 WHERE profile_id = ?1
+                   AND profile_config_hash = ?2
+                   AND embedding_input_hash = ?3",
+                params![
+                    profile_id.as_str(),
+                    profile_config_hash,
+                    embedding_input_hash,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        vector_json
+            .map(|json| serde_json::from_str(&json).context("parse cached embedding vector"))
+            .transpose()
+    }
+
+    pub fn record_embedding_cache_hit(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        profile_config_hash: &str,
+        embedding_input_hash: &str,
+    ) -> Result<()> {
+        let now = unix_timestamp_string();
+        self.conn.execute(
+            "UPDATE embedding_cache
+             SET cache_hits = cache_hits + 1, updated_at = ?4
+             WHERE profile_id = ?1
+               AND profile_config_hash = ?2
+               AND embedding_input_hash = ?3",
+            params![
+                profile_id.as_str(),
+                profile_config_hash,
+                embedding_input_hash,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_embedding_cache_entries(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        profile_config_hash: &str,
+        entries: &[EmbeddingCacheEntry],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let now = unix_timestamp_string();
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO embedding_cache
+                    (profile_id, profile_config_hash, embedding_input_hash, vector_json, dimension, cache_hits, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)
+                 ON CONFLICT(profile_id, profile_config_hash, embedding_input_hash) DO UPDATE SET
+                    vector_json = excluded.vector_json,
+                    dimension = excluded.dimension,
+                    updated_at = excluded.updated_at",
+            )?;
+            for entry in entries {
+                let vector_json =
+                    serde_json::to_string(&entry.vector).context("serialize cached vector")?;
+                stmt.execute(params![
+                    profile_id.as_str(),
+                    profile_config_hash,
+                    &entry.embedding_input_hash,
+                    vector_json,
+                    sql_usize(entry.vector.len()),
+                    &now,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn set_source_embedding_status(
@@ -2015,6 +2140,8 @@ type ChunkTuple = (
     String,
     String,
     Option<String>,
+    String,
+    Option<String>,
     u32,
     String,
     Option<String>,
@@ -2031,15 +2158,30 @@ fn row_to_chunk_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkTuple> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
     ))
 }
 
 fn tuple_to_chunk(t: ChunkTuple, conn: &Connection) -> Result<Chunk> {
-    let (id, source_id, text, context_text, token_count, chunk_type, parent_id, heading_json) = t;
+    let (
+        id,
+        source_id,
+        chunk_hash,
+        embedding_input_hash,
+        text,
+        context_text,
+        token_count,
+        chunk_type,
+        parent_id,
+        heading_json,
+    ) = t;
     let evidence_unit_ids = get_evidence_ids_for_chunk(conn, &id)?;
     Ok(Chunk {
         id: ChunkId(id),
         source_id: SourceId(source_id),
+        chunk_hash,
+        embedding_input_hash,
         text,
         context_text,
         token_count,
@@ -2372,6 +2514,8 @@ CREATE TABLE IF NOT EXISTS image_captions (
 CREATE TABLE IF NOT EXISTS chunks (
     id TEXT PRIMARY KEY,
     source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    chunk_hash TEXT NOT NULL DEFAULT '',
+    embedding_input_hash TEXT,
     text TEXT NOT NULL,
     context_text TEXT,
     token_count INTEGER NOT NULL,
@@ -2404,6 +2548,17 @@ CREATE TABLE IF NOT EXISTS chunk_vectors (
     source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     vector_json TEXT NOT NULL,
     PRIMARY KEY (profile_id, chunk_id)
+);
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    profile_id TEXT NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
+    profile_config_hash TEXT NOT NULL,
+    embedding_input_hash TEXT NOT NULL,
+    vector_json TEXT NOT NULL,
+    dimension INTEGER NOT NULL,
+    cache_hits INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, profile_config_hash, embedding_input_hash)
 );
 CREATE TABLE IF NOT EXISTS source_embedding_status (
     profile_id TEXT NOT NULL REFERENCES embedding_profiles(id) ON DELETE CASCADE,
@@ -2616,6 +2771,8 @@ mod tests {
             Chunk {
                 id: ChunkId("parent-1".into()),
                 source_id: SourceId(source_id.into()),
+                chunk_hash: "hash-parent-1".into(),
+                embedding_input_hash: None,
                 text: "First paragraph. Second paragraph.".into(),
                 context_text: None,
                 token_count: 50,
@@ -2627,6 +2784,8 @@ mod tests {
             Chunk {
                 id: ChunkId("child-1".into()),
                 source_id: SourceId(source_id.into()),
+                chunk_hash: "hash-child-1".into(),
+                embedding_input_hash: Some("embedding-hash-child-1".into()),
                 text: "First paragraph.".into(),
                 context_text: Some("This chunk is from Chapter 1.".into()),
                 token_count: 20,

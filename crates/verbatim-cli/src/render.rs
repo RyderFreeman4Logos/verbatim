@@ -146,6 +146,9 @@ where
     }
     writeln!(writer, "  request: {}", compact_json(&task.request))?;
     if let Some(result) = &task.result {
+        if let Some(summary) = task_embedding_cache_summary(result) {
+            writeln!(writer, "  embedding_cache: {summary}")?;
+        }
         writeln!(writer, "  result: {}", compact_json(result))?;
     }
     write_task_spans(writer, spans)?;
@@ -281,6 +284,19 @@ fn task_progress_summary(progress: &TaskProgressSnapshot) -> String {
     } else {
         parts.join(" ")
     }
+}
+
+fn task_embedding_cache_summary(result: &Value) -> Option<String> {
+    let cache = result.get("embedding_cache")?.as_object()?;
+    let value = |key: &str| cache.get(key).and_then(Value::as_u64).unwrap_or(0);
+    Some(format!(
+        "hits={} misses={} embedded={} reused={} changed={}",
+        value("cache_hits"),
+        value("cache_misses"),
+        value("embedded_chunks"),
+        value("reused_chunks"),
+        value("changed_chunks")
+    ))
 }
 
 pub fn write_task_spans<W>(writer: &mut W, spans: &[TaskSpan]) -> std::io::Result<()>
@@ -834,9 +850,45 @@ mod tests {
     use verbatim_core::api::{
         EvidenceResponse, RetrieveControlsResponse, RetrieveResponse, RetrieveResultResponse,
     };
+    use verbatim_core::task::{TaskId, TaskKind, TaskStatus};
     use verbatim_core::types::{
         MarkdownBlockKind, MarkdownHeadingLocator, OcrLocatorMetadata, OcrProfile,
     };
+
+    #[test]
+    fn task_summary_renders_embedding_cache_stats_from_result_metadata() {
+        let task = TaskSummary {
+            id: TaskId("task-1".into()),
+            kind: TaskKind::Ingest,
+            status: TaskStatus::Succeeded,
+            created_at: "1".into(),
+            updated_at: "2".into(),
+            started_at: Some("1".into()),
+            finished_at: Some("2".into()),
+            request: serde_json::json!({"operation": "reindex"}),
+            result: Some(serde_json::json!({
+                "reindexed": 1,
+                "embedding_cache": {
+                    "cache_hits": 2,
+                    "cache_misses": 1,
+                    "embedded_chunks": 1,
+                    "reused_chunks": 2,
+                    "changed_chunks": 1
+                }
+            })),
+            error: None,
+            queue_position: None,
+            blocking_reason: None,
+            progress: None,
+        };
+        let mut output = Vec::new();
+
+        write_task_summary(&mut output, &task, &[]).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("embedding_cache: hits=2 misses=1 embedded=1 reused=2 changed=1"));
+        assert!(output.contains("\"embedding_cache\""));
+    }
 
     #[test]
     fn ocr_evidence_lookup_renders_structured_locator_details() {

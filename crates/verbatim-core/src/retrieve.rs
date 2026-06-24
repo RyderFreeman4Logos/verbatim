@@ -1661,6 +1661,8 @@ mod tests {
         let chunk = Chunk {
             id: ChunkId(chunk_id.into()),
             source_id: source.id.clone(),
+            chunk_hash: format!("hash-{chunk_id}"),
+            embedding_input_hash: None,
             text: text.into(),
             context_text: None,
             token_count: 4,
@@ -1814,6 +1816,8 @@ mod tests {
         let chunk = Chunk {
             id: ChunkId(chunk_id.into()),
             source_id: source.id.clone(),
+            chunk_hash: format!("hash-{chunk_id}"),
+            embedding_input_hash: None,
             text: text.into(),
             context_text,
             token_count: 4,
@@ -1842,6 +1846,8 @@ mod tests {
         let chunk = Chunk {
             id: ChunkId(chunk_id.into()),
             source_id: source.id.clone(),
+            chunk_hash: format!("hash-{chunk_id}"),
+            embedding_input_hash: None,
             text: text.into(),
             context_text: None,
             token_count: 12,
@@ -1894,6 +1900,8 @@ mod tests {
         let chunk = Chunk {
             id: ChunkId(chunk_id.into()),
             source_id: source.id.clone(),
+            chunk_hash: format!("hash-{chunk_id}"),
+            embedding_input_hash: None,
             text: "Image evidence artifact.".into(),
             context_text: None,
             token_count: 4,

@@ -7,7 +7,10 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chunker::{chunk_evidence, estimate_tokens, ChunkOutput, ChunkerConfig};
+use crate::chunker::{
+    chunk_evidence, deterministic_chunk_hash, estimate_tokens, ChunkOutput, ChunkerConfig,
+    CHUNKER_VERSION,
+};
 use crate::config::{Config, GraphExtractionConfig};
 use crate::context::ContextGenerator;
 use crate::embed::OpenAiEmbeddingClient;
@@ -26,14 +29,14 @@ use crate::ocr::{
 use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
-use crate::store::{EmbeddingProfileConfig, SourceContentsReplacement, Store};
+use crate::store::{EmbeddingCacheEntry, EmbeddingProfileConfig, SourceContentsReplacement, Store};
 use crate::task::{PhaseTiming, TaskEndpointSummary, TaskId, TaskProgressSnapshot};
 use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
 use crate::types::{
-    hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
-    EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, ImageArtifact,
-    ImageId, ParsedImageArtifact, Source, SourceEmbeddingStatus, SourceId, SourceLocator,
-    SourceStatus,
+    hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingCacheStats, EmbeddingProfileId,
+    EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
+    GraphNodeKind, ImageArtifact, ImageId, ParsedImageArtifact, Source, SourceEmbeddingStatus,
+    SourceId, SourceLocator, SourceStatus,
 };
 use crate::vision_caption::{
     caption_derived_evidence, request_image_caption, vision_caption_prompt_hash, CaptionAttempt,
@@ -63,6 +66,13 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
 struct PreparedIndexes {
     hnsw: HnswIndex,
     vectors: Vec<VectorDocument>,
+    cache_stats: EmbeddingCacheStats,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IndexingOutcome {
+    pub source_count: usize,
+    pub embedding_cache: EmbeddingCacheStats,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +96,17 @@ impl EmbeddingProfileSpec {
             document_instruction: &self.document_instruction,
         }
     }
+
+    fn config_hash(&self) -> String {
+        self.as_store_config().config_hash()
+    }
+}
+
+struct EmbeddingInput {
+    chunk_id: ChunkId,
+    source_id: SourceId,
+    hash: String,
+    text: String,
 }
 
 #[derive(Debug)]
@@ -429,7 +450,7 @@ where
         Ok(stale)
     }
 
-    pub async fn ingest_source(&mut self, source_id: &SourceId) -> Result<()> {
+    pub async fn ingest_source(&mut self, source_id: &SourceId) -> Result<EmbeddingCacheStats> {
         self.ingest_source_inner(source_id, None).await
     }
 
@@ -437,7 +458,7 @@ where
         &mut self,
         source_id: &SourceId,
         task_id: &TaskId,
-    ) -> Result<()> {
+    ) -> Result<EmbeddingCacheStats> {
         self.ingest_source_inner(source_id, Some(task_id)).await
     }
 
@@ -445,7 +466,7 @@ where
         &mut self,
         source_id: &SourceId,
         task_id: Option<&TaskId>,
-    ) -> Result<()> {
+    ) -> Result<EmbeddingCacheStats> {
         let source = self
             .store
             .get_source(source_id)?
@@ -646,6 +667,9 @@ where
             }),
         );
 
+        let active_profile_id = self.active_profile_id.clone();
+        let active_profile_config_hash = self.embedding_profile_spec.config_hash();
+        self.assign_embedding_input_hashes(&mut chunks, &active_profile_config_hash);
         let child_chunks = chunks
             .iter()
             .filter(|chunk| chunk.chunk_type == ChunkType::Child)
@@ -657,6 +681,8 @@ where
             phase
                 .progress_snapshot()
                 .with_counter("embedding_vectors", 0, Some(child_chunks.len() as u64))
+                .with_counter("embedding_cache_hits", 0, Some(child_chunks.len() as u64))
+                .with_counter("embedding_cache_misses", 0, Some(child_chunks.len() as u64))
                 .with_counter(
                     "batches",
                     usize::from(!child_chunks.is_empty()) as u64,
@@ -664,7 +690,6 @@ where
                 )
                 .with_recent_status("embedding child chunks"),
         );
-        let active_profile_id = self.active_profile_id.clone();
         let prepared = self
             .prepare_source_indexes_for_profile(&active_profile_id, source_id, &child_chunks)
             .await?;
@@ -672,8 +697,28 @@ where
             .progress_snapshot()
             .with_counter(
                 "embedding_vectors",
-                prepared.vectors.len() as u64,
+                prepared.cache_stats.embedded_chunks as u64,
                 Some(child_chunks.len() as u64),
+            )
+            .with_counter(
+                "embedding_cache_hits",
+                prepared.cache_stats.cache_hits as u64,
+                Some(child_chunks.len() as u64),
+            )
+            .with_counter(
+                "embedding_cache_misses",
+                prepared.cache_stats.cache_misses as u64,
+                Some(child_chunks.len() as u64),
+            )
+            .with_counter(
+                "reused_chunks",
+                prepared.cache_stats.reused_chunks as u64,
+                None,
+            )
+            .with_counter(
+                "changed_chunks",
+                prepared.cache_stats.changed_chunks as u64,
+                None,
             )
             .with_counter(
                 "batches",
@@ -684,6 +729,7 @@ where
         let embedding_timing = phase.finish(serde_json::json!({
             "child_chunk_count": child_chunks.len(),
             "vector_count": prepared.vectors.len(),
+            "embedding_cache": &prepared.cache_stats,
         }));
         if !child_chunks.is_empty() {
             embedding_progress.set_endpoint(TaskEndpointSummary::single_call(
@@ -737,6 +783,7 @@ where
                 "index_generation": generation,
             }),
         );
+        let cache_stats = prepared.cache_stats.clone();
         self.publish_committed_indexes(&active_profile_id, generation, staged, prepared)?;
         self.record_task_phase(
             task_id,
@@ -762,7 +809,7 @@ where
         })?;
 
         tracing::info!(source = %source_id.0, "ingest complete");
-        Ok(())
+        Ok(cache_stats)
     }
 
     async fn append_generated_graph(
@@ -813,15 +860,23 @@ where
         }
     }
 
-    pub async fn ingest_all(&mut self, force: bool) -> Result<usize> {
+    pub async fn ingest_all(&mut self, force: bool) -> Result<IndexingOutcome> {
         self.ingest_all_inner(force, None).await
     }
 
-    pub async fn ingest_all_with_task(&mut self, force: bool, task_id: &TaskId) -> Result<usize> {
+    pub async fn ingest_all_with_task(
+        &mut self,
+        force: bool,
+        task_id: &TaskId,
+    ) -> Result<IndexingOutcome> {
         self.ingest_all_inner(force, Some(task_id)).await
     }
 
-    async fn ingest_all_inner(&mut self, force: bool, task_id: Option<&TaskId>) -> Result<usize> {
+    async fn ingest_all_inner(
+        &mut self,
+        force: bool,
+        task_id: Option<&TaskId>,
+    ) -> Result<IndexingOutcome> {
         if !force {
             self.check_stale()?;
         }
@@ -834,6 +889,10 @@ where
             .collect();
 
         let total = to_ingest.len();
+        let mut outcome = IndexingOutcome {
+            source_count: total,
+            embedding_cache: EmbeddingCacheStats::default(),
+        };
         for (i, source_id) in to_ingest.iter().enumerate() {
             tracing::info!(progress = format!("{}/{}", i + 1, total), source = %source_id.0);
             self.record_task_progress(
@@ -842,11 +901,22 @@ where
                     .with_counter("sources", i as u64, Some(total as u64))
                     .with_recent_status(format!("ingesting source {}", source_id.0)),
             );
-            self.ingest_source_inner(source_id, task_id).await?;
+            let cache_stats = self.ingest_source_inner(source_id, task_id).await?;
+            outcome.embedding_cache.add(&cache_stats);
             self.record_task_progress(
                 task_id,
                 TaskProgressSnapshot::phase("ingest")
                     .with_counter("sources", (i + 1) as u64, Some(total as u64))
+                    .with_counter(
+                        "embedding_cache_hits",
+                        outcome.embedding_cache.cache_hits as u64,
+                        None,
+                    )
+                    .with_counter(
+                        "embedding_cache_misses",
+                        outcome.embedding_cache.cache_misses as u64,
+                        None,
+                    )
                     .with_recent_status(format!("finished source {}", source_id.0)),
             );
         }
@@ -855,7 +925,7 @@ where
             self.sync_qdrant_all().await;
         }
 
-        Ok(total)
+        Ok(outcome)
     }
 
     fn record_task_phase(
@@ -941,7 +1011,9 @@ where
             embedding_profile_id = %active_profile_id,
             "rebuilding local indexes"
         );
-        let prepared = self.prepare_full_indexes_for_chunks(&child_chunks).await?;
+        let prepared = self
+            .prepare_full_indexes_for_chunks(&active_profile_id, &child_chunks)
+            .await?;
         self.store
             .replace_all_vector_documents_for_profile(&active_profile_id, &prepared.vectors)?;
         self.mark_profile_sources_embedded(&active_profile_id, &source_ids, &prepared.vectors)?;
@@ -957,7 +1029,7 @@ where
         &mut self,
         profile_id: &EmbeddingProfileId,
         source_id: Option<&SourceId>,
-    ) -> Result<usize> {
+    ) -> Result<IndexingOutcome> {
         self.ensure_embedding_profile(profile_id)?;
         let target_source_ids = match source_id {
             Some(source_id) => {
@@ -987,7 +1059,10 @@ where
                 self.prepare_source_indexes_for_profile(profile_id, source_id, &child_chunks)
                     .await?
             }
-            None => self.prepare_full_indexes_for_chunks(&child_chunks).await?,
+            None => {
+                self.prepare_full_indexes_for_chunks(profile_id, &child_chunks)
+                    .await?
+            }
         };
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
         let generation = match source_id {
@@ -1007,6 +1082,7 @@ where
                 self.store.index_generation_for_profile(profile_id)?
             }
         };
+        let cache_stats = prepared.cache_stats.clone();
         self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
         if *profile_id == self.active_profile_id {
             self.clear_vector_only_stale_status(source_id)?;
@@ -1016,7 +1092,10 @@ where
             Some(source_id) => self.sync_qdrant_profile_source(profile_id, source_id).await,
             None => self.sync_qdrant_profile_all(profile_id).await,
         }
-        Ok(target_source_ids.len())
+        Ok(IndexingOutcome {
+            source_count: target_source_ids.len(),
+            embedding_cache: cache_stats,
+        })
     }
 
     fn clear_vector_only_stale_status(&self, source_id: Option<&SourceId>) -> Result<()> {
@@ -1048,36 +1127,96 @@ where
 
     async fn prepare_full_indexes_for_chunks(
         &self,
+        profile_id: &EmbeddingProfileId,
         child_chunks: &[Chunk],
     ) -> Result<PreparedIndexes> {
         let mut hnsw = HnswIndex::new();
         let mut vectors = Vec::new();
+        let mut cache_stats = EmbeddingCacheStats::default();
         if !child_chunks.is_empty() {
-            let texts: Vec<String> = child_chunks
-                .iter()
-                .map(|c| self.embedding_text(c))
-                .collect();
-            let embeddings = self.embed_client.embed(&texts).await?;
-            if embeddings.len() != child_chunks.len() {
-                bail!(
-                    "embedding count mismatch: expected {}, got {}",
-                    child_chunks.len(),
-                    embeddings.len()
-                );
+            let profile_config_hash = self.embedding_profile_spec.config_hash();
+            let expected_dimension = self.embed_client.dimension();
+            let mut misses = Vec::new();
+            for chunk in child_chunks {
+                let input = self.embedding_input(chunk, &profile_config_hash);
+                match self.store.get_embedding_cache_vector(
+                    profile_id,
+                    &profile_config_hash,
+                    &input.hash,
+                )? {
+                    Some(vector) if vector.len() == expected_dimension => {
+                        self.store.record_embedding_cache_hit(
+                            profile_id,
+                            &profile_config_hash,
+                            &input.hash,
+                        )?;
+                        cache_stats.cache_hits += 1;
+                        cache_stats.reused_chunks += 1;
+                        let document = VectorDocument {
+                            chunk_id: input.chunk_id,
+                            source_id: input.source_id,
+                            vector,
+                        };
+                        hnsw.upsert(document.clone());
+                        vectors.push(document);
+                    }
+                    _ => {
+                        cache_stats.cache_misses += 1;
+                        cache_stats.changed_chunks += 1;
+                        misses.push(input);
+                    }
+                }
             }
-            for (chunk, embedding) in child_chunks.iter().zip(embeddings) {
-                let document = VectorDocument {
-                    chunk_id: chunk.id.clone(),
-                    source_id: chunk.source_id.clone(),
-                    vector: embedding,
-                };
-                hnsw.upsert(document.clone());
-                vectors.push(document);
+
+            if !misses.is_empty() {
+                let texts = misses
+                    .iter()
+                    .map(|input| input.text.clone())
+                    .collect::<Vec<_>>();
+                let embeddings = self.embed_client.embed(&texts).await?;
+                if embeddings.len() != misses.len() {
+                    bail!(
+                        "embedding count mismatch: expected {}, got {}",
+                        misses.len(),
+                        embeddings.len()
+                    );
+                }
+                let mut cache_entries = Vec::with_capacity(misses.len());
+                for (input, embedding) in misses.into_iter().zip(embeddings) {
+                    cache_stats.embedded_chunks += 1;
+                    cache_entries.push(EmbeddingCacheEntry {
+                        embedding_input_hash: input.hash.clone(),
+                        vector: embedding.clone(),
+                    });
+                    let document = VectorDocument {
+                        chunk_id: input.chunk_id,
+                        source_id: input.source_id,
+                        vector: embedding,
+                    };
+                    hnsw.upsert(document.clone());
+                    vectors.push(document);
+                }
+                self.store.upsert_embedding_cache_entries(
+                    profile_id,
+                    &profile_config_hash,
+                    &cache_entries,
+                )?;
+            }
+            if vectors.len() != child_chunks.len() {
+                bail!(
+                    "vector count mismatch: expected {}, got {}",
+                    child_chunks.len(),
+                    vectors.len()
+                );
             }
         }
         hnsw.build()?;
 
-        Ok(PreparedIndexes { hnsw, vectors })
+        Ok(PreparedIndexes {
+            hnsw,
+            vectors,
+            cache_stats,
+        })
     }
 
     async fn prepare_source_indexes_for_profile(
@@ -1093,13 +1232,14 @@ where
             .filter(|document| document.source_id != *source_id)
             .collect::<Vec<_>>();
         let source_prepared = self
-            .prepare_full_indexes_for_chunks(source_child_chunks)
+            .prepare_full_indexes_for_chunks(profile_id, source_child_chunks)
             .await?;
         all_vectors.extend(source_prepared.vectors.clone());
         let hnsw = hnsw_from_vectors(&all_vectors)?;
         Ok(PreparedIndexes {
             hnsw,
             vectors: source_prepared.vectors,
+            cache_stats: source_prepared.cache_stats,
         })
     }
 
@@ -1108,7 +1248,11 @@ where
         vectors: Vec<VectorDocument>,
     ) -> Result<PreparedIndexes> {
         let hnsw = hnsw_from_vectors(&vectors)?;
-        Ok(PreparedIndexes { hnsw, vectors })
+        Ok(PreparedIndexes {
+            hnsw,
+            vectors,
+            cache_stats: EmbeddingCacheStats::default(),
+        })
     }
 
     fn mark_profile_sources_embedded(
@@ -1247,6 +1391,27 @@ where
     fn embedding_text(&self, chunk: &Chunk) -> String {
         self.embed_client
             .prepare_document(&chunk_search_text(chunk), &chunk.heading_path.join(" > "))
+    }
+
+    fn assign_embedding_input_hashes(&self, chunks: &mut [Chunk], profile_config_hash: &str) {
+        for chunk in chunks {
+            if chunk.chunk_type != ChunkType::Child {
+                continue;
+            }
+            let input = self.embedding_input(chunk, profile_config_hash);
+            chunk.embedding_input_hash = Some(input.hash);
+        }
+    }
+
+    fn embedding_input(&self, chunk: &Chunk, profile_config_hash: &str) -> EmbeddingInput {
+        let text = self.embedding_text(chunk);
+        let hash = embedding_input_hash(profile_config_hash, &text);
+        EmbeddingInput {
+            chunk_id: chunk.id.clone(),
+            source_id: chunk.source_id.clone(),
+            hash,
+            text,
+        }
     }
 
     async fn caption_prepared_image_artifacts(
@@ -1646,15 +1811,28 @@ fn chunk_search_text(chunk: &Chunk) -> String {
         .unwrap_or_else(|| chunk.text.clone())
 }
 
+fn embedding_input_hash(profile_config_hash: &str, prepared_text: &str) -> String {
+    hex_sha256(format!("{CHUNKER_VERSION}\0{profile_config_hash}\0{prepared_text}").as_bytes())
+}
+
 fn chunk_caption_evidence(source_id: &SourceId, evidence: &[EvidenceUnit]) -> ChunkOutput {
     let mut chunks = Vec::with_capacity(evidence.len());
     let mut links = Vec::with_capacity(evidence.len());
 
     for unit in evidence {
-        let chunk_id = ChunkId(format!("{}:chunk", unit.id.0));
+        let evidence_hashes = vec![format!("evidence:{}:{}", unit.id.0, unit.text_hash)];
+        let chunk_hash = deterministic_chunk_hash(
+            ChunkType::Child,
+            &unit.text,
+            &unit.heading_path,
+            &evidence_hashes,
+        );
+        let chunk_id = ChunkId(format!("{}:chunk:{}", unit.id.0, &chunk_hash[..16]));
         chunks.push(Chunk {
             id: chunk_id.clone(),
             source_id: source_id.clone(),
+            chunk_hash,
+            embedding_input_hash: None,
             text: unit.text.clone(),
             context_text: None,
             token_count: estimate_tokens(&unit.text),
@@ -2813,6 +2991,47 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RecordingEmbeddingClient {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl RecordingEmbeddingClient {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls
+                .lock()
+                .expect("recording embedding calls lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingClient for RecordingEmbeddingClient {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls
+                .lock()
+                .expect("recording embedding calls lock should not be poisoned")
+                .push(texts.to_vec());
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    let sum = text.bytes().fold(0_u32, |acc, byte| acc + u32::from(byte));
+                    vec![sum as f32, 1.0]
+                })
+                .collect())
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
     struct CaptionKeywordEmbeddingClient;
 
     #[async_trait]
@@ -3072,6 +3291,8 @@ mod tests {
         Chunk {
             id: ChunkId(id.to_string()),
             source_id: source_id.clone(),
+            chunk_hash: format!("hash-{id}"),
+            embedding_input_hash: None,
             text: text.to_string(),
             context_text: None,
             token_count: 4,
@@ -3200,7 +3421,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(source_count, 1);
+        assert_eq!(source_count.source_count, 1);
         assert_eq!(
             pipeline
                 .store()
@@ -3221,7 +3442,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(all_count, 2);
+        assert_eq!(all_count.source_count, 2);
         assert_eq!(
             pipeline
                 .store()
@@ -3260,7 +3481,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(source_count, 1);
+        assert_eq!(source_count.source_count, 1);
         assert_eq!(
             pipeline
                 .store()
@@ -3274,7 +3495,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(all_count, 1);
+        assert_eq!(all_count.source_count, 1);
         assert_eq!(
             pipeline
                 .store()
@@ -3306,7 +3527,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(source_count, 1);
+        assert_eq!(source_count.source_count, 1);
         assert_eq!(
             pipeline
                 .store()
@@ -3341,7 +3562,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(source_count, 1);
+        assert_eq!(source_count.source_count, 1);
         assert_eq!(
             pipeline
                 .store()
@@ -3388,7 +3609,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(rebuilt, 1);
+        assert_eq!(rebuilt.source_count, 1);
         let source = pipeline.store().get_source(&source_id).unwrap().unwrap();
         assert_eq!(source.status, SourceStatus::Stale);
         assert!(source.parser_used.is_none());
@@ -4627,7 +4848,7 @@ model = "local-vision"
 
         let ingested = pipeline.ingest_all(true).await.unwrap();
 
-        assert_eq!(ingested, 1);
+        assert_eq!(ingested.source_count, 1);
         let requests = handle.join().unwrap();
         assert_eq!(
             requests[5].line,
@@ -4686,7 +4907,7 @@ model = "local-vision"
             .await
             .unwrap();
 
-        assert_eq!(count, 1);
+        assert_eq!(count.source_count, 1);
         let requests = handle.join().unwrap();
         assert_eq!(
             requests[1].line,
@@ -4747,6 +4968,71 @@ model = "local-vision"
         assert!(vectors
             .iter()
             .all(|vector| vector.chunk_id.0 != "old-chunk"));
+    }
+
+    #[tokio::test]
+    async fn markdown_reingest_reuses_cached_vectors_after_insertion_and_deletion() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("doc.md");
+        let original = "# Alpha\n\nAlpha body.\n\n# Stable\n\nStable body.\n";
+        let inserted =
+            "# Inserted\n\nInserted body.\n\n# Alpha\n\nAlpha body.\n\n# Stable\n\nStable body.\n";
+        std::fs::write(&path, original).unwrap();
+        let store = Store::in_memory().unwrap();
+        let embedding = RecordingEmbeddingClient::new();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            embedding.clone(),
+            tempdir.path().to_path_buf(),
+        );
+        let source_id = pipeline.add_source(&path).unwrap();
+
+        let first = pipeline.ingest_source(&source_id).await.unwrap();
+        let first_chunks = pipeline.store().list_chunks_by_source(&source_id).unwrap();
+        let first_alpha = child_chunk_for_heading(&first_chunks, "Alpha");
+        let first_stable = child_chunk_for_heading(&first_chunks, "Stable");
+
+        assert_eq!(first.cache_hits, 0);
+        assert_eq!(first.cache_misses, 2);
+        assert_eq!(first.embedded_chunks, 2);
+        assert_eq!(embedding.calls().len(), 1);
+
+        std::fs::write(&path, inserted).unwrap();
+        let second = pipeline.ingest_source(&source_id).await.unwrap();
+        let second_chunks = pipeline.store().list_chunks_by_source(&source_id).unwrap();
+        let second_alpha = child_chunk_for_heading(&second_chunks, "Alpha");
+        let second_stable = child_chunk_for_heading(&second_chunks, "Stable");
+
+        assert_eq!(second.cache_hits, 2);
+        assert_eq!(second.cache_misses, 1);
+        assert_eq!(second.reused_chunks, 2);
+        assert_eq!(second.changed_chunks, 1);
+        assert_eq!(second.embedded_chunks, 1);
+        assert_eq!(first_alpha.id, second_alpha.id);
+        assert_eq!(first_alpha.chunk_hash, second_alpha.chunk_hash);
+        assert_eq!(first_stable.id, second_stable.id);
+        assert_eq!(first_stable.chunk_hash, second_stable.chunk_hash);
+        assert_eq!(embedding.calls().len(), 2);
+
+        std::fs::write(&path, original).unwrap();
+        let third = pipeline.ingest_source(&source_id).await.unwrap();
+
+        assert_eq!(third.cache_hits, 2);
+        assert_eq!(third.cache_misses, 0);
+        assert_eq!(third.reused_chunks, 2);
+        assert_eq!(third.embedded_chunks, 0);
+        assert_eq!(embedding.calls().len(), 2);
+    }
+
+    fn child_chunk_for_heading<'a>(chunks: &'a [Chunk], heading: &str) -> &'a Chunk {
+        chunks
+            .iter()
+            .find(|chunk| {
+                chunk.chunk_type == ChunkType::Child
+                    && chunk.heading_path == vec![heading.to_string()]
+            })
+            .expect("child chunk for heading")
     }
 
     #[tokio::test]

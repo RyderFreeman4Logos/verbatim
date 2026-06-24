@@ -38,7 +38,7 @@ use verbatim_core::generate::{
     image_artifact_evidence_id, select_image_attachments, GenerationContext, Generator,
 };
 use verbatim_core::graphrag::GraphRagService;
-use verbatim_core::ingest::IngestPipeline;
+use verbatim_core::ingest::{IndexingOutcome, IngestPipeline};
 use verbatim_core::ocr::source_ingest_diagnostics;
 use verbatim_core::provider::openai_compatible::OpenAiCompatibleReranker;
 use verbatim_core::provider::ProviderError;
@@ -2300,10 +2300,17 @@ async fn execute_started_ingest_task(
         embedding_profile_id,
         vectors_only,
     };
-    let (result, profile_id) =
+    let (outcome, profile_id) =
         run_indexing_operation(Arc::clone(&state), task_id, &controls, "ingest").await?;
-    let response = IngestResponse { ingested: result };
-    finish_task_success(&state, task_id, ingest_result_metadata(response.ingested)).await?;
+    let response = IngestResponse {
+        ingested: outcome.source_count,
+    };
+    finish_task_success(
+        &state,
+        task_id,
+        ingest_result_metadata(response.ingested, &outcome.embedding_cache),
+    )
+    .await?;
     tracing::debug!(
         task_id = %task_id.0,
         embedding_profile_id = %profile_id,
@@ -2333,10 +2340,17 @@ async fn execute_started_reindex_task(
     task_id: &TaskId,
     controls: IndexingTaskControls,
 ) -> Result<ReindexResponse, (StatusCode, Json<ErrorResponse>)> {
-    let (result, profile_id) =
+    let (outcome, profile_id) =
         run_indexing_operation(Arc::clone(&state), task_id, &controls, "reindex").await?;
-    let response = ReindexResponse { reindexed: result };
-    finish_task_success(&state, task_id, reindex_result_metadata(response.reindexed)).await?;
+    let response = ReindexResponse {
+        reindexed: outcome.source_count,
+    };
+    finish_task_success(
+        &state,
+        task_id,
+        reindex_result_metadata(response.reindexed, &outcome.embedding_cache),
+    )
+    .await?;
     tracing::debug!(
         task_id = %task_id.0,
         embedding_profile_id = %profile_id,
@@ -2350,7 +2364,7 @@ async fn run_indexing_operation(
     task_id: &TaskId,
     controls: &IndexingTaskControls,
     phase_name: &str,
-) -> Result<(usize, EmbeddingProfileId), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(IndexingOutcome, EmbeddingProfileId), (StatusCode, Json<ErrorResponse>)> {
     if controls.embedding_profile_id.is_some() && !controls.vectors_only {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -2386,7 +2400,7 @@ async fn run_indexing_operation(
             .with_active_worker_kind(TaskKind::Ingest.as_str()),
     )
     .await;
-    let result = tokio::task::spawn_blocking(move || {
+    let outcome = tokio::task::spawn_blocking(move || {
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         if vectors_only {
             let source_filter = source_id.as_ref().map(|id| SourceId(id.clone()));
@@ -2396,8 +2410,12 @@ async fn run_indexing_operation(
         }
         match source_id {
             Some(id) => {
-                runtime.block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2))?;
-                Ok::<_, anyhow::Error>(1)
+                let embedding_cache =
+                    runtime.block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2))?;
+                Ok::<_, anyhow::Error>(IndexingOutcome {
+                    source_count: 1,
+                    embedding_cache,
+                })
             }
             None => runtime.block_on(pipeline.ingest_all_with_task(force, &task_id2)),
         }
@@ -2409,17 +2427,43 @@ async fn run_indexing_operation(
         .progress_snapshot()
         .with_counter(
             "sources",
-            result as u64,
+            outcome.source_count as u64,
             controls.source_id.as_ref().map(|_| 1_u64),
+        )
+        .with_counter(
+            "embedding_cache_hits",
+            outcome.embedding_cache.cache_hits as u64,
+            None,
+        )
+        .with_counter(
+            "embedding_cache_misses",
+            outcome.embedding_cache.cache_misses as u64,
+            None,
+        )
+        .with_counter(
+            "embedded_chunks",
+            outcome.embedding_cache.embedded_chunks as u64,
+            None,
+        )
+        .with_counter(
+            "reused_chunks",
+            outcome.embedding_cache.reused_chunks as u64,
+            None,
+        )
+        .with_counter(
+            "changed_chunks",
+            outcome.embedding_cache.changed_chunks as u64,
+            None,
         )
         .with_recent_status(format!("{phase_name} complete"))
         .with_active_worker_kind(TaskKind::Ingest.as_str());
     let finished = timing.finish(serde_json::json!({
-        "rebuilt": result,
+        "rebuilt": outcome.source_count,
         "force": controls.force,
         "embedding_profile_id": profile_id.as_str(),
         "vectors_only": controls.vectors_only,
         "source_id": controls.source_id.as_deref(),
+        "embedding_cache": &outcome.embedding_cache,
     }));
     if controls.vectors_only {
         progress.set_endpoint(TaskEndpointSummary::single_call(
@@ -2429,7 +2473,7 @@ async fn run_indexing_operation(
     }
     record_task_progress(&state, task_id, progress).await;
     record_task_span(&state, task_id, finished).await?;
-    Ok((result, profile_id))
+    Ok((outcome, profile_id))
 }
 
 fn indexing_operation_error(
@@ -3396,8 +3440,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use verbatim_core::types::{
-        Chunk, ChunkId, ChunkType, EvidenceKind, EvidenceUnit, RetrievalEvidenceRole,
-        RetrievalProvenance, SourceLocator,
+        Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind, EvidenceUnit,
+        RetrievalEvidenceRole, RetrievalProvenance, SourceLocator,
     };
 
     #[test]
@@ -4048,7 +4092,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.reindexed, 1);
-        assert_eq!(model_server.embedding_requests(), 2);
+        assert_eq!(model_server.embedding_requests(), 1);
     }
 
     #[tokio::test]
@@ -4259,9 +4303,13 @@ mod tests {
         schedule_ingest_queue(Arc::clone(&state));
         wait_for_ingest_queue_idle(&state).await;
 
-        finish_task_success(&state, &running_id, ingest_result_metadata(0))
-            .await
-            .unwrap();
+        finish_task_success(
+            &state,
+            &running_id,
+            ingest_result_metadata(0, &EmbeddingCacheStats::default()),
+        )
+        .await
+        .unwrap();
 
         wait_for_task_status(&state, &queued_id, TaskStatus::Succeeded).await;
         let events = task_events_response(&state, queued_id, None, Some(10))
@@ -4517,17 +4565,25 @@ mod tests {
         assert_eq!(running_ingest_count(&state).await, 1);
         assert_queued_ingest_waits_for_running(&state, &foreground_id).await;
 
-        finish_task_success(&state, &background_id, ingest_result_metadata(0))
-            .await
-            .unwrap();
+        finish_task_success(
+            &state,
+            &background_id,
+            ingest_result_metadata(0, &EmbeddingCacheStats::default()),
+        )
+        .await
+        .unwrap();
         ensure_ingest_task_started(&state, &foreground_id)
             .await
             .unwrap();
 
         assert_eq!(running_ingest_count(&state).await, 1);
-        finish_task_success(&state, &foreground_id, ingest_result_metadata(0))
-            .await
-            .unwrap();
+        finish_task_success(
+            &state,
+            &foreground_id,
+            ingest_result_metadata(0, &EmbeddingCacheStats::default()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -4563,9 +4619,13 @@ mod tests {
         assert!(claimed.is_none());
         assert_queued_ingest_waits_for_running(&state, &background_id).await;
 
-        finish_task_success(&state, &foreground_id, ingest_result_metadata(0))
-            .await
-            .unwrap();
+        finish_task_success(
+            &state,
+            &foreground_id,
+            ingest_result_metadata(0, &EmbeddingCacheStats::default()),
+        )
+        .await
+        .unwrap();
 
         wait_for_task_status(&state, &background_id, TaskStatus::Succeeded).await;
     }
@@ -4596,6 +4656,8 @@ mod tests {
         let chunk = Chunk {
             id: chunk_id.clone(),
             source_id: source_id.clone(),
+            chunk_hash: format!("hash-{}", chunk_id.0),
+            embedding_input_hash: None,
             text: evidence.text.clone(),
             context_text: None,
             token_count: 2,

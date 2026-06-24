@@ -699,6 +699,11 @@ pub enum ChunkType {
 pub struct Chunk {
     pub id: ChunkId,
     pub source_id: SourceId,
+    /// Deterministic identity for this chunk's content and structural context.
+    pub chunk_hash: String,
+    /// Hash of the exact embedding input for the active embedding profile, when embedded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_input_hash: Option<String>,
     pub text: String,
     pub context_text: Option<String>,
     pub token_count: u32,
@@ -706,6 +711,33 @@ pub struct Chunk {
     pub parent_chunk_id: Option<ChunkId>,
     pub heading_path: Vec<String>,
     pub evidence_unit_ids: Vec<EvidenceId>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingCacheStats {
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub embedded_chunks: usize,
+    pub reused_chunks: usize,
+    pub changed_chunks: usize,
+}
+
+impl EmbeddingCacheStats {
+    pub fn add(&mut self, other: &Self) {
+        self.cache_hits += other.cache_hits;
+        self.cache_misses += other.cache_misses;
+        self.embedded_chunks += other.embedded_chunks;
+        self.reused_chunks += other.reused_chunks;
+        self.changed_chunks += other.changed_chunks;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cache_hits == 0
+            && self.cache_misses == 0
+            && self.embedded_chunks == 0
+            && self.reused_chunks == 0
+            && self.changed_chunks == 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

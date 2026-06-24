@@ -1210,6 +1210,8 @@ mod tests {
             chunk: Chunk {
                 id: ChunkId("c1".into()),
                 source_id: SourceId("src".into()),
+                chunk_hash: "hash-c1".into(),
+                embedding_input_hash: None,
                 text: "sample".into(),
                 context_text: None,
                 token_count: 10,
@@ -1291,6 +1293,8 @@ mod tests {
             chunk: Chunk {
                 id: ChunkId("caption-child".into()),
                 source_id: SourceId("src".into()),
+                chunk_hash: "hash-caption-child".into(),
+                embedding_input_hash: None,
                 text: "captionneedle".into(),
                 context_text: None,
                 token_count: 12,
@@ -1341,6 +1345,8 @@ mod tests {
             chunk: Chunk {
                 id: chunk_id.clone(),
                 source_id: source_id.clone(),
+                chunk_hash: "hash-ocr-child".into(),
+                embedding_input_hash: None,
                 text: "ocrneedle scanned invoice total".into(),
                 context_text: None,
                 token_count: 5,
@@ -1398,6 +1404,8 @@ mod tests {
             chunk: Chunk {
                 id: chunk_id.clone(),
                 source_id: source_id.clone(),
+                chunk_hash: "hash-graphrag-report".into(),
+                embedding_input_hash: None,
                 text: "Community report: Alpha\nGrounded claims:\n- Alpha is grounded.".into(),
                 context_text: None,
                 token_count: 8,
