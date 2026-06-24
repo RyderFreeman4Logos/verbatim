@@ -86,6 +86,58 @@ pub struct CollectionSyncResponse {
     pub report: CollectionSyncReport,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionFilterRequest {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collection_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub require_fresh: bool,
+}
+
+impl CollectionFilterRequest {
+    pub fn is_empty(&self) -> bool {
+        self.collection_ids.is_empty() && self.names.is_empty() && !self.require_fresh
+    }
+
+    pub fn has_filters(&self) -> bool {
+        !self.collection_ids.is_empty() || !self.names.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionFilterResponse {
+    pub requested: CollectionFilterRequest,
+    pub union_source_count: usize,
+    #[serde(default)]
+    pub applied: Vec<AppliedCollectionFilterResponse>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedCollectionFilterResponse {
+    pub collection_id: String,
+    pub name: String,
+    pub member_count: usize,
+    pub indexed_member_count: usize,
+    pub stale_member_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced_at: Option<String>,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectionResultProvenance {
+    pub collection_id: String,
+    pub name: String,
+    pub logical_path: String,
+    pub source_path: String,
+    pub member_updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestResponse {
     pub ingested: usize,
@@ -157,6 +209,8 @@ pub struct AskRequest {
     pub question: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "CollectionFilterRequest::is_empty")]
+    pub collection_filter: CollectionFilterRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_profile_id: Option<String>,
     #[serde(default)]
@@ -175,6 +229,8 @@ pub struct AskResponse {
     pub retrieval: Option<RetrievalDebug>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<RetrieveResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_filter: Option<CollectionFilterResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +238,8 @@ pub struct RetrieveRequest {
     pub question: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "CollectionFilterRequest::is_empty")]
+    pub collection_filter: CollectionFilterRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,6 +270,8 @@ pub struct RetrieveResponse {
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_filter: Option<CollectionFilterResponse>,
     pub embedding_profile_id: String,
     pub limit: usize,
     pub page_size: usize,
@@ -252,6 +312,8 @@ pub struct RetrieveResultResponse {
     pub source_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<CollectionResultProvenance>,
     pub chunk_id: String,
     pub kind: String,
     pub role: String,
@@ -272,6 +334,8 @@ pub struct CitationResponse {
     pub evidence_id: String,
     pub kind: String,
     pub derived_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<CollectionResultProvenance>,
     pub locator: String,
     pub text_preview: String,
 }
@@ -379,6 +443,7 @@ mod tests {
 
         assert_eq!(request.question, "What is cited?");
         assert!(request.source_id.is_none());
+        assert!(request.collection_filter.is_empty());
         assert!(request.limit.is_none());
         assert!(request.page_size.is_none());
         assert!(!request.fast);
@@ -393,6 +458,7 @@ mod tests {
             task_id: "task-1".into(),
             query: "What is cited?".into(),
             source_id: None,
+            collection_filter: None,
             embedding_profile_id: "default".into(),
             limit: 12,
             page_size: 1,
@@ -418,6 +484,7 @@ mod tests {
                 evidence_id: "ev-1".into(),
                 source_id: "src-1".into(),
                 source_path: Some("/tmp/doc.md".into()),
+                collections: Vec::new(),
                 chunk_id: "chunk-1".into(),
                 kind: "text".into(),
                 role: "original_text".into(),
@@ -486,6 +553,7 @@ mod tests {
             evidence_id: "ev-md".into(),
             source_id: "src-1".into(),
             source_path: Some("/tmp/doc.md".into()),
+            collections: Vec::new(),
             chunk_id: "chunk-1".into(),
             kind: "text".into(),
             role: "original_text".into(),

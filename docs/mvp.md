@@ -257,6 +257,23 @@ fd 'Areskapitalon.*\.md' ../drafts/articles/articles \
   | cargo run -p verbatim-cli -- collection sync areskapitalon --stdin
 ```
 
+Retrieve or ask within the materialized collection membership without rescanning
+those roots:
+
+```sh
+cargo run -p verbatim-cli -- retrieve \
+  --collection articles \
+  "What evidence is relevant across the articles?"
+
+cargo run -p verbatim-cli -- retrieve \
+  --collection areskapitalon \
+  "What does Areskapitalon cover?"
+
+cargo run -p verbatim-cli -- ask \
+  --collection articles \
+  "What does the article set conclude?"
+```
+
 Ingest and retrieve a context pack without chat generation:
 
 ```sh

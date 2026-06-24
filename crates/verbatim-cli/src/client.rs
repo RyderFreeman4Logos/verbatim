@@ -1192,6 +1192,7 @@ mod tests {
         let ask = AskRequest {
             question: "Why?".into(),
             source_id: Some("src-1".into()),
+            collection_filter: Default::default(),
             embedding_profile_id: None,
             show_retrieval: false,
             context_only: false,

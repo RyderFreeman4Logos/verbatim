@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use verbatim_core::api::{
-    AddCollectionRootRequest, AskRequest, CollectionSyncPathRequest, CollectionSyncRequest,
-    CreateCollectionRequest, ReindexRequest, RetrieveRequest,
+    AddCollectionRootRequest, AskRequest, CollectionFilterRequest, CollectionSyncPathRequest,
+    CollectionSyncRequest, CreateCollectionRequest, ReindexRequest, RetrieveRequest,
 };
 
 mod client;
@@ -98,6 +98,17 @@ fn rerank_override(rerank: bool, no_rerank: bool) -> Option<bool> {
         (true, false) => Some(true),
         (false, true) => Some(false),
         _ => None,
+    }
+}
+
+fn collection_filter_request(
+    collection_names: Vec<String>,
+    require_fresh: bool,
+) -> CollectionFilterRequest {
+    CollectionFilterRequest {
+        collection_ids: Vec::new(),
+        names: collection_names,
+        require_fresh,
     }
 }
 
@@ -240,6 +251,8 @@ where
         Commands::Ask {
             question,
             source_id,
+            collection,
+            require_fresh,
             embedding_profile,
             show_retrieval,
             context_only,
@@ -249,6 +262,7 @@ where
         } => {
             let context_only = context_only || no_generate;
             let question = question.join(" ");
+            let collection_filter = collection_filter_request(collection, require_fresh);
             if context_only {
                 if background {
                     return Err(CliError::Api(
@@ -259,6 +273,7 @@ where
                 let request = RetrieveRequest {
                     question,
                     source_id,
+                    collection_filter,
                     embedding_profile_id: embedding_profile,
                     limit: None,
                     page_size: None,
@@ -285,6 +300,7 @@ where
             let request = AskRequest {
                 question,
                 source_id,
+                collection_filter,
                 embedding_profile_id: embedding_profile,
                 show_retrieval,
                 context_only: false,
@@ -301,6 +317,8 @@ where
         Commands::Retrieve {
             question,
             source_id,
+            collection,
+            require_fresh,
             embedding_profile,
             limit,
             page_size,
@@ -319,6 +337,7 @@ where
             let request = RetrieveRequest {
                 question: question.join(" "),
                 source_id,
+                collection_filter: collection_filter_request(collection, require_fresh),
                 embedding_profile_id: embedding_profile,
                 limit,
                 page_size,
@@ -734,6 +753,7 @@ Caveats:
 const ASK_AFTER_HELP: &str = r#"Examples:
   verbatim ask "What does the report conclude?"
   verbatim ask --source-id <source-id> --show-retrieval "What supports it?"
+  verbatim ask --collection articles "What evidence is relevant?"
   verbatim ask --context-only "What evidence is relevant?"
   verbatim ask --no-generate --format json "What evidence is relevant?"
 
@@ -747,12 +767,16 @@ Caveats:
 const RETRIEVE_AFTER_HELP: &str = r#"Examples:
   verbatim retrieve "What does the report conclude?"
   verbatim retrieve --source-id <source-id> --page-size 1 "What supports it?"
+  verbatim retrieve --collection articles "What evidence is relevant?"
+  verbatim retrieve --collection articles --collection areskapitalon "What changed?"
   verbatim retrieve --show-debug --show-locator "What evidence is relevant?"
   verbatim retrieve --format json --show-debug "What evidence is relevant?"
 
 Debugging:
   retrieve never invokes chat generation.
   It returns evidence context without invoking chat generation.
+  --collection filters against materialized daemon membership and does not
+  rescan collection roots during retrieve.
   --show-debug includes deterministic dense/BM25/RRF/rerank evidence ranking
   details for debugging and agent workflows.
   --show-locator and JSON output include structured locator/provenance fields
@@ -992,6 +1016,12 @@ enum Commands {
         /// Restrict retrieval to one source.
         #[arg(short = 's', long = "source-id")]
         source_id: Option<String>,
+        /// Restrict retrieval to this materialized collection. Repeat for union semantics.
+        #[arg(long = "collection", value_name = "NAME")]
+        collection: Vec<String>,
+        /// Fail instead of returning warning metadata for stale collection membership.
+        #[arg(long = "require-fresh")]
+        require_fresh: bool,
         /// Use this embedding profile for retrieval.
         #[arg(long = "embedding-profile")]
         embedding_profile: Option<String>,
@@ -1026,6 +1056,12 @@ enum Commands {
         /// Restrict retrieval to one source.
         #[arg(short = 's', long = "source-id")]
         source_id: Option<String>,
+        /// Restrict retrieval to this materialized collection. Repeat for union semantics.
+        #[arg(long = "collection", value_name = "NAME")]
+        collection: Vec<String>,
+        /// Fail instead of returning warning metadata for stale collection membership.
+        #[arg(long = "require-fresh")]
+        require_fresh: bool,
         /// Use this embedding profile for retrieval.
         #[arg(long = "embedding-profile")]
         embedding_profile: Option<String>,
@@ -1812,6 +1848,7 @@ mod tests {
             &AskRequest {
                 question: "What is cited?".into(),
                 source_id: Some("src-1".into()),
+                collection_filter: CollectionFilterRequest::default(),
                 embedding_profile_id: None,
                 show_retrieval: false,
                 context_only: false,
@@ -1908,6 +1945,7 @@ mod tests {
             &AskRequest {
                 question: "What is cited?".into(),
                 source_id: Some("src-1".into()),
+                collection_filter: CollectionFilterRequest::default(),
                 embedding_profile_id: None,
                 show_retrieval: true,
                 context_only: false,
@@ -1947,6 +1985,7 @@ mod tests {
             &RetrieveRequest {
                 question: "What is cited?".into(),
                 source_id: Some("src-1".into()),
+                collection_filter: CollectionFilterRequest::default(),
                 embedding_profile_id: None,
                 limit: Some(3),
                 page_size: Some(1),
@@ -1999,6 +2038,44 @@ mod tests {
     }
 
     #[test]
+    fn retrieve_and_ask_collection_flags_are_plumbed() {
+        let (code, _, stderr, client, _) = run_mock([
+            "retrieve",
+            "--collection",
+            "articles",
+            "--collection",
+            "areskapitalon",
+            "--require-fresh",
+            "What",
+            "is",
+            "cited?",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        let request = client.last_retrieve.borrow();
+        let request = request.as_ref().unwrap();
+        assert_eq!(
+            request.collection_filter.names,
+            vec!["articles".to_string(), "areskapitalon".to_string()]
+        );
+        assert!(request.collection_filter.require_fresh);
+
+        let (code, _, stderr, client, _) =
+            run_mock(["ask", "--collection", "articles", "What", "is", "cited?"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        let request = client.last_ask.borrow();
+        let request = request.as_ref().unwrap();
+        assert_eq!(
+            request.collection_filter.names,
+            vec!["articles".to_string()]
+        );
+        assert!(!request.collection_filter.require_fresh);
+    }
+
+    #[test]
     fn retrieve_markdown_show_debug_renders_retrieval_debug() {
         let (code, stdout, stderr, client, _) = run_mock([
             "retrieve",
@@ -2048,6 +2125,7 @@ mod tests {
             &RetrieveRequest {
                 question: "What is cited?".into(),
                 source_id: Some("src-1".into()),
+                collection_filter: CollectionFilterRequest::default(),
                 embedding_profile_id: None,
                 limit: None,
                 page_size: None,
@@ -2116,6 +2194,7 @@ mod tests {
             &AskRequest {
                 question: "What is cited?".into(),
                 source_id: None,
+                collection_filter: CollectionFilterRequest::default(),
                 embedding_profile_id: Some("alt".into()),
                 show_retrieval: false,
                 context_only: false,
@@ -2693,6 +2772,7 @@ mod tests {
             evidence_id: "ev-1".into(),
             kind: "original_text".into(),
             derived_from: None,
+            collections: Vec::new(),
             locator: "PDF p.1 para.1".into(),
             text_preview: "preview".into(),
         }
@@ -2703,6 +2783,7 @@ mod tests {
             task_id: "task-1".into(),
             query: request.question.clone(),
             source_id: request.source_id.clone(),
+            collection_filter: None,
             embedding_profile_id: request
                 .embedding_profile_id
                 .clone()
@@ -2731,6 +2812,7 @@ mod tests {
                 evidence_id: "ev-1".into(),
                 source_id: "src-1".into(),
                 source_path: Some("/tmp/doc.md".into()),
+                collections: Vec::new(),
                 chunk_id: "chunk-1".into(),
                 kind: "text".into(),
                 role: "original_text".into(),

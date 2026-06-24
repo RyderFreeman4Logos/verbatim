@@ -86,6 +86,15 @@ fd 'Areskapitalon.*\.md' ../drafts/articles/articles \
   | verbatim collection sync areskapitalon --stdin
 ```
 
+Collection-scoped retrieval and ask use the daemon's materialized membership;
+they do not rescan collection roots during query execution:
+
+```sh
+verbatim retrieve --collection articles "What evidence is relevant?"
+verbatim retrieve --collection areskapitalon "What does Areskapitalon cover?"
+verbatim ask --collection articles "What does the article set conclude?"
+```
+
 Ask with citations:
 
 ```sh
