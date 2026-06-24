@@ -9,12 +9,13 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use verbatim_core::api::{
-    AddCollectionRootRequest, AddSourceRequest, AddSourceResponse, AskRequest, CheckStaleResponse,
-    CollectionResponse, CollectionStatusResponse, CollectionSyncRequest, CollectionSyncResponse,
-    CollectionWatcherResponse, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
-    ConfigResponse, CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse,
-    ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse, SourceResponse,
-    TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse,
+    AddCollectionRootRequest, AddSourceRequest, AddSourceResponse, ApiHttpMethod, AskRequest,
+    CheckStaleResponse, CollectionApiEndpoint, CollectionResponse, CollectionStatusResponse,
+    CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
+    CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
+    CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse, ReindexRequest,
+    ReindexResponse, RetrieveRequest, RetrieveResponse, SourceResponse, TaskCreatedResponse,
+    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse,
 };
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
@@ -328,7 +329,12 @@ impl DaemonClient for HttpDaemonClient {
         &self,
         request: &CreateCollectionRequest,
     ) -> CliResult<CollectionResponse> {
-        self.request_json(Method::POST, "/api/collections", Some(request))
+        let route = CollectionApiEndpoint::CreateCollection;
+        self.request_json(
+            collection_method(route),
+            route.path_template(),
+            Some(request),
+        )
     }
 
     fn add_collection_root(
@@ -336,29 +342,36 @@ impl DaemonClient for HttpDaemonClient {
         name: &str,
         request: &AddCollectionRootRequest,
     ) -> CliResult<CollectionResponse> {
-        self.request_json(
-            Method::POST,
-            &format!("/api/collections/{name}/roots"),
-            Some(request),
-        )
+        let route = CollectionApiEndpoint::AddCollectionRoot;
+        self.request_json(collection_method(route), &route.path(name), Some(request))
     }
 
     fn list_collections(&self) -> CliResult<Vec<CollectionRecord>> {
-        self.request_json::<Vec<CollectionRecord>, ()>(Method::GET, "/api/collections", None)
+        let route = CollectionApiEndpoint::ListCollections;
+        self.request_json::<Vec<CollectionRecord>, ()>(
+            collection_method(route),
+            route.path_template(),
+            None,
+        )
     }
 
     fn get_collection(&self, name: &str) -> CliResult<CollectionResponse> {
+        let route = CollectionApiEndpoint::GetCollection;
         self.request_json::<CollectionResponse, ()>(
-            Method::GET,
-            &format!("/api/collections/{name}"),
+            collection_method(route),
+            &route.path(name),
             None,
         )
     }
 
     fn delete_collection(&self, name: &str) -> CliResult<()> {
-        let url = self.url(&format!("/api/collections/{name}"))?;
+        let route = CollectionApiEndpoint::DeleteCollection;
+        let url = self.url(&route.path(name))?;
         let response = self
-            .apply_timeout(self.client.delete(&url), RequestTimeoutPolicy::LongRunning)?
+            .apply_timeout(
+                self.client.request(collection_method(route), &url),
+                RequestTimeoutPolicy::LongRunning,
+            )?
             .send()
             .map_err(|error| request_error(&url, error))?;
         if response.status() == StatusCode::NO_CONTENT {
@@ -372,33 +385,33 @@ impl DaemonClient for HttpDaemonClient {
         name: &str,
         request: &CollectionSyncRequest,
     ) -> CliResult<CollectionSyncResponse> {
-        self.request_json(
-            Method::POST,
-            &format!("/api/collections/{name}/sync"),
-            Some(request),
-        )
+        let route = CollectionApiEndpoint::SyncCollection;
+        self.request_json(collection_method(route), &route.path(name), Some(request))
     }
 
     fn collection_status(&self, name: &str) -> CliResult<CollectionStatusResponse> {
+        let route = CollectionApiEndpoint::CollectionStatus;
         self.request_json::<CollectionStatusResponse, ()>(
-            Method::GET,
-            &format!("/api/collections/{name}/status"),
+            collection_method(route),
+            &route.path(name),
             None,
         )
     }
 
     fn list_collection_watcher_statuses(&self) -> CliResult<CollectionWatchersStatusResponse> {
+        let route = CollectionApiEndpoint::ListCollectionWatcherStatuses;
         self.request_json::<CollectionWatchersStatusResponse, ()>(
-            Method::GET,
-            "/api/collections/watchers/status",
+            collection_method(route),
+            route.path_template(),
             None,
         )
     }
 
     fn collection_watcher_status(&self, name: &str) -> CliResult<CollectionWatcherResponse> {
+        let route = CollectionApiEndpoint::CollectionWatcherStatus;
         self.request_json::<CollectionWatcherResponse, ()>(
-            Method::GET,
-            &format!("/api/collections/{name}/watcher"),
+            collection_method(route),
+            &route.path(name),
             None,
         )
     }
@@ -408,11 +421,8 @@ impl DaemonClient for HttpDaemonClient {
         name: &str,
         request: &CollectionWatcherUpdateRequest,
     ) -> CliResult<CollectionWatcherResponse> {
-        self.request_json(
-            Method::PUT,
-            &format!("/api/collections/{name}/watcher"),
-            Some(request),
-        )
+        let route = CollectionApiEndpoint::UpdateCollectionWatcher;
+        self.request_json(collection_method(route), &route.path(name), Some(request))
     }
 
     fn ingest(
@@ -644,6 +654,15 @@ fn is_long_running_mutation(method: &Method, path: &str) -> bool {
             || (path.starts_with("/api/collections/") && path.ends_with("/sync"));
     }
     false
+}
+
+fn collection_method(route: CollectionApiEndpoint) -> Method {
+    match route.method() {
+        ApiHttpMethod::Delete => Method::DELETE,
+        ApiHttpMethod::Get => Method::GET,
+        ApiHttpMethod::Post => Method::POST,
+        ApiHttpMethod::Put => Method::PUT,
+    }
 }
 
 fn daemon_http_timeout_seconds(config: &Config) -> u64 {
@@ -1125,6 +1144,171 @@ mod tests {
     }
 
     #[test]
+    fn http_collection_routes_are_plumbed_from_shared_inventory() {
+        let collection = concat!(
+            "{\"collection\":{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"},",
+            "\"roots\":[],\"members\":[]}"
+        );
+        let collection_list = "[{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}]";
+        let sync = concat!(
+            "{\"report\":{\"member_count\":1,\"added\":1,\"removed\":0,\"unchanged\":0,",
+            "\"scanned_roots\":1,\"max_depth\":32,\"skipped\":[]}}"
+        );
+        let status = concat!(
+            "{\"status\":{\"collection\":{\"name\":\"articles\",\"created_at\":\"1\",",
+            "\"updated_at\":\"2\"},\"root_count\":1,\"member_count\":1}}"
+        );
+        let watcher_status = concat!(
+            "{\"collection_name\":\"articles\",\"watch_enabled\":true,",
+            "\"auto_index_enabled\":false,\"active\":true,\"ignored_by_config\":false,",
+            "\"watched_root_count\":1,\"pending_event_count\":0}"
+        );
+        let watcher = format!(
+            "{{\"collection\":{{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}},\
+             \"watcher\":{watcher_status}}}"
+        );
+        let watchers = format!("{{\"watchers\":[{watcher_status}]}}");
+        let server = TestServer::respond_many(vec![
+            json_response("201 Created", collection),
+            json_response("200 OK", collection),
+            json_response("200 OK", collection_list),
+            json_response("200 OK", collection),
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
+            json_response("200 OK", sync),
+            json_response("200 OK", status),
+            json_response("200 OK", watchers.as_str()),
+            json_response("200 OK", watcher.as_str()),
+            json_response("200 OK", watcher.as_str()),
+        ]);
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        assert_eq!(
+            client
+                .create_collection(&CreateCollectionRequest {
+                    name: "articles".into(),
+                    ignore_patterns: vec!["drafts/".into()],
+                })
+                .unwrap()
+                .collection
+                .name,
+            "articles"
+        );
+        assert_eq!(
+            client
+                .add_collection_root(
+                    "articles",
+                    &AddCollectionRootRequest {
+                        path: "/tmp/articles".into(),
+                    },
+                )
+                .unwrap()
+                .collection
+                .name,
+            "articles"
+        );
+        assert_eq!(client.list_collections().unwrap()[0].name, "articles");
+        assert_eq!(
+            client.get_collection("articles").unwrap().collection.name,
+            "articles"
+        );
+        client.delete_collection("articles").unwrap();
+        assert_eq!(
+            client
+                .sync_collection(
+                    "articles",
+                    &CollectionSyncRequest {
+                        paths: Vec::new(),
+                        max_depth: Some(7),
+                    },
+                )
+                .unwrap()
+                .report
+                .member_count,
+            1
+        );
+        assert_eq!(
+            client
+                .collection_status("articles")
+                .unwrap()
+                .status
+                .member_count,
+            1
+        );
+        assert_eq!(
+            client.list_collection_watcher_statuses().unwrap().watchers[0].collection_name,
+            "articles"
+        );
+        assert!(
+            client
+                .collection_watcher_status("articles")
+                .unwrap()
+                .watcher
+                .active
+        );
+        assert!(
+            client
+                .update_collection_watcher(
+                    "articles",
+                    &CollectionWatcherUpdateRequest {
+                        enabled: true,
+                        auto_index_enabled: Some(false),
+                    },
+                )
+                .unwrap()
+                .watcher
+                .watch_enabled
+        );
+
+        let requests = server.requests();
+        assert_collection_request(&requests[0], CollectionApiEndpoint::CreateCollection, None);
+        assert!(requests[0].contains("\"ignore_patterns\":[\"drafts/\"]"));
+        assert_collection_request(
+            &requests[1],
+            CollectionApiEndpoint::AddCollectionRoot,
+            Some("articles"),
+        );
+        assert!(requests[1].contains("\"path\":\"/tmp/articles\""));
+        assert_collection_request(&requests[2], CollectionApiEndpoint::ListCollections, None);
+        assert_collection_request(
+            &requests[3],
+            CollectionApiEndpoint::GetCollection,
+            Some("articles"),
+        );
+        assert_collection_request(
+            &requests[4],
+            CollectionApiEndpoint::DeleteCollection,
+            Some("articles"),
+        );
+        assert_collection_request(
+            &requests[5],
+            CollectionApiEndpoint::SyncCollection,
+            Some("articles"),
+        );
+        assert!(requests[5].contains("\"max_depth\":7"));
+        assert_collection_request(
+            &requests[6],
+            CollectionApiEndpoint::CollectionStatus,
+            Some("articles"),
+        );
+        assert_collection_request(
+            &requests[7],
+            CollectionApiEndpoint::ListCollectionWatcherStatuses,
+            None,
+        );
+        assert_collection_request(
+            &requests[8],
+            CollectionApiEndpoint::CollectionWatcherStatus,
+            Some("articles"),
+        );
+        assert_collection_request(
+            &requests[9],
+            CollectionApiEndpoint::UpdateCollectionWatcher,
+            Some("articles"),
+        );
+        assert!(requests[9].contains("\"enabled\":true"));
+    }
+
+    #[test]
     fn http_ingest_force_uses_query_parameter() {
         let server = TestServer::respond_once(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ingested\":2}",
@@ -1535,6 +1719,26 @@ mod tests {
 
     fn default_config() -> Config {
         serde_json::from_value(serde_json::json!({})).expect("empty config uses serde defaults")
+    }
+
+    fn json_response(status: &str, body: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}")
+    }
+
+    fn assert_collection_request(
+        request: &str,
+        route: CollectionApiEndpoint,
+        collection_name: Option<&str>,
+    ) {
+        let path = collection_name.map_or_else(
+            || route.path_template().to_string(),
+            |name| route.path(name),
+        );
+        let expected = format!("{} {path} HTTP/1.1", route.method().as_str());
+        assert!(
+            request.starts_with(&expected),
+            "expected request line {expected:?}, got {request:?}"
+        );
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
