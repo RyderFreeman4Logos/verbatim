@@ -1621,6 +1621,43 @@ impl Store {
         Ok(changed > 0)
     }
 
+    pub fn start_tasks_if_no_running(&self, task_ids: &[TaskId], kind: TaskKind) -> Result<bool> {
+        if task_ids.is_empty() {
+            return Ok(false);
+        }
+        let now = unix_timestamp_string();
+        let tx = self.conn.unchecked_transaction()?;
+        let running: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE kind = ?1 AND status = ?2",
+            params![kind.as_str(), TaskStatus::Running.as_str()],
+            |row| row.get(0),
+        )?;
+        if running > 0 {
+            return Ok(false);
+        }
+        for task_id in task_ids {
+            let changed = tx.execute(
+                "UPDATE tasks
+                 SET status = ?2, started_at = COALESCE(started_at, ?3), updated_at = ?3
+                 WHERE id = ?1
+                   AND kind = ?4
+                   AND status = ?5",
+                params![
+                    &task_id.0,
+                    TaskStatus::Running.as_str(),
+                    &now,
+                    kind.as_str(),
+                    TaskStatus::Queued.as_str(),
+                ],
+            )?;
+            if changed != 1 {
+                return Ok(false);
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn update_task_progress(
         &self,
         task_id: &TaskId,
