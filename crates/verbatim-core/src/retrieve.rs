@@ -8,13 +8,18 @@ use crate::config::{GraphConfig, QdrantConfig, RerankConfig, RetrievalConfig};
 use crate::index::qdrant::QdrantClient;
 use crate::provider::ProviderError;
 use crate::store::Store;
-use crate::traits::{EmbeddingClient, LexicalIndex, Reranker, VectorIndex};
+use crate::traits::{
+    EmbeddingClient, LexicalIndex, RerankCapabilityState, RerankDiagnostics, RerankError,
+    RerankRequestDiagnostics, Reranker, VectorIndex,
+};
 use crate::types::{
     Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
     EvidenceUnit, GraphExpansionStep, GraphNodeId, GraphNodeKind, GraphTraversalDirection, ImageId,
     RetrievalDebug, RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalFusedHit,
-    RetrievalGraphExpansionDebug, RetrievalLocatorDebug, RetrievalProvenance, RetrievalRerankDebug,
-    RetrievalRerankScore, RetrievalResult, RetrievalStageHit, SourceId, SourceLocator,
+    RetrievalGraphExpansionDebug, RetrievalLocatorDebug, RetrievalProvenance,
+    RetrievalRerankCapabilityDebug, RetrievalRerankCapabilityState, RetrievalRerankDebug,
+    RetrievalRerankRequestDebug, RetrievalRerankScore, RetrievalResult, RetrievalStageHit,
+    SourceId, SourceLocator,
 };
 
 const GRAPH_EXPANSION_SCORE_DECAY: f32 = 0.5;
@@ -515,49 +520,76 @@ impl<'a> RetrievalPipeline<'a> {
             .collect::<Vec<_>>();
 
         let rerank_started = Instant::now();
-        match reranker.rerank(query, &documents, top_n).await {
-            Ok(hits) => {
+        match reranker
+            .rerank_with_diagnostics(query, &documents, top_n)
+            .await
+        {
+            Ok(response) => {
                 let latency_ms = elapsed_ms(rerank_started);
-                let (reranked, scores) = validated_rerank_hits(&candidates, hits, top_n);
+                let actual_top_n =
+                    actual_rerank_top_n(top_n, response.diagnostics.request.as_ref());
+                let actual_candidate_count = actual_rerank_candidate_count(
+                    candidates.len(),
+                    response.diagnostics.request.as_ref(),
+                );
+                let (reranked, scores) =
+                    validated_rerank_hits(&candidates, response.hits, actual_top_n);
                 if reranked.is_empty() {
                     return Ok(RerankOutcome {
                         fused,
-                        debug: RetrievalRerankDebug::fallback(
-                            &config.provider,
-                            &config.model,
-                            top_n,
-                            candidates.len(),
-                            "no_usable_results",
-                        )
-                        .with_latency_ms(latency_ms),
+                        debug: with_rerank_diagnostics(
+                            RetrievalRerankDebug::fallback(
+                                &config.provider,
+                                &config.model,
+                                actual_top_n,
+                                actual_candidate_count,
+                                "no_usable_results",
+                            )
+                            .with_latency_ms(latency_ms),
+                            Some(&response.diagnostics),
+                        ),
                     });
                 }
                 Ok(RerankOutcome {
                     fused: reranked,
-                    debug: RetrievalRerankDebug::succeeded(
-                        &config.provider,
-                        &config.model,
-                        top_n,
-                        candidates.len(),
-                        scores,
-                    )
-                    .with_latency_ms(latency_ms),
+                    debug: with_rerank_diagnostics(
+                        RetrievalRerankDebug::succeeded(
+                            &config.provider,
+                            &config.model,
+                            actual_top_n,
+                            actual_candidate_count,
+                            scores,
+                        )
+                        .with_latency_ms(latency_ms),
+                        Some(&response.diagnostics),
+                    ),
                 })
             }
             Err(error) => {
                 let latency_ms = elapsed_ms(rerank_started);
-                let reason = rerank_failure_reason(&error);
+                let (reason, diagnostics) = rerank_error_reason_and_diagnostics(&error);
+                let actual_top_n = diagnostics
+                    .and_then(|diagnostics| diagnostics.request.as_ref())
+                    .map_or(top_n, |request| actual_rerank_top_n(top_n, Some(request)));
+                let actual_candidate_count = diagnostics
+                    .and_then(|diagnostics| diagnostics.request.as_ref())
+                    .map_or(candidates.len(), |request| {
+                        actual_rerank_candidate_count(candidates.len(), Some(request))
+                    });
                 tracing::warn!(reason = %reason, "rerank failed; falling back to RRF ordering");
                 Ok(RerankOutcome {
                     fused,
-                    debug: RetrievalRerankDebug::fallback(
-                        &config.provider,
-                        &config.model,
-                        top_n,
-                        candidates.len(),
-                        reason,
-                    )
-                    .with_latency_ms(latency_ms),
+                    debug: with_rerank_diagnostics(
+                        RetrievalRerankDebug::fallback(
+                            &config.provider,
+                            &config.model,
+                            actual_top_n,
+                            actual_candidate_count,
+                            reason,
+                        )
+                        .with_latency_ms(latency_ms),
+                        diagnostics,
+                    ),
                 })
             }
         }
@@ -1293,6 +1325,68 @@ fn validated_rerank_hits(
     (reranked, scores)
 }
 
+fn actual_rerank_top_n(top_n: usize, request: Option<&RerankRequestDiagnostics>) -> usize {
+    request.map_or(top_n, |request| request.top_n)
+}
+
+fn actual_rerank_candidate_count(
+    candidate_count: usize,
+    request: Option<&RerankRequestDiagnostics>,
+) -> usize {
+    request.map_or(candidate_count, |request| request.candidate_count)
+}
+
+fn with_rerank_diagnostics(
+    mut debug: RetrievalRerankDebug,
+    diagnostics: Option<&RerankDiagnostics>,
+) -> RetrievalRerankDebug {
+    let Some(diagnostics) = diagnostics else {
+        return debug;
+    };
+    debug.capability =
+        diagnostics
+            .capability
+            .as_ref()
+            .map(|capability| RetrievalRerankCapabilityDebug {
+                state: retrieval_rerank_capability_state(capability.state),
+                max_context_tokens: capability.max_context_tokens,
+                reason: capability.reason.as_deref().map(bounded_rerank_debug_text),
+                retried_after_context_limit: diagnostics.retried_after_context_limit,
+            });
+    debug.request = diagnostics
+        .request
+        .as_ref()
+        .map(|request| RetrievalRerankRequestDebug {
+            candidate_count: request.candidate_count,
+            document_char_limit: request.document_char_limit,
+            top_n: request.top_n,
+        });
+    debug
+}
+
+fn retrieval_rerank_capability_state(
+    state: RerankCapabilityState,
+) -> RetrievalRerankCapabilityState {
+    match state {
+        RerankCapabilityState::Cached => RetrievalRerankCapabilityState::Cached,
+        RerankCapabilityState::Refreshed => RetrievalRerankCapabilityState::Refreshed,
+        RerankCapabilityState::Unavailable => RetrievalRerankCapabilityState::Unavailable,
+        RerankCapabilityState::RefreshFailed => RetrievalRerankCapabilityState::RefreshFailed,
+    }
+}
+
+fn rerank_error_reason_and_diagnostics(
+    error: &anyhow::Error,
+) -> (String, Option<&RerankDiagnostics>) {
+    if let Some(rerank_error) = error.downcast_ref::<RerankError>() {
+        return (
+            rerank_failure_reason(rerank_error.source_error()),
+            Some(rerank_error.diagnostics()),
+        );
+    }
+    (rerank_failure_reason(error), None)
+}
+
 fn rerank_failure_reason(error: &anyhow::Error) -> String {
     if let Some(provider_error) = error.downcast_ref::<ProviderError>() {
         return match provider_error {
@@ -1316,6 +1410,11 @@ fn rerank_failure_reason(error: &anyhow::Error) -> String {
     } else {
         "request_failed".to_string()
     }
+}
+
+fn bounded_rerank_debug_text(input: &str) -> String {
+    const MAX_DEBUG_TEXT_CHARS: usize = 96;
+    input.chars().take(MAX_DEBUG_TEXT_CHARS).collect()
 }
 
 /// Rebuild the final evidence-pack debug view after callers alter retrieval result order.

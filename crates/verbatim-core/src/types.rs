@@ -899,6 +899,10 @@ pub struct RetrievalRerankDebug {
     pub candidate_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<RetrievalRerankCapabilityDebug>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<RetrievalRerankRequestDebug>,
     pub scores: Vec<RetrievalRerankScore>,
 }
 
@@ -912,6 +916,8 @@ impl RetrievalRerankDebug {
             top_n: None,
             candidate_count: None,
             latency_ms: None,
+            capability: None,
+            request: None,
             scores: Vec::new(),
         }
     }
@@ -925,6 +931,8 @@ impl RetrievalRerankDebug {
             top_n: None,
             candidate_count: None,
             latency_ms: None,
+            capability: None,
+            request: None,
             scores: Vec::new(),
         }
     }
@@ -944,6 +952,8 @@ impl RetrievalRerankDebug {
             top_n: Some(top_n),
             candidate_count: Some(candidate_count),
             latency_ms: None,
+            capability: None,
+            request: None,
             scores,
         }
     }
@@ -963,6 +973,8 @@ impl RetrievalRerankDebug {
             top_n: Some(top_n),
             candidate_count: Some(candidate_count),
             latency_ms: None,
+            capability: None,
+            request: None,
             scores: Vec::new(),
         }
     }
@@ -971,6 +983,33 @@ impl RetrievalRerankDebug {
         self.latency_ms = Some(latency_ms);
         self
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalRerankCapabilityDebug {
+    pub state: RetrievalRerankCapabilityState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retried_after_context_limit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalRerankCapabilityState {
+    Cached,
+    Refreshed,
+    Unavailable,
+    RefreshFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalRerankRequestDebug {
+    pub candidate_count: usize,
+    pub document_char_limit: usize,
+    pub top_n: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -996,6 +1035,10 @@ fn bounded_debug_text(input: &str) -> String {
         output.push(ch);
     }
     output
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1184,5 +1227,32 @@ mod tests {
 
         let decoded: RetrievalDebug = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, debug);
+    }
+
+    #[test]
+    fn rerank_debug_metadata_serializes_without_request_text_or_secrets() {
+        let mut debug =
+            RetrievalRerankDebug::fallback("vllm", "rerank-model", 1, 1, "http_status_400");
+        debug.capability = Some(RetrievalRerankCapabilityDebug {
+            state: RetrievalRerankCapabilityState::Refreshed,
+            max_context_tokens: Some(512),
+            reason: Some("capability_absent".into()),
+            retried_after_context_limit: true,
+        });
+        debug.request = Some(RetrievalRerankRequestDebug {
+            candidate_count: 1,
+            document_char_limit: 768,
+            top_n: 1,
+        });
+
+        let encoded = serde_json::to_string(&debug).unwrap();
+
+        assert!(encoded.contains("refreshed"));
+        assert!(encoded.contains("document_char_limit"));
+        assert!(!encoded.contains("Authorization"));
+        assert!(!encoded.contains("Bearer"));
+        assert!(!encoded.contains("api_key"));
+        assert!(!encoded.contains("secret query token=fixture-query"));
+        assert!(!encoded.contains("secret document body"));
     }
 }
