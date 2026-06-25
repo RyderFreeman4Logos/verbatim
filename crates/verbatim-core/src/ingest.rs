@@ -55,6 +55,7 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     loaded_profile_id: EmbeddingProfileId,
     active_profile_id: EmbeddingProfileId,
     embedding_profile_spec: EmbeddingProfileSpec,
+    embedding_enabled: bool,
     embed_client: E,
     context_gen: Option<ContextGenerator>,
     vision_model: Option<Box<dyn VisionModel>>,
@@ -351,6 +352,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             loaded_profile_id: active_profile_id.clone(),
             active_profile_id,
             embedding_profile_spec,
+            embedding_enabled: config.embedding.enabled,
             embed_client,
             context_gen,
             vision_model,
@@ -377,6 +379,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
 
     pub fn reload_runtime_config(&mut self, config: &Config) -> Result<()> {
         self.embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+        self.embedding_enabled = config.embedding.enabled;
         self.context_gen = if config.context.enabled {
             Some(ContextGenerator::new(&config.chat))
         } else {
@@ -474,6 +477,7 @@ where
             loaded_profile_id: active_profile_id.clone(),
             active_profile_id,
             embedding_profile_spec,
+            embedding_enabled: true,
             embed_client,
             context_gen: None,
             vision_model: None,
@@ -502,6 +506,12 @@ where
     ) -> Self {
         self.embedding_batch_size = batch_size.max(1);
         self.embedding_max_concurrent_requests = max_concurrent_requests.max(1);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_embedding_enabled(mut self, enabled: bool) -> Self {
+        self.embedding_enabled = enabled;
         self
     }
 
@@ -665,9 +675,13 @@ where
                 current_hashes.insert(source.id.clone(), hash);
             }
         }
-        let stale = self
-            .store
-            .find_stale_sources_for_profile(&current_hashes, &self.active_profile_id)?;
+        let stale = if self.embedding_enabled {
+            self.store
+                .find_stale_sources_for_profile(&current_hashes, &self.active_profile_id)?
+        } else {
+            self.store
+                .find_stale_sources_for_lexical_index(&current_hashes)?
+        };
         let mut stale_set = stale.into_iter().collect::<HashSet<_>>();
         if let Some(provider) = &self.ocr_provider {
             let profile = provider.profile();
@@ -1148,6 +1162,15 @@ where
         if prepared_sources.is_empty() {
             return Vec::new();
         }
+        if !self.embedding_enabled {
+            return self
+                .commit_prepared_sources_without_embeddings(
+                    profile_id,
+                    prepared_sources,
+                    cancellation_scope,
+                )
+                .await;
+        }
         let source_count = prepared_sources.len();
         let input_count = prepared_sources
             .iter()
@@ -1294,6 +1317,85 @@ where
                 result,
             });
         }
+        outcomes
+    }
+
+    async fn commit_prepared_sources_without_embeddings(
+        &mut self,
+        profile_id: &EmbeddingProfileId,
+        prepared_sources: Vec<PreparedSourceIngest>,
+        cancellation_scope: BatchCancellationScope,
+    ) -> Vec<PreparedSourceOutcome> {
+        let source_count = prepared_sources.len();
+        let input_count = prepared_sources
+            .iter()
+            .map(|source| source.child_chunks.len())
+            .sum::<usize>();
+        let metrics = EmbeddingBatchMetrics {
+            request_count: 0,
+            source_count,
+            input_count,
+            max_vectors_per_request: 0,
+            max_concurrent_requests: self.embedding_max_concurrent_requests,
+            duration_ms: 0,
+        };
+        let mut outcomes = Vec::with_capacity(source_count);
+        let mut stopped_after_commit_error: Option<String> = None;
+        let mut committed_sources_in_batch = 0;
+
+        for source in prepared_sources {
+            let child_count = source.child_chunks.len();
+            let source_id = source.source.id.clone();
+            let task_id = source.task_id.clone();
+            let embedding_phase = source.embedding_phase.clone();
+            let cache_stats = EmbeddingCacheStats::default();
+            self.record_embedding_complete(
+                task_id.as_ref(),
+                embedding_phase,
+                child_count,
+                0,
+                &cache_stats,
+                &metrics,
+            );
+
+            let result = if let Some(error) = &stopped_after_commit_error {
+                Err(format!(
+                    "source ingest not attempted after earlier batch commit failure: {error}"
+                ))
+            } else {
+                let (completed_sources, total_sources) =
+                    cancellation_scope.progress(committed_sources_in_batch);
+                match self.ensure_task_not_cancelled(
+                    task_id.as_ref(),
+                    completed_sources,
+                    total_sources,
+                    Some(&source_id),
+                ) {
+                    Ok(()) => self
+                        .commit_prepared_source(profile_id, source, Vec::new(), cache_stats.clone())
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            };
+
+            match &result {
+                Ok(_) => {
+                    committed_sources_in_batch += 1;
+                    #[cfg(test)]
+                    self.notify_source_committed_for_test(&source_id);
+                }
+                Err(error) => {
+                    stopped_after_commit_error.get_or_insert_with(|| error.clone());
+                }
+            }
+            outcomes.push(PreparedSourceOutcome {
+                source_id,
+                task_id,
+                result,
+            });
+        }
+
         outcomes
     }
 
@@ -1733,12 +1835,20 @@ where
             embedding_profile_id = %active_profile_id,
             "rebuilding local indexes"
         );
-        let prepared = self
-            .prepare_full_indexes_for_chunks(&active_profile_id, &child_chunks)
-            .await?;
-        self.store
-            .replace_all_vector_documents_for_profile(&active_profile_id, &prepared.vectors)?;
-        self.mark_profile_sources_embedded(&active_profile_id, &source_ids, &prepared.vectors)?;
+        let prepared = if self.embedding_enabled {
+            let prepared = self
+                .prepare_full_indexes_for_chunks(&active_profile_id, &child_chunks)
+                .await?;
+            self.store
+                .replace_all_vector_documents_for_profile(&active_profile_id, &prepared.vectors)?;
+            self.mark_profile_sources_embedded(&active_profile_id, &source_ids, &prepared.vectors)?;
+            prepared
+        } else {
+            let prepared = self.prepare_indexes_from_vectors(Vec::new())?;
+            self.store
+                .replace_all_vector_documents_for_profile(&active_profile_id, &[])?;
+            prepared
+        };
         self.lexical_index().rebuild_from_store(&self.store)?;
         self.publish_prepared_indexes(&active_profile_id, prepared)?;
         #[cfg(feature = "qdrant")]
@@ -1752,6 +1862,9 @@ where
         profile_id: &EmbeddingProfileId,
         source_id: Option<&SourceId>,
     ) -> Result<IndexingOutcome> {
+        if !self.embedding_enabled {
+            bail!("embedding is disabled; enable [embedding] before building vectors");
+        }
         self.ensure_embedding_profile(profile_id)?;
         let target_source_ids = match source_id {
             Some(source_id) => {
@@ -1890,6 +2003,9 @@ where
         profile_id: &EmbeddingProfileId,
         child_chunks: &[Chunk],
     ) -> Result<PreparedVectors> {
+        if !self.embedding_enabled {
+            bail!("embedding is disabled; enable [embedding] before building vectors");
+        }
         let mut vectors = Vec::new();
         let mut cache_stats = EmbeddingCacheStats::default();
         let mut cache_stats_by_source = HashMap::<SourceId, EmbeddingCacheStats>::new();
@@ -4572,6 +4688,35 @@ mod tests {
         assert_unparsed_source_remains_stale_after_vector_only_rebuild(false).await;
     }
 
+    #[test]
+    fn embedding_disabled_check_stale_reports_pending_source_with_unchanged_hash() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_embedding_enabled(false);
+        let source_path = tempdir.path().join("pending.txt");
+        fs::write(&source_path, "alpha pending source needs lexical indexing").unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+
+        let stale = pipeline.check_stale().unwrap();
+
+        assert_eq!(stale, vec![source_id.clone()]);
+        assert_eq!(
+            pipeline
+                .store()
+                .get_source(&source_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            SourceStatus::Stale
+        );
+    }
+
     async fn assert_unparsed_source_remains_stale_after_vector_only_rebuild(source_specific: bool) {
         let tempdir = tempfile::tempdir().unwrap();
         let store = Store::in_memory().unwrap();
@@ -6020,6 +6165,69 @@ model = "local-vision"
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn embedding_disabled_ingest_builds_lexical_index_without_embedding_calls() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let embedding = RecordingEmbeddingClient::new();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            embedding.clone(),
+            tempdir.path().to_path_buf(),
+        )
+        .with_embedding_enabled(false);
+        let source_path = tempdir.path().join("bm25-only.txt");
+        fs::write(
+            &source_path,
+            "alpha lexical retrieval evidence for BM25-only ingest\n",
+        )
+        .unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+
+        let cache_stats = pipeline.ingest_source(&source_id).await.unwrap();
+
+        assert!(embedding.calls().is_empty());
+        assert_eq!(cache_stats.embedded_chunks, 0);
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(
+                    &EmbeddingProfileId::default_profile(),
+                    Some(&source_id),
+                )
+                .unwrap(),
+            0
+        );
+
+        let lexical_index = pipeline.lexical_index();
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 4,
+            bm25_top_k: 4,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let retrieval = RetrievalPipeline::new(
+            pipeline.vector_index(),
+            &lexical_index,
+            pipeline.store(),
+            &embedding,
+            &retrieval_config,
+        )
+        .with_embedding_enabled(false);
+        let (results, debug) = retrieval
+            .search_source_set_with_debug("alpha BM25 ingest", None)
+            .await
+            .unwrap();
+
+        assert!(results
+            .iter()
+            .any(|result| result.chunk.source_id == source_id));
+        assert!(debug.dense_hits.is_empty());
+        assert_eq!(debug.query_embedding_latency_ms, None);
+        assert!(!debug.bm25_hits.is_empty());
     }
 
     #[tokio::test]

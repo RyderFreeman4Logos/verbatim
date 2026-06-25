@@ -1019,6 +1019,7 @@ mod tests {
     #[test]
     fn daemon_http_timeout_uses_largest_enabled_model_timeout_with_padding() {
         let mut config = default_config();
+        config.embedding.enabled = true;
         config.embedding.timeout_seconds = 1800;
         config.rerank.timeout_seconds = 90;
         config.chat.timeout_seconds = 600;

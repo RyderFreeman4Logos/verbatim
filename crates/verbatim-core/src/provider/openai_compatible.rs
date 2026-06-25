@@ -1,6 +1,6 @@
 //! OpenAI-compatible provider adapters for local model servers.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -50,6 +50,9 @@ const RERANK_RETRY_CONTEXT_BUDGET_DENOMINATOR: usize = 2;
 const RERANK_MIN_CHARS_PER_CANDIDATE: usize = 512;
 const RERANK_MAX_DOCUMENT_CHARS: usize = 8_000;
 const RERANK_RETRY_MAX_DOCUMENT_CHARS: usize = 4_000;
+const LLM_RERANK_MAX_CANDIDATES: usize = 20;
+const LLM_RERANK_MAX_DOCUMENT_CHARS: usize = 2_000;
+const LLM_RERANK_MAX_OUTPUT_TOKENS: u32 = 1_024;
 
 /// OpenAI-compatible chat completion adapter.
 #[derive(Clone, Debug)]
@@ -312,6 +315,29 @@ pub struct OpenAiCompatibleReranker {
     provider: RerankProviderKind,
     default_top_n: usize,
     capability_cache_ttl: Duration,
+}
+
+/// OpenAI-compatible chat adapter used only for explicitly configured LLM rerank.
+#[derive(Clone, Debug)]
+pub struct OpenAiCompatibleLlmReranker {
+    chat: OpenAiCompatibleChatModel,
+}
+
+impl OpenAiCompatibleLlmReranker {
+    pub fn from_config(config: &RerankConfig) -> Self {
+        Self {
+            chat: OpenAiCompatibleChatModel {
+                endpoint: OpenAiEndpoint::new_with_options(
+                    &config.base_url,
+                    &config.model,
+                    &config.api_key,
+                    config.timeout_seconds,
+                    &config.endpoint_runtime,
+                ),
+                temperature: 0.0,
+            },
+        }
+    }
 }
 
 impl OpenAiCompatibleReranker {
@@ -836,6 +862,183 @@ impl crate::traits::Reranker for OpenAiCompatibleReranker {
             Err(failure) => Err(RerankError::new(failure.error.into(), failure.diagnostics).into()),
         }
     }
+}
+
+#[async_trait]
+impl crate::traits::Reranker for OpenAiCompatibleLlmReranker {
+    async fn rerank(
+        &self,
+        query: &str,
+        docs: &[String],
+        top_n: usize,
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        Ok(self.rerank_with_diagnostics(query, docs, top_n).await?.hits)
+    }
+
+    async fn rerank_with_diagnostics(
+        &self,
+        query: &str,
+        docs: &[String],
+        top_n: usize,
+    ) -> anyhow::Result<RerankResponse> {
+        let shape = LlmRerankRequestShape::new(docs, top_n);
+        let diagnostics = RerankDiagnostics {
+            request: Some(shape.diagnostics()),
+            ..RerankDiagnostics::default()
+        };
+        if shape.candidate_count == 0 {
+            return Ok(RerankResponse {
+                hits: Vec::new(),
+                diagnostics,
+            });
+        }
+
+        let request = ChatRequest::new(vec![
+            ChatMessage::system(LLM_RERANK_SYSTEM_PROMPT),
+            ChatMessage::user(llm_rerank_user_prompt(query, docs, &shape)?),
+        ])
+        .with_temperature(0.0)
+        .with_max_tokens(LLM_RERANK_MAX_OUTPUT_TOKENS);
+
+        let response = self
+            .chat
+            .chat_with_operation(request, "llm rerank", "rerank")
+            .await
+            .map_err(|error| RerankError::new(error.into(), diagnostics.clone()))?;
+        let hits = parse_llm_rerank_response(&response.content, shape.candidate_count)
+            .map_err(|error| RerankError::new(error.into(), diagnostics.clone()))?;
+
+        Ok(RerankResponse { hits, diagnostics })
+    }
+}
+
+const LLM_RERANK_SYSTEM_PROMPT: &str = "\
+You are a reranking system. Output only strict JSON. \
+Return {\"rankings\":[{\"index\":0,\"score\":0.0}]} using only submitted candidate indexes. \
+Scores must be finite numbers where larger means more relevant.";
+
+#[derive(Debug)]
+struct LlmRerankRequestShape {
+    candidate_count: usize,
+    document_char_limit: usize,
+    top_n: usize,
+}
+
+impl LlmRerankRequestShape {
+    fn new(docs: &[String], requested_top_n: usize) -> Self {
+        let candidate_count = docs.len().min(LLM_RERANK_MAX_CANDIDATES);
+        let top_n = if candidate_count == 0 {
+            0
+        } else {
+            requested_top_n.max(1).min(candidate_count)
+        };
+        Self {
+            candidate_count,
+            document_char_limit: LLM_RERANK_MAX_DOCUMENT_CHARS,
+            top_n,
+        }
+    }
+
+    fn diagnostics(&self) -> RerankRequestDiagnostics {
+        RerankRequestDiagnostics {
+            candidate_count: self.candidate_count,
+            document_char_limit: self.document_char_limit,
+            top_n: self.top_n,
+        }
+    }
+}
+
+fn llm_rerank_user_prompt(
+    query: &str,
+    docs: &[String],
+    shape: &LlmRerankRequestShape,
+) -> ProviderResult<String> {
+    let candidates = docs
+        .iter()
+        .take(shape.candidate_count)
+        .enumerate()
+        .map(|(index, text)| {
+            serde_json::json!({
+                "index": index,
+                "text": bounded_doc_text(text, shape.document_char_limit),
+            })
+        })
+        .collect::<Vec<_>>();
+    let candidates = serde_json::to_string(&candidates)
+        .map_err(|error| ProviderError::malformed("llm rerank", error.to_string()))?;
+    Ok(format!(
+        "Query:\n{query}\n\nReturn the top {top_n} candidates ranked by relevance.\nCandidates JSON:\n{candidates}",
+        top_n = shape.top_n
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmRerankJsonResponse {
+    #[serde(alias = "results", alias = "data")]
+    rankings: Vec<LlmRerankJsonItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmRerankJsonItem {
+    #[serde(alias = "document_index")]
+    index: usize,
+    #[serde(alias = "relevance_score", alias = "rerank_score")]
+    score: f32,
+}
+
+fn parse_llm_rerank_response(
+    content: &str,
+    submitted_candidate_count: usize,
+) -> ProviderResult<Vec<(usize, f32)>> {
+    let cleaned = strip_json_fence(content);
+    let response: LlmRerankJsonResponse =
+        serde_json::from_str(cleaned).map_err(|source| ProviderError::MalformedResponse {
+            operation: "llm rerank",
+            message: format!("model returned invalid JSON: {source}"),
+        })?;
+    if response.rankings.is_empty() {
+        return Err(ProviderError::malformed(
+            "llm rerank",
+            "response did not include rankings",
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut hits = Vec::with_capacity(response.rankings.len());
+    for item in response.rankings {
+        if item.index >= submitted_candidate_count {
+            return Err(ProviderError::malformed(
+                "llm rerank",
+                format!(
+                    "response included index {} outside submitted candidate count {}",
+                    item.index, submitted_candidate_count
+                ),
+            ));
+        }
+        if !seen.insert(item.index) {
+            return Err(ProviderError::malformed(
+                "llm rerank",
+                format!("response included duplicate index {}", item.index),
+            ));
+        }
+        if !item.score.is_finite() {
+            return Err(ProviderError::malformed(
+                "llm rerank",
+                "response included a non-finite score",
+            ));
+        }
+        hits.push((item.index, item.score));
+    }
+    Ok(hits)
+}
+
+fn strip_json_fence(content: &str) -> &str {
+    let trimmed = content.trim();
+    let trimmed = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    trimmed.strip_suffix("```").unwrap_or(trimmed).trim()
 }
 
 #[derive(Clone, Debug)]
@@ -1688,6 +1891,7 @@ fn parse_sse_frame(frame: &str, pending: &mut VecDeque<ProviderResult<ChatStream
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RerankStrategy;
     use crate::provider::{
         ChatMessageContent, ImageInput, RerankDoc, Reranker as ProviderReranker,
     };
@@ -2382,6 +2586,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "rerank-model".into(),
@@ -2444,6 +2649,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "cohere".into(),
             base_url,
             model: "cohere-rerank".into(),
@@ -2499,6 +2705,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "hint-model".into(),
@@ -2575,6 +2782,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "cache-model".into(),
@@ -2645,6 +2853,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "ctx-model".into(),
@@ -2732,6 +2941,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "payload-model".into(),
@@ -2802,6 +3012,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "exhaust-model".into(),
@@ -2864,6 +3075,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "refresh-fail-model".into(),
@@ -2923,6 +3135,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "bad-request-model".into(),
@@ -2978,6 +3191,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "unsupported-models".into(),
@@ -3028,6 +3242,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "fieldless-model".into(),
@@ -3059,6 +3274,48 @@ mod tests {
                 .map(|request| request.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["/v1/models", "/v1/rerank"]
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_rerank_malformed_json_returns_diagnostic_rerank_error() {
+        let body = r#"{"choices":[{"message":{"content":"not json"},"finish_reason":"stop"}]}"#;
+        let (base_url, handle) = spawn_response_server("200 OK", "application/json", body);
+        let config = RerankConfig {
+            enabled: true,
+            strategy: RerankStrategy::Llm,
+            provider: "openai_compatible".into(),
+            base_url,
+            model: "llm-reranker".into(),
+            top_n: 1,
+            timeout_seconds: 5,
+            api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+        };
+        let reranker = OpenAiCompatibleLlmReranker::from_config(&config);
+        let docs = vec!["alpha document".to_string()];
+
+        let error =
+            <OpenAiCompatibleLlmReranker as crate::traits::Reranker>::rerank_with_diagnostics(
+                &reranker, "alpha?", &docs, 1,
+            )
+            .await
+            .expect_err("malformed LLM rerank output fails");
+        let request = handle.join().expect("server thread joins");
+        let rerank_error = error
+            .downcast_ref::<RerankError>()
+            .expect("error carries rerank diagnostics");
+
+        assert_eq!(request.path, "/chat/completions");
+        assert!(request.body.contains("alpha document"));
+        assert_eq!(
+            rerank_error.diagnostics().request.as_ref(),
+            Some(&RerankRequestDiagnostics {
+                candidate_count: 1,
+                document_char_limit: LLM_RERANK_MAX_DOCUMENT_CHARS,
+                top_n: 1,
+            })
         );
     }
 
@@ -3173,6 +3430,7 @@ mod tests {
         ]);
         let config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             base_url,
             model: "rerank-model".into(),

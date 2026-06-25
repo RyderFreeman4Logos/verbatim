@@ -40,7 +40,8 @@ use verbatim_core::collection::{
     CollectionMemberCandidate, CollectionRecord, CollectionSyncPathInput,
 };
 use verbatim_core::config::{
-    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, RerankConfig, RetrievalConfig,
+    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, RerankConfig, RerankStrategy,
+    RetrievalConfig,
 };
 use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::{
@@ -50,7 +51,9 @@ use verbatim_core::graphrag::GraphRagService;
 use verbatim_core::index_gc::{apply_index_gc, plan_index_gc, IndexGcApplyReport};
 use verbatim_core::ingest::{IndexingOutcome, IngestPipeline, SourceIngestOutcome};
 use verbatim_core::ocr::source_ingest_diagnostics;
-use verbatim_core::provider::openai_compatible::OpenAiCompatibleReranker;
+use verbatim_core::provider::openai_compatible::{
+    OpenAiCompatibleLlmReranker, OpenAiCompatibleReranker,
+};
 use verbatim_core::provider::ProviderError;
 use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
 use verbatim_core::store::Store;
@@ -4006,10 +4009,11 @@ async fn prepare_retrieve_context(
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.select_embedding_profile(&embedding_profile_id)?;
+        if controls.config.embedding.enabled {
+            pipeline.select_embedding_profile(&embedding_profile_id)?;
+        }
         let lexical_index = pipeline.lexical_index();
         let embed_client = OpenAiEmbeddingClient::new(&controls.config.embedding);
-        let reranker = OpenAiCompatibleReranker::from_config(&controls.rerank_config);
         let retrieval = RetrievalPipeline::new_with_graph(
             pipeline.vector_index(),
             &lexical_index,
@@ -4018,12 +4022,31 @@ async fn prepare_retrieve_context(
             &controls.retrieval_config,
             &controls.config.graph,
         )
+        .with_embedding_enabled(controls.config.embedding.enabled)
         .require_embedding_profile(&embedding_profile_id)
-        .with_qdrant_search(&controls.config.qdrant)
-        .with_reranker(&controls.rerank_config, &reranker);
+        .with_qdrant_search(&controls.config.qdrant);
         let source_filter_ref = source_filter.as_ref();
-        let (mut results, mut debug) = runtime
-            .block_on(retrieval.search_source_set_with_debug(&question2, source_filter_ref))?;
+        let (mut results, mut debug) = match (
+            controls.rerank_config.enabled,
+            controls.rerank_config.strategy,
+        ) {
+            (true, RerankStrategy::Endpoint) => {
+                let reranker = OpenAiCompatibleReranker::from_config(&controls.rerank_config);
+                let retrieval = retrieval.with_reranker(&controls.rerank_config, &reranker);
+                runtime.block_on(
+                    retrieval.search_source_set_with_debug(&question2, source_filter_ref),
+                )?
+            }
+            (true, RerankStrategy::Llm) => {
+                let reranker = OpenAiCompatibleLlmReranker::from_config(&controls.rerank_config);
+                let retrieval = retrieval.with_reranker(&controls.rerank_config, &reranker);
+                runtime.block_on(
+                    retrieval.search_source_set_with_debug(&question2, source_filter_ref),
+                )?
+            }
+            (false, _) => runtime
+                .block_on(retrieval.search_source_set_with_debug(&question2, source_filter_ref))?,
+        };
         if controls.config.graph.global_search.enabled && source_filter_ref.is_none() {
             let global_results =
                 GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
@@ -4079,10 +4102,11 @@ async fn prepare_generation_context(
     let runtime = tokio::runtime::Handle::current();
     let (results, generation_context, retrieval_debug) = tokio::task::spawn_blocking(move || {
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.select_embedding_profile(&embedding_profile_id)?;
+        if config.embedding.enabled {
+            pipeline.select_embedding_profile(&embedding_profile_id)?;
+        }
         let lexical_index = pipeline.lexical_index();
         let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
-        let reranker = OpenAiCompatibleReranker::from_config(&config.rerank);
         let retrieval = RetrievalPipeline::new_with_graph(
             pipeline.vector_index(),
             &lexical_index,
@@ -4091,19 +4115,18 @@ async fn prepare_generation_context(
             &config.retrieval,
             &config.graph,
         )
+        .with_embedding_enabled(config.embedding.enabled)
         .require_embedding_profile(&embedding_profile_id)
-        .with_qdrant_search(&config.qdrant)
-        .with_reranker(&config.rerank, &reranker);
+        .with_qdrant_search(&config.qdrant);
         let source_filter_ref = source_filter.as_ref();
-        let (mut results, mut retrieval_debug) = if show_retrieval {
-            let (results, debug) = runtime
-                .block_on(retrieval.search_source_set_with_debug(&question2, source_filter_ref))?;
-            (results, Some(debug))
-        } else {
-            let results =
-                runtime.block_on(retrieval.search_source_set(&question2, source_filter_ref))?;
-            (results, None)
-        };
+        let (mut results, mut retrieval_debug) = run_generation_retrieval(
+            runtime,
+            retrieval,
+            &config.rerank,
+            &question2,
+            source_filter_ref,
+            show_retrieval,
+        )?;
         if config.graph.global_search.enabled && source_filter_ref.is_none() {
             let global_results =
                 GraphRagService::new(pipeline.store(), &config.graph.global_search)
@@ -4128,6 +4151,62 @@ async fn prepare_generation_context(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok((results, generation_context, retrieval_debug))
+}
+
+fn run_generation_retrieval(
+    runtime: tokio::runtime::Handle,
+    retrieval: RetrievalPipeline<'_>,
+    rerank_config: &RerankConfig,
+    question: &str,
+    source_filter: Option<&HashSet<SourceId>>,
+    show_retrieval: bool,
+) -> Result<(Vec<RetrievalResult>, Option<RetrievalDebug>)> {
+    match (rerank_config.enabled, rerank_config.strategy) {
+        (true, RerankStrategy::Endpoint) => {
+            let reranker = OpenAiCompatibleReranker::from_config(rerank_config);
+            run_generation_retrieval_once(
+                &runtime,
+                retrieval.with_reranker(rerank_config, &reranker),
+                question,
+                source_filter,
+                show_retrieval,
+            )
+        }
+        (true, RerankStrategy::Llm) => {
+            let reranker = OpenAiCompatibleLlmReranker::from_config(rerank_config);
+            run_generation_retrieval_once(
+                &runtime,
+                retrieval.with_reranker(rerank_config, &reranker),
+                question,
+                source_filter,
+                show_retrieval,
+            )
+        }
+        (false, _) => run_generation_retrieval_once(
+            &runtime,
+            retrieval,
+            question,
+            source_filter,
+            show_retrieval,
+        ),
+    }
+}
+
+fn run_generation_retrieval_once(
+    runtime: &tokio::runtime::Handle,
+    retrieval: RetrievalPipeline<'_>,
+    question: &str,
+    source_filter: Option<&HashSet<SourceId>>,
+    show_retrieval: bool,
+) -> Result<(Vec<RetrievalResult>, Option<RetrievalDebug>)> {
+    if show_retrieval {
+        let (results, debug) =
+            runtime.block_on(retrieval.search_source_set_with_debug(question, source_filter))?;
+        Ok((results, Some(debug)))
+    } else {
+        let results = runtime.block_on(retrieval.search_source_set(question, source_filter))?;
+        Ok((results, None))
+    }
 }
 
 fn prepend_global_results(
@@ -5471,7 +5550,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use verbatim_core::types::{
         Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind, EvidenceUnit,
-        RetrievalEvidenceRole, RetrievalProvenance, SourceLocator,
+        RetrievalEvidenceRole, RetrievalProvenance, RetrievalRerankStatus, SourceLocator,
     };
 
     #[test]
@@ -6211,6 +6290,99 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn collection_watcher_maintenance_queues_unchanged_pending_bm25_member() {
+        let test_dir = TestDir::new("collection-watcher-bm25-pending");
+        let root = test_dir.path().join("articles");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("one.md"), "one").unwrap();
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(sync) = sync_collection(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionSyncRequest {
+                paths: Vec::new(),
+                max_depth: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync.report.added, 1);
+        let member_source_id = {
+            let pipeline = state.pipeline.lock().unwrap();
+            let members = pipeline
+                .store()
+                .list_collection_members("articles")
+                .unwrap();
+            assert_eq!(members.len(), 1);
+            let source = pipeline
+                .store()
+                .get_source(&members[0].source_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(source.status, SourceStatus::Pending);
+            members[0].source_id.clone()
+        };
+        let _ = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+
+        let outcome = maintain_collection_after_watch_event(&state, "articles")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.added, 0);
+        assert_eq!(outcome.unchanged, 1);
+        assert_eq!(outcome.queued_task_ids.len(), 1);
+        let store = state.task_store.lock().unwrap();
+        let queued = store.queued_tasks(TaskKind::Ingest).unwrap();
+        assert!(queued.iter().any(|task| {
+            task.request
+                .get("source_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(member_source_id.0.as_str())
+        }));
+    }
+
     #[test]
     fn collection_watcher_debounce_coalesces_collection_names() {
         let mut debounced = DebouncedCollectionSet::default();
@@ -6567,6 +6739,140 @@ mod tests {
         assert!(context.results[0].structured_locator.is_some());
         assert!(model_server.embedding_requests() >= 2);
         assert_eq!(model_server.chat_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn ask_with_bm25_only_retrieval_uses_configured_chat_without_embedding_calls() {
+        let model_server =
+            MockModelServer::start_with_chat(3, "BM25 answer from evidence [E1]").await;
+        let test_dir = TestDir::new("ask-bm25-only-chat");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Alpha BM25-only evidence answers the generated ask question.",
+        )
+        .unwrap();
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.embedding.enabled = false;
+        config.chat.enabled = true;
+        config.chat.base_url = model_server.base_url.clone();
+        config.chat.model = "test-chat".into();
+        config.rerank.enabled = false;
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+
+        let state = test_state(config, test_dir.path(), pipeline);
+        let response = ask(
+            State(state),
+            Json(AskRequest {
+                question: "What does Alpha evidence answer?".into(),
+                source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                show_retrieval: true,
+                context_only: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response.answer.contains("BM25 answer"));
+        let debug = response.retrieval.expect("retrieval debug");
+        assert_eq!(debug.query_embedding_latency_ms, None);
+        assert!(debug.dense_hits.is_empty());
+        assert!(!debug.bm25_hits.is_empty());
+        assert_eq!(model_server.embedding_requests(), 0);
+        assert_eq!(model_server.chat_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_llm_rerank_out_of_range_output_falls_back_without_embedding_calls() {
+        let (response, model_server) = retrieve_with_llm_rerank_chat_response(
+            "retrieve-llm-rerank-invalid",
+            r#"{"rankings":[{"index":99,"score":0.9}]}"#,
+        )
+        .await;
+
+        assert_eq!(response.returned_results, 1);
+        let debug = response.debug.expect("retrieval debug");
+        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Fallback);
+        assert_eq!(debug.reranker.reason.as_deref(), Some("invalid_response"));
+        assert_eq!(debug.query_embedding_latency_ms, None);
+        assert!(debug.dense_hits.is_empty());
+        assert_eq!(model_server.embedding_requests(), 0);
+        assert_eq!(model_server.chat_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_llm_rerank_mixed_invalid_output_falls_back_without_partial_success() {
+        let (response, model_server) = retrieve_with_llm_rerank_chat_response(
+            "retrieve-llm-rerank-mixed-invalid",
+            r#"{"rankings":[{"index":99,"score":0.9},{"index":0,"score":0.1}]}"#,
+        )
+        .await;
+
+        assert_eq!(response.returned_results, 1);
+        let debug = response.debug.expect("retrieval debug");
+        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Fallback);
+        assert_eq!(debug.reranker.reason.as_deref(), Some("invalid_response"));
+        assert_eq!(debug.query_embedding_latency_ms, None);
+        assert!(debug.dense_hits.is_empty());
+        assert_eq!(model_server.embedding_requests(), 0);
+        assert_eq!(model_server.chat_requests(), 1);
+    }
+
+    async fn retrieve_with_llm_rerank_chat_response(
+        test_name: &str,
+        chat_response: &str,
+    ) -> (RetrieveResponse, MockModelServer) {
+        let model_server = MockModelServer::start_with_chat(3, chat_response).await;
+        let test_dir = TestDir::new(test_name);
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Alpha LLM rerank fallback evidence should still be returned.",
+        )
+        .unwrap();
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.embedding.enabled = false;
+        config.rerank.enabled = true;
+        config.rerank.strategy = RerankStrategy::Llm;
+        config.rerank.base_url = model_server.base_url.clone();
+        config.rerank.model = "test-llm-reranker".into();
+        config.rerank.top_n = 1;
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+
+        let state = test_state(config, test_dir.path(), pipeline);
+        let response = retrieve(
+            State(state),
+            Json(RetrieveRequest {
+                question: "Alpha fallback evidence?".into(),
+                source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(1),
+                fast: false,
+                rerank: None,
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: true,
+                include_locator: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        (response, model_server)
     }
 
     #[tokio::test]
@@ -7936,16 +8242,25 @@ mod tests {
 
     impl MockModelServer {
         async fn start(dimension: usize) -> Self {
+            Self::start_with_chat_response(dimension, None).await
+        }
+
+        async fn start_with_chat(dimension: usize, chat_response: impl Into<String>) -> Self {
+            Self::start_with_chat_response(dimension, Some(chat_response.into())).await
+        }
+
+        async fn start_with_chat_response(dimension: usize, chat_response: Option<String>) -> Self {
             let state = MockModelState {
                 dimension,
                 embedding_requests: Arc::new(AtomicUsize::new(0)),
                 chat_requests: Arc::new(AtomicUsize::new(0)),
+                chat_response,
             };
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let app = Router::new()
                 .route("/v1/embeddings", post(mock_embeddings))
-                .route("/v1/chat/completions", post(mock_forbidden_chat))
+                .route("/v1/chat/completions", post(mock_chat))
                 .with_state(state.clone());
             let handle = tokio::spawn(async move {
                 let _ = axum::serve(listener, app).await;
@@ -7979,6 +8294,7 @@ mod tests {
         dimension: usize,
         embedding_requests: Arc<AtomicUsize>,
         chat_requests: Arc<AtomicUsize>,
+        chat_response: Option<String>,
     }
 
     async fn mock_embeddings(
@@ -8003,10 +8319,23 @@ mod tests {
         Json(serde_json::json!({ "data": data }))
     }
 
-    async fn mock_forbidden_chat(
+    async fn mock_chat(
         State(state): State<MockModelState>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         state.chat_requests.fetch_add(1, Ordering::SeqCst);
+        if let Some(content) = state.chat_response {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "choices": [
+                        {
+                            "message": { "content": content },
+                            "finish_reason": "stop"
+                        }
+                    ]
+                })),
+            );
+        }
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "chat must not be called by retrieve" })),
