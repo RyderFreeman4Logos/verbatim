@@ -50,6 +50,7 @@ pub const DEFAULT_MODEL_ENDPOINT_QUEUE_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_MODEL_RETRY_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_MODEL_RETRY_INITIAL_BACKOFF_MILLIS: u64 = 500;
 pub const DEFAULT_MODEL_RETRY_MAX_BACKOFF_MILLIS: u64 = 5_000;
+pub const DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelEndpointRuntimeConfig {
@@ -131,6 +132,10 @@ fn default_model_retry_initial_backoff_millis() -> u64 {
 
 fn default_model_retry_max_backoff_millis() -> u64 {
     DEFAULT_MODEL_RETRY_MAX_BACKOFF_MILLIS
+}
+
+fn default_rerank_capability_cache_ttl_seconds() -> u64 {
+    DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,6 +510,8 @@ pub struct RerankConfig {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default = "default_rerank_capability_cache_ttl_seconds")]
+    pub capability_cache_ttl_seconds: u64,
     #[serde(default, flatten)]
     pub endpoint_runtime: ModelEndpointRuntimeConfig,
 }
@@ -519,6 +526,7 @@ impl Default for RerankConfig {
             top_n: 12,
             timeout_seconds: default_rerank_timeout_seconds(),
             api_key: String::new(),
+            capability_cache_ttl_seconds: default_rerank_capability_cache_ttl_seconds(),
             endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         }
     }
@@ -1117,6 +1125,7 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "rerank.top_n"
             | "rerank.timeout_seconds"
             | "rerank.api_key"
+            | "rerank.capability_cache_ttl_seconds"
             | "rerank.max_concurrent_requests"
             | "rerank.queue_timeout_seconds"
             | "rerank.retry.max_retries"
@@ -1310,6 +1319,7 @@ model = "Qwen/Qwen3-Reranker-4B"
 top_n = 12
 timeout_seconds = 120
 api_key = ""
+capability_cache_ttl_seconds = 60
 max_concurrent_requests = 4
 queue_timeout_seconds = 300
 
@@ -1484,6 +1494,10 @@ mod tests {
         assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
         assert_eq!(config.rerank.model, "Qwen/Qwen3-Reranker-4B");
         assert_eq!(config.rerank.top_n, 12);
+        assert_eq!(
+            config.rerank.capability_cache_ttl_seconds,
+            DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS
+        );
         assert_eq!(
             config.rerank.endpoint_runtime.max_concurrent_requests,
             DEFAULT_MODEL_ENDPOINT_MAX_CONCURRENT_REQUESTS
@@ -1692,6 +1706,10 @@ model = "custom-reranker"
         assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
         assert_eq!(config.rerank.model, "custom-reranker");
         assert_eq!(config.rerank.top_n, 12);
+        assert_eq!(
+            config.rerank.capability_cache_ttl_seconds,
+            DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS
+        );
     }
 
     #[test]
@@ -1744,6 +1762,23 @@ model_supports_vision = true
         let config: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
         let serialized = config.show().unwrap();
         let _reparsed: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    #[test]
+    fn default_template_places_rerank_capability_cache_ttl_under_rerank() {
+        let template: toml::Value = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+
+        assert_eq!(
+            template
+                .get("rerank")
+                .and_then(|rerank| rerank.get("capability_cache_ttl_seconds"))
+                .and_then(toml::Value::as_integer),
+            Some(DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS as i64)
+        );
+        assert!(template
+            .get("embedding")
+            .and_then(|embedding| embedding.get("capability_cache_ttl_seconds"))
+            .is_none());
     }
 
     #[test]

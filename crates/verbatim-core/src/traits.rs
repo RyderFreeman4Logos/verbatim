@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::Path;
 
 use anyhow::Result;
@@ -105,4 +106,82 @@ pub trait VectorIndex: Send + Sync {
 pub trait Reranker: Send + Sync {
     async fn rerank(&self, query: &str, docs: &[String], top_n: usize)
         -> Result<Vec<(usize, f32)>>;
+
+    async fn rerank_with_diagnostics(
+        &self,
+        query: &str,
+        docs: &[String],
+        top_n: usize,
+    ) -> Result<RerankResponse> {
+        Ok(RerankResponse {
+            hits: self.rerank(query, docs, top_n).await?,
+            diagnostics: RerankDiagnostics::default(),
+        })
+    }
 }
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RerankResponse {
+    pub hits: Vec<(usize, f32)>,
+    pub diagnostics: RerankDiagnostics,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RerankDiagnostics {
+    pub capability: Option<RerankCapabilityDiagnostics>,
+    pub request: Option<RerankRequestDiagnostics>,
+    pub retried_after_context_limit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerankCapabilityDiagnostics {
+    pub state: RerankCapabilityState,
+    pub max_context_tokens: Option<usize>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankCapabilityState {
+    Cached,
+    Refreshed,
+    Unavailable,
+    RefreshFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerankRequestDiagnostics {
+    pub candidate_count: usize,
+    pub document_char_limit: usize,
+    pub top_n: usize,
+}
+
+#[derive(Debug)]
+pub struct RerankError {
+    source: anyhow::Error,
+    diagnostics: RerankDiagnostics,
+}
+
+impl RerankError {
+    pub fn new(source: anyhow::Error, diagnostics: RerankDiagnostics) -> Self {
+        Self {
+            source,
+            diagnostics,
+        }
+    }
+
+    pub fn source_error(&self) -> &anyhow::Error {
+        &self.source
+    }
+
+    pub fn diagnostics(&self) -> &RerankDiagnostics {
+        &self.diagnostics
+    }
+}
+
+impl fmt::Display for RerankError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "rerank failed: {}", self.source)
+    }
+}
+
+impl std::error::Error for RerankError {}

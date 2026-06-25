@@ -15,6 +15,10 @@ use crate::config::{
     ChatConfig, EmbeddingConfig, ModelEndpointRuntimeConfig, ModelRetryConfig, RerankConfig,
     VisionConfig,
 };
+use crate::traits::{
+    RerankCapabilityDiagnostics, RerankCapabilityState, RerankDiagnostics, RerankError,
+    RerankRequestDiagnostics, RerankResponse,
+};
 use crate::upstream::{
     capture_full_response, capture_response_prefix, sanitize_text, UpstreamRequestContext,
     DEFAULT_BODY_PREFIX_MAX_BYTES,
@@ -32,6 +36,16 @@ const EMBEDDINGS_PATH: &str = "embeddings";
 const RERANK_PATH: &str = "rerank";
 const RERANK_V1_PATH: &str = "v1/rerank";
 const RERANK_V2_PATH: &str = "v2/rerank";
+const MODELS_PATH: &str = "models";
+const MODELS_V1_PATH: &str = "v1/models";
+const RERANK_DOCUMENT_CHARS_PER_CONTEXT_TOKEN: usize = 3;
+const RERANK_DOCUMENT_CONTEXT_BUDGET_NUMERATOR: usize = 3;
+const RERANK_DOCUMENT_CONTEXT_BUDGET_DENOMINATOR: usize = 4;
+const RERANK_RETRY_CONTEXT_BUDGET_NUMERATOR: usize = 1;
+const RERANK_RETRY_CONTEXT_BUDGET_DENOMINATOR: usize = 2;
+const RERANK_MIN_CHARS_PER_CANDIDATE: usize = 512;
+const RERANK_MAX_DOCUMENT_CHARS: usize = 8_000;
+const RERANK_RETRY_MAX_DOCUMENT_CHARS: usize = 4_000;
 
 /// OpenAI-compatible chat completion adapter.
 #[derive(Clone, Debug)]
@@ -194,6 +208,7 @@ pub struct OpenAiCompatibleReranker {
     endpoint: OpenAiEndpoint,
     provider: RerankProviderKind,
     default_top_n: usize,
+    capability_cache_ttl: Duration,
 }
 
 impl OpenAiCompatibleReranker {
@@ -208,6 +223,129 @@ impl OpenAiCompatibleReranker {
             ),
             provider: RerankProviderKind::from_provider(&config.provider),
             default_top_n: config.top_n,
+            capability_cache_ttl: Duration::from_secs(config.capability_cache_ttl_seconds.max(1)),
+        }
+    }
+
+    async fn rerank_with_outcome(
+        &self,
+        query: &str,
+        docs: Vec<RerankDoc>,
+        top_n: usize,
+    ) -> Result<ProviderRerankOutcome, ProviderRerankFailure> {
+        let mut diagnostics = RerankDiagnostics::default();
+        let capability = self.load_rerank_capability(false).await;
+        diagnostics.capability = Some(capability.diagnostics.clone());
+
+        let first_shape = RerankRequestShape::new(
+            &docs,
+            top_n,
+            self.default_top_n,
+            capability.value.as_ref(),
+            false,
+        );
+        diagnostics.request = Some(first_shape.diagnostics());
+
+        match self.post_rerank(query, &docs, &first_shape).await {
+            Ok(hits) => Ok(ProviderRerankOutcome { hits, diagnostics }),
+            Err(error) if is_context_limit_rerank_error(&error) => {
+                let refresh = self.load_rerank_capability(true).await;
+                diagnostics.capability = Some(refresh.diagnostics.clone());
+
+                let Some(refreshed_capability) = refresh.value else {
+                    return Err(ProviderRerankFailure { error, diagnostics });
+                };
+
+                let retry_shape = RerankRequestShape::new(
+                    &docs,
+                    top_n,
+                    self.default_top_n,
+                    Some(&refreshed_capability),
+                    true,
+                );
+                diagnostics.request = Some(retry_shape.diagnostics());
+                diagnostics.retried_after_context_limit = true;
+
+                match self.post_rerank(query, &docs, &retry_shape).await {
+                    Ok(hits) => Ok(ProviderRerankOutcome { hits, diagnostics }),
+                    Err(retry_error) => Err(ProviderRerankFailure {
+                        error: retry_error,
+                        diagnostics,
+                    }),
+                }
+            }
+            Err(error) => Err(ProviderRerankFailure { error, diagnostics }),
+        }
+    }
+
+    async fn post_rerank(
+        &self,
+        query: &str,
+        docs: &[RerankDoc],
+        shape: &RerankRequestShape,
+    ) -> ProviderResult<Vec<RerankHit>> {
+        let body = OpenAiRerankRequest {
+            model: self.endpoint.model.clone(),
+            query: query.to_string(),
+            documents: shape
+                .document_texts(docs)
+                .into_iter()
+                .map(|text| text.to_string())
+                .collect(),
+            top_n: shape.top_n,
+        };
+
+        let paths = self.provider.rerank_paths(&self.endpoint.base_url);
+        let response: OpenAiRerankResponse = self
+            .endpoint
+            .post_json_paths(&paths, &body, "rerank", "rerank")
+            .await?;
+        let results = response.into_hits();
+        if results.is_empty() && !body.documents.is_empty() {
+            return Err(ProviderError::malformed(
+                "rerank",
+                "response did not include rerank results",
+            ));
+        }
+        Ok(results)
+    }
+
+    async fn load_rerank_capability(&self, force_refresh: bool) -> RerankCapabilityLookup {
+        let key = RerankCapabilityCacheKey::new(
+            &self.endpoint.base_url,
+            self.provider,
+            &self.endpoint.model,
+        );
+        if !force_refresh {
+            if let Some(cached) =
+                rerank_capability_cache().get_fresh(&key, self.capability_cache_ttl)
+            {
+                return cached;
+            }
+        }
+
+        let refreshed = self.refresh_rerank_capability().await;
+        rerank_capability_cache().insert(key, refreshed.clone());
+        refreshed
+    }
+
+    async fn refresh_rerank_capability(&self) -> RerankCapabilityLookup {
+        let paths = model_discovery_paths(&self.endpoint.base_url);
+        let response = self
+            .endpoint
+            .get_json_paths::<serde_json::Value>(&paths, "rerank capability discovery", "rerank")
+            .await;
+        match response {
+            Ok(value) => match parse_rerank_capability(&value, &self.endpoint.model) {
+                Some(capability) => RerankCapabilityLookup::refreshed(capability),
+                None => RerankCapabilityLookup::unavailable("capability_absent"),
+            },
+            Err(error) if is_discovery_unsupported(&error) => {
+                RerankCapabilityLookup::unavailable("discovery_unsupported")
+            }
+            Err(error) => {
+                RerankCapabilityLookup::refresh_failed(rerank_capability_failure_reason(&error))
+            }
         }
     }
 }
@@ -338,35 +476,14 @@ impl ProviderReranker for OpenAiCompatibleReranker {
         docs: Vec<RerankDoc>,
         top_n: usize,
     ) -> ProviderResult<Vec<RerankHit>> {
-        let top_n = if top_n == 0 {
-            self.default_top_n
-        } else {
-            top_n
-        };
-        let body = OpenAiRerankRequest {
-            model: self.endpoint.model.clone(),
-            query: query.to_string(),
-            documents: docs.into_iter().map(|doc| doc.text).collect(),
-            top_n,
-        };
-
-        let paths = self.provider.rerank_paths(&self.endpoint.base_url);
-        let response: OpenAiRerankResponse = self
-            .endpoint
-            .post_json_paths(&paths, &body, "rerank", "rerank")
-            .await?;
-        let results = response.into_hits();
-        if results.is_empty() && !body.documents.is_empty() {
-            return Err(ProviderError::malformed(
-                "rerank",
-                "response did not include rerank results",
-            ));
-        }
-        Ok(results)
+        self.rerank_with_outcome(query, docs, top_n)
+            .await
+            .map(|outcome| outcome.hits)
+            .map_err(|failure| failure.error)
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum RerankProviderKind {
     Vllm,
     Cohere,
@@ -399,6 +516,438 @@ impl RerankProviderKind {
     }
 }
 
+#[derive(Debug)]
+struct ProviderRerankOutcome {
+    hits: Vec<RerankHit>,
+    diagnostics: RerankDiagnostics,
+}
+
+#[derive(Debug)]
+struct ProviderRerankFailure {
+    error: ProviderError,
+    diagnostics: RerankDiagnostics,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RerankEndpointCapability {
+    max_context_tokens: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RerankCapabilityLookup {
+    value: Option<RerankEndpointCapability>,
+    diagnostics: RerankCapabilityDiagnostics,
+}
+
+impl RerankCapabilityLookup {
+    fn cached(value: Option<RerankEndpointCapability>, reason: Option<String>) -> Self {
+        let max_context_tokens = value
+            .as_ref()
+            .map(|capability| capability.max_context_tokens);
+        let state = if value.is_some() {
+            RerankCapabilityState::Cached
+        } else {
+            RerankCapabilityState::Unavailable
+        };
+        Self {
+            value,
+            diagnostics: RerankCapabilityDiagnostics {
+                state,
+                max_context_tokens,
+                reason,
+            },
+        }
+    }
+
+    fn refreshed(value: RerankEndpointCapability) -> Self {
+        Self {
+            diagnostics: RerankCapabilityDiagnostics {
+                state: RerankCapabilityState::Refreshed,
+                max_context_tokens: Some(value.max_context_tokens),
+                reason: None,
+            },
+            value: Some(value),
+        }
+    }
+
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            value: None,
+            diagnostics: RerankCapabilityDiagnostics {
+                state: RerankCapabilityState::Unavailable,
+                max_context_tokens: None,
+                reason: Some(reason.into()),
+            },
+        }
+    }
+
+    fn refresh_failed(reason: impl Into<String>) -> Self {
+        Self {
+            value: None,
+            diagnostics: RerankCapabilityDiagnostics {
+                state: RerankCapabilityState::RefreshFailed,
+                max_context_tokens: None,
+                reason: Some(reason.into()),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct RerankCapabilityCacheKey {
+    base_url: String,
+    provider: RerankProviderKind,
+    model: String,
+}
+
+impl RerankCapabilityCacheKey {
+    fn new(base_url: &str, provider: RerankProviderKind, model: &str) -> Self {
+        Self {
+            base_url: normalized_endpoint_key(base_url),
+            provider,
+            model: model.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RerankCapabilityCacheEntry {
+    lookup: RerankCapabilityLookup,
+    refreshed_at: std::time::Instant,
+}
+
+#[derive(Debug)]
+struct RerankCapabilityCache {
+    entries: Mutex<HashMap<RerankCapabilityCacheKey, RerankCapabilityCacheEntry>>,
+}
+
+impl RerankCapabilityCache {
+    fn get_fresh(
+        &self,
+        key: &RerankCapabilityCacheKey,
+        ttl: Duration,
+    ) -> Option<RerankCapabilityLookup> {
+        let entries = lock_unpoisoned(&self.entries);
+        let entry = entries.get(key)?;
+        if entry.refreshed_at.elapsed() > ttl {
+            return None;
+        }
+        Some(RerankCapabilityLookup::cached(
+            entry.lookup.value.clone(),
+            entry.lookup.diagnostics.reason.clone(),
+        ))
+    }
+
+    fn insert(&self, key: RerankCapabilityCacheKey, lookup: RerankCapabilityLookup) {
+        let mut entries = lock_unpoisoned(&self.entries);
+        entries.insert(
+            key,
+            RerankCapabilityCacheEntry {
+                lookup,
+                refreshed_at: std::time::Instant::now(),
+            },
+        );
+    }
+}
+
+fn rerank_capability_cache() -> &'static RerankCapabilityCache {
+    static CACHE: OnceLock<RerankCapabilityCache> = OnceLock::new();
+    CACHE.get_or_init(|| RerankCapabilityCache {
+        entries: Mutex::new(HashMap::new()),
+    })
+}
+
+#[derive(Debug)]
+struct RerankRequestShape {
+    candidate_count: usize,
+    document_char_limit: usize,
+    top_n: usize,
+}
+
+impl RerankRequestShape {
+    fn new(
+        docs: &[RerankDoc],
+        requested_top_n: usize,
+        default_top_n: usize,
+        capability: Option<&RerankEndpointCapability>,
+        force_smaller: bool,
+    ) -> Self {
+        let base_candidate_count = docs.len();
+        let requested_top_n = if requested_top_n == 0 {
+            default_top_n
+        } else {
+            requested_top_n
+        };
+
+        let (candidate_count, document_char_limit) = capability
+            .map(|capability| {
+                capability_request_limits(capability, base_candidate_count, force_smaller)
+            })
+            .unwrap_or((base_candidate_count, RERANK_MAX_DOCUMENT_CHARS));
+        let candidate_count = candidate_count.min(base_candidate_count);
+        let top_n = if candidate_count == 0 {
+            0
+        } else {
+            requested_top_n.max(1).min(candidate_count)
+        };
+
+        Self {
+            candidate_count,
+            document_char_limit,
+            top_n,
+        }
+    }
+
+    fn document_texts<'a>(&self, docs: &'a [RerankDoc]) -> Vec<&'a str> {
+        docs.iter()
+            .take(self.candidate_count)
+            .map(|doc| bounded_doc_text(&doc.text, self.document_char_limit))
+            .collect()
+    }
+
+    fn diagnostics(&self) -> RerankRequestDiagnostics {
+        RerankRequestDiagnostics {
+            candidate_count: self.candidate_count,
+            document_char_limit: self.document_char_limit,
+            top_n: self.top_n,
+        }
+    }
+}
+
+fn capability_request_limits(
+    capability: &RerankEndpointCapability,
+    docs_len: usize,
+    force_smaller: bool,
+) -> (usize, usize) {
+    if docs_len == 0 {
+        return (0, RERANK_MAX_DOCUMENT_CHARS);
+    }
+
+    let (numerator, denominator) = if force_smaller {
+        (
+            RERANK_RETRY_CONTEXT_BUDGET_NUMERATOR,
+            RERANK_RETRY_CONTEXT_BUDGET_DENOMINATOR,
+        )
+    } else {
+        (
+            RERANK_DOCUMENT_CONTEXT_BUDGET_NUMERATOR,
+            RERANK_DOCUMENT_CONTEXT_BUDGET_DENOMINATOR,
+        )
+    };
+    let token_budget = capability
+        .max_context_tokens
+        .saturating_mul(numerator)
+        .checked_div(denominator)
+        .unwrap_or(0)
+        .max(1);
+    let aggregate_chars = token_budget
+        .saturating_mul(RERANK_DOCUMENT_CHARS_PER_CONTEXT_TOKEN)
+        .max(1);
+    let budget_candidate_count = (aggregate_chars / RERANK_MIN_CHARS_PER_CANDIDATE).max(1);
+    let mut candidate_count = docs_len.min(budget_candidate_count);
+    if force_smaller && docs_len > 1 {
+        candidate_count = candidate_count.min(docs_len.div_ceil(2)).max(1);
+    }
+
+    let mut document_char_limit =
+        (aggregate_chars / candidate_count.max(1)).clamp(1, RERANK_MAX_DOCUMENT_CHARS);
+    if force_smaller {
+        document_char_limit = document_char_limit.min(RERANK_RETRY_MAX_DOCUMENT_CHARS);
+    }
+
+    (candidate_count, document_char_limit)
+}
+
+fn bounded_doc_text(text: &str, max_chars: usize) -> &str {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let end = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
+fn model_discovery_paths(base_url: &str) -> Vec<&'static str> {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") || trimmed.ends_with("/v2") {
+        vec![MODELS_PATH]
+    } else {
+        vec![MODELS_V1_PATH, MODELS_PATH]
+    }
+}
+
+fn parse_rerank_capability(
+    value: &serde_json::Value,
+    model: &str,
+) -> Option<RerankEndpointCapability> {
+    let search_root = capability_search_root(value, model)?;
+    let max_context_tokens = find_context_limit(search_root)?;
+    Some(RerankEndpointCapability { max_context_tokens })
+}
+
+fn capability_search_root<'a>(
+    value: &'a serde_json::Value,
+    model: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(data) = value.get("data").and_then(serde_json::Value::as_array) {
+        if let Some(matched) = data
+            .iter()
+            .find(|candidate| model_entry_matches(candidate, model))
+        {
+            return Some(matched);
+        }
+        if data.len() == 1 {
+            return data.first();
+        }
+        return None;
+    }
+    Some(value)
+}
+
+fn model_entry_matches(value: &serde_json::Value, model: &str) -> bool {
+    ["id", "model", "name"]
+        .iter()
+        .filter_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
+        .any(|candidate| candidate == model)
+}
+
+fn find_context_limit(value: &serde_json::Value) -> Option<usize> {
+    let mut limits = Vec::new();
+    collect_context_limits(value, &mut limits);
+    limits.into_iter().filter(|limit| *limit > 0).min()
+}
+
+fn collect_context_limits(value: &serde_json::Value, limits: &mut Vec<usize>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if is_context_limit_field(key) {
+                    if let Some(limit) = value_as_positive_usize(value) {
+                        limits.push(limit);
+                    }
+                }
+                collect_context_limits(value, limits);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_context_limits(value, limits);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn is_context_limit_field(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "max_model_len"
+            | "max_context_length"
+            | "context_length"
+            | "max_sequence_length"
+            | "max_seq_len"
+            | "max_position_embeddings"
+            | "model_max_length"
+            | "n_ctx"
+    )
+}
+
+fn value_as_positive_usize(value: &serde_json::Value) -> Option<usize> {
+    if let Some(value) = value.as_u64() {
+        return usize::try_from(value).ok().filter(|value| *value > 0);
+    }
+    if let Some(value) = value.as_str() {
+        return value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0);
+    }
+    None
+}
+
+fn is_context_limit_rerank_error(error: &ProviderError) -> bool {
+    let ProviderError::HttpStatus {
+        status,
+        message,
+        diagnostic,
+        ..
+    } = error
+    else {
+        return false;
+    };
+    if !matches!(
+        *status,
+        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+
+    let mut haystack = message.to_ascii_lowercase();
+    if let Some(reason) = status.canonical_reason() {
+        haystack.push(' ');
+        haystack.push_str(&reason.to_ascii_lowercase());
+    }
+    if let Some(prefix) = &diagnostic.response_body_prefix {
+        haystack.push(' ');
+        haystack.push_str(&prefix.to_ascii_lowercase());
+    }
+    is_context_limit_message(&haystack)
+}
+
+fn is_context_limit_message(message: &str) -> bool {
+    [
+        "context length",
+        "max model len",
+        "maximum context",
+        "token limit",
+        "prompt too long",
+        "input too long",
+        "payload too large",
+        "maximum sequence",
+        "max_model_len",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
+}
+
+fn is_discovery_unsupported(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::HttpStatus { status, .. }
+            if matches!(
+                *status,
+                StatusCode::NOT_FOUND
+                    | StatusCode::METHOD_NOT_ALLOWED
+                    | StatusCode::NOT_IMPLEMENTED
+            )
+    )
+}
+
+fn rerank_capability_failure_reason(error: &ProviderError) -> String {
+    match error {
+        ProviderError::Configuration { .. } => "invalid_configuration".to_string(),
+        ProviderError::Transport { source, .. } if source.is_timeout() => {
+            "discovery_timeout".to_string()
+        }
+        ProviderError::Transport { .. } => "discovery_request_failed".to_string(),
+        ProviderError::HttpStatus { status, .. } => {
+            format!("discovery_http_status_{}", status.as_u16())
+        }
+        ProviderError::ResponseDecode { .. } => "discovery_invalid_json".to_string(),
+        ProviderError::QueueTimeout { .. } => "discovery_queue_timeout".to_string(),
+        ProviderError::StreamDecode { .. } | ProviderError::MalformedResponse { .. } => {
+            "discovery_invalid_response".to_string()
+        }
+    }
+}
+
 #[async_trait]
 impl crate::traits::Reranker for OpenAiCompatibleReranker {
     async fn rerank(
@@ -410,6 +959,26 @@ impl crate::traits::Reranker for OpenAiCompatibleReranker {
         let docs = docs.iter().cloned().map(RerankDoc::new).collect();
         let hits = ProviderReranker::rerank(self, query, docs, top_n).await?;
         Ok(hits.into_iter().map(|hit| (hit.index, hit.score)).collect())
+    }
+
+    async fn rerank_with_diagnostics(
+        &self,
+        query: &str,
+        docs: &[String],
+        top_n: usize,
+    ) -> anyhow::Result<RerankResponse> {
+        let docs = docs.iter().cloned().map(RerankDoc::new).collect();
+        match self.rerank_with_outcome(query, docs, top_n).await {
+            Ok(outcome) => Ok(RerankResponse {
+                hits: outcome
+                    .hits
+                    .into_iter()
+                    .map(|hit| (hit.index, hit.score))
+                    .collect(),
+                diagnostics: outcome.diagnostics,
+            }),
+            Err(failure) => Err(RerankError::new(failure.error.into(), failure.diagnostics).into()),
+        }
     }
 }
 
@@ -508,6 +1077,33 @@ impl OpenAiEndpoint {
         }))
     }
 
+    async fn get_json_paths<T: serde::de::DeserializeOwned>(
+        &self,
+        paths: &[&str],
+        operation: &'static str,
+        client_kind: &'static str,
+    ) -> ProviderResult<T> {
+        let mut last_variant_error = None;
+        for (idx, path) in paths.iter().enumerate() {
+            match self.get_json_once(path, operation, client_kind).await {
+                Ok(value) => return Ok(value),
+                Err(error @ ProviderError::HttpStatus { status, .. })
+                    if idx + 1 < paths.len()
+                        && matches!(
+                            status,
+                            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                        ) =>
+                {
+                    last_variant_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_variant_error.unwrap_or_else(|| {
+            ProviderError::configuration(operation, "no provider endpoint paths configured")
+        }))
+    }
+
     async fn post_json_once<T: serde::de::DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         path: &str,
@@ -517,6 +1113,20 @@ impl OpenAiEndpoint {
     ) -> ProviderResult<T> {
         let (response, context, _permit) =
             self.post_once(path, body, operation, client_kind).await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_status_error(operation, &context, status, response).await);
+        }
+        decode_json_response(response, operation, &context).await
+    }
+
+    async fn get_json_once<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        operation: &'static str,
+        client_kind: &'static str,
+    ) -> ProviderResult<T> {
+        let (response, context, _permit) = self.get_once(path, operation, client_kind).await?;
         let status = response.status();
         if !status.is_success() {
             return Err(http_status_error(operation, &context, status, response).await);
@@ -613,6 +1223,40 @@ impl OpenAiEndpoint {
                 diagnostic: Box::new(diagnostic),
             }
         })
+    }
+
+    async fn get_once(
+        &self,
+        path: &str,
+        operation: &'static str,
+        client_kind: &'static str,
+    ) -> ProviderResult<(reqwest::Response, UpstreamRequestContext, EndpointPermit)> {
+        if self.base_url.is_empty() {
+            return Err(ProviderError::configuration(operation, "base_url is empty"));
+        }
+
+        let url = format!("{}/{}", self.base_url, path);
+        let context = UpstreamRequestContext::new(
+            operation,
+            client_kind,
+            Some("openai_compatible".into()),
+            Some(self.model.clone()),
+            &Method::GET,
+            &url,
+        );
+        let permit = self.runtime.acquire(operation).await?;
+        self.auth(self.runtime.client.get(url).timeout(self.timeout))
+            .send()
+            .await
+            .map(|response| (response, context.clone(), permit))
+            .map_err(|source| {
+                let diagnostic = context.transport_failure(&source);
+                ProviderError::Transport {
+                    operation,
+                    source,
+                    diagnostic: Box::new(diagnostic),
+                }
+            })
     }
 
     fn auth(&self, req: RequestBuilder) -> RequestBuilder {
@@ -1216,6 +1860,7 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordedRequest {
+        method: String,
         path: String,
         body: String,
     }
@@ -1241,6 +1886,27 @@ mod tests {
             request
         });
         (base_url, handle)
+    }
+
+    fn spawn_response_sequence_server(
+        responses: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (
+        String,
+        Arc<Mutex<mpsc::Receiver<RecordedRequest>>>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for (status, content_type, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let request = read_http_request(&mut stream);
+                request_tx.send(request).expect("record request");
+                write_http_response(&mut stream, status, content_type, body);
+            }
+        });
+        (base_url, Arc::new(Mutex::new(request_rx)), handle)
     }
 
     fn spawn_blocking_first_embedding_server() -> (
@@ -1350,6 +2016,27 @@ mod tests {
         .expect("request receiver task joins")
     }
 
+    async fn collect_recorded_requests(
+        rx: Arc<Mutex<mpsc::Receiver<RecordedRequest>>>,
+        count: usize,
+    ) -> Vec<RecordedRequest> {
+        let mut requests = Vec::with_capacity(count);
+        for _ in 0..count {
+            requests.push(
+                recv_recorded_request(Arc::clone(&rx), Duration::from_secs(1))
+                    .await
+                    .expect("request recorded"),
+            );
+        }
+        assert!(
+            recv_recorded_request(rx, Duration::from_millis(75))
+                .await
+                .is_none(),
+            "unexpected extra request recorded"
+        );
+        requests
+    }
+
     fn embedding_response_body() -> &'static str {
         r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#
     }
@@ -1435,16 +2122,17 @@ mod tests {
             buffer.extend_from_slice(&chunk[..read]);
         }
 
-        let path = headers
+        let mut request_line = headers
             .lines()
             .next()
-            .and_then(|line| line.split_whitespace().nth(1))
             .unwrap_or_default()
-            .to_string();
+            .split_whitespace();
+        let method = request_line.next().unwrap_or_default().to_string();
+        let path = request_line.next().unwrap_or_default().to_string();
         let body = String::from_utf8(buffer[body_start..body_start + content_length].to_vec())
             .expect("request body utf8");
 
-        RecordedRequest { path, body }
+        RecordedRequest { method, path, body }
     }
 
     fn find_header_end(buffer: &[u8]) -> Option<usize> {
@@ -1785,12 +2473,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_rerank_capability_from_common_model_metadata_shapes() {
+        let response: serde_json::Value = serde_json::from_str(
+            r#"{
+                "data": [
+                    {
+                        "id": "rerank-model",
+                        "max_model_len": 8192,
+                        "model_extra": {
+                            "max_context_length": "4096",
+                            "tokenizer_config": {"model_max_length": 16384}
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("models json parses");
+
+        let capability =
+            parse_rerank_capability(&response, "rerank-model").expect("capability parsed");
+
+        assert_eq!(capability.max_context_tokens, 4096);
+    }
+
+    #[test]
+    fn model_discovery_paths_support_v1_and_bare_host_base_urls() {
+        assert_eq!(
+            model_discovery_paths("http://127.0.0.1:8003/v1"),
+            vec!["models"]
+        );
+        assert_eq!(
+            model_discovery_paths("http://127.0.0.1:8003"),
+            vec!["v1/models", "models"]
+        );
+    }
+
     #[tokio::test]
     async fn reranker_posts_vllm_request_to_v1_rerank() {
-        let (base_url, handle) = spawn_json_server(
-            "200 OK",
-            r#"{"results":[{"index":1,"relevance_score":0.93}]}"#,
-        );
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"rerank-model","max_model_len":8192}]}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"results":[{"index":1,"relevance_score":0.93}]}"#,
+            ),
+        ]);
         let config = RerankConfig {
             enabled: true,
             provider: "vllm".into(),
@@ -1799,6 +2531,7 @@ mod tests {
             top_n: 2,
             timeout_seconds: 5,
             api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
             endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
@@ -1811,9 +2544,18 @@ mod tests {
         )
         .await
         .expect("rerank request succeeds");
-        let request = handle.join().expect("server thread joins");
+        let discovery_request =
+            recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+                .await
+                .expect("discovery request recorded");
+        let request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("rerank request recorded");
+        handle.join().expect("server thread joins");
         let body: serde_json::Value = serde_json::from_str(&request.body).expect("request json");
 
+        assert_eq!(discovery_request.method, "GET");
+        assert_eq!(discovery_request.path, "/v1/models");
         assert_eq!(request.path, "/v1/rerank");
         assert_eq!(body["model"], "rerank-model");
         assert_eq!(body["query"], "alpha?");
@@ -1831,10 +2573,18 @@ mod tests {
 
     #[tokio::test]
     async fn reranker_posts_cohere_request_to_v2_rerank() {
-        let (base_url, handle) = spawn_json_server(
-            "200 OK",
-            r#"{"results":[{"index":0,"relevance_score":0.88}]}"#,
-        );
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"cohere-rerank","max_context_length":4096}]}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"results":[{"index":0,"relevance_score":0.88}]}"#,
+            ),
+        ]);
         let config = RerankConfig {
             enabled: true,
             provider: "cohere".into(),
@@ -1843,6 +2593,7 @@ mod tests {
             top_n: 1,
             timeout_seconds: 5,
             api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
             endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
@@ -1855,8 +2606,16 @@ mod tests {
         )
         .await
         .expect("rerank request succeeds");
-        let request = handle.join().expect("server thread joins");
+        let discovery_request =
+            recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+                .await
+                .expect("discovery request recorded");
+        let request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("rerank request recorded");
+        handle.join().expect("server thread joins");
 
+        assert_eq!(discovery_request.path, "/v1/models");
         assert_eq!(request.path, "/v2/rerank");
         assert_eq!(
             hits,
@@ -1864,6 +2623,485 @@ mod tests {
                 index: 0,
                 score: 0.88
             }]
+        );
+    }
+
+    #[test]
+    fn rerank_capability_cache_respects_ttl() {
+        let cache = RerankCapabilityCache {
+            entries: Mutex::new(HashMap::new()),
+        };
+        let key = RerankCapabilityCacheKey::new(
+            "HTTP://LOCALHOST:8003/v1?token=fixture-secret",
+            RerankProviderKind::Vllm,
+            "cache-model",
+        );
+        cache.insert(
+            key.clone(),
+            RerankCapabilityLookup::refreshed(RerankEndpointCapability {
+                max_context_tokens: 4096,
+            }),
+        );
+
+        let fresh = cache
+            .get_fresh(&key, Duration::from_secs(60))
+            .expect("fresh cache entry is returned");
+        assert_eq!(fresh.diagnostics.state, RerankCapabilityState::Cached);
+        assert_eq!(fresh.diagnostics.max_context_tokens, Some(4096));
+
+        {
+            let mut entries = lock_unpoisoned(&cache.entries);
+            entries
+                .get_mut(&key)
+                .expect("cache entry exists")
+                .refreshed_at = std::time::Instant::now() - Duration::from_secs(120);
+        }
+        assert!(cache.get_fresh(&key, Duration::from_secs(60)).is_none());
+    }
+
+    #[tokio::test]
+    async fn reranker_uses_cached_capability_until_explicit_refresh() {
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"cache-model","max_model_len":4096}]}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"results":[{"index":0,"relevance_score":0.91}]}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"results":[{"index":0,"relevance_score":0.92}]}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"cache-model","max_model_len":2048}]}"#,
+            ),
+        ]);
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "cache-model".into(),
+            top_n: 1,
+            timeout_seconds: 5,
+            api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+
+        ProviderReranker::rerank(&reranker, "alpha?", vec![RerankDoc::new("first")], 1)
+            .await
+            .expect("first rerank succeeds");
+        ProviderReranker::rerank(&reranker, "alpha?", vec![RerankDoc::new("first")], 1)
+            .await
+            .expect("second rerank succeeds with cached capability");
+        let refreshed = reranker.load_rerank_capability(true).await;
+
+        assert_eq!(
+            refreshed.diagnostics.state,
+            RerankCapabilityState::Refreshed
+        );
+        assert_eq!(refreshed.diagnostics.max_context_tokens, Some(2048));
+        let first = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("first discovery recorded");
+        let second = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("first rerank recorded");
+        let third = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("second rerank recorded");
+        let fourth = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("explicit refresh recorded");
+        handle.join().expect("server thread joins");
+
+        assert_eq!(first.path, "/v1/models");
+        assert_eq!(second.path, "/v1/rerank");
+        assert_eq!(third.path, "/v1/rerank");
+        assert_eq!(fourth.path, "/v1/models");
+    }
+
+    #[tokio::test]
+    async fn rerank_context_limit_400_refreshes_once_and_retries_bounded() {
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"ctx-model","max_model_len":8192}]}"#,
+            ),
+            (
+                "400 Bad Request",
+                "application/json",
+                r#"{"error":{"message":"context length exceeds max_model_len"}}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"ctx-model","max_model_len":512}]}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"results":[{"index":0,"relevance_score":0.97}]}"#,
+            ),
+        ]);
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "ctx-model".into(),
+            top_n: 6,
+            timeout_seconds: 5,
+            api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+        let docs = vec!["x".repeat(8_000); 6];
+
+        let response =
+            <OpenAiCompatibleReranker as crate::traits::Reranker>::rerank_with_diagnostics(
+                &reranker,
+                "secret query token=fixture-query",
+                &docs,
+                6,
+            )
+            .await
+            .expect("context-limit retry succeeds");
+
+        assert_eq!(response.hits, vec![(0, 0.97)]);
+        assert!(response.diagnostics.retried_after_context_limit);
+        let capability = response
+            .diagnostics
+            .capability
+            .as_ref()
+            .expect("capability diagnostics");
+        assert_eq!(capability.state, RerankCapabilityState::Refreshed);
+        assert_eq!(capability.max_context_tokens, Some(512));
+        let retry_request = response
+            .diagnostics
+            .request
+            .as_ref()
+            .expect("request diagnostics");
+        assert_eq!(retry_request.candidate_count, 1);
+        assert_eq!(retry_request.document_char_limit, 768);
+        assert_eq!(retry_request.top_n, 1);
+
+        let requests = collect_recorded_requests(request_rx, 4).await;
+        handle.join().expect("server thread joins");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/v1/models", "/v1/rerank", "/v1/models", "/v1/rerank"]
+        );
+        let first_body: serde_json::Value =
+            serde_json::from_str(&requests[1].body).expect("first rerank body");
+        let retry_body: serde_json::Value =
+            serde_json::from_str(&requests[3].body).expect("retry rerank body");
+        assert_eq!(first_body["documents"].as_array().unwrap().len(), 6);
+        assert_eq!(retry_body["documents"].as_array().unwrap().len(), 1);
+        assert!(
+            first_body["documents"][0].as_str().unwrap().len()
+                > retry_body["documents"][0].as_str().unwrap().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_payload_limit_413_refreshes_once_and_retries_bounded() {
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"payload-model","max_model_len":4096}]}"#,
+            ),
+            (
+                "413 Payload Too Large",
+                "application/json",
+                r#"{"error":{"message":"payload too large for maximum context"}}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"payload-model","max_sequence_length":512}]}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"results":[{"index":0,"relevance_score":0.87}]}"#,
+            ),
+        ]);
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "payload-model".into(),
+            top_n: 4,
+            timeout_seconds: 5,
+            api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+        let docs = vec!["payload".repeat(1_000); 4];
+
+        let response =
+            <OpenAiCompatibleReranker as crate::traits::Reranker>::rerank_with_diagnostics(
+                &reranker,
+                "payload query",
+                &docs,
+                4,
+            )
+            .await
+            .expect("payload-limit retry succeeds");
+
+        assert_eq!(response.hits, vec![(0, 0.87)]);
+        assert!(response.diagnostics.retried_after_context_limit);
+        assert_eq!(
+            response
+                .diagnostics
+                .capability
+                .as_ref()
+                .unwrap()
+                .max_context_tokens,
+            Some(512)
+        );
+        let requests = collect_recorded_requests(request_rx, 4).await;
+        handle.join().expect("server thread joins");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/v1/models", "/v1/rerank", "/v1/models", "/v1/rerank"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_context_limit_refresh_failure_does_not_retry_rerank() {
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"refresh-fail-model","max_model_len":8192}]}"#,
+            ),
+            (
+                "400 Bad Request",
+                "application/json",
+                r#"{"error":{"message":"prompt too long for maximum context"}}"#,
+            ),
+            (
+                "500 Internal Server Error",
+                "application/json",
+                r#"{"error":{"message":"metadata service unavailable"}}"#,
+            ),
+        ]);
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "refresh-fail-model".into(),
+            top_n: 2,
+            timeout_seconds: 5,
+            api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+        let docs = vec!["doc".repeat(2_000); 2];
+
+        let error = <OpenAiCompatibleReranker as crate::traits::Reranker>::rerank_with_diagnostics(
+            &reranker, "query", &docs, 2,
+        )
+        .await
+        .expect_err("refresh failure preserves original context error");
+        let rerank_error = error
+            .downcast_ref::<RerankError>()
+            .expect("error carries rerank diagnostics");
+        let capability = rerank_error
+            .diagnostics()
+            .capability
+            .as_ref()
+            .expect("capability diagnostics");
+
+        assert_eq!(capability.state, RerankCapabilityState::RefreshFailed);
+        assert_eq!(
+            capability.reason.as_deref(),
+            Some("discovery_http_status_500")
+        );
+        assert!(!rerank_error.diagnostics().retried_after_context_limit);
+        let requests = collect_recorded_requests(request_rx, 3).await;
+        handle.join().expect("server thread joins");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/v1/models", "/v1/rerank", "/v1/models"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_non_context_400_is_not_refreshed_or_retried() {
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"bad-request-model","max_model_len":8192}]}"#,
+            ),
+            (
+                "400 Bad Request",
+                "application/json",
+                r#"{"error":{"message":"unknown parameter top_n_extra"}}"#,
+            ),
+        ]);
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "bad-request-model".into(),
+            top_n: 1,
+            timeout_seconds: 5,
+            api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+
+        let error = ProviderReranker::rerank(&reranker, "query", vec![RerankDoc::new("doc")], 1)
+            .await
+            .expect_err("non-context 400 fails");
+
+        let ProviderError::HttpStatus {
+            status, diagnostic, ..
+        } = error
+        else {
+            panic!("expected HTTP status error");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(diagnostic.retry_count, Some(0));
+        let requests = collect_recorded_requests(request_rx, 2).await;
+        handle.join().expect("server thread joins");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/v1/models", "/v1/rerank"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_discovery_unsupported_fails_soft_and_still_reranks() {
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "404 Not Found",
+                "application/json",
+                r#"{"error":{"message":"not found"}}"#,
+            ),
+            (
+                "404 Not Found",
+                "application/json",
+                r#"{"error":{"message":"not found"}}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"results":[{"index":0,"relevance_score":0.7}]}"#,
+            ),
+        ]);
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "unsupported-models".into(),
+            top_n: 1,
+            timeout_seconds: 5,
+            api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+        let docs = vec!["doc".to_string()];
+
+        let response =
+            <OpenAiCompatibleReranker as crate::traits::Reranker>::rerank_with_diagnostics(
+                &reranker, "query", &docs, 1,
+            )
+            .await
+            .expect("rerank succeeds without discovery");
+
+        assert_eq!(response.hits, vec![(0, 0.7)]);
+        let capability = response.diagnostics.capability.as_ref().unwrap();
+        assert_eq!(capability.state, RerankCapabilityState::Unavailable);
+        assert_eq!(capability.reason.as_deref(), Some("discovery_unsupported"));
+        let requests = collect_recorded_requests(request_rx, 3).await;
+        handle.join().expect("server thread joins");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/v1/models", "/models", "/v1/rerank"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_discovery_without_capability_fields_fails_soft() {
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"fieldless-model","object":"model"}]}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"results":[{"index":0,"relevance_score":0.72}]}"#,
+            ),
+        ]);
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "fieldless-model".into(),
+            top_n: 1,
+            timeout_seconds: 5,
+            api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+        let docs = vec!["doc".to_string()];
+
+        let response =
+            <OpenAiCompatibleReranker as crate::traits::Reranker>::rerank_with_diagnostics(
+                &reranker, "query", &docs, 1,
+            )
+            .await
+            .expect("rerank succeeds with unparseable discovery");
+
+        assert_eq!(response.hits, vec![(0, 0.72)]);
+        let capability = response.diagnostics.capability.as_ref().unwrap();
+        assert_eq!(capability.state, RerankCapabilityState::Unavailable);
+        assert_eq!(capability.reason.as_deref(), Some("capability_absent"));
+        let requests = collect_recorded_requests(request_rx, 2).await;
+        handle.join().expect("server thread joins");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/v1/models", "/v1/rerank"]
         );
     }
 
@@ -1966,7 +3204,14 @@ mod tests {
 
     #[tokio::test]
     async fn rerank_invalid_json_error_includes_rerank_diagnostic() {
-        let (base_url, handle) = spawn_json_server("200 OK", "not-json");
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"rerank-model","max_model_len":8192}]}"#,
+            ),
+            ("200 OK", "application/json", "not-json"),
+        ]);
         let config = RerankConfig {
             enabled: true,
             provider: "vllm".into(),
@@ -1975,6 +3220,7 @@ mod tests {
             top_n: 1,
             timeout_seconds: 5,
             api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
             endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
@@ -1982,7 +3228,14 @@ mod tests {
         let error = ProviderReranker::rerank(&reranker, "query", vec![RerankDoc::new("doc")], 1)
             .await
             .expect_err("invalid rerank json fails");
-        let request = handle.join().expect("server thread joins");
+        let _discovery_request =
+            recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+                .await
+                .expect("discovery request recorded");
+        let request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
+            .await
+            .expect("rerank request recorded");
+        handle.join().expect("server thread joins");
 
         assert_eq!(request.path, "/v1/rerank");
         let ProviderError::ResponseDecode { diagnostic, .. } = error else {
