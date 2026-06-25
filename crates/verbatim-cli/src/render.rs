@@ -4,10 +4,11 @@ use serde_json::Value;
 use verbatim_core::api::{
     AskResponse, CheckStaleResponse, CitationResponse, CollectionFilterResponse,
     CollectionResultProvenance, CollectionWatcherStatus, ConfigResponse, EvidenceResponse,
-    HealthResponse, IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse,
-    TaskCreatedResponse, TaskWaitEvent,
+    HealthResponse, IndexGcResponse, IngestResponse, ReindexResponse, RetrieveResponse,
+    SourceResponse, TaskCreatedResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
+use verbatim_core::index_gc::{IndexGcPlanEntry, IndexGcSkippedEntry};
 use verbatim_core::task::{TaskEvent, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary};
 use verbatim_core::types::{BBox, OcrSourceStatus, RetrievalDebug, SourceLocator};
 
@@ -295,6 +296,121 @@ where
     W: Write,
 {
     writeln!(writer, "Reindexed {} source(s).", response.reindexed)
+}
+
+pub fn write_index_gc<W>(writer: &mut W, response: &IndexGcResponse) -> std::io::Result<()>
+where
+    W: Write,
+{
+    let action = if response.dry_run {
+        "Index GC dry-run"
+    } else {
+        "Index GC"
+    };
+    writeln!(writer, "{action}:")?;
+    writeln!(
+        writer,
+        "  policy: retain_previous_generations={} stale_staging_seconds={}",
+        response.policy.retain_previous_generations, response.policy.stale_staging_seconds
+    )?;
+    writeln!(
+        writer,
+        "  planned: {} artifact(s), {} approximate reclaimable",
+        response.plan.entries.len(),
+        format_bytes(response.plan.approximate_reclaim_bytes)
+    )?;
+    if !response.dry_run {
+        writeln!(
+            writer,
+            "  removed: {} artifact(s), {} reclaimed",
+            response.apply.removed.len(),
+            format_bytes(response.apply.reclaimed_bytes)
+        )?;
+    }
+
+    let entries = if response.dry_run {
+        &response.plan.entries
+    } else {
+        &response.apply.removed
+    };
+    if entries.is_empty() {
+        writeln!(writer, "No removable index artifacts.")?;
+    } else {
+        let heading = if response.dry_run {
+            "Planned removals:"
+        } else {
+            "Removed artifacts:"
+        };
+        writeln!(writer, "{heading}")?;
+        for entry in entries {
+            write_index_gc_entry(writer, entry)?;
+        }
+    }
+
+    if !response.plan.skipped.is_empty() {
+        writeln!(writer, "Skipped:")?;
+        for entry in &response.plan.skipped {
+            write_index_gc_skipped(writer, entry)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_index_gc_entry<W>(writer: &mut W, entry: &IndexGcPlanEntry) -> std::io::Result<()>
+where
+    W: Write,
+{
+    let profile = entry.profile_id.as_deref().unwrap_or("-");
+    let generation = entry
+        .generation
+        .map(|generation| generation.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    writeln!(
+        writer,
+        "  kind={} profile={} generation={} bytes={} path={}",
+        entry.kind.as_str(),
+        profile,
+        generation,
+        format_bytes(entry.approximate_bytes),
+        entry.path.display()
+    )?;
+    writeln!(writer, "    reason: {}", entry.reason)
+}
+
+fn write_index_gc_skipped<W>(writer: &mut W, entry: &IndexGcSkippedEntry) -> std::io::Result<()>
+where
+    W: Write,
+{
+    let kind = entry.kind.map(|kind| kind.as_str()).unwrap_or("-");
+    let profile = entry.profile_id.as_deref().unwrap_or("-");
+    let generation = entry
+        .generation
+        .map(|generation| generation.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    writeln!(
+        writer,
+        "  kind={} profile={} generation={} path={}",
+        kind,
+        profile,
+        generation,
+        entry.path.display()
+    )?;
+    writeln!(writer, "    reason: {}", entry.reason)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1}GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1}MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1}KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 pub fn write_task_created<W>(writer: &mut W, response: &TaskCreatedResponse) -> std::io::Result<()>

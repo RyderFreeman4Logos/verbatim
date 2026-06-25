@@ -9,6 +9,7 @@ pub mod graph_extraction;
 pub mod graphrag;
 pub mod image_limits;
 pub mod index;
+pub mod index_gc;
 pub mod ingest;
 pub mod ocr;
 pub mod parser;

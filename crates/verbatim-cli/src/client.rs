@@ -13,9 +13,10 @@ use verbatim_core::api::{
     CheckStaleResponse, CollectionApiEndpoint, CollectionResponse, CollectionStatusResponse,
     CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
     CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
-    CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse, ReindexRequest,
-    ReindexResponse, RetrieveRequest, RetrieveResponse, SourceResponse, TaskCreatedResponse,
-    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse,
+    CreateCollectionRequest, EvidenceResponse, HealthResponse, IndexGcRequest, IndexGcResponse,
+    IngestResponse, ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse,
+    SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest,
+    TaskSummaryResponse,
 };
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
@@ -121,6 +122,7 @@ pub trait DaemonClient {
         vectors_only: bool,
     ) -> CliResult<TaskCreatedResponse>;
     fn submit_reindex_task(&self, request: &ReindexRequest) -> CliResult<TaskCreatedResponse>;
+    fn index_gc(&self, request: &IndexGcRequest) -> CliResult<IndexGcResponse>;
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
     fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse>;
     fn wait_task<W>(
@@ -499,6 +501,10 @@ impl DaemonClient for HttpDaemonClient {
         self.request_json(Method::POST, "/api/tasks/reindex", Some(request))
     }
 
+    fn index_gc(&self, request: &IndexGcRequest) -> CliResult<IndexGcResponse> {
+        self.request_json(Method::POST, "/api/index/gc", Some(request))
+    }
+
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse> {
         self.request_json::<TaskSummaryResponse, ()>(
             Method::GET,
@@ -650,6 +656,7 @@ fn is_long_running_mutation(method: &Method, path: &str) -> bool {
             || path.starts_with("/api/ingest?")
             || path.starts_with("/api/ingest/")
             || path == "/api/reindex"
+            || path == "/api/index/gc"
             || path == "/api/tasks/reindex"
             || (path.starts_with("/api/collections/") && path.ends_with("/sync"));
     }
@@ -1060,6 +1067,10 @@ mod tests {
             RequestTimeoutPolicy::LongRunning
         );
         assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/index/gc"),
+            RequestTimeoutPolicy::LongRunning
+        );
+        assert_eq!(
             json_timeout_policy(&Method::POST, "/api/tasks/reindex"),
             RequestTimeoutPolicy::LongRunning
         );
@@ -1382,6 +1393,29 @@ mod tests {
         assert!(requests[2].contains("\"force\":true"));
         assert!(requests[2].contains("\"all\":false"));
         assert!(!requests[2].contains("\"source_id\""));
+    }
+
+    #[test]
+    fn http_index_gc_posts_dry_run_request() {
+        let body = concat!(
+            "{\"dry_run\":true,",
+            "\"policy\":{\"retain_previous_generations\":2,\"stale_staging_seconds\":86400},",
+            "\"plan\":{\"entries\":[{\"path\":\"/tmp/verbatim/indexes/profiles/default/gen-1\",",
+            "\"kind\":\"generation\",\"profile_id\":\"default\",\"generation\":1,",
+            "\"approximate_bytes\":10,\"reason\":\"old\"}],\"skipped\":[],",
+            "\"approximate_reclaim_bytes\":10},",
+            "\"apply\":{\"removed\":[],\"reclaimed_bytes\":0}}"
+        );
+        let server = TestServer::respond_many(vec![json_response("200 OK", body)]);
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let response = client.index_gc(&IndexGcRequest { dry_run: true }).unwrap();
+
+        assert!(response.dry_run);
+        assert_eq!(response.plan.entries.len(), 1);
+        let request = server.request();
+        assert!(request.starts_with("POST /api/index/gc HTTP/1.1"));
+        assert!(request.contains("\"dry_run\":true"));
     }
 
     #[test]
