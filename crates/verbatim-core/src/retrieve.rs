@@ -1869,20 +1869,7 @@ mod tests {
     }
 
     fn insert_text_chunk(store: &Store, source: &Source, chunk_id: &str, text: &str) -> Chunk {
-        insert_text_chunk_with(
-            store,
-            source,
-            chunk_id,
-            text,
-            SourceLocator::Document {
-                path_or_url: source.path.to_string_lossy().into_owned(),
-                line_start: 1,
-                line_end: None,
-            },
-            Vec::new(),
-            None,
-            None,
-        )
+        TextChunkFixture::new(store, source, chunk_id, text).insert()
     }
 
     fn insert_text_chunk_with_context(
@@ -1892,20 +1879,9 @@ mod tests {
         text: &str,
         context_text: &str,
     ) -> Chunk {
-        insert_text_chunk_with(
-            store,
-            source,
-            chunk_id,
-            text,
-            SourceLocator::Document {
-                path_or_url: source.path.to_string_lossy().into_owned(),
-                line_start: 1,
-                line_end: None,
-            },
-            Vec::new(),
-            None,
-            Some(context_text.to_string()),
-        )
+        TextChunkFixture::new(store, source, chunk_id, text)
+            .with_context_text(context_text)
+            .insert()
     }
 
     fn insert_pdf_text_chunk(
@@ -1915,20 +1891,13 @@ mod tests {
         text: &str,
         page: u32,
     ) -> Chunk {
-        insert_text_chunk_with(
-            store,
-            source,
-            chunk_id,
-            text,
-            SourceLocator::Pdf {
+        TextChunkFixture::new(store, source, chunk_id, text)
+            .with_locator(SourceLocator::Pdf {
                 page,
                 paragraph: 1,
                 bbox: None,
-            },
-            Vec::new(),
-            None,
-            None,
-        )
+            })
+            .insert()
     }
 
     fn insert_text_chunk_with_heading(
@@ -1938,20 +1907,9 @@ mod tests {
         text: &str,
         heading_path: Vec<String>,
     ) -> Chunk {
-        insert_text_chunk_with(
-            store,
-            source,
-            chunk_id,
-            text,
-            SourceLocator::Document {
-                path_or_url: source.path.to_string_lossy().into_owned(),
-                line_start: 1,
-                line_end: None,
-            },
-            heading_path,
-            None,
-            None,
-        )
+        TextChunkFixture::new(store, source, chunk_id, text)
+            .with_heading_path(heading_path)
+            .insert()
     }
 
     fn insert_text_chunk_with_parent(
@@ -1961,64 +1919,94 @@ mod tests {
         text: &str,
         parent_chunk_id: ChunkId,
     ) -> Chunk {
-        insert_text_chunk_with(
-            store,
-            source,
-            chunk_id,
-            text,
-            SourceLocator::Document {
-                path_or_url: source.path.to_string_lossy().into_owned(),
-                line_start: 1,
-                line_end: None,
-            },
-            Vec::new(),
-            Some(parent_chunk_id),
-            None,
-        )
+        TextChunkFixture::new(store, source, chunk_id, text)
+            .with_parent_chunk_id(parent_chunk_id)
+            .insert()
     }
 
-    fn insert_text_chunk_with(
-        store: &Store,
-        source: &Source,
-        chunk_id: &str,
-        text: &str,
+    struct TextChunkFixture<'a> {
+        store: &'a Store,
+        source: &'a Source,
+        chunk_id: &'a str,
+        text: &'a str,
         locator: SourceLocator,
         heading_path: Vec<String>,
         parent_chunk_id: Option<ChunkId>,
         context_text: Option<String>,
-    ) -> Chunk {
-        let evidence = EvidenceUnit {
-            id: EvidenceId(format!("ev-{chunk_id}")),
-            source_id: source.id.clone(),
-            kind: EvidenceKind::Text,
-            derived_from: None,
-            locator,
-            text: text.into(),
-            text_hash: format!("hash-{chunk_id}"),
-            heading_path: heading_path.clone(),
-            position: 0,
-        };
-        let chunk = Chunk {
-            id: ChunkId(chunk_id.into()),
-            source_id: source.id.clone(),
-            chunk_hash: format!("hash-{chunk_id}"),
-            embedding_input_hash: None,
-            text: text.into(),
-            context_text,
-            token_count: 4,
-            chunk_type: ChunkType::Child,
-            parent_chunk_id,
-            heading_path,
-            evidence_unit_ids: vec![evidence.id.clone()],
-        };
-        store.bulk_insert_evidence(&[evidence]).unwrap();
-        store
-            .bulk_insert_chunks(std::slice::from_ref(&chunk))
-            .unwrap();
-        store
-            .link_chunk_evidence(&[(chunk.id.clone(), chunk.evidence_unit_ids[0].clone())])
-            .unwrap();
-        chunk
+    }
+
+    impl<'a> TextChunkFixture<'a> {
+        fn new(store: &'a Store, source: &'a Source, chunk_id: &'a str, text: &'a str) -> Self {
+            Self {
+                store,
+                source,
+                chunk_id,
+                text,
+                locator: SourceLocator::Document {
+                    path_or_url: source.path.to_string_lossy().into_owned(),
+                    line_start: 1,
+                    line_end: None,
+                },
+                heading_path: Vec::new(),
+                parent_chunk_id: None,
+                context_text: None,
+            }
+        }
+
+        fn with_locator(mut self, locator: SourceLocator) -> Self {
+            self.locator = locator;
+            self
+        }
+
+        fn with_heading_path(mut self, heading_path: Vec<String>) -> Self {
+            self.heading_path = heading_path;
+            self
+        }
+
+        fn with_parent_chunk_id(mut self, parent_chunk_id: ChunkId) -> Self {
+            self.parent_chunk_id = Some(parent_chunk_id);
+            self
+        }
+
+        fn with_context_text(mut self, context_text: &str) -> Self {
+            self.context_text = Some(context_text.to_string());
+            self
+        }
+
+        fn insert(self) -> Chunk {
+            let evidence = EvidenceUnit {
+                id: EvidenceId(format!("ev-{}", self.chunk_id)),
+                source_id: self.source.id.clone(),
+                kind: EvidenceKind::Text,
+                derived_from: None,
+                locator: self.locator,
+                text: self.text.into(),
+                text_hash: format!("hash-{}", self.chunk_id),
+                heading_path: self.heading_path.clone(),
+                position: 0,
+            };
+            let chunk = Chunk {
+                id: ChunkId(self.chunk_id.into()),
+                source_id: self.source.id.clone(),
+                chunk_hash: format!("hash-{}", self.chunk_id),
+                embedding_input_hash: None,
+                text: self.text.into(),
+                context_text: self.context_text,
+                token_count: 4,
+                chunk_type: ChunkType::Child,
+                parent_chunk_id: self.parent_chunk_id,
+                heading_path: self.heading_path,
+                evidence_unit_ids: vec![evidence.id.clone()],
+            };
+            self.store.bulk_insert_evidence(&[evidence]).unwrap();
+            self.store
+                .bulk_insert_chunks(std::slice::from_ref(&chunk))
+                .unwrap();
+            self.store
+                .link_chunk_evidence(&[(chunk.id.clone(), chunk.evidence_unit_ids[0].clone())])
+                .unwrap();
+            chunk
+        }
     }
 
     fn insert_parent_chunk(

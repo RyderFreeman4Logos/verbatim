@@ -1909,12 +1909,14 @@ mod tests {
         (base_url, Arc::new(Mutex::new(request_rx)), handle)
     }
 
-    fn spawn_blocking_first_embedding_server() -> (
-        String,
-        Arc<Mutex<mpsc::Receiver<RecordedRequest>>>,
-        mpsc::Sender<()>,
-        thread::JoinHandle<()>,
-    ) {
+    struct BlockingFirstEmbeddingServer {
+        base_url: String,
+        requests: Arc<Mutex<mpsc::Receiver<RecordedRequest>>>,
+        release_first_response: mpsc::Sender<()>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    fn spawn_blocking_first_embedding_server() -> BlockingFirstEmbeddingServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
         let (request_tx, request_rx) = mpsc::channel();
@@ -1941,12 +1943,12 @@ mod tests {
                 embedding_response_body(),
             );
         });
-        (
+        BlockingFirstEmbeddingServer {
             base_url,
-            Arc::new(Mutex::new(request_rx)),
-            release_tx,
+            requests: Arc::new(Mutex::new(request_rx)),
+            release_first_response: release_tx,
             handle,
-        )
+        }
     }
 
     fn spawn_embedding_sequence_server(
@@ -2151,31 +2153,36 @@ mod tests {
 
     #[tokio::test]
     async fn endpoints_with_same_normalized_base_url_share_capacity() {
-        let (base_url, request_rx, release_first, handle) = spawn_blocking_first_embedding_server();
+        let server = spawn_blocking_first_embedding_server();
         let runtime = test_runtime_config(1, 0, 1);
-        let first_model = embedding_model_with_runtime(&base_url, &runtime);
-        let second_model = embedding_model_with_runtime(&format!("{base_url}/"), &runtime);
+        let first_model = embedding_model_with_runtime(&server.base_url, &runtime);
+        let second_model = embedding_model_with_runtime(&format!("{}/", server.base_url), &runtime);
 
         let first =
             tokio::spawn(async move { first_model.embed_prepared(vec!["first".into()]).await });
-        let first_request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
-            .await
-            .expect("first request reaches server");
+        let first_request =
+            recv_recorded_request(Arc::clone(&server.requests), Duration::from_secs(1))
+                .await
+                .expect("first request reaches server");
         assert!(first_request.body.contains("first"));
 
         let second =
             tokio::spawn(async move { second_model.embed_prepared(vec!["second".into()]).await });
         assert!(
-            recv_recorded_request(Arc::clone(&request_rx), Duration::from_millis(75))
+            recv_recorded_request(Arc::clone(&server.requests), Duration::from_millis(75))
                 .await
                 .is_none(),
             "second request must wait for shared endpoint capacity"
         );
 
-        release_first.send(()).expect("release first response");
-        let second_request = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
-            .await
-            .expect("second request reaches server after release");
+        server
+            .release_first_response
+            .send(())
+            .expect("release first response");
+        let second_request =
+            recv_recorded_request(Arc::clone(&server.requests), Duration::from_secs(1))
+                .await
+                .expect("second request reaches server after release");
         assert!(second_request.body.contains("second"));
         first
             .await
@@ -2185,7 +2192,7 @@ mod tests {
             .await
             .expect("second task joins")
             .expect("second succeeds");
-        handle.join().expect("server thread joins");
+        server.handle.join().expect("server thread joins");
     }
 
     #[tokio::test]
