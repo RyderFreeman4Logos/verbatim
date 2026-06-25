@@ -35,6 +35,7 @@ pub struct RetrievalPipeline<'a> {
     lexical_index: &'a dyn LexicalIndex,
     store: &'a Store,
     embed_client: &'a dyn EmbeddingClient,
+    embedding_enabled: bool,
     config: &'a RetrievalConfig,
     graph_config: Option<&'a GraphConfig>,
     rerank_config: Option<&'a RerankConfig>,
@@ -57,6 +58,7 @@ impl<'a> RetrievalPipeline<'a> {
             lexical_index,
             store,
             embed_client,
+            embedding_enabled: true,
             config,
             graph_config: None,
             rerank_config: None,
@@ -80,6 +82,7 @@ impl<'a> RetrievalPipeline<'a> {
             lexical_index,
             store,
             embed_client,
+            embedding_enabled: true,
             config,
             graph_config: Some(graph_config),
             rerank_config: None,
@@ -92,6 +95,11 @@ impl<'a> RetrievalPipeline<'a> {
 
     pub fn require_embedding_profile(mut self, profile_id: &EmbeddingProfileId) -> Self {
         self.required_profile_id = Some(profile_id.clone());
+        self
+    }
+
+    pub fn with_embedding_enabled(mut self, enabled: bool) -> Self {
+        self.embedding_enabled = enabled;
         self
     }
 
@@ -175,17 +183,9 @@ impl<'a> RetrievalPipeline<'a> {
         if source_filter.is_some_and(HashSet::is_empty) {
             return Ok(empty_search_output(include_debug));
         }
-        self.ensure_required_profile_vectors(source_filter)?;
-        let query_text = self.embed_client.prepare_query(query);
-        let embedding_started = Instant::now();
-        let query_vec = self
-            .embed_client
-            .embed(&[query_text])
-            .await?
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        let query_embedding_latency_ms = elapsed_ms(embedding_started);
+        if self.embedding_enabled {
+            self.ensure_required_profile_vectors(source_filter)?;
+        }
 
         let all_child_count = if source_filter.is_some() {
             self.store.list_child_chunks()?.len()
@@ -196,7 +196,9 @@ impl<'a> RetrievalPipeline<'a> {
         let qdrant_can_filter = self.qdrant.is_some();
         #[cfg(not(feature = "qdrant"))]
         let qdrant_can_filter = false;
-        let dense_top_k = if source_filter.is_some()
+        let dense_top_k = if !self.embedding_enabled {
+            0
+        } else if source_filter.is_some()
             && !qdrant_can_filter
             && !self.vector_index.supports_source_filter()
         {
@@ -208,9 +210,25 @@ impl<'a> RetrievalPipeline<'a> {
             .map(|_| all_child_count.max(self.config.bm25_top_k))
             .unwrap_or(self.config.bm25_top_k);
 
-        let dense_results = self
-            .dense_search(&query_vec, dense_top_k, source_filter)
-            .await?;
+        let (dense_results, query_embedding_latency_ms) = if self.embedding_enabled {
+            let query_text = self.embed_client.prepare_query(query);
+            let embedding_started = Instant::now();
+            let query_vec = self
+                .embed_client
+                .embed(&[query_text])
+                .await?
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            let query_embedding_latency_ms = elapsed_ms(embedding_started);
+            (
+                self.dense_search(&query_vec, dense_top_k, source_filter)
+                    .await?,
+                Some(query_embedding_latency_ms),
+            )
+        } else {
+            (Vec::new(), None)
+        };
 
         let bm25_results = self.lexical_index.search(query, bm25_top_k)?;
 
@@ -262,7 +280,7 @@ impl<'a> RetrievalPipeline<'a> {
 
         let debug = if include_debug {
             Some(RetrievalDebug {
-                query_embedding_latency_ms: Some(query_embedding_latency_ms),
+                query_embedding_latency_ms,
                 bm25_hits,
                 dense_hits,
                 rrf_fused_hits,
@@ -1558,6 +1576,7 @@ fn push_unique_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RerankStrategy;
     use crate::traits::RerankResponse;
     use async_trait::async_trait;
     #[cfg(feature = "qdrant")]
@@ -1628,6 +1647,34 @@ mod tests {
     impl EmbeddingClient for KeywordEmbeddingClient {
         async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             Ok(texts.iter().map(|text| keyword_vector(text)).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
+    struct RecordingEmbeddingClient {
+        calls: AtomicUsize,
+    }
+
+    impl RecordingEmbeddingClient {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingClient for RecordingEmbeddingClient {
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow!("embedding should not be called in BM25-only mode"))
         }
 
         fn dimension(&self) -> usize {
@@ -2331,6 +2378,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bm25_only_search_skips_query_embedding_and_dense_search() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-bm25-only");
+        let alpha = insert_child(
+            &store,
+            &source,
+            "chunk-alpha",
+            "alpha lexical evidence answers the question",
+        );
+        let lexical_index = SqliteFtsIndex::new(&store);
+        lexical_index.rebuild_from_store(&store).unwrap();
+        let vector_index = StaticVectorIndex::new(Vec::new());
+        let embed_client = RecordingEmbeddingClient::new();
+        let config = RetrievalConfig {
+            dense_top_k: 10,
+            bm25_top_k: 10,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let pipeline = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &config,
+        )
+        .with_embedding_enabled(false)
+        .require_embedding_profile(&EmbeddingProfileId::default_profile());
+
+        let (results, debug) = pipeline
+            .search_source_set_with_debug("alpha question", None)
+            .await
+            .unwrap();
+
+        assert_eq!(embed_client.call_count(), 0);
+        assert_eq!(results[0].chunk_id, alpha.id);
+        assert_eq!(debug.query_embedding_latency_ms, None);
+        assert!(debug.dense_hits.is_empty());
+        assert!(!debug.bm25_hits.is_empty());
+    }
+
+    #[tokio::test]
     async fn requested_profile_without_vectors_fails_clearly_before_bm25_fallback() {
         let store = Store::in_memory().unwrap();
         let source = source("src-missing-profile");
@@ -2633,6 +2722,7 @@ mod tests {
         };
         let rerank_config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "vllm".into(),
             model: "test-reranker".into(),
             top_n: 2,
@@ -2775,6 +2865,7 @@ mod tests {
         };
         let rerank_config = RerankConfig {
             enabled: true,
+            strategy: RerankStrategy::Endpoint,
             provider: "jina".into(),
             model: "fallback-reranker".into(),
             top_n: 2,

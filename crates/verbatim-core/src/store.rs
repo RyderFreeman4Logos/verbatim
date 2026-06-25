@@ -627,6 +627,25 @@ impl Store {
         Ok(stale)
     }
 
+    pub fn find_stale_sources_for_lexical_index(
+        &self,
+        current_hashes: &HashMap<SourceId, String>,
+    ) -> Result<Vec<SourceId>> {
+        let sources = self.list_sources()?;
+        let stale: Vec<SourceId> = sources
+            .into_iter()
+            .filter(|source| {
+                let file_stale = current_hashes
+                    .get(&source.id)
+                    .is_some_and(|current| *current != source.hash);
+                let source_status_stale = source.status != SourceStatus::Indexed;
+                file_stale || source_status_stale
+            })
+            .map(|source| source.id)
+            .collect();
+        Ok(stale)
+    }
+
     pub fn find_stale_sources_for_profile(
         &self,
         current_hashes: &HashMap<SourceId, String>,

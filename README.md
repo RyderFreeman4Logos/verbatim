@@ -39,6 +39,63 @@ want generated answers, chat. Keep credentials in the config or your own secret
 management; do not paste secrets into commands or logs. Runtime data lives under
 `~/.local/share/verbatim/` by default.
 
+Minimal model role configurations:
+
+```toml
+# BM25-only retrieval plus generated ask answers.
+[embedding]
+enabled = false
+
+[chat]
+enabled = true
+base_url = "http://127.0.0.1:8000/v1"
+model = "qwen3.6-27B"
+
+[rerank]
+enabled = false
+```
+
+```toml
+# Dense retrieval plus chat, with no reranker calls.
+[embedding]
+enabled = true
+base_url = "http://127.0.0.1:8002/v1"
+model = "Qwen/Qwen3-Embedding-8B"
+
+[chat]
+enabled = true
+base_url = "http://127.0.0.1:8000/v1"
+model = "qwen3.6-27B"
+
+[rerank]
+enabled = false
+```
+
+```toml
+# Dedicated reranker endpoint. The explicit endpoint/model auto-enable rerank.
+[rerank]
+strategy = "endpoint"
+base_url = "http://127.0.0.1:8003/v1"
+model = "Qwen/Qwen3-Reranker-4B"
+top_n = 12
+```
+
+```toml
+# Explicit LLM rerank. Chat is not reused as rerank unless configured here.
+[rerank]
+enabled = true
+strategy = "llm"
+base_url = "http://127.0.0.1:8000/v1"
+model = "qwen3.6-27B"
+top_n = 12
+```
+
+If `[embedding]` is absent or `embedding.enabled = false`, Verbatim builds and
+queries the lexical BM25 index without probing a default embedding endpoint. If
+`embedding.enabled = true`, the configured embedding endpoint is required and
+endpoint errors fail clearly. If `[rerank]` is absent, rerank stays disabled;
+`rerank.enabled = false` always overrides rerank endpoint or model fields.
+
 Install and start the systemd user service:
 
 ```sh

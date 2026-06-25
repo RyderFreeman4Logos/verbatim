@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 use crate::image_limits::ImageArtifactLimits;
@@ -171,7 +172,7 @@ impl Default for ParserConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EmbeddingConfig {
     #[serde(default)]
     pub profile_id: EmbeddingProfileId,
@@ -207,7 +208,7 @@ impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
             profile_id: EmbeddingProfileId::default_profile(),
-            enabled: true,
+            enabled: false,
             provider: default_openai_provider(),
             base_url: default_embedding_base_url(),
             model: default_embedding_model(),
@@ -221,6 +222,72 @@ impl Default for EmbeddingConfig {
             capability_cache_ttl_seconds: default_endpoint_capability_cache_ttl_seconds(),
             endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for EmbeddingConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        struct RawEmbeddingConfig {
+            #[serde(default)]
+            profile_id: Option<EmbeddingProfileId>,
+            #[serde(default)]
+            enabled: Option<bool>,
+            #[serde(default)]
+            provider: Option<String>,
+            #[serde(default)]
+            base_url: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            dimension: Option<usize>,
+            #[serde(default)]
+            normalize: Option<bool>,
+            #[serde(default)]
+            query_instruction: Option<String>,
+            #[serde(default)]
+            document_instruction: Option<String>,
+            #[serde(default)]
+            batch_size: Option<usize>,
+            #[serde(default)]
+            timeout_seconds: Option<u64>,
+            #[serde(default)]
+            api_key: Option<String>,
+            #[serde(default)]
+            capability_cache_ttl_seconds: Option<u64>,
+            #[serde(default, flatten)]
+            endpoint_runtime: ModelEndpointRuntimeConfig,
+        }
+
+        let raw = RawEmbeddingConfig::deserialize(deserializer)?;
+        let endpoint_configured = raw.base_url.is_some() || raw.model.is_some();
+        Ok(Self {
+            profile_id: raw
+                .profile_id
+                .unwrap_or_else(EmbeddingProfileId::default_profile),
+            enabled: raw.enabled.unwrap_or(endpoint_configured),
+            provider: raw.provider.unwrap_or_else(default_openai_provider),
+            base_url: raw.base_url.unwrap_or_else(default_embedding_base_url),
+            model: raw.model.unwrap_or_else(default_embedding_model),
+            dimension: raw.dimension.unwrap_or_else(default_dimension),
+            normalize: raw.normalize.unwrap_or_else(default_normalize_embeddings),
+            query_instruction: raw
+                .query_instruction
+                .unwrap_or_else(default_query_instruction),
+            document_instruction: raw.document_instruction.unwrap_or_default(),
+            batch_size: raw.batch_size.unwrap_or_else(default_batch_size),
+            timeout_seconds: raw
+                .timeout_seconds
+                .unwrap_or_else(default_embedding_timeout_seconds),
+            api_key: raw.api_key.unwrap_or_default(),
+            capability_cache_ttl_seconds: raw
+                .capability_cache_ttl_seconds
+                .unwrap_or_else(default_endpoint_capability_cache_ttl_seconds),
+            endpoint_runtime: raw.endpoint_runtime,
+        })
     }
 }
 
@@ -501,10 +568,20 @@ fn default_graph_extraction_max_error_chars() -> usize {
     256
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RerankStrategy {
+    #[default]
+    Endpoint,
+    Llm,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RerankConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub strategy: RerankStrategy,
     #[serde(default = "default_rerank_provider")]
     pub provider: String,
     #[serde(default = "default_rerank_base_url")]
@@ -527,6 +604,7 @@ impl Default for RerankConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            strategy: RerankStrategy::Endpoint,
             provider: default_rerank_provider(),
             base_url: default_rerank_base_url(),
             model: default_rerank_model(),
@@ -536,6 +614,66 @@ impl Default for RerankConfig {
             capability_cache_ttl_seconds: default_rerank_capability_cache_ttl_seconds(),
             endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for RerankConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        struct RawRerankConfig {
+            #[serde(default)]
+            enabled: Option<bool>,
+            #[serde(default)]
+            strategy: Option<RerankStrategy>,
+            #[serde(default)]
+            provider: Option<String>,
+            #[serde(default)]
+            base_url: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            top_n: Option<usize>,
+            #[serde(default)]
+            timeout_seconds: Option<u64>,
+            #[serde(default)]
+            api_key: Option<String>,
+            #[serde(default)]
+            capability_cache_ttl_seconds: Option<u64>,
+            #[serde(default, flatten)]
+            endpoint_runtime: ModelEndpointRuntimeConfig,
+        }
+
+        let raw = RawRerankConfig::deserialize(deserializer)?;
+        let endpoint_or_model_configured = raw.base_url.is_some() || raw.model.is_some();
+        let strategy = raw.strategy.unwrap_or_default();
+        if strategy == RerankStrategy::Llm
+            && raw.enabled != Some(false)
+            && (raw.base_url.is_none() || raw.model.is_none())
+        {
+            return Err(de::Error::custom(
+                "rerank strategy 'llm' requires explicit rerank.base_url and rerank.model",
+            ));
+        }
+
+        Ok(Self {
+            enabled: raw.enabled.unwrap_or(endpoint_or_model_configured),
+            strategy,
+            provider: raw.provider.unwrap_or_else(default_rerank_provider),
+            base_url: raw.base_url.unwrap_or_else(default_rerank_base_url),
+            model: raw.model.unwrap_or_else(default_rerank_model),
+            top_n: raw.top_n.unwrap_or_else(default_rerank_top_n),
+            timeout_seconds: raw
+                .timeout_seconds
+                .unwrap_or_else(default_rerank_timeout_seconds),
+            api_key: raw.api_key.unwrap_or_default(),
+            capability_cache_ttl_seconds: raw
+                .capability_cache_ttl_seconds
+                .unwrap_or_else(default_rerank_capability_cache_ttl_seconds),
+            endpoint_runtime: raw.endpoint_runtime,
+        })
     }
 }
 
@@ -996,6 +1134,7 @@ impl Config {
     pub fn apply_reload_safe_changes(&self, candidate: &Self) -> Self {
         let mut next = self.clone();
 
+        next.embedding.enabled = candidate.embedding.enabled;
         next.embedding.base_url = candidate.embedding.base_url.clone();
         next.embedding.batch_size = candidate.embedding.batch_size;
         next.embedding.timeout_seconds = candidate.embedding.timeout_seconds;
@@ -1101,6 +1240,7 @@ fn is_reload_safe_key(key: &str) -> bool {
     matches!(
         key,
         "embedding.base_url"
+            | "embedding.enabled"
             | "embedding.batch_size"
             | "embedding.timeout_seconds"
             | "embedding.api_key"
@@ -1129,6 +1269,7 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "graph.global_search.drift.enabled"
             | "graph.global_search.drift.max_subqueries"
             | "rerank.enabled"
+            | "rerank.strategy"
             | "rerank.provider"
             | "rerank.base_url"
             | "rerank.model"
@@ -1324,6 +1465,7 @@ max_subqueries = 4
 
 [rerank]
 enabled = false
+strategy = "endpoint"          # endpoint | llm
 provider = "vllm"              # vllm | cohere | jina
 base_url = "http://127.0.0.1:8003"
 model = "Qwen/Qwen3-Reranker-4B"
@@ -1505,6 +1647,7 @@ mod tests {
         assert!(!config.graph.global_search.drift.enabled);
         assert_eq!(config.graph.global_search.drift.max_subqueries, 4);
         assert!(!config.rerank.enabled);
+        assert_eq!(config.rerank.strategy, RerankStrategy::Endpoint);
         assert_eq!(config.rerank.provider, "vllm");
         assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
         assert_eq!(config.rerank.model, "Qwen/Qwen3-Reranker-4B");
@@ -1615,7 +1758,7 @@ model = "Qwen/Qwen3.6-27B"
 
         assert!(!config.vision.enabled);
         assert_eq!(config.vision.model, "Qwen/Qwen3.6-27B");
-        assert!(config.embedding.enabled);
+        assert!(!config.embedding.enabled);
         assert!(config.chat.enabled);
     }
 
@@ -1707,7 +1850,7 @@ max_search_results = 2
     }
 
     #[test]
-    fn partial_rerank_config_defaults_disabled() {
+    fn partial_rerank_endpoint_config_auto_enables_when_enabled_omitted() {
         let config: Config = toml::from_str(
             r#"
 [rerank]
@@ -1716,7 +1859,8 @@ model = "custom-reranker"
         )
         .unwrap();
 
-        assert!(!config.rerank.enabled);
+        assert!(config.rerank.enabled);
+        assert_eq!(config.rerank.strategy, RerankStrategy::Endpoint);
         assert_eq!(config.rerank.provider, "vllm");
         assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
         assert_eq!(config.rerank.model, "custom-reranker");
@@ -1725,6 +1869,117 @@ model = "custom-reranker"
             config.rerank.capability_cache_ttl_seconds,
             DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS
         );
+    }
+
+    #[test]
+    fn absent_rerank_config_remains_disabled_despite_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+[retrieval]
+dense_top_k = 4
+bm25_top_k = 4
+rrf_k = 60
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.rerank.enabled);
+        assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
+        assert_eq!(config.rerank.model, "Qwen/Qwen3-Reranker-4B");
+    }
+
+    #[test]
+    fn chat_config_does_not_implicitly_select_llm_rerank() {
+        let config: Config = toml::from_str(
+            r#"
+[chat]
+base_url = "http://127.0.0.1:8000/v1"
+model = "chat-model"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.chat.enabled);
+        assert!(!config.rerank.enabled);
+        assert_eq!(config.rerank.strategy, RerankStrategy::Endpoint);
+    }
+
+    #[test]
+    fn explicit_rerank_disabled_overrides_endpoint_fields() {
+        let config: Config = toml::from_str(
+            r#"
+[rerank]
+enabled = false
+base_url = "http://127.0.0.1:9999"
+model = "custom-reranker"
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.rerank.enabled);
+        assert_eq!(config.rerank.model, "custom-reranker");
+    }
+
+    #[test]
+    fn absent_embedding_config_defaults_disabled() {
+        let config: Config = toml::from_str(
+            r#"
+[retrieval]
+dense_top_k = 4
+bm25_top_k = 4
+rrf_k = 60
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.embedding.enabled);
+    }
+
+    #[test]
+    fn configured_embedding_endpoint_auto_enables_when_enabled_omitted() {
+        let config: Config = toml::from_str(
+            r#"
+[embedding]
+base_url = "http://127.0.0.1:18002/v1"
+model = "test-embedding"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.embedding.enabled);
+        assert_eq!(config.embedding.model, "test-embedding");
+    }
+
+    #[test]
+    fn llm_rerank_requires_explicit_endpoint_and_model() {
+        let error = toml::from_str::<Config>(
+            r#"
+[rerank]
+strategy = "llm"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires explicit rerank.base_url and rerank.model"));
+    }
+
+    #[test]
+    fn explicit_llm_rerank_config_auto_enables_when_enabled_omitted() {
+        let config: Config = toml::from_str(
+            r#"
+[rerank]
+strategy = "llm"
+base_url = "http://127.0.0.1:8000/v1"
+model = "chat-reranker"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.rerank.enabled);
+        assert_eq!(config.rerank.strategy, RerankStrategy::Llm);
+        assert_eq!(config.rerank.model, "chat-reranker");
     }
 
     #[test]
