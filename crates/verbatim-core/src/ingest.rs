@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -67,6 +68,10 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     data_dir: PathBuf,
     image_artifact_limits: ImageArtifactLimits,
     index_gc_policy: IndexGcPolicy,
+    embedding_batch_size: usize,
+    embedding_max_concurrent_requests: usize,
+    #[cfg(test)]
+    source_commit_observer: Option<Box<dyn Fn(&Store, &SourceId) + Send + Sync>>,
 }
 
 struct PreparedIndexes {
@@ -75,10 +80,36 @@ struct PreparedIndexes {
     cache_stats: EmbeddingCacheStats,
 }
 
+struct PreparedVectors {
+    vectors: Vec<VectorDocument>,
+    cache_stats: EmbeddingCacheStats,
+    cache_stats_by_source: HashMap<SourceId, EmbeddingCacheStats>,
+    errors_by_source: HashMap<SourceId, String>,
+    request_count: usize,
+    max_vectors_per_request: usize,
+}
+
+struct EmbeddingBatchMetrics {
+    request_count: usize,
+    source_count: usize,
+    input_count: usize,
+    max_vectors_per_request: usize,
+    max_concurrent_requests: usize,
+    duration_ms: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct IndexingOutcome {
     pub source_count: usize,
     pub embedding_cache: EmbeddingCacheStats,
+}
+
+/// Result for one source inside a multi-source background ingest batch.
+#[derive(Debug, Clone)]
+pub struct SourceIngestOutcome {
+    pub source_id: SourceId,
+    pub task_id: TaskId,
+    pub result: std::result::Result<EmbeddingCacheStats, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +144,122 @@ struct EmbeddingInput {
     source_id: SourceId,
     hash: String,
     text: String,
+}
+
+struct PreparedSourceIngest {
+    task_id: Option<TaskId>,
+    source: Source,
+    evidence: Vec<EvidenceUnit>,
+    chunks: Vec<Chunk>,
+    links: Vec<(ChunkId, EvidenceId)>,
+    image_artifacts: PreparedImageArtifacts,
+    graph_nodes: Vec<GraphNode>,
+    graph_edges: Vec<GraphEdge>,
+    child_chunks: Vec<Chunk>,
+    embedding_phase: PhaseTiming,
+}
+
+impl PreparedSourceIngest {
+    fn prepared_artifact_bytes(&self) -> usize {
+        self.image_artifacts
+            .files
+            .iter()
+            .fold(0_usize, |total, file| {
+                total.saturating_add(file.bytes.len())
+            })
+    }
+}
+
+#[derive(Default)]
+struct PendingPreparedSources {
+    sources: Vec<PreparedSourceIngest>,
+    child_count: usize,
+    artifact_bytes: usize,
+}
+
+impl PendingPreparedSources {
+    fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    #[cfg(test)]
+    fn artifact_bytes(&self) -> usize {
+        self.artifact_bytes
+    }
+
+    fn should_flush_before_push(
+        &self,
+        next_artifact_bytes: usize,
+        artifact_byte_limit: usize,
+    ) -> bool {
+        !self.is_empty()
+            && self.artifact_bytes > 0
+            && next_artifact_bytes > 0
+            && self.artifact_bytes.saturating_add(next_artifact_bytes) > artifact_byte_limit.max(1)
+    }
+
+    fn should_flush_after_push(
+        &self,
+        embedding_window_limit: usize,
+        artifact_byte_limit: usize,
+    ) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let embedding_window_limit = embedding_window_limit.max(1);
+        self.child_count >= embedding_window_limit
+            || self.sources.len() >= embedding_window_limit
+            || (self.artifact_bytes > 0 && self.artifact_bytes >= artifact_byte_limit.max(1))
+    }
+
+    fn push(&mut self, source: PreparedSourceIngest) {
+        self.child_count = self.child_count.saturating_add(source.child_chunks.len());
+        self.artifact_bytes = self
+            .artifact_bytes
+            .saturating_add(source.prepared_artifact_bytes());
+        self.sources.push(source);
+    }
+
+    fn take(&mut self) -> Vec<PreparedSourceIngest> {
+        self.child_count = 0;
+        self.artifact_bytes = 0;
+        std::mem::take(&mut self.sources)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BatchCancellationScope {
+    SharedTask {
+        completed_sources_before_batch: usize,
+        total_sources: usize,
+    },
+    PerSourceTask,
+}
+
+impl BatchCancellationScope {
+    fn progress(self, committed_sources_in_batch: usize) -> (usize, usize) {
+        match self {
+            Self::SharedTask {
+                completed_sources_before_batch,
+                total_sources,
+            } => (
+                completed_sources_before_batch.saturating_add(committed_sources_in_batch),
+                total_sources,
+            ),
+            Self::PerSourceTask => (0, 1),
+        }
+    }
+}
+
+struct PreparedSourceOutcome {
+    source_id: SourceId,
+    task_id: Option<TaskId>,
+    result: std::result::Result<EmbeddingCacheStats, String>,
 }
 
 #[derive(Debug)]
@@ -214,6 +361,14 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             data_dir: data_dir.to_path_buf(),
             image_artifact_limits: config.parser.image_artifacts,
             index_gc_policy: config.index_gc.policy(),
+            embedding_batch_size: config.embedding.batch_size.max(1),
+            embedding_max_concurrent_requests: config
+                .embedding
+                .endpoint_runtime
+                .bounded()
+                .max_concurrent_requests,
+            #[cfg(test)]
+            source_commit_observer: None,
         })
     }
 
@@ -228,6 +383,12 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         self.vision_model = vision_model;
         self.vision_caption_model = vision_caption_model;
         self.index_gc_policy = config.index_gc.policy();
+        self.embedding_batch_size = config.embedding.batch_size.max(1);
+        self.embedding_max_concurrent_requests = config
+            .embedding
+            .endpoint_runtime
+            .bounded()
+            .max_concurrent_requests;
         self.graph_extractor = if self.graph_extraction_config.enabled && config.chat.enabled {
             Some(GraphExtractor::from_config(&config.chat))
         } else {
@@ -323,6 +484,37 @@ where
             data_dir,
             image_artifact_limits: ImageArtifactLimits::default(),
             index_gc_policy: IndexGcPolicy::default(),
+            embedding_batch_size: 16,
+            embedding_max_concurrent_requests: 4,
+            #[cfg(test)]
+            source_commit_observer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_embedding_controls(
+        mut self,
+        batch_size: usize,
+        max_concurrent_requests: usize,
+    ) -> Self {
+        self.embedding_batch_size = batch_size.max(1);
+        self.embedding_max_concurrent_requests = max_concurrent_requests.max(1);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_source_commit_observer<F>(mut self, observer: F) -> Self
+    where
+        F: Fn(&Store, &SourceId) + Send + Sync + 'static,
+    {
+        self.source_commit_observer = Some(Box::new(observer));
+        self
+    }
+
+    #[cfg(test)]
+    fn notify_source_committed_for_test(&self, source_id: &SourceId) {
+        if let Some(observer) = &self.source_commit_observer {
+            observer(&self.store, source_id);
         }
     }
 
@@ -513,11 +705,99 @@ where
         self.ingest_source_inner(source_id, Some(task_id)).await
     }
 
+    /// Ingest already-queued source tasks as one bounded cross-source embedding batch stream.
+    pub async fn ingest_sources_with_tasks(
+        &mut self,
+        source_tasks: &[(SourceId, TaskId)],
+    ) -> Vec<SourceIngestOutcome> {
+        let active_profile_id = self.active_profile_id.clone();
+        let mut pending = PendingPreparedSources::default();
+        let mut outcomes = Vec::with_capacity(source_tasks.len());
+        for (source_id, task_id) in source_tasks {
+            match self.prepare_source_contents(source_id, Some(task_id)).await {
+                Ok(prepared_source) => {
+                    if self.should_flush_before_pending_push(
+                        &pending,
+                        prepared_source.prepared_artifact_bytes(),
+                    ) {
+                        outcomes.extend(
+                            self.flush_pending_prepared_sources(
+                                &active_profile_id,
+                                &mut pending,
+                                BatchCancellationScope::PerSourceTask,
+                            )
+                            .await
+                            .into_iter()
+                            .map(public_source_ingest_outcome),
+                        );
+                    }
+                    pending.push(prepared_source);
+                    if self.should_flush_pending_sources(&pending) {
+                        outcomes.extend(
+                            self.flush_pending_prepared_sources(
+                                &active_profile_id,
+                                &mut pending,
+                                BatchCancellationScope::PerSourceTask,
+                            )
+                            .await
+                            .into_iter()
+                            .map(public_source_ingest_outcome),
+                        );
+                    }
+                }
+                Err(error) => outcomes.push(SourceIngestOutcome {
+                    source_id: source_id.clone(),
+                    task_id: task_id.clone(),
+                    result: Err(error.to_string()),
+                }),
+            }
+        }
+        if !pending.is_empty() {
+            outcomes.extend(
+                self.flush_pending_prepared_sources(
+                    &active_profile_id,
+                    &mut pending,
+                    BatchCancellationScope::PerSourceTask,
+                )
+                .await
+                .into_iter()
+                .map(public_source_ingest_outcome),
+            );
+        }
+        outcomes
+    }
+
     async fn ingest_source_inner(
         &mut self,
         source_id: &SourceId,
         task_id: Option<&TaskId>,
     ) -> Result<EmbeddingCacheStats> {
+        let active_profile_id = self.active_profile_id.clone();
+        let prepared_source = self.prepare_source_contents(source_id, task_id).await?;
+        let outcomes = self
+            .embed_and_commit_prepared_sources(
+                &active_profile_id,
+                vec![prepared_source],
+                BatchCancellationScope::SharedTask {
+                    completed_sources_before_batch: 0,
+                    total_sources: 1,
+                },
+            )
+            .await;
+        let Some(outcome) = outcomes.into_iter().next() else {
+            return Ok(EmbeddingCacheStats::default());
+        };
+        match outcome.result {
+            Ok(cache_stats) => Ok(cache_stats),
+            Err(error) => bail!(error),
+        }
+    }
+
+    async fn prepare_source_contents(
+        &self,
+        source_id: &SourceId,
+        task_id: Option<&TaskId>,
+    ) -> Result<PreparedSourceIngest> {
         let source = self
             .store
             .get_source(source_id)?
@@ -718,7 +998,6 @@ where
             }),
         );
 
-        let active_profile_id = self.active_profile_id.clone();
         let active_profile_config_hash = self.embedding_profile_spec.config_hash();
         self.assign_embedding_input_hashes(&mut chunks, &active_profile_config_hash);
         let child_chunks = chunks
@@ -726,94 +1005,88 @@ where
             .filter(|chunk| chunk.chunk_type == ChunkType::Child)
             .cloned()
             .collect::<Vec<_>>();
-        let phase = PhaseTiming::start("embedding");
+        let embedding_phase = PhaseTiming::start("embedding");
         self.record_task_progress(
             task_id,
-            phase
+            embedding_phase
                 .progress_snapshot()
                 .with_counter("embedding_vectors", 0, Some(child_chunks.len() as u64))
                 .with_counter("embedding_cache_hits", 0, Some(child_chunks.len() as u64))
                 .with_counter("embedding_cache_misses", 0, Some(child_chunks.len() as u64))
                 .with_counter(
                     "batches",
-                    usize::from(!child_chunks.is_empty()) as u64,
-                    Some(1),
+                    0,
+                    Some(embedding_request_count(
+                        child_chunks.len(),
+                        self.embedding_batch_size,
+                    )),
                 )
-                .with_recent_status("embedding child chunks"),
+                .with_counter("embedding_batch_sources", 1, None)
+                .with_counter(
+                    "embedding_in_flight_limit",
+                    self.embedding_max_concurrent_requests as u64,
+                    None,
+                )
+                .with_recent_status("waiting for embedding batch"),
         );
-        let prepared = self
-            .prepare_source_indexes_for_profile(&active_profile_id, source_id, &child_chunks)
-            .await?;
-        let mut embedding_progress = phase
-            .progress_snapshot()
-            .with_counter(
-                "embedding_vectors",
-                prepared.cache_stats.embedded_chunks as u64,
-                Some(child_chunks.len() as u64),
-            )
-            .with_counter(
-                "embedding_cache_hits",
-                prepared.cache_stats.cache_hits as u64,
-                Some(child_chunks.len() as u64),
-            )
-            .with_counter(
-                "embedding_cache_misses",
-                prepared.cache_stats.cache_misses as u64,
-                Some(child_chunks.len() as u64),
-            )
-            .with_counter(
-                "reused_chunks",
-                prepared.cache_stats.reused_chunks as u64,
-                None,
-            )
-            .with_counter(
-                "changed_chunks",
-                prepared.cache_stats.changed_chunks as u64,
-                None,
-            )
-            .with_counter(
-                "batches",
-                usize::from(!child_chunks.is_empty()) as u64,
-                Some(1),
-            )
-            .with_recent_status("embedding complete");
-        let embedding_timing = phase.finish(serde_json::json!({
-            "child_chunk_count": child_chunks.len(),
-            "vector_count": prepared.vectors.len(),
-            "embedding_cache": &prepared.cache_stats,
-        }));
-        if !child_chunks.is_empty() {
-            embedding_progress.set_endpoint(TaskEndpointSummary::single_call(
-                "embedding",
-                embedding_timing.duration_ms,
-            ));
-        }
-        self.record_task_progress(task_id, embedding_progress);
-        self.record_finished_task_phase(task_id, embedding_timing);
+        Ok(PreparedSourceIngest {
+            task_id: task_id.cloned(),
+            source: new_source,
+            evidence,
+            chunks,
+            links,
+            image_artifacts: prepared_image_artifacts,
+            graph_nodes,
+            graph_edges,
+            child_chunks,
+            embedding_phase,
+        })
+    }
 
+    async fn commit_prepared_source(
+        &mut self,
+        profile_id: &EmbeddingProfileId,
+        prepared_source: PreparedSourceIngest,
+        vectors: Vec<VectorDocument>,
+        cache_stats: EmbeddingCacheStats,
+    ) -> Result<EmbeddingCacheStats> {
+        let PreparedSourceIngest {
+            task_id,
+            source,
+            evidence,
+            chunks,
+            links,
+            image_artifacts,
+            graph_nodes,
+            graph_edges,
+            child_chunks: _,
+            embedding_phase: _,
+        } = prepared_source;
+        let source_id = source.id.clone();
+        let task_id = task_id.as_ref();
+        let prepared =
+            self.prepare_source_indexes_from_vectors(profile_id, &source_id, vectors, cache_stats)?;
         let phase = PhaseTiming::start("ingest_index_publishing");
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
-        let written_image_files = match write_image_artifact_files(
-            &prepared_image_artifacts.files,
-            self.image_artifact_limits,
-        ) {
-            Ok(written) => written,
-            Err(err) => {
-                let _ = remove_dir_if_exists(&staged);
-                return Err(err);
-            }
-        };
+        let written_image_files =
+            match write_image_artifact_files(&image_artifacts.files, self.image_artifact_limits) {
+                Ok(written) => written,
+                Err(err) => {
+                    let _ = remove_dir_if_exists(&staged);
+                    return Err(err);
+                }
+            };
         let db_phase = PhaseTiming::start("db");
         let generation = match self
             .store
             .replace_source_contents(SourceContentsReplacement {
-                source: &new_source,
+                source: &source,
                 evidence: &evidence,
                 chunks: &chunks,
-                embedding_profile_id: &active_profile_id,
+                embedding_profile_id: profile_id,
                 vectors: &prepared.vectors,
                 links: &links,
-                image_artifacts: &prepared_image_artifacts.artifacts,
+                image_artifacts: &image_artifacts.artifacts,
                 graph_nodes: &graph_nodes,
                 graph_edges: &graph_edges,
             }) {
@@ -830,27 +1103,27 @@ where
             serde_json::json!({
                 "operation": "replace_source_contents",
                 "source_id": source_id.0,
-                "embedding_profile_id": active_profile_id.as_str(),
+                "embedding_profile_id": profile_id.as_str(),
                 "index_generation": generation,
             }),
         );
         let cache_stats = prepared.cache_stats.clone();
-        self.publish_committed_indexes(&active_profile_id, generation, staged, prepared)?;
+        self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
         self.record_task_phase(
             task_id,
             phase,
             serde_json::json!({
                 "source_id": source_id.0,
-                "embedding_profile_id": active_profile_id.as_str(),
+                "embedding_profile_id": profile_id.as_str(),
                 "index_generation": generation,
             }),
         );
         #[cfg(feature = "qdrant")]
-        self.sync_qdrant_source(source_id).await;
+        self.sync_qdrant_source(&source_id).await;
         cleanup_stale_source_image_artifacts(
             &self.data_dir,
-            source_id,
-            &prepared_image_artifacts.artifacts,
+            &source_id,
+            &image_artifacts.artifacts,
         )
         .with_context(|| {
             format!(
@@ -861,6 +1134,237 @@ where
 
         tracing::info!(source = %source_id.0, "ingest complete");
         Ok(cache_stats)
+    }
+
+    async fn embed_and_commit_prepared_sources(
+        &mut self,
+        profile_id: &EmbeddingProfileId,
+        prepared_sources: Vec<PreparedSourceIngest>,
+        cancellation_scope: BatchCancellationScope,
+    ) -> Vec<PreparedSourceOutcome> {
+        if prepared_sources.is_empty() {
+            return Vec::new();
+        }
+        let source_count = prepared_sources.len();
+        let input_count = prepared_sources
+            .iter()
+            .map(|source| source.child_chunks.len())
+            .sum::<usize>();
+        let child_chunks = prepared_sources
+            .iter()
+            .flat_map(|source| source.child_chunks.iter().cloned())
+            .collect::<Vec<_>>();
+        let embedding_started = Instant::now();
+        let prepared_vectors = match self
+            .prepare_vectors_for_chunks_partial(profile_id, &child_chunks)
+            .await
+        {
+            Ok(prepared_vectors) => prepared_vectors,
+            Err(error) => {
+                let error = error.to_string();
+                return prepared_sources
+                    .into_iter()
+                    .map(|source| PreparedSourceOutcome {
+                        source_id: source.source.id,
+                        task_id: source.task_id,
+                        result: Err(error.clone()),
+                    })
+                    .collect();
+            }
+        };
+        let duration_ms = embedding_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let metrics = EmbeddingBatchMetrics {
+            request_count: prepared_vectors.request_count,
+            source_count,
+            input_count,
+            max_vectors_per_request: prepared_vectors.max_vectors_per_request,
+            max_concurrent_requests: self.embedding_max_concurrent_requests,
+            duration_ms,
+        };
+        let mut vectors_by_source = HashMap::<SourceId, Vec<VectorDocument>>::new();
+        for vector in prepared_vectors.vectors {
+            vectors_by_source
+                .entry(vector.source_id.clone())
+                .or_default()
+                .push(vector);
+        }
+        let mut stats_by_source = prepared_vectors.cache_stats_by_source;
+        let mut outcomes = Vec::with_capacity(source_count);
+        let mut stopped_after_commit_error: Option<String> = None;
+        let mut committed_sources_in_batch = 0;
+        for source in prepared_sources {
+            let PreparedSourceIngest {
+                task_id,
+                source,
+                evidence,
+                chunks,
+                links,
+                image_artifacts,
+                graph_nodes,
+                graph_edges,
+                child_chunks,
+                embedding_phase,
+            } = source;
+            let source_id = source.id.clone();
+            let child_count = child_chunks.len();
+            let source_vectors = vectors_by_source.remove(&source_id).unwrap_or_default();
+            let source_cache_stats = stats_by_source.remove(&source_id).unwrap_or_default();
+            let embedding_error = prepared_vectors.errors_by_source.get(&source_id).cloned();
+            self.record_embedding_complete(
+                task_id.as_ref(),
+                embedding_phase,
+                child_count,
+                source_vectors.len(),
+                &source_cache_stats,
+                &metrics,
+            );
+            let committable_source = PreparedSourceIngest {
+                task_id: task_id.clone(),
+                source,
+                evidence,
+                chunks,
+                links,
+                image_artifacts,
+                graph_nodes,
+                graph_edges,
+                child_chunks,
+                embedding_phase: PhaseTiming::start("embedding"),
+            };
+            let result = if let Some(error) = &stopped_after_commit_error {
+                Err(format!(
+                    "source ingest not attempted after earlier batch commit failure: {error}"
+                ))
+            } else if let Some(error) = embedding_error {
+                Err(error)
+            } else if source_vectors.len() != child_count {
+                Err(format!(
+                    "vector count mismatch for source {}: expected {}, got {}",
+                    source_id.0,
+                    child_count,
+                    source_vectors.len()
+                ))
+            } else {
+                let (completed_sources, total_sources) =
+                    cancellation_scope.progress(committed_sources_in_batch);
+                match self.ensure_task_not_cancelled(
+                    task_id.as_ref(),
+                    completed_sources,
+                    total_sources,
+                    Some(&source_id),
+                ) {
+                    Ok(()) => self
+                        .commit_prepared_source(
+                            profile_id,
+                            committable_source,
+                            source_vectors,
+                            source_cache_stats.clone(),
+                        )
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                }
+            };
+            match &result {
+                Ok(_) => {
+                    committed_sources_in_batch += 1;
+                    #[cfg(test)]
+                    self.notify_source_committed_for_test(&source_id);
+                }
+                Err(error) if prepared_vectors.errors_by_source.contains_key(&source_id) => {
+                    tracing::warn!(
+                        source = %source_id.0,
+                        error = %error,
+                        "source ingest failed because one of its embedding requests failed"
+                    );
+                }
+                Err(error) => {
+                    stopped_after_commit_error.get_or_insert_with(|| error.clone());
+                }
+            }
+            outcomes.push(PreparedSourceOutcome {
+                source_id,
+                task_id,
+                result,
+            });
+        }
+        outcomes
+    }
+
+    fn record_embedding_complete(
+        &self,
+        task_id: Option<&TaskId>,
+        phase: PhaseTiming,
+        child_chunk_count: usize,
+        vector_count: usize,
+        cache_stats: &EmbeddingCacheStats,
+        metrics: &EmbeddingBatchMetrics,
+    ) {
+        let mut embedding_progress = phase
+            .progress_snapshot()
+            .with_counter(
+                "embedding_vectors",
+                cache_stats.embedded_chunks as u64,
+                Some(child_chunk_count as u64),
+            )
+            .with_counter(
+                "embedding_cache_hits",
+                cache_stats.cache_hits as u64,
+                Some(child_chunk_count as u64),
+            )
+            .with_counter(
+                "embedding_cache_misses",
+                cache_stats.cache_misses as u64,
+                Some(child_chunk_count as u64),
+            )
+            .with_counter("reused_chunks", cache_stats.reused_chunks as u64, None)
+            .with_counter("changed_chunks", cache_stats.changed_chunks as u64, None)
+            .with_counter(
+                "batches",
+                metrics.request_count as u64,
+                Some(metrics.request_count as u64),
+            )
+            .with_counter("embedding_batch_sources", metrics.source_count as u64, None)
+            .with_counter(
+                "max_vectors_per_request",
+                metrics.max_vectors_per_request as u64,
+                None,
+            )
+            .with_counter(
+                "embedding_in_flight_limit",
+                metrics.max_concurrent_requests as u64,
+                None,
+            )
+            .with_recent_status("embedding complete");
+        if metrics.request_count > 0 {
+            embedding_progress.set_endpoint(TaskEndpointSummary {
+                name: "embedding".into(),
+                calls: metrics.request_count as u64,
+                latest_latency_ms: Some(metrics.duration_ms),
+                first_token_latency_ms: None,
+                p50_latency_ms: Some(metrics.duration_ms),
+                p95_latency_ms: Some(metrics.duration_ms),
+                latest_error: None,
+            });
+        }
+        let embedding_timing = phase.finish(serde_json::json!({
+            "child_chunk_count": child_chunk_count,
+            "vector_count": vector_count,
+            "embedding_cache": cache_stats,
+            "cross_source_batch": {
+                "source_count": metrics.source_count,
+                "input_count": metrics.input_count,
+                "requests": metrics.request_count,
+                "max_vectors_per_request": metrics.max_vectors_per_request,
+                "max_concurrent_requests": metrics.max_concurrent_requests,
+                "duration_ms": metrics.duration_ms,
+            },
+        }));
+        self.record_task_progress(task_id, embedding_progress);
+        self.record_finished_task_phase(task_id, embedding_timing);
     }
 
     async fn append_generated_graph(
@@ -944,34 +1448,80 @@ where
             source_count: total,
             embedding_cache: EmbeddingCacheStats::default(),
         };
+        let active_profile_id = self.active_profile_id.clone();
+        let mut pending = PendingPreparedSources::default();
+        let mut completed = 0;
         for (i, source_id) in to_ingest.iter().enumerate() {
-            self.ensure_task_not_cancelled(task_id, i, total, Some(source_id))?;
+            self.ensure_task_not_cancelled(task_id, completed, total, Some(source_id))?;
             tracing::info!(progress = format!("{}/{}", i + 1, total), source = %source_id.0);
             self.record_task_progress(
                 task_id,
                 TaskProgressSnapshot::phase("ingest")
-                    .with_counter("sources", i as u64, Some(total as u64))
+                    .with_counter("sources", completed as u64, Some(total as u64))
                     .with_recent_status(format!("ingesting source {}", source_id.0)),
             );
-            let cache_stats = self.ingest_source_inner(source_id, task_id).await?;
-            self.ensure_task_not_cancelled(task_id, i + 1, total, Some(source_id))?;
-            outcome.embedding_cache.add(&cache_stats);
-            self.record_task_progress(
+            let prepared_source = self.prepare_source_contents(source_id, task_id).await?;
+            if self.should_flush_before_pending_push(
+                &pending,
+                prepared_source.prepared_artifact_bytes(),
+            ) {
+                let source_outcomes = self
+                    .flush_pending_prepared_sources(
+                        &active_profile_id,
+                        &mut pending,
+                        BatchCancellationScope::SharedTask {
+                            completed_sources_before_batch: completed,
+                            total_sources: total,
+                        },
+                    )
+                    .await;
+                self.apply_ingest_all_source_outcomes(
+                    task_id,
+                    total,
+                    &mut completed,
+                    &mut outcome,
+                    source_outcomes,
+                )?;
+            }
+            pending.push(prepared_source);
+            if self.should_flush_pending_sources(&pending) {
+                let source_outcomes = self
+                    .flush_pending_prepared_sources(
+                        &active_profile_id,
+                        &mut pending,
+                        BatchCancellationScope::SharedTask {
+                            completed_sources_before_batch: completed,
+                            total_sources: total,
+                        },
+                    )
+                    .await;
+                self.apply_ingest_all_source_outcomes(
+                    task_id,
+                    total,
+                    &mut completed,
+                    &mut outcome,
+                    source_outcomes,
+                )?;
+            }
+        }
+        if !pending.is_empty() {
+            let source_outcomes = self
+                .flush_pending_prepared_sources(
+                    &active_profile_id,
+                    &mut pending,
+                    BatchCancellationScope::SharedTask {
+                        completed_sources_before_batch: completed,
+                        total_sources: total,
+                    },
+                )
+                .await;
+            self.apply_ingest_all_source_outcomes(
                 task_id,
-                TaskProgressSnapshot::phase("ingest")
-                    .with_counter("sources", (i + 1) as u64, Some(total as u64))
-                    .with_counter(
-                        "embedding_cache_hits",
-                        outcome.embedding_cache.cache_hits as u64,
-                        None,
-                    )
-                    .with_counter(
-                        "embedding_cache_misses",
-                        outcome.embedding_cache.cache_misses as u64,
-                        None,
-                    )
-                    .with_recent_status(format!("finished source {}", source_id.0)),
-            );
+                total,
+                &mut completed,
+                &mut outcome,
+                source_outcomes,
+            )?;
         }
         if force {
             #[cfg(feature = "qdrant")]
@@ -979,6 +1529,90 @@ where
         }
 
         Ok(outcome)
+    }
+
+    fn should_flush_before_pending_push(
+        &self,
+        pending_sources: &PendingPreparedSources,
+        next_artifact_bytes: usize,
+    ) -> bool {
+        pending_sources.should_flush_before_push(
+            next_artifact_bytes,
+            self.pending_prepared_artifact_bytes_limit(),
+        )
+    }
+
+    fn should_flush_pending_sources(&self, pending_sources: &PendingPreparedSources) -> bool {
+        pending_sources.should_flush_after_push(
+            self.pending_embedding_limit(),
+            self.pending_prepared_artifact_bytes_limit(),
+        )
+    }
+
+    fn pending_embedding_limit(&self) -> usize {
+        self.embedding_batch_size
+            .saturating_mul(self.embedding_max_concurrent_requests)
+            .max(1)
+    }
+
+    fn pending_prepared_artifact_bytes_limit(&self) -> usize {
+        self.image_artifact_limits.max_total_bytes_per_source.max(1)
+    }
+
+    async fn flush_pending_prepared_sources(
+        &mut self,
+        profile_id: &EmbeddingProfileId,
+        pending_sources: &mut PendingPreparedSources,
+        cancellation_scope: BatchCancellationScope,
+    ) -> Vec<PreparedSourceOutcome> {
+        let prepared_sources = pending_sources.take();
+        self.embed_and_commit_prepared_sources(profile_id, prepared_sources, cancellation_scope)
+            .await
+    }
+
+    fn apply_ingest_all_source_outcomes(
+        &self,
+        task_id: Option<&TaskId>,
+        total: usize,
+        completed: &mut usize,
+        outcome: &mut IndexingOutcome,
+        source_outcomes: Vec<PreparedSourceOutcome>,
+    ) -> Result<()> {
+        for source_outcome in source_outcomes {
+            match source_outcome.result {
+                Ok(cache_stats) => {
+                    *completed += 1;
+                    self.ensure_task_not_cancelled(
+                        task_id,
+                        *completed,
+                        total,
+                        Some(&source_outcome.source_id),
+                    )?;
+                    outcome.embedding_cache.add(&cache_stats);
+                    self.record_task_progress(
+                        task_id,
+                        TaskProgressSnapshot::phase("ingest")
+                            .with_counter("sources", *completed as u64, Some(total as u64))
+                            .with_counter(
+                                "embedding_cache_hits",
+                                outcome.embedding_cache.cache_hits as u64,
+                                None,
+                            )
+                            .with_counter(
+                                "embedding_cache_misses",
+                                outcome.embedding_cache.cache_misses as u64,
+                                None,
+                            )
+                            .with_recent_status(format!(
+                                "finished source {}",
+                                source_outcome.source_id.0
+                            )),
+                    );
+                }
+                Err(error) => bail!(error),
+            }
+        }
+        Ok(())
     }
 
     fn ensure_task_not_cancelled(
@@ -1215,9 +1849,50 @@ where
         profile_id: &EmbeddingProfileId,
         child_chunks: &[Chunk],
     ) -> Result<PreparedIndexes> {
-        let mut hnsw = HnswIndex::new();
+        let prepared = self
+            .prepare_vectors_for_chunks(profile_id, child_chunks)
+            .await?;
+        let hnsw = hnsw_from_vectors(&prepared.vectors)?;
+
+        Ok(PreparedIndexes {
+            hnsw,
+            vectors: prepared.vectors,
+            cache_stats: prepared.cache_stats,
+        })
+    }
+
+    async fn prepare_vectors_for_chunks(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        child_chunks: &[Chunk],
+    ) -> Result<PreparedVectors> {
+        let prepared = self
+            .prepare_vectors_for_chunks_partial(profile_id, child_chunks)
+            .await?;
+        if let Some((source_id, error)) = prepared.errors_by_source.iter().next() {
+            bail!("embedding failed for source {}: {error}", source_id.0);
+        }
+        if prepared.vectors.len() != child_chunks.len() {
+            bail!(
+                "vector count mismatch: expected {}, got {}",
+                child_chunks.len(),
+                prepared.vectors.len()
+            );
+        }
+        Ok(prepared)
+    }
+
+    async fn prepare_vectors_for_chunks_partial(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        child_chunks: &[Chunk],
+    ) -> Result<PreparedVectors> {
         let mut vectors = Vec::new();
         let mut cache_stats = EmbeddingCacheStats::default();
+        let mut cache_stats_by_source = HashMap::<SourceId, EmbeddingCacheStats>::new();
+        let mut errors_by_source = HashMap::<SourceId, String>::new();
+        let mut request_count = 0;
+        let mut max_vectors_per_request = 0;
         if !child_chunks.is_empty() {
             let profile_config_hash = self.embedding_profile_spec.config_hash();
             let expected_dimension = self.embed_client.dimension();
@@ -1237,49 +1912,94 @@ where
                         )?;
                         cache_stats.cache_hits += 1;
                         cache_stats.reused_chunks += 1;
-                        let document = VectorDocument {
+                        let source_stats = cache_stats_by_source
+                            .entry(input.source_id.clone())
+                            .or_default();
+                        source_stats.cache_hits += 1;
+                        source_stats.reused_chunks += 1;
+                        vectors.push(VectorDocument {
                             chunk_id: input.chunk_id,
                             source_id: input.source_id,
                             vector,
-                        };
-                        hnsw.upsert(document.clone());
-                        vectors.push(document);
+                        });
                     }
                     _ => {
                         cache_stats.cache_misses += 1;
                         cache_stats.changed_chunks += 1;
+                        let source_stats = cache_stats_by_source
+                            .entry(input.source_id.clone())
+                            .or_default();
+                        source_stats.cache_misses += 1;
+                        source_stats.changed_chunks += 1;
                         misses.push(input);
                     }
                 }
             }
 
             if !misses.is_empty() {
-                let texts = misses
-                    .iter()
-                    .map(|input| input.text.clone())
-                    .collect::<Vec<_>>();
-                let embeddings = self.embed_client.embed(&texts).await?;
-                if embeddings.len() != misses.len() {
-                    bail!(
-                        "embedding count mismatch: expected {}, got {}",
-                        misses.len(),
-                        embeddings.len()
-                    );
-                }
-                let mut cache_entries = Vec::with_capacity(misses.len());
-                for (input, embedding) in misses.into_iter().zip(embeddings) {
-                    cache_stats.embedded_chunks += 1;
-                    cache_entries.push(EmbeddingCacheEntry {
-                        embedding_input_hash: input.hash.clone(),
-                        vector: embedding.clone(),
-                    });
-                    let document = VectorDocument {
-                        chunk_id: input.chunk_id,
-                        source_id: input.source_id,
-                        vector: embedding,
-                    };
-                    hnsw.upsert(document.clone());
-                    vectors.push(document);
+                let batches = embedding_input_batches(misses, self.embedding_batch_size);
+                request_count = batches.len();
+                max_vectors_per_request = batches.iter().map(Vec::len).max().unwrap_or(0);
+                let embed_client = &self.embed_client;
+                let batch_results = stream::iter(batches.into_iter().enumerate())
+                    .map(|(batch_index, batch)| async move {
+                        let texts = batch
+                            .iter()
+                            .map(|input| input.text.clone())
+                            .collect::<Vec<_>>();
+                        let embeddings = match embed_client.embed(&texts).await {
+                            Ok(embeddings) => embeddings,
+                            Err(error) => return Err((batch_index, batch, error)),
+                        };
+                        if embeddings.len() != batch.len() {
+                            let expected = batch.len();
+                            return Err((
+                                batch_index,
+                                batch,
+                                anyhow::anyhow!(
+                                    "embedding count mismatch: expected {}, got {}",
+                                    expected,
+                                    embeddings.len()
+                                ),
+                            ));
+                        }
+                        Ok((batch_index, batch, embeddings))
+                    })
+                    .buffered(self.embedding_max_concurrent_requests)
+                    .collect::<Vec<_>>()
+                    .await;
+
+                let mut cache_entries = Vec::new();
+                for result in batch_results {
+                    match result {
+                        Ok((_batch_index, batch, embeddings)) => {
+                            cache_entries.reserve(batch.len());
+                            for (input, embedding) in batch.into_iter().zip(embeddings) {
+                                cache_stats.embedded_chunks += 1;
+                                cache_stats_by_source
+                                    .entry(input.source_id.clone())
+                                    .or_default()
+                                    .embedded_chunks += 1;
+                                cache_entries.push(EmbeddingCacheEntry {
+                                    embedding_input_hash: input.hash.clone(),
+                                    vector: embedding.clone(),
+                                });
+                                vectors.push(VectorDocument {
+                                    chunk_id: input.chunk_id,
+                                    source_id: input.source_id,
+                                    vector: embedding,
+                                });
+                            }
+                        }
+                        Err((_batch_index, batch, error)) => {
+                            let error = error.to_string();
+                            for source_id in embedding_batch_source_ids(&batch) {
+                                errors_by_source
+                                    .entry(source_id)
+                                    .or_insert_with(|| error.clone());
+                            }
+                        }
+                    }
                 }
                 self.store.upsert_embedding_cache_entries(
                     profile_id,
@@ -1287,20 +2007,15 @@ where
                     &cache_entries,
                 )?;
             }
-            if vectors.len() != child_chunks.len() {
-                bail!(
-                    "vector count mismatch: expected {}, got {}",
-                    child_chunks.len(),
-                    vectors.len()
-                );
-            }
         }
-        hnsw.build()?;
 
-        Ok(PreparedIndexes {
-            hnsw,
+        Ok(PreparedVectors {
             vectors,
             cache_stats,
+            cache_stats_by_source,
+            errors_by_source,
+            request_count,
+            max_vectors_per_request,
         })
     }
 
@@ -1310,21 +2025,36 @@ where
         source_id: &SourceId,
         source_child_chunks: &[Chunk],
     ) -> Result<PreparedIndexes> {
+        let source_prepared = self
+            .prepare_vectors_for_chunks(profile_id, source_child_chunks)
+            .await?;
+        self.prepare_source_indexes_from_vectors(
+            profile_id,
+            source_id,
+            source_prepared.vectors,
+            source_prepared.cache_stats,
+        )
+    }
+
+    fn prepare_source_indexes_from_vectors(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_id: &SourceId,
+        source_vectors: Vec<VectorDocument>,
+        cache_stats: EmbeddingCacheStats,
+    ) -> Result<PreparedIndexes> {
         let mut all_vectors = self
             .store
             .list_vector_documents_for_profile(profile_id)?
             .into_iter()
             .filter(|document| document.source_id != *source_id)
             .collect::<Vec<_>>();
-        let source_prepared = self
-            .prepare_full_indexes_for_chunks(profile_id, source_child_chunks)
-            .await?;
-        all_vectors.extend(source_prepared.vectors.clone());
+        all_vectors.extend(source_vectors.clone());
         let hnsw = hnsw_from_vectors(&all_vectors)?;
         Ok(PreparedIndexes {
             hnsw,
-            vectors: source_prepared.vectors,
-            cache_stats: source_prepared.cache_stats,
+            vectors: source_vectors,
+            cache_stats,
         })
     }
 
@@ -1906,6 +2636,51 @@ fn chunk_search_text(chunk: &Chunk) -> String {
 
 fn embedding_input_hash(profile_config_hash: &str, prepared_text: &str) -> String {
     hex_sha256(format!("{CHUNKER_VERSION}\0{profile_config_hash}\0{prepared_text}").as_bytes())
+}
+
+fn embedding_request_count(input_count: usize, batch_size: usize) -> u64 {
+    if input_count == 0 {
+        return 0;
+    }
+    input_count.div_ceil(batch_size.max(1)) as u64
+}
+
+fn embedding_input_batches(
+    inputs: Vec<EmbeddingInput>,
+    batch_size: usize,
+) -> Vec<Vec<EmbeddingInput>> {
+    let batch_size = batch_size.max(1);
+    let mut batches = Vec::with_capacity(inputs.len().div_ceil(batch_size));
+    let mut current = Vec::with_capacity(batch_size);
+    for input in inputs {
+        current.push(input);
+        if current.len() == batch_size {
+            batches.push(current);
+            current = Vec::with_capacity(batch_size);
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn embedding_batch_source_ids(inputs: &[EmbeddingInput]) -> Vec<SourceId> {
+    let mut source_ids = Vec::new();
+    for input in inputs {
+        if !source_ids.contains(&input.source_id) {
+            source_ids.push(input.source_id.clone());
+        }
+    }
+    source_ids
+}
+
+fn public_source_ingest_outcome(outcome: PreparedSourceOutcome) -> SourceIngestOutcome {
+    SourceIngestOutcome {
+        source_id: outcome.source_id,
+        task_id: outcome.task_id.unwrap_or_default(),
+        result: outcome.result,
+    }
 }
 
 fn chunk_caption_evidence(source_id: &SourceId, evidence: &[EvidenceUnit]) -> ChunkOutput {
@@ -3072,6 +3847,22 @@ mod tests {
         }
     }
 
+    struct SelectiveFailingEmbeddingClient;
+
+    #[async_trait]
+    impl EmbeddingClient for SelectiveFailingEmbeddingClient {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            if texts.iter().any(|text| text.contains("FAIL_EMBED")) {
+                bail!("selective embedding unavailable");
+            }
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
     struct StaticEmbeddingClient;
 
     #[async_trait]
@@ -3119,6 +3910,53 @@ mod tests {
                     vec![sum as f32, 1.0]
                 })
                 .collect())
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
+    #[derive(Clone)]
+    struct DelayedRecordingEmbeddingClient {
+        calls: Arc<Mutex<Vec<usize>>>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    impl DelayedRecordingEmbeddingClient {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn call_sizes(&self) -> Vec<usize> {
+            self.calls
+                .lock()
+                .expect("delayed embedding calls lock should not be poisoned")
+                .clone()
+        }
+
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingClient for DelayedRecordingEmbeddingClient {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.calls
+                .lock()
+                .expect("delayed embedding calls lock should not be poisoned")
+                .push(texts.len());
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
         }
 
         fn dimension(&self) -> usize {
@@ -3360,6 +4198,56 @@ mod tests {
             status: SourceStatus::Indexed,
             parser_used: Some("plaintext".into()),
             last_ingested_at: None,
+        }
+    }
+
+    fn prepared_source_with_image_bytes(id: &str, bytes: usize) -> PreparedSourceIngest {
+        let source_id = SourceId(id.to_string());
+        let image_id = ImageId(format!("{id}-image"));
+        let evidence_id = EvidenceId(format!("{id}-image-evidence"));
+        let files = if bytes == 0 {
+            Vec::new()
+        } else {
+            vec![PreparedImageFile {
+                absolute_path: PathBuf::from(format!("/tmp/{id}.png")),
+                bytes: vec![0; bytes],
+                content_hash: format!("{id}-content-hash"),
+                page: 1,
+                image_index: 1,
+            }]
+        };
+        let artifacts = files
+            .iter()
+            .map(|file| ImageArtifact {
+                image_id: image_id.clone(),
+                source_id: source_id.clone(),
+                evidence_id: evidence_id.clone(),
+                relative_path: PathBuf::from(format!("{id}.png")),
+                content_hash: file.content_hash.clone(),
+                mime_type: "image/png".into(),
+                width: 1,
+                height: 1,
+                page: file.page,
+                image_index: file.image_index,
+                bbox: None,
+            })
+            .collect();
+        PreparedSourceIngest {
+            task_id: None,
+            source: test_source(id, PathBuf::from(format!("/tmp/{id}.txt"))),
+            evidence: Vec::new(),
+            chunks: Vec::new(),
+            links: Vec::new(),
+            image_artifacts: PreparedImageArtifacts {
+                evidence: Vec::new(),
+                artifacts,
+                files,
+                text_proximities: Vec::new(),
+            },
+            graph_nodes: Vec::new(),
+            graph_edges: Vec::new(),
+            child_chunks: Vec::new(),
+            embedding_phase: PhaseTiming::start("embedding"),
         }
     }
 
@@ -4862,6 +5750,329 @@ model = "local-vision"
         assert_eq!(retained[0].0 .0, "chunk-2");
         assert_eq!(pipeline.store().list_vector_documents().unwrap().len(), 1);
         assert_eq!(pipeline.hnsw().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingest_all_batches_small_sources_across_embedding_requests() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let embed_client = DelayedRecordingEmbeddingClient::new();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            embed_client.clone(),
+            tempdir.path().to_path_buf(),
+        )
+        .with_embedding_controls(2, 2);
+        let task_id = TaskId("task-cross-source-batch".into());
+        pipeline
+            .store()
+            .create_task(&task_id, TaskKind::Ingest, &serde_json::json!({}))
+            .unwrap();
+
+        for index in 0..4 {
+            let path = tempdir.path().join(format!("small-{index}.txt"));
+            fs::write(&path, format!("small source {index} retrieval text\n")).unwrap();
+            let source = test_source(&format!("src-{index}"), path);
+            pipeline.store().add_source(&source).unwrap();
+        }
+
+        let outcome = pipeline.ingest_all_with_task(true, &task_id).await.unwrap();
+
+        assert_eq!(outcome.source_count, 4);
+        assert_eq!(outcome.embedding_cache.embedded_chunks, 4);
+        let mut call_sizes = embed_client.call_sizes();
+        call_sizes.sort_unstable();
+        assert_eq!(call_sizes, vec![2, 2]);
+        assert_eq!(embed_client.max_in_flight(), 2);
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(&EmbeddingProfileId::default_profile(), None)
+                .unwrap(),
+            4
+        );
+        let events = pipeline
+            .store()
+            .list_task_events(&task_id, None, 100)
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type == "progress"
+                && event.payload["counters"]
+                    .as_array()
+                    .is_some_and(|counters| {
+                        counters.iter().any(|counter| {
+                            counter["name"] == "embedding_batch_sources"
+                                && counter["completed"] == 4
+                        }) && counters.iter().any(|counter| {
+                            counter["name"] == "max_vectors_per_request"
+                                && counter["completed"] == 2
+                        })
+                    })
+        }));
+    }
+
+    #[test]
+    fn pending_prepared_sources_flush_before_retaining_multiple_image_heavy_sources() {
+        let mut pending = PendingPreparedSources::default();
+        pending.push(prepared_source_with_image_bytes("src-image-1", 6));
+        let next = prepared_source_with_image_bytes("src-image-2", 6);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.artifact_bytes(), 6);
+        assert!(pending.should_flush_before_push(next.prepared_artifact_bytes(), 10));
+
+        let flushed = pending.take();
+        assert_eq!(flushed.len(), 1);
+        assert!(pending.is_empty());
+        pending.push(next);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.artifact_bytes(), 6);
+    }
+
+    #[tokio::test]
+    async fn ingest_all_batch_cancellation_after_first_commit_skips_later_sources() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let task_id = TaskId("task-cancel-after-first-source".into());
+        let committed_sources = Arc::new(AtomicUsize::new(0));
+        let observer_task_id = task_id.clone();
+        let observer_committed_sources = Arc::clone(&committed_sources);
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_source_commit_observer(move |store, _source_id| {
+            if observer_committed_sources.fetch_add(1, Ordering::SeqCst) == 0 {
+                store.cancel_task(&observer_task_id).unwrap();
+            }
+        });
+        pipeline
+            .store()
+            .create_task(&task_id, TaskKind::Ingest, &serde_json::json!({}))
+            .unwrap();
+        for index in 0..2 {
+            let path = tempdir.path().join(format!("cancel-{index}.txt"));
+            fs::write(&path, format!("cancel source {index} retrieval text\n")).unwrap();
+            let source = test_source(&format!("src-cancel-{index}"), path);
+            pipeline.store().add_source(&source).unwrap();
+        }
+
+        let err = pipeline
+            .ingest_all_with_task(true, &task_id)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("ingest task cancelled"));
+        assert_eq!(committed_sources.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(&EmbeddingProfileId::default_profile(), None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            pipeline.store().task_status(&task_id).unwrap(),
+            Some(TaskStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_task_batch_cancellation_after_first_commit_skips_later_sources() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let first_task = TaskId("task-source-batch-first".into());
+        let second_task = TaskId("task-source-batch-second".into());
+        let second_task_for_observer = second_task.clone();
+        let committed_sources = Arc::new(AtomicUsize::new(0));
+        let observer_committed_sources = Arc::clone(&committed_sources);
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_source_commit_observer(move |store, _source_id| {
+            if observer_committed_sources.fetch_add(1, Ordering::SeqCst) == 0 {
+                store.cancel_task(&second_task_for_observer).unwrap();
+            }
+        });
+        let mut source_tasks = Vec::new();
+        for (index, task_id) in [&first_task, &second_task].into_iter().enumerate() {
+            pipeline
+                .store()
+                .create_task(task_id, TaskKind::Ingest, &serde_json::json!({}))
+                .unwrap();
+            pipeline.store().start_task(task_id).unwrap();
+            let source_id = SourceId(format!("src-source-batch-{index}"));
+            let path = tempdir.path().join(format!("source-batch-{index}.txt"));
+            fs::write(&path, format!("source batch {index} retrieval text\n")).unwrap();
+            let source = test_source(&source_id.0, path);
+            pipeline.store().add_source(&source).unwrap();
+            source_tasks.push((source_id, task_id.clone()));
+        }
+
+        let outcomes = pipeline.ingest_sources_with_tasks(&source_tasks).await;
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].result.is_ok());
+        assert!(outcomes[1]
+            .result
+            .as_ref()
+            .unwrap_err()
+            .contains("ingest task cancelled"));
+        assert_eq!(committed_sources.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(&EmbeddingProfileId::default_profile(), None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            pipeline.store().task_status(&second_task).unwrap(),
+            Some(TaskStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_task_batch_embedding_failure_only_fails_dependent_source() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            SelectiveFailingEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_embedding_controls(1, 2);
+        let ok_task = TaskId("task-source-batch-ok".into());
+        let fail_task = TaskId("task-source-batch-fail".into());
+        let ok_source_id = SourceId("src-source-batch-ok".into());
+        let fail_source_id = SourceId("src-source-batch-fail".into());
+        for (source_id, task_id, text) in [
+            (
+                &ok_source_id,
+                &ok_task,
+                "successful source retrieval text\n",
+            ),
+            (
+                &fail_source_id,
+                &fail_task,
+                "FAIL_EMBED source retrieval text\n",
+            ),
+        ] {
+            pipeline
+                .store()
+                .create_task(task_id, TaskKind::Ingest, &serde_json::json!({}))
+                .unwrap();
+            pipeline.store().start_task(task_id).unwrap();
+            let path = tempdir.path().join(format!("{}.txt", source_id.0));
+            fs::write(&path, text).unwrap();
+            let source = test_source(&source_id.0, path);
+            pipeline.store().add_source(&source).unwrap();
+        }
+
+        let outcomes = pipeline
+            .ingest_sources_with_tasks(&[
+                (ok_source_id.clone(), ok_task.clone()),
+                (fail_source_id.clone(), fail_task.clone()),
+            ])
+            .await;
+
+        let ok_outcome = outcomes
+            .iter()
+            .find(|outcome| outcome.source_id == ok_source_id)
+            .unwrap();
+        let fail_outcome = outcomes
+            .iter()
+            .find(|outcome| outcome.source_id == fail_source_id)
+            .unwrap();
+        assert!(ok_outcome.result.is_ok());
+        assert!(fail_outcome
+            .result
+            .as_ref()
+            .unwrap_err()
+            .contains("selective embedding unavailable"));
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(
+                    &EmbeddingProfileId::default_profile(),
+                    Some(&ok_source_id),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(
+                    &EmbeddingProfileId::default_profile(),
+                    Some(&fail_source_id),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_all_embedding_failure_commits_independent_sources_in_flush() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            SelectiveFailingEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_embedding_controls(1, 2);
+        let task_id = TaskId("task-ingest-all-partial-embedding-failure".into());
+        let ok_source_id = SourceId("src-ingest-all-ok".into());
+        let fail_source_id = SourceId("src-ingest-all-fail".into());
+        pipeline
+            .store()
+            .create_task(&task_id, TaskKind::Ingest, &serde_json::json!({}))
+            .unwrap();
+        for (source_id, text) in [
+            (&ok_source_id, "successful all-source retrieval text\n"),
+            (&fail_source_id, "FAIL_EMBED all-source retrieval text\n"),
+        ] {
+            let path = tempdir.path().join(format!("{}.txt", source_id.0));
+            fs::write(&path, text).unwrap();
+            let source = test_source(&source_id.0, path);
+            pipeline.store().add_source(&source).unwrap();
+        }
+
+        let err = pipeline
+            .ingest_all_with_task(true, &task_id)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("selective embedding unavailable"));
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(
+                    &EmbeddingProfileId::default_profile(),
+                    Some(&ok_source_id),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(
+                    &EmbeddingProfileId::default_profile(),
+                    Some(&fail_source_id),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[cfg(feature = "qdrant")]
