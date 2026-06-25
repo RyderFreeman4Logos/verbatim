@@ -71,8 +71,11 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     embedding_batch_size: usize,
     embedding_max_concurrent_requests: usize,
     #[cfg(test)]
-    source_commit_observer: Option<Box<dyn Fn(&Store, &SourceId) + Send + Sync>>,
+    source_commit_observer: Option<SourceCommitObserver>,
 }
+
+#[cfg(test)]
+type SourceCommitObserver = Box<dyn Fn(&Store, &SourceId) + Send + Sync>;
 
 struct PreparedIndexes {
     hnsw: HnswIndex,
