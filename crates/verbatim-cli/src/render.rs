@@ -1114,6 +1114,32 @@ where
             provider, model, top_n, candidate_count
         )?;
     }
+    if let Some(capability) = reranker.get("capability") {
+        let state = value_string(capability, "state");
+        let reason = value_string(capability, "reason");
+        let retried = value_string(capability, "retried_after_context_limit");
+        writeln!(
+            writer,
+            "  capability state={} max_context_tokens={} max_candidates={} max_documents={} max_document_chars={} max_payload_chars={} retried_after_limit={} reason={}",
+            state,
+            value_string(capability, "max_context_tokens"),
+            value_string(capability, "max_candidates"),
+            value_string(capability, "max_documents"),
+            value_string(capability, "max_document_chars"),
+            value_string(capability, "max_payload_chars"),
+            retried,
+            reason
+        )?;
+    }
+    if let Some(request) = reranker.get("request") {
+        writeln!(
+            writer,
+            "  request candidates={} document_char_limit={} top_n={}",
+            value_string(request, "candidate_count"),
+            value_string(request, "document_char_limit"),
+            value_string(request, "top_n")
+        )?;
+    }
     let scores = reranker
         .get("scores")
         .and_then(Value::as_array)
@@ -1267,6 +1293,42 @@ mod tests {
 
         assert!(output.contains("embedding_cache: hits=2 misses=1 embedded=1 reused=2 changed=1"));
         assert!(output.contains("\"embedding_cache\""));
+    }
+
+    #[test]
+    fn reranker_debug_renders_sanitized_capability_and_request_state() {
+        let reranker = serde_json::json!({
+            "status": "fallback",
+            "reason": "http_status_400",
+            "provider": "vllm",
+            "model": "rerank-model",
+            "top_n": 2,
+            "candidate_count": 4,
+            "capability": {
+                "state": "refreshed",
+                "max_context_tokens": 512,
+                "max_candidates": 2,
+                "max_documents": 2,
+                "max_document_chars": 1024,
+                "max_payload_chars": 4096,
+                "retried_after_context_limit": true
+            },
+            "request": {
+                "candidate_count": 2,
+                "document_char_limit": 1024,
+                "top_n": 2
+            },
+            "scores": []
+        });
+        let mut output = Vec::new();
+
+        write_reranker(&mut output, Some(&reranker)).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("capability state=refreshed"));
+        assert!(output.contains("max_context_tokens=512"));
+        assert!(output.contains("max_document_chars=1024"));
+        assert!(output.contains("request candidates=2 document_char_limit=1024 top_n=2"));
     }
 
     #[test]
