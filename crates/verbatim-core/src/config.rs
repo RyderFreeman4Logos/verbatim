@@ -138,6 +138,10 @@ fn default_rerank_capability_cache_ttl_seconds() -> u64 {
     DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS
 }
 
+fn default_endpoint_capability_cache_ttl_seconds() -> u64 {
+    DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreConfig {
     pub path: String,
@@ -193,6 +197,8 @@ pub struct EmbeddingConfig {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default = "default_endpoint_capability_cache_ttl_seconds")]
+    pub capability_cache_ttl_seconds: u64,
     #[serde(default, flatten)]
     pub endpoint_runtime: ModelEndpointRuntimeConfig,
 }
@@ -212,6 +218,7 @@ impl Default for EmbeddingConfig {
             batch_size: default_batch_size(),
             timeout_seconds: default_embedding_timeout_seconds(),
             api_key: String::new(),
+            capability_cache_ttl_seconds: default_endpoint_capability_cache_ttl_seconds(),
             endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         }
     }
@@ -993,6 +1000,8 @@ impl Config {
         next.embedding.batch_size = candidate.embedding.batch_size;
         next.embedding.timeout_seconds = candidate.embedding.timeout_seconds;
         next.embedding.api_key = candidate.embedding.api_key.clone();
+        next.embedding.capability_cache_ttl_seconds =
+            candidate.embedding.capability_cache_ttl_seconds;
         next.embedding.endpoint_runtime = candidate.embedding.endpoint_runtime.clone();
 
         next.retrieval = candidate.retrieval.clone();
@@ -1095,6 +1104,7 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "embedding.batch_size"
             | "embedding.timeout_seconds"
             | "embedding.api_key"
+            | "embedding.capability_cache_ttl_seconds"
             | "embedding.max_concurrent_requests"
             | "embedding.queue_timeout_seconds"
             | "embedding.retry.max_retries"
@@ -1265,6 +1275,7 @@ document_instruction = ""
 batch_size = 16
 timeout_seconds = 120
 api_key = ""
+capability_cache_ttl_seconds = 60
 max_concurrent_requests = 4
 queue_timeout_seconds = 300
 
@@ -1440,6 +1451,10 @@ mod tests {
         assert_eq!(config.embedding.dimension, 4096);
         assert!(config.embedding.normalize);
         assert_eq!(config.embedding.batch_size, 16);
+        assert_eq!(
+            config.embedding.capability_cache_ttl_seconds,
+            DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS
+        );
         assert_eq!(
             config.embedding.endpoint_runtime.max_concurrent_requests,
             DEFAULT_MODEL_ENDPOINT_MAX_CONCURRENT_REQUESTS
@@ -1765,9 +1780,16 @@ model_supports_vision = true
     }
 
     #[test]
-    fn default_template_places_rerank_capability_cache_ttl_under_rerank() {
+    fn default_template_places_capability_cache_ttl_under_model_tables() {
         let template: toml::Value = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
 
+        assert_eq!(
+            template
+                .get("embedding")
+                .and_then(|embedding| embedding.get("capability_cache_ttl_seconds"))
+                .and_then(toml::Value::as_integer),
+            Some(DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS as i64)
+        );
         assert_eq!(
             template
                 .get("rerank")
@@ -1775,10 +1797,6 @@ model_supports_vision = true
                 .and_then(toml::Value::as_integer),
             Some(DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS as i64)
         );
-        assert!(template
-            .get("embedding")
-            .and_then(|embedding| embedding.get("capability_cache_ttl_seconds"))
-            .is_none());
     }
 
     #[test]
@@ -1818,6 +1836,7 @@ model_supports_vision = true
         candidate.chat.endpoint_runtime.max_concurrent_requests = 2;
         candidate.chat.endpoint_runtime.retry.max_retries = 1;
         candidate.embedding.base_url = "http://127.0.0.1:18002/v1".into();
+        candidate.embedding.capability_cache_ttl_seconds = 5;
         candidate.embedding.endpoint_runtime.queue_timeout_seconds = 60;
         candidate.index_gc.retain_previous_generations = 1;
         candidate.index_gc.stale_staging_seconds = 3_600;
@@ -1831,6 +1850,7 @@ model_supports_vision = true
                 "chat.retry.max_retries",
                 "chat.timeout_seconds",
                 "embedding.base_url",
+                "embedding.capability_cache_ttl_seconds",
                 "embedding.queue_timeout_seconds",
                 "index_gc.retain_previous_generations",
                 "index_gc.stale_staging_seconds",
@@ -1845,6 +1865,7 @@ model_supports_vision = true
         assert_eq!(applied.chat.endpoint_runtime.max_concurrent_requests, 2);
         assert_eq!(applied.chat.endpoint_runtime.retry.max_retries, 1);
         assert_eq!(applied.embedding.base_url, "http://127.0.0.1:18002/v1");
+        assert_eq!(applied.embedding.capability_cache_ttl_seconds, 5);
         assert_eq!(applied.embedding.endpoint_runtime.queue_timeout_seconds, 60);
         assert_eq!(applied.index_gc.retain_previous_generations, 1);
         assert_eq!(applied.index_gc.stale_staging_seconds, 3_600);

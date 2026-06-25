@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
-use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
+use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
@@ -24,6 +24,12 @@ use crate::upstream::{
     DEFAULT_BODY_PREFIX_MAX_BYTES,
 };
 
+use super::endpoint_capability::{
+    capability_failure_reason, endpoint_capability_cache, is_context_or_payload_limit_error,
+    is_discovery_unsupported, model_discovery_paths, normalized_endpoint_key,
+    parse_endpoint_capability, EndpointCapability, EndpointCapabilityCacheKey,
+    EndpointCapabilityLookup, EndpointCapabilityRole, EndpointCapabilityState,
+};
 use super::{
     ChatContentPart, ChatMessage, ChatModel, ChatRequest, ChatResponse, ChatStream,
     ChatStreamEvent, EmbeddingModel, EmbeddingPurpose, ImageDescribeRequest, ImageDescription,
@@ -36,8 +42,6 @@ const EMBEDDINGS_PATH: &str = "embeddings";
 const RERANK_PATH: &str = "rerank";
 const RERANK_V1_PATH: &str = "v1/rerank";
 const RERANK_V2_PATH: &str = "v2/rerank";
-const MODELS_PATH: &str = "models";
-const MODELS_V1_PATH: &str = "v1/models";
 const RERANK_DOCUMENT_CHARS_PER_CONTEXT_TOKEN: usize = 3;
 const RERANK_DOCUMENT_CONTEXT_BUDGET_NUMERATOR: usize = 3;
 const RERANK_DOCUMENT_CONTEXT_BUDGET_DENOMINATOR: usize = 4;
@@ -96,9 +100,11 @@ impl OpenAiCompatibleVisionModel {
 #[derive(Clone, Debug)]
 pub struct OpenAiCompatibleEmbeddingModel {
     endpoint: OpenAiEndpoint,
+    provider_kind: String,
     dimension: usize,
     normalize: bool,
     batch_size: usize,
+    capability_cache_ttl: Duration,
     query_instruction: String,
     document_instruction: String,
 }
@@ -113,9 +119,11 @@ impl OpenAiCompatibleEmbeddingModel {
                 config.timeout_seconds,
                 &config.endpoint_runtime,
             ),
+            provider_kind: config.provider.clone(),
             dimension: config.dimension,
             normalize: config.normalize,
             batch_size: config.batch_size.max(1),
+            capability_cache_ttl: Duration::from_secs(config.capability_cache_ttl_seconds.max(1)),
             query_instruction: config.query_instruction.clone(),
             document_instruction: config.document_instruction.clone(),
         }
@@ -148,31 +156,66 @@ impl OpenAiCompatibleEmbeddingModel {
 
     pub async fn embed_prepared(&self, texts: Vec<String>) -> ProviderResult<Vec<Vec<f32>>> {
         let mut all_embeddings = Vec::with_capacity(texts.len());
+        let capability = self.cached_endpoint_capability();
+        let mut batch_size = self.embedding_batch_size(capability.value.as_ref());
+        let mut offset = 0;
+        let mut refreshed_after_limit = false;
 
-        for batch in texts.chunks(self.batch_size) {
-            let body = OpenAiEmbeddingRequest {
-                model: self.endpoint.model.clone(),
-                input: batch.to_vec(),
-                encoding_format: "float",
-            };
+        while offset < texts.len() {
+            let end = offset.saturating_add(batch_size).min(texts.len());
+            let batch = &texts[offset..end];
 
-            let response: OpenAiEmbeddingResponse = self
-                .endpoint
-                .post_json(EMBEDDINGS_PATH, &body, "embedding", "embedding")
-                .await?;
-
-            if response.data.len() != batch.len() {
-                return Err(ProviderError::malformed(
-                    "embedding",
-                    format!(
-                        "expected {} embeddings, got {}",
-                        batch.len(),
-                        response.data.len()
-                    ),
-                ));
+            match self.post_embedding_batch(batch).await {
+                Ok(mut embeddings) => {
+                    all_embeddings.append(&mut embeddings);
+                    offset = end;
+                }
+                Err(error)
+                    if is_context_or_payload_limit_error(&error) && !refreshed_after_limit =>
+                {
+                    refreshed_after_limit = true;
+                    let refresh = self.load_endpoint_capability(true).await;
+                    let refreshed_batch_size = self.embedding_batch_size(refresh.value.as_ref());
+                    if refreshed_batch_size < batch.len() {
+                        batch_size = refreshed_batch_size;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
             }
+        }
 
-            for item in response.data {
+        Ok(all_embeddings)
+    }
+
+    async fn post_embedding_batch(&self, batch: &[String]) -> ProviderResult<Vec<Vec<f32>>> {
+        let body = OpenAiEmbeddingRequest {
+            model: self.endpoint.model.clone(),
+            input: batch.to_vec(),
+            encoding_format: "float",
+        };
+
+        let response: OpenAiEmbeddingResponse = self
+            .endpoint
+            .post_json(EMBEDDINGS_PATH, &body, "embedding", "embedding")
+            .await?;
+
+        if response.data.len() != batch.len() {
+            return Err(ProviderError::malformed(
+                "embedding",
+                format!(
+                    "expected {} embeddings, got {}",
+                    batch.len(),
+                    response.data.len()
+                ),
+            ));
+        }
+
+        response
+            .data
+            .into_iter()
+            .map(|item| {
                 let mut embedding = item.embedding;
                 if self.dimension > 0 && embedding.len() != self.dimension {
                     return Err(ProviderError::malformed(
@@ -187,11 +230,71 @@ impl OpenAiCompatibleEmbeddingModel {
                 if self.normalize {
                     normalize_vector(&mut embedding);
                 }
-                all_embeddings.push(embedding);
+                Ok(embedding)
+            })
+            .collect()
+    }
+
+    async fn load_endpoint_capability(&self, force_refresh: bool) -> EndpointCapabilityLookup {
+        let key = self.capability_cache_key();
+        if !force_refresh {
+            if let Some(cached) =
+                endpoint_capability_cache().get_fresh(&key, self.capability_cache_ttl)
+            {
+                return cached;
             }
         }
 
-        Ok(all_embeddings)
+        let refreshed = self.refresh_endpoint_capability().await;
+        endpoint_capability_cache().insert(key, refreshed.clone());
+        refreshed
+    }
+
+    fn cached_endpoint_capability(&self) -> EndpointCapabilityLookup {
+        let key = self.capability_cache_key();
+        endpoint_capability_cache()
+            .get_fresh(&key, self.capability_cache_ttl)
+            .unwrap_or_else(|| EndpointCapabilityLookup::unavailable("capability_not_loaded"))
+    }
+
+    fn capability_cache_key(&self) -> EndpointCapabilityCacheKey {
+        EndpointCapabilityCacheKey::new(
+            &self.endpoint.base_url,
+            EndpointCapabilityRole::Embedding,
+            &self.provider_kind,
+            &self.endpoint.model,
+        )
+    }
+
+    async fn refresh_endpoint_capability(&self) -> EndpointCapabilityLookup {
+        let paths = model_discovery_paths(&self.endpoint.base_url);
+        let response = self
+            .endpoint
+            .get_json_paths::<serde_json::Value>(
+                &paths,
+                "embedding capability discovery",
+                "embedding",
+            )
+            .await;
+        match response {
+            Ok(value) => match parse_endpoint_capability(&value, &self.endpoint.model) {
+                Some(capability) => EndpointCapabilityLookup::refreshed(capability),
+                None => EndpointCapabilityLookup::unavailable("capability_absent"),
+            },
+            Err(error) if is_discovery_unsupported(&error) => {
+                EndpointCapabilityLookup::unavailable("discovery_unsupported")
+            }
+            Err(error) => {
+                EndpointCapabilityLookup::refresh_failed(capability_failure_reason(&error))
+            }
+        }
+    }
+
+    fn embedding_batch_size(&self, capability: Option<&EndpointCapability>) -> usize {
+        capability
+            .and_then(|capability| capability.request_limits.embedding_batch_size())
+            .map_or(self.batch_size, |limit| self.batch_size.min(limit.max(1)))
+            .max(1)
     }
 
     fn prepare_for_purpose(&self, text: &str, purpose: EmbeddingPurpose) -> String {
@@ -235,7 +338,7 @@ impl OpenAiCompatibleReranker {
     ) -> Result<ProviderRerankOutcome, ProviderRerankFailure> {
         let mut diagnostics = RerankDiagnostics::default();
         let capability = self.load_rerank_capability(false).await;
-        diagnostics.capability = Some(capability.diagnostics.clone());
+        diagnostics.capability = Some(rerank_capability_diagnostics(&capability));
 
         let first_shape = RerankRequestShape::new(
             &docs,
@@ -248,9 +351,9 @@ impl OpenAiCompatibleReranker {
 
         match self.post_rerank(query, &docs, &first_shape).await {
             Ok(hits) => Ok(ProviderRerankOutcome { hits, diagnostics }),
-            Err(error) if is_context_limit_rerank_error(&error) => {
+            Err(error) if is_context_or_payload_limit_error(&error) => {
                 let refresh = self.load_rerank_capability(true).await;
-                diagnostics.capability = Some(refresh.diagnostics.clone());
+                diagnostics.capability = Some(rerank_capability_diagnostics(&refresh));
 
                 let Some(refreshed_capability) = refresh.value else {
                     return Err(ProviderRerankFailure { error, diagnostics });
@@ -310,41 +413,42 @@ impl OpenAiCompatibleReranker {
         Ok(results)
     }
 
-    async fn load_rerank_capability(&self, force_refresh: bool) -> RerankCapabilityLookup {
-        let key = RerankCapabilityCacheKey::new(
+    async fn load_rerank_capability(&self, force_refresh: bool) -> EndpointCapabilityLookup {
+        let key = EndpointCapabilityCacheKey::new(
             &self.endpoint.base_url,
-            self.provider,
+            EndpointCapabilityRole::Rerank,
+            self.provider.capability_provider_kind(),
             &self.endpoint.model,
         );
         if !force_refresh {
             if let Some(cached) =
-                rerank_capability_cache().get_fresh(&key, self.capability_cache_ttl)
+                endpoint_capability_cache().get_fresh(&key, self.capability_cache_ttl)
             {
                 return cached;
             }
         }
 
         let refreshed = self.refresh_rerank_capability().await;
-        rerank_capability_cache().insert(key, refreshed.clone());
+        endpoint_capability_cache().insert(key, refreshed.clone());
         refreshed
     }
 
-    async fn refresh_rerank_capability(&self) -> RerankCapabilityLookup {
+    async fn refresh_rerank_capability(&self) -> EndpointCapabilityLookup {
         let paths = model_discovery_paths(&self.endpoint.base_url);
         let response = self
             .endpoint
             .get_json_paths::<serde_json::Value>(&paths, "rerank capability discovery", "rerank")
             .await;
         match response {
-            Ok(value) => match parse_rerank_capability(&value, &self.endpoint.model) {
-                Some(capability) => RerankCapabilityLookup::refreshed(capability),
-                None => RerankCapabilityLookup::unavailable("capability_absent"),
+            Ok(value) => match parse_endpoint_capability(&value, &self.endpoint.model) {
+                Some(capability) => EndpointCapabilityLookup::refreshed(capability),
+                None => EndpointCapabilityLookup::unavailable("capability_absent"),
             },
             Err(error) if is_discovery_unsupported(&error) => {
-                RerankCapabilityLookup::unavailable("discovery_unsupported")
+                EndpointCapabilityLookup::unavailable("discovery_unsupported")
             }
             Err(error) => {
-                RerankCapabilityLookup::refresh_failed(rerank_capability_failure_reason(&error))
+                EndpointCapabilityLookup::refresh_failed(capability_failure_reason(&error))
             }
         }
     }
@@ -514,6 +618,15 @@ impl RerankProviderKind {
             }
         }
     }
+
+    fn capability_provider_kind(self) -> &'static str {
+        match self {
+            Self::Vllm => "vllm",
+            Self::Cohere => "cohere",
+            Self::Jina => "jina",
+            Self::OpenAiCompatible => "openai_compatible",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -528,133 +641,25 @@ struct ProviderRerankFailure {
     diagnostics: RerankDiagnostics,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RerankEndpointCapability {
-    max_context_tokens: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RerankCapabilityLookup {
-    value: Option<RerankEndpointCapability>,
-    diagnostics: RerankCapabilityDiagnostics,
-}
-
-impl RerankCapabilityLookup {
-    fn cached(value: Option<RerankEndpointCapability>, reason: Option<String>) -> Self {
-        let max_context_tokens = value
-            .as_ref()
-            .map(|capability| capability.max_context_tokens);
-        let state = if value.is_some() {
-            RerankCapabilityState::Cached
-        } else {
-            RerankCapabilityState::Unavailable
-        };
-        Self {
-            value,
-            diagnostics: RerankCapabilityDiagnostics {
-                state,
-                max_context_tokens,
-                reason,
-            },
-        }
-    }
-
-    fn refreshed(value: RerankEndpointCapability) -> Self {
-        Self {
-            diagnostics: RerankCapabilityDiagnostics {
-                state: RerankCapabilityState::Refreshed,
-                max_context_tokens: Some(value.max_context_tokens),
-                reason: None,
-            },
-            value: Some(value),
-        }
-    }
-
-    fn unavailable(reason: impl Into<String>) -> Self {
-        Self {
-            value: None,
-            diagnostics: RerankCapabilityDiagnostics {
-                state: RerankCapabilityState::Unavailable,
-                max_context_tokens: None,
-                reason: Some(reason.into()),
-            },
-        }
-    }
-
-    fn refresh_failed(reason: impl Into<String>) -> Self {
-        Self {
-            value: None,
-            diagnostics: RerankCapabilityDiagnostics {
-                state: RerankCapabilityState::RefreshFailed,
-                max_context_tokens: None,
-                reason: Some(reason.into()),
-            },
-        }
+fn rerank_capability_diagnostics(lookup: &EndpointCapabilityLookup) -> RerankCapabilityDiagnostics {
+    RerankCapabilityDiagnostics {
+        state: rerank_capability_state(lookup.diagnostics.state),
+        max_context_tokens: lookup.diagnostics.max_context_tokens,
+        max_candidates: lookup.diagnostics.max_candidates,
+        max_documents: lookup.diagnostics.max_documents,
+        max_document_chars: lookup.diagnostics.max_document_chars,
+        max_payload_chars: lookup.diagnostics.max_payload_chars,
+        reason: lookup.diagnostics.reason.clone(),
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct RerankCapabilityCacheKey {
-    base_url: String,
-    provider: RerankProviderKind,
-    model: String,
-}
-
-impl RerankCapabilityCacheKey {
-    fn new(base_url: &str, provider: RerankProviderKind, model: &str) -> Self {
-        Self {
-            base_url: normalized_endpoint_key(base_url),
-            provider,
-            model: model.to_string(),
-        }
+fn rerank_capability_state(state: EndpointCapabilityState) -> RerankCapabilityState {
+    match state {
+        EndpointCapabilityState::Cached => RerankCapabilityState::Cached,
+        EndpointCapabilityState::Refreshed => RerankCapabilityState::Refreshed,
+        EndpointCapabilityState::Unavailable => RerankCapabilityState::Unavailable,
+        EndpointCapabilityState::RefreshFailed => RerankCapabilityState::RefreshFailed,
     }
-}
-
-#[derive(Clone, Debug)]
-struct RerankCapabilityCacheEntry {
-    lookup: RerankCapabilityLookup,
-    refreshed_at: std::time::Instant,
-}
-
-#[derive(Debug)]
-struct RerankCapabilityCache {
-    entries: Mutex<HashMap<RerankCapabilityCacheKey, RerankCapabilityCacheEntry>>,
-}
-
-impl RerankCapabilityCache {
-    fn get_fresh(
-        &self,
-        key: &RerankCapabilityCacheKey,
-        ttl: Duration,
-    ) -> Option<RerankCapabilityLookup> {
-        let entries = lock_unpoisoned(&self.entries);
-        let entry = entries.get(key)?;
-        if entry.refreshed_at.elapsed() > ttl {
-            return None;
-        }
-        Some(RerankCapabilityLookup::cached(
-            entry.lookup.value.clone(),
-            entry.lookup.diagnostics.reason.clone(),
-        ))
-    }
-
-    fn insert(&self, key: RerankCapabilityCacheKey, lookup: RerankCapabilityLookup) {
-        let mut entries = lock_unpoisoned(&self.entries);
-        entries.insert(
-            key,
-            RerankCapabilityCacheEntry {
-                lookup,
-                refreshed_at: std::time::Instant::now(),
-            },
-        );
-    }
-}
-
-fn rerank_capability_cache() -> &'static RerankCapabilityCache {
-    static CACHE: OnceLock<RerankCapabilityCache> = OnceLock::new();
-    CACHE.get_or_init(|| RerankCapabilityCache {
-        entries: Mutex::new(HashMap::new()),
-    })
 }
 
 #[derive(Debug)]
@@ -669,7 +674,7 @@ impl RerankRequestShape {
         docs: &[RerankDoc],
         requested_top_n: usize,
         default_top_n: usize,
-        capability: Option<&RerankEndpointCapability>,
+        capability: Option<&EndpointCapability>,
         force_smaller: bool,
     ) -> Self {
         let base_candidate_count = docs.len();
@@ -715,14 +720,44 @@ impl RerankRequestShape {
 }
 
 fn capability_request_limits(
-    capability: &RerankEndpointCapability,
+    capability: &EndpointCapability,
     docs_len: usize,
     force_smaller: bool,
 ) -> (usize, usize) {
     if docs_len == 0 {
         return (0, RERANK_MAX_DOCUMENT_CHARS);
     }
+    let explicit_candidate_count = capability.request_limits.rerank_candidate_count();
+    let explicit_document_char_limit = capability.request_limits.max_document_chars;
 
+    let (mut candidate_count, mut document_char_limit) =
+        if let Some(max_context_tokens) = capability.max_context_tokens {
+            context_budget_request_limits(max_context_tokens, docs_len, force_smaller)
+        } else {
+            (docs_len, RERANK_MAX_DOCUMENT_CHARS)
+        };
+
+    if let Some(limit) = explicit_candidate_count {
+        candidate_count = candidate_count.min(limit.max(1));
+    }
+    candidate_count = candidate_count.min(docs_len).max(1);
+
+    if let Some(limit) = explicit_document_char_limit {
+        document_char_limit = document_char_limit.min(limit.max(1));
+    }
+    document_char_limit = document_char_limit.clamp(1, RERANK_MAX_DOCUMENT_CHARS);
+    if force_smaller {
+        document_char_limit = document_char_limit.min(RERANK_RETRY_MAX_DOCUMENT_CHARS);
+    }
+
+    (candidate_count, document_char_limit)
+}
+
+fn context_budget_request_limits(
+    max_context_tokens: usize,
+    docs_len: usize,
+    force_smaller: bool,
+) -> (usize, usize) {
     let (numerator, denominator) = if force_smaller {
         (
             RERANK_RETRY_CONTEXT_BUDGET_NUMERATOR,
@@ -734,8 +769,7 @@ fn capability_request_limits(
             RERANK_DOCUMENT_CONTEXT_BUDGET_DENOMINATOR,
         )
     };
-    let token_budget = capability
-        .max_context_tokens
+    let token_budget = max_context_tokens
         .saturating_mul(numerator)
         .checked_div(denominator)
         .unwrap_or(0)
@@ -768,184 +802,6 @@ fn bounded_doc_text(text: &str, max_chars: usize) -> &str {
         .map(|(idx, _)| idx)
         .unwrap_or(text.len());
     &text[..end]
-}
-
-fn model_discovery_paths(base_url: &str) -> Vec<&'static str> {
-    let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/v1") || trimmed.ends_with("/v2") {
-        vec![MODELS_PATH]
-    } else {
-        vec![MODELS_V1_PATH, MODELS_PATH]
-    }
-}
-
-fn parse_rerank_capability(
-    value: &serde_json::Value,
-    model: &str,
-) -> Option<RerankEndpointCapability> {
-    let search_root = capability_search_root(value, model)?;
-    let max_context_tokens = find_context_limit(search_root)?;
-    Some(RerankEndpointCapability { max_context_tokens })
-}
-
-fn capability_search_root<'a>(
-    value: &'a serde_json::Value,
-    model: &str,
-) -> Option<&'a serde_json::Value> {
-    if let Some(data) = value.get("data").and_then(serde_json::Value::as_array) {
-        if let Some(matched) = data
-            .iter()
-            .find(|candidate| model_entry_matches(candidate, model))
-        {
-            return Some(matched);
-        }
-        if data.len() == 1 {
-            return data.first();
-        }
-        return None;
-    }
-    Some(value)
-}
-
-fn model_entry_matches(value: &serde_json::Value, model: &str) -> bool {
-    ["id", "model", "name"]
-        .iter()
-        .filter_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
-        .any(|candidate| candidate == model)
-}
-
-fn find_context_limit(value: &serde_json::Value) -> Option<usize> {
-    let mut limits = Vec::new();
-    collect_context_limits(value, &mut limits);
-    limits.into_iter().filter(|limit| *limit > 0).min()
-}
-
-fn collect_context_limits(value: &serde_json::Value, limits: &mut Vec<usize>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, value) in map {
-                if is_context_limit_field(key) {
-                    if let Some(limit) = value_as_positive_usize(value) {
-                        limits.push(limit);
-                    }
-                }
-                collect_context_limits(value, limits);
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_context_limits(value, limits);
-            }
-        }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
-    }
-}
-
-fn is_context_limit_field(key: &str) -> bool {
-    matches!(
-        key.to_ascii_lowercase().as_str(),
-        "max_model_len"
-            | "max_context_length"
-            | "context_length"
-            | "max_sequence_length"
-            | "max_seq_len"
-            | "max_position_embeddings"
-            | "model_max_length"
-            | "n_ctx"
-    )
-}
-
-fn value_as_positive_usize(value: &serde_json::Value) -> Option<usize> {
-    if let Some(value) = value.as_u64() {
-        return usize::try_from(value).ok().filter(|value| *value > 0);
-    }
-    if let Some(value) = value.as_str() {
-        return value
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|value| *value > 0);
-    }
-    None
-}
-
-fn is_context_limit_rerank_error(error: &ProviderError) -> bool {
-    let ProviderError::HttpStatus {
-        status,
-        message,
-        diagnostic,
-        ..
-    } = error
-    else {
-        return false;
-    };
-    if !matches!(
-        *status,
-        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
-    ) {
-        return false;
-    }
-
-    let mut haystack = message.to_ascii_lowercase();
-    if let Some(reason) = status.canonical_reason() {
-        haystack.push(' ');
-        haystack.push_str(&reason.to_ascii_lowercase());
-    }
-    if let Some(prefix) = &diagnostic.response_body_prefix {
-        haystack.push(' ');
-        haystack.push_str(&prefix.to_ascii_lowercase());
-    }
-    is_context_limit_message(&haystack)
-}
-
-fn is_context_limit_message(message: &str) -> bool {
-    [
-        "context length",
-        "max model len",
-        "maximum context",
-        "token limit",
-        "prompt too long",
-        "input too long",
-        "payload too large",
-        "maximum sequence",
-        "max_model_len",
-    ]
-    .iter()
-    .any(|phrase| message.contains(phrase))
-}
-
-fn is_discovery_unsupported(error: &ProviderError) -> bool {
-    matches!(
-        error,
-        ProviderError::HttpStatus { status, .. }
-            if matches!(
-                *status,
-                StatusCode::NOT_FOUND
-                    | StatusCode::METHOD_NOT_ALLOWED
-                    | StatusCode::NOT_IMPLEMENTED
-            )
-    )
-}
-
-fn rerank_capability_failure_reason(error: &ProviderError) -> String {
-    match error {
-        ProviderError::Configuration { .. } => "invalid_configuration".to_string(),
-        ProviderError::Transport { source, .. } if source.is_timeout() => {
-            "discovery_timeout".to_string()
-        }
-        ProviderError::Transport { .. } => "discovery_request_failed".to_string(),
-        ProviderError::HttpStatus { status, .. } => {
-            format!("discovery_http_status_{}", status.as_u16())
-        }
-        ProviderError::ResponseDecode { .. } => "discovery_invalid_json".to_string(),
-        ProviderError::QueueTimeout { .. } => "discovery_queue_timeout".to_string(),
-        ProviderError::StreamDecode { .. } | ProviderError::MalformedResponse { .. } => {
-            "discovery_invalid_response".to_string()
-        }
-    }
 }
 
 #[async_trait]
@@ -1337,23 +1193,6 @@ impl Hash for EndpointKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
-}
-
-fn normalized_endpoint_key(base_url: &str) -> String {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    let Ok(mut url) = Url::parse(trimmed) else {
-        return trimmed.to_ascii_lowercase();
-    };
-    url.set_query(None);
-    url.set_fragment(None);
-    let scheme = url.scheme().to_ascii_lowercase();
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let port = url
-        .port()
-        .map(|port| format!(":{port}"))
-        .unwrap_or_default();
-    let path = url.path().trim_end_matches('/');
-    format!("{scheme}://{host}{port}{path}")
 }
 
 #[derive(Debug)]
@@ -2069,9 +1908,11 @@ mod tests {
     ) -> OpenAiCompatibleEmbeddingModel {
         OpenAiCompatibleEmbeddingModel {
             endpoint: OpenAiEndpoint::new_with_options(base_url, "embedding-model", "", 5, runtime),
+            provider_kind: "openai_compatible".into(),
             dimension: 3,
             normalize: false,
             batch_size: 16,
+            capability_cache_ttl: Duration::from_secs(60),
             query_instruction: String::new(),
             document_instruction: String::new(),
         }
@@ -2353,6 +2194,49 @@ mod tests {
         handle.join().expect("server thread joins");
     }
 
+    #[tokio::test]
+    async fn embedding_payload_limit_forces_capability_refresh_and_splits_batch() {
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "413 Payload Too Large",
+                "application/json",
+                r#"{"error":{"message":"payload too large for embedding batch"}}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"embedding-model","max_batch_size":1}]}"#,
+            ),
+            ("200 OK", "application/json", embedding_response_body()),
+            ("200 OK", "application/json", embedding_response_body()),
+        ]);
+        let runtime = test_runtime_config(1, 0, 1);
+        let model = embedding_model_with_runtime(&base_url, &runtime);
+
+        let embeddings = model
+            .embed_prepared(vec!["first".into(), "second".into()])
+            .await
+            .expect("payload-limit refresh splits embedding batch");
+
+        assert_eq!(embeddings, vec![vec![1.0, 0.0, 0.0], vec![1.0, 0.0, 0.0]]);
+        let requests = collect_recorded_requests(request_rx, 4).await;
+        handle.join().expect("server thread joins");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/embeddings", "/v1/models", "/embeddings", "/embeddings"]
+        );
+        let first_body: serde_json::Value =
+            serde_json::from_str(&requests[0].body).expect("first embedding body");
+        let retry_body: serde_json::Value =
+            serde_json::from_str(&requests[2].body).expect("retry embedding body");
+        assert_eq!(first_body["input"].as_array().unwrap().len(), 2);
+        assert_eq!(retry_body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(retry_body["input"][0], "first");
+    }
+
     #[test]
     fn serializes_text_chat_request_shape() {
         let model = OpenAiCompatibleChatModel {
@@ -2415,9 +2299,11 @@ mod tests {
     fn embedding_purpose_applies_query_instruction() {
         let model = OpenAiCompatibleEmbeddingModel {
             endpoint: OpenAiEndpoint::new("http://127.0.0.1:8002/v1", "model", "", 120),
+            provider_kind: "openai_compatible".into(),
             dimension: 3,
             normalize: false,
             batch_size: 16,
+            capability_cache_ttl: Duration::from_secs(60),
             query_instruction: "Find evidence.".into(),
             document_instruction: String::new(),
         };
@@ -2477,42 +2363,6 @@ mod tests {
                 index: 3,
                 score: 0.6
             }]
-        );
-    }
-
-    #[test]
-    fn parses_rerank_capability_from_common_model_metadata_shapes() {
-        let response: serde_json::Value = serde_json::from_str(
-            r#"{
-                "data": [
-                    {
-                        "id": "rerank-model",
-                        "max_model_len": 8192,
-                        "model_extra": {
-                            "max_context_length": "4096",
-                            "tokenizer_config": {"model_max_length": 16384}
-                        }
-                    }
-                ]
-            }"#,
-        )
-        .expect("models json parses");
-
-        let capability =
-            parse_rerank_capability(&response, "rerank-model").expect("capability parsed");
-
-        assert_eq!(capability.max_context_tokens, 4096);
-    }
-
-    #[test]
-    fn model_discovery_paths_support_v1_and_bare_host_base_urls() {
-        assert_eq!(
-            model_discovery_paths("http://127.0.0.1:8003/v1"),
-            vec!["models"]
-        );
-        assert_eq!(
-            model_discovery_paths("http://127.0.0.1:8003"),
-            vec!["v1/models", "models"]
         );
     }
 
@@ -2633,37 +2483,70 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rerank_capability_cache_respects_ttl() {
-        let cache = RerankCapabilityCache {
-            entries: Mutex::new(HashMap::new()),
+    #[tokio::test]
+    async fn reranker_uses_explicit_request_shaping_hints() {
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"hint-model","max_candidates":2,"max_document_chars":5}]}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"results":[{"index":0,"relevance_score":0.99}]}"#,
+            ),
+        ]);
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "hint-model".into(),
+            top_n: 4,
+            timeout_seconds: 5,
+            api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
         };
-        let key = RerankCapabilityCacheKey::new(
-            "HTTP://LOCALHOST:8003/v1?token=fixture-secret",
-            RerankProviderKind::Vllm,
-            "cache-model",
-        );
-        cache.insert(
-            key.clone(),
-            RerankCapabilityLookup::refreshed(RerankEndpointCapability {
-                max_context_tokens: 4096,
-            }),
-        );
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+        let docs = vec![
+            "alpha-long".to_string(),
+            "bravo-long".to_string(),
+            "charlie-long".to_string(),
+            "delta-long".to_string(),
+        ];
 
-        let fresh = cache
-            .get_fresh(&key, Duration::from_secs(60))
-            .expect("fresh cache entry is returned");
-        assert_eq!(fresh.diagnostics.state, RerankCapabilityState::Cached);
-        assert_eq!(fresh.diagnostics.max_context_tokens, Some(4096));
+        let response =
+            <OpenAiCompatibleReranker as crate::traits::Reranker>::rerank_with_diagnostics(
+                &reranker, "query", &docs, 4,
+            )
+            .await
+            .expect("rerank succeeds with explicit shaping hints");
 
-        {
-            let mut entries = lock_unpoisoned(&cache.entries);
-            entries
-                .get_mut(&key)
-                .expect("cache entry exists")
-                .refreshed_at = std::time::Instant::now() - Duration::from_secs(120);
-        }
-        assert!(cache.get_fresh(&key, Duration::from_secs(60)).is_none());
+        assert_eq!(response.hits, vec![(0, 0.99)]);
+        let capability = response
+            .diagnostics
+            .capability
+            .as_ref()
+            .expect("capability diagnostics");
+        assert_eq!(capability.max_candidates, Some(2));
+        assert_eq!(capability.max_document_chars, Some(5));
+        let request = response
+            .diagnostics
+            .request
+            .as_ref()
+            .expect("request diagnostics");
+        assert_eq!(request.candidate_count, 2);
+        assert_eq!(request.document_char_limit, 5);
+        assert_eq!(request.top_n, 2);
+
+        let requests = collect_recorded_requests(request_rx, 2).await;
+        handle.join().expect("server thread joins");
+        let body: serde_json::Value = serde_json::from_str(&requests[1].body).expect("rerank body");
+        assert_eq!(body["documents"].as_array().unwrap().len(), 2);
+        assert_eq!(body["documents"][0], "alpha");
+        assert_eq!(body["documents"][1], "bravo");
+        assert_eq!(body["top_n"], 2);
     }
 
     #[tokio::test]
@@ -2713,7 +2596,7 @@ mod tests {
 
         assert_eq!(
             refreshed.diagnostics.state,
-            RerankCapabilityState::Refreshed
+            EndpointCapabilityState::Refreshed
         );
         assert_eq!(refreshed.diagnostics.max_context_tokens, Some(2048));
         let first = recv_recorded_request(Arc::clone(&request_rx), Duration::from_secs(1))
@@ -2880,6 +2763,73 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .max_context_tokens,
+            Some(512)
+        );
+        let requests = collect_recorded_requests(request_rx, 4).await;
+        handle.join().expect("server thread joins");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/v1/models", "/v1/rerank", "/v1/models", "/v1/rerank"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_context_limit_retry_is_exhausted_after_one_retry() {
+        let (base_url, request_rx, handle) = spawn_response_sequence_server(vec![
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"exhaust-model","max_model_len":8192}]}"#,
+            ),
+            (
+                "422 Unprocessable Entity",
+                "application/json",
+                r#"{"error":{"message":"input too long for context window"}}"#,
+            ),
+            (
+                "200 OK",
+                "application/json",
+                r#"{"data":[{"id":"exhaust-model","max_model_len":512}]}"#,
+            ),
+            (
+                "422 Unprocessable Entity",
+                "application/json",
+                r#"{"error":{"message":"input too long for context window"}}"#,
+            ),
+        ]);
+        let config = RerankConfig {
+            enabled: true,
+            provider: "vllm".into(),
+            base_url,
+            model: "exhaust-model".into(),
+            top_n: 2,
+            timeout_seconds: 5,
+            api_key: String::new(),
+            capability_cache_ttl_seconds: 60,
+            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+        };
+        let reranker = OpenAiCompatibleReranker::from_config(&config);
+        let docs = vec!["doc".repeat(2_000); 2];
+
+        let error = <OpenAiCompatibleReranker as crate::traits::Reranker>::rerank_with_diagnostics(
+            &reranker, "query", &docs, 2,
+        )
+        .await
+        .expect_err("retry context-limit failure is returned");
+        let rerank_error = error
+            .downcast_ref::<RerankError>()
+            .expect("error carries rerank diagnostics");
+
+        assert!(rerank_error.diagnostics().retried_after_context_limit);
+        assert_eq!(
+            rerank_error
+                .diagnostics()
+                .capability
+                .as_ref()
+                .and_then(|capability| capability.max_context_tokens),
             Some(512)
         );
         let requests = collect_recorded_requests(request_rx, 4).await;
@@ -3185,9 +3135,11 @@ mod tests {
         let (base_url, handle) = spawn_json_server("200 OK", "not-json");
         let model = OpenAiCompatibleEmbeddingModel {
             endpoint: OpenAiEndpoint::new(&base_url, "embedding-model", "", 5),
+            provider_kind: "openai_compatible".into(),
             dimension: 3,
             normalize: false,
             batch_size: 16,
+            capability_cache_ttl: Duration::from_secs(60),
             query_instruction: String::new(),
             document_instruction: String::new(),
         };

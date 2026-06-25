@@ -137,6 +137,10 @@ pub struct RerankDiagnostics {
 pub struct RerankCapabilityDiagnostics {
     pub state: RerankCapabilityState,
     pub max_context_tokens: Option<usize>,
+    pub max_candidates: Option<usize>,
+    pub max_documents: Option<usize>,
+    pub max_document_chars: Option<usize>,
+    pub max_payload_chars: Option<usize>,
     pub reason: Option<String>,
 }
 

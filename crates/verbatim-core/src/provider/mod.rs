@@ -13,6 +13,8 @@ use crate::upstream::UpstreamFailureDiagnostic;
 
 pub mod openai_compatible;
 
+mod endpoint_capability;
+
 /// Result type used by model providers.
 pub type ProviderResult<T> = std::result::Result<T, ProviderError>;
 

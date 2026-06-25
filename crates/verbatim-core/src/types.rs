@@ -991,6 +991,14 @@ pub struct RetrievalRerankCapabilityDebug {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_candidates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_documents: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_document_chars: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_payload_chars: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub retried_after_context_limit: bool,
@@ -1236,6 +1244,10 @@ mod tests {
         debug.capability = Some(RetrievalRerankCapabilityDebug {
             state: RetrievalRerankCapabilityState::Refreshed,
             max_context_tokens: Some(512),
+            max_candidates: Some(2),
+            max_documents: Some(2),
+            max_document_chars: Some(1024),
+            max_payload_chars: Some(4096),
             reason: Some("capability_absent".into()),
             retried_after_context_limit: true,
         });
@@ -1248,6 +1260,7 @@ mod tests {
         let encoded = serde_json::to_string(&debug).unwrap();
 
         assert!(encoded.contains("refreshed"));
+        assert!(encoded.contains("max_document_chars"));
         assert!(encoded.contains("document_char_limit"));
         assert!(!encoded.contains("Authorization"));
         assert!(!encoded.contains("Bearer"));

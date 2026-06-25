@@ -532,8 +532,12 @@ impl<'a> RetrievalPipeline<'a> {
                     candidates.len(),
                     response.diagnostics.request.as_ref(),
                 );
-                let (reranked, scores) =
-                    validated_rerank_hits(&candidates, response.hits, actual_top_n);
+                let (reranked, scores) = validated_rerank_hits(
+                    &candidates,
+                    response.hits,
+                    actual_top_n,
+                    actual_candidate_count,
+                );
                 if reranked.is_empty() {
                     return Ok(RerankOutcome {
                         fused,
@@ -1291,12 +1295,14 @@ fn validated_rerank_hits(
     candidates: &[RerankCandidate],
     hits: Vec<(usize, f32)>,
     top_n: usize,
+    submitted_candidate_count: usize,
 ) -> (Vec<(ChunkId, f32)>, Vec<RetrievalRerankScore>) {
     let mut seen_indices = HashSet::new();
+    let submitted_candidate_count = submitted_candidate_count.min(candidates.len());
     let mut valid_hits = hits
         .into_iter()
         .filter(|(index, score)| {
-            *index < candidates.len() && score.is_finite() && seen_indices.insert(*index)
+            *index < submitted_candidate_count && score.is_finite() && seen_indices.insert(*index)
         })
         .collect::<Vec<_>>();
 
@@ -1350,6 +1356,10 @@ fn with_rerank_diagnostics(
             .map(|capability| RetrievalRerankCapabilityDebug {
                 state: retrieval_rerank_capability_state(capability.state),
                 max_context_tokens: capability.max_context_tokens,
+                max_candidates: capability.max_candidates,
+                max_documents: capability.max_documents,
+                max_document_chars: capability.max_document_chars,
+                max_payload_chars: capability.max_payload_chars,
                 reason: capability.reason.as_deref().map(bounded_rerank_debug_text),
                 retried_after_context_limit: diagnostics.retried_after_context_limit,
             });
@@ -1548,6 +1558,7 @@ fn push_unique_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::RerankResponse;
     use async_trait::async_trait;
     #[cfg(feature = "qdrant")]
     use std::io::{Read, Write};
@@ -1756,6 +1767,10 @@ mod tests {
 
     enum MockRerankResponse {
         Hits(Vec<(usize, f32)>),
+        HitsWithRequest {
+            hits: Vec<(usize, f32)>,
+            request: RerankRequestDiagnostics,
+        },
         Error(&'static str),
     }
 
@@ -1770,6 +1785,15 @@ mod tests {
         fn hits(hits: Vec<(usize, f32)>) -> Self {
             Self {
                 response: MockRerankResponse::Hits(hits),
+                calls: AtomicUsize::new(0),
+                docs: Mutex::new(Vec::new()),
+                top_ns: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn hits_with_request(hits: Vec<(usize, f32)>, request: RerankRequestDiagnostics) -> Self {
+            Self {
+                response: MockRerankResponse::HitsWithRequest { hits, request },
                 calls: AtomicUsize::new(0),
                 docs: Mutex::new(Vec::new()),
                 top_ns: Mutex::new(Vec::new()),
@@ -1796,6 +1820,12 @@ mod tests {
         fn recorded_top_ns(&self) -> Vec<usize> {
             self.top_ns.lock().unwrap().clone()
         }
+
+        fn record_call(&self, docs: &[String], top_n: usize) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.docs.lock().unwrap().push(docs.to_vec());
+            self.top_ns.lock().unwrap().push(top_n);
+        }
     }
 
     #[async_trait]
@@ -1806,11 +1836,33 @@ mod tests {
             docs: &[String],
             top_n: usize,
         ) -> Result<Vec<(usize, f32)>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.docs.lock().unwrap().push(docs.to_vec());
-            self.top_ns.lock().unwrap().push(top_n);
+            self.record_call(docs, top_n);
             match &self.response {
                 MockRerankResponse::Hits(hits) => Ok(hits.clone()),
+                MockRerankResponse::HitsWithRequest { hits, .. } => Ok(hits.clone()),
+                MockRerankResponse::Error(message) => Err(anyhow!(*message)),
+            }
+        }
+
+        async fn rerank_with_diagnostics(
+            &self,
+            _query: &str,
+            docs: &[String],
+            top_n: usize,
+        ) -> Result<RerankResponse> {
+            self.record_call(docs, top_n);
+            match &self.response {
+                MockRerankResponse::Hits(hits) => Ok(RerankResponse {
+                    hits: hits.clone(),
+                    diagnostics: RerankDiagnostics::default(),
+                }),
+                MockRerankResponse::HitsWithRequest { hits, request } => Ok(RerankResponse {
+                    hits: hits.clone(),
+                    diagnostics: RerankDiagnostics {
+                        request: Some(request.clone()),
+                        ..RerankDiagnostics::default()
+                    },
+                }),
                 MockRerankResponse::Error(message) => Err(anyhow!(*message)),
             }
         }
@@ -2798,6 +2850,61 @@ mod tests {
         assert_eq!(chunk_ids(&results), vec!["chunk-first", "chunk-second"]);
         assert_eq!(debug.reranker.status, RetrievalRerankStatus::Succeeded);
         assert_eq!(debug.reranker.scores.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rerank_ignores_indices_outside_submitted_candidate_count() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-rerank-shaped");
+        store.add_source(&source).unwrap();
+        let first = insert_text_chunk(&store, &source, "chunk-first", "alpha first");
+        let second = insert_text_chunk(&store, &source, "chunk-second", "alpha second");
+        let third = insert_text_chunk(&store, &source, "chunk-third", "alpha third");
+        let vector_index = StaticVectorIndex::new(vec![
+            (first.id.clone(), 0.9),
+            (second.id.clone(), 0.8),
+            (third.id.clone(), 0.7),
+        ]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = KeywordEmbeddingClient;
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 3,
+            bm25_top_k: 0,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            top_n: 3,
+            ..Default::default()
+        };
+        let reranker = RecordingReranker::hits_with_request(
+            vec![(2, 0.99), (0, 0.8)],
+            RerankRequestDiagnostics {
+                candidate_count: 1,
+                document_char_limit: 512,
+                top_n: 1,
+            },
+        );
+
+        let (results, debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &reranker)
+        .search_filtered_with_debug("alpha", None)
+        .await
+        .unwrap();
+
+        assert_eq!(chunk_ids(&results), vec!["chunk-first"]);
+        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Succeeded);
+        assert_eq!(debug.reranker.candidate_count, Some(1));
+        assert_eq!(debug.reranker.scores.len(), 1);
+        assert_eq!(debug.reranker.scores[0].chunk_id, first.id);
+        assert_ne!(debug.reranker.scores[0].chunk_id, third.id);
     }
 
     #[tokio::test]
