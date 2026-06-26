@@ -15,11 +15,11 @@ use crate::traits::{
 use crate::types::{
     Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
     EvidenceUnit, GraphExpansionStep, GraphNodeId, GraphNodeKind, GraphTraversalDirection, ImageId,
-    RetrievalDebug, RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalFusedHit,
-    RetrievalGraphExpansionDebug, RetrievalLocatorDebug, RetrievalProvenance,
+    RetrievalDebug, RetrievalDenseVectorPath, RetrievalEvidencePackEntry, RetrievalEvidenceRole,
+    RetrievalFusedHit, RetrievalGraphExpansionDebug, RetrievalLocatorDebug, RetrievalProvenance,
     RetrievalRerankCapabilityDebug, RetrievalRerankCapabilityState, RetrievalRerankDebug,
     RetrievalRerankRequestDebug, RetrievalRerankScore, RetrievalResult, RetrievalStageHit,
-    SourceId, SourceLocator,
+    SourceId, SourceLocator, VectorIndexResidency,
 };
 
 const GRAPH_EXPANSION_SCORE_DECAY: f32 = 0.5;
@@ -41,6 +41,7 @@ pub struct RetrievalPipeline<'a> {
     rerank_config: Option<&'a RerankConfig>,
     reranker: Option<&'a dyn Reranker>,
     required_profile_id: Option<EmbeddingProfileId>,
+    vector_residency: VectorIndexResidency,
     #[cfg(feature = "qdrant")]
     qdrant: Option<QdrantClient>,
 }
@@ -64,6 +65,7 @@ impl<'a> RetrievalPipeline<'a> {
             rerank_config: None,
             reranker: None,
             required_profile_id: None,
+            vector_residency: VectorIndexResidency::ResidentHnsw,
             #[cfg(feature = "qdrant")]
             qdrant: None,
         }
@@ -88,6 +90,7 @@ impl<'a> RetrievalPipeline<'a> {
             rerank_config: None,
             reranker: None,
             required_profile_id: None,
+            vector_residency: VectorIndexResidency::ResidentHnsw,
             #[cfg(feature = "qdrant")]
             qdrant: None,
         }
@@ -100,6 +103,11 @@ impl<'a> RetrievalPipeline<'a> {
 
     pub fn with_embedding_enabled(mut self, enabled: bool) -> Self {
         self.embedding_enabled = enabled;
+        self
+    }
+
+    pub fn with_vector_residency(mut self, residency: VectorIndexResidency) -> Self {
+        self.vector_residency = residency;
         self
     }
 
@@ -210,25 +218,27 @@ impl<'a> RetrievalPipeline<'a> {
             .map(|_| all_child_count.max(self.config.bm25_top_k))
             .unwrap_or(self.config.bm25_top_k);
 
-        let (dense_results, query_embedding_latency_ms) = if self.embedding_enabled {
-            let query_text = self.embed_client.prepare_query(query);
-            let embedding_started = Instant::now();
-            let query_vec = self
-                .embed_client
-                .embed(&[query_text])
-                .await?
-                .into_iter()
-                .next()
-                .unwrap_or_default();
-            let query_embedding_latency_ms = elapsed_ms(embedding_started);
-            (
-                self.dense_search(&query_vec, dense_top_k, source_filter)
-                    .await?,
-                Some(query_embedding_latency_ms),
-            )
-        } else {
-            (Vec::new(), None)
-        };
+        let (dense_results, query_embedding_latency_ms, dense_vector_path) =
+            if self.embedding_enabled {
+                let query_text = self.embed_client.prepare_query(query);
+                let embedding_started = Instant::now();
+                let query_vec = self
+                    .embed_client
+                    .embed(&[query_text])
+                    .await?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                let query_embedding_latency_ms = elapsed_ms(embedding_started);
+                (
+                    self.dense_search(&query_vec, dense_top_k, source_filter)
+                        .await?,
+                    Some(query_embedding_latency_ms),
+                    self.dense_vector_path(),
+                )
+            } else {
+                (Vec::new(), None, RetrievalDenseVectorPath::Bm25Only)
+            };
 
         let bm25_results = self.lexical_index.search(query, bm25_top_k)?;
 
@@ -280,6 +290,7 @@ impl<'a> RetrievalPipeline<'a> {
 
         let debug = if include_debug {
             Some(RetrievalDebug {
+                dense_vector_path,
                 query_embedding_latency_ms,
                 bm25_hits,
                 dense_hits,
@@ -332,7 +343,7 @@ impl<'a> RetrievalPipeline<'a> {
     ) -> Result<Vec<(ChunkId, f32)>> {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &self.qdrant {
-            let local_results = self.local_dense_search(query_vec, top_k, source_filter);
+            let local_results = self.local_dense_search(query_vec, top_k, source_filter)?;
             let default_profile_id;
             let profile_id = match &self.required_profile_id {
                 Some(profile_id) => profile_id,
@@ -352,13 +363,13 @@ impl<'a> RetrievalPipeline<'a> {
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
-                        "qdrant search failed; falling back to local HNSW"
+                        "qdrant search failed; falling back to local dense index"
                     );
                     self.valid_dense_hits(local_results, top_k, source_filter)
                 }
             };
         }
-        Ok(self.local_dense_search(query_vec, top_k, source_filter))
+        self.local_dense_search(query_vec, top_k, source_filter)
     }
 
     fn local_dense_search(
@@ -366,15 +377,39 @@ impl<'a> RetrievalPipeline<'a> {
         query_vec: &[f32],
         top_k: usize,
         source_filter: Option<&HashSet<SourceId>>,
-    ) -> Vec<(ChunkId, f32)> {
+    ) -> Result<Vec<(ChunkId, f32)>> {
+        if self.vector_residency == VectorIndexResidency::LowMemory {
+            let default_profile_id;
+            let profile_id = match &self.required_profile_id {
+                Some(profile_id) => profile_id,
+                None => {
+                    default_profile_id = EmbeddingProfileId::default_profile();
+                    &default_profile_id
+                }
+            };
+            return self.store.search_vector_documents_for_profile(
+                profile_id,
+                query_vec,
+                top_k,
+                source_filter,
+            );
+        }
         let fallback_top_k = if source_filter.is_some() {
             self.vector_index.len().max(top_k)
         } else {
             top_k
         };
         let index_source_filter = single_source_filter(source_filter);
-        self.vector_index
-            .search_filtered(query_vec, fallback_top_k, index_source_filter)
+        Ok(self
+            .vector_index
+            .search_filtered(query_vec, fallback_top_k, index_source_filter))
+    }
+
+    fn dense_vector_path(&self) -> RetrievalDenseVectorPath {
+        match self.vector_residency {
+            VectorIndexResidency::LowMemory => RetrievalDenseVectorPath::LowMemorySqliteScan,
+            VectorIndexResidency::ResidentHnsw => RetrievalDenseVectorPath::ResidentHnsw,
+        }
     }
 
     #[cfg(feature = "qdrant")]
@@ -1217,6 +1252,7 @@ fn empty_search_output(include_debug: bool) -> RetrievalSearchOutput {
     RetrievalSearchOutput {
         results: Vec::new(),
         debug: include_debug.then(|| RetrievalDebug {
+            dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
             query_embedding_latency_ms: None,
             bm25_hits: Vec::new(),
             dense_hits: Vec::new(),
@@ -1594,8 +1630,9 @@ mod tests {
     use crate::traits::{LexicalIndex, VectorDocument, VectorIndex};
     use crate::types::{
         BBox, EdgeType, EvidenceId, EvidenceKind, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
-        GraphNodeKind, GraphTraversalDirection, ImageArtifact, ImageId, RetrievalEvidenceRole,
-        RetrievalOrigin, RetrievalRerankStatus, Source, SourceLocator, SourceStatus,
+        GraphNodeKind, GraphTraversalDirection, ImageArtifact, ImageId, RetrievalDenseVectorPath,
+        RetrievalEvidenceRole, RetrievalOrigin, RetrievalRerankStatus, Source, SourceLocator,
+        SourceStatus, VectorIndexResidency,
     };
 
     #[test]
@@ -2414,9 +2451,108 @@ mod tests {
 
         assert_eq!(embed_client.call_count(), 0);
         assert_eq!(results[0].chunk_id, alpha.id);
+        assert_eq!(debug.dense_vector_path, RetrievalDenseVectorPath::Bm25Only);
         assert_eq!(debug.query_embedding_latency_ms, None);
         assert!(debug.dense_hits.is_empty());
         assert!(!debug.bm25_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn low_memory_dense_search_reads_stored_vectors_without_resident_hnsw() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-low-memory");
+        store.add_source(&source).unwrap();
+        let alpha = insert_text_chunk(&store, &source, "chunk-alpha", "alpha semantic evidence");
+        let beta = insert_text_chunk(&store, &source, "chunk-beta", "beta semantic evidence");
+        store
+            .replace_all_vector_documents(&[
+                VectorDocument {
+                    chunk_id: alpha.id.clone(),
+                    source_id: source.id.clone(),
+                    vector: keyword_vector(&alpha.text),
+                },
+                VectorDocument {
+                    chunk_id: beta.id.clone(),
+                    source_id: source.id.clone(),
+                    vector: keyword_vector(&beta.text),
+                },
+            ])
+            .unwrap();
+        let empty_hnsw = StaticVectorIndex::new(Vec::new());
+        let lexical_index = SqliteFtsIndex::new(&store);
+        lexical_index.rebuild_from_store(&store).unwrap();
+        let embed_client = KeywordEmbeddingClient;
+        let config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 1,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let pipeline =
+            RetrievalPipeline::new(&empty_hnsw, &lexical_index, &store, &embed_client, &config)
+                .with_vector_residency(VectorIndexResidency::LowMemory)
+                .require_embedding_profile(&EmbeddingProfileId::default_profile());
+
+        let (results, debug) = pipeline
+            .search_source_set_with_debug("alpha", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            debug.dense_vector_path,
+            RetrievalDenseVectorPath::LowMemorySqliteScan
+        );
+        assert_eq!(debug.dense_hits[0].chunk_id, alpha.id);
+        assert!(results.iter().any(|result| result.chunk_id == alpha.id));
+    }
+
+    #[tokio::test]
+    async fn resident_hnsw_dense_search_uses_resident_index() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-resident-hnsw");
+        store.add_source(&source).unwrap();
+        let alpha = insert_text_chunk(&store, &source, "chunk-alpha", "alpha semantic evidence");
+        let beta = insert_text_chunk(&store, &source, "chunk-beta", "beta semantic evidence");
+        store
+            .replace_all_vector_documents(&[
+                VectorDocument {
+                    chunk_id: alpha.id.clone(),
+                    source_id: source.id.clone(),
+                    vector: keyword_vector(&alpha.text),
+                },
+                VectorDocument {
+                    chunk_id: beta.id.clone(),
+                    source_id: source.id.clone(),
+                    vector: keyword_vector(&beta.text),
+                },
+            ])
+            .unwrap();
+        let mut hnsw = HnswIndex::new();
+        hnsw.rebuild_from_store(&store).unwrap();
+        let lexical_index = SqliteFtsIndex::new(&store);
+        lexical_index.rebuild_from_store(&store).unwrap();
+        let embed_client = KeywordEmbeddingClient;
+        let config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 1,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let pipeline =
+            RetrievalPipeline::new(&hnsw, &lexical_index, &store, &embed_client, &config)
+                .with_vector_residency(VectorIndexResidency::ResidentHnsw);
+
+        let (results, debug) = pipeline
+            .search_source_set_with_debug("alpha", None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            debug.dense_vector_path,
+            RetrievalDenseVectorPath::ResidentHnsw
+        );
+        assert_eq!(debug.dense_hits[0].chunk_id, alpha.id);
+        assert!(results.iter().any(|result| result.chunk_id == alpha.id));
     }
 
     #[tokio::test]

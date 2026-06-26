@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::image_limits::ImageArtifactLimits;
 use crate::index_gc::IndexGcConfig;
-use crate::types::{EdgeType, EmbeddingProfileId, OcrProfile};
+use crate::types::{EdgeType, EmbeddingProfileId, OcrProfile, VectorIndexResidency};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -19,6 +19,8 @@ pub struct Config {
     pub embedding: EmbeddingConfig,
     #[serde(default)]
     pub retrieval: RetrievalConfig,
+    #[serde(default)]
+    pub vector_index: VectorIndexConfig,
     #[serde(default)]
     pub graph: GraphConfig,
     #[serde(default)]
@@ -346,6 +348,20 @@ impl Default for RetrievalConfig {
             rrf_k: 60,
             default_limit: default_retrieval_limit(),
             default_page_size: default_retrieval_page_size(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorIndexConfig {
+    #[serde(default)]
+    pub residency: VectorIndexResidency,
+}
+
+impl Default for VectorIndexConfig {
+    fn default() -> Self {
+        Self {
+            residency: VectorIndexResidency::LowMemory,
         }
     }
 }
@@ -1340,6 +1356,8 @@ fn restart_required_reason(key: &str) -> &'static str {
         "OCR settings affect persisted OCR-derived text; reingest before treating the change as active"
     } else if key.starts_with("qdrant.") {
         "Qdrant settings affect external vector index integration; restart or reindex with the new target"
+    } else if key.starts_with("vector_index.") {
+        "vector index residency controls whether the daemon loads resident HNSW; restart verbatim-daemon to apply it"
     } else {
         "setting is not reload-safe in this version; restart verbatim-daemon to apply it"
     }
@@ -1431,6 +1449,11 @@ bm25_top_k = 50
 rrf_k = 60
 default_limit = 12
 default_page_size = 1
+
+[vector_index]
+# low_memory scans SQLite-stored vectors at query time and avoids resident HNSW.
+# resident_hnsw loads the published local HNSW index into daemon memory.
+residency = "low_memory"
 
 [graph]
 enabled = true
@@ -1612,6 +1635,10 @@ mod tests {
         assert_eq!(config.retrieval.dense_top_k, 80);
         assert_eq!(config.retrieval.default_limit, 12);
         assert_eq!(config.retrieval.default_page_size, 1);
+        assert_eq!(
+            config.vector_index.residency,
+            VectorIndexResidency::LowMemory
+        );
         assert!(config.graph.enabled);
         assert_eq!(config.graph.max_hops, 1);
         assert_eq!(config.graph.max_expanded_chunks, 30);
@@ -2133,6 +2160,7 @@ model_supports_vision = true
         candidate.daemon.bind = "127.0.0.1:9900".into();
         candidate.store.path = "/srv/verbatim".into();
         candidate.embedding.model = "other-embedding-model".into();
+        candidate.vector_index.residency = VectorIndexResidency::ResidentHnsw;
 
         let plan = current.reload_plan(&candidate).unwrap();
 
@@ -2142,14 +2170,29 @@ model_supports_vision = true
             .iter()
             .map(|change| change.key.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(keys, vec!["daemon.bind", "embedding.model", "store.path"]);
+        assert_eq!(
+            keys,
+            vec![
+                "daemon.bind",
+                "embedding.model",
+                "store.path",
+                "vector_index.residency"
+            ]
+        );
         assert!(plan.restart_required_keys[0].reason.contains("listener"));
         assert!(plan.restart_required_keys[1].reason.contains("vectors"));
         assert!(plan.restart_required_keys[2].reason.contains("SQLite"));
+        assert!(plan.restart_required_keys[3]
+            .reason
+            .contains("resident HNSW"));
 
         let applied = current.apply_reload_safe_changes(&candidate);
         assert_eq!(applied.daemon.bind, current.daemon.bind);
         assert_eq!(applied.store.path, current.store.path);
         assert_eq!(applied.embedding.model, current.embedding.model);
+        assert_eq!(
+            applied.vector_index.residency,
+            current.vector_index.residency
+        );
     }
 }

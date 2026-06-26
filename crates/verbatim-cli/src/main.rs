@@ -3485,6 +3485,7 @@ mod tests {
 
     fn sample_debug_json() -> Value {
         serde_json::json!({
+            "dense_vector_path": "resident_hnsw",
             "bm25_hits": [
                 {
                     "rank": 1,

@@ -840,6 +840,8 @@ impl Default for RetrievalProvenance {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalDebug {
+    #[serde(default)]
+    pub dense_vector_path: RetrievalDenseVectorPath,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_embedding_latency_ms: Option<u64>,
     pub bm25_hits: Vec<RetrievalStageHit>,
@@ -848,6 +850,30 @@ pub struct RetrievalDebug {
     pub graph_expanded_hits: Vec<RetrievalGraphExpansionDebug>,
     pub reranker: RetrievalRerankDebug,
     pub final_evidence_pack: Vec<RetrievalEvidencePackEntry>,
+}
+
+/// Local dense vector residency policy for the daemon.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorIndexResidency {
+    /// Keep vectors in SQLite and scan stored vectors at query time.
+    #[default]
+    LowMemory,
+    /// Load the published local HNSW index into daemon memory.
+    ResidentHnsw,
+}
+
+/// Actual local dense vector path used for one retrieval debug result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalDenseVectorPath {
+    /// Dense retrieval was disabled, so BM25 supplied the candidates.
+    Bm25Only,
+    /// Dense retrieval scanned SQLite-stored vectors without resident HNSW.
+    #[default]
+    LowMemorySqliteScan,
+    /// Dense retrieval used the resident local HNSW index.
+    ResidentHnsw,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1163,6 +1189,7 @@ mod tests {
     #[test]
     fn retrieval_debug_serializes_without_raw_text_or_secrets() {
         let debug = RetrievalDebug {
+            dense_vector_path: RetrievalDenseVectorPath::ResidentHnsw,
             query_embedding_latency_ms: None,
             bm25_hits: vec![RetrievalStageHit {
                 rank: 1,

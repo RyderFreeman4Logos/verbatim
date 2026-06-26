@@ -69,7 +69,8 @@ use verbatim_core::task::{
 };
 use verbatim_core::types::{
     CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact,
-    RetrievalDebug, RetrievalEvidenceRole, RetrievalResult, SourceId, SourceStatus,
+    RetrievalDebug, RetrievalDenseVectorPath, RetrievalEvidenceRole, RetrievalResult, SourceId,
+    SourceStatus,
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
@@ -2081,6 +2082,7 @@ async fn execute_retrieve_task_inner(
         "rerank_enabled": controls.rerank_config.enabled,
         "dense_top_k": controls.retrieval_config.dense_top_k,
         "bm25_top_k": controls.retrieval_config.bm25_top_k,
+        "dense_vector_path": debug.dense_vector_path,
     }));
     record_task_progress(&state, task_id, retrieval_progress).await;
     record_task_span(&state, task_id, retrieval_timing.clone()).await?;
@@ -2092,6 +2094,7 @@ async fn execute_retrieve_task_inner(
         serde_json::json!({
             "result_count": results.len(),
             "rerank_enabled": controls.rerank_config.enabled,
+            "dense_vector_path": debug.dense_vector_path,
         }),
     )
     .await?;
@@ -2196,6 +2199,7 @@ async fn execute_ask_task_inner(
         timing.finish(serde_json::json!({
             "result_count": results.len(),
             "retrieval_debug": retrieval_debug.is_some(),
+            "dense_vector_path": retrieval_debug.as_ref().map(|debug| debug.dense_vector_path),
         })),
     )
     .await?;
@@ -2204,7 +2208,10 @@ async fn execute_ask_task_inner(
         task_id,
         "phase",
         "retrieval complete",
-        serde_json::json!({ "result_count": results.len() }),
+        serde_json::json!({
+            "result_count": results.len(),
+            "dense_vector_path": retrieval_debug.as_ref().map(|debug| debug.dense_vector_path),
+        }),
     )
     .await?;
 
@@ -4078,6 +4085,7 @@ async fn prepare_retrieve_context(
             &controls.config.graph,
         )
         .with_embedding_enabled(controls.config.embedding.enabled)
+        .with_vector_residency(controls.config.vector_index.residency)
         .require_embedding_profile(&embedding_profile_id)
         .with_qdrant_search(&controls.config.qdrant);
         let source_filter_ref = source_filter.as_ref();
@@ -4124,6 +4132,7 @@ async fn prepare_retrieve_context(
 
 fn empty_retrieval_debug() -> RetrievalDebug {
     RetrievalDebug {
+        dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
         query_embedding_latency_ms: None,
         bm25_hits: Vec::new(),
         dense_hits: Vec::new(),
@@ -4171,6 +4180,7 @@ async fn prepare_generation_context(
             &config.graph,
         )
         .with_embedding_enabled(config.embedding.enabled)
+        .with_vector_residency(config.vector_index.residency)
         .require_embedding_profile(&embedding_profile_id)
         .with_qdrant_search(&config.qdrant);
         let source_filter_ref = source_filter.as_ref();
@@ -5606,7 +5616,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use verbatim_core::types::{
         Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind, EvidenceUnit,
-        RetrievalEvidenceRole, RetrievalProvenance, RetrievalRerankStatus, SourceLocator,
+        RetrievalDenseVectorPath, RetrievalEvidenceRole, RetrievalProvenance,
+        RetrievalRerankStatus, SourceLocator, VectorIndexResidency,
     };
 
     #[test]
@@ -6018,6 +6029,7 @@ mod tests {
             citations: Vec::new(),
             verified: false,
             retrieval: Some(RetrievalDebug {
+                dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
                 query_embedding_latency_ms: None,
                 bm25_hits: Vec::new(),
                 dense_hits: Vec::new(),
@@ -6051,6 +6063,7 @@ mod tests {
         );
         let mut results = vec![local];
         let mut debug = Some(RetrievalDebug {
+            dense_vector_path: RetrievalDenseVectorPath::ResidentHnsw,
             query_embedding_latency_ms: None,
             bm25_hits: Vec::new(),
             dense_hits: Vec::new(),
@@ -6546,6 +6559,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retrieve_handler_low_memory_dense_search_uses_stored_vectors_without_resident_hnsw() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("retrieve-low-memory-vectors");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Alpha low-memory dense retrieval should use stored vectors.",
+        )
+        .unwrap();
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.vector_index.residency = VectorIndexResidency::LowMemory;
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        assert!(pipeline.hnsw().is_empty());
+        assert!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(
+                    &EmbeddingProfileId::default_profile(),
+                    Some(&source_id),
+                )
+                .unwrap()
+                > 0
+        );
+
+        let state = test_state(config, test_dir.path(), pipeline);
+        let response = retrieve(
+            State(state),
+            Json(RetrieveRequest {
+                question: "Alpha dense retrieval?".into(),
+                source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(1),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: true,
+                include_locator: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let debug = response.debug.expect("retrieval debug");
+        assert_eq!(
+            debug.dense_vector_path,
+            RetrievalDenseVectorPath::LowMemorySqliteScan
+        );
+        assert!(!debug.dense_hits.is_empty());
+        assert_eq!(model_server.chat_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn retrieve_handler_resident_hnsw_dense_search_remains_configurable() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("retrieve-resident-hnsw");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Alpha resident HNSW dense retrieval should use the loaded index.",
+        )
+        .unwrap();
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.vector_index.residency = VectorIndexResidency::ResidentHnsw;
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        assert!(!pipeline.hnsw().is_empty());
+
+        let state = test_state(config, test_dir.path(), pipeline);
+        let response = retrieve(
+            State(state),
+            Json(RetrieveRequest {
+                question: "Alpha dense retrieval?".into(),
+                source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(1),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: true,
+                include_locator: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let debug = response.debug.expect("retrieval debug");
+        assert_eq!(
+            debug.dense_vector_path,
+            RetrievalDenseVectorPath::ResidentHnsw
+        );
+        assert!(!debug.dense_hits.is_empty());
+        assert_eq!(model_server.chat_requests(), 0);
+    }
+
+    #[tokio::test]
     async fn retrieve_handler_filters_by_materialized_collections_with_provenance() {
         use verbatim_core::collection::{CollectionMemberCandidate, CollectionSyncReport};
 
@@ -6837,6 +6962,7 @@ mod tests {
 
         assert!(response.answer.contains("BM25 answer"));
         let debug = response.retrieval.expect("retrieval debug");
+        assert_eq!(debug.dense_vector_path, RetrievalDenseVectorPath::Bm25Only);
         assert_eq!(debug.query_embedding_latency_ms, None);
         assert!(debug.dense_hits.is_empty());
         assert!(!debug.bm25_hits.is_empty());
