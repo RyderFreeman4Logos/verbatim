@@ -110,7 +110,13 @@ fn rerank_override(rerank: bool, no_rerank: bool) -> Option<bool> {
 fn collection_filter_request(
     collection_names: Vec<String>,
     require_fresh: bool,
+    allow_stale: bool,
 ) -> CollectionFilterRequest {
+    let require_fresh = if collection_names.is_empty() {
+        require_fresh
+    } else {
+        require_fresh || !allow_stale
+    };
     CollectionFilterRequest {
         collection_ids: Vec::new(),
         names: collection_names,
@@ -260,6 +266,7 @@ where
             source_id,
             collection,
             require_fresh,
+            allow_stale,
             embedding_profile,
             show_retrieval,
             context_only,
@@ -269,7 +276,8 @@ where
         } => {
             let context_only = context_only || no_generate;
             let question = question.join(" ");
-            let collection_filter = collection_filter_request(collection, require_fresh);
+            let collection_filter =
+                collection_filter_request(collection, require_fresh, allow_stale);
             if context_only {
                 if background {
                     return Err(CliError::Api(
@@ -326,6 +334,7 @@ where
             source_id,
             collection,
             require_fresh,
+            allow_stale,
             embedding_profile,
             limit,
             page_size,
@@ -344,7 +353,11 @@ where
             let request = RetrieveRequest {
                 question: question.join(" "),
                 source_id,
-                collection_filter: collection_filter_request(collection, require_fresh),
+                collection_filter: collection_filter_request(
+                    collection,
+                    require_fresh,
+                    allow_stale,
+                ),
                 embedding_profile_id: embedding_profile,
                 limit,
                 page_size,
@@ -1193,6 +1206,9 @@ enum Commands {
         /// Fail instead of returning warning metadata for stale collection membership.
         #[arg(long = "require-fresh")]
         require_fresh: bool,
+        /// Allow retrieval from stale collection membership or stale member indexes.
+        #[arg(long = "allow-stale", action = ArgAction::SetTrue, conflicts_with = "require_fresh")]
+        allow_stale: bool,
         /// Use this embedding profile for retrieval.
         #[arg(long = "embedding-profile")]
         embedding_profile: Option<String>,
@@ -1233,6 +1249,9 @@ enum Commands {
         /// Fail instead of returning warning metadata for stale collection membership.
         #[arg(long = "require-fresh")]
         require_fresh: bool,
+        /// Allow retrieval from stale collection membership or stale member indexes.
+        #[arg(long = "allow-stale", action = ArgAction::SetTrue, conflicts_with = "require_fresh")]
+        allow_stale: bool,
         /// Use this embedding profile for retrieval.
         #[arg(long = "embedding-profile")]
         embedding_profile: Option<String>,
@@ -2532,6 +2551,41 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
         let request = client.last_ask.borrow();
+        let request = request.as_ref().unwrap();
+        assert_eq!(
+            request.collection_filter.names,
+            vec!["articles".to_string()]
+        );
+        assert!(request.collection_filter.require_fresh);
+    }
+
+    #[test]
+    fn collection_queries_require_fresh_by_default_and_can_allow_stale() {
+        let (code, _, stderr, client, _) =
+            run_mock(["ask", "--collection", "articles", "What", "changed?"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        let request = client.last_ask.borrow();
+        let request = request.as_ref().unwrap();
+        assert_eq!(
+            request.collection_filter.names,
+            vec!["articles".to_string()]
+        );
+        assert!(request.collection_filter.require_fresh);
+
+        let (code, _, stderr, client, _) = run_mock([
+            "retrieve",
+            "--collection",
+            "articles",
+            "--allow-stale",
+            "What",
+            "changed?",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        let request = client.last_retrieve.borrow();
         let request = request.as_ref().unwrap();
         assert_eq!(
             request.collection_filter.names,

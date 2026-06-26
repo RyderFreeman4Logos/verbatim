@@ -2024,7 +2024,20 @@ async fn execute_retrieve_task_inner(
         &controls.config.embedding.profile_id,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let query_scope = resolve_query_scope(&state, source_id, collection_filter).await?;
+    let freshness_profile_id = controls
+        .config
+        .embedding
+        .enabled
+        .then(|| embedding_profile_id.clone());
+    refresh_query_embedding_profile_for_collection_filter(
+        &state,
+        &collection_filter,
+        controls.config.embedding.enabled,
+        &embedding_profile_id,
+    )
+    .await?;
+    let query_scope =
+        resolve_query_scope(&state, source_id, collection_filter, freshness_profile_id).await?;
 
     let timing = PhaseTiming::start("retrieval");
     record_task_progress(
@@ -2171,7 +2184,19 @@ async fn execute_ask_task_inner(
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let show_retrieval = req.show_retrieval;
-    let query_scope = resolve_query_scope(&state, source_id, collection_filter).await?;
+    let freshness_profile_id = config
+        .embedding
+        .enabled
+        .then(|| embedding_profile_id.clone());
+    refresh_query_embedding_profile_for_collection_filter(
+        &state,
+        &collection_filter,
+        config.embedding.enabled,
+        &embedding_profile_id,
+    )
+    .await?;
+    let query_scope =
+        resolve_query_scope(&state, source_id, collection_filter, freshness_profile_id).await?;
 
     let timing = PhaseTiming::start("retrieval");
     record_task_progress(
@@ -2375,7 +2400,19 @@ async fn execute_ask_stream_task_inner(
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let show_retrieval = req.show_retrieval;
-    let query_scope = resolve_query_scope(&state, source_id, collection_filter).await?;
+    let freshness_profile_id = config
+        .embedding
+        .enabled
+        .then(|| embedding_profile_id.clone());
+    refresh_query_embedding_profile_for_collection_filter(
+        &state,
+        &collection_filter,
+        config.embedding.enabled,
+        &embedding_profile_id,
+    )
+    .await?;
+    let query_scope =
+        resolve_query_scope(&state, source_id, collection_filter, freshness_profile_id).await?;
 
     let timing = PhaseTiming::start("retrieval");
     record_task_progress(
@@ -2727,6 +2764,7 @@ async fn resolve_query_scope(
     state: &SharedState,
     source_id: Option<SourceId>,
     collection_filter: CollectionFilterRequest,
+    embedding_profile_id: Option<EmbeddingProfileId>,
 ) -> Result<QueryScope, (StatusCode, Json<ErrorResponse>)> {
     if !collection_filter.has_filters() {
         return Ok(QueryScope {
@@ -2740,7 +2778,12 @@ async fn resolve_query_scope(
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
         let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        resolve_query_scope_from_store(pipeline.store(), source_id, collection_filter)
+        resolve_query_scope_from_store(
+            pipeline.store(),
+            source_id,
+            collection_filter,
+            embedding_profile_id,
+        )
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
@@ -2751,11 +2794,15 @@ fn resolve_query_scope_from_store(
     store: &Store,
     source_id: Option<SourceId>,
     requested: CollectionFilterRequest,
+    embedding_profile_id: Option<EmbeddingProfileId>,
 ) -> Result<QueryScope> {
     let collection_names = collection_filter_names(&requested)?;
+    let requested_collection_names = collection_names.iter().cloned().collect::<BTreeSet<_>>();
     let mut union_source_ids = HashSet::new();
     let mut applied = Vec::new();
     let mut warnings = Vec::new();
+    let mut required_collection_syncs = BTreeSet::new();
+    let mut required_source_ingests = BTreeSet::new();
     let mut collection_provenance: HashMap<String, Vec<CollectionResultProvenance>> =
         HashMap::new();
 
@@ -2769,6 +2816,7 @@ fn resolve_query_scope_from_store(
         let mut stale_member_count = 0usize;
 
         if collection.last_synced_at.is_none() {
+            required_collection_syncs.insert(name.clone());
             warnings.push(format!(
                 "collection '{name}' has never been synced; retrieval uses materialized membership and does not scan roots"
             ));
@@ -2785,10 +2833,32 @@ fn resolve_query_scope_from_store(
                 .push(collection_result_provenance(member));
             match store.get_source(&member.source_id)? {
                 Some(source) if source.status == SourceStatus::Indexed => {
-                    indexed_member_count += 1;
+                    let vectors_stale = embedding_profile_id
+                        .as_ref()
+                        .map(|profile_id| {
+                            store.source_vectors_stale_for_profile(profile_id, &source.id)
+                        })
+                        .transpose()?
+                        .unwrap_or(false);
+                    if vectors_stale {
+                        stale_member_count += 1;
+                        required_source_ingests.insert(source.id.0.clone());
+                        tracing::debug!(
+                            collection = %name,
+                            source_id = %source.id.0,
+                            profile_id = embedding_profile_id
+                                .as_ref()
+                                .map(|profile_id| profile_id.as_str())
+                                .unwrap_or(""),
+                            "collection member source vectors are stale for the retrieval profile"
+                        );
+                    } else {
+                        indexed_member_count += 1;
+                    }
                 }
                 Some(source) => {
                     stale_member_count += 1;
+                    required_source_ingests.insert(source.id.0.clone());
                     tracing::debug!(
                         collection = %name,
                         source_id = %source.id.0,
@@ -2798,6 +2868,7 @@ fn resolve_query_scope_from_store(
                 }
                 None => {
                     stale_member_count += 1;
+                    required_collection_syncs.insert(name.clone());
                 }
             }
         }
@@ -2822,9 +2893,11 @@ fn resolve_query_scope_from_store(
 
     let stale = applied.iter().any(|collection| collection.stale);
     if requested.require_fresh && stale {
-        bail!(
-            "collection filter requires fresh membership; resolve warnings with `verbatim collection sync <name>` or ingest stale member sources"
-        );
+        bail!(collection_freshness_remediation_error(
+            &requested_collection_names,
+            &required_collection_syncs,
+            &required_source_ingests,
+        ));
     }
 
     let effective_source_filter = match &source_id {
@@ -2868,6 +2941,74 @@ fn collection_filter_names(filter: &CollectionFilterRequest) -> Result<Vec<Strin
         names.insert(name.to_string());
     }
     Ok(names.into_iter().collect())
+}
+
+fn collection_freshness_remediation_error(
+    requested_collection_names: &BTreeSet<String>,
+    required_collection_syncs: &BTreeSet<String>,
+    required_source_ingests: &BTreeSet<String>,
+) -> String {
+    const MAX_SOURCE_COMMANDS: usize = 25;
+
+    let mut message = String::from(
+        "collection filter requires fresh collection membership and member indexes.\n\nRun the relevant remediation command(s), then retry the query:",
+    );
+
+    if required_collection_syncs.is_empty() && required_source_ingests.is_empty() {
+        message.push_str("\n  verbatim collection sync <name>");
+        message.push_str("\n  verbatim reindex --stale");
+        append_collection_retry_command(&mut message, requested_collection_names);
+        return message;
+    }
+
+    for name in required_collection_syncs {
+        message.push_str(&format!("\n  verbatim collection sync {}", shell_arg(name)));
+    }
+
+    for source_id in required_source_ingests.iter().take(MAX_SOURCE_COMMANDS) {
+        message.push_str(&format!("\n  verbatim ingest {}", shell_arg(source_id)));
+    }
+
+    if required_source_ingests.len() > MAX_SOURCE_COMMANDS {
+        let omitted = required_source_ingests.len() - MAX_SOURCE_COMMANDS;
+        message.push_str(&format!(
+            "\n  # {omitted} more stale member source(s) omitted; to rebuild every stale source, run:"
+        ));
+        message.push_str("\n  verbatim reindex --stale");
+    } else if !required_source_ingests.is_empty() {
+        message.push_str("\n  # To rebuild every stale source instead, run:");
+        message.push_str("\n  verbatim reindex --stale");
+    }
+
+    append_collection_retry_command(&mut message, requested_collection_names);
+    message
+}
+
+fn append_collection_retry_command(
+    message: &mut String,
+    requested_collection_names: &BTreeSet<String>,
+) {
+    if requested_collection_names.is_empty() {
+        return;
+    }
+
+    let collection_args = requested_collection_names
+        .iter()
+        .map(|name| format!(" --collection {}", shell_arg(name)))
+        .collect::<String>();
+    message.push_str(&format!(
+        "\n\nAfter the command(s) complete, retry:\n  verbatim ask{collection_args} --require-fresh '<question>'"
+    ));
+}
+
+fn shell_arg(value: &str) -> String {
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+    }) {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
 }
 
 fn collection_result_provenance(member: &CollectionMember) -> CollectionResultProvenance {
@@ -3560,16 +3701,10 @@ async fn execute_started_ingest_source_batch(
     };
     match run_started_ingest_source_batch(Arc::clone(&state), source_tasks).await {
         Ok(outcomes) => {
-            for outcome in outcomes {
-                match outcome.result {
-                    Ok(embedding_cache) => {
-                        let result = ingest_result_metadata(1, &embedding_cache);
-                        let _ = finish_task_success(&state, &outcome.task_id, result).await;
-                    }
-                    Err(error) => {
-                        let _ = finish_task_failed(&state, &outcome.task_id, &error).await;
-                    }
-                }
+            if let Err(error) =
+                finish_started_ingest_source_batch_outcomes(&state, tasks, outcomes).await
+            {
+                tracing::error!(error = %error, "failed to finalize source batch ingest tasks");
             }
         }
         Err((_, Json(error))) => {
@@ -3578,6 +3713,92 @@ async fn execute_started_ingest_source_batch(
             }
         }
     }
+}
+
+async fn finish_started_ingest_source_batch_outcomes(
+    state: &SharedState,
+    tasks: Vec<verbatim_core::task::TaskSummary>,
+    outcomes: Vec<SourceIngestOutcome>,
+) -> Result<()> {
+    let mut outcomes_by_task_id = HashMap::with_capacity(outcomes.len());
+    let mut first_error = None;
+    for outcome in outcomes {
+        let task_id = outcome.task_id.clone();
+        if outcomes_by_task_id
+            .insert(task_id.clone(), outcome)
+            .is_some()
+        {
+            first_error.get_or_insert_with(|| {
+                anyhow::anyhow!("duplicate source batch outcome for task {}", task_id.0)
+            });
+        }
+    }
+
+    for task in tasks {
+        match outcomes_by_task_id.remove(&task.id) {
+            Some(outcome) => match outcome.result {
+                Ok(embedding_cache) => {
+                    let result = ingest_result_metadata(1, &embedding_cache);
+                    if let Err((status, Json(error))) =
+                        finish_task_success(state, &task.id, result).await
+                    {
+                        tracing::error!(task_id = %task.id.0, status = %status, error = %error.error, "failed to mark source batch task succeeded");
+                        first_error.get_or_insert_with(|| {
+                            anyhow::anyhow!(
+                                "failed to mark source batch task {} succeeded: {}: {}",
+                                task.id.0,
+                                status,
+                                error.error
+                            )
+                        });
+                    }
+                }
+                Err(error_message) => {
+                    if let Err((status, Json(error))) =
+                        finish_task_failed(state, &task.id, &error_message).await
+                    {
+                        tracing::error!(task_id = %task.id.0, status = %status, error = %error.error, "failed to mark source batch task failed");
+                        first_error.get_or_insert_with(|| {
+                            anyhow::anyhow!(
+                                "failed to mark source batch task {} failed: {}: {}",
+                                task.id.0,
+                                status,
+                                error.error
+                            )
+                        });
+                    }
+                }
+            },
+            None => {
+                let error_message = format!(
+                    "missing source batch outcome for started task {}; failing task to unblock ingest queue",
+                    task.id.0
+                );
+                if let Err((status, Json(error))) =
+                    finish_task_failed(state, &task.id, &error_message).await
+                {
+                    tracing::error!(task_id = %task.id.0, status = %status, error = %error.error, "failed to mark source batch task failed after missing outcome");
+                    first_error.get_or_insert_with(|| {
+                        anyhow::anyhow!(
+                            "failed to mark source batch task {} failed after missing outcome: {}: {}",
+                            task.id.0,
+                            status,
+                            error.error
+                        )
+                    });
+                }
+            }
+        }
+    }
+
+    for task_id in outcomes_by_task_id.into_keys() {
+        tracing::warn!(
+            task_id = %task_id.0,
+            "source batch returned outcome for a task that was not claimed in this batch"
+        );
+    }
+
+    first_error.map_or(Ok(()), Err)
 }
 
 fn started_source_batch_inputs(
@@ -4086,6 +4307,30 @@ fn refresh_embedding_profile_capabilities_blocking(
 ) -> Result<()> {
     runtime.block_on(pipeline.refresh_embedding_profile_capabilities())?;
     Ok(())
+}
+
+async fn refresh_query_embedding_profile_for_collection_filter(
+    state: &SharedState,
+    collection_filter: &CollectionFilterRequest,
+    embedding_enabled: bool,
+    embedding_profile_id: &EmbeddingProfileId,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if !collection_filter.has_filters() || !embedding_enabled {
+        return Ok(());
+    }
+
+    let state = Arc::clone(state);
+    let embedding_profile_id = embedding_profile_id.clone();
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        refresh_embedding_profile_capabilities_blocking(&runtime, &mut pipeline)?;
+        pipeline.select_embedding_profile(&embedding_profile_id)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 async fn prepare_retrieve_context(
@@ -6680,6 +6925,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collection_require_fresh_retrieve_refreshes_profile_before_vector_check() {
+        let (_test_dir, state, source_id, model_server) =
+            reloaded_embedding_endpoint_state("capability-refresh-collection-retrieve", false)
+                .await;
+        add_single_source_collection_for_test(&state, "articles", &source_id);
+
+        let (status, Json(body)) = retrieve(
+            State(Arc::clone(&state)),
+            Json(RetrieveRequest {
+                question: "Alpha drifted endpoint collection question?".into(),
+                source_id: None,
+                collection_filter: CollectionFilterRequest {
+                    collection_ids: Vec::new(),
+                    names: vec!["articles".into()],
+                    require_fresh: true,
+                },
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(1),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: false,
+                include_locator: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("collection filter requires fresh"));
+        assert!(body
+            .error
+            .contains(&format!("verbatim ingest {}", source_id.0)));
+        assert!(body.error.contains("verbatim reindex --stale"));
+        assert!(!body.error.contains("has no vectors"));
+        assert_eq!(model_server.embedding_requests(), 0);
+        assert_eq!(default_profile_source_vector_count(&state, &source_id), 0);
+    }
+
+    #[tokio::test]
+    async fn collection_require_fresh_ask_refreshes_profile_before_vector_check() {
+        let (_test_dir, state, source_id, model_server) =
+            reloaded_embedding_endpoint_state("capability-refresh-collection-ask", true).await;
+        add_single_source_collection_for_test(&state, "articles", &source_id);
+
+        let (status, Json(body)) = ask(
+            State(Arc::clone(&state)),
+            Json(AskRequest {
+                question: "Alpha drifted endpoint collection ask?".into(),
+                source_id: None,
+                collection_filter: CollectionFilterRequest {
+                    collection_ids: Vec::new(),
+                    names: vec!["articles".into()],
+                    require_fresh: true,
+                },
+                embedding_profile_id: None,
+                show_retrieval: false,
+                context_only: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("collection filter requires fresh"));
+        assert!(body
+            .error
+            .contains(&format!("verbatim ingest {}", source_id.0)));
+        assert!(!body.error.contains("has no vectors"));
+        assert_eq!(model_server.embedding_requests(), 0);
+        assert_eq!(model_server.chat_requests(), 0);
+        assert_eq!(default_profile_source_vector_count(&state, &source_id), 0);
+    }
+
+    #[tokio::test]
     async fn retrieve_handler_low_memory_dense_search_uses_stored_vectors_without_resident_hnsw() {
         let model_server = MockModelServer::start(3).await;
         let test_dir = TestDir::new("retrieve-low-memory-vectors");
@@ -6914,6 +7238,77 @@ mod tests {
             .collections
             .iter()
             .any(|collection| collection.name == "areskapitalon"));
+    }
+
+    #[tokio::test]
+    async fn collection_require_fresh_error_prints_copyable_reingest_commands() {
+        use verbatim_core::collection::{CollectionMemberCandidate, CollectionSyncReport};
+
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("collection-fresh-error-remediation");
+        let source_path = test_dir.path().join("Areskapitalon-stale.md");
+        fs::write(&source_path, "Areskapitalon stale evidence needs indexing.").unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline
+            .store()
+            .create_collection("areskapitalon", &[])
+            .unwrap();
+        pipeline
+            .store()
+            .replace_collection_members(
+                "areskapitalon",
+                &[CollectionMemberCandidate {
+                    source_id: source_id.clone(),
+                    logical_path: "Areskapitalon-stale.md".into(),
+                    source_path: fs::canonicalize(&source_path).unwrap(),
+                }],
+                CollectionSyncReport {
+                    member_count: 0,
+                    added: 0,
+                    removed: 0,
+                    unchanged: 0,
+                    scanned_roots: 1,
+                    max_depth: 32,
+                    skipped: Vec::new(),
+                },
+            )
+            .unwrap();
+        let source_id_text = source_id.0.clone();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let error = retrieve(
+            State(state),
+            Json(RetrieveRequest {
+                question: "Areskapitalon evidence?".into(),
+                source_id: None,
+                collection_filter: CollectionFilterRequest {
+                    collection_ids: Vec::new(),
+                    names: vec!["areskapitalon".into()],
+                    require_fresh: true,
+                },
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(1),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: false,
+                include_locator: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        let message = error.1 .0.error;
+        assert!(!message.contains("verbatim collection sync areskapitalon"));
+        assert!(message.contains(&format!("verbatim ingest {source_id_text}")));
+        assert!(message.contains("verbatim ask --collection areskapitalon --require-fresh"));
     }
 
     #[tokio::test]
@@ -8358,6 +8753,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_batch_finalization_fails_started_tasks_missing_core_outcomes() {
+        let test_dir = TestDir::new("source-batch-missing-outcome");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.batch_size = 2;
+        config.embedding.endpoint_runtime.max_concurrent_requests = 1;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let first_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                Some("src-batch-first"),
+                false,
+                None,
+                false,
+                true,
+                Some("parent-batch"),
+            ),
+        )
+        .await
+        .unwrap();
+        let second_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                Some("src-batch-second"),
+                false,
+                None,
+                false,
+                true,
+                Some("parent-batch"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let claimed = claim_startable_ingest_work(&state).await.unwrap().unwrap();
+        let ClaimedIngestWork::SourceBatch(tasks) = claimed else {
+            panic!("expected source batch claim");
+        };
+        assert_eq!(tasks.len(), 2);
+
+        finish_started_ingest_source_batch_outcomes(
+            &state,
+            tasks,
+            vec![SourceIngestOutcome {
+                source_id: SourceId("src-batch-first".into()),
+                task_id: first_id.clone(),
+                result: Ok(EmbeddingCacheStats::default()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let first = task_summary_response(&state, first_id).await.unwrap().task;
+        let second = task_summary_response(&state, second_id).await.unwrap().task;
+        assert_eq!(first.status, TaskStatus::Succeeded);
+        assert_eq!(second.status, TaskStatus::Failed);
+        assert!(second
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing source batch outcome"));
+        assert_eq!(running_ingest_count(&state).await, 0);
+    }
+
+    #[tokio::test]
     async fn background_queue_claim_waits_when_foreground_starts_after_candidate_selection() {
         let test_dir = TestDir::new("foreground-starts-before-background-claim");
         let config = retrieve_test_config("http://127.0.0.1:9/v1");
@@ -8829,6 +9291,43 @@ mod tests {
                 Some(source_id),
             )
             .unwrap()
+    }
+
+    fn add_single_source_collection_for_test(
+        state: &SharedState,
+        collection_name: &str,
+        source_id: &SourceId,
+    ) {
+        use verbatim_core::collection::{CollectionMemberCandidate, CollectionSyncReport};
+
+        let pipeline = state.pipeline.lock().unwrap();
+        let Some(source) = pipeline.store().get_source(source_id).unwrap() else {
+            panic!("test source not found: {}", source_id.0);
+        };
+        pipeline
+            .store()
+            .create_collection(collection_name, &[])
+            .unwrap();
+        pipeline
+            .store()
+            .replace_collection_members(
+                collection_name,
+                &[CollectionMemberCandidate {
+                    source_id: source_id.clone(),
+                    logical_path: "doc.md".into(),
+                    source_path: source.path,
+                }],
+                CollectionSyncReport {
+                    member_count: 0,
+                    added: 0,
+                    removed: 0,
+                    unchanged: 0,
+                    scanned_roots: 1,
+                    max_depth: 32,
+                    skipped: Vec::new(),
+                },
+            )
+            .unwrap();
     }
 
     #[tokio::test]
