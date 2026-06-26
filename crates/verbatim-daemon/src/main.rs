@@ -3701,16 +3701,10 @@ async fn execute_started_ingest_source_batch(
     };
     match run_started_ingest_source_batch(Arc::clone(&state), source_tasks).await {
         Ok(outcomes) => {
-            for outcome in outcomes {
-                match outcome.result {
-                    Ok(embedding_cache) => {
-                        let result = ingest_result_metadata(1, &embedding_cache);
-                        let _ = finish_task_success(&state, &outcome.task_id, result).await;
-                    }
-                    Err(error) => {
-                        let _ = finish_task_failed(&state, &outcome.task_id, &error).await;
-                    }
-                }
+            if let Err(error) =
+                finish_started_ingest_source_batch_outcomes(&state, tasks, outcomes).await
+            {
+                tracing::error!(error = %error, "failed to finalize source batch ingest tasks");
             }
         }
         Err((_, Json(error))) => {
@@ -3719,6 +3713,92 @@ async fn execute_started_ingest_source_batch(
             }
         }
     }
+}
+
+async fn finish_started_ingest_source_batch_outcomes(
+    state: &SharedState,
+    tasks: Vec<verbatim_core::task::TaskSummary>,
+    outcomes: Vec<SourceIngestOutcome>,
+) -> Result<()> {
+    let mut outcomes_by_task_id = HashMap::with_capacity(outcomes.len());
+    let mut first_error = None;
+    for outcome in outcomes {
+        let task_id = outcome.task_id.clone();
+        if outcomes_by_task_id
+            .insert(task_id.clone(), outcome)
+            .is_some()
+        {
+            first_error.get_or_insert_with(|| {
+                anyhow::anyhow!("duplicate source batch outcome for task {}", task_id.0)
+            });
+        }
+    }
+
+    for task in tasks {
+        match outcomes_by_task_id.remove(&task.id) {
+            Some(outcome) => match outcome.result {
+                Ok(embedding_cache) => {
+                    let result = ingest_result_metadata(1, &embedding_cache);
+                    if let Err((status, Json(error))) =
+                        finish_task_success(state, &task.id, result).await
+                    {
+                        tracing::error!(task_id = %task.id.0, status = %status, error = %error.error, "failed to mark source batch task succeeded");
+                        first_error.get_or_insert_with(|| {
+                            anyhow::anyhow!(
+                                "failed to mark source batch task {} succeeded: {}: {}",
+                                task.id.0,
+                                status,
+                                error.error
+                            )
+                        });
+                    }
+                }
+                Err(error_message) => {
+                    if let Err((status, Json(error))) =
+                        finish_task_failed(state, &task.id, &error_message).await
+                    {
+                        tracing::error!(task_id = %task.id.0, status = %status, error = %error.error, "failed to mark source batch task failed");
+                        first_error.get_or_insert_with(|| {
+                            anyhow::anyhow!(
+                                "failed to mark source batch task {} failed: {}: {}",
+                                task.id.0,
+                                status,
+                                error.error
+                            )
+                        });
+                    }
+                }
+            },
+            None => {
+                let error_message = format!(
+                    "missing source batch outcome for started task {}; failing task to unblock ingest queue",
+                    task.id.0
+                );
+                if let Err((status, Json(error))) =
+                    finish_task_failed(state, &task.id, &error_message).await
+                {
+                    tracing::error!(task_id = %task.id.0, status = %status, error = %error.error, "failed to mark source batch task failed after missing outcome");
+                    first_error.get_or_insert_with(|| {
+                        anyhow::anyhow!(
+                            "failed to mark source batch task {} failed after missing outcome: {}: {}",
+                            task.id.0,
+                            status,
+                            error.error
+                        )
+                    });
+                }
+            }
+        }
+    }
+
+    for task_id in outcomes_by_task_id.into_keys() {
+        tracing::warn!(
+            task_id = %task_id.0,
+            "source batch returned outcome for a task that was not claimed in this batch"
+        );
+    }
+
+    first_error.map_or(Ok(()), Err)
 }
 
 fn started_source_batch_inputs(
@@ -8670,6 +8750,73 @@ mod tests {
             }
         }
         assert_eq!(queued_children, 1);
+    }
+
+    #[tokio::test]
+    async fn source_batch_finalization_fails_started_tasks_missing_core_outcomes() {
+        let test_dir = TestDir::new("source-batch-missing-outcome");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.batch_size = 2;
+        config.embedding.endpoint_runtime.max_concurrent_requests = 1;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let first_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                Some("src-batch-first"),
+                false,
+                None,
+                false,
+                true,
+                Some("parent-batch"),
+            ),
+        )
+        .await
+        .unwrap();
+        let second_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                Some("src-batch-second"),
+                false,
+                None,
+                false,
+                true,
+                Some("parent-batch"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let claimed = claim_startable_ingest_work(&state).await.unwrap().unwrap();
+        let ClaimedIngestWork::SourceBatch(tasks) = claimed else {
+            panic!("expected source batch claim");
+        };
+        assert_eq!(tasks.len(), 2);
+
+        finish_started_ingest_source_batch_outcomes(
+            &state,
+            tasks,
+            vec![SourceIngestOutcome {
+                source_id: SourceId("src-batch-first".into()),
+                task_id: first_id.clone(),
+                result: Ok(EmbeddingCacheStats::default()),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let first = task_summary_response(&state, first_id).await.unwrap().task;
+        let second = task_summary_response(&state, second_id).await.unwrap().task;
+        assert_eq!(first.status, TaskStatus::Succeeded);
+        assert_eq!(second.status, TaskStatus::Failed);
+        assert!(second
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing source batch outcome"));
+        assert_eq!(running_ingest_count(&state).await, 0);
     }
 
     #[tokio::test]
