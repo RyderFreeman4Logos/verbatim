@@ -8,6 +8,7 @@ use crate::collection::{
 };
 use crate::config::ConfigReloadMetadata;
 use crate::index_gc::{IndexGcApplyReport, IndexGcConfig, IndexGcPlan};
+use crate::index_profile_delete::{IndexProfileDeleteApplyReport, IndexProfileDeletePlan};
 use crate::task::{TaskEvent, TaskSpan, TaskSummary};
 use crate::types::{
     BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceIngestDiagnostics,
@@ -352,6 +353,24 @@ pub struct IndexGcResponse {
     pub policy: IndexGcConfig,
     pub plan: IndexGcPlan,
     pub apply: IndexGcApplyReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexProfileDeleteRequest {
+    pub profile_id: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default)]
+    pub allow_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexProfileDeleteResponse {
+    pub dry_run: bool,
+    pub plan: IndexProfileDeletePlan,
+    pub apply: IndexProfileDeleteApplyReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

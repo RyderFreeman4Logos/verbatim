@@ -88,13 +88,7 @@ fn extract_from_resource_dict(
         let Ok(stream) = object.as_stream() else {
             continue;
         };
-        if stream
-            .dict
-            .get(b"Subtype")
-            .and_then(Object::as_name_str)
-            .ok()
-            != Some("Image")
-        {
+        if stream.dict.get(b"Subtype").ok().and_then(pdf_name_str) != Some("Image") {
             continue;
         }
 
@@ -254,7 +248,7 @@ fn raw_png_color(
     let color_space = dict
         .get(b"ColorSpace")
         .ok()
-        .and_then(|color_space| color_space.as_name_str().ok())
+        .and_then(pdf_name_str)
         .unwrap_or("DeviceRGB");
     match color_space {
         "DeviceGray" => Ok((1, image::ColorType::L8)),
@@ -289,6 +283,10 @@ fn resolve_object<'a>(doc: &'a Document, object: &'a Object) -> Option<&'a Objec
         Ok(id) => doc.get_object(id).ok(),
         Err(_) => Some(object),
     }
+}
+
+fn pdf_name_str(object: &Object) -> Option<&str> {
+    std::str::from_utf8(object.as_name().ok()?).ok()
 }
 
 fn positive_u32(dict: &Dictionary, key: &[u8]) -> Option<u32> {

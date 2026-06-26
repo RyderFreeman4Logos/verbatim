@@ -1393,7 +1393,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Verbatim configuration
 path = "~/.local/share/verbatim"
 
 [parser]
-default = "pdf_oxide"   # pdf_oxide | pdfplumber
+default = "pdf_oxide"   # pdf_oxide or pdfplumber
 
 [parser.image_artifacts]
 max_images_per_source = 512

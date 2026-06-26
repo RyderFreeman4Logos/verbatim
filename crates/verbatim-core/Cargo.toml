@@ -28,7 +28,7 @@ futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 pdf_oxide = { version = "0.3", optional = true }
 pdfplumber = { version = "0.2", optional = true }
-lopdf = { version = "0.34", default-features = false, features = ["nom_parser"], optional = true }
+lopdf = { version = "0.42", default-features = false, optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 pulldown-cmark = "0.12"
 instant-distance = "0.6"

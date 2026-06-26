@@ -28,6 +28,10 @@ use crate::index::hnsw::HnswIndex;
 use crate::index::qdrant::{records_from_store_for_profile, QdrantClient};
 use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::index_gc::{apply_index_gc, IndexGcPolicy};
+use crate::index_profile_delete::{
+    apply_index_profile_delete, plan_index_profile_delete, IndexProfileDeleteApplyReport,
+    IndexProfileDeletePlan,
+};
 use crate::ocr::{
     configured_ocr_provider, ocr_evidence_from_output, ocr_profile_stale, ocr_required_pages,
     pdf_scan_summary, source_ingest_diagnostics, OcrPageRequest, OcrProvider,
@@ -418,6 +422,37 @@ where
 
     pub fn active_embedding_profile_id(&self) -> &EmbeddingProfileId {
         &self.active_profile_id
+    }
+
+    pub fn plan_embedding_profile_delete(
+        &self,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<IndexProfileDeletePlan> {
+        plan_index_profile_delete(
+            &self.data_dir,
+            &self.store,
+            profile_id,
+            &self.active_profile_id,
+        )
+    }
+
+    pub fn delete_embedding_profile_index_data(
+        &mut self,
+        profile_id: &EmbeddingProfileId,
+        allow_active: bool,
+    ) -> Result<(IndexProfileDeletePlan, IndexProfileDeleteApplyReport)> {
+        let result = apply_index_profile_delete(
+            &self.data_dir,
+            &self.store,
+            profile_id,
+            &self.active_profile_id,
+            allow_active,
+        )?;
+        if self.loaded_profile_id == *profile_id || self.active_profile_id == *profile_id {
+            self.hnsw.clear();
+            self.loaded_profile_id = profile_id.clone();
+        }
+        Ok(result)
     }
 
     pub fn active_ocr_profile(&self) -> Option<crate::types::OcrProfile> {
