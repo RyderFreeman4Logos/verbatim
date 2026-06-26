@@ -190,6 +190,16 @@ pub struct EmbeddingConfig {
     pub dimension: usize,
     #[serde(default = "default_normalize_embeddings")]
     pub normalize: bool,
+    #[serde(default)]
+    pub context_window_tokens: Option<usize>,
+    #[serde(default)]
+    pub served_model: Option<String>,
+    #[serde(default)]
+    pub dtype: Option<String>,
+    #[serde(default)]
+    pub quantization: Option<String>,
+    #[serde(default)]
+    pub weight_identity: Option<String>,
     #[serde(default = "default_query_instruction")]
     pub query_instruction: String,
     #[serde(default)]
@@ -216,6 +226,11 @@ impl Default for EmbeddingConfig {
             model: default_embedding_model(),
             dimension: default_dimension(),
             normalize: true,
+            context_window_tokens: None,
+            served_model: None,
+            dtype: None,
+            quantization: None,
+            weight_identity: None,
             query_instruction: default_query_instruction(),
             document_instruction: String::new(),
             batch_size: default_batch_size(),
@@ -249,6 +264,16 @@ impl<'de> Deserialize<'de> for EmbeddingConfig {
             #[serde(default)]
             normalize: Option<bool>,
             #[serde(default)]
+            context_window_tokens: Option<usize>,
+            #[serde(default)]
+            served_model: Option<String>,
+            #[serde(default)]
+            dtype: Option<String>,
+            #[serde(default)]
+            quantization: Option<String>,
+            #[serde(default)]
+            weight_identity: Option<String>,
+            #[serde(default)]
             query_instruction: Option<String>,
             #[serde(default)]
             document_instruction: Option<String>,
@@ -276,6 +301,11 @@ impl<'de> Deserialize<'de> for EmbeddingConfig {
             model: raw.model.unwrap_or_else(default_embedding_model),
             dimension: raw.dimension.unwrap_or_else(default_dimension),
             normalize: raw.normalize.unwrap_or_else(default_normalize_embeddings),
+            context_window_tokens: raw.context_window_tokens,
+            served_model: raw.served_model,
+            dtype: raw.dtype,
+            quantization: raw.quantization,
+            weight_identity: raw.weight_identity,
             query_instruction: raw
                 .query_instruction
                 .unwrap_or_else(default_query_instruction),

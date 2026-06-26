@@ -743,6 +743,18 @@ mod tests {
             model: "test-model",
             dimension: 2,
             normalize: true,
+            endpoint_identity: None,
+            requested_model: None,
+            served_model: None,
+            max_context_tokens: None,
+            dtype: None,
+            quantization: None,
+            weight_identity: None,
+            chunker_version: "parent-child-v2",
+            child_target_tokens: 300,
+            child_overlap_tokens: 80,
+            parent_children_count: 5,
+            embedding_input_budget_tokens: None,
             query_instruction: "",
             document_instruction: "",
         }
@@ -753,10 +765,12 @@ mod tests {
         store
             .ensure_embedding_profile(&profile, test_profile_config())
             .unwrap();
-        for _ in 0..generation {
+        let mut current = store.index_generation_for_profile(&profile).unwrap();
+        while current < generation {
             store
                 .replace_all_vector_documents_for_profile(&profile, &[])
                 .unwrap();
+            current = store.index_generation_for_profile(&profile).unwrap();
         }
         assert_eq!(
             store.index_generation_for_profile(&profile).unwrap(),

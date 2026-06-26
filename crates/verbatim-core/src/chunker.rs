@@ -10,6 +10,7 @@ const DEFAULT_CHILD_OVERLAP: usize = 80;
 const DEFAULT_PARENT_CHILDREN: usize = 5;
 const CHARS_PER_TOKEN: usize = 4;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkerConfig {
     pub child_target_tokens: usize,
     pub child_overlap_tokens: usize,

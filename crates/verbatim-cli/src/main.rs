@@ -11,7 +11,10 @@ use verbatim_core::api::{
     IndexProfileDeleteRequest, ReindexRequest, RetrieveRequest,
 };
 #[cfg(test)]
-use verbatim_core::api::{IndexGcResponse, IndexProfileDeleteResponse};
+use verbatim_core::api::{
+    ChunkingProfileStatusResponse, EmbeddingCapabilityStatusResponse, IndexGcResponse,
+    IndexProfileDeleteResponse, IndexStatusResponse,
+};
 
 mod client;
 mod local;
@@ -514,6 +517,10 @@ where
     C: DaemonClient,
 {
     match command {
+        IndexCommand::Status => {
+            let response = client.index_status()?;
+            render::write_index_status(stdout, &response)?;
+        }
         IndexCommand::Gc { dry_run } => {
             let response = client.index_gc(&IndexGcRequest { dry_run })?;
             render::write_index_gc(stdout, &response)?;
@@ -1493,6 +1500,9 @@ enum CollectionWatchCommand {
 
 #[derive(Debug, Subcommand)]
 enum IndexCommand {
+    /// Show active embedding profile capability and chunking status.
+    #[command(about = "Show active embedding profile capability and chunking status.")]
+    Status,
     /// Garbage collect old index generations and stale staging directories.
     #[command(
         about = "Garbage collect old index generations and stale staging directories.",
@@ -1981,6 +1991,23 @@ mod tests {
     }
 
     #[test]
+    fn source_check_reports_profile_status_diagnostics() {
+        let (code, stdout, stderr, client, _) = run_mock(["source", "check"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["check_sources"]);
+        assert!(stdout.contains("Stale sources:"));
+        assert!(stdout.contains("src-1"));
+        assert!(stdout.contains("Embedding profile:"));
+        assert!(stdout.contains("served_model: text-embedding-3-small@2026-06"));
+        assert!(stdout.contains("chunking:"));
+        assert!(stdout.contains("embedding_input_budget_tokens: 7168"));
+        assert!(stdout
+            .contains("context window grew from 4096 to 8192; reindex is optional for quality"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
     fn index_gc_dry_run_calls_daemon_and_reports_plan() {
         let (code, stdout, stderr, client, _) = run_mock(["index", "gc", "--dry-run"]);
 
@@ -1991,6 +2018,22 @@ mod tests {
         assert!(stdout.contains("Planned removals:"));
         assert!(stdout.contains("kind=generation profile=default generation=1"));
         assert!(stdout.contains("Skipped:"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn index_status_calls_daemon_and_reports_capability_fingerprint() {
+        let (code, stdout, stderr, client, _) = run_mock(["index", "status"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(client.calls.borrow().as_slice(), ["index_status"]);
+        assert!(stdout.contains("Index status:"));
+        assert!(stdout.contains("active_profile_id: openai:text-embedding-3-small"));
+        assert!(stdout.contains("served_model: text-embedding-3-small@2026-06"));
+        assert!(stdout.contains("quantization: fp16"));
+        assert!(stdout.contains("embedding_input_budget_tokens: 7168"));
+        assert!(stdout
+            .contains("context window grew from 4096 to 8192; reindex is optional for quality"));
         assert!(stderr.is_empty());
     }
 
@@ -2843,6 +2886,7 @@ mod tests {
             self.calls.borrow_mut().push("check_sources".into());
             Ok(CheckStaleResponse {
                 stale: vec!["src-1".into()],
+                profile_status: Some(sample_index_status_response()),
             })
         }
 
@@ -3007,6 +3051,11 @@ mod tests {
             Ok(TaskCreatedResponse {
                 task_id: "task-1".into(),
             })
+        }
+
+        fn index_status(&self) -> client::CliResult<IndexStatusResponse> {
+            self.calls.borrow_mut().push("index_status".into());
+            Ok(sample_index_status_response())
         }
 
         fn index_gc(&self, request: &IndexGcRequest) -> client::CliResult<IndexGcResponse> {
@@ -3252,6 +3301,39 @@ mod tests {
             scanned_roots: 1,
             max_depth: 32,
             skipped: Vec::new(),
+        }
+    }
+
+    fn sample_index_status_response() -> IndexStatusResponse {
+        IndexStatusResponse {
+            embedding_enabled: true,
+            active_profile_id: "openai:text-embedding-3-small".into(),
+            source_count: 4,
+            stale_source_count: 1,
+            stale_source_ids: vec!["src-1".into()],
+            capability: EmbeddingCapabilityStatusResponse {
+                provider: "openai-compatible".into(),
+                model: "text-embedding-3-small".into(),
+                dimension: 1536,
+                normalize: true,
+                endpoint_identity: Some("https://embeddings.local/v1".into()),
+                requested_model: Some("text-embedding-3-small".into()),
+                served_model: Some("text-embedding-3-small@2026-06".into()),
+                max_context_tokens: Some(8192),
+                dtype: Some("float16".into()),
+                quantization: Some("fp16".into()),
+                weight_identity: Some("sha256:weights".into()),
+            },
+            chunking: ChunkingProfileStatusResponse {
+                version: "markdown-v1".into(),
+                child_target_tokens: 512,
+                child_overlap_tokens: 64,
+                parent_children_count: 4,
+                embedding_input_budget_tokens: Some(7168),
+            },
+            messages: vec![
+                "context window grew from 4096 to 8192; reindex is optional for quality".into(),
+            ],
         }
     }
 

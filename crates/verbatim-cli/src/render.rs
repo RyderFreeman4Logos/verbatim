@@ -4,8 +4,9 @@ use serde_json::Value;
 use verbatim_core::api::{
     AskResponse, CheckStaleResponse, CitationResponse, CollectionFilterResponse,
     CollectionResultProvenance, CollectionWatcherStatus, ConfigResponse, EvidenceResponse,
-    HealthResponse, IndexGcResponse, IndexProfileDeleteResponse, IngestResponse, ReindexResponse,
-    RetrieveResponse, SourceResponse, TaskCreatedResponse, TaskWaitEvent,
+    HealthResponse, IndexGcResponse, IndexProfileDeleteResponse, IndexStatusResponse,
+    IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse, TaskCreatedResponse,
+    TaskWaitEvent,
 };
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::index_gc::{IndexGcPlanEntry, IndexGcSkippedEntry};
@@ -275,11 +276,186 @@ where
     W: Write,
 {
     if response.stale.is_empty() {
-        return writeln!(writer, "No stale sources.");
+        writeln!(writer, "No stale sources.")?;
+    } else {
+        writeln!(writer, "Stale sources:")?;
+        for id in &response.stale {
+            writeln!(writer, "  {id}")?;
+        }
     }
-    writeln!(writer, "Stale sources:")?;
-    for id in &response.stale {
-        writeln!(writer, "  {id}")?;
+    if let Some(status) = &response.profile_status {
+        write_index_status_summary(writer, status)?;
+        write_index_status_messages(writer, status)?;
+    }
+    Ok(())
+}
+
+pub fn write_index_status<W>(writer: &mut W, response: &IndexStatusResponse) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Index status:")?;
+    writeln!(
+        writer,
+        "  embedding_enabled: {}",
+        response.embedding_enabled
+    )?;
+    writeln!(
+        writer,
+        "  active_profile_id: {}",
+        response.active_profile_id
+    )?;
+    writeln!(writer, "  source_count: {}", response.source_count)?;
+    writeln!(
+        writer,
+        "  stale_source_count: {}",
+        response.stale_source_count
+    )?;
+    if !response.stale_source_ids.is_empty() {
+        writeln!(
+            writer,
+            "  stale_source_ids: {}",
+            response.stale_source_ids.join(", ")
+        )?;
+    }
+    writeln!(writer, "  capability:")?;
+    writeln!(writer, "    provider: {}", response.capability.provider)?;
+    writeln!(writer, "    model: {}", response.capability.model)?;
+    writeln!(writer, "    dimension: {}", response.capability.dimension)?;
+    writeln!(writer, "    normalize: {}", response.capability.normalize)?;
+    write_optional_field(
+        writer,
+        "    endpoint_identity",
+        response.capability.endpoint_identity.as_deref(),
+    )?;
+    write_optional_field(
+        writer,
+        "    requested_model",
+        response.capability.requested_model.as_deref(),
+    )?;
+    write_optional_field(
+        writer,
+        "    served_model",
+        response.capability.served_model.as_deref(),
+    )?;
+    write_optional_usize_field(
+        writer,
+        "    max_context_tokens",
+        response.capability.max_context_tokens,
+    )?;
+    write_optional_field(writer, "    dtype", response.capability.dtype.as_deref())?;
+    write_optional_field(
+        writer,
+        "    quantization",
+        response.capability.quantization.as_deref(),
+    )?;
+    write_optional_field(
+        writer,
+        "    weight_identity",
+        response.capability.weight_identity.as_deref(),
+    )?;
+    writeln!(writer, "  chunking:")?;
+    writeln!(writer, "    version: {}", response.chunking.version)?;
+    writeln!(
+        writer,
+        "    child_target_tokens: {}",
+        response.chunking.child_target_tokens
+    )?;
+    writeln!(
+        writer,
+        "    child_overlap_tokens: {}",
+        response.chunking.child_overlap_tokens
+    )?;
+    writeln!(
+        writer,
+        "    parent_children_count: {}",
+        response.chunking.parent_children_count
+    )?;
+    write_optional_usize_field(
+        writer,
+        "    embedding_input_budget_tokens",
+        response.chunking.embedding_input_budget_tokens,
+    )?;
+    write_index_status_messages(writer, response)
+}
+
+fn write_index_status_messages<W>(
+    writer: &mut W,
+    response: &IndexStatusResponse,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if response.messages.is_empty() {
+        return Ok(());
+    }
+    writeln!(writer, "  diagnostics:")?;
+    for message in &response.messages {
+        writeln!(writer, "    - {message}")?;
+    }
+    Ok(())
+}
+
+fn write_index_status_summary<W>(
+    writer: &mut W,
+    response: &IndexStatusResponse,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Embedding profile:")?;
+    writeln!(
+        writer,
+        "  active_profile_id: {}",
+        response.active_profile_id
+    )?;
+    writeln!(writer, "  provider: {}", response.capability.provider)?;
+    writeln!(writer, "  model: {}", response.capability.model)?;
+    write_optional_field(
+        writer,
+        "  served_model",
+        response.capability.served_model.as_deref(),
+    )?;
+    write_optional_usize_field(
+        writer,
+        "  max_context_tokens",
+        response.capability.max_context_tokens,
+    )?;
+    write_optional_field(writer, "  dtype", response.capability.dtype.as_deref())?;
+    write_optional_field(
+        writer,
+        "  quantization",
+        response.capability.quantization.as_deref(),
+    )?;
+    writeln!(writer, "  chunking:")?;
+    writeln!(writer, "    version: {}", response.chunking.version)?;
+    write_optional_usize_field(
+        writer,
+        "    embedding_input_budget_tokens",
+        response.chunking.embedding_input_budget_tokens,
+    )
+}
+
+fn write_optional_field<W>(writer: &mut W, name: &str, value: Option<&str>) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if let Some(value) = value {
+        writeln!(writer, "{name}: {value}")?;
+    }
+    Ok(())
+}
+
+fn write_optional_usize_field<W>(
+    writer: &mut W,
+    name: &str,
+    value: Option<usize>,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if let Some(value) = value {
+        writeln!(writer, "{name}: {value}")?;
     }
     Ok(())
 }

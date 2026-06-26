@@ -16,8 +16,8 @@ use crate::config::{
     VisionConfig,
 };
 use crate::traits::{
-    RerankCapabilityDiagnostics, RerankCapabilityState, RerankDiagnostics, RerankError,
-    RerankRequestDiagnostics, RerankResponse,
+    EmbeddingEndpointCapabilities, RerankCapabilityDiagnostics, RerankCapabilityState,
+    RerankDiagnostics, RerankError, RerankRequestDiagnostics, RerankResponse,
 };
 use crate::upstream::{
     capture_full_response, capture_response_prefix, sanitize_text, UpstreamRequestContext,
@@ -134,6 +134,20 @@ impl OpenAiCompatibleEmbeddingModel {
 
     pub fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    pub async fn endpoint_capabilities(&self) -> ProviderResult<EmbeddingEndpointCapabilities> {
+        let lookup = self.load_endpoint_capability(false).await;
+        let capability = lookup.value.as_ref();
+        Ok(EmbeddingEndpointCapabilities {
+            endpoint_identity: Some(normalized_endpoint_key(&self.endpoint.base_url)),
+            requested_model: Some(self.endpoint.model.clone()),
+            served_model: capability.and_then(|capability| capability.served_model.clone()),
+            max_context_tokens: capability.and_then(|capability| capability.max_context_tokens),
+            dtype: capability.and_then(|capability| capability.dtype.clone()),
+            quantization: capability.and_then(|capability| capability.quantization.clone()),
+            weight_identity: capability.and_then(|capability| capability.weight_identity.clone()),
+        })
     }
 
     pub fn prepare_query(&self, query: &str) -> String {
