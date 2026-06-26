@@ -920,7 +920,8 @@ impl Store {
         Ok(stale)
     }
 
-    fn source_vectors_stale_for_profile(
+    /// Return whether a source is missing fresh child vectors for an embedding profile.
+    pub fn source_vectors_stale_for_profile(
         &self,
         profile_id: &EmbeddingProfileId,
         source_id: &SourceId,
