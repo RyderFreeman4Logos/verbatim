@@ -46,7 +46,7 @@ use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingCacheStats, EmbeddingProfileId,
     EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
     GraphNodeKind, ImageArtifact, ImageId, ParsedImageArtifact, Source, SourceEmbeddingStatus,
-    SourceId, SourceLocator, SourceStatus,
+    SourceId, SourceLocator, SourceStatus, VectorIndexResidency,
 };
 use crate::vision_caption::{
     caption_derived_evidence, request_image_caption, vision_caption_prompt_hash, CaptionAttempt,
@@ -56,6 +56,7 @@ use crate::vision_caption::{
 pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     store: Store,
     hnsw: HnswIndex,
+    vector_residency: VectorIndexResidency,
     loaded_profile_id: EmbeddingProfileId,
     active_profile_id: EmbeddingProfileId,
     embedding_profile_spec: EmbeddingProfileSpec,
@@ -332,7 +333,12 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             embedding_profile_spec.as_store_config(),
         )?;
 
-        let hnsw = load_published_vector_index(data_dir, &store, &active_profile_id)?;
+        let hnsw = load_vector_index_for_residency(
+            config.vector_index.residency,
+            data_dir,
+            &store,
+            &active_profile_id,
+        )?;
 
         let context_gen = if config.context.enabled {
             Some(ContextGenerator::new(&config.chat))
@@ -353,6 +359,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         Ok(Self {
             store,
             hnsw,
+            vector_residency: config.vector_index.residency,
             loaded_profile_id: active_profile_id.clone(),
             active_profile_id,
             embedding_profile_spec,
@@ -420,6 +427,10 @@ where
         &self.hnsw
     }
 
+    pub fn vector_residency(&self) -> VectorIndexResidency {
+        self.vector_residency
+    }
+
     pub fn active_embedding_profile_id(&self) -> &EmbeddingProfileId {
         &self.active_profile_id
     }
@@ -478,7 +489,12 @@ where
         if self.loaded_profile_id == *profile_id {
             return Ok(());
         }
-        self.hnsw = load_published_vector_index(&self.data_dir, &self.store, profile_id)?;
+        self.hnsw = load_vector_index_for_residency(
+            self.vector_residency,
+            &self.data_dir,
+            &self.store,
+            profile_id,
+        )?;
         self.loaded_profile_id = profile_id.clone();
         Ok(())
     }
@@ -509,6 +525,7 @@ where
         Self {
             store,
             hnsw,
+            vector_residency: VectorIndexResidency::ResidentHnsw,
             loaded_profile_id: active_profile_id.clone(),
             active_profile_id,
             embedding_profile_spec,
@@ -2271,7 +2288,10 @@ where
                 return Err(err);
             }
         };
-        if self.loaded_profile_id == *profile_id || self.active_profile_id == *profile_id {
+        if self.vector_residency == VectorIndexResidency::LowMemory {
+            self.hnsw.clear();
+            self.loaded_profile_id = profile_id.clone();
+        } else if self.loaded_profile_id == *profile_id || self.active_profile_id == *profile_id {
             self.hnsw = prepared.hnsw;
             self.loaded_profile_id = profile_id.clone();
         }
@@ -2601,6 +2621,20 @@ fn configured_vision_model(config: &Config) -> (Option<Box<dyn VisionModel>>, St
         ))),
         model_name,
     )
+}
+
+fn load_vector_index_for_residency(
+    residency: VectorIndexResidency,
+    data_dir: &Path,
+    store: &Store,
+    profile_id: &EmbeddingProfileId,
+) -> Result<HnswIndex> {
+    match residency {
+        VectorIndexResidency::LowMemory => Ok(HnswIndex::new()),
+        VectorIndexResidency::ResidentHnsw => {
+            load_published_vector_index(data_dir, store, profile_id)
+        }
+    }
 }
 
 fn load_published_vector_index(
@@ -4495,6 +4529,7 @@ mod tests {
             parser: Default::default(),
             embedding: Default::default(),
             retrieval: Default::default(),
+            vector_index: Default::default(),
             graph: Default::default(),
             rerank: Default::default(),
             context: Default::default(),
@@ -4833,7 +4868,8 @@ mod tests {
     fn pipeline_loads_only_active_profile_index_until_profile_switch() {
         let tempdir = tempfile::tempdir().unwrap();
         let db_path = tempdir.path().join("verbatim.db");
-        let config = test_config();
+        let mut config = test_config();
+        config.vector_index.residency = VectorIndexResidency::ResidentHnsw;
         let alt_profile = EmbeddingProfileId::new("alt").unwrap();
         {
             let store = Store::new(&db_path).unwrap();

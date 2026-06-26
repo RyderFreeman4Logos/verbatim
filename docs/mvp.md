@@ -165,6 +165,9 @@ rrf_k = 60
 default_limit = 12
 default_page_size = 1
 
+[vector_index]
+residency = "low_memory" # or "resident_hnsw" for faster queries with higher RAM use
+
 [chat]
 enabled = true
 provider = "openai_compatible"
@@ -179,6 +182,10 @@ enabled = true
 
 If your model server expects a key, set the `api_key` field for that role. The
 daemon redacts secret-like fields in `verbatim config show`.
+Dense retrieval defaults to low-memory residency: the daemon keeps vectors in
+SQLite and scans them at query time instead of loading the complete local HNSW
+index. Set `[vector_index] residency = "resident_hnsw"` when lower query latency
+is worth the extra resident memory.
 
 ## Daemon
 

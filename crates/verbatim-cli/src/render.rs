@@ -1083,6 +1083,9 @@ where
 {
     writeln!(writer)?;
     writeln!(writer, "Retrieval Debug")?;
+    if let Some(path) = debug.get("dense_vector_path").and_then(Value::as_str) {
+        writeln!(writer, "Dense vector path: {path}")?;
+    }
     write_stage_hits(writer, "BM25 hits", debug.get("bm25_hits"))?;
     write_stage_hits(writer, "Dense hits", debug.get("dense_hits"))?;
     write_fused_hits(writer, debug.get("rrf_fused_hits"))?;

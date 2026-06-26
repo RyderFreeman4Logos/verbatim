@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1510,6 +1511,87 @@ impl Store {
         Ok(result)
     }
 
+    /// Search SQLite-stored vectors for one profile without building a resident vector index.
+    pub fn search_vector_documents_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        query: &[f32],
+        top_k: usize,
+        source_filter: Option<&HashSet<SourceId>>,
+    ) -> Result<Vec<(ChunkId, f32)>> {
+        if top_k == 0 || query.is_empty() {
+            return Ok(Vec::new());
+        }
+        if source_filter.is_some_and(HashSet::is_empty) {
+            return Ok(Vec::new());
+        }
+
+        let mut hits = Vec::new();
+        match source_filter {
+            Some(source_ids) => {
+                let mut source_ids = source_ids
+                    .iter()
+                    .map(|source_id| source_id.0.as_str())
+                    .collect::<Vec<_>>();
+                source_ids.sort_unstable();
+                let placeholders = vec!["?"; source_ids.len()].join(", ");
+                let sql = format!(
+                    "SELECT chunk_id, vector_json
+                     FROM chunk_vectors
+                     WHERE profile_id = ? AND source_id IN ({placeholders})
+                     ORDER BY source_id, chunk_id"
+                );
+                let mut params = Vec::with_capacity(source_ids.len() + 1);
+                params.push(profile_id.as_str().to_string());
+                params.extend(source_ids.into_iter().map(str::to_string));
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (chunk_id, vector_json) = row?;
+                    let vector = parse_stored_vector(&chunk_id, &vector_json)?;
+                    push_top_vector_hit(
+                        &mut hits,
+                        top_k,
+                        ChunkId(chunk_id),
+                        vector_search_score(query, &vector),
+                    );
+                }
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT chunk_id, vector_json
+                     FROM chunk_vectors
+                     WHERE profile_id = ?1
+                     ORDER BY source_id, chunk_id",
+                )?;
+                let rows = stmt.query_map(params![profile_id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (chunk_id, vector_json) = row?;
+                    let vector = parse_stored_vector(&chunk_id, &vector_json)?;
+                    push_top_vector_hit(
+                        &mut hits,
+                        top_k,
+                        ChunkId(chunk_id),
+                        vector_search_score(query, &vector),
+                    );
+                }
+            }
+        }
+
+        hits.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.0 .0.cmp(&right.0 .0))
+        });
+        Ok(hits)
+    }
+
     pub fn count_vector_documents_for_profile(
         &self,
         profile_id: &EmbeddingProfileId,
@@ -2684,6 +2766,54 @@ fn get_evidence_ids_for_chunk(conn: &Connection, chunk_id: &str) -> Result<Vec<E
         conn.prepare("SELECT evidence_unit_id FROM chunk_evidence WHERE chunk_id = ?1")?;
     let rows = stmt.query_map(params![chunk_id], |row| row.get::<_, String>(0))?;
     rows.map(|r| Ok(EvidenceId(r?))).collect()
+}
+
+fn parse_stored_vector(chunk_id: &str, vector_json: &str) -> Result<Vec<f32>> {
+    serde_json::from_str(vector_json)
+        .with_context(|| format!("parse stored vector for chunk {chunk_id}"))
+}
+
+fn vector_search_score(query: &[f32], vector: &[f32]) -> f32 {
+    let distance = query
+        .iter()
+        .zip(vector.iter())
+        .map(|(left, right)| (left - right) * (left - right))
+        .sum::<f32>()
+        .sqrt();
+    1.0 / (1.0 + distance)
+}
+
+fn push_top_vector_hit(
+    hits: &mut Vec<(ChunkId, f32)>,
+    top_k: usize,
+    chunk_id: ChunkId,
+    score: f32,
+) {
+    let candidate = (chunk_id, score);
+    if hits.len() < top_k {
+        hits.push(candidate);
+        return;
+    }
+
+    let Some((worst_index, worst_hit)) = hits.iter().enumerate().min_by(|(_, left), (_, right)| {
+        left.1
+            .partial_cmp(&right.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| right.0 .0.cmp(&left.0 .0))
+    }) else {
+        return;
+    };
+    if is_better_vector_hit(&candidate, worst_hit) {
+        hits[worst_index] = candidate;
+    }
+}
+
+fn is_better_vector_hit(left: &(ChunkId, f32), right: &(ChunkId, f32)) -> bool {
+    left.1
+        .partial_cmp(&right.1)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| right.0 .0.cmp(&left.0 .0))
+        == Ordering::Greater
 }
 
 fn replace_vector_documents_for_profile_tx(

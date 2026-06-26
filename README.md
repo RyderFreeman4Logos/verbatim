@@ -72,6 +72,12 @@ enabled = false
 ```
 
 ```toml
+# Local dense vector residency. low_memory is the default.
+[vector_index]
+residency = "low_memory" # or "resident_hnsw" for faster queries with higher RAM use
+```
+
+```toml
 # Dedicated reranker endpoint. The explicit endpoint/model auto-enable rerank.
 [rerank]
 strategy = "endpoint"
@@ -95,6 +101,10 @@ queries the lexical BM25 index without probing a default embedding endpoint. If
 `embedding.enabled = true`, the configured embedding endpoint is required and
 endpoint errors fail clearly. If `[rerank]` is absent, rerank stays disabled;
 `rerank.enabled = false` always overrides rerank endpoint or model fields.
+By default `[vector_index] residency = "low_memory"` keeps dense vectors in
+SQLite and scans them at query time; set `resident_hnsw` to load the published
+local HNSW index into the daemon for lower query latency on machines with enough
+RAM.
 
 Install and start the systemd user service:
 
