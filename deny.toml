@@ -7,6 +7,10 @@ db-path = ".git/cargo-deny-advisory-dbs"
 ignore = [
     # Transitive from reqwest -> rustls-pemfile. Archived crate, no upgrade path.
     "RUSTSEC-2025-0134",
+    # Transitive from optional parser-pdfplumber -> pdfplumber-parse.
+    # Keep the existing optional parser contract until upstream publishes a fixed
+    # pdfplumber-parse release; the default pdf_oxide parser uses lopdf >=0.42.
+    "RUSTSEC-2026-0187",
 ]
 
 [licenses]

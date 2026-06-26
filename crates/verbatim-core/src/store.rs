@@ -89,6 +89,16 @@ pub struct EmbeddingProfileIndexGeneration {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EmbeddingProfileStorageCounts {
+    pub chunk_vectors: u64,
+    pub embedding_cache_entries: u64,
+    pub source_embedding_statuses: u64,
+    pub embeddings_meta_entries: u64,
+    pub embedding_profile_index_meta_entries: u64,
+    pub embedding_profiles: u64,
+}
+
 impl Store {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -592,6 +602,102 @@ impl Store {
             });
         }
         Ok(generations)
+    }
+
+    pub fn embedding_profile_storage_counts(
+        &self,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<EmbeddingProfileStorageCounts> {
+        Ok(EmbeddingProfileStorageCounts {
+            chunk_vectors: self.count_embedding_profile_rows(
+                "SELECT COUNT(*) FROM chunk_vectors WHERE profile_id = ?1",
+                profile_id,
+            )?,
+            embedding_cache_entries: self.count_embedding_profile_rows(
+                "SELECT COUNT(*) FROM embedding_cache WHERE profile_id = ?1",
+                profile_id,
+            )?,
+            source_embedding_statuses: self.count_embedding_profile_rows(
+                "SELECT COUNT(*) FROM source_embedding_status WHERE profile_id = ?1",
+                profile_id,
+            )?,
+            embeddings_meta_entries: self.count_embedding_profile_rows(
+                "SELECT COUNT(*) FROM embeddings_meta WHERE profile_id = ?1",
+                profile_id,
+            )?,
+            embedding_profile_index_meta_entries: self.count_embedding_profile_rows(
+                "SELECT COUNT(*) FROM embedding_profile_index_meta WHERE profile_id = ?1",
+                profile_id,
+            )?,
+            embedding_profiles: self.count_embedding_profile_rows(
+                "SELECT COUNT(*) FROM embedding_profiles WHERE id = ?1",
+                profile_id,
+            )?,
+        })
+    }
+
+    pub fn delete_embedding_profile_index_data(
+        &self,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<EmbeddingProfileStorageCounts> {
+        let tx = self.conn.unchecked_transaction()?;
+        let counts = EmbeddingProfileStorageCounts {
+            chunk_vectors: tx
+                .execute(
+                    "DELETE FROM chunk_vectors WHERE profile_id = ?1",
+                    params![profile_id.as_str()],
+                )?
+                .try_into()
+                .unwrap_or_default(),
+            embedding_cache_entries: tx
+                .execute(
+                    "DELETE FROM embedding_cache WHERE profile_id = ?1",
+                    params![profile_id.as_str()],
+                )?
+                .try_into()
+                .unwrap_or_default(),
+            source_embedding_statuses: tx
+                .execute(
+                    "DELETE FROM source_embedding_status WHERE profile_id = ?1",
+                    params![profile_id.as_str()],
+                )?
+                .try_into()
+                .unwrap_or_default(),
+            embeddings_meta_entries: tx
+                .execute(
+                    "DELETE FROM embeddings_meta WHERE profile_id = ?1",
+                    params![profile_id.as_str()],
+                )?
+                .try_into()
+                .unwrap_or_default(),
+            embedding_profile_index_meta_entries: tx
+                .execute(
+                    "DELETE FROM embedding_profile_index_meta WHERE profile_id = ?1",
+                    params![profile_id.as_str()],
+                )?
+                .try_into()
+                .unwrap_or_default(),
+            embedding_profiles: tx
+                .execute(
+                    "DELETE FROM embedding_profiles WHERE id = ?1",
+                    params![profile_id.as_str()],
+                )?
+                .try_into()
+                .unwrap_or_default(),
+        };
+        tx.commit()?;
+        Ok(counts)
+    }
+
+    fn count_embedding_profile_rows(
+        &self,
+        query: &str,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row(query, params![profile_id.as_str()], |row| row.get(0))?;
+        Ok(count.try_into().unwrap_or_default())
     }
 
     pub fn update_source_status(&self, id: &SourceId, status: &SourceStatus) -> Result<()> {

@@ -5,13 +5,13 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
-#[cfg(test)]
-use verbatim_core::api::IndexGcResponse;
 use verbatim_core::api::{
     AddCollectionRootRequest, AskRequest, CollectionFilterRequest, CollectionSyncPathRequest,
     CollectionSyncRequest, CollectionWatcherUpdateRequest, CreateCollectionRequest, IndexGcRequest,
-    ReindexRequest, RetrieveRequest,
+    IndexProfileDeleteRequest, ReindexRequest, RetrieveRequest,
 };
+#[cfg(test)]
+use verbatim_core::api::{IndexGcResponse, IndexProfileDeleteResponse};
 
 mod client;
 mod local;
@@ -518,6 +518,20 @@ where
             let response = client.index_gc(&IndexGcRequest { dry_run })?;
             render::write_index_gc(stdout, &response)?;
         }
+        IndexCommand::DeleteProfile {
+            profile_id,
+            dry_run,
+            confirm,
+            allow_active,
+        } => {
+            let response = client.index_delete_profile(&IndexProfileDeleteRequest {
+                profile_id,
+                dry_run,
+                confirm,
+                allow_active,
+            })?;
+            render::write_index_profile_delete(stdout, &response)?;
+        }
     }
     Ok(0)
 }
@@ -836,6 +850,8 @@ events, last sync diff, last task id, and last error.
 const INDEX_AFTER_HELP: &str = r#"Examples:
   verbatim index gc --dry-run
   verbatim index gc
+  verbatim index delete-profile old-profile --dry-run
+  verbatim index delete-profile old-profile --confirm
 
 Index maintenance operates on daemon-managed index artifacts only.
 "#;
@@ -847,6 +863,17 @@ const INDEX_GC_AFTER_HELP: &str = r#"Examples:
 GC removes old per-profile gen-* index generations and stale staging-*
 directories according to [index_gc] policy. It does not delete sources, SQLite
 data, embedding cache, or image artifacts.
+"#;
+
+const INDEX_DELETE_PROFILE_AFTER_HELP: &str = r#"Examples:
+  verbatim index delete-profile old-profile --dry-run
+  verbatim index delete-profile old-profile --confirm
+  verbatim index delete-profile old-profile --confirm --allow-active
+
+Deletes profile-scoped vector/index/cache/status metadata and published HNSW
+artifacts for an obsolete embedding profile. It preserves sources, chunks,
+evidence, collections, and lexical SQLite FTS/BM25 data. Active profile deletion
+is refused unless --allow-active is passed.
 "#;
 
 const INGEST_AFTER_HELP: &str = r#"Examples:
@@ -1476,6 +1503,26 @@ enum IndexCommand {
         #[arg(long = "dry-run", action = ArgAction::SetTrue)]
         dry_run: bool,
     },
+    /// Delete obsolete embedding profile index metadata and artifacts.
+    #[command(
+        name = "delete-profile",
+        about = "Delete obsolete embedding profile index metadata and artifacts.",
+        after_help = INDEX_DELETE_PROFILE_AFTER_HELP
+    )]
+    DeleteProfile {
+        /// Embedding profile id to delete.
+        #[arg(value_name = "PROFILE_ID")]
+        profile_id: String,
+        /// Show what would be removed without deleting anything.
+        #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+        dry_run: bool,
+        /// Required for non-dry-run deletion.
+        #[arg(long = "confirm", action = ArgAction::SetTrue)]
+        confirm: bool,
+        /// Permit deleting the daemon's active embedding profile and clear resident vectors.
+        #[arg(long = "allow-active", action = ArgAction::SetTrue)]
+        allow_active: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1956,6 +2003,62 @@ mod tests {
         assert!(stdout.contains("Index GC:"));
         assert!(stdout.contains("removed: 1 artifact(s), 2.0KiB reclaimed"));
         assert!(stdout.contains("Removed artifacts:"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn index_delete_profile_dry_run_calls_daemon_and_reports_plan() {
+        let (code, stdout, stderr, client, _) =
+            run_mock(["index", "delete-profile", "old-profile", "--dry-run"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["index_delete_profile:old-profile:true:false:false"]
+        );
+        assert_eq!(
+            client.last_index_profile_delete.borrow().as_ref().unwrap(),
+            &IndexProfileDeleteRequest {
+                profile_id: "old-profile".into(),
+                dry_run: true,
+                confirm: false,
+                allow_active: false,
+            }
+        );
+        assert!(stdout.contains("Index profile delete dry-run"));
+        assert!(stdout.contains("profile: old-profile"));
+        assert!(stdout.contains("planned sqlite rows: chunk_vectors=2 embedding_cache=1"));
+        assert!(stdout.contains("artifact would remove"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn index_delete_profile_apply_requires_confirm_flag_payload() {
+        let (code, stdout, stderr, client, _) = run_mock([
+            "index",
+            "delete-profile",
+            "old-profile",
+            "--confirm",
+            "--allow-active",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["index_delete_profile:old-profile:false:true:true"]
+        );
+        assert_eq!(
+            client.last_index_profile_delete.borrow().as_ref().unwrap(),
+            &IndexProfileDeleteRequest {
+                profile_id: "old-profile".into(),
+                dry_run: false,
+                confirm: true,
+                allow_active: true,
+            }
+        );
+        assert!(stdout.contains("Index profile delete complete"));
+        assert!(stdout.contains("removed sqlite rows: chunk_vectors=2 embedding_cache=1"));
+        assert!(stdout.contains("Removed artifact directories:"));
         assert!(stderr.is_empty());
     }
 
@@ -2703,6 +2806,7 @@ mod tests {
         last_ask: RefCell<Option<AskRequest>>,
         last_retrieve: RefCell<Option<RetrieveRequest>>,
         last_reindex: RefCell<Option<ReindexRequest>>,
+        last_index_profile_delete: RefCell<Option<IndexProfileDeleteRequest>>,
         last_collection_create: RefCell<Option<CreateCollectionRequest>>,
         last_collection_root: RefCell<Option<AddCollectionRootRequest>>,
         last_collection_sync: RefCell<Option<CollectionSyncRequest>>,
@@ -2910,6 +3014,19 @@ mod tests {
                 .borrow_mut()
                 .push(format!("index_gc:{}", request.dry_run));
             Ok(sample_index_gc_response(request.dry_run))
+        }
+
+        fn index_delete_profile(
+            &self,
+            request: &IndexProfileDeleteRequest,
+        ) -> client::CliResult<IndexProfileDeleteResponse> {
+            self.calls.borrow_mut().push(format!(
+                "index_delete_profile:{}:{}:{}:{}",
+                request.profile_id, request.dry_run, request.confirm, request.allow_active
+            ));
+            self.last_index_profile_delete
+                .replace(Some(request.clone()));
+            Ok(sample_index_profile_delete_response(request.dry_run))
         }
 
         fn get_task(&self, task_id: &str) -> client::CliResult<TaskSummaryResponse> {
@@ -3171,6 +3288,42 @@ mod tests {
                 verbatim_core::index_gc::IndexGcApplyReport {
                     removed: vec![entry.clone()],
                     reclaimed_bytes: entry.approximate_bytes,
+                }
+            },
+        }
+    }
+
+    fn sample_index_profile_delete_response(dry_run: bool) -> IndexProfileDeleteResponse {
+        let sqlite = verbatim_core::store::EmbeddingProfileStorageCounts {
+            chunk_vectors: 2,
+            embedding_cache_entries: 1,
+            source_embedding_statuses: 3,
+            embeddings_meta_entries: 2,
+            embedding_profile_index_meta_entries: 1,
+            embedding_profiles: 1,
+        };
+        let artifact = verbatim_core::index_profile_delete::IndexProfileArtifactPlan {
+            path: PathBuf::from("/tmp/verbatim/indexes/profiles/old-profile"),
+            approximate_bytes: 4096,
+            reason: "profile-scoped published vector artifacts are obsolete".into(),
+        };
+        IndexProfileDeleteResponse {
+            dry_run,
+            plan: verbatim_core::index_profile_delete::IndexProfileDeletePlan {
+                profile_id: "old-profile".into(),
+                active_profile: false,
+                sqlite,
+                artifact: Some(artifact.clone()),
+                skipped: Vec::new(),
+                approximate_reclaim_bytes: artifact.approximate_bytes,
+            },
+            apply: if dry_run {
+                verbatim_core::index_profile_delete::IndexProfileDeleteApplyReport::default()
+            } else {
+                verbatim_core::index_profile_delete::IndexProfileDeleteApplyReport {
+                    sqlite,
+                    removed_artifacts: vec![artifact.clone()],
+                    reclaimed_bytes: artifact.approximate_bytes,
                 }
             },
         }

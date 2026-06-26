@@ -31,9 +31,10 @@ use verbatim_core::api::{
     CollectionWatcherResponse, CollectionWatcherStatus, CollectionWatcherUpdateRequest,
     CollectionWatchersStatusResponse, ConfigResponse, CreateCollectionRequest, ErrorResponse,
     EvidenceResponse, HealthResponse, ImageArtifactResponse, IndexGcRequest, IndexGcResponse,
-    IngestResponse, ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest,
-    RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
-    TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
+    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IngestResponse, ReindexRequest,
+    ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
+    RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
+    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -436,10 +437,64 @@ async fn index_gc(
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
     Ok(Json(IndexGcResponse {
         dry_run,
         policy: policy_config,
+        plan,
+        apply,
+    }))
+}
+
+async fn index_delete_profile(
+    State(state): State<SharedState>,
+    Json(req): Json<IndexProfileDeleteRequest>,
+) -> Result<Json<IndexProfileDeleteResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let profile_id = EmbeddingProfileId::new(req.profile_id.clone())
+        .map_err(|error| err(StatusCode::BAD_REQUEST, anyhow::anyhow!(error)))?;
+    if !req.dry_run && !req.confirm {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("index profile delete requires confirm=true unless dry_run=true"),
+        ));
+    }
+    if !req.dry_run && !req.allow_active {
+        let pipeline = state.pipeline.lock().map_err(|error| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                anyhow::anyhow!("{error}"),
+            )
+        })?;
+        if *pipeline.active_embedding_profile_id() == profile_id {
+            return Err(err(
+                StatusCode::CONFLICT,
+                anyhow::anyhow!(
+                    "refusing to delete active embedding profile {}; pass allow_active=true to clear active profile artifacts",
+                    profile_id
+                ),
+            ));
+        }
+    }
+
+    let state = Arc::clone(&state);
+    let dry_run = req.dry_run;
+    let allow_active = req.allow_active;
+    let (plan, apply) = tokio::task::spawn_blocking(move || {
+        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        if dry_run {
+            let plan = pipeline.plan_embedding_profile_delete(&profile_id)?;
+            Ok::<_, anyhow::Error>((
+                plan,
+                verbatim_core::index_profile_delete::IndexProfileDeleteApplyReport::default(),
+            ))
+        } else {
+            pipeline.delete_embedding_profile_index_data(&profile_id, allow_active)
+        }
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(IndexProfileDeleteResponse {
+        dry_run,
         plan,
         apply,
     }))
@@ -5515,6 +5570,7 @@ async fn run_daemon() -> Result<()> {
         .route("/api/ingest/{id}", post(ingest_one))
         .route("/api/reindex", post(reindex))
         .route("/api/index/gc", post(index_gc))
+        .route("/api/index/profiles/delete", post(index_delete_profile))
         .route("/api/ask", post(ask))
         .route("/api/ask/stream", post(ask_stream))
         .route("/api/retrieve", post(retrieve))
@@ -7103,6 +7159,77 @@ mod tests {
         assert_eq!(applied.apply.removed.len(), 1);
         assert!(!old_generation.exists());
         assert!(current_generation.exists());
+    }
+
+    #[tokio::test]
+    async fn index_delete_profile_dry_run_and_apply_use_daemon_data_dir() {
+        let test_dir = TestDir::new("index-delete-profile");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let profile = EmbeddingProfileId::new("old-profile").unwrap();
+        pipeline
+            .store()
+            .ensure_embedding_profile(
+                &profile,
+                verbatim_core::store::EmbeddingProfileConfig {
+                    provider: "test",
+                    model: "old-model",
+                    dimension: 2,
+                    normalize: true,
+                    query_instruction: "",
+                    document_instruction: "",
+                },
+            )
+            .unwrap();
+        pipeline
+            .store()
+            .replace_all_vector_documents_for_profile(&profile, &[])
+            .unwrap();
+        let profile_root = test_dir
+            .path()
+            .join("indexes")
+            .join("profiles")
+            .join("old-profile");
+        fs::create_dir_all(profile_root.join("gen-1")).unwrap();
+        fs::write(profile_root.join("gen-1").join("vectors.hnsw"), b"old").unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let Json(dry_run) = index_delete_profile(
+            State(Arc::clone(&state)),
+            Json(IndexProfileDeleteRequest {
+                profile_id: "old-profile".into(),
+                dry_run: true,
+                confirm: false,
+                allow_active: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dry_run.plan.artifact.is_some());
+        assert!(profile_root.exists());
+
+        let Json(applied) = index_delete_profile(
+            State(Arc::clone(&state)),
+            Json(IndexProfileDeleteRequest {
+                profile_id: "old-profile".into(),
+                dry_run: false,
+                confirm: true,
+                allow_active: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied.apply.removed_artifacts.len(), 1);
+        assert_eq!(applied.apply.sqlite.embedding_profile_index_meta_entries, 1);
+        assert!(!profile_root.exists());
+        let counts = state
+            .pipeline
+            .lock()
+            .unwrap()
+            .store()
+            .embedding_profile_storage_counts(&profile)
+            .unwrap();
+        assert_eq!(counts.embedding_profile_index_meta_entries, 0);
     }
 
     #[tokio::test]

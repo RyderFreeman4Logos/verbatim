@@ -4,8 +4,8 @@ use serde_json::Value;
 use verbatim_core::api::{
     AskResponse, CheckStaleResponse, CitationResponse, CollectionFilterResponse,
     CollectionResultProvenance, CollectionWatcherStatus, ConfigResponse, EvidenceResponse,
-    HealthResponse, IndexGcResponse, IngestResponse, ReindexResponse, RetrieveResponse,
-    SourceResponse, TaskCreatedResponse, TaskWaitEvent,
+    HealthResponse, IndexGcResponse, IndexProfileDeleteResponse, IngestResponse, ReindexResponse,
+    RetrieveResponse, SourceResponse, TaskCreatedResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::index_gc::{IndexGcPlanEntry, IndexGcSkippedEntry};
@@ -351,6 +351,93 @@ where
         writeln!(writer, "Skipped:")?;
         for entry in &response.plan.skipped {
             write_index_gc_skipped(writer, entry)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn write_index_profile_delete<W>(
+    writer: &mut W,
+    response: &IndexProfileDeleteResponse,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    let heading = if response.dry_run {
+        "Index profile delete dry-run"
+    } else {
+        "Index profile delete complete"
+    };
+    writeln!(writer, "{heading}")?;
+    writeln!(writer, "  profile: {}", response.plan.profile_id)?;
+    writeln!(writer, "  active_profile: {}", response.plan.active_profile)?;
+    writeln!(
+        writer,
+        "  planned sqlite rows: chunk_vectors={} embedding_cache={} source_status={} embeddings_meta={} index_meta={} profiles={}",
+        response.plan.sqlite.chunk_vectors,
+        response.plan.sqlite.embedding_cache_entries,
+        response.plan.sqlite.source_embedding_statuses,
+        response.plan.sqlite.embeddings_meta_entries,
+        response.plan.sqlite.embedding_profile_index_meta_entries,
+        response.plan.sqlite.embedding_profiles,
+    )?;
+    writeln!(
+        writer,
+        "  planned artifacts: {} reclaimable",
+        format_bytes(response.plan.approximate_reclaim_bytes)
+    )?;
+    if !response.dry_run {
+        writeln!(
+            writer,
+            "  removed sqlite rows: chunk_vectors={} embedding_cache={} source_status={} embeddings_meta={} index_meta={} profiles={}",
+            response.apply.sqlite.chunk_vectors,
+            response.apply.sqlite.embedding_cache_entries,
+            response.apply.sqlite.source_embedding_statuses,
+            response.apply.sqlite.embeddings_meta_entries,
+            response.apply.sqlite.embedding_profile_index_meta_entries,
+            response.apply.sqlite.embedding_profiles,
+        )?;
+        writeln!(
+            writer,
+            "  removed artifacts: {} reclaimed",
+            format_bytes(response.apply.reclaimed_bytes)
+        )?;
+    }
+
+    if let Some(artifact) = &response.plan.artifact {
+        let action = if response.dry_run {
+            "would remove"
+        } else {
+            "planned"
+        };
+        writeln!(
+            writer,
+            "  artifact {action}: bytes={} path={}",
+            format_bytes(artifact.approximate_bytes),
+            artifact.path.display()
+        )?;
+        writeln!(writer, "    reason: {}", artifact.reason)?;
+    } else {
+        writeln!(writer, "No profile artifact directory found.")?;
+    }
+
+    if !response.dry_run && !response.apply.removed_artifacts.is_empty() {
+        writeln!(writer, "Removed artifact directories:")?;
+        for artifact in &response.apply.removed_artifacts {
+            writeln!(
+                writer,
+                "  bytes={} path={}",
+                format_bytes(artifact.approximate_bytes),
+                artifact.path.display()
+            )?;
+        }
+    }
+
+    if !response.plan.skipped.is_empty() {
+        writeln!(writer, "Skipped:")?;
+        for skipped in &response.plan.skipped {
+            writeln!(writer, "  path={}", skipped.path.display())?;
+            writeln!(writer, "    reason: {}", skipped.reason)?;
         }
     }
     Ok(())
