@@ -171,6 +171,53 @@ pub struct SourceResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckStaleResponse {
     pub stale: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_status: Option<IndexStatusResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexStatusResponse {
+    pub embedding_enabled: bool,
+    pub active_profile_id: String,
+    pub source_count: usize,
+    pub stale_source_count: usize,
+    pub stale_source_ids: Vec<String>,
+    pub capability: EmbeddingCapabilityStatusResponse,
+    pub chunking: ChunkingProfileStatusResponse,
+    #[serde(default)]
+    pub messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingCapabilityStatusResponse {
+    pub provider: String,
+    pub model: String,
+    pub dimension: usize,
+    pub normalize: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkingProfileStatusResponse {
+    pub version: String,
+    pub child_target_tokens: usize,
+    pub child_overlap_tokens: usize,
+    pub parent_children_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_input_budget_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

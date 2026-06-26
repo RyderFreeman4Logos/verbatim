@@ -8,6 +8,9 @@ use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::api::{
+    ChunkingProfileStatusResponse, EmbeddingCapabilityStatusResponse, IndexStatusResponse,
+};
 use crate::chunker::{
     chunk_evidence, deterministic_chunk_hash, estimate_tokens, ChunkOutput, ChunkerConfig,
     CHUNKER_VERSION,
@@ -39,9 +42,15 @@ use crate::ocr::{
 use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
-use crate::store::{EmbeddingCacheEntry, EmbeddingProfileConfig, SourceContentsReplacement, Store};
+use crate::store::{
+    EmbeddingCacheEntry, EmbeddingProfileConfig, SourceContentsReplacement, Store,
+    StoredEmbeddingProfileConfig,
+};
 use crate::task::{PhaseTiming, TaskEndpointSummary, TaskId, TaskProgressSnapshot, TaskStatus};
-use crate::traits::{EmbeddingClient, LexicalIndex, Parser, VectorDocument, VectorIndex};
+use crate::traits::{
+    EmbeddingClient, EmbeddingEndpointCapabilities, LexicalIndex, Parser, VectorDocument,
+    VectorIndex,
+};
 use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingCacheStats, EmbeddingProfileId,
     EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
@@ -68,6 +77,8 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     graph_extraction_config: GraphExtractionConfig,
     #[cfg(feature = "qdrant")]
     qdrant: Option<QdrantClient>,
+    #[cfg(feature = "qdrant")]
+    pending_qdrant_profile_syncs: Vec<EmbeddingProfileId>,
     vision_caption_model: String,
     vision_caption_prompt_hash: String,
     ocr_provider: Option<Box<dyn OcrProvider>>,
@@ -127,17 +138,139 @@ struct EmbeddingProfileSpec {
     model: String,
     dimension: usize,
     normalize: bool,
+    endpoint_identity: Option<String>,
+    requested_model: Option<String>,
+    served_model: Option<String>,
+    max_context_tokens: Option<usize>,
+    dtype: Option<String>,
+    quantization: Option<String>,
+    weight_identity: Option<String>,
+    chunker_config: ChunkerConfig,
+    embedding_input_budget_tokens: Option<usize>,
     query_instruction: String,
     document_instruction: String,
 }
 
 impl EmbeddingProfileSpec {
+    fn from_config(config: &crate::config::EmbeddingConfig) -> Self {
+        let mut spec = Self {
+            provider: config.provider.clone(),
+            model: config.model.clone(),
+            dimension: config.dimension,
+            normalize: config.normalize,
+            endpoint_identity: sanitized_endpoint_identity(&config.base_url),
+            requested_model: trimmed_optional_string(Some(&config.model)),
+            served_model: trimmed_optional_string(config.served_model.as_deref()),
+            max_context_tokens: config.context_window_tokens,
+            dtype: lowercase_optional_string(config.dtype.as_deref()),
+            quantization: lowercase_optional_string(config.quantization.as_deref()),
+            weight_identity: trimmed_optional_string(config.weight_identity.as_deref()),
+            chunker_config: ChunkerConfig::default(),
+            embedding_input_budget_tokens: None,
+            query_instruction: config.query_instruction.clone(),
+            document_instruction: config.document_instruction.clone(),
+        };
+        spec.recompute_chunking_policy();
+        spec
+    }
+
+    fn apply_endpoint_capabilities(&mut self, capabilities: EmbeddingEndpointCapabilities) {
+        self.endpoint_identity = capabilities
+            .endpoint_identity
+            .and_then(|value| sanitized_endpoint_identity(&value))
+            .or_else(|| self.endpoint_identity.clone());
+        self.requested_model = trimmed_optional_string(capabilities.requested_model.as_deref())
+            .or_else(|| self.requested_model.clone());
+        self.served_model = trimmed_optional_string(capabilities.served_model.as_deref())
+            .or_else(|| self.served_model.clone());
+        self.max_context_tokens = capabilities.max_context_tokens.or(self.max_context_tokens);
+        self.dtype =
+            lowercase_optional_string(capabilities.dtype.as_deref()).or_else(|| self.dtype.clone());
+        self.quantization = lowercase_optional_string(capabilities.quantization.as_deref())
+            .or_else(|| self.quantization.clone());
+        self.weight_identity = trimmed_optional_string(capabilities.weight_identity.as_deref())
+            .or_else(|| self.weight_identity.clone());
+        self.recompute_chunking_policy();
+    }
+
+    fn apply_stored_profile_config(&mut self, stored: &StoredEmbeddingProfileConfig) {
+        self.endpoint_identity = self
+            .endpoint_identity
+            .clone()
+            .or_else(|| stored.endpoint_identity.clone());
+        self.requested_model = self
+            .requested_model
+            .clone()
+            .or_else(|| stored.requested_model.clone());
+        self.served_model = self
+            .served_model
+            .clone()
+            .or_else(|| stored.served_model.clone());
+        let preserve_stored_chunking = self.max_context_tokens.is_none()
+            && (stored.max_context_tokens.is_some()
+                || stored.embedding_input_budget_tokens.is_some());
+        self.max_context_tokens = self.max_context_tokens.or(stored.max_context_tokens);
+        self.dtype = self.dtype.clone().or_else(|| stored.dtype.clone());
+        self.quantization = self
+            .quantization
+            .clone()
+            .or_else(|| stored.quantization.clone());
+        self.weight_identity = self
+            .weight_identity
+            .clone()
+            .or_else(|| stored.weight_identity.clone());
+        if preserve_stored_chunking {
+            self.chunker_config = ChunkerConfig {
+                child_target_tokens: stored.child_target_tokens,
+                child_overlap_tokens: stored.child_overlap_tokens,
+                parent_children_count: stored.parent_children_count,
+            };
+            self.embedding_input_budget_tokens = stored.embedding_input_budget_tokens;
+        } else {
+            self.recompute_chunking_policy();
+        }
+    }
+
+    fn recompute_chunking_policy(&mut self) {
+        let default = ChunkerConfig::default();
+        let budget = self.max_context_tokens.map(safe_embedding_input_budget);
+        let child_target_tokens = budget
+            .map(|budget| default.child_target_tokens.min(budget.max(1)))
+            .unwrap_or(default.child_target_tokens)
+            .max(1);
+        let child_overlap_tokens = if budget.is_some() {
+            default
+                .child_overlap_tokens
+                .min(child_target_tokens.saturating_div(4).max(1))
+        } else {
+            default.child_overlap_tokens
+        };
+        self.chunker_config = ChunkerConfig {
+            child_target_tokens,
+            child_overlap_tokens,
+            parent_children_count: default.parent_children_count,
+        };
+        self.embedding_input_budget_tokens = budget;
+    }
+
     fn as_store_config(&self) -> EmbeddingProfileConfig<'_> {
         EmbeddingProfileConfig {
             provider: &self.provider,
             model: &self.model,
             dimension: self.dimension,
             normalize: self.normalize,
+            endpoint_identity: self.endpoint_identity.as_deref(),
+            requested_model: self.requested_model.as_deref(),
+            served_model: self.served_model.as_deref(),
+            max_context_tokens: self.max_context_tokens,
+            dtype: self.dtype.as_deref(),
+            quantization: self.quantization.as_deref(),
+            weight_identity: self.weight_identity.as_deref(),
+            chunker_version: CHUNKER_VERSION,
+            child_target_tokens: self.chunker_config.child_target_tokens,
+            child_overlap_tokens: self.chunker_config.child_overlap_tokens,
+            parent_children_count: self.chunker_config.parent_children_count,
+            embedding_input_budget_tokens: self.embedding_input_budget_tokens,
             query_instruction: &self.query_instruction,
             document_instruction: &self.document_instruction,
         }
@@ -146,6 +279,64 @@ impl EmbeddingProfileSpec {
     fn config_hash(&self) -> String {
         self.as_store_config().config_hash()
     }
+}
+
+#[cfg(test)]
+fn test_embedding_profile_spec(dimension: usize) -> EmbeddingProfileSpec {
+    EmbeddingProfileSpec {
+        provider: "test".to_string(),
+        model: "test-embedding".to_string(),
+        dimension,
+        normalize: true,
+        endpoint_identity: None,
+        requested_model: Some("test-embedding".to_string()),
+        served_model: None,
+        max_context_tokens: None,
+        dtype: None,
+        quantization: None,
+        weight_identity: None,
+        chunker_config: ChunkerConfig::default(),
+        embedding_input_budget_tokens: None,
+        query_instruction: String::new(),
+        document_instruction: String::new(),
+    }
+}
+
+fn safe_embedding_input_budget(max_context_tokens: usize) -> usize {
+    max_context_tokens
+        .saturating_mul(3)
+        .saturating_div(4)
+        .max(1)
+}
+
+fn trimmed_optional_string(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn lowercase_optional_string(value: Option<&str>) -> Option<String> {
+    trimmed_optional_string(value).map(|value| value.to_ascii_lowercase())
+}
+
+fn sanitized_endpoint_identity(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        return None;
+    }
+    if let Ok(mut url) = url::Url::parse(value) {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        return Some(url.as_str().trim_end_matches('/').to_string());
+    }
+    Some(
+        value
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(value)
+            .trim_end_matches('/')
+            .to_string(),
+    )
 }
 
 struct EmbeddingInput {
@@ -320,18 +511,16 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
 
         let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
         let active_profile_id = config.embedding.profile_id.clone();
-        let embedding_profile_spec = EmbeddingProfileSpec {
-            provider: config.embedding.provider.clone(),
-            model: config.embedding.model.clone(),
-            dimension: config.embedding.dimension,
-            normalize: config.embedding.normalize,
-            query_instruction: config.embedding.query_instruction.clone(),
-            document_instruction: config.embedding.document_instruction.clone(),
-        };
-        store.ensure_embedding_profile(
+        let mut embedding_profile_spec = EmbeddingProfileSpec::from_config(&config.embedding);
+        if let Some(stored) = store.load_embedding_profile_config(&active_profile_id)? {
+            embedding_profile_spec.apply_stored_profile_config(&stored);
+        }
+        let profile_reset_on_open = store.ensure_embedding_profile(
             &active_profile_id,
             embedding_profile_spec.as_store_config(),
         )?;
+        #[cfg(not(feature = "qdrant"))]
+        let _ = profile_reset_on_open;
 
         let hnsw = load_vector_index_for_residency(
             config.vector_index.residency,
@@ -355,6 +544,11 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         };
         #[cfg(feature = "qdrant")]
         let qdrant = QdrantClient::from_config(&config.qdrant);
+        #[cfg(feature = "qdrant")]
+        let pending_qdrant_profile_syncs = profile_reset_on_open
+            .then(|| active_profile_id.clone())
+            .into_iter()
+            .collect();
 
         Ok(Self {
             store,
@@ -371,6 +565,8 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             graph_extraction_config,
             #[cfg(feature = "qdrant")]
             qdrant,
+            #[cfg(feature = "qdrant")]
+            pending_qdrant_profile_syncs,
             vision_caption_model,
             vision_caption_prompt_hash: vision_caption_prompt_hash(),
             ocr_provider,
@@ -472,6 +668,32 @@ where
             .map(|provider| provider.profile())
     }
 
+    pub async fn refresh_embedding_profile_capabilities(&mut self) -> Result<bool> {
+        if !self.embedding_enabled {
+            return Ok(false);
+        }
+        self.sync_pending_qdrant_profile_resets().await;
+        let previous_hash = self.embedding_profile_spec.config_hash();
+        let capabilities = self.embed_client.endpoint_capabilities().await?;
+        self.embedding_profile_spec
+            .apply_endpoint_capabilities(capabilities);
+        let new_hash = self.embedding_profile_spec.config_hash();
+        let reset_vectors = self.store.ensure_embedding_profile(
+            &self.active_profile_id,
+            self.embedding_profile_spec.as_store_config(),
+        )?;
+        if reset_vectors {
+            self.hnsw.clear();
+            self.loaded_profile_id = self.active_profile_id.clone();
+            #[cfg(feature = "qdrant")]
+            {
+                let profile_id = self.active_profile_id.clone();
+                self.sync_qdrant_profile_all(&profile_id).await;
+            }
+        }
+        Ok(previous_hash != new_hash)
+    }
+
     pub fn vector_index(&self) -> &dyn VectorIndex {
         &self.hnsw
     }
@@ -485,7 +707,7 @@ where
     }
 
     pub fn select_embedding_profile(&mut self, profile_id: &EmbeddingProfileId) -> Result<()> {
-        self.ensure_embedding_profile(profile_id)?;
+        let _ = self.ensure_embedding_profile(profile_id)?;
         if self.loaded_profile_id == *profile_id {
             return Ok(());
         }
@@ -503,7 +725,7 @@ where
         SqliteFtsIndex::new(&self.store)
     }
 
-    fn ensure_embedding_profile(&self, profile_id: &EmbeddingProfileId) -> Result<()> {
+    fn ensure_embedding_profile(&self, profile_id: &EmbeddingProfileId) -> Result<bool> {
         self.store
             .ensure_embedding_profile(profile_id, self.embedding_profile_spec.as_store_config())
     }
@@ -511,14 +733,7 @@ where
     #[cfg(test)]
     fn from_parts(store: Store, hnsw: HnswIndex, embed_client: E, data_dir: PathBuf) -> Self {
         let active_profile_id = EmbeddingProfileId::default_profile();
-        let embedding_profile_spec = EmbeddingProfileSpec {
-            provider: "test".to_string(),
-            model: "test-embedding".to_string(),
-            dimension: embed_client.dimension(),
-            normalize: true,
-            query_instruction: String::new(),
-            document_instruction: String::new(),
-        };
+        let embedding_profile_spec = test_embedding_profile_spec(embed_client.dimension());
         store
             .ensure_embedding_profile(&active_profile_id, embedding_profile_spec.as_store_config())
             .unwrap();
@@ -537,6 +752,8 @@ where
             graph_extraction_config: GraphExtractionConfig::default(),
             #[cfg(feature = "qdrant")]
             qdrant: None,
+            #[cfg(feature = "qdrant")]
+            pending_qdrant_profile_syncs: Vec::new(),
             vision_caption_model: "vision-disabled".to_string(),
             vision_caption_prompt_hash: vision_caption_prompt_hash(),
             ocr_provider: None,
@@ -762,6 +979,87 @@ where
         Ok(stale)
     }
 
+    pub fn index_status(&self) -> Result<IndexStatusResponse> {
+        let sources = self.store.list_sources()?;
+        let mut current_hashes = HashMap::new();
+        for source in &sources {
+            if source.path.exists() {
+                let hash = file_hash(&source.path)?;
+                current_hashes.insert(source.id.clone(), hash);
+            }
+        }
+        let stale_source_ids = if self.embedding_enabled {
+            self.store
+                .find_stale_sources_for_profile(&current_hashes, &self.active_profile_id)?
+        } else {
+            self.store
+                .find_stale_sources_for_lexical_index(&current_hashes)?
+        };
+        let mut messages = Vec::new();
+        if self.embedding_enabled {
+            messages.push(
+                "Embedding profile compatibility is capability-fingerprinted: endpoint identity, requested/served model, dimension, normalize flag, dtype, quantization, weight identity, context window, and chunking policy are part of the active profile."
+                    .to_string(),
+            );
+            if let Some(context) = self.embedding_profile_spec.max_context_tokens {
+                let budget = self
+                    .embedding_profile_spec
+                    .embedding_input_budget_tokens
+                    .unwrap_or_else(|| safe_embedding_input_budget(context));
+                messages.push(format!(
+                    "Chunking uses a safe embedding input budget of {budget} token(s), derived from the effective {context}-token context window. Context shrink requires reingest/reindex; context growth is a quality reindex opportunity."
+                ));
+            } else {
+                messages.push(
+                    "No embedding context window is known, so chunking uses the default parent/child policy until the endpoint exposes a context window or [embedding].context_window_tokens is configured."
+                        .to_string(),
+                );
+            }
+            if !stale_source_ids.is_empty() {
+                messages.push(format!(
+                    "{} source(s) are stale for the current capability/chunking profile and should be ingested or reindexed.",
+                    stale_source_ids.len()
+                ));
+            }
+        } else {
+            messages.push(
+                "Embedding is disabled; index status is BM25/lexical-only and no embedding capability fingerprint is required."
+                    .to_string(),
+            );
+        }
+        let chunker_config = &self.embedding_profile_spec.chunker_config;
+        Ok(IndexStatusResponse {
+            embedding_enabled: self.embedding_enabled,
+            active_profile_id: self.active_profile_id.as_str().to_string(),
+            source_count: sources.len(),
+            stale_source_count: stale_source_ids.len(),
+            stale_source_ids: stale_source_ids.into_iter().map(|id| id.0).collect(),
+            capability: EmbeddingCapabilityStatusResponse {
+                provider: self.embedding_profile_spec.provider.clone(),
+                model: self.embedding_profile_spec.model.clone(),
+                dimension: self.embedding_profile_spec.dimension,
+                normalize: self.embedding_profile_spec.normalize,
+                endpoint_identity: self.embedding_profile_spec.endpoint_identity.clone(),
+                requested_model: self.embedding_profile_spec.requested_model.clone(),
+                served_model: self.embedding_profile_spec.served_model.clone(),
+                max_context_tokens: self.embedding_profile_spec.max_context_tokens,
+                dtype: self.embedding_profile_spec.dtype.clone(),
+                quantization: self.embedding_profile_spec.quantization.clone(),
+                weight_identity: self.embedding_profile_spec.weight_identity.clone(),
+            },
+            chunking: ChunkingProfileStatusResponse {
+                version: CHUNKER_VERSION.to_string(),
+                child_target_tokens: chunker_config.child_target_tokens,
+                child_overlap_tokens: chunker_config.child_overlap_tokens,
+                parent_children_count: chunker_config.parent_children_count,
+                embedding_input_budget_tokens: self
+                    .embedding_profile_spec
+                    .embedding_input_budget_tokens,
+            },
+            messages,
+        })
+    }
+
     pub async fn ingest_source(&mut self, source_id: &SourceId) -> Result<EmbeddingCacheStats> {
         self.ingest_source_inner(source_id, None).await
     }
@@ -779,6 +1077,16 @@ where
         &mut self,
         source_tasks: &[(SourceId, TaskId)],
     ) -> Vec<SourceIngestOutcome> {
+        if let Err(error) = self.refresh_embedding_profile_capabilities().await {
+            return source_tasks
+                .iter()
+                .map(|(source_id, task_id)| SourceIngestOutcome {
+                    source_id: source_id.clone(),
+                    task_id: task_id.clone(),
+                    result: Err(error.to_string()),
+                })
+                .collect();
+        }
         let active_profile_id = self.active_profile_id.clone();
         let mut pending = PendingPreparedSources::default();
         let mut outcomes = Vec::with_capacity(source_tasks.len());
@@ -841,6 +1149,7 @@ where
         source_id: &SourceId,
         task_id: Option<&TaskId>,
     ) -> Result<EmbeddingCacheStats> {
+        self.refresh_embedding_profile_capabilities().await?;
         let active_profile_id = self.active_profile_id.clone();
         let prepared_source = self.prepare_source_contents(source_id, task_id).await?;
         let outcomes = self
@@ -981,7 +1290,7 @@ where
             "parsed searchable evidence"
         );
 
-        let chunker_config = ChunkerConfig::default();
+        let chunker_config = self.embedding_profile_spec.chunker_config.clone();
         let phase = PhaseTiming::start("ingest_chunking");
         self.record_task_progress(
             task_id,
@@ -998,6 +1307,12 @@ where
             serde_json::json!({
                 "source_id": source_id.0,
                 "chunk_count": output.chunks.len(),
+                "chunker_version": CHUNKER_VERSION,
+                "child_target_tokens": chunker_config.child_target_tokens,
+                "child_overlap_tokens": chunker_config.child_overlap_tokens,
+                "parent_children_count": chunker_config.parent_children_count,
+                "embedding_input_budget_tokens": self.embedding_profile_spec.embedding_input_budget_tokens,
+                "embedding_context_tokens": self.embedding_profile_spec.max_context_tokens,
             }),
         );
 
@@ -1589,6 +1904,7 @@ where
         force: bool,
         task_id: Option<&TaskId>,
     ) -> Result<IndexingOutcome> {
+        self.refresh_embedding_profile_capabilities().await?;
         if !force {
             self.check_stale()?;
         }
@@ -1874,6 +2190,7 @@ where
     }
 
     pub async fn rebuild_indexes_from_store(&mut self) -> Result<()> {
+        self.refresh_embedding_profile_capabilities().await?;
         let source_ids = self
             .store
             .list_sources()?
@@ -1917,7 +2234,10 @@ where
         if !self.embedding_enabled {
             bail!("embedding is disabled; enable [embedding] before building vectors");
         }
-        self.ensure_embedding_profile(profile_id)?;
+        self.refresh_embedding_profile_capabilities().await?;
+        let profile_reset = self.ensure_embedding_profile(profile_id)?;
+        #[cfg(not(feature = "qdrant"))]
+        let _ = profile_reset;
         let target_source_ids = match source_id {
             Some(source_id) => {
                 self.store
@@ -1975,9 +2295,12 @@ where
             self.clear_vector_only_stale_status(source_id)?;
         }
         #[cfg(feature = "qdrant")]
-        match source_id {
-            Some(source_id) => self.sync_qdrant_profile_source(profile_id, source_id).await,
-            None => self.sync_qdrant_profile_all(profile_id).await,
+        {
+            if profile_reset || source_id.is_none() {
+                self.sync_qdrant_profile_all(profile_id).await;
+            } else if let Some(source_id) = source_id {
+                self.sync_qdrant_profile_source(profile_id, source_id).await;
+            }
         }
         Ok(IndexingOutcome {
             source_count: target_source_ids.len(),
@@ -2316,6 +2639,17 @@ where
         self.sync_qdrant_profile_source(&self.active_profile_id, source_id)
             .await;
     }
+
+    #[cfg(feature = "qdrant")]
+    pub async fn sync_pending_qdrant_profile_resets(&mut self) {
+        let profiles = std::mem::take(&mut self.pending_qdrant_profile_syncs);
+        for profile_id in profiles {
+            self.sync_qdrant_profile_all(&profile_id).await;
+        }
+    }
+
+    #[cfg(not(feature = "qdrant"))]
+    pub async fn sync_pending_qdrant_profile_resets(&mut self) {}
 
     #[cfg(feature = "qdrant")]
     async fn sync_qdrant_profile_source(
@@ -3991,13 +4325,10 @@ mod tests {
     use async_trait::async_trait;
     use futures::StreamExt;
     use std::collections::VecDeque;
-    #[cfg(feature = "qdrant")]
     use std::io::{Read, Write};
-    #[cfg(feature = "qdrant")]
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    #[cfg(feature = "qdrant")]
     use std::thread;
     use std::time::Duration;
 
@@ -4483,8 +4814,19 @@ mod tests {
         chunk_id: &str,
         text: &str,
     ) -> Result<Chunk> {
+        ensure_default_test_embedding_profile(store);
         store.add_source(source)?;
         insert_child_text(store, &source.id, chunk_id, text)
+    }
+
+    fn ensure_default_test_embedding_profile(store: &Store) {
+        let embedding_profile_spec = test_embedding_profile_spec(2);
+        store
+            .ensure_embedding_profile(
+                &EmbeddingProfileId::default_profile(),
+                embedding_profile_spec.as_store_config(),
+            )
+            .unwrap();
     }
 
     fn insert_child_text(
@@ -4543,6 +4885,43 @@ mod tests {
             daemon: Default::default(),
             collection_watcher: Default::default(),
         }
+    }
+
+    fn embedding_context_config(context_window_tokens: usize) -> Config {
+        let mut config = test_config();
+        config.embedding.enabled = true;
+        config.embedding.base_url = "https://embeddings.example.test/v1".into();
+        config.embedding.model = "same-configured-model".into();
+        config.embedding.context_window_tokens = Some(context_window_tokens);
+        config.embedding.served_model = Some("same-configured-model".into());
+        config.embedding.dtype = Some("float16".into());
+        config.embedding.quantization = Some("fp16".into());
+        config.embedding.weight_identity = Some("sha256:weights-a".into());
+        config
+    }
+
+    fn seed_indexed_source_for_profile(
+        store: &Store,
+        profile_id: &EmbeddingProfileId,
+        source_path: &Path,
+    ) -> SourceId {
+        let mut source = test_source("src-context", source_path.to_path_buf());
+        source.hash = file_hash(source_path).unwrap();
+        store.add_source(&source).unwrap();
+        let chunk =
+            insert_child_text(store, &source.id, "chunk-context", "alpha context text").unwrap();
+        store
+            .replace_source_vector_documents_for_profile(
+                profile_id,
+                &source.id,
+                &[VectorDocument {
+                    chunk_id: chunk.id,
+                    source_id: source.id.clone(),
+                    vector: vec![1.0, 0.0],
+                }],
+            )
+            .unwrap();
+        source.id
     }
 
     #[test]
@@ -4865,6 +5244,226 @@ mod tests {
     }
 
     #[test]
+    fn context_window_shrink_marks_existing_profile_vectors_stale() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_path = tempdir.path().join("context.txt");
+        fs::write(&source_path, "alpha context text").unwrap();
+        let high_config = embedding_context_config(8192);
+        let low_config = embedding_context_config(128);
+        let source_id = {
+            let pipeline = IngestPipeline::new(&high_config, tempdir.path()).unwrap();
+            let source_id = seed_indexed_source_for_profile(
+                pipeline.store(),
+                pipeline.active_embedding_profile_id(),
+                &source_path,
+            );
+            assert!(pipeline.check_stale().unwrap().is_empty());
+            source_id
+        };
+
+        let pipeline = IngestPipeline::new(&low_config, tempdir.path()).unwrap();
+        let status = pipeline.index_status().unwrap();
+
+        assert_eq!(status.stale_source_ids, vec![source_id.0]);
+        assert_eq!(status.chunking.embedding_input_budget_tokens, Some(96));
+        assert!(status
+            .messages
+            .iter()
+            .any(|message| message.contains("Context shrink requires reingest/reindex")));
+        assert!(pipeline
+            .store()
+            .list_vector_documents_for_profile(pipeline.active_embedding_profile_id())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn context_window_growth_keeps_existing_vectors_as_quality_reindex_opportunity() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_path = tempdir.path().join("context.txt");
+        fs::write(&source_path, "alpha context text").unwrap();
+        let low_config = embedding_context_config(128);
+        let high_config = embedding_context_config(8192);
+        {
+            let pipeline = IngestPipeline::new(&low_config, tempdir.path()).unwrap();
+            seed_indexed_source_for_profile(
+                pipeline.store(),
+                pipeline.active_embedding_profile_id(),
+                &source_path,
+            );
+            assert!(pipeline.check_stale().unwrap().is_empty());
+        }
+
+        let pipeline = IngestPipeline::new(&high_config, tempdir.path()).unwrap();
+        let status = pipeline.index_status().unwrap();
+
+        assert_eq!(status.stale_source_count, 0);
+        assert!(status.stale_source_ids.is_empty());
+        assert_eq!(status.chunking.embedding_input_budget_tokens, Some(6144));
+        assert!(status.messages.iter().any(|message| {
+            message.contains("context growth is a quality reindex opportunity")
+        }));
+        assert_eq!(
+            pipeline
+                .store()
+                .list_vector_documents_for_profile(pipeline.active_embedding_profile_id())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn capability_refresh_preserves_mixed_case_embedding_identities() {
+        let mut config = embedding_context_config(8192);
+        config.embedding.model = "Qwen/Qwen3-Embedding-8B".into();
+        config.embedding.served_model = Some("Qwen/Qwen3-Embedding-8B-Served".into());
+        config.embedding.dtype = Some("FLOAT16".into());
+        config.embedding.quantization = Some("FP16".into());
+        config.embedding.weight_identity = Some("Sha256:ABCDef".into());
+        let mut spec = EmbeddingProfileSpec::from_config(&config.embedding);
+        let before_hash = spec.config_hash();
+
+        spec.apply_endpoint_capabilities(EmbeddingEndpointCapabilities {
+            endpoint_identity: Some("https://embeddings.example.test/v1".into()),
+            requested_model: Some(" Qwen/Qwen3-Embedding-8B ".into()),
+            served_model: Some(" Qwen/Qwen3-Embedding-8B-Served ".into()),
+            max_context_tokens: Some(8192),
+            dtype: Some("float16".into()),
+            quantization: Some("fp16".into()),
+            weight_identity: Some(" Sha256:ABCDef ".into()),
+        });
+
+        assert_eq!(
+            spec.requested_model.as_deref(),
+            Some("Qwen/Qwen3-Embedding-8B")
+        );
+        assert_eq!(
+            spec.served_model.as_deref(),
+            Some("Qwen/Qwen3-Embedding-8B-Served")
+        );
+        assert_eq!(spec.dtype.as_deref(), Some("float16"));
+        assert_eq!(spec.quantization.as_deref(), Some("fp16"));
+        assert_eq!(spec.weight_identity.as_deref(), Some("Sha256:ABCDef"));
+        assert_eq!(spec.config_hash(), before_hash);
+    }
+
+    #[test]
+    fn same_model_with_different_exposed_capability_has_distinct_safe_fingerprint() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut first = embedding_context_config(8192);
+        first.embedding.base_url =
+            "https://user:secret@embeddings.example.test/v1?api_key=hidden#frag".into();
+        first.embedding.served_model = Some("served-a".into());
+        first.embedding.dtype = Some("float16".into());
+        first.embedding.quantization = Some("q4_k_m".into());
+        first.embedding.weight_identity = Some("sha256:weights-a".into());
+        let mut second = first.clone();
+        second.embedding.served_model = Some("served-b".into());
+        second.embedding.dtype = Some("float32".into());
+        second.embedding.quantization = Some("q8_0".into());
+        second.embedding.weight_identity = Some("sha256:weights-b".into());
+
+        let first_spec = EmbeddingProfileSpec::from_config(&first.embedding);
+        let second_spec = EmbeddingProfileSpec::from_config(&second.embedding);
+        let pipeline = IngestPipeline::new(&first, tempdir.path()).unwrap();
+        let status_json = serde_json::to_string(&pipeline.index_status().unwrap()).unwrap();
+
+        assert_eq!(first_spec.model, second_spec.model);
+        assert_ne!(first_spec.config_hash(), second_spec.config_hash());
+        assert_eq!(
+            first_spec.endpoint_identity.as_deref(),
+            Some("https://embeddings.example.test/v1")
+        );
+        assert!(!status_json.contains("secret"));
+        assert!(!status_json.contains("api_key"));
+        assert!(!status_json.contains("hidden"));
+        assert!(status_json.contains("served-a"));
+        assert!(status_json.contains("q4_k_m"));
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_endpoint_discovered_profile_until_refresh_confirms_same_capability()
+    {
+        let body = r#"{"data":[{"id":"same-configured-model","served_model":"served-a","max_model_len":8192,"dtype":"float16","quantization":"fp16","revision":"Sha256:ABCDef"}]}"#;
+        let (base_url, handle) = spawn_embedding_models_server(vec![body]);
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_path = tempdir.path().join("context.txt");
+        fs::write(&source_path, "alpha context text").unwrap();
+        let mut config = test_config();
+        config.embedding.enabled = true;
+        config.embedding.base_url = base_url;
+        config.embedding.model = "same-configured-model".into();
+        config.embedding.context_window_tokens = None;
+        config.embedding.served_model = None;
+        config.embedding.dtype = None;
+        config.embedding.quantization = None;
+        config.embedding.weight_identity = None;
+        config.embedding.capability_cache_ttl_seconds = 60;
+
+        let source_id = {
+            let mut pipeline = IngestPipeline::new(&config, tempdir.path()).unwrap();
+            assert!(pipeline
+                .refresh_embedding_profile_capabilities()
+                .await
+                .unwrap());
+            let status = pipeline.index_status().unwrap();
+            assert_eq!(status.capability.served_model.as_deref(), Some("served-a"));
+            assert_eq!(status.capability.max_context_tokens, Some(8192));
+            let source_id = seed_indexed_source_for_profile(
+                pipeline.store(),
+                pipeline.active_embedding_profile_id(),
+                &source_path,
+            );
+            assert!(pipeline.check_stale().unwrap().is_empty());
+            source_id
+        };
+
+        let mut pipeline = IngestPipeline::new(&config, tempdir.path()).unwrap();
+        assert_eq!(
+            pipeline
+                .store()
+                .list_vector_documents_for_profile(pipeline.active_embedding_profile_id())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(pipeline.check_stale().unwrap().is_empty());
+
+        assert!(!pipeline
+            .refresh_embedding_profile_capabilities()
+            .await
+            .unwrap());
+        let status = pipeline.index_status().unwrap();
+
+        assert_eq!(status.stale_source_ids, Vec::<String>::new());
+        assert_eq!(status.capability.served_model.as_deref(), Some("served-a"));
+        assert_eq!(status.capability.max_context_tokens, Some(8192));
+        assert_eq!(status.chunking.embedding_input_budget_tokens, Some(6144));
+        assert_eq!(
+            pipeline
+                .store()
+                .list_vector_documents_for_profile(pipeline.active_embedding_profile_id())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!pipeline
+            .store()
+            .find_stale_sources_for_profile(
+                &HashMap::from([(source_id.clone(), file_hash(&source_path).unwrap())]),
+                pipeline.active_embedding_profile_id(),
+            )
+            .unwrap()
+            .contains(&source_id));
+
+        let requests = handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].line, "GET /v1/models HTTP/1.1");
+        assert!(requests[0].body.is_empty());
+    }
+
+    #[test]
     fn pipeline_loads_only_active_profile_index_until_profile_switch() {
         let tempdir = tempfile::tempdir().unwrap();
         let db_path = tempdir.path().join("verbatim.db");
@@ -4875,23 +5474,22 @@ mod tests {
             let store = Store::new(&db_path).unwrap();
             let first = test_source("src-1", PathBuf::from("/tmp/first.txt"));
             let second = test_source("src-2", PathBuf::from("/tmp/second.txt"));
-            let first_chunk =
-                insert_source_with_child_text(&store, &first, "chunk-1", "alpha text").unwrap();
-            let second_chunk =
-                insert_source_with_child_text(&store, &second, "chunk-2", "beta text").unwrap();
+            let embedding_profile_spec = EmbeddingProfileSpec::from_config(&config.embedding);
             store
                 .ensure_embedding_profile(
-                    &alt_profile,
-                    EmbeddingProfileConfig {
-                        provider: &config.embedding.provider,
-                        model: &config.embedding.model,
-                        dimension: config.embedding.dimension,
-                        normalize: config.embedding.normalize,
-                        query_instruction: &config.embedding.query_instruction,
-                        document_instruction: &config.embedding.document_instruction,
-                    },
+                    &EmbeddingProfileId::default_profile(),
+                    embedding_profile_spec.as_store_config(),
                 )
                 .unwrap();
+            store
+                .ensure_embedding_profile(&alt_profile, embedding_profile_spec.as_store_config())
+                .unwrap();
+            store.add_source(&first).unwrap();
+            store.add_source(&second).unwrap();
+            let first_chunk =
+                insert_child_text(&store, &first.id, "chunk-1", "alpha text").unwrap();
+            let second_chunk =
+                insert_child_text(&store, &second.id, "chunk-2", "beta text").unwrap();
             store
                 .replace_all_vector_documents_for_profile(
                     &EmbeddingProfileId::default_profile(),
@@ -4932,7 +5530,6 @@ mod tests {
     }
 
     #[derive(Debug)]
-    #[cfg(feature = "qdrant")]
     struct TestHttpRequest {
         line: String,
         body: String,
@@ -4947,6 +5544,23 @@ mod tests {
             prefer_for_search: false,
             timeout_seconds: 2,
         }
+    }
+
+    fn spawn_embedding_models_server(
+        bodies: Vec<&'static str>,
+    ) -> (String, thread::JoinHandle<Vec<TestHttpRequest>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding test server");
+        let addr = listener.local_addr().expect("embedding test server addr");
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().expect("accept embedding request");
+                requests.push(read_http_request(&mut stream));
+                write_http_response(&mut stream, 200, body);
+            }
+            requests
+        });
+        (format!("http://{addr}/v1"), handle)
     }
 
     #[cfg(feature = "qdrant")]
@@ -4967,7 +5581,6 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    #[cfg(feature = "qdrant")]
     fn read_http_request(stream: &mut TcpStream) -> TestHttpRequest {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -4989,7 +5602,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "qdrant")]
     fn http_request_complete(buffer: &[u8]) -> bool {
         let text = String::from_utf8_lossy(buffer);
         let Some((head, body)) = text.split_once("\r\n\r\n") else {
@@ -5007,7 +5619,6 @@ mod tests {
         body.len() >= content_len
     }
 
-    #[cfg(feature = "qdrant")]
     fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
         let reason = if status == 200 { "OK" } else { "ERR" };
         write!(
@@ -6514,6 +7125,151 @@ model = "local-vision"
         assert_eq!(upsert_body["points"][0]["payload"]["source_id"], "src-alt");
     }
 
+    #[cfg(feature = "qdrant")]
+    #[tokio::test]
+    async fn source_scoped_profile_reset_full_syncs_qdrant_and_filters_stale_remote_hits() {
+        let (qdrant_url, handle) = spawn_qdrant_server(vec![
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
+            ),
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
+            ),
+            (
+                200,
+                r#"{"status":"ok","result":[{"score":0.99,"payload":{"chunk_id":"chunk-stale-remote"}}]}"#,
+            ),
+        ]);
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let first = test_source("src-reset-first", tempdir.path().join("first.txt"));
+        let second = test_source("src-reset-second", tempdir.path().join("second.txt"));
+        let first_chunk =
+            insert_source_with_child_text(&store, &first, "chunk-reset-fresh", "alpha fresh")
+                .unwrap();
+        let second_chunk =
+            insert_source_with_child_text(&store, &second, "chunk-stale-remote", "alpha stale")
+                .unwrap();
+        let alt_profile = EmbeddingProfileId::new("alt-reset").unwrap();
+        let chunker = ChunkerConfig::default();
+        store
+            .ensure_embedding_profile(
+                &alt_profile,
+                EmbeddingProfileConfig {
+                    provider: "test",
+                    model: "test-embedding",
+                    dimension: 2,
+                    normalize: true,
+                    endpoint_identity: None,
+                    requested_model: Some("old-embedding"),
+                    served_model: None,
+                    max_context_tokens: None,
+                    dtype: None,
+                    quantization: None,
+                    weight_identity: None,
+                    chunker_version: CHUNKER_VERSION,
+                    child_target_tokens: chunker.child_target_tokens,
+                    child_overlap_tokens: chunker.child_overlap_tokens,
+                    parent_children_count: chunker.parent_children_count,
+                    embedding_input_budget_tokens: None,
+                    query_instruction: "",
+                    document_instruction: "",
+                },
+            )
+            .unwrap();
+        store
+            .replace_all_vector_documents_for_profile(
+                &alt_profile,
+                &[
+                    VectorDocument {
+                        chunk_id: first_chunk.id.clone(),
+                        source_id: first.id.clone(),
+                        vector: vec![1.0, 0.0],
+                    },
+                    VectorDocument {
+                        chunk_id: second_chunk.id.clone(),
+                        source_id: second.id.clone(),
+                        vector: vec![0.0, 1.0],
+                    },
+                ],
+            )
+            .unwrap();
+        let qdrant = QdrantClient::new(qdrant_test_config(qdrant_url.clone()));
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_qdrant_client(qdrant);
+
+        pipeline
+            .build_embedding_profile(&alt_profile, Some(&first.id))
+            .await
+            .unwrap();
+
+        let mut hnsw = HnswIndex::new();
+        hnsw.rebuild_from_store_for_profile(pipeline.store(), &alt_profile)
+            .unwrap();
+        let lexical_index = SqliteFtsIndex::new(pipeline.store());
+        let mut qdrant_search = qdrant_test_config(qdrant_url);
+        qdrant_search.prefer_for_search = true;
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 0,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let embed_client = StaticEmbeddingClient;
+        let results = RetrievalPipeline::new(
+            &hnsw,
+            &lexical_index,
+            pipeline.store(),
+            &embed_client,
+            &retrieval_config,
+        )
+        .require_embedding_profile(&alt_profile)
+        .with_qdrant_search(&qdrant_search)
+        .search("alpha")
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_id, first_chunk.id);
+        assert!(results
+            .iter()
+            .all(|result| result.chunk_id != second_chunk.id));
+        let requests = handle.join().unwrap();
+        assert_eq!(
+            requests[1].line,
+            "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        );
+        let delete_body: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert_eq!(delete_body["filter"]["must"][0]["key"], "profile_id");
+        assert_eq!(
+            delete_body["filter"]["must"][0]["match"]["value"],
+            "alt-reset"
+        );
+        assert_eq!(
+            requests[3].line,
+            "PUT /collections/verbatim/points?wait=true HTTP/1.1"
+        );
+        let upsert_body: serde_json::Value = serde_json::from_str(&requests[3].body).unwrap();
+        assert_eq!(upsert_body["points"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            upsert_body["points"][0]["payload"]["source_id"],
+            "src-reset-first"
+        );
+        assert_eq!(
+            requests[4].line,
+            "POST /collections/verbatim/points/search HTTP/1.1"
+        );
+    }
+
     #[tokio::test]
     async fn ingest_source_replaces_stale_lexical_and_dense_state() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -7989,11 +8745,15 @@ model = "local-vision"
             StaticEmbeddingClient,
             tempdir.path().to_path_buf(),
         );
+        let before_generation = pipeline.store().index_generation().unwrap();
 
         let err = pipeline.ingest_source(&source.id).await.unwrap_err();
 
         assert!(err.to_string().contains("write index manifest temp"));
-        assert_eq!(pipeline.store().index_generation().unwrap(), 1);
+        assert_eq!(
+            pipeline.store().index_generation().unwrap(),
+            before_generation + 1
+        );
         assert!(read_index_manifest(tempdir.path(), &default_profile)
             .unwrap()
             .is_none());
@@ -8033,6 +8793,10 @@ model = "local-vision"
             .store()
             .replace_all_vector_documents_for_profile(&default_profile, &[])
             .unwrap();
+        let first_generation = pipeline
+            .store()
+            .index_generation_for_profile(&default_profile)
+            .unwrap();
         pipeline
             .publish_prepared_indexes(
                 &default_profile,
@@ -8043,12 +8807,17 @@ model = "local-vision"
                 },
             )
             .unwrap();
-        let first_generation_dir = index_generation_dir(tempdir.path(), &default_profile, 1);
+        let first_generation_dir =
+            index_generation_dir(tempdir.path(), &default_profile, first_generation);
         assert!(first_generation_dir.exists());
 
         pipeline
             .store()
             .replace_all_vector_documents_for_profile(&default_profile, &[])
+            .unwrap();
+        let second_generation = pipeline
+            .store()
+            .index_generation_for_profile(&default_profile)
             .unwrap();
         pipeline
             .publish_prepared_indexes(
@@ -8062,7 +8831,7 @@ model = "local-vision"
             .unwrap();
 
         assert!(!first_generation_dir.exists());
-        assert!(index_generation_dir(tempdir.path(), &default_profile, 2).exists());
+        assert!(index_generation_dir(tempdir.path(), &default_profile, second_generation).exists());
     }
 
     #[tokio::test]

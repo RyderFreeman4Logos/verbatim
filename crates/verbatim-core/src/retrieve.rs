@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 
 use crate::config::{GraphConfig, QdrantConfig, RerankConfig, RetrievalConfig};
 #[cfg(feature = "qdrant")]
-use crate::index::qdrant::QdrantClient;
+use crate::index::qdrant::{QdrantClient, QdrantHit};
 use crate::provider::ProviderError;
 use crate::store::Store;
 use crate::traits::{
@@ -44,6 +44,41 @@ pub struct RetrievalPipeline<'a> {
     vector_residency: VectorIndexResidency,
     #[cfg(feature = "qdrant")]
     qdrant: Option<QdrantClient>,
+}
+
+#[cfg(feature = "qdrant")]
+trait DenseHit {
+    fn chunk_id(&self) -> ChunkId;
+    fn score(&self) -> f32;
+    fn profile_generation(&self) -> Option<u64> {
+        None
+    }
+}
+
+#[cfg(feature = "qdrant")]
+impl DenseHit for (ChunkId, f32) {
+    fn chunk_id(&self) -> ChunkId {
+        self.0.clone()
+    }
+
+    fn score(&self) -> f32 {
+        self.1
+    }
+}
+
+#[cfg(feature = "qdrant")]
+impl DenseHit for QdrantHit {
+    fn chunk_id(&self) -> ChunkId {
+        self.chunk_id.clone()
+    }
+
+    fn score(&self) -> f32 {
+        self.score
+    }
+
+    fn profile_generation(&self) -> Option<u64> {
+        Some(self.profile_generation)
+    }
 }
 
 impl<'a> RetrievalPipeline<'a> {
@@ -344,6 +379,9 @@ impl<'a> RetrievalPipeline<'a> {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &self.qdrant {
             let local_results = self.local_dense_search(query_vec, top_k, source_filter)?;
+            if local_results.is_empty() {
+                return Ok(local_results);
+            }
             let default_profile_id;
             let profile_id = match &self.required_profile_id {
                 Some(profile_id) => profile_id,
@@ -353,13 +391,19 @@ impl<'a> RetrievalPipeline<'a> {
                 }
             };
             let qdrant_source_filter = single_source_filter(source_filter);
+            let profile_generation = self.store.index_generation_for_profile(profile_id)?;
             return match qdrant
                 .search(profile_id, query_vec, top_k, qdrant_source_filter)
                 .await
             {
-                Ok(results) => {
-                    self.merge_preferred_dense_hits(results, local_results, top_k, source_filter)
-                }
+                Ok(results) => self.merge_preferred_dense_hits(
+                    profile_id,
+                    profile_generation,
+                    results,
+                    local_results,
+                    top_k,
+                    source_filter,
+                ),
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
@@ -423,16 +467,23 @@ impl<'a> RetrievalPipeline<'a> {
         let mut seen = HashSet::new();
         let mut hits = hits.into_iter();
         while valid.len() < top_k
-            && self.append_next_valid_dense_hit(&mut valid, &mut seen, &mut hits, source_filter)?
-        {
-        }
+            && self.append_next_valid_dense_hit(
+                &mut valid,
+                &mut seen,
+                &mut hits,
+                source_filter,
+                None,
+            )?
+        {}
         Ok(valid)
     }
 
     #[cfg(feature = "qdrant")]
     fn merge_preferred_dense_hits(
         &self,
-        preferred_hits: Vec<(ChunkId, f32)>,
+        profile_id: &EmbeddingProfileId,
+        profile_generation: u64,
+        preferred_hits: Vec<QdrantHit>,
         fallback_hits: Vec<(ChunkId, f32)>,
         top_k: usize,
         source_filter: Option<&HashSet<SourceId>>,
@@ -448,6 +499,7 @@ impl<'a> RetrievalPipeline<'a> {
                 &mut seen,
                 &mut preferred_hits,
                 source_filter,
+                Some((profile_id, profile_generation)),
             )?;
             if merged.len() >= top_k {
                 break;
@@ -457,6 +509,7 @@ impl<'a> RetrievalPipeline<'a> {
                 &mut seen,
                 &mut fallback_hits,
                 source_filter,
+                None,
             )?;
             if !preferred_added && !fallback_added {
                 break;
@@ -473,12 +526,15 @@ impl<'a> RetrievalPipeline<'a> {
         seen: &mut HashSet<ChunkId>,
         hits: &mut I,
         source_filter: Option<&HashSet<SourceId>>,
+        required_profile: Option<(&EmbeddingProfileId, u64)>,
     ) -> Result<bool>
     where
-        I: Iterator<Item = (ChunkId, f32)>,
+        I: Iterator,
+        I::Item: DenseHit,
     {
-        for (chunk_id, score) in hits {
-            if !seen.insert(chunk_id.clone()) {
+        for hit in hits {
+            let chunk_id = hit.chunk_id();
+            if seen.contains(&chunk_id) {
                 continue;
             }
             let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
@@ -487,6 +543,20 @@ impl<'a> RetrievalPipeline<'a> {
             if source_filter_excludes(source_filter, &chunk.source_id) {
                 continue;
             }
+            if let Some((profile_id, profile_generation)) = required_profile {
+                if hit.profile_generation() != Some(profile_generation) {
+                    continue;
+                }
+                if !self.store.has_vector_document_for_profile(
+                    profile_id,
+                    &chunk_id,
+                    &chunk.source_id,
+                )? {
+                    continue;
+                }
+            }
+            seen.insert(chunk_id.clone());
+            let score = hit.score();
             target.push((chunk_id, score));
             return Ok(true);
         }
@@ -1758,6 +1828,38 @@ mod tests {
     }
 
     #[cfg(feature = "qdrant")]
+    fn spawn_optional_qdrant_search_response(
+        status: u16,
+        body: &'static str,
+    ) -> (String, thread::JoinHandle<Option<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind qdrant search server");
+        listener
+            .set_nonblocking(true)
+            .expect("set qdrant listener nonblocking");
+        let addr = listener.local_addr().expect("qdrant search server addr");
+        let handle = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request_line = read_request_line(&mut stream);
+                        write_http_response(&mut stream, status, body);
+                        return Some(request_line);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return None;
+                        }
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept qdrant search: {error}"),
+                }
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[cfg(feature = "qdrant")]
     fn read_request_line(stream: &mut TcpStream) -> String {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -2589,6 +2691,49 @@ mod tests {
 
     #[cfg(feature = "qdrant")]
     #[tokio::test]
+    async fn qdrant_remote_hits_are_ignored_when_local_profile_has_no_vectors() {
+        let (qdrant_url, handle) = spawn_optional_qdrant_search_response(
+            200,
+            r#"{"status":"ok","result":[{"score":0.99,"payload":{"chunk_id":"chunk-local-stale-profile"}}]}"#,
+        );
+        let store = Store::in_memory().unwrap();
+        let source = source("src-qdrant-reset-profile");
+        insert_child(
+            &store,
+            &source,
+            "chunk-local-stale-profile",
+            "alpha content",
+        );
+        let vector_index = StaticVectorIndex::new(Vec::new());
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = KeywordEmbeddingClient;
+        let config = RetrievalConfig {
+            dense_top_k: 1,
+            bm25_top_k: 0,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let qdrant = qdrant_config(qdrant_url);
+        let pipeline = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &config,
+        )
+        .with_qdrant_search(&qdrant);
+
+        let results = pipeline
+            .search_filtered("alpha", Some(&source.id))
+            .await
+            .unwrap();
+
+        assert!(results.is_empty());
+        assert!(handle.join().unwrap().is_none());
+    }
+
+    #[cfg(feature = "qdrant")]
+    #[tokio::test]
     async fn qdrant_search_failure_falls_back_to_local_dense_index() {
         let (qdrant_url, handle) =
             spawn_qdrant_search_response(500, r#"{"status":{"error":"down"}}"#);
@@ -2678,7 +2823,7 @@ mod tests {
     async fn qdrant_valid_success_prefers_remote_then_fills_from_local_dense_index() {
         let (qdrant_url, handle) = spawn_qdrant_search_response(
             200,
-            r#"{"status":"ok","result":[{"score":0.99,"payload":{"chunk_id":"chunk-remote-preferred"}}]}"#,
+            r#"{"status":"ok","result":[{"score":0.99,"payload":{"chunk_id":"chunk-remote-preferred","profile_generation":1}}]}"#,
         );
         let store = Store::in_memory().unwrap();
         let source = source("src-qdrant-preferred");
@@ -2695,6 +2840,20 @@ mod tests {
             "chunk-local-fallback",
             "alpha local fallback",
         );
+        store
+            .replace_all_vector_documents(&[
+                VectorDocument {
+                    chunk_id: remote_preferred.id.clone(),
+                    source_id: source.id.clone(),
+                    vector: keyword_vector(&remote_preferred.text),
+                },
+                VectorDocument {
+                    chunk_id: local_fallback.id.clone(),
+                    source_id: source.id.clone(),
+                    vector: keyword_vector(&local_fallback.text),
+                },
+            ])
+            .unwrap();
         let vector_index = StaticVectorIndex::new(vec![(local_fallback.id.clone(), 0.95)]);
         let lexical_index = StaticLexicalIndex::new(Vec::new());
         let embed_client = KeywordEmbeddingClient;
@@ -2730,10 +2889,10 @@ mod tests {
 
     #[cfg(feature = "qdrant")]
     #[tokio::test]
-    async fn qdrant_stale_existing_hits_still_include_local_dense_evidence() {
+    async fn qdrant_stale_generation_hits_fall_back_to_local_dense_evidence() {
         let (qdrant_url, handle) = spawn_qdrant_search_response(
             200,
-            r#"{"status":"ok","result":[{"score":0.99,"payload":{"chunk_id":"src-qdrant-stale-existing-child-0"}},{"score":0.98,"payload":{"chunk_id":"src-qdrant-stale-existing-child-2"}}]}"#,
+            r#"{"status":"ok","result":[{"score":0.99,"payload":{"chunk_id":"src-qdrant-stale-existing-child-0","profile_generation":0}},{"score":0.98,"payload":{"chunk_id":"src-qdrant-stale-existing-child-2","profile_generation":0}}]}"#,
         );
         let store = Store::in_memory().unwrap();
         let source = source("src-qdrant-stale-existing");
@@ -2756,6 +2915,20 @@ mod tests {
             "src-qdrant-stale-existing-child-2",
             "alpha remote only stale",
         );
+        store
+            .replace_all_vector_documents(&[
+                VectorDocument {
+                    chunk_id: stale_remote_best.id.clone(),
+                    source_id: source.id.clone(),
+                    vector: keyword_vector(&stale_remote_best.text),
+                },
+                VectorDocument {
+                    chunk_id: current_local_best.id.clone(),
+                    source_id: source.id.clone(),
+                    vector: keyword_vector(&current_local_best.text),
+                },
+            ])
+            .unwrap();
         let vector_index = StaticVectorIndex::new(vec![
             (current_local_best.id.clone(), 0.95),
             (stale_remote_best.id.clone(), 0.5),
@@ -2785,11 +2958,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].chunk_id, stale_remote_best.id);
-        assert_eq!(results[1].chunk_id, current_local_best.id);
+        assert_eq!(results[0].chunk_id, current_local_best.id);
+        assert_eq!(results[1].chunk_id, stale_remote_best.id);
         assert!(!results
             .iter()
             .any(|result| result.chunk_id == remote_only_stale.id));
+        assert_eq!(
+            handle.join().unwrap(),
+            "POST /collections/verbatim/points/search HTTP/1.1"
+        );
+    }
+
+    #[cfg(feature = "qdrant")]
+    #[tokio::test]
+    async fn qdrant_stale_generation_same_chunk_hit_does_not_block_local_fallback() {
+        let (qdrant_url, handle) = spawn_qdrant_search_response(
+            200,
+            r#"{"status":"ok","result":[{"score":0.99,"payload":{"chunk_id":"chunk-rebuilt-same-id","profile_generation":1}}]}"#,
+        );
+        let store = Store::in_memory().unwrap();
+        let source = source("src-qdrant-rebuilt-same-id");
+        store.add_source(&source).unwrap();
+        let rebuilt_same_id = insert_text_chunk(
+            &store,
+            &source,
+            "chunk-rebuilt-same-id",
+            "alpha rebuilt same id",
+        );
+        let fresh_best = insert_text_chunk(
+            &store,
+            &source,
+            "chunk-fresh-current-generation",
+            "alpha fresh current generation",
+        );
+        store
+            .replace_all_vector_documents(&[VectorDocument {
+                chunk_id: rebuilt_same_id.id.clone(),
+                source_id: source.id.clone(),
+                vector: keyword_vector(&rebuilt_same_id.text),
+            }])
+            .unwrap();
+        assert_eq!(store.index_generation().unwrap(), 1);
+        store
+            .replace_all_vector_documents(&[
+                VectorDocument {
+                    chunk_id: rebuilt_same_id.id.clone(),
+                    source_id: source.id.clone(),
+                    vector: keyword_vector(&rebuilt_same_id.text),
+                },
+                VectorDocument {
+                    chunk_id: fresh_best.id.clone(),
+                    source_id: source.id.clone(),
+                    vector: keyword_vector(&fresh_best.text),
+                },
+            ])
+            .unwrap();
+        assert_eq!(store.index_generation().unwrap(), 2);
+        let vector_index = StaticVectorIndex::new(vec![
+            (fresh_best.id.clone(), 0.95),
+            (rebuilt_same_id.id.clone(), 0.5),
+        ]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = KeywordEmbeddingClient;
+        let config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 0,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let qdrant = qdrant_config(qdrant_url);
+        let pipeline = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &config,
+        )
+        .with_qdrant_search(&qdrant);
+
+        let results = pipeline
+            .search_filtered("alpha", Some(&source.id))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].chunk_id, fresh_best.id);
+        assert_eq!(results[1].chunk_id, rebuilt_same_id.id);
         assert_eq!(
             handle.join().unwrap(),
             "POST /collections/verbatim/points/search HTTP/1.1"

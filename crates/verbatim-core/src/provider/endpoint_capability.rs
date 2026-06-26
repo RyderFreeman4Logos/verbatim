@@ -10,6 +10,31 @@ use super::ProviderError;
 
 const MODELS_PATH: &str = "models";
 const MODELS_V1_PATH: &str = "v1/models";
+const SERVED_MODEL_FIELDS: &[&str] = &[
+    "served_model",
+    "served_model_name",
+    "served_model_id",
+    "base_model",
+    "base_model_name",
+    "root",
+];
+const DTYPE_FIELDS: &[&str] = &["dtype", "torch_dtype", "model_dtype", "weight_dtype"];
+const QUANTIZATION_FIELDS: &[&str] = &[
+    "quantization",
+    "quantization_method",
+    "quant_method",
+    "load_format",
+];
+const WEIGHT_IDENTITY_FIELDS: &[&str] = &[
+    "revision",
+    "commit",
+    "commit_hash",
+    "sha",
+    "model_sha",
+    "digest",
+    "weight_hash",
+    "checkpoint",
+];
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(super) enum EndpointCapabilityRole {
@@ -28,12 +53,21 @@ pub(super) enum EndpointCapabilityState {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct EndpointCapability {
     pub max_context_tokens: Option<usize>,
+    pub served_model: Option<String>,
+    pub dtype: Option<String>,
+    pub quantization: Option<String>,
+    pub weight_identity: Option<String>,
     pub request_limits: EndpointRequestLimits,
 }
 
 impl EndpointCapability {
     fn is_empty(&self) -> bool {
-        self.max_context_tokens.is_none() && self.request_limits.is_empty()
+        self.max_context_tokens.is_none()
+            && self.served_model.is_none()
+            && self.dtype.is_none()
+            && self.quantization.is_none()
+            && self.weight_identity.is_none()
+            && self.request_limits.is_empty()
     }
 }
 
@@ -72,6 +106,10 @@ impl EndpointRequestLimits {
 pub(super) struct EndpointCapabilityDiagnostics {
     pub state: EndpointCapabilityState,
     pub max_context_tokens: Option<usize>,
+    pub served_model: Option<String>,
+    pub dtype: Option<String>,
+    pub quantization: Option<String>,
+    pub weight_identity: Option<String>,
     pub max_batch_size: Option<usize>,
     pub max_inputs: Option<usize>,
     pub max_input_chars: Option<usize>,
@@ -92,6 +130,10 @@ impl EndpointCapabilityDiagnostics {
         Self {
             state,
             max_context_tokens: value.and_then(|capability| capability.max_context_tokens),
+            served_model: value.and_then(|capability| capability.served_model.clone()),
+            dtype: value.and_then(|capability| capability.dtype.clone()),
+            quantization: value.and_then(|capability| capability.quantization.clone()),
+            weight_identity: value.and_then(|capability| capability.weight_identity.clone()),
             max_batch_size: limits.and_then(|limits| limits.max_batch_size),
             max_inputs: limits.and_then(|limits| limits.max_inputs),
             max_input_chars: limits.and_then(|limits| limits.max_input_chars),
@@ -262,6 +304,10 @@ pub(super) fn parse_endpoint_capability(
     let search_root = capability_search_root(value, model)?;
     let capability = EndpointCapability {
         max_context_tokens: find_context_limit(search_root),
+        served_model: find_metadata_string(search_root, SERVED_MODEL_FIELDS),
+        dtype: find_metadata_string(search_root, DTYPE_FIELDS),
+        quantization: find_metadata_string(search_root, QUANTIZATION_FIELDS),
+        weight_identity: find_metadata_string(search_root, WEIGHT_IDENTITY_FIELDS),
         request_limits: find_request_limits(search_root),
     };
     (!capability.is_empty()).then_some(capability)
@@ -374,6 +420,57 @@ fn find_context_limit(value: &serde_json::Value) -> Option<usize> {
     let mut limits = Vec::new();
     collect_context_limits(value, &mut limits);
     limits.into_iter().filter(|limit| *limit > 0).min()
+}
+
+fn find_metadata_string(value: &serde_json::Value, fields: &[&str]) -> Option<String> {
+    let mut values = Vec::new();
+    collect_metadata_strings(value, fields, &mut values);
+    values.into_iter().next()
+}
+
+fn collect_metadata_strings(value: &serde_json::Value, fields: &[&str], values: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if fields.iter().any(|field| key.eq_ignore_ascii_case(field)) {
+                    if let Some(value) = metadata_value_as_string(value) {
+                        values.push(value);
+                    }
+                }
+                collect_metadata_strings(value, fields, values);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_metadata_strings(item, fields, values);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn metadata_value_as_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => sanitized_metadata_value(value),
+        serde_json::Value::Number(value) => sanitized_metadata_value(&value.to_string()),
+        serde_json::Value::Bool(value) => {
+            sanitized_metadata_value(if *value { "true" } else { "false" })
+        }
+        serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            None
+        }
+    }
+}
+
+fn sanitized_metadata_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(256).collect())
 }
 
 fn collect_context_limits(value: &serde_json::Value, limits: &mut Vec<usize>) {
@@ -670,6 +767,10 @@ mod tests {
             key.clone(),
             EndpointCapabilityLookup::refreshed(EndpointCapability {
                 max_context_tokens: Some(4096),
+                served_model: None,
+                dtype: None,
+                quantization: None,
+                weight_identity: None,
                 request_limits: EndpointRequestLimits::default(),
             }),
         );

@@ -9,6 +9,25 @@ use crate::image_limits::ImageArtifactLimits;
 use crate::store::Store;
 use crate::types::{ChunkId, EvidenceUnit, ParsedImageArtifact, SourceId};
 
+/// Sanitized embedding endpoint/runtime semantics that can affect vector identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingEndpointCapabilities {
+    /// Endpoint identity with query strings/fragments stripped so secrets are never persisted.
+    pub endpoint_identity: Option<String>,
+    /// Requested model name sent to the embedding endpoint.
+    pub requested_model: Option<String>,
+    /// Served/base model identity when exposed or configured.
+    pub served_model: Option<String>,
+    /// Effective embedding context window used for adaptive chunking.
+    pub max_context_tokens: Option<usize>,
+    /// Exposed or configured weight dtype.
+    pub dtype: Option<String>,
+    /// Exposed or configured quantization/runtime format.
+    pub quantization: Option<String>,
+    /// Exposed or configured immutable weight/revision identity.
+    pub weight_identity: Option<String>,
+}
+
 pub trait Parser: Send + Sync {
     fn name(&self) -> &str;
     fn supported_extensions(&self) -> &[&str];
@@ -28,6 +47,10 @@ pub trait Parser: Send + Sync {
 #[async_trait]
 pub trait EmbeddingClient: Send + Sync {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    async fn endpoint_capabilities(&self) -> Result<EmbeddingEndpointCapabilities> {
+        Ok(EmbeddingEndpointCapabilities::default())
+    }
+
     fn dimension(&self) -> usize;
 
     fn prepare_query(&self, query: &str) -> String {

@@ -14,9 +14,9 @@ use verbatim_core::api::{
     CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
     CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
     CreateCollectionRequest, EvidenceResponse, HealthResponse, IndexGcRequest, IndexGcResponse,
-    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IngestResponse, ReindexRequest,
-    ReindexResponse, RetrieveRequest, RetrieveResponse, SourceResponse, TaskCreatedResponse,
-    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse,
+    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
+    ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse, SourceResponse,
+    TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse,
 };
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
@@ -122,6 +122,7 @@ pub trait DaemonClient {
         vectors_only: bool,
     ) -> CliResult<TaskCreatedResponse>;
     fn submit_reindex_task(&self, request: &ReindexRequest) -> CliResult<TaskCreatedResponse>;
+    fn index_status(&self) -> CliResult<IndexStatusResponse>;
     fn index_gc(&self, request: &IndexGcRequest) -> CliResult<IndexGcResponse>;
     fn index_delete_profile(
         &self,
@@ -503,6 +504,10 @@ impl DaemonClient for HttpDaemonClient {
 
     fn submit_reindex_task(&self, request: &ReindexRequest) -> CliResult<TaskCreatedResponse> {
         self.request_json(Method::POST, "/api/tasks/reindex", Some(request))
+    }
+
+    fn index_status(&self) -> CliResult<IndexStatusResponse> {
+        self.request_json::<IndexStatusResponse, ()>(Method::GET, "/api/index/status", None)
     }
 
     fn index_gc(&self, request: &IndexGcRequest) -> CliResult<IndexGcResponse> {

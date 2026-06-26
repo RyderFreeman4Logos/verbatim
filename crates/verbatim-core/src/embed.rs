@@ -3,7 +3,7 @@ use async_trait::async_trait;
 
 use crate::config::EmbeddingConfig;
 use crate::provider::openai_compatible::OpenAiCompatibleEmbeddingModel;
-use crate::traits::EmbeddingClient;
+use crate::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 
 pub struct OpenAiEmbeddingClient {
     model: OpenAiCompatibleEmbeddingModel,
@@ -32,6 +32,10 @@ impl EmbeddingClient for OpenAiEmbeddingClient {
             .embed_prepared(texts.to_vec())
             .await
             .map_err(Into::into)
+    }
+
+    async fn endpoint_capabilities(&self) -> Result<EmbeddingEndpointCapabilities> {
+        self.model.endpoint_capabilities().await.map_err(Into::into)
     }
 
     fn dimension(&self) -> usize {

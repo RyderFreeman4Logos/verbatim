@@ -31,8 +31,8 @@ use verbatim_core::api::{
     CollectionWatcherResponse, CollectionWatcherStatus, CollectionWatcherUpdateRequest,
     CollectionWatchersStatusResponse, ConfigResponse, CreateCollectionRequest, ErrorResponse,
     EvidenceResponse, HealthResponse, ImageArtifactResponse, IndexGcRequest, IndexGcResponse,
-    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IngestResponse, ReindexRequest,
-    ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
+    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
+    ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
     RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
     TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
 };
@@ -446,6 +446,22 @@ async fn index_gc(
     }))
 }
 
+async fn index_status(
+    State(state): State<SharedState>,
+) -> Result<Json<IndexStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let handle = tokio::runtime::Handle::current();
+    let state = Arc::clone(&state);
+    let response = tokio::task::spawn_blocking(move || {
+        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        refresh_embedding_profile_capabilities_blocking(&handle, &mut pipeline)?;
+        pipeline.index_status()
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(response))
+}
+
 async fn index_delete_profile(
     State(state): State<SharedState>,
     Json(req): Json<IndexProfileDeleteRequest>,
@@ -636,10 +652,14 @@ fn is_source_not_found_error(source_id: &str, error: &anyhow::Error) -> bool {
 async fn check_stale(
     State(state): State<SharedState>,
 ) -> Result<Json<CheckStaleResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let handle = tokio::runtime::Handle::current();
     let state = Arc::clone(&state);
-    let ids = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.check_stale()
+    let (ids, profile_status) = tokio::task::spawn_blocking(move || {
+        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        refresh_embedding_profile_capabilities_blocking(&handle, &mut pipeline)?;
+        let ids = pipeline.check_stale()?;
+        let profile_status = pipeline.index_status()?;
+        Ok::<_, anyhow::Error>((ids, profile_status))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
@@ -647,6 +667,7 @@ async fn check_stale(
 
     Ok(Json(CheckStaleResponse {
         stale: ids.into_iter().map(|id| id.0).collect(),
+        profile_status: Some(profile_status),
     }))
 }
 
@@ -1027,10 +1048,12 @@ async fn background_ingest_batch_source_ids(
     force: bool,
     vectors_only: bool,
 ) -> Result<Vec<SourceId>> {
+    let handle = tokio::runtime::Handle::current();
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         if !force && !vectors_only {
+            refresh_embedding_profile_capabilities_blocking(&handle, &mut pipeline)?;
             pipeline.check_stale()?;
         }
         let sources = pipeline.store().list_sources()?;
@@ -4057,6 +4080,14 @@ fn parse_embedding_profile_id(
         .map_err(Into::into)
 }
 
+fn refresh_embedding_profile_capabilities_blocking(
+    runtime: &tokio::runtime::Handle,
+    pipeline: &mut IngestPipeline,
+) -> Result<()> {
+    runtime.block_on(pipeline.refresh_embedding_profile_capabilities())?;
+    Ok(())
+}
+
 async fn prepare_retrieve_context(
     state: SharedState,
     question: &str,
@@ -4072,8 +4103,10 @@ async fn prepare_retrieve_context(
     tokio::task::spawn_blocking(move || {
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         if controls.config.embedding.enabled {
+            refresh_embedding_profile_capabilities_blocking(&runtime, &mut pipeline)?;
             pipeline.select_embedding_profile(&embedding_profile_id)?;
         }
+        runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
         let lexical_index = pipeline.lexical_index();
         let embed_client = OpenAiEmbeddingClient::new(&controls.config.embedding);
         let retrieval = RetrievalPipeline::new_with_graph(
@@ -4167,8 +4200,10 @@ async fn prepare_generation_context(
     let (results, generation_context, retrieval_debug) = tokio::task::spawn_blocking(move || {
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         if config.embedding.enabled {
+            refresh_embedding_profile_capabilities_blocking(&runtime, &mut pipeline)?;
             pipeline.select_embedding_profile(&embedding_profile_id)?;
         }
+        runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
         let lexical_index = pipeline.lexical_index();
         let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
         let retrieval = RetrievalPipeline::new_with_graph(
@@ -5579,6 +5614,7 @@ async fn run_daemon() -> Result<()> {
         .route("/api/ingest", post(ingest_all))
         .route("/api/ingest/{id}", post(ingest_one))
         .route("/api/reindex", post(reindex))
+        .route("/api/index/status", get(index_status))
         .route("/api/index/gc", post(index_gc))
         .route("/api/index/profiles/delete", post(index_delete_profile))
         .route("/api/ask", post(ask))
@@ -6559,6 +6595,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capability_refresh_direct_retrieve_rejects_reset_profile_vectors() {
+        let (_test_dir, state, source_id, model_server) =
+            reloaded_embedding_endpoint_state("capability-refresh-retrieve", false).await;
+
+        let (status, Json(body)) = retrieve(
+            State(Arc::clone(&state)),
+            Json(RetrieveRequest {
+                question: "Alpha drifted endpoint question?".into(),
+                source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(1),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: false,
+                include_locator: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body
+            .error
+            .contains("embedding profile 'default' has no vectors"));
+        assert_eq!(model_server.embedding_requests(), 0);
+        assert_eq!(default_profile_source_vector_count(&state, &source_id), 0);
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_ask_rejects_reset_profile_vectors_before_chat() {
+        let (_test_dir, state, source_id, model_server) =
+            reloaded_embedding_endpoint_state("capability-refresh-ask", true).await;
+
+        let (status, Json(body)) = ask(
+            State(Arc::clone(&state)),
+            Json(AskRequest {
+                question: "Alpha drifted endpoint ask?".into(),
+                source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                show_retrieval: false,
+                context_only: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body
+            .error
+            .contains("embedding profile 'default' has no vectors"));
+        assert_eq!(model_server.embedding_requests(), 0);
+        assert_eq!(model_server.chat_requests(), 0);
+        assert_eq!(default_profile_source_vector_count(&state, &source_id), 0);
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_background_batch_expansion_marks_reset_sources_stale() {
+        let (_test_dir, state, source_id, _model_server) =
+            reloaded_embedding_endpoint_state("capability-refresh-background-batch", false).await;
+
+        let expanded = background_ingest_batch_source_ids(&state, false, false)
+            .await
+            .unwrap();
+
+        assert_eq!(expanded, vec![source_id.clone()]);
+        let source = state
+            .pipeline
+            .lock()
+            .unwrap()
+            .store()
+            .get_source(&source_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.status, SourceStatus::Stale);
+        assert_eq!(default_profile_source_vector_count(&state, &source_id), 0);
+    }
+
+    #[tokio::test]
     async fn retrieve_handler_low_memory_dense_search_uses_stored_vectors_without_resident_hnsw() {
         let model_server = MockModelServer::start(3).await;
         let test_dir = TestDir::new("retrieve-low-memory-vectors");
@@ -7245,24 +7366,32 @@ mod tests {
             .store()
             .replace_all_vector_documents_for_profile(&profile, &[])
             .unwrap();
+        let old_generation_number = pipeline
+            .store()
+            .index_generation_for_profile(&profile)
+            .unwrap();
         let old_generation = test_dir
             .path()
             .join("indexes")
             .join("profiles")
             .join("default")
-            .join("gen-1");
+            .join(format!("gen-{old_generation_number}"));
         fs::create_dir_all(&old_generation).unwrap();
         fs::write(old_generation.join("vectors.hnsw"), b"old").unwrap();
         pipeline
             .store()
             .replace_all_vector_documents_for_profile(&profile, &[])
             .unwrap();
+        let current_generation_number = pipeline
+            .store()
+            .index_generation_for_profile(&profile)
+            .unwrap();
         let current_generation = test_dir
             .path()
             .join("indexes")
             .join("profiles")
             .join("default")
-            .join("gen-2");
+            .join(format!("gen-{current_generation_number}"));
         fs::create_dir_all(&current_generation).unwrap();
         fs::write(current_generation.join("vectors.hnsw"), b"current").unwrap();
         let state = test_state(config, test_dir.path(), pipeline);
@@ -7302,6 +7431,18 @@ mod tests {
                     model: "old-model",
                     dimension: 2,
                     normalize: true,
+                    endpoint_identity: None,
+                    requested_model: None,
+                    served_model: None,
+                    max_context_tokens: None,
+                    dtype: None,
+                    quantization: None,
+                    weight_identity: None,
+                    chunker_version: "parent-child-v2",
+                    child_target_tokens: 300,
+                    child_overlap_tokens: 80,
+                    parent_children_count: 5,
+                    embedding_input_budget_tokens: None,
                     query_instruction: "",
                     document_instruction: "",
                 },
@@ -8628,6 +8769,66 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    async fn reloaded_embedding_endpoint_state(
+        test_name: &str,
+        chat_enabled_after_reload: bool,
+    ) -> (TestDir, SharedState, SourceId, MockModelServer) {
+        let old_model_server = MockModelServer::start(3).await;
+        let new_model_server =
+            MockModelServer::start_with_chat(3, "answer should not be generated [E1]").await;
+        let test_dir = TestDir::new(test_name);
+        let config_path = test_dir.path().join("config.toml");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Alpha endpoint capability drift evidence for stale vector tests.",
+        )
+        .unwrap();
+        let config = retrieve_test_config(&old_model_server.base_url);
+        fs::write(&config_path, config.show().unwrap()).unwrap();
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        assert!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(
+                    &EmbeddingProfileId::default_profile(),
+                    Some(&source_id),
+                )
+                .unwrap()
+                > 0
+        );
+
+        let state =
+            test_state_with_config_path(config.clone(), test_dir.path(), pipeline, config_path);
+        let mut candidate = config.clone();
+        candidate.embedding.base_url = new_model_server.base_url.clone();
+        candidate.chat.enabled = chat_enabled_after_reload;
+        candidate.chat.base_url = new_model_server.base_url.clone();
+        candidate.chat.model = "test-chat".into();
+        fs::write(&state.config_path, candidate.show().unwrap()).unwrap();
+        reload_config_from_path(&state).await.unwrap();
+        assert!(old_model_server.embedding_requests() > 0);
+        assert!(default_profile_source_vector_count(&state, &source_id) > 0);
+
+        (test_dir, state, source_id, new_model_server)
+    }
+
+    fn default_profile_source_vector_count(state: &SharedState, source_id: &SourceId) -> usize {
+        state
+            .pipeline
+            .lock()
+            .unwrap()
+            .store()
+            .count_vector_documents_for_profile(
+                &EmbeddingProfileId::default_profile(),
+                Some(source_id),
+            )
+            .unwrap()
     }
 
     #[tokio::test]

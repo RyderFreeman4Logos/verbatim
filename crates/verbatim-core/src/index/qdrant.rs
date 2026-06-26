@@ -25,6 +25,7 @@ const MAX_QDRANT_TEXT_PREVIEW_CHARS: usize = 240;
 #[derive(Clone, Debug, PartialEq)]
 pub struct QdrantVectorRecord {
     pub profile_id: EmbeddingProfileId,
+    pub profile_generation: u64,
     pub document: VectorDocument,
     pub heading_path: Vec<String>,
     pub text_preview: String,
@@ -33,16 +34,29 @@ pub struct QdrantVectorRecord {
 impl QdrantVectorRecord {
     pub fn from_chunk(
         profile_id: &EmbeddingProfileId,
+        profile_generation: u64,
         document: VectorDocument,
         chunk: &Chunk,
     ) -> Self {
         Self {
             profile_id: profile_id.clone(),
+            profile_generation,
             document,
             heading_path: chunk.heading_path.clone(),
             text_preview: text_preview(chunk),
         }
     }
+}
+
+/// Remote dense hit plus the profile generation that produced the stored vector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QdrantHit {
+    /// Chunk identifier returned by Qdrant payload.
+    pub chunk_id: ChunkId,
+    /// Qdrant similarity score.
+    pub score: f32,
+    /// SQLite profile index generation captured when the point was synced.
+    pub profile_generation: u64,
 }
 
 /// Build Qdrant records from SQLite's authoritative vector table and chunks.
@@ -60,6 +74,7 @@ pub fn records_from_store_for_profile(
     source_filter: Option<&SourceId>,
 ) -> Result<Vec<QdrantVectorRecord>> {
     let mut records = Vec::new();
+    let profile_generation = store.index_generation_for_profile(profile_id)?;
     for document in store.list_vector_documents_for_profile(profile_id)? {
         if source_filter.is_some_and(|source_id| &document.source_id != source_id) {
             continue;
@@ -71,7 +86,12 @@ pub fn records_from_store_for_profile(
             );
             continue;
         };
-        records.push(QdrantVectorRecord::from_chunk(profile_id, document, &chunk));
+        records.push(QdrantVectorRecord::from_chunk(
+            profile_id,
+            profile_generation,
+            document,
+            &chunk,
+        ));
     }
     Ok(records)
 }
@@ -168,7 +188,7 @@ impl QdrantClient {
         query: &[f32],
         top_k: usize,
         source_filter: Option<&SourceId>,
-    ) -> Result<Vec<(ChunkId, f32)>> {
+    ) -> Result<Vec<QdrantHit>> {
         if top_k == 0 || query.is_empty() {
             return Ok(Vec::new());
         }
@@ -176,7 +196,7 @@ impl QdrantClient {
             vector: query,
             limit: top_k,
             filter: Some(profile_source_filter(profile_id, source_filter)),
-            with_payload: ["chunk_id"],
+            with_payload: ["chunk_id", "profile_generation"],
             with_vector: false,
         };
         let response: QdrantEnvelope<Vec<QdrantScoredPoint>> = self
@@ -190,7 +210,7 @@ impl QdrantClient {
         Ok(response
             .result
             .into_iter()
-            .filter_map(|point| chunk_id_from_payload(point.payload).map(|id| (id, point.score)))
+            .filter_map(|point| hit_from_payload(point.payload, point.score))
             .collect())
     }
 
@@ -396,6 +416,7 @@ impl QdrantPoint {
             vector: record.document.vector.clone(),
             payload: QdrantPayload {
                 profile_id: record.profile_id.as_str().to_string(),
+                profile_generation: record.profile_generation,
                 chunk_id: record.document.chunk_id.0.clone(),
                 source_id: record.document.source_id.0.clone(),
                 heading_path: record.heading_path.clone(),
@@ -408,6 +429,7 @@ impl QdrantPoint {
 #[derive(Debug, Serialize)]
 struct QdrantPayload {
     profile_id: String,
+    profile_generation: u64,
     chunk_id: String,
     source_id: String,
     heading_path: Vec<String>,
@@ -425,7 +447,7 @@ struct QdrantSearchRequest<'a> {
     limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     filter: Option<QdrantFilter<'a>>,
-    with_payload: [&'static str; 1],
+    with_payload: [&'static str; 2],
     with_vector: bool,
 }
 
@@ -489,11 +511,18 @@ fn profile_source_filter<'a>(
     QdrantFilter { must }
 }
 
-fn chunk_id_from_payload(payload: Option<Value>) -> Option<ChunkId> {
-    payload?
+fn hit_from_payload(payload: Option<Value>, score: f32) -> Option<QdrantHit> {
+    let payload = payload?;
+    let chunk_id = payload
         .get("chunk_id")
         .and_then(Value::as_str)
-        .map(|id| ChunkId(id.to_string()))
+        .map(|id| ChunkId(id.to_string()))?;
+    let profile_generation = payload.get("profile_generation").and_then(Value::as_u64)?;
+    Some(QdrantHit {
+        chunk_id,
+        score,
+        profile_generation,
+    })
 }
 
 fn records_dimension(records: &[QdrantVectorRecord]) -> Result<usize> {
@@ -583,6 +612,7 @@ mod tests {
     fn record(source_id: &str, chunk_id: &str, vector: Vec<f32>) -> QdrantVectorRecord {
         QdrantVectorRecord {
             profile_id: EmbeddingProfileId::default_profile(),
+            profile_generation: 7,
             document: VectorDocument {
                 chunk_id: ChunkId(chunk_id.into()),
                 source_id: SourceId(source_id.into()),
@@ -707,6 +737,7 @@ mod tests {
         );
         let upsert: Value = serde_json::from_str(&requests[2].body).unwrap();
         assert_eq!(upsert["points"][0]["payload"]["profile_id"], "default");
+        assert_eq!(upsert["points"][0]["payload"]["profile_generation"], 7);
         assert_eq!(upsert["points"][0]["payload"]["chunk_id"], "src-1-child-0");
         assert_eq!(upsert["points"][0]["payload"]["source_id"], "src-1");
         assert_eq!(upsert["points"][0]["payload"]["heading_path"][0], "Intro");
@@ -721,7 +752,7 @@ mod tests {
     async fn search_sends_source_filter_and_maps_payload_chunk_ids() {
         let (url, handle) = spawn_server(vec![(
             200,
-            r#"{"status":"ok","result":[{"id":"550e8400-e29b-41d4-a716-446655440000","score":0.75,"payload":{"chunk_id":"chunk-a"}}]}"#,
+            r#"{"status":"ok","result":[{"id":"550e8400-e29b-41d4-a716-446655440000","score":0.75,"payload":{"chunk_id":"chunk-a","profile_generation":3}}]}"#,
         )]);
         let client = QdrantClient::new(qdrant_config(url));
         let alt_profile = EmbeddingProfileId::new("alt").unwrap();
@@ -736,7 +767,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(hits, vec![(ChunkId("chunk-a".into()), 0.75)]);
+        assert_eq!(
+            hits,
+            vec![QdrantHit {
+                chunk_id: ChunkId("chunk-a".into()),
+                score: 0.75,
+                profile_generation: 3,
+            }]
+        );
         let requests = handle.join().unwrap();
         assert_eq!(
             requests[0].line,
@@ -749,6 +787,7 @@ mod tests {
         assert_eq!(body["filter"]["must"][1]["key"], "source_id");
         assert_eq!(body["filter"]["must"][1]["match"]["value"], "src-1");
         assert_eq!(body["with_payload"][0], "chunk_id");
+        assert_eq!(body["with_payload"][1], "profile_generation");
         assert_eq!(body["with_vector"], false);
     }
 

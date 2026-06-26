@@ -53,8 +53,162 @@ pub struct EmbeddingProfileConfig<'a> {
     pub model: &'a str,
     pub dimension: usize,
     pub normalize: bool,
+    pub endpoint_identity: Option<&'a str>,
+    pub requested_model: Option<&'a str>,
+    pub served_model: Option<&'a str>,
+    pub max_context_tokens: Option<usize>,
+    pub dtype: Option<&'a str>,
+    pub quantization: Option<&'a str>,
+    pub weight_identity: Option<&'a str>,
+    pub chunker_version: &'a str,
+    pub child_target_tokens: usize,
+    pub child_overlap_tokens: usize,
+    pub parent_children_count: usize,
+    pub embedding_input_budget_tokens: Option<usize>,
     pub query_instruction: &'a str,
     pub document_instruction: &'a str,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredEmbeddingProfileConfig {
+    provider: String,
+    model: String,
+    dimension: usize,
+    normalize: bool,
+    pub(crate) endpoint_identity: Option<String>,
+    pub(crate) requested_model: Option<String>,
+    pub(crate) served_model: Option<String>,
+    pub(crate) max_context_tokens: Option<usize>,
+    pub(crate) dtype: Option<String>,
+    pub(crate) quantization: Option<String>,
+    pub(crate) weight_identity: Option<String>,
+    pub(crate) chunker_version: String,
+    pub(crate) child_target_tokens: usize,
+    pub(crate) child_overlap_tokens: usize,
+    pub(crate) parent_children_count: usize,
+    pub(crate) embedding_input_budget_tokens: Option<usize>,
+    query_instruction_hash: String,
+    document_instruction_hash: String,
+    config_hash: String,
+}
+
+impl StoredEmbeddingProfileConfig {
+    fn incompatible_config_fields(&self, next: EmbeddingProfileConfig<'_>) -> Vec<&'static str> {
+        if self.config_hash == LEGACY_EMBEDDING_PROFILE_CONFIG_HASH {
+            return Vec::new();
+        }
+
+        let mut fields = Vec::new();
+        if self.provider != next.provider {
+            fields.push("provider");
+        }
+        if self.model != next.model {
+            fields.push("model");
+        }
+        if self.dimension != next.dimension {
+            fields.push("dimension");
+        }
+        if self.normalize != next.normalize {
+            fields.push("normalize");
+        }
+        if self.query_instruction_hash != next.query_instruction_hash() {
+            fields.push("query_instruction_hash");
+        }
+        if self.document_instruction_hash != next.document_instruction_hash() {
+            fields.push("document_instruction_hash");
+        }
+        fields
+    }
+
+    fn requires_vector_reset(&self, next: EmbeddingProfileConfig<'_>, next_hash: &str) -> bool {
+        if self.config_hash == next_hash {
+            return false;
+        }
+        if self.config_hash == LEGACY_EMBEDDING_PROFILE_CONFIG_HASH {
+            return true;
+        }
+        if self.provider != next.provider
+            || self.model != next.model
+            || self.dimension != next.dimension
+            || self.normalize != next.normalize
+            || !optional_str_matches(&self.endpoint_identity, next.endpoint_identity)
+            || !optional_str_matches(&self.requested_model, next.requested_model)
+            || !optional_str_matches(&self.served_model, next.served_model)
+            || !optional_str_matches(&self.dtype, next.dtype)
+            || !optional_str_matches(&self.quantization, next.quantization)
+            || !optional_str_matches(&self.weight_identity, next.weight_identity)
+            || self.query_instruction_hash != next.query_instruction_hash()
+            || self.document_instruction_hash != next.document_instruction_hash()
+        {
+            return true;
+        }
+        if self.chunker_version != next.chunker_version
+            || self.parent_children_count != next.parent_children_count
+        {
+            return true;
+        }
+        next.child_target_tokens < self.child_target_tokens
+            || next.child_overlap_tokens < self.child_overlap_tokens
+            || optional_usize_decreased(
+                self.embedding_input_budget_tokens,
+                next.embedding_input_budget_tokens,
+            )
+    }
+
+    fn preserve_unknown_capabilities<'a>(
+        &'a self,
+        next: EmbeddingProfileConfig<'a>,
+    ) -> EmbeddingProfileConfig<'a> {
+        let preserve_stored_chunking = next.max_context_tokens.is_none()
+            && (self.max_context_tokens.is_some() || self.embedding_input_budget_tokens.is_some());
+        EmbeddingProfileConfig {
+            provider: next.provider,
+            model: next.model,
+            dimension: next.dimension,
+            normalize: next.normalize,
+            endpoint_identity: next.endpoint_identity.or(self.endpoint_identity.as_deref()),
+            requested_model: next.requested_model.or(self.requested_model.as_deref()),
+            served_model: next.served_model.or(self.served_model.as_deref()),
+            max_context_tokens: next.max_context_tokens.or(self.max_context_tokens),
+            dtype: next.dtype.or(self.dtype.as_deref()),
+            quantization: next.quantization.or(self.quantization.as_deref()),
+            weight_identity: next.weight_identity.or(self.weight_identity.as_deref()),
+            chunker_version: next.chunker_version,
+            child_target_tokens: if preserve_stored_chunking {
+                self.child_target_tokens
+            } else {
+                next.child_target_tokens
+            },
+            child_overlap_tokens: if preserve_stored_chunking {
+                self.child_overlap_tokens
+            } else {
+                next.child_overlap_tokens
+            },
+            parent_children_count: if preserve_stored_chunking {
+                self.parent_children_count
+            } else {
+                next.parent_children_count
+            },
+            embedding_input_budget_tokens: if preserve_stored_chunking {
+                self.embedding_input_budget_tokens
+            } else {
+                next.embedding_input_budget_tokens
+            },
+            query_instruction: next.query_instruction,
+            document_instruction: next.document_instruction,
+        }
+    }
+}
+
+fn optional_str_matches(stored: &Option<String>, next: Option<&str>) -> bool {
+    stored.as_deref().unwrap_or("") == next.unwrap_or("")
+}
+
+fn optional_usize_decreased(previous: Option<usize>, next: Option<usize>) -> bool {
+    match (previous, next) {
+        (Some(previous), Some(next)) => next < previous,
+        (None, Some(_)) | (Some(_), None) | (None, None) => false,
+    }
 }
 
 impl EmbeddingProfileConfig<'_> {
@@ -67,14 +221,7 @@ impl EmbeddingProfileConfig<'_> {
     }
 
     pub fn config_hash(&self) -> String {
-        embedding_profile_config_hash(
-            self.provider,
-            self.model,
-            self.dimension,
-            self.normalize,
-            &self.query_instruction_hash(),
-            &self.document_instruction_hash(),
-        )
+        embedding_profile_config_hash(self)
     }
 }
 
@@ -1262,15 +1409,15 @@ impl Store {
         &self,
         profile_id: &EmbeddingProfileId,
         config: EmbeddingProfileConfig<'_>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let now = unix_timestamp_string();
         let query_instruction_hash = config.query_instruction_hash();
         let document_instruction_hash = config.document_instruction_hash();
         let config_hash = config.config_hash();
         self.conn.execute(
             "INSERT INTO embedding_profiles
-                (id, provider, model, dimension, normalize, query_instruction_hash, document_instruction_hash, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?9)
+                (id, provider, model, dimension, normalize, endpoint_identity, requested_model, served_model, max_context_tokens, dtype, quantization, weight_identity, chunker_version, child_target_tokens, child_overlap_tokens, parent_children_count, embedding_input_budget_tokens, query_instruction_hash, document_instruction_hash, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, NULL, NULL, ?21, ?21)
              ON CONFLICT(id) DO NOTHING",
             params![
                 profile_id.as_str(),
@@ -1278,6 +1425,18 @@ impl Store {
                 config.model,
                 sql_usize(config.dimension),
                 config.normalize,
+                config.endpoint_identity,
+                config.requested_model,
+                config.served_model,
+                sql_opt_usize(config.max_context_tokens),
+                config.dtype,
+                config.quantization,
+                config.weight_identity,
+                config.chunker_version,
+                sql_usize(config.child_target_tokens),
+                sql_usize(config.child_overlap_tokens),
+                sql_usize(config.parent_children_count),
+                sql_opt_usize(config.embedding_input_budget_tokens),
                 &query_instruction_hash,
                 &document_instruction_hash,
                 &config_hash,
@@ -1290,85 +1449,82 @@ impl Store {
             params![profile_id.as_str()],
         )?;
 
-        let existing: Option<(String, String, i64, bool, String, String, String)> = self
-            .conn
+        let Some(existing) = self.load_embedding_profile_config(profile_id)? else {
+            bail!("embedding profile was not persisted: {profile_id}");
+        };
+        let effective_config = existing.preserve_unknown_capabilities(config);
+        let query_instruction_hash = effective_config.query_instruction_hash();
+        let document_instruction_hash = effective_config.document_instruction_hash();
+        let config_hash = effective_config.config_hash();
+        if existing.config_hash != config_hash {
+            let incompatible_fields = existing.incompatible_config_fields(effective_config);
+            if !incompatible_fields.is_empty() {
+                bail!(
+                    "embedding profile '{}' already exists with incompatible config fields: {}",
+                    profile_id.as_str(),
+                    incompatible_fields.join(", ")
+                );
+            }
+            let reset_vectors = existing.requires_vector_reset(effective_config, &config_hash);
+            let tx = self.conn.unchecked_transaction()?;
+            update_embedding_profile_config_tx(
+                &tx,
+                profile_id,
+                effective_config,
+                &query_instruction_hash,
+                &document_instruction_hash,
+                &config_hash,
+            )?;
+            if reset_vectors {
+                clear_profile_vector_state_tx(&tx, profile_id)?;
+            }
+            tx.commit()?;
+            return Ok(reset_vectors);
+        }
+
+        Ok(false)
+    }
+
+    pub(crate) fn load_embedding_profile_config(
+        &self,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<Option<StoredEmbeddingProfileConfig>> {
+        self.conn
             .query_row(
-                "SELECT provider, model, dimension, normalize, query_instruction_hash, document_instruction_hash, config_hash
+                "SELECT provider, model, dimension, normalize, endpoint_identity, requested_model,
+                        served_model, max_context_tokens, dtype, quantization, weight_identity,
+                        chunker_version, child_target_tokens, child_overlap_tokens,
+                        parent_children_count, embedding_input_budget_tokens, query_instruction_hash,
+                        document_instruction_hash, config_hash
                  FROM embedding_profiles
                  WHERE id = ?1",
                 params![profile_id.as_str()],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
+                    Ok(StoredEmbeddingProfileConfig {
+                        provider: row.get(0)?,
+                        model: row.get(1)?,
+                        dimension: row_usize(row, 2)?,
+                        normalize: row.get(3)?,
+                        endpoint_identity: row.get(4)?,
+                        requested_model: row.get(5)?,
+                        served_model: row.get(6)?,
+                        max_context_tokens: row_opt_usize(row, 7)?,
+                        dtype: row.get(8)?,
+                        quantization: row.get(9)?,
+                        weight_identity: row.get(10)?,
+                        chunker_version: row.get(11)?,
+                        child_target_tokens: row_usize(row, 12)?,
+                        child_overlap_tokens: row_usize(row, 13)?,
+                        parent_children_count: row_usize(row, 14)?,
+                        embedding_input_budget_tokens: row_opt_usize(row, 15)?,
+                        query_instruction_hash: row.get(16)?,
+                        document_instruction_hash: row.get(17)?,
+                        config_hash: row.get(18)?,
+                    })
                 },
             )
-            .optional()?;
-        let Some((
-            existing_provider,
-            existing_model,
-            existing_dimension,
-            existing_normalize,
-            existing_query_instruction_hash,
-            existing_document_instruction_hash,
-            existing_hash,
-        )) = existing
-        else {
-            bail!("embedding profile was not persisted: {profile_id}");
-        };
-        if existing_hash == LEGACY_EMBEDDING_PROFILE_CONFIG_HASH {
-            let now = unix_timestamp_string();
-            self.conn.execute(
-                "UPDATE embedding_profiles
-                 SET provider = ?2,
-                     model = ?3,
-                     dimension = ?4,
-                     normalize = ?5,
-                     query_instruction_hash = ?6,
-                     document_instruction_hash = ?7,
-                     config_hash = ?8,
-                     updated_at = ?9
-                 WHERE id = ?1",
-                params![
-                    profile_id.as_str(),
-                    config.provider,
-                    config.model,
-                    sql_usize(config.dimension),
-                    config.normalize,
-                    query_instruction_hash,
-                    document_instruction_hash,
-                    config_hash,
-                    now,
-                ],
-            )?;
-            return Ok(());
-        }
-        if existing_hash != config_hash {
-            bail!(
-                "embedding profile '{}' already exists for provider='{}', model='{}', dimension={}, normalize={}, query_instruction_hash='{}', document_instruction_hash='{}', but current config is provider='{}', model='{}', dimension={}, normalize={}, query_instruction_hash='{}', document_instruction_hash='{}'",
-                profile_id,
-                existing_provider,
-                existing_model,
-                existing_dimension,
-                existing_normalize,
-                existing_query_instruction_hash,
-                existing_document_instruction_hash,
-                config.provider,
-                config.model,
-                config.dimension,
-                config.normalize,
-                query_instruction_hash,
-                document_instruction_hash,
-            );
-        }
-
-        Ok(())
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn set_embedding_meta(
@@ -1509,6 +1665,22 @@ impl Store {
             });
         }
         Ok(result)
+    }
+
+    pub fn has_vector_document_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        chunk_id: &ChunkId,
+        source_id: &SourceId,
+    ) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM chunk_vectors
+             WHERE profile_id = ?1 AND chunk_id = ?2 AND source_id = ?3",
+            params![profile_id.as_str(), &chunk_id.0, &source_id.0],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Search SQLite-stored vectors for one profile without building a resident vector index.
@@ -2278,6 +2450,78 @@ fn migrate_embedding_profile_tables(conn: &Connection) -> Result<()> {
         "document_instruction_hash",
         "ALTER TABLE embedding_profiles ADD COLUMN document_instruction_hash TEXT NOT NULL DEFAULT ''",
     )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "endpoint_identity",
+        "ALTER TABLE embedding_profiles ADD COLUMN endpoint_identity TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "requested_model",
+        "ALTER TABLE embedding_profiles ADD COLUMN requested_model TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "served_model",
+        "ALTER TABLE embedding_profiles ADD COLUMN served_model TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "max_context_tokens",
+        "ALTER TABLE embedding_profiles ADD COLUMN max_context_tokens INTEGER",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "dtype",
+        "ALTER TABLE embedding_profiles ADD COLUMN dtype TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "quantization",
+        "ALTER TABLE embedding_profiles ADD COLUMN quantization TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "weight_identity",
+        "ALTER TABLE embedding_profiles ADD COLUMN weight_identity TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "chunker_version",
+        "ALTER TABLE embedding_profiles ADD COLUMN chunker_version TEXT NOT NULL DEFAULT 'parent-child-v2'",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "child_target_tokens",
+        "ALTER TABLE embedding_profiles ADD COLUMN child_target_tokens INTEGER NOT NULL DEFAULT 300",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "child_overlap_tokens",
+        "ALTER TABLE embedding_profiles ADD COLUMN child_overlap_tokens INTEGER NOT NULL DEFAULT 80",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "parent_children_count",
+        "ALTER TABLE embedding_profiles ADD COLUMN parent_children_count INTEGER NOT NULL DEFAULT 5",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "embedding_input_budget_tokens",
+        "ALTER TABLE embedding_profiles ADD COLUMN embedding_input_budget_tokens INTEGER",
+    )?;
     if !had_query_instruction_hash || !had_document_instruction_hash {
         backfill_embedding_profile_instruction_hashes(conn)?;
     }
@@ -2383,7 +2627,6 @@ fn backfill_embedding_profile_instruction_hashes(conn: &Connection) -> Result<()
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let empty_instruction_hash = embedding_instruction_hash("");
     for (id, provider, model, dimension, normalize, old_config_hash) in rows {
         if old_config_hash == LEGACY_EMBEDDING_PROFILE_CONFIG_HASH {
             continue;
@@ -2391,14 +2634,28 @@ fn backfill_embedding_profile_instruction_hashes(conn: &Connection) -> Result<()
         let dimension = usize::try_from(dimension).with_context(|| {
             format!("invalid embedding profile dimension for profile '{id}': {dimension}")
         })?;
-        let config_hash = embedding_profile_config_hash(
-            &provider,
-            &model,
+        let config = EmbeddingProfileConfig {
+            provider: &provider,
+            model: &model,
             dimension,
             normalize,
-            &empty_instruction_hash,
-            &empty_instruction_hash,
-        );
+            endpoint_identity: None,
+            requested_model: None,
+            served_model: None,
+            max_context_tokens: None,
+            dtype: None,
+            quantization: None,
+            weight_identity: None,
+            chunker_version: "parent-child-v2",
+            child_target_tokens: 300,
+            child_overlap_tokens: 80,
+            parent_children_count: 5,
+            embedding_input_budget_tokens: None,
+            query_instruction: "",
+            document_instruction: "",
+        };
+        let empty_instruction_hash = config.query_instruction_hash();
+        let config_hash = config.config_hash();
         conn.execute(
             "UPDATE embedding_profiles
              SET query_instruction_hash = ?2,
@@ -2645,20 +2902,143 @@ fn sql_usize(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn embedding_profile_config_hash(
-    provider: &str,
-    model: &str,
-    dimension: usize,
-    normalize: bool,
-    query_instruction_hash: &str,
-    document_instruction_hash: &str,
-) -> String {
+fn sql_opt_usize(value: Option<usize>) -> Option<i64> {
+    value.map(sql_usize)
+}
+
+fn row_usize(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<usize> {
+    let value = row.get::<_, i64>(idx)?;
+    value
+        .try_into()
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+}
+
+fn row_opt_usize(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<usize>> {
+    row.get::<_, Option<i64>>(idx)?
+        .map(|value| {
+            value
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+        })
+        .transpose()
+}
+
+fn embedding_profile_config_hash(config: &EmbeddingProfileConfig<'_>) -> String {
+    let query_instruction_hash = config.query_instruction_hash();
+    let document_instruction_hash = config.document_instruction_hash();
     hex_sha256(
         format!(
-            "{provider}\0{model}\0{dimension}\0{normalize}\0{query_instruction_hash}\0{document_instruction_hash}"
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            config.provider,
+            config.model,
+            config.dimension,
+            config.normalize,
+            config.endpoint_identity.unwrap_or(""),
+            config.requested_model.unwrap_or(""),
+            config.served_model.unwrap_or(""),
+            config
+                .max_context_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            config.dtype.unwrap_or(""),
+            config.quantization.unwrap_or(""),
+            config.weight_identity.unwrap_or(""),
+            config.chunker_version,
+            config.child_target_tokens,
+            config.child_overlap_tokens,
+            config.parent_children_count,
+            config
+                .embedding_input_budget_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            query_instruction_hash,
+            document_instruction_hash
         )
         .as_bytes(),
     )
+}
+
+fn update_embedding_profile_config_tx(
+    tx: &Transaction<'_>,
+    profile_id: &EmbeddingProfileId,
+    config: EmbeddingProfileConfig<'_>,
+    query_instruction_hash: &str,
+    document_instruction_hash: &str,
+    config_hash: &str,
+) -> Result<()> {
+    let now = unix_timestamp_string();
+    tx.execute(
+        "UPDATE embedding_profiles
+         SET provider = ?2,
+             model = ?3,
+             dimension = ?4,
+             normalize = ?5,
+             endpoint_identity = ?6,
+             requested_model = ?7,
+             served_model = ?8,
+             max_context_tokens = ?9,
+             dtype = ?10,
+             quantization = ?11,
+             weight_identity = ?12,
+             chunker_version = ?13,
+             child_target_tokens = ?14,
+             child_overlap_tokens = ?15,
+             parent_children_count = ?16,
+             embedding_input_budget_tokens = ?17,
+             query_instruction_hash = ?18,
+             document_instruction_hash = ?19,
+             config_hash = ?20,
+             updated_at = ?21
+         WHERE id = ?1",
+        params![
+            profile_id.as_str(),
+            config.provider,
+            config.model,
+            sql_usize(config.dimension),
+            config.normalize,
+            config.endpoint_identity,
+            config.requested_model,
+            config.served_model,
+            sql_opt_usize(config.max_context_tokens),
+            config.dtype,
+            config.quantization,
+            config.weight_identity,
+            config.chunker_version,
+            sql_usize(config.child_target_tokens),
+            sql_usize(config.child_overlap_tokens),
+            sql_usize(config.parent_children_count),
+            sql_opt_usize(config.embedding_input_budget_tokens),
+            query_instruction_hash,
+            document_instruction_hash,
+            config_hash,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn clear_profile_vector_state_tx(
+    tx: &Transaction<'_>,
+    profile_id: &EmbeddingProfileId,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM chunk_vectors WHERE profile_id = ?1",
+        params![profile_id.as_str()],
+    )?;
+    tx.execute(
+        "DELETE FROM embedding_cache WHERE profile_id = ?1",
+        params![profile_id.as_str()],
+    )?;
+    tx.execute(
+        "DELETE FROM source_embedding_status WHERE profile_id = ?1",
+        params![profile_id.as_str()],
+    )?;
+    tx.execute(
+        "DELETE FROM embeddings_meta WHERE profile_id = ?1",
+        params![profile_id.as_str()],
+    )?;
+    let _ = bump_profile_index_generation(tx, profile_id)?;
+    Ok(())
 }
 
 fn embedding_instruction_hash(instruction: &str) -> String {
@@ -3232,6 +3612,18 @@ CREATE TABLE IF NOT EXISTS embedding_profiles (
     model TEXT NOT NULL,
     dimension INTEGER NOT NULL,
     normalize INTEGER NOT NULL,
+    endpoint_identity TEXT,
+    requested_model TEXT,
+    served_model TEXT,
+    max_context_tokens INTEGER,
+    dtype TEXT,
+    quantization TEXT,
+    weight_identity TEXT,
+    chunker_version TEXT NOT NULL DEFAULT 'parent-child-v2',
+    child_target_tokens INTEGER NOT NULL DEFAULT 300,
+    child_overlap_tokens INTEGER NOT NULL DEFAULT 80,
+    parent_children_count INTEGER NOT NULL DEFAULT 5,
+    embedding_input_budget_tokens INTEGER,
     query_instruction_hash TEXT NOT NULL DEFAULT '',
     document_instruction_hash TEXT NOT NULL DEFAULT '',
     config_hash TEXT NOT NULL,
@@ -3533,6 +3925,18 @@ mod tests {
             model,
             dimension,
             normalize,
+            endpoint_identity: None,
+            requested_model: None,
+            served_model: None,
+            max_context_tokens: None,
+            dtype: None,
+            quantization: None,
+            weight_identity: None,
+            chunker_version: "parent-child-v2",
+            child_target_tokens: 300,
+            child_overlap_tokens: 80,
+            parent_children_count: 5,
+            embedding_input_budget_tokens: None,
             query_instruction,
             document_instruction,
         }
@@ -3842,6 +4246,138 @@ mod tests {
                 test_profile_config("provider-a", "model-a", 2, true, "", ""),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn embedding_profile_reset_rolls_back_profile_update_when_clear_fails() {
+        let store = Store::in_memory().unwrap();
+        let profile = profile_id("atomic-reset");
+        let source = sample_source();
+        let chunk_id = ChunkId("child-1".into());
+        let first_config = EmbeddingProfileConfig {
+            served_model: Some("Served-A"),
+            ..test_profile_config("test", "model", 2, true, "", "")
+        };
+        let second_config = EmbeddingProfileConfig {
+            served_model: Some("Served-B"),
+            ..test_profile_config("test", "model", 2, true, "", "")
+        };
+        let first_config_hash = first_config.config_hash();
+
+        store
+            .ensure_embedding_profile(&profile, first_config)
+            .unwrap();
+        store.add_source(&source).unwrap();
+        store
+            .bulk_insert_chunks(&sample_chunks(&source.id.0))
+            .unwrap();
+        store
+            .replace_all_vector_documents_for_profile(
+                &profile,
+                &[VectorDocument {
+                    chunk_id: chunk_id.clone(),
+                    source_id: source.id.clone(),
+                    vector: vec![1.0, 0.0],
+                }],
+            )
+            .unwrap();
+        store
+            .set_source_embedding_status(
+                &profile,
+                &source.id,
+                SourceEmbeddingStatus::Embedded,
+                1,
+                None,
+            )
+            .unwrap();
+        store
+            .set_embedding_meta_for_profile(&profile, &chunk_id, 0, "model", "2026-01-01")
+            .unwrap();
+        store
+            .upsert_embedding_cache_entries(
+                &profile,
+                &first_config_hash,
+                &[EmbeddingCacheEntry {
+                    embedding_input_hash: "input-a".into(),
+                    vector: vec![1.0, 0.0],
+                }],
+            )
+            .unwrap();
+        let first_generation = store.index_generation_for_profile(&profile).unwrap();
+
+        store
+            .conn
+            .execute_batch(
+                "
+                CREATE TRIGGER fail_profile_vector_reset
+                BEFORE DELETE ON chunk_vectors
+                WHEN OLD.profile_id = 'atomic-reset'
+                BEGIN
+                    SELECT RAISE(FAIL, 'forced profile reset failure');
+                END;
+                ",
+            )
+            .unwrap();
+
+        let err = store
+            .ensure_embedding_profile(&profile, second_config)
+            .unwrap_err();
+        assert!(err.to_string().contains("forced profile reset failure"));
+        let stored = store
+            .load_embedding_profile_config(&profile)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.config_hash, first_config_hash);
+        assert_eq!(stored.served_model.as_deref(), Some("Served-A"));
+        assert_eq!(
+            store
+                .list_vector_documents_for_profile(&profile)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .get_embedding_cache_vector(&profile, &first_config_hash, "input-a")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_embedding_meta_for_profile(&profile, &chunk_id)
+            .unwrap()
+            .is_some());
+        assert!(!store
+            .source_vectors_stale_for_profile(&profile, &source.id)
+            .unwrap());
+        assert_eq!(
+            store.index_generation_for_profile(&profile).unwrap(),
+            first_generation
+        );
+
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_profile_vector_reset;")
+            .unwrap();
+        assert!(store
+            .ensure_embedding_profile(&profile, second_config)
+            .unwrap());
+        assert!(store
+            .list_vector_documents_for_profile(&profile)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_embedding_cache_vector(&profile, &first_config_hash, "input-a")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_embedding_meta_for_profile(&profile, &chunk_id)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .source_vectors_stale_for_profile(&profile, &source.id)
+            .unwrap());
+        assert_eq!(
+            store.index_generation_for_profile(&profile).unwrap(),
+            first_generation + 1
+        );
     }
 
     #[test]
