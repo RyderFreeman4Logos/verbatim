@@ -3190,6 +3190,20 @@ fn acquire_ingest_worker(
 }
 
 async fn drain_ingest_queue(state: SharedState) {
+    match recover_abandoned_running_source_batch_children(&state).await {
+        Ok(0) => {}
+        Ok(recovered) => {
+            tracing::warn!(
+                recovered,
+                "recovered abandoned running source-batch ingest tasks before draining queue"
+            );
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to recover abandoned running ingest tasks");
+            return;
+        }
+    }
+
     loop {
         match expand_next_unexpanded_ingest_batch(&state).await {
             Ok(_) => {}
@@ -3242,6 +3256,53 @@ async fn drain_ingest_queue(state: SharedState) {
             }
         }
     }
+}
+
+async fn recover_abandoned_running_source_batch_children(state: &SharedState) -> Result<usize> {
+    if state.ingest_worker_active.load(Ordering::Acquire) {
+        return Ok(0);
+    }
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        recover_abandoned_running_source_batch_children_in_store(&store)
+    })
+    .await
+    .context("join abandoned ingest recovery task")?
+}
+
+fn recover_abandoned_running_source_batch_children_in_store(store: &Store) -> Result<usize> {
+    let mut candidates = Vec::new();
+    for task in store.tasks(TaskKind::Ingest)? {
+        if task.status == TaskStatus::Running && parse_source_batch_child_request(&task)?.is_some()
+        {
+            candidates.push(task);
+        }
+    }
+
+    let mut recovered = 0;
+    for task in candidates {
+        let error_message = "abandoned running source-batch ingest task recovered without an active worker; failing task to unblock ingest queue";
+        let resumability = task_failure_resumability_metadata(&task, Some(error_message))?;
+        if !store.finish_task_failed_with_result(&task.id, error_message, resumability.as_ref())? {
+            continue;
+        }
+
+        let mut payload = serde_json::json!({
+            "error": bounded_error(error_message),
+            "recovery": "abandoned_running_source_batch_child",
+        });
+        if let Some(resumability) = &resumability {
+            payload["resumability"] = resumability.clone();
+        }
+        store.insert_task_event(&task.id, "failed", "task failed", &payload)?;
+        finalize_ingest_batch_parent_if_complete(store, Some(&task))?;
+        recovered += 1;
+    }
+    Ok(recovered)
 }
 
 async fn claim_startable_ingest_work(state: &SharedState) -> Result<Option<ClaimedIngestWork>> {
@@ -9044,6 +9105,111 @@ mod tests {
             .unwrap_or_default()
             .contains("missing source batch outcome"));
         assert_eq!(running_ingest_count(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_queue_recovers_abandoned_running_source_batch_children() {
+        let test_dir = TestDir::new("source-batch-abandoned-running");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.batch_size = 2;
+        config.embedding.endpoint_runtime.max_concurrent_requests = 1;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let parent_id = TaskId::new();
+        create_persisted_task_with_id(
+            &state,
+            parent_id.clone(),
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(&parent_id.0),
+            ),
+        )
+        .await
+        .unwrap();
+        let mut child_ids = Vec::new();
+        for source_id in ["stalled-source-one", "stalled-source-two"] {
+            let child_id = create_persisted_task(
+                &state,
+                TaskKind::Ingest,
+                ingest_task_request_metadata_with_queue_claim_and_batch(
+                    Some(source_id),
+                    false,
+                    None,
+                    false,
+                    true,
+                    Some(&parent_id.0),
+                ),
+            )
+            .await
+            .unwrap();
+            child_ids.push(child_id);
+        }
+        let claimed = claim_startable_ingest_work(&state).await.unwrap().unwrap();
+        let ClaimedIngestWork::SourceBatch(tasks) = claimed else {
+            panic!("expected source batch claim");
+        };
+        assert_eq!(tasks.len(), 2);
+        {
+            let store = state.task_store.lock().unwrap();
+            let now = unix_timestamp_string();
+            for task in &tasks {
+                store
+                    .update_task_progress(
+                        &task.id,
+                        TaskProgressSnapshot::phase("embedding")
+                            .with_recent_status("embedding complete"),
+                    )
+                    .unwrap();
+                store
+                    .insert_task_span(
+                        &task.id,
+                        "db",
+                        &now,
+                        1280,
+                        &serde_json::json!({ "operation": "replace_source_contents" }),
+                    )
+                    .unwrap();
+                store
+                    .insert_task_span(
+                        &task.id,
+                        "ingest_index_publishing",
+                        &now,
+                        2058,
+                        &serde_json::json!({}),
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(running_ingest_count(&state).await, 2);
+        let followup_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, true),
+        )
+        .await
+        .unwrap();
+
+        schedule_ingest_queue(Arc::clone(&state));
+        wait_for_ingest_queue_idle(&state).await;
+
+        assert_eq!(running_ingest_count(&state).await, 0);
+        for child_id in child_ids {
+            let child = task_summary_response(&state, child_id).await.unwrap().task;
+            assert_eq!(child.status, TaskStatus::Failed);
+            assert!(child
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("abandoned running source-batch ingest task"));
+            assert_eq!(child.result.as_ref().unwrap()["resumable"], true);
+        }
+        wait_for_task_status(&state, &parent_id, TaskStatus::Failed).await;
+        wait_for_task_status(&state, &followup_id, TaskStatus::Succeeded).await;
     }
 
     #[tokio::test]
