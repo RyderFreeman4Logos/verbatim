@@ -160,6 +160,8 @@ pub struct TaskProgressSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_worker_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_status: Option<String>,
 }
 
@@ -221,6 +223,11 @@ impl TaskProgressSnapshot {
         self
     }
 
+    pub fn with_wait_reason(mut self, reason: impl Into<String>) -> Self {
+        self.wait_reason = Some(reason.into());
+        self
+    }
+
     pub fn with_recent_status(mut self, status: impl Into<String>) -> Self {
         self.recent_status = Some(status.into());
         self
@@ -271,6 +278,10 @@ impl TaskProgressSnapshot {
             .active_worker_kind
             .as_deref()
             .map(|worker| bounded_chars(worker, TASK_STRING_MAX_CHARS));
+        self.wait_reason = self
+            .wait_reason
+            .as_deref()
+            .map(|reason| bounded_chars(reason, TASK_STRING_MAX_CHARS));
         self.recent_status = self
             .recent_status
             .as_deref()

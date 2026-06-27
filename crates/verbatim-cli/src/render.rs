@@ -7,7 +7,7 @@ use verbatim_core::api::{
     CollectionResultProvenance, CollectionWatcherStatus, ConfigResponse, EvidenceResponse,
     HealthResponse, IndexGcResponse, IndexProfileDeleteResponse, IndexStatusResponse,
     IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse, TaskCreatedResponse,
-    TaskListResponse, TaskWaitEvent,
+    TaskListAggregate, TaskListResponse, TaskReasonBucket, TaskWaitEvent,
 };
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::index_gc::{IndexGcPlanEntry, IndexGcSkippedEntry};
@@ -771,6 +771,7 @@ struct TaskQueueSummary {
     total: usize,
     percent_tenths: u64,
     eta_seconds: Option<u64>,
+    explanations: Vec<String>,
     history: TaskListAggregateHistory,
 }
 
@@ -810,11 +811,27 @@ fn task_queue_summary(
         let denominator = completed_since_previous as u128 * 1000;
         Some(numerator.div_ceil(denominator) as u64)
     });
+    let reusable_active_total_unchanged = reusable_history.is_some_and(|history| {
+        history.previous_total == current_total && sampled_at_ms > history.sampled_at_ms
+    });
+    let same_total_as_previous_sample = history.is_some_and(|history| {
+        history.previous_total == current_total && sampled_at_ms > history.sampled_at_ms
+    });
+    let explanations = response
+        .aggregate
+        .as_ref()
+        .map(|aggregate| {
+            let active_total_unchanged = reusable_active_total_unchanged
+                || (same_total_as_previous_sample && has_recent_turnover(aggregate));
+            task_queue_explanations(aggregate, active_total_unchanged)
+        })
+        .unwrap_or_default();
     TaskQueueSummary {
         completed,
         total: baseline_total,
         percent_tenths,
         eta_seconds,
+        explanations,
         history: TaskListAggregateHistory {
             baseline_total,
             previous_total: current_total,
@@ -857,13 +874,94 @@ where
         summary.total,
         percent,
         format_eta(summary.eta_seconds)
-    )
+    )?;
+    for explanation in &summary.explanations {
+        writeln!(writer, "  {explanation}")?;
+    }
+    Ok(())
 }
 
 fn format_eta(eta_seconds: Option<u64>) -> String {
     let Some(seconds) = eta_seconds else {
         return "--".into();
     };
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds.div_ceil(60);
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let remainder_minutes = minutes % 60;
+    if remainder_minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {remainder_minutes}m")
+    }
+}
+
+fn task_queue_explanations(
+    aggregate: &TaskListAggregate,
+    active_total_unchanged: bool,
+) -> Vec<String> {
+    let mut explanations = Vec::new();
+    if active_total_unchanged {
+        if has_recent_turnover(aggregate) {
+            explanations.push(format!(
+                "active total unchanged; recent turnover terminalized={} backfilled={} window={}..{}",
+                aggregate.turnover.recent_terminalized,
+                aggregate.turnover.recent_backfilled,
+                aggregate.turnover.window.event_sequence_floor,
+                aggregate.turnover.window.event_sequence_ceiling,
+            ));
+        } else {
+            explanations.push(format!(
+                "active total unchanged; no recent completions in last {} task events",
+                aggregate.turnover.window.event_limit
+            ));
+        }
+    }
+    if aggregate.embedding_wait.waiting > 0 {
+        let oldest = aggregate
+            .embedding_wait
+            .oldest_wait_ms
+            .map(format_duration_ms)
+            .unwrap_or_else(|| "unknown age".to_string());
+        explanations.push(format!(
+            "embedding wait: {} sampled active task(s), oldest {}, reasons {}",
+            aggregate.embedding_wait.waiting,
+            oldest,
+            format_reason_buckets(&aggregate.embedding_wait.reason_buckets)
+        ));
+    }
+    if aggregate.stale_running.publish_complete_running > 0 {
+        explanations.push(format!(
+            "stale running: {} publish-complete task(s), reasons {}",
+            aggregate.stale_running.publish_complete_running,
+            format_reason_buckets(&aggregate.stale_running.reason_buckets)
+        ));
+    }
+    explanations
+}
+
+fn has_recent_turnover(aggregate: &TaskListAggregate) -> bool {
+    aggregate.turnover.recent_terminalized > 0 || aggregate.turnover.recent_backfilled > 0
+}
+
+fn format_reason_buckets(buckets: &[TaskReasonBucket]) -> String {
+    if buckets.is_empty() {
+        return "unknown".to_string();
+    }
+    buckets
+        .iter()
+        .map(|bucket| format!("{}={}", bucket.reason, bucket.count))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    let seconds = ms.div_ceil(1000);
     if seconds < 60 {
         return format!("{seconds}s");
     }
@@ -1026,6 +1124,9 @@ fn task_progress_summary(progress: &TaskProgressSnapshot) -> String {
     if let Some(worker) = &progress.active_worker_kind {
         parts.push(format!("active_worker={worker}"));
     }
+    if let Some(reason) = &progress.wait_reason {
+        parts.push(format!("wait_reason={reason}"));
+    }
     for counter in &progress.counters {
         match counter.total {
             Some(total) => parts.push(format!("{}={}/{}", counter.name, counter.completed, total)),
@@ -1137,6 +1238,9 @@ fn task_progress_list_detail(task: &TaskSummary, progress: &TaskProgressSnapshot
     }
     if let Some(status) = &progress.recent_status {
         parts.push(status.clone());
+    }
+    if let Some(reason) = &progress.wait_reason {
+        parts.push(format!("wait_reason {reason}"));
     }
     if let Some(reason) = task.blocking_reason.as_ref().or_else(|| {
         progress

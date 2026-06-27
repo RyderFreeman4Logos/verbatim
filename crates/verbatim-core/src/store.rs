@@ -50,6 +50,26 @@ pub struct TaskListPage {
     pub total: usize,
 }
 
+/// Bounded queue turnover counts from the most recent task event sequence window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskTurnoverWindow {
+    pub event_sequence_floor: i64,
+    pub event_sequence_ceiling: i64,
+    pub event_limit: usize,
+    pub recent_succeeded: usize,
+    pub recent_failed: usize,
+    pub recent_cancelled: usize,
+    pub recent_backfilled: usize,
+}
+
+impl TaskTurnoverWindow {
+    pub fn recent_terminalized(&self) -> usize {
+        self.recent_succeeded
+            .saturating_add(self.recent_failed)
+            .saturating_add(self.recent_cancelled)
+    }
+}
+
 pub struct SourceContentsReplacement<'a> {
     pub source: &'a Source,
     pub evidence: &'a [EvidenceUnit],
@@ -2199,6 +2219,70 @@ impl Store {
             }
         };
         Ok(TaskListPage { tasks, total })
+    }
+
+    pub fn task_turnover_window(&self, limit: usize) -> Result<TaskTurnoverWindow> {
+        let event_limit = limit.max(1);
+        let event_sequence_ceiling =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM task_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+        let event_sequence_floor = event_sequence_ceiling
+            .saturating_sub(sql_limit(event_limit).saturating_sub(1))
+            .max(0);
+        let mut window = TaskTurnoverWindow {
+            event_sequence_floor,
+            event_sequence_ceiling,
+            event_limit,
+            recent_succeeded: 0,
+            recent_failed: 0,
+            recent_cancelled: 0,
+            recent_backfilled: 0,
+        };
+        if event_sequence_ceiling == 0 {
+            return Ok(window);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT e.event_type, t.status, COUNT(*)
+             FROM task_events e
+             JOIN tasks t ON t.id = e.task_id
+             WHERE e.id >= ?1 AND e.id <= ?2
+             GROUP BY e.event_type, t.status",
+        )?;
+        let rows = stmt.query_map(
+            params![event_sequence_floor, event_sequence_ceiling],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row_usize(row, 2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (event_type, status, count) = row?;
+            match event_type.as_str() {
+                "succeeded" => {
+                    window.recent_succeeded = window.recent_succeeded.saturating_add(count)
+                }
+                "failed" => window.recent_failed = window.recent_failed.saturating_add(count),
+                "cancelled" => {
+                    window.recent_cancelled = window.recent_cancelled.saturating_add(count);
+                }
+                "queued"
+                    if matches!(
+                        TaskStatus::from_store_str(&status),
+                        Some(TaskStatus::Queued | TaskStatus::Running)
+                    ) =>
+                {
+                    window.recent_backfilled = window.recent_backfilled.saturating_add(count);
+                }
+                _ => {}
+            }
+        }
+        Ok(window)
     }
 
     pub fn queued_task_position(&self, task_id: &TaskId) -> Result<Option<usize>> {

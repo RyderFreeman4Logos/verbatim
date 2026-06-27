@@ -1664,6 +1664,7 @@ where
                     self.embedding_max_concurrent_requests as u64,
                     None,
                 )
+                .with_wait_reason("embedding_batch")
                 .with_recent_status("waiting for embedding batch"),
         );
         Ok(PreparedSourceIngest {
@@ -1781,6 +1782,7 @@ where
             phase
                 .progress_snapshot()
                 .with_counter("sources", 1, Some(1))
+                .with_wait_reason("post_publish_cleanup")
                 .with_recent_status("index publishing complete")
                 .with_active_worker_kind("ingest"),
         );

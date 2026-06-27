@@ -449,6 +449,57 @@ pub struct TaskListResponse {
     #[serde(default)]
     pub tasks: Vec<TaskSummary>,
     pub total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<TaskListAggregate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskListAggregate {
+    pub active_total: usize,
+    pub active_sample_size: usize,
+    pub active_sample_limit: usize,
+    pub turnover: TaskQueueTurnover,
+    pub embedding_wait: TaskEmbeddingWaitAggregate,
+    pub stale_running: TaskStaleRunningAggregate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskQueueTurnover {
+    pub window: TaskQueueTurnoverWindow,
+    pub recent_terminalized: usize,
+    pub recent_succeeded: usize,
+    pub recent_failed: usize,
+    pub recent_cancelled: usize,
+    pub recent_backfilled: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskQueueTurnoverWindow {
+    pub event_sequence_floor: i64,
+    pub event_sequence_ceiling: i64,
+    pub event_limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEmbeddingWaitAggregate {
+    pub waiting: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_buckets: Vec<TaskReasonBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStaleRunningAggregate {
+    pub publish_complete_running: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_buckets: Vec<TaskReasonBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskReasonBucket {
+    pub reason: String,
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
