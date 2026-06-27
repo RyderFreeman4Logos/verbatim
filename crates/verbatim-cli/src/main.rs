@@ -2566,7 +2566,41 @@ mod tests {
     }
 
     #[test]
-    fn task_list_discards_history_when_sampled_task_ids_do_not_overlap() {
+    fn task_list_continues_history_when_total_decreases_beyond_sample_window() {
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        *local.now_millis.borrow_mut() = 301_000;
+        local
+            .task_list_history
+            .replace(Some(render::TaskListAggregateHistory {
+                baseline_total: 842,
+                previous_total: 842,
+                sampled_at_ms: 1_000,
+                sampled_task_ids: (0..32).map(|index| format!("old-task-{index}")).collect(),
+            }));
+        let mut current_queue = sample_task_list_response();
+        current_queue.total = 650;
+        for (index, task) in current_queue.tasks.iter_mut().enumerate() {
+            task.id = TaskId(format!("new-task-{index}"));
+        }
+        client.task_list_response.replace(Some(current_queue));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("192/842"));
+        assert!(stdout.contains("22.8%"));
+        assert!(stdout.contains("ETA 17m"));
+        let history = local.task_list_history.borrow().clone().unwrap();
+        assert_eq!(history.baseline_total, 842);
+        assert_eq!(history.previous_total, 650);
+        assert_eq!(history.sampled_at_ms, 301_000);
+    }
+
+    #[test]
+    fn task_list_discards_history_when_sampled_task_ids_do_not_overlap_and_total_does_not_decrease()
+    {
         let client = MockDaemonClient::default();
         let local = MockLocalActions::default();
         *local.now_millis.borrow_mut() = 301_000;
@@ -2574,7 +2608,7 @@ mod tests {
             .task_list_history
             .replace(Some(render::TaskListAggregateHistory {
                 baseline_total: 10,
-                previous_total: 8,
+                previous_total: 5,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-old".into()],
             }));
