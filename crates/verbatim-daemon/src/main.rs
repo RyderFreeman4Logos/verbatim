@@ -3872,39 +3872,12 @@ async fn finish_started_ingest_source_batch_outcomes(
 
     for task in tasks {
         match outcomes_by_task_id.remove(&task.id) {
-            Some(outcome) => match outcome.result {
-                Ok(embedding_cache) => {
-                    let result = ingest_result_metadata(1, &embedding_cache);
-                    if let Err((status, Json(error))) =
-                        finish_task_success(state, &task.id, result).await
-                    {
-                        tracing::error!(task_id = %task.id.0, status = %status, error = %error.error, "failed to mark source batch task succeeded");
-                        first_error.get_or_insert_with(|| {
-                            anyhow::anyhow!(
-                                "failed to mark source batch task {} succeeded: {}: {}",
-                                task.id.0,
-                                status,
-                                error.error
-                            )
-                        });
-                    }
+            Some(outcome) => {
+                if let Err(error) = finish_source_batch_task_outcome(state, outcome).await {
+                    tracing::error!(task_id = %task.id.0, error = %error, "failed to mark source batch task terminal");
+                    first_error.get_or_insert(error);
                 }
-                Err(error_message) => {
-                    if let Err((status, Json(error))) =
-                        finish_task_failed(state, &task.id, &error_message).await
-                    {
-                        tracing::error!(task_id = %task.id.0, status = %status, error = %error.error, "failed to mark source batch task failed");
-                        first_error.get_or_insert_with(|| {
-                            anyhow::anyhow!(
-                                "failed to mark source batch task {} failed: {}: {}",
-                                task.id.0,
-                                status,
-                                error.error
-                            )
-                        });
-                    }
-                }
-            },
+            }
             None => {
                 let error_message = format!(
                     "missing source batch outcome for started task {}; failing task to unblock ingest queue",
@@ -3937,6 +3910,41 @@ async fn finish_started_ingest_source_batch_outcomes(
     first_error.map_or(Ok(()), Err)
 }
 
+async fn finish_source_batch_task_outcome(
+    state: &SharedState,
+    outcome: SourceIngestOutcome,
+) -> Result<()> {
+    let task_id = outcome.task_id.clone();
+    match outcome.result {
+        Ok(embedding_cache) => {
+            let result = ingest_result_metadata(1, &embedding_cache);
+            finish_task_success(state, &task_id, result).await.map_err(
+                |(status, Json(error))| {
+                    anyhow::anyhow!(
+                        "failed to mark source batch task {} succeeded: {}: {}",
+                        task_id.0,
+                        status,
+                        error.error
+                    )
+                },
+            )?;
+        }
+        Err(error_message) => {
+            finish_task_failed(state, &task_id, &error_message)
+                .await
+                .map_err(|(status, Json(error))| {
+                    anyhow::anyhow!(
+                        "failed to mark source batch task {} failed: {}: {}",
+                        task_id.0,
+                        status,
+                        error.error
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
 fn started_source_batch_inputs(
     tasks: &[verbatim_core::task::TaskSummary],
 ) -> Result<Vec<(SourceId, TaskId)>> {
@@ -3967,7 +3975,18 @@ async fn run_started_ingest_source_batch(
     let state2 = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
         let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok::<_, anyhow::Error>(runtime.block_on(pipeline.ingest_sources_with_tasks(&source_tasks)))
+        let state_for_reporter = Arc::clone(&state2);
+        Ok::<_, anyhow::Error>(runtime.block_on(pipeline.ingest_sources_with_tasks_reporting(
+            &source_tasks,
+            move |outcome| {
+                let state = Arc::clone(&state_for_reporter);
+                async move {
+                    if let Err(error) = finish_source_batch_task_outcome(&state, outcome).await {
+                        tracing::error!(error = %error, "failed to stream-finalize source batch task outcome");
+                    }
+                }
+            },
+        )))
     })
     .await
     .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.into()))?
@@ -9105,6 +9124,120 @@ mod tests {
             .unwrap_or_default()
             .contains("missing source batch outcome"));
         assert_eq!(running_ingest_count(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn source_batch_streamed_outcomes_are_idempotent_with_final_pass() {
+        let test_dir = TestDir::new("source-batch-streamed-outcomes-idempotent");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.batch_size = 2;
+        config.embedding.endpoint_runtime.max_concurrent_requests = 1;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let parent_id = TaskId::new();
+        create_persisted_task_with_id(
+            &state,
+            parent_id.clone(),
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(&parent_id.0),
+            ),
+        )
+        .await
+        .unwrap();
+        let first_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                Some("src-batch-stream-first"),
+                false,
+                None,
+                false,
+                true,
+                Some(&parent_id.0),
+            ),
+        )
+        .await
+        .unwrap();
+        let second_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim_and_batch(
+                Some("src-batch-stream-second"),
+                false,
+                None,
+                false,
+                true,
+                Some(&parent_id.0),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let claimed = claim_startable_ingest_work(&state).await.unwrap().unwrap();
+        let ClaimedIngestWork::SourceBatch(tasks) = claimed else {
+            panic!("expected source batch claim");
+        };
+        assert_eq!(tasks.len(), 2);
+        let _worker = acquire_ingest_worker(&state).unwrap();
+        let first_outcome = SourceIngestOutcome {
+            source_id: SourceId("src-batch-stream-first".into()),
+            task_id: first_id.clone(),
+            result: Ok(EmbeddingCacheStats::default()),
+        };
+        let second_outcome = SourceIngestOutcome {
+            source_id: SourceId("src-batch-stream-second".into()),
+            task_id: second_id.clone(),
+            result: Ok(EmbeddingCacheStats::default()),
+        };
+
+        finish_source_batch_task_outcome(&state, first_outcome.clone())
+            .await
+            .unwrap();
+
+        let first = task_summary_response(&state, first_id.clone())
+            .await
+            .unwrap()
+            .task;
+        let second = task_summary_response(&state, second_id.clone())
+            .await
+            .unwrap()
+            .task;
+        assert_eq!(first.status, TaskStatus::Succeeded);
+        assert_eq!(second.status, TaskStatus::Running);
+        assert_eq!(running_ingest_count(&state).await, 1);
+
+        finish_started_ingest_source_batch_outcomes(
+            &state,
+            tasks,
+            vec![first_outcome, second_outcome],
+        )
+        .await
+        .unwrap();
+
+        let first = task_summary_response(&state, first_id.clone())
+            .await
+            .unwrap()
+            .task;
+        let second = task_summary_response(&state, second_id).await.unwrap().task;
+        assert_eq!(first.status, TaskStatus::Succeeded);
+        assert_eq!(second.status, TaskStatus::Succeeded);
+        assert_eq!(running_ingest_count(&state).await, 0);
+        let succeeded_events = {
+            let store = state.task_store.lock().unwrap();
+            store
+                .list_task_events(&first_id, None, 10)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.event_type == "succeeded")
+                .count()
+        };
+        assert_eq!(succeeded_events, 1);
     }
 
     #[tokio::test]
