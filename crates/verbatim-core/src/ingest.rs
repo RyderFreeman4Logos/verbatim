@@ -1841,9 +1841,35 @@ where
             .iter()
             .flat_map(|source| source.child_chunks.iter().cloned())
             .collect::<Vec<_>>();
+        let source_progress = prepared_sources
+            .iter()
+            .filter_map(|source| {
+                source.task_id.as_ref().map(|task_id| {
+                    (
+                        source.source.id.clone(),
+                        (
+                            task_id.clone(),
+                            source.embedding_phase.clone(),
+                            source.child_chunks.len(),
+                        ),
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
         let embedding_started = Instant::now();
         let prepared_vectors = match self
-            .prepare_vectors_for_chunks_partial(profile_id, &child_chunks)
+            .prepare_vectors_for_chunks_partial(
+                profile_id,
+                &child_chunks,
+                |batches, request_count, max_vectors_per_request| {
+                    self.record_embedding_throughput_wait(
+                        &source_progress,
+                        batches,
+                        request_count,
+                        max_vectors_per_request,
+                    );
+                },
+            )
             .await
         {
             Ok(prepared_vectors) => prepared_vectors,
@@ -2131,6 +2157,60 @@ where
         }));
         self.record_task_progress(task_id, embedding_progress);
         self.record_finished_task_phase(task_id, embedding_timing);
+    }
+
+    fn record_embedding_throughput_wait(
+        &self,
+        source_progress: &HashMap<SourceId, (TaskId, PhaseTiming, usize)>,
+        batches: &[Vec<EmbeddingInput>],
+        request_count: usize,
+        max_vectors_per_request: usize,
+    ) {
+        if batches.is_empty() {
+            return;
+        }
+        let mut inputs_by_source = HashMap::<SourceId, usize>::new();
+        for input in batches.iter().flat_map(|batch| batch.iter()) {
+            *inputs_by_source.entry(input.source_id.clone()).or_default() += 1;
+        }
+        let source_count = inputs_by_source.len();
+        let input_count = inputs_by_source.values().sum::<usize>();
+        for (source_id, input_count_for_source) in inputs_by_source {
+            let Some((task_id, phase, child_chunk_count)) = source_progress.get(&source_id) else {
+                continue;
+            };
+            self.record_task_progress(
+                Some(task_id),
+                phase
+                    .progress_snapshot()
+                    .with_counter(
+                        "embedding_vectors",
+                        child_chunk_count.saturating_sub(input_count_for_source) as u64,
+                        Some(*child_chunk_count as u64),
+                    )
+                    .with_counter(
+                        "embedding_cache_misses",
+                        input_count_for_source as u64,
+                        None,
+                    )
+                    .with_counter("embedding_batch_sources", source_count as u64, None)
+                    .with_counter("embedding_batch_inputs", input_count as u64, None)
+                    .with_counter("batches", 0, Some(request_count as u64))
+                    .with_counter(
+                        "max_vectors_per_request",
+                        max_vectors_per_request as u64,
+                        None,
+                    )
+                    .with_counter(
+                        "embedding_in_flight_limit",
+                        self.embedding_max_concurrent_requests as u64,
+                        None,
+                    )
+                    .with_wait_reason("embedding_throughput")
+                    .with_recent_status("waiting for embedding model throughput")
+                    .with_active_worker_kind("ingest"),
+            );
+        }
     }
 
     async fn append_generated_graph(
@@ -2652,7 +2732,7 @@ where
         child_chunks: &[Chunk],
     ) -> Result<PreparedVectors> {
         let prepared = self
-            .prepare_vectors_for_chunks_partial(profile_id, child_chunks)
+            .prepare_vectors_for_chunks_partial(profile_id, child_chunks, |_, _, _| {})
             .await?;
         if let Some((source_id, error)) = prepared.errors_by_source.iter().next() {
             bail!("embedding failed for source {}: {error}", source_id.0);
@@ -2667,11 +2747,15 @@ where
         Ok(prepared)
     }
 
-    async fn prepare_vectors_for_chunks_partial(
+    async fn prepare_vectors_for_chunks_partial<F>(
         &self,
         profile_id: &EmbeddingProfileId,
         child_chunks: &[Chunk],
-    ) -> Result<PreparedVectors> {
+        mut record_throughput_wait: F,
+    ) -> Result<PreparedVectors>
+    where
+        F: FnMut(&[Vec<EmbeddingInput>], usize, usize),
+    {
         if !self.embedding_enabled {
             bail!("embedding is disabled; enable [embedding] before building vectors");
         }
@@ -2728,6 +2812,7 @@ where
                 let batches = embedding_input_batches(misses, self.embedding_batch_size);
                 request_count = batches.len();
                 max_vectors_per_request = batches.iter().map(Vec::len).max().unwrap_or(0);
+                record_throughput_wait(&batches, request_count, max_vectors_per_request);
                 let embed_client = &self.embed_client;
                 let batch_results = stream::iter(batches.into_iter().enumerate())
                     .map(|(batch_index, batch)| async move {
@@ -7051,6 +7136,16 @@ model = "local-vision"
             .unwrap();
         assert!(events.iter().any(|event| {
             event.event_type == "progress"
+                && event
+                    .payload
+                    .get("wait_reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("embedding_throughput")
+                && event
+                    .payload
+                    .get("recent_status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("waiting for embedding model throughput")
                 && event.payload["counters"]
                     .as_array()
                     .is_some_and(|counters| {

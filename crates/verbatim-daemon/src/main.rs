@@ -116,6 +116,7 @@ const TASK_LIST_DEFAULT_LIMIT: usize = 20;
 const TASK_LIST_MAX_LIMIT: usize = 100;
 const TASK_QUEUE_TURNOVER_EVENT_LIMIT: usize = 1000;
 const TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT: usize = 100;
+const TASK_QUEUE_REASON_BUCKET_LIMIT: usize = 16;
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FAST_RETRIEVAL_TOP_K: usize = 20;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
@@ -1580,7 +1581,7 @@ fn task_list_aggregate(store: &Store) -> Result<TaskListAggregate> {
         TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT,
     )?;
     let turnover = store.task_turnover_window(TASK_QUEUE_TURNOVER_EVENT_LIMIT)?;
-    let (embedding_wait, stale_running) = active_task_aggregates(&active_sample.tasks);
+    let active_metadata = store.active_task_metadata_aggregate(TASK_QUEUE_REASON_BUCKET_LIMIT)?;
 
     Ok(TaskListAggregate {
         active_total: active_sample.total,
@@ -1598,89 +1599,28 @@ fn task_list_aggregate(store: &Store) -> Result<TaskListAggregate> {
             recent_cancelled: turnover.recent_cancelled,
             recent_backfilled: turnover.recent_backfilled,
         },
-        embedding_wait,
-        stale_running,
+        embedding_wait: TaskEmbeddingWaitAggregate {
+            waiting: active_metadata.embedding_waiting,
+            oldest_wait_ms: active_metadata.oldest_embedding_wait_ms,
+            reason_buckets: task_reason_buckets(active_metadata.embedding_reason_buckets),
+        },
+        stale_running: TaskStaleRunningAggregate {
+            publish_complete_running: active_metadata.publish_complete_running,
+            reason_buckets: task_reason_buckets(active_metadata.stale_reason_buckets),
+        },
     })
 }
 
-fn active_task_aggregates(
-    tasks: &[verbatim_core::task::TaskSummary],
-) -> (TaskEmbeddingWaitAggregate, TaskStaleRunningAggregate) {
-    let mut embedding_waiting = 0usize;
-    let mut oldest_embedding_wait_ms = None::<u64>;
-    let mut embedding_reasons = BTreeMap::<String, usize>::new();
-    let mut publish_complete_running = 0usize;
-    let mut stale_reasons = BTreeMap::<String, usize>::new();
-
-    for task in tasks {
-        let Some(progress) = &task.progress else {
-            continue;
-        };
-
-        if let Some(reason) = embedding_wait_reason(progress) {
-            embedding_waiting = embedding_waiting.saturating_add(1);
-            *embedding_reasons.entry(reason).or_default() += 1;
-            if let Some(phase) = &progress.phase {
-                oldest_embedding_wait_ms = Some(
-                    oldest_embedding_wait_ms
-                        .unwrap_or_default()
-                        .max(phase.elapsed_ms),
-                );
-            }
-        }
-
-        if task.status == TaskStatus::Running && is_publish_complete_running(progress) {
-            publish_complete_running = publish_complete_running.saturating_add(1);
-            let reason = progress
-                .wait_reason
-                .clone()
-                .unwrap_or_else(|| "post_publish_follow_up".to_string());
-            *stale_reasons.entry(reason).or_default() += 1;
-        }
-    }
-
-    (
-        TaskEmbeddingWaitAggregate {
-            waiting: embedding_waiting,
-            oldest_wait_ms: oldest_embedding_wait_ms,
-            reason_buckets: reason_buckets(embedding_reasons),
-        },
-        TaskStaleRunningAggregate {
-            publish_complete_running,
-            reason_buckets: reason_buckets(stale_reasons),
-        },
-    )
-}
-
-fn embedding_wait_reason(progress: &TaskProgressSnapshot) -> Option<String> {
-    if progress.phase.as_ref().map(|phase| phase.name.as_str()) != Some("embedding") {
-        return None;
-    }
-    if let Some(reason) = &progress.wait_reason {
-        return Some(reason.clone());
-    }
-    match progress.recent_status.as_deref() {
-        Some("waiting for embedding batch") => Some("embedding_batch".to_string()),
-        _ => None,
-    }
-}
-
-fn is_publish_complete_running(progress: &TaskProgressSnapshot) -> bool {
-    progress.recent_status.as_deref() == Some("index publishing complete")
-}
-
-fn reason_buckets(reasons: BTreeMap<String, usize>) -> Vec<TaskReasonBucket> {
-    let mut buckets = reasons
-        .into_iter()
-        .map(|(reason, count)| TaskReasonBucket { reason, count })
-        .collect::<Vec<_>>();
-    buckets.sort_by(|left, right| {
-        right
-            .count
-            .cmp(&left.count)
-            .then_with(|| left.reason.cmp(&right.reason))
-    });
+fn task_reason_buckets(
+    buckets: Vec<verbatim_core::store::TaskReasonCount>,
+) -> Vec<TaskReasonBucket> {
     buckets
+        .into_iter()
+        .map(|bucket| TaskReasonBucket {
+            reason: bucket.reason,
+            count: bucket.count,
+        })
+        .collect()
 }
 
 fn task_list_filter(status: Option<&str>) -> Result<TaskListFilter> {
@@ -6820,6 +6760,103 @@ mod tests {
             .as_ref()
             .and_then(|progress| progress.wait_reason.as_ref())
             .is_some()));
+    }
+
+    #[tokio::test]
+    async fn task_list_aggregate_metadata_counts_waits_beyond_returned_sample() {
+        let test_dir = TestDir::new("task-list-aggregate-beyond-sample");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        for index in 0..(TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT + 5) {
+            create_persisted_task(
+                &state,
+                TaskKind::Ask,
+                ask_request_metadata(
+                    &format!("queued filler question {index}"),
+                    None,
+                    None,
+                    false,
+                    false,
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let embedding_wait = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-wait-beyond-sample"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &embedding_wait).await.unwrap();
+        let mut progress = TaskProgressSnapshot::phase("embedding")
+            .with_counter("embedding_vectors", 0, Some(10))
+            .with_wait_reason("embedding_throughput")
+            .with_recent_status("waiting for embedding model throughput");
+        if let Some(phase) = &mut progress.phase {
+            phase.started_at = "1".into();
+        }
+        record_task_progress(&state, &embedding_wait, progress).await;
+
+        let publish_wait = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-publish-beyond-sample"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &publish_wait).await.unwrap();
+        record_task_progress(
+            &state,
+            &publish_wait,
+            TaskProgressSnapshot::phase("ingest_index_publishing")
+                .with_counter("sources", 1, Some(1))
+                .with_wait_reason("post_publish_cleanup")
+                .with_recent_status("index publishing complete"),
+        )
+        .await;
+
+        let Json(response) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("active".into()),
+                limit: Some(20),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.total, TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT + 7);
+        assert!(!response.tasks.iter().any(|task| task.id == embedding_wait));
+        assert!(!response.tasks.iter().any(|task| task.id == publish_wait));
+        let aggregate = response.aggregate.expect("aggregate metadata is present");
+        assert_eq!(aggregate.embedding_wait.waiting, 1);
+        assert!(aggregate.embedding_wait.oldest_wait_ms.unwrap_or_default() > 60_000);
+        assert_eq!(
+            aggregate.embedding_wait.reason_buckets[0].reason,
+            "embedding_throughput"
+        );
+        assert_eq!(aggregate.stale_running.publish_complete_running, 1);
+        assert_eq!(
+            aggregate.stale_running.reason_buckets[0].reason,
+            "post_publish_cleanup"
+        );
     }
 
     #[tokio::test]
