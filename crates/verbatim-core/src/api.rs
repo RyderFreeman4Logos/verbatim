@@ -480,6 +480,12 @@ pub struct AskRequest {
     pub show_retrieval: bool,
     #[serde(default)]
     pub context_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -751,6 +757,22 @@ mod tests {
     }
 
     #[test]
+    fn ask_request_defaults_to_generated_answer_without_context_pagination() {
+        let request: AskRequest =
+            serde_json::from_value(serde_json::json!({"question": "What is cited?"})).unwrap();
+
+        assert_eq!(request.question, "What is cited?");
+        assert!(request.source_id.is_none());
+        assert!(request.collection_filter.is_empty());
+        assert!(request.embedding_profile_id.is_none());
+        assert!(!request.show_retrieval);
+        assert!(!request.context_only);
+        assert!(request.limit.is_none());
+        assert!(request.page_size.is_none());
+        assert!(request.page.is_none());
+    }
+
+    #[test]
     fn retrieve_request_defaults_to_context_only_compact_output() {
         let request: RetrieveRequest =
             serde_json::from_value(serde_json::json!({"question": "What is cited?"})).unwrap();
@@ -760,6 +782,7 @@ mod tests {
         assert!(request.collection_filter.is_empty());
         assert!(request.limit.is_none());
         assert!(request.page_size.is_none());
+        assert!(request.page.is_none());
         assert!(!request.fast);
         assert!(request.rerank.is_none());
         assert!(!request.include_debug);

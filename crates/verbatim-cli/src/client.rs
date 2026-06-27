@@ -1477,6 +1477,9 @@ mod tests {
             embedding_profile_id: None,
             show_retrieval: false,
             context_only: false,
+            limit: None,
+            page_size: None,
+            page: None,
         };
 
         assert_eq!(client.submit_ask_task(&ask).unwrap().task_id, "task-1");

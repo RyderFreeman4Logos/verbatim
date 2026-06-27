@@ -1709,6 +1709,7 @@ async fn ask(
     State(state): State<SharedState>,
     Json(req): Json<AskRequest>,
 ) -> Result<Json<AskResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_ask_retrieve_controls(&req)?;
     let task_id = create_persisted_task(
         &state,
         TaskKind::Ask,
@@ -1729,30 +1730,34 @@ async fn ask_stream(
     Json(req): Json<AskRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(ASK_STREAM_EVENT_BUFFER);
-    match create_persisted_task(
-        &state,
-        TaskKind::Ask,
-        ask_request_metadata(
-            &req.question,
-            req.source_id.as_deref(),
-            req.embedding_profile_id.as_deref(),
-            req.show_retrieval,
-            req.context_only,
-        ),
-    )
-    .await
-    {
-        Ok(task_id) => {
-            tokio::spawn(async move {
-                if let Err((status, Json(error))) =
-                    execute_ask_stream_task(state, task_id, req, tx.clone()).await
-                {
-                    let _ = tx.send(sse_error_event(status, error.error)).await;
-                }
-            });
-        }
-        Err((status, Json(error))) => {
-            let _ = tx.try_send(sse_error_event(status, error.error));
+    if let Err((status, Json(error))) = validate_ask_retrieve_controls(&req) {
+        let _ = tx.try_send(sse_error_event(status, error.error));
+    } else {
+        match create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata(
+                &req.question,
+                req.source_id.as_deref(),
+                req.embedding_profile_id.as_deref(),
+                req.show_retrieval,
+                req.context_only,
+            ),
+        )
+        .await
+        {
+            Ok(task_id) => {
+                tokio::spawn(async move {
+                    if let Err((status, Json(error))) =
+                        execute_ask_stream_task(state, task_id, req, tx.clone()).await
+                    {
+                        let _ = tx.send(sse_error_event(status, error.error)).await;
+                    }
+                });
+            }
+            Err((status, Json(error))) => {
+                let _ = tx.try_send(sse_error_event(status, error.error));
+            }
         }
     }
 
@@ -1765,6 +1770,7 @@ async fn submit_ask_task(
     State(state): State<SharedState>,
     Json(req): Json<AskRequest>,
 ) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    validate_ask_retrieve_controls(&req)?;
     let task_id = create_persisted_task(
         &state,
         TaskKind::Ask,
@@ -2707,9 +2713,9 @@ fn context_only_retrieve_request(req: AskRequest) -> RetrieveRequest {
         source_id: req.source_id,
         collection_filter: req.collection_filter,
         embedding_profile_id: req.embedding_profile_id,
-        limit: None,
-        page_size: None,
-        page: None,
+        limit: req.limit,
+        page_size: req.page_size,
+        page: req.page,
         fast: false,
         rerank: None,
         dense_top_k: None,
@@ -2718,6 +2724,19 @@ fn context_only_retrieve_request(req: AskRequest) -> RetrieveRequest {
         include_debug: req.show_retrieval,
         include_locator: true,
     }
+}
+
+fn validate_ask_retrieve_controls(
+    req: &AskRequest,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if req.context_only || (req.limit.is_none() && req.page_size.is_none() && req.page.is_none()) {
+        return Ok(());
+    }
+
+    Err(err(
+        StatusCode::BAD_REQUEST,
+        anyhow::anyhow!("limit, page_size, and page are only supported when context_only is true"),
+    ))
 }
 
 fn spawn_ask_task(state: SharedState, task_id: TaskId, req: AskRequest) {
@@ -6424,6 +6443,52 @@ mod tests {
         assert!(req.collection_filter.is_empty());
         assert!(!req.show_retrieval);
         assert!(!req.context_only);
+        assert!(req.limit.is_none());
+        assert!(req.page_size.is_none());
+        assert!(req.page.is_none());
+    }
+
+    #[test]
+    fn context_only_ask_request_plumbs_retrieve_pagination_controls() {
+        let retrieve_req = context_only_retrieve_request(AskRequest {
+            question: "What is cited?".into(),
+            source_id: Some("src-1".into()),
+            collection_filter: CollectionFilterRequest::default(),
+            embedding_profile_id: Some("alt".into()),
+            show_retrieval: true,
+            context_only: true,
+            limit: Some(7),
+            page_size: Some(2),
+            page: Some(3),
+        });
+
+        assert_eq!(retrieve_req.question, "What is cited?");
+        assert_eq!(retrieve_req.source_id.as_deref(), Some("src-1"));
+        assert_eq!(retrieve_req.embedding_profile_id.as_deref(), Some("alt"));
+        assert_eq!(retrieve_req.limit, Some(7));
+        assert_eq!(retrieve_req.page_size, Some(2));
+        assert_eq!(retrieve_req.page, Some(3));
+        assert!(retrieve_req.include_debug);
+        assert!(retrieve_req.include_locator);
+    }
+
+    #[test]
+    fn generated_ask_request_rejects_retrieve_pagination_controls() {
+        let error = validate_ask_retrieve_controls(&AskRequest {
+            question: "What is cited?".into(),
+            source_id: None,
+            collection_filter: CollectionFilterRequest::default(),
+            embedding_profile_id: None,
+            show_retrieval: false,
+            context_only: false,
+            limit: None,
+            page_size: None,
+            page: Some(2),
+        })
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.error.contains("context_only"));
     }
 
     #[test]
@@ -7035,6 +7100,9 @@ mod tests {
                 embedding_profile_id: None,
                 show_retrieval: false,
                 context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
             }),
         )
         .await
@@ -7134,6 +7202,9 @@ mod tests {
                 embedding_profile_id: None,
                 show_retrieval: false,
                 context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
             }),
         )
         .await
@@ -7516,6 +7587,9 @@ mod tests {
                 embedding_profile_id: None,
                 show_retrieval: false,
                 context_only: true,
+                limit: None,
+                page_size: None,
+                page: None,
             }),
         )
         .await
@@ -7563,6 +7637,9 @@ mod tests {
                 embedding_profile_id: None,
                 show_retrieval: false,
                 context_only: true,
+                limit: None,
+                page_size: None,
+                page: None,
             }),
         )
         .await
@@ -7617,6 +7694,9 @@ mod tests {
                 embedding_profile_id: None,
                 show_retrieval: true,
                 context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
             }),
         )
         .await
