@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,12 +7,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use verbatim_core::config::{self, Config};
 
 use crate::client::{CliError, CliResult};
+use crate::render::TaskListAggregateHistory;
+
+const TASK_LIST_HISTORY_MAX_BYTES: u64 = 4096;
 
 pub trait LocalActions {
     fn config_init(&self) -> CliResult<PathBuf>;
     fn config_validate(&self) -> CliResult<PathBuf>;
     fn daemon_start(&self) -> CliResult<u8>;
     fn daemon_install(&self, force: bool) -> CliResult<PathBuf>;
+    fn load_task_list_history(&self) -> CliResult<Option<TaskListAggregateHistory>>;
+    fn store_task_list_history(&self, history: &TaskListAggregateHistory) -> CliResult<()>;
+    fn clear_task_list_history(&self) -> CliResult<()>;
+    fn now_millis(&self) -> u64;
 }
 
 #[derive(Default)]
@@ -60,6 +67,84 @@ impl LocalActions for RealLocalActions {
         write_unit_file(&unit_path, &systemd_unit(&daemon), force)?;
         Ok(unit_path)
     }
+
+    fn load_task_list_history(&self) -> CliResult<Option<TaskListAggregateHistory>> {
+        let path = task_list_history_path()?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(CliError::Api(format!(
+                    "failed to inspect task list history {}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        if !metadata.file_type().is_file() || metadata.len() > TASK_LIST_HISTORY_MAX_BYTES {
+            discard_task_list_history_file(&path);
+            return Ok(None);
+        }
+        let contents = match read_bounded_task_list_history_file(&path) {
+            Ok(Some(contents)) => contents,
+            Ok(None) => {
+                discard_task_list_history_file(&path);
+                return Ok(None);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(CliError::Api(format!(
+                    "failed to read task list history {}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        match serde_json::from_slice(&contents) {
+            Ok(history) => Ok(Some(history)),
+            Err(_) => {
+                discard_task_list_history_file(&path);
+                Ok(None)
+            }
+        }
+    }
+
+    fn store_task_list_history(&self, history: &TaskListAggregateHistory) -> CliResult<()> {
+        let path = task_list_history_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let contents = serde_json::to_vec(history).map_err(|error| {
+            CliError::Api(format!("failed to encode task list history: {error}"))
+        })?;
+        let temp_path = temporary_sibling_path(&path, "task-list-aggregate.json");
+        if let Err(error) = fs::write(&temp_path, contents) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(&temp_path, &path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn clear_task_list_history(&self) -> CliResult<()> {
+        let path = task_list_history_path()?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CliError::Api(format!(
+                "failed to clear task list history {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn now_millis(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
 }
 
 pub fn write_config_init<W>(writer: &mut W, path: &std::path::Path) -> std::io::Result<()>
@@ -94,6 +179,30 @@ fn user_systemd_unit_path() -> CliResult<PathBuf> {
         .join("systemd")
         .join("user")
         .join("verbatim.service"))
+}
+
+fn task_list_history_path() -> CliResult<PathBuf> {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .ok_or_else(|| CliError::Api("HOME or XDG_STATE_HOME is required".into()))?;
+    Ok(state_home.join("verbatim").join("task-list-aggregate.json"))
+}
+
+fn discard_task_list_history_file(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+fn read_bounded_task_list_history_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let file = fs::File::open(path)?;
+    let mut contents = Vec::with_capacity(TASK_LIST_HISTORY_MAX_BYTES as usize);
+    let mut reader = file.take(TASK_LIST_HISTORY_MAX_BYTES + 1);
+    reader.read_to_end(&mut contents)?;
+    if contents.len() as u64 > TASK_LIST_HISTORY_MAX_BYTES {
+        Ok(None)
+    } else {
+        Ok(Some(contents))
+    }
 }
 
 fn systemd_unit(daemon: &Path) -> String {
@@ -222,15 +331,19 @@ fn existing_unit_error(unit_path: &Path) -> CliError {
 }
 
 fn temporary_unit_path(unit_path: &Path) -> PathBuf {
+    temporary_sibling_path(unit_path, "verbatim.service")
+}
+
+fn temporary_sibling_path(path: &Path, fallback_file_name: &str) -> PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let file_name = unit_path
+    let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("verbatim.service");
-    unit_path.with_file_name(format!(".{file_name}.{}.{suffix}.tmp", std::process::id()))
+        .unwrap_or(fallback_file_name);
+    path.with_file_name(format!(".{file_name}.{}.{suffix}.tmp", std::process::id()))
 }
 
 #[cfg(test)]
@@ -382,6 +495,123 @@ mod tests {
             .join("user")
             .join("verbatim.service")
             .exists());
+        fs::remove_dir_all(tempdir).unwrap();
+    }
+
+    #[test]
+    fn task_list_history_store_load_clear_uses_xdg_state_home() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::capture(&["XDG_STATE_HOME", "HOME"]);
+        let tempdir = unique_temp_dir("task-history-roundtrip");
+        let state_home = tempdir.join("state");
+        env::set_var("XDG_STATE_HOME", &state_home);
+        env::remove_var("HOME");
+        let history = TaskListAggregateHistory {
+            baseline_total: 120,
+            previous_total: 100,
+            sampled_at_ms: 42,
+            sampled_task_ids: vec!["task-current".into()],
+        };
+
+        RealLocalActions.store_task_list_history(&history).unwrap();
+
+        let path = state_home.join("verbatim").join("task-list-aggregate.json");
+        assert!(path.exists());
+        assert_eq!(
+            RealLocalActions.load_task_list_history().unwrap(),
+            Some(history)
+        );
+
+        RealLocalActions.clear_task_list_history().unwrap();
+
+        assert!(!path.exists());
+        fs::remove_dir_all(tempdir).unwrap();
+    }
+
+    #[test]
+    fn task_list_history_treats_malformed_json_as_cache_miss() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::capture(&["XDG_STATE_HOME", "HOME"]);
+        let tempdir = unique_temp_dir("task-history-malformed");
+        let state_home = tempdir.join("state");
+        let path = state_home.join("verbatim").join("task-list-aggregate.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"not json").unwrap();
+        env::set_var("XDG_STATE_HOME", &state_home);
+        env::remove_var("HOME");
+
+        assert_eq!(RealLocalActions.load_task_list_history().unwrap(), None);
+
+        assert!(!path.exists());
+        fs::remove_dir_all(tempdir).unwrap();
+    }
+
+    #[test]
+    fn task_list_history_treats_invalid_utf8_as_cache_miss() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::capture(&["XDG_STATE_HOME", "HOME"]);
+        let tempdir = unique_temp_dir("task-history-invalid-utf8");
+        let state_home = tempdir.join("state");
+        let path = state_home.join("verbatim").join("task-list-aggregate.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+        env::set_var("XDG_STATE_HOME", &state_home);
+        env::remove_var("HOME");
+
+        assert_eq!(RealLocalActions.load_task_list_history().unwrap(), None);
+
+        assert!(!path.exists());
+        fs::remove_dir_all(tempdir).unwrap();
+    }
+
+    #[test]
+    fn task_list_history_treats_oversized_file_as_cache_miss() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::capture(&["XDG_STATE_HOME", "HOME"]);
+        let tempdir = unique_temp_dir("task-history-oversized");
+        let state_home = tempdir.join("state");
+        let path = state_home.join("verbatim").join("task-list-aggregate.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, vec![b' '; TASK_LIST_HISTORY_MAX_BYTES as usize + 1]).unwrap();
+        env::set_var("XDG_STATE_HOME", &state_home);
+        env::remove_var("HOME");
+
+        assert_eq!(RealLocalActions.load_task_list_history().unwrap(), None);
+
+        assert!(!path.exists());
+        fs::remove_dir_all(tempdir).unwrap();
+    }
+
+    #[test]
+    fn task_list_history_bounded_reader_rejects_oversized_content() {
+        let tempdir = unique_temp_dir("task-history-bounded-reader");
+        let path = tempdir.join("task-list-aggregate.json");
+        fs::write(&path, vec![b' '; TASK_LIST_HISTORY_MAX_BYTES as usize + 16]).unwrap();
+
+        assert_eq!(read_bounded_task_list_history_file(&path).unwrap(), None);
+
+        fs::remove_dir_all(tempdir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_list_history_treats_symlink_as_cache_miss() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::capture(&["XDG_STATE_HOME", "HOME"]);
+        let tempdir = unique_temp_dir("task-history-symlink");
+        let state_home = tempdir.join("state");
+        let path = state_home.join("verbatim").join("task-list-aggregate.json");
+        let target = tempdir.join("target.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        env::set_var("XDG_STATE_HOME", &state_home);
+        env::remove_var("HOME");
+
+        assert_eq!(RealLocalActions.load_task_list_history().unwrap(), None);
+
+        assert!(!path.exists());
+        assert!(target.exists());
         fs::remove_dir_all(tempdir).unwrap();
     }
 

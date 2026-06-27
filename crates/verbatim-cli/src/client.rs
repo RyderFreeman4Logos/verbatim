@@ -1560,7 +1560,7 @@ mod tests {
                 "\"progress\":{\"phase\":{\"name\":\"chat\",\"started_at\":\"1\",\"elapsed_ms\":100},",
                 "\"recent_status\":\"streaming\"}},\"events\":[],\"spans\":[],\"terminal\":false}\n\n",
             ),
-            Duration::from_millis(250),
+            Duration::from_secs(2),
         );
         let client = HttpDaemonClient::with_base_url(server.base_url());
         let mut stdout = Vec::new();
@@ -1569,7 +1569,7 @@ mod tests {
             .wait_task(
                 "task-1",
                 None,
-                TaskWaitTimeout::Bounded(Duration::from_millis(50)),
+                TaskWaitTimeout::Bounded(Duration::from_millis(500)),
                 &mut stdout,
             )
             .unwrap_err();
