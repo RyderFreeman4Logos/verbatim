@@ -674,6 +674,10 @@ where
     C: DaemonClient,
 {
     match command {
+        TaskCommand::List => {
+            let response = client.list_tasks()?;
+            render::write_task_list(stdout, &response)?;
+        }
         TaskCommand::Show { task_id } => {
             let response = client.get_task(&task_id)?;
             render::write_task_summary(stdout, &response.task, &response.spans)?;
@@ -1030,6 +1034,7 @@ under XDG_CONFIG_HOME. Use --force only to replace an existing unit file.
 "#;
 
 const TASK_AFTER_HELP: &str = r#"Examples:
+  verbatim task list
   verbatim task show <task-id>
   verbatim task events <task-id>
   verbatim task wait --timeout 25m <task-id>
@@ -1037,6 +1042,13 @@ const TASK_AFTER_HELP: &str = r#"Examples:
   verbatim task resume <task-id>
 
 Task ids are returned by --background ingest/reindex/ask commands.
+"#;
+
+const TASK_LIST_AFTER_HELP: &str = r#"Examples:
+  verbatim task list
+
+List shows active queued/running tasks with compact progress bars. It is capped
+to the first active tasks so a large ingest backlog stays readable.
 "#;
 
 const TASK_SHOW_AFTER_HELP: &str = r#"Examples:
@@ -1604,6 +1616,12 @@ enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
+    /// List active queued/running tasks with compact progress bars.
+    #[command(
+        about = "List active queued/running tasks with progress bars.",
+        after_help = TASK_LIST_AFTER_HELP
+    )]
+    List,
     /// Show task summary and phase spans.
     #[command(
         about = "Show task status, progress, result, and spans.",
@@ -1704,7 +1722,7 @@ mod tests {
         CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse, ReindexRequest,
         ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
         RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
-        TaskEventsResponse, TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
+        TaskEventsResponse, TaskListResponse, TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
     };
     use verbatim_core::collection::{
         CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
@@ -2397,6 +2415,29 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert_eq!(client.calls.borrow().as_slice(), ["resume_task:task-1"]);
         assert!(stdout.contains("Task: task-1"));
+    }
+
+    #[test]
+    fn task_list_renders_active_tasks_with_progress_bars() {
+        let (code, stdout, stderr, client, _) = run_mock(["task", "list"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(client.calls.borrow().as_slice(), ["list_tasks:active"]);
+        assert!(stdout.contains("Active tasks:"));
+        assert!(stdout.contains("task-run"));
+        assert!(stdout.contains("running"));
+        assert!(stdout.contains("[##########----------]  50%"));
+        assert!(stdout.contains("embedding_vectors 4/8"));
+        assert!(stdout.contains("task-queued"));
+        assert!(stdout.contains("queue #12"));
+        assert!(stdout.contains("waiting for 11 queued ingest task(s) ahead"));
+        assert!(stdout.contains("task-unknown"));
+        assert!(stdout.contains("[????????????????????]   --"));
+        assert!(stdout.contains("tokens 42"));
+        assert!(stdout.contains("task-done-counter"));
+        assert!(stdout.contains("[####################] 100% (still running)"));
+        assert!(stdout.contains("embedding complete"));
     }
 
     #[test]
@@ -3132,6 +3173,11 @@ mod tests {
             Ok(sample_index_profile_delete_response(request.dry_run))
         }
 
+        fn list_tasks(&self) -> client::CliResult<TaskListResponse> {
+            self.calls.borrow_mut().push("list_tasks:active".into());
+            Ok(sample_task_list_response())
+        }
+
         fn get_task(&self, task_id: &str) -> client::CliResult<TaskSummaryResponse> {
             self.calls.borrow_mut().push(format!("get_task:{task_id}"));
             Ok(sample_task_response(TaskStatus::Succeeded))
@@ -3605,6 +3651,88 @@ mod tests {
                 duration_ms: 7,
                 metadata: serde_json::json!({"result_count": 1}),
             }],
+        }
+    }
+
+    fn sample_task_list_response() -> TaskListResponse {
+        TaskListResponse {
+            total: 4,
+            tasks: vec![
+                TaskSummary {
+                    id: TaskId("task-run".into()),
+                    kind: TaskKind::Ingest,
+                    status: TaskStatus::Running,
+                    created_at: "1".into(),
+                    updated_at: "2".into(),
+                    started_at: Some("2".into()),
+                    finished_at: None,
+                    request: serde_json::json!({"source_id": "src-run"}),
+                    result: None,
+                    error: None,
+                    queue_position: None,
+                    blocking_reason: None,
+                    progress: Some(TaskProgressSnapshot::phase("embedding").with_counter(
+                        "embedding_vectors",
+                        4,
+                        Some(8),
+                    )),
+                },
+                TaskSummary {
+                    id: TaskId("task-queued".into()),
+                    kind: TaskKind::Ingest,
+                    status: TaskStatus::Queued,
+                    created_at: "3".into(),
+                    updated_at: "3".into(),
+                    started_at: None,
+                    finished_at: None,
+                    request: serde_json::json!({"source_id": "src-queued"}),
+                    result: None,
+                    error: None,
+                    queue_position: Some(12),
+                    blocking_reason: Some("waiting for 11 queued ingest task(s) ahead".into()),
+                    progress: Some(TaskProgressSnapshot::phase("queued").with_queue(
+                        12,
+                        Some("ingest".into()),
+                        Some("waiting for 11 queued ingest task(s) ahead".into()),
+                    )),
+                },
+                TaskSummary {
+                    id: TaskId("task-unknown".into()),
+                    kind: TaskKind::Ask,
+                    status: TaskStatus::Running,
+                    created_at: "4".into(),
+                    updated_at: "5".into(),
+                    started_at: Some("5".into()),
+                    finished_at: None,
+                    request: serde_json::json!({"question_chars": 100}),
+                    result: None,
+                    error: None,
+                    queue_position: None,
+                    blocking_reason: None,
+                    progress: Some(
+                        TaskProgressSnapshot::phase("chat").with_counter("tokens", 42, None),
+                    ),
+                },
+                TaskSummary {
+                    id: TaskId("task-done-counter".into()),
+                    kind: TaskKind::Ingest,
+                    status: TaskStatus::Running,
+                    created_at: "6".into(),
+                    updated_at: "7".into(),
+                    started_at: Some("7".into()),
+                    finished_at: None,
+                    request: serde_json::json!({"source_id": "src-done"}),
+                    result: None,
+                    error: None,
+                    queue_position: None,
+                    blocking_reason: None,
+                    progress: Some(
+                        TaskProgressSnapshot::phase("publish")
+                            .with_counter("embedding_vectors", 8, Some(8))
+                            .with_recent_status("embedding complete"),
+                    ),
+                },
+            ],
         }
     }
 

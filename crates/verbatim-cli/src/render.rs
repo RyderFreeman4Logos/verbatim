@@ -6,7 +6,7 @@ use verbatim_core::api::{
     CollectionResultProvenance, CollectionWatcherStatus, ConfigResponse, EvidenceResponse,
     HealthResponse, IndexGcResponse, IndexProfileDeleteResponse, IndexStatusResponse,
     IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse, TaskCreatedResponse,
-    TaskWaitEvent,
+    TaskListResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::index_gc::{IndexGcPlanEntry, IndexGcSkippedEntry};
@@ -701,6 +701,28 @@ where
     writeln!(writer, "progress: {}", task_progress_summary(progress))
 }
 
+pub fn write_task_list<W>(writer: &mut W, response: &TaskListResponse) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if response.tasks.is_empty() {
+        return writeln!(writer, "No active tasks.");
+    }
+    writeln!(writer, "Active tasks:")?;
+    for task in &response.tasks {
+        writeln!(writer, "  {}", task_progress_list_line(task))?;
+    }
+    if response.total > response.tasks.len() {
+        writeln!(
+            writer,
+            "  showing {} of {} active tasks",
+            response.tasks.len(),
+            response.total
+        )?;
+    }
+    Ok(())
+}
+
 pub fn write_task_summary<W>(
     writer: &mut W,
     task: &TaskSummary,
@@ -871,6 +893,107 @@ fn task_progress_summary(progress: &TaskProgressSnapshot) -> String {
     } else {
         parts.join(" ")
     }
+}
+
+fn task_progress_list_line(task: &TaskSummary) -> String {
+    let (bar, detail) = match &task.progress {
+        Some(progress) => (
+            task_progress_bar(task.status, progress),
+            task_progress_list_detail(task, progress),
+        ),
+        None => (
+            unknown_task_progress_bar(),
+            task_progress_fallback_detail(task),
+        ),
+    };
+    format!(
+        "{} {} {} {}{}",
+        task.id.0,
+        task.kind.as_str(),
+        task.status.as_str(),
+        bar,
+        detail
+    )
+}
+
+fn task_progress_bar(status: TaskStatus, progress: &TaskProgressSnapshot) -> String {
+    let Some(counter) = progress
+        .counters
+        .iter()
+        .find(|counter| counter.total.is_some_and(|total| total > 0))
+    else {
+        return unknown_task_progress_bar();
+    };
+    let total = counter.total.unwrap_or(0);
+    let percent = if total == 0 {
+        0
+    } else {
+        counter
+            .completed
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(0)
+            .min(100)
+    };
+    let filled = (percent * 20 / 100) as usize;
+    let empty = 20usize.saturating_sub(filled);
+    let suffix = if status == TaskStatus::Running && percent == 100 {
+        " (still running)"
+    } else {
+        ""
+    };
+    format!(
+        "[{}{}] {:>3}%{suffix}",
+        "#".repeat(filled),
+        "-".repeat(empty),
+        percent
+    )
+}
+
+fn unknown_task_progress_bar() -> String {
+    "[????????????????????]   --".into()
+}
+
+fn task_progress_list_detail(task: &TaskSummary, progress: &TaskProgressSnapshot) -> String {
+    let mut parts = Vec::new();
+    if let Some(phase) = &progress.phase {
+        parts.push(phase.name.clone());
+    }
+    if let Some(position) = task
+        .queue_position
+        .or_else(|| progress.queue.as_ref().map(|queue| queue.position))
+    {
+        parts.push(format!("queue #{position}"));
+    }
+    for counter in &progress.counters {
+        match counter.total {
+            Some(total) => parts.push(format!("{} {}/{}", counter.name, counter.completed, total)),
+            None => parts.push(format!("{} {}", counter.name, counter.completed)),
+        }
+    }
+    if let Some(status) = &progress.recent_status {
+        parts.push(status.clone());
+    }
+    if let Some(reason) = task.blocking_reason.as_ref().or_else(|| {
+        progress
+            .queue
+            .as_ref()
+            .and_then(|queue| queue.blocking_reason.as_ref())
+    }) {
+        parts.push(reason.clone());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join(" | "))
+    }
+}
+
+fn task_progress_fallback_detail(task: &TaskSummary) -> String {
+    task.blocking_reason
+        .as_ref()
+        .map(|reason| format!(" {reason}"))
+        .unwrap_or_default()
 }
 
 fn task_embedding_cache_summary(result: &Value) -> Option<String> {

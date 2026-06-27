@@ -34,6 +34,22 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Task list status filter used by bounded task overview queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskListFilter {
+    /// Queued and running tasks only.
+    Active,
+    /// All persisted tasks, including terminal history.
+    All,
+}
+
+/// Bounded task overview page plus the total number of matching tasks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskListPage {
+    pub tasks: Vec<TaskSummary>,
+    pub total: usize,
+}
+
 pub struct SourceContentsReplacement<'a> {
     pub source: &'a Source,
     pub evidence: &'a [EvidenceUnit],
@@ -2134,6 +2150,55 @@ impl Store {
             row_to_task_summary,
         )?;
         rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn list_tasks_page(&self, filter: TaskListFilter, limit: usize) -> Result<TaskListPage> {
+        let limit = sql_limit(limit.max(1));
+        let (tasks, total) = match filter {
+            TaskListFilter::Active => {
+                let total = self.conn.query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE status IN (?1, ?2)",
+                    params![TaskStatus::Queued.as_str(), TaskStatus::Running.as_str()],
+                    |row| row_usize(row, 0),
+                )?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json
+                     FROM tasks
+                     WHERE status IN (?1, ?2)
+                     ORDER BY created_at, id
+                     LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        TaskStatus::Queued.as_str(),
+                        TaskStatus::Running.as_str(),
+                        limit,
+                    ],
+                    row_to_task_summary,
+                )?;
+                let tasks = rows
+                    .map(|row| row.map_err(Into::into))
+                    .collect::<Result<_>>()?;
+                (tasks, total)
+            }
+            TaskListFilter::All => {
+                let total = self
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM tasks", [], |row| row_usize(row, 0))?;
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json
+                     FROM tasks
+                     ORDER BY created_at, id
+                     LIMIT ?1",
+                )?;
+                let rows = stmt.query_map(params![limit], row_to_task_summary)?;
+                let tasks = rows
+                    .map(|row| row.map_err(Into::into))
+                    .collect::<Result<_>>()?;
+                (tasks, total)
+            }
+        };
+        Ok(TaskListPage { tasks, total })
     }
 
     pub fn queued_task_position(&self, task_id: &TaskId) -> Result<Option<usize>> {
@@ -4630,6 +4695,46 @@ mod tests {
         let spans = store.list_task_spans(&task_id).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].metadata["model"], "qwen");
+    }
+
+    #[test]
+    fn task_list_page_is_limited_and_reports_total() {
+        let store = Store::in_memory().unwrap();
+        for index in 0..8 {
+            let task_id = TaskId(format!("task-history-{index:02}"));
+            store
+                .create_task(
+                    &task_id,
+                    TaskKind::Ask,
+                    &ask_request_metadata("What is cited?", None, None, false, false),
+                )
+                .unwrap();
+            store.start_task(&task_id).unwrap();
+            store
+                .finish_task_success(&task_id, &ask_result_metadata("answer", 0, false, false))
+                .unwrap();
+        }
+        for index in 0..3 {
+            store
+                .create_task(
+                    &TaskId(format!("task-active-{index:02}")),
+                    TaskKind::Ingest,
+                    &ingest_request_metadata(Some("src-1"), false),
+                )
+                .unwrap();
+        }
+
+        let history = store.list_tasks_page(TaskListFilter::All, 5).unwrap();
+        assert_eq!(history.total, 11);
+        assert_eq!(history.tasks.len(), 5);
+
+        let active = store.list_tasks_page(TaskListFilter::Active, 2).unwrap();
+        assert_eq!(active.total, 3);
+        assert_eq!(active.tasks.len(), 2);
+        assert!(active
+            .tasks
+            .iter()
+            .all(|task| task.status == TaskStatus::Queued));
     }
 
     #[test]

@@ -16,7 +16,8 @@ use verbatim_core::api::{
     CreateCollectionRequest, EvidenceResponse, HealthResponse, IndexGcRequest, IndexGcResponse,
     IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
     ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse, SourceResponse,
-    TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse,
+    TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskListResponse,
+    TaskSummaryResponse,
 };
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
@@ -128,6 +129,7 @@ pub trait DaemonClient {
         &self,
         request: &IndexProfileDeleteRequest,
     ) -> CliResult<IndexProfileDeleteResponse>;
+    fn list_tasks(&self) -> CliResult<TaskListResponse>;
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
     fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse>;
     fn wait_task<W>(
@@ -519,6 +521,14 @@ impl DaemonClient for HttpDaemonClient {
         request: &IndexProfileDeleteRequest,
     ) -> CliResult<IndexProfileDeleteResponse> {
         self.request_json(Method::POST, "/api/index/profiles/delete", Some(request))
+    }
+
+    fn list_tasks(&self) -> CliResult<TaskListResponse> {
+        self.request_json::<TaskListResponse, ()>(
+            Method::GET,
+            "/api/tasks?status=active&limit=20",
+            None,
+        )
     }
 
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse> {
