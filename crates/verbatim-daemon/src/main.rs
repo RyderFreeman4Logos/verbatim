@@ -34,7 +34,7 @@ use verbatim_core::api::{
     IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
     ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
     RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
-    TaskEventsResponse, TaskIngestRequest, TaskSummaryResponse, TaskWaitEvent,
+    TaskEventsResponse, TaskIngestRequest, TaskListResponse, TaskSummaryResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -57,7 +57,7 @@ use verbatim_core::provider::openai_compatible::{
 };
 use verbatim_core::provider::ProviderError;
 use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
-use verbatim_core::store::Store;
+use verbatim_core::store::{Store, TaskListFilter};
 use verbatim_core::task::{
     ask_request_metadata, ask_result_metadata, bounded_error, ingest_result_metadata,
     ingest_task_request_metadata_with_queue_claim,
@@ -110,6 +110,8 @@ struct RuntimeConfigState {
 const ASK_STREAM_EVENT_BUFFER: usize = 32;
 const TASK_WAIT_EVENT_BUFFER: usize = 16;
 const TASK_WAIT_EVENT_LIMIT: usize = 100;
+const TASK_LIST_DEFAULT_LIMIT: usize = 20;
+const TASK_LIST_MAX_LIMIT: usize = 100;
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FAST_RETRIEVAL_TOP_K: usize = 20;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
@@ -1520,6 +1522,60 @@ async fn task_summary_response(
             err(StatusCode::INTERNAL_SERVER_ERROR, e)
         }
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskListQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_tasks_handler(
+    State(state): State<SharedState>,
+    Query(query): Query<TaskListQuery>,
+) -> Result<Json<TaskListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let state = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        let store = state
+            .task_store
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let filter = task_list_filter(query.status.as_deref())?;
+        let limit = query
+            .limit
+            .unwrap_or(TASK_LIST_DEFAULT_LIMIT)
+            .clamp(1, TASK_LIST_MAX_LIMIT);
+        let page = store.list_tasks_page(filter, limit)?;
+        let tasks = page
+            .tasks
+            .into_iter()
+            .map(|task| with_queue_details(&store, task))
+            .collect::<Result<Vec<_>>>()?;
+        Ok::<_, anyhow::Error>(TaskListResponse {
+            tasks,
+            total: page.total,
+        })
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map(Json)
+    .map_err(|e| {
+        if e.to_string().contains("unsupported task status filter") {
+            err(StatusCode::BAD_REQUEST, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })
+}
+
+fn task_list_filter(status: Option<&str>) -> Result<TaskListFilter> {
+    match status.unwrap_or("active") {
+        "active" => Ok(TaskListFilter::Active),
+        "all" => Ok(TaskListFilter::All),
+        other => {
+            bail!("unsupported task status filter: {other}")
+        }
+    }
 }
 
 async fn task_events_response(
@@ -5868,6 +5924,7 @@ async fn run_daemon() -> Result<()> {
         .route("/api/tasks/ask", post(submit_ask_task))
         .route("/api/tasks/ingest", post(submit_ingest_task))
         .route("/api/tasks/reindex", post(submit_reindex_task))
+        .route("/api/tasks", get(list_tasks_handler))
         .route("/api/tasks/{id}", get(show_task))
         .route("/api/tasks/{id}/events", get(list_task_events_handler))
         .route("/api/tasks/{id}/wait", get(wait_task))
@@ -6265,6 +6322,96 @@ mod tests {
         assert_eq!(progress.phase.unwrap().name, "chat");
         assert_eq!(progress.counters[0].name, "chat_bytes_streamed");
         assert_eq!(progress.endpoints[0].first_token_latency_ms, Some(250));
+    }
+
+    #[tokio::test]
+    async fn task_list_defaults_to_active_tasks_with_queue_details() {
+        let test_dir = TestDir::new("task-list-active");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let done_id = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &done_id).await.unwrap();
+        finish_task_success(
+            &state,
+            &done_id,
+            ask_result_metadata("answer", 0, false, false),
+        )
+        .await
+        .unwrap();
+        let (running_id, queued_id) = blocked_ingest_pair(&state).await;
+
+        let Json(response) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.total, 2);
+        assert_eq!(response.tasks.len(), 2);
+        assert!(response.tasks.iter().any(|task| task.id == running_id));
+        let queued = response
+            .tasks
+            .iter()
+            .find(|task| task.id == queued_id)
+            .expect("queued task is listed");
+        assert_eq!(queued.queue_position, Some(1));
+        assert_eq!(
+            queued.blocking_reason.as_deref(),
+            Some("waiting for running ingest task to finish")
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_all_clamps_large_limit_and_reports_total() {
+        let test_dir = TestDir::new("task-list-all-clamped");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        {
+            let store = state.task_store.lock().unwrap();
+            for index in 0..TASK_LIST_MAX_LIMIT + 5 {
+                let task_id = TaskId(format!("task-history-{index:03}"));
+                store
+                    .create_task(
+                        &task_id,
+                        TaskKind::Ask,
+                        &ask_request_metadata("What is cited?", None, None, false, false),
+                    )
+                    .unwrap();
+                store.start_task(&task_id).unwrap();
+                store
+                    .finish_task_success(&task_id, &ask_result_metadata("answer", 0, false, false))
+                    .unwrap();
+            }
+        }
+
+        let Json(response) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("all".into()),
+                limit: Some(usize::MAX),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.total, TASK_LIST_MAX_LIMIT + 5);
+        assert_eq!(response.tasks.len(), TASK_LIST_MAX_LIMIT);
+        assert!(response
+            .tasks
+            .iter()
+            .all(|task| task.status == TaskStatus::Succeeded));
     }
 
     #[test]

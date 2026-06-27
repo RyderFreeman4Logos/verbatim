@@ -1451,6 +1451,14 @@ where
         let prepared =
             self.prepare_source_indexes_from_vectors(profile_id, &source_id, vectors, cache_stats)?;
         let phase = PhaseTiming::start("ingest_index_publishing");
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("preparing index artifacts")
+                .with_active_worker_kind("ingest"),
+        );
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
         let written_image_files =
             match write_image_artifact_files(&image_artifacts.files, self.image_artifact_limits) {
@@ -1461,6 +1469,14 @@ where
                 }
             };
         let db_phase = PhaseTiming::start("db");
+        self.record_task_progress(
+            task_id,
+            db_phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("committing source contents")
+                .with_active_worker_kind("ingest"),
+        );
         let generation = match self
             .store
             .replace_source_contents(SourceContentsReplacement {
@@ -1492,7 +1508,23 @@ where
             }),
         );
         let cache_stats = prepared.cache_stats.clone();
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("publishing index artifacts")
+                .with_active_worker_kind("ingest"),
+        );
         self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_counter("sources", 1, Some(1))
+                .with_recent_status("index publishing complete")
+                .with_active_worker_kind("ingest"),
+        );
         self.record_task_phase(
             task_id,
             phase,
@@ -6640,6 +6672,54 @@ model = "local-vision"
                         })
                     })
         }));
+    }
+
+    #[tokio::test]
+    async fn source_task_batch_progress_marks_commit_phases_after_embedding() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let task_id = TaskId("task-source-batch-commit-progress".into());
+        let source_id = SourceId("src-source-batch-commit-progress".into());
+        pipeline
+            .store()
+            .create_task(&task_id, TaskKind::Ingest, &serde_json::json!({}))
+            .unwrap();
+        pipeline.store().start_task(&task_id).unwrap();
+        let path = tempdir.path().join("source-batch-commit-progress.txt");
+        fs::write(&path, "source batch commit progress retrieval text\n").unwrap();
+        let source = test_source(&source_id.0, path);
+        pipeline.store().add_source(&source).unwrap();
+
+        let outcomes = pipeline
+            .ingest_sources_with_tasks(&[(source_id.clone(), task_id.clone())])
+            .await;
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].result.is_ok());
+        let events = pipeline
+            .store()
+            .list_task_events(&task_id, None, 100)
+            .unwrap();
+        let phases = events
+            .iter()
+            .filter(|event| event.event_type == "progress")
+            .filter_map(|event| event.payload["phase"]["name"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            phases.contains(&"db"),
+            "progress phases should include db commit, got {phases:?}"
+        );
+        assert!(
+            phases.contains(&"ingest_index_publishing"),
+            "progress phases should include index publishing, got {phases:?}"
+        );
     }
 
     #[test]

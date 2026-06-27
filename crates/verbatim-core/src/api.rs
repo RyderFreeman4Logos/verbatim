@@ -445,6 +445,13 @@ pub struct TaskSummaryResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskListResponse {
+    #[serde(default)]
+    pub tasks: Vec<TaskSummary>,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskEventsResponse {
     #[serde(default)]
     pub events: Vec<TaskEvent>,
