@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -1294,15 +1295,35 @@ where
         &mut self,
         source_tasks: &[(SourceId, TaskId)],
     ) -> Vec<SourceIngestOutcome> {
+        self.ingest_sources_with_tasks_reporting(source_tasks, |_| async {})
+            .await
+    }
+
+    /// Ingest queued source tasks and report each source outcome as soon as it is known.
+    pub async fn ingest_sources_with_tasks_reporting<F, Fut>(
+        &mut self,
+        source_tasks: &[(SourceId, TaskId)],
+        mut report_outcome: F,
+    ) -> Vec<SourceIngestOutcome>
+    where
+        F: FnMut(SourceIngestOutcome) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         if let Err(error) = self.refresh_embedding_profile_capabilities().await {
-            return source_tasks
-                .iter()
-                .map(|(source_id, task_id)| SourceIngestOutcome {
-                    source_id: source_id.clone(),
-                    task_id: task_id.clone(),
-                    result: Err(error.to_string()),
-                })
-                .collect();
+            let mut outcomes = Vec::with_capacity(source_tasks.len());
+            for (source_id, task_id) in source_tasks {
+                push_reported_source_outcome(
+                    &mut outcomes,
+                    SourceIngestOutcome {
+                        source_id: source_id.clone(),
+                        task_id: task_id.clone(),
+                        result: Err(error.to_string()),
+                    },
+                    &mut report_outcome,
+                )
+                .await;
+            }
+            return outcomes;
         }
         let active_profile_id = self.active_profile_id.clone();
         let mut pending = PendingPreparedSources::default();
@@ -1314,53 +1335,68 @@ where
                         &pending,
                         prepared_source.prepared_artifact_bytes(),
                     ) {
-                        outcomes.extend(
-                            self.flush_pending_prepared_sources(
+                        let prepared_outcomes = self
+                            .flush_pending_prepared_sources(
                                 &active_profile_id,
                                 &mut pending,
                                 BatchCancellationScope::PerSourceTask,
                             )
-                            .await
-                            .into_iter()
-                            .map(public_source_ingest_outcome),
-                        );
+                            .await;
+                        push_reported_prepared_source_outcomes(
+                            &mut outcomes,
+                            prepared_outcomes,
+                            &mut report_outcome,
+                        )
+                        .await;
                     }
                     pending.push(prepared_source);
                     if self.should_flush_pending_sources(&pending) {
-                        outcomes.extend(
-                            self.flush_pending_prepared_sources(
+                        let prepared_outcomes = self
+                            .flush_pending_prepared_sources(
                                 &active_profile_id,
                                 &mut pending,
                                 BatchCancellationScope::PerSourceTask,
                             )
-                            .await
-                            .into_iter()
-                            .map(public_source_ingest_outcome),
-                        );
+                            .await;
+                        push_reported_prepared_source_outcomes(
+                            &mut outcomes,
+                            prepared_outcomes,
+                            &mut report_outcome,
+                        )
+                        .await;
                     }
                 }
-                Err(error) => outcomes.push(SourceIngestOutcome {
-                    source_id: source_id.clone(),
-                    task_id: task_id.clone(),
-                    result: Err(error.to_string()),
-                }),
+                Err(error) => {
+                    push_reported_source_outcome(
+                        &mut outcomes,
+                        SourceIngestOutcome {
+                            source_id: source_id.clone(),
+                            task_id: task_id.clone(),
+                            result: Err(error.to_string()),
+                        },
+                        &mut report_outcome,
+                    )
+                    .await;
+                }
             }
         }
         if !pending.is_empty() {
-            outcomes.extend(
-                self.flush_pending_prepared_sources(
+            let prepared_outcomes = self
+                .flush_pending_prepared_sources(
                     &active_profile_id,
                     &mut pending,
                     BatchCancellationScope::PerSourceTask,
                 )
-                .await
-                .into_iter()
-                .map(public_source_ingest_outcome),
-            );
+                .await;
+            push_reported_prepared_source_outcomes(
+                &mut outcomes,
+                prepared_outcomes,
+                &mut report_outcome,
+            )
+            .await;
         }
         outcomes
     }
-
     async fn ingest_source_inner(
         &mut self,
         source_id: &SourceId,
@@ -3480,6 +3516,34 @@ fn public_source_ingest_outcome(outcome: PreparedSourceOutcome) -> SourceIngestO
         task_id: outcome.task_id.unwrap_or_default(),
         result: outcome.result,
     }
+}
+
+async fn push_reported_prepared_source_outcomes<F, Fut>(
+    outcomes: &mut Vec<SourceIngestOutcome>,
+    prepared_outcomes: Vec<PreparedSourceOutcome>,
+    report_outcome: &mut F,
+) where
+    F: FnMut(SourceIngestOutcome) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    for outcome in prepared_outcomes
+        .into_iter()
+        .map(public_source_ingest_outcome)
+    {
+        push_reported_source_outcome(outcomes, outcome, report_outcome).await;
+    }
+}
+
+async fn push_reported_source_outcome<F, Fut>(
+    outcomes: &mut Vec<SourceIngestOutcome>,
+    outcome: SourceIngestOutcome,
+    report_outcome: &mut F,
+) where
+    F: FnMut(SourceIngestOutcome) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    report_outcome(outcome.clone()).await;
+    outcomes.push(outcome);
 }
 
 fn chunk_caption_evidence(source_id: &SourceId, evidence: &[EvidenceUnit]) -> ChunkOutput {
@@ -7045,6 +7109,73 @@ model = "local-vision"
             phases.contains(&"ingest_index_publishing"),
             "progress phases should include index publishing, got {phases:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn source_task_batch_reports_each_outcome_before_later_sources_complete() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let committed_sources = Arc::new(AtomicUsize::new(0));
+        let observer_committed_sources = Arc::clone(&committed_sources);
+        let reported_committed_counts = Arc::new(Mutex::new(Vec::new()));
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_embedding_controls(1, 1)
+        .with_source_commit_observer(move |_store, _source_id| {
+            observer_committed_sources.fetch_add(1, Ordering::SeqCst);
+        });
+        let mut source_tasks = Vec::new();
+        for index in 0..2 {
+            let task_id = TaskId(format!("task-source-batch-report-{index}"));
+            let source_id = SourceId(format!("src-source-batch-report-{index}"));
+            pipeline
+                .store()
+                .create_task(&task_id, TaskKind::Ingest, &serde_json::json!({}))
+                .unwrap();
+            pipeline.store().start_task(&task_id).unwrap();
+            let path = tempdir
+                .path()
+                .join(format!("source-batch-report-{index}.txt"));
+            fs::write(
+                &path,
+                format!("source batch report {index} retrieval text\n"),
+            )
+            .unwrap();
+            let source = test_source(&source_id.0, path);
+            pipeline.store().add_source(&source).unwrap();
+            source_tasks.push((source_id, task_id));
+        }
+
+        let reported_counts = Arc::clone(&reported_committed_counts);
+        let committed_sources_for_reporter = Arc::clone(&committed_sources);
+        let outcomes = pipeline
+            .ingest_sources_with_tasks_reporting(&source_tasks, move |outcome| {
+                let reported_counts = Arc::clone(&reported_counts);
+                let committed_sources = Arc::clone(&committed_sources_for_reporter);
+                async move {
+                    reported_counts
+                        .lock()
+                        .expect("reported counts lock should not be poisoned")
+                        .push((outcome.task_id, committed_sources.load(Ordering::SeqCst)));
+                }
+            })
+            .await;
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|outcome| outcome.result.is_ok()));
+        let reported_counts = reported_committed_counts
+            .lock()
+            .expect("reported counts lock should not be poisoned")
+            .clone();
+        assert_eq!(reported_counts.len(), 2);
+        assert_eq!(reported_counts[0].0, source_tasks[0].1);
+        assert_eq!(reported_counts[0].1, 1);
+        assert_eq!(reported_counts[1].0, source_tasks[1].1);
+        assert_eq!(reported_counts[1].1, 2);
     }
 
     #[test]

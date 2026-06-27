@@ -2242,13 +2242,14 @@ impl Store {
         let changed = self.conn.execute(
             "UPDATE tasks
              SET status = ?2, updated_at = ?3, finished_at = COALESCE(finished_at, ?3), result_json = ?4, error = NULL
-             WHERE id = ?1 AND status != ?5",
+             WHERE id = ?1 AND status IN (?5, ?6)",
             params![
                 &task_id.0,
                 TaskStatus::Succeeded.as_str(),
                 now,
                 result,
-                TaskStatus::Cancelled.as_str(),
+                TaskStatus::Queued.as_str(),
+                TaskStatus::Running.as_str(),
             ],
         )?;
         Ok(changed > 0)
@@ -2274,14 +2275,15 @@ impl Store {
         let changed = self.conn.execute(
             "UPDATE tasks
              SET status = ?2, updated_at = ?3, finished_at = COALESCE(finished_at, ?3), error = ?4, result_json = ?5
-             WHERE id = ?1 AND status != ?6",
+             WHERE id = ?1 AND status IN (?6, ?7)",
             params![
                 &task_id.0,
                 TaskStatus::Failed.as_str(),
                 now,
                 bounded_error(error),
                 result,
-                TaskStatus::Cancelled.as_str(),
+                TaskStatus::Queued.as_str(),
+                TaskStatus::Running.as_str(),
             ],
         )?;
         Ok(changed > 0)
