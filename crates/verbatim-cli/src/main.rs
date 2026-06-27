@@ -1092,7 +1092,9 @@ const TASK_LIST_AFTER_HELP: &str = r#"Examples:
   verbatim task list --details
 
 List shows an aggregate active task queue summary by default so a large backlog
-stays readable. Use --details to print the bounded per-task rows.
+stays readable. The daemon may also report active total plateau explanations,
+bounded turnover/backfill, waiting reason buckets, and stale running tasks. Use
+--details to print the bounded per-task rows.
 "#;
 
 const TASK_SHOW_AFTER_HELP: &str = r#"Examples:
@@ -1774,7 +1776,11 @@ enum RetrieveFormat {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::io::{Read as _, Write as _};
+    use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     use serde_json::Value;
     use verbatim_core::api::{
@@ -1785,7 +1791,9 @@ mod tests {
         CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse, ReindexRequest,
         ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
         RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
-        TaskEventsResponse, TaskListResponse, TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
+        TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskListAggregate, TaskListResponse,
+        TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate,
+        TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
     };
     use verbatim_core::collection::{
         CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
@@ -2054,6 +2062,18 @@ mod tests {
         assert!(help.contains("model timeout_seconds do not cap task streams"));
         assert!(help.contains("cli.task_wait_timeout_seconds"));
         assert!(help.contains("separate from model timeout_seconds"));
+    }
+
+    #[test]
+    fn task_list_help_documents_plateau_metadata_terms() {
+        let (code, help, stderr, _, _) = run_mock(["task", "list", "--help"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(help.contains("active total"));
+        assert!(help.contains("turnover/backfill"));
+        assert!(help.contains("waiting reason"));
+        assert!(help.contains("stale running"));
     }
 
     #[test]
@@ -2599,8 +2619,7 @@ mod tests {
     }
 
     #[test]
-    fn task_list_discards_history_when_sampled_task_ids_do_not_overlap_and_total_does_not_decrease()
-    {
+    fn task_list_discards_eta_history_but_renders_daemon_turnover_when_ids_do_not_overlap() {
         let client = MockDaemonClient::default();
         let local = MockLocalActions::default();
         *local.now_millis.borrow_mut() = 301_000;
@@ -2614,6 +2633,7 @@ mod tests {
             }));
         let mut current_queue = sample_task_list_response();
         current_queue.total = 5;
+        current_queue.aggregate = Some(sample_task_list_aggregate(1, 1, 0, 0, 0));
         client.task_list_response.replace(Some(current_queue));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -2627,6 +2647,9 @@ mod tests {
         assert_eq!(history.previous_total, 5);
         assert_eq!(history.sampled_at_ms, 301_000);
         assert!(history.sampled_task_ids.contains(&"task-run".into()));
+        assert!(
+            stdout.contains("active total unchanged; recent turnover terminalized=1 backfilled=1")
+        );
     }
 
     #[test]
@@ -2644,6 +2667,7 @@ mod tests {
         client.task_list_response.replace(Some(TaskListResponse {
             total: 0,
             tasks: Vec::new(),
+            aggregate: None,
         }));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -2652,6 +2676,117 @@ mod tests {
         assert!(stderr.is_empty());
         assert_eq!(stdout, "No active tasks.\n");
         assert!(local.task_list_history.borrow().is_none());
+    }
+
+    #[test]
+    fn task_list_plateau_eta_rendering() {
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        *local.now_millis.borrow_mut() = 301_000;
+        local
+            .task_list_history
+            .replace(Some(render::TaskListAggregateHistory {
+                baseline_total: 10,
+                previous_total: 4,
+                sampled_at_ms: 1_000,
+                sampled_task_ids: vec!["task-run".into()],
+            }));
+        let mut response = sample_task_list_response();
+        response.aggregate = Some(sample_task_list_aggregate(3, 3, 2, 125_000, 1));
+        client.task_list_response.replace(Some(response));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(
+            stdout.contains("active total unchanged; recent turnover terminalized=3 backfilled=3")
+        );
+        assert!(stdout.contains("embedding wait: 2 sampled active task(s), oldest 3m"));
+        assert!(stdout.contains("reasons embedding_batch=1, embedding_throughput=1"));
+        assert!(stdout.contains("stale running: 1 publish-complete task(s)"));
+        assert!(stdout.contains("post_publish_cleanup=1"));
+
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        *local.now_millis.borrow_mut() = 301_000;
+        local
+            .task_list_history
+            .replace(Some(render::TaskListAggregateHistory {
+                baseline_total: 4,
+                previous_total: 4,
+                sampled_at_ms: 1_000,
+                sampled_task_ids: vec!["task-run".into()],
+            }));
+        let mut response = sample_task_list_response();
+        response.aggregate = Some(sample_task_list_aggregate(0, 0, 0, 0, 0));
+        client.task_list_response.replace(Some(response));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(stdout
+            .contains("active total unchanged; no recent completions in last 1000 task events"));
+
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        *local.now_millis.borrow_mut() = 301_000;
+        local
+            .task_list_history
+            .replace(Some(render::TaskListAggregateHistory {
+                baseline_total: 4,
+                previous_total: 4,
+                sampled_at_ms: 1_000,
+                sampled_task_ids: vec!["task-run".into()],
+            }));
+        client
+            .task_list_response
+            .replace(Some(sample_task_list_response()));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("Task queue:"));
+        assert!(!stdout.contains("recent turnover"));
+        assert!(!stdout.contains("embedding wait:"));
+    }
+
+    #[test]
+    fn plateau_queue_integration() {
+        let local = MockLocalActions::default();
+        *local.now_millis.borrow_mut() = 301_000;
+        local
+            .task_list_history
+            .replace(Some(render::TaskListAggregateHistory {
+                baseline_total: 4,
+                previous_total: 4,
+                sampled_at_ms: 1_000,
+                sampled_task_ids: vec!["task-run".into()],
+            }));
+        let mut daemon_response = sample_task_list_response();
+        daemon_response.aggregate = Some(sample_task_list_aggregate(1, 1, 1, 65_000, 1));
+        let server =
+            TaskListHttpServer::respond_json(serde_json::to_string(&daemon_response).unwrap());
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = run_with(["task", "list"], &mut stdout, &mut stderr, &client, &local);
+        let stdout = String::from_utf8(stdout).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(server
+            .request()
+            .starts_with("GET /api/tasks?status=active&limit=20 HTTP/1.1"));
+        assert!(
+            stdout.contains("active total unchanged; recent turnover terminalized=1 backfilled=1")
+        );
+        assert!(stdout.contains("embedding wait: 1 sampled active task(s), oldest 2m"));
+        assert!(stdout.contains("stale running: 1 publish-complete task(s)"));
     }
 
     #[test]
@@ -2680,6 +2815,7 @@ mod tests {
         client.task_list_response.replace(Some(TaskListResponse {
             total: 0,
             tasks: Vec::new(),
+            aggregate: None,
         }));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -3244,6 +3380,58 @@ mod tests {
             String::from_utf8(stdout).unwrap(),
             String::from_utf8(stderr).unwrap(),
         )
+    }
+
+    struct TaskListHttpServer {
+        addr: SocketAddr,
+        request: Arc<Mutex<Option<String>>>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl TaskListHttpServer {
+        fn respond_json(body: String) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let request = Arc::new(Mutex::new(None));
+            let thread_request = Arc::clone(&request);
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request_bytes = Vec::new();
+                let mut buffer = [0u8; 512];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request_bytes.extend_from_slice(&buffer[..read]);
+                    if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request_text = String::from_utf8_lossy(&request_bytes).into_owned();
+                thread_request.lock().unwrap().replace(request_text);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            Self {
+                addr,
+                request,
+                handle,
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn request(self) -> String {
+            self.handle.join().unwrap();
+            self.request.lock().unwrap().take().unwrap()
+        }
     }
 
     #[derive(Default)]
@@ -4033,6 +4221,7 @@ mod tests {
     fn sample_task_list_response() -> TaskListResponse {
         TaskListResponse {
             total: 4,
+            aggregate: None,
             tasks: vec![
                 TaskSummary {
                     id: TaskId("task-run".into()),
@@ -4109,6 +4298,66 @@ mod tests {
                     ),
                 },
             ],
+        }
+    }
+
+    fn sample_task_list_aggregate(
+        terminalized: usize,
+        backfilled: usize,
+        embedding_waiting: usize,
+        oldest_embedding_wait_ms: u64,
+        publish_complete_running: usize,
+    ) -> TaskListAggregate {
+        let embedding_reasons = match embedding_waiting {
+            0 => Vec::new(),
+            1 => vec![TaskReasonBucket {
+                reason: "embedding_batch".into(),
+                count: 1,
+            }],
+            count => vec![
+                TaskReasonBucket {
+                    reason: "embedding_batch".into(),
+                    count: 1,
+                },
+                TaskReasonBucket {
+                    reason: "embedding_throughput".into(),
+                    count: count.saturating_sub(1),
+                },
+            ],
+        };
+        let stale_reasons = if publish_complete_running == 0 {
+            Vec::new()
+        } else {
+            vec![TaskReasonBucket {
+                reason: "post_publish_cleanup".into(),
+                count: publish_complete_running,
+            }]
+        };
+        TaskListAggregate {
+            active_total: 4,
+            active_sample_size: 4,
+            active_sample_limit: 100,
+            turnover: TaskQueueTurnover {
+                window: TaskQueueTurnoverWindow {
+                    event_sequence_floor: 7,
+                    event_sequence_ceiling: 42,
+                    event_limit: 1000,
+                },
+                recent_terminalized: terminalized,
+                recent_succeeded: terminalized,
+                recent_failed: 0,
+                recent_cancelled: 0,
+                recent_backfilled: backfilled,
+            },
+            embedding_wait: TaskEmbeddingWaitAggregate {
+                waiting: embedding_waiting,
+                oldest_wait_ms: (oldest_embedding_wait_ms > 0).then_some(oldest_embedding_wait_ms),
+                reason_buckets: embedding_reasons,
+            },
+            stale_running: TaskStaleRunningAggregate {
+                publish_complete_running,
+                reason_buckets: stale_reasons,
+            },
         }
     }
 

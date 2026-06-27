@@ -34,7 +34,9 @@ use verbatim_core::api::{
     IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
     ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
     RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
-    TaskEventsResponse, TaskIngestRequest, TaskListResponse, TaskSummaryResponse, TaskWaitEvent,
+    TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskIngestRequest, TaskListAggregate,
+    TaskListResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
+    TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -112,6 +114,9 @@ const TASK_WAIT_EVENT_BUFFER: usize = 16;
 const TASK_WAIT_EVENT_LIMIT: usize = 100;
 const TASK_LIST_DEFAULT_LIMIT: usize = 20;
 const TASK_LIST_MAX_LIMIT: usize = 100;
+const TASK_QUEUE_TURNOVER_EVENT_LIMIT: usize = 1000;
+const TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT: usize = 100;
+const TASK_QUEUE_REASON_BUCKET_LIMIT: usize = 16;
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FAST_RETRIEVAL_TOP_K: usize = 20;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
@@ -1551,9 +1556,11 @@ async fn list_tasks_handler(
             .into_iter()
             .map(|task| with_queue_details(&store, task))
             .collect::<Result<Vec<_>>>()?;
+        let aggregate = task_list_aggregate(&store)?;
         Ok::<_, anyhow::Error>(TaskListResponse {
             tasks,
             total: page.total,
+            aggregate: Some(aggregate),
         })
     })
     .await
@@ -1566,6 +1573,54 @@ async fn list_tasks_handler(
             err(StatusCode::INTERNAL_SERVER_ERROR, e)
         }
     })
+}
+
+fn task_list_aggregate(store: &Store) -> Result<TaskListAggregate> {
+    let active_sample = store.list_tasks_page(
+        TaskListFilter::Active,
+        TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT,
+    )?;
+    let turnover = store.task_turnover_window(TASK_QUEUE_TURNOVER_EVENT_LIMIT)?;
+    let active_metadata = store.active_task_metadata_aggregate(TASK_QUEUE_REASON_BUCKET_LIMIT)?;
+
+    Ok(TaskListAggregate {
+        active_total: active_sample.total,
+        active_sample_size: active_sample.tasks.len(),
+        active_sample_limit: TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT,
+        turnover: TaskQueueTurnover {
+            window: TaskQueueTurnoverWindow {
+                event_sequence_floor: turnover.event_sequence_floor,
+                event_sequence_ceiling: turnover.event_sequence_ceiling,
+                event_limit: turnover.event_limit,
+            },
+            recent_terminalized: turnover.recent_terminalized(),
+            recent_succeeded: turnover.recent_succeeded,
+            recent_failed: turnover.recent_failed,
+            recent_cancelled: turnover.recent_cancelled,
+            recent_backfilled: turnover.recent_backfilled,
+        },
+        embedding_wait: TaskEmbeddingWaitAggregate {
+            waiting: active_metadata.embedding_waiting,
+            oldest_wait_ms: active_metadata.oldest_embedding_wait_ms,
+            reason_buckets: task_reason_buckets(active_metadata.embedding_reason_buckets),
+        },
+        stale_running: TaskStaleRunningAggregate {
+            publish_complete_running: active_metadata.publish_complete_running,
+            reason_buckets: task_reason_buckets(active_metadata.stale_reason_buckets),
+        },
+    })
+}
+
+fn task_reason_buckets(
+    buckets: Vec<verbatim_core::store::TaskReasonCount>,
+) -> Vec<TaskReasonBucket> {
+    buckets
+        .into_iter()
+        .map(|bucket| TaskReasonBucket {
+            reason: bucket.reason,
+            count: bucket.count,
+        })
+        .collect()
 }
 
 fn task_list_filter(status: Option<&str>) -> Result<TaskListFilter> {
@@ -6513,6 +6568,458 @@ mod tests {
             .all(|task| task.status == TaskStatus::Succeeded));
     }
 
+    #[tokio::test]
+    async fn task_queue_plateau_exposes_completed_work_and_backfill() {
+        let test_dir = TestDir::new("task-queue-plateau");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let first_active = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-active-1"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        let second_active = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-active-2"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        let completed = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-done"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &completed).await.unwrap();
+        finish_task_success(
+            &state,
+            &completed,
+            ingest_result_metadata(1, &EmbeddingCacheStats::default()),
+        )
+        .await
+        .unwrap();
+
+        let Json(response) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("active".into()),
+                limit: Some(20),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.total, 2);
+        assert!(response.tasks.iter().any(|task| task.id == first_active));
+        assert!(response.tasks.iter().any(|task| task.id == second_active));
+        let aggregate = response.aggregate.expect("aggregate metadata is present");
+        assert_eq!(aggregate.active_total, 2);
+        assert_eq!(aggregate.turnover.recent_terminalized, 1);
+        assert_eq!(aggregate.turnover.recent_succeeded, 1);
+        assert_eq!(aggregate.turnover.recent_backfilled, 2);
+        assert!(aggregate.turnover.window.event_sequence_ceiling >= 4);
+    }
+
+    #[tokio::test]
+    async fn publish_complete_running_tasks_expose_stale_reason() {
+        let test_dir = TestDir::new("publish-complete-running-tasks");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-publish"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &task_id).await.unwrap();
+        record_task_progress(
+            &state,
+            &task_id,
+            TaskProgressSnapshot::phase("ingest_index_publishing")
+                .with_counter("sources", 1, Some(1))
+                .with_wait_reason("post_publish_cleanup")
+                .with_recent_status("index publishing complete"),
+        )
+        .await;
+
+        let Json(response) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("active".into()),
+                limit: Some(20),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let aggregate = response.aggregate.expect("aggregate metadata is present");
+        assert_eq!(aggregate.stale_running.publish_complete_running, 1);
+        assert_eq!(
+            aggregate.stale_running.reason_buckets[0].reason,
+            "post_publish_cleanup"
+        );
+        let detail = task_summary_response(&state, task_id).await.unwrap().task;
+        assert_eq!(
+            detail.progress.and_then(|progress| progress.wait_reason),
+            Some("post_publish_cleanup".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_wait_reason_metadata_exposes_counts_age_and_buckets() {
+        let test_dir = TestDir::new("embedding-wait-reason-metadata");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        for (source_id, reason) in [
+            ("src-batch-wait", "embedding_batch"),
+            ("src-throughput-wait", "embedding_throughput"),
+        ] {
+            let task_id = create_persisted_task(
+                &state,
+                TaskKind::Ingest,
+                ingest_task_request_metadata_with_queue_claim(
+                    Some(source_id),
+                    false,
+                    None,
+                    false,
+                    true,
+                ),
+            )
+            .await
+            .unwrap();
+            ensure_task_started(&state, &task_id).await.unwrap();
+            let mut progress = TaskProgressSnapshot::phase("embedding")
+                .with_counter("embedding_vectors", 0, Some(10))
+                .with_wait_reason(reason)
+                .with_recent_status("waiting for embedding batch");
+            if let Some(phase) = &mut progress.phase {
+                phase.started_at = "1".into();
+            }
+            record_task_progress(&state, &task_id, progress).await;
+        }
+
+        let Json(response) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("active".into()),
+                limit: Some(20),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let aggregate = response.aggregate.expect("aggregate metadata is present");
+        assert_eq!(aggregate.embedding_wait.waiting, 2);
+        assert!(aggregate.embedding_wait.oldest_wait_ms.unwrap_or_default() > 60_000);
+        assert!(aggregate
+            .embedding_wait
+            .reason_buckets
+            .iter()
+            .any(|bucket| bucket.reason == "embedding_batch" && bucket.count == 1));
+        assert!(aggregate
+            .embedding_wait
+            .reason_buckets
+            .iter()
+            .any(|bucket| bucket.reason == "embedding_throughput" && bucket.count == 1));
+        assert!(response.tasks.iter().all(|task| task
+            .progress
+            .as_ref()
+            .and_then(|progress| progress.wait_reason.as_ref())
+            .is_some()));
+    }
+
+    #[tokio::test]
+    async fn task_list_aggregate_metadata_counts_waits_beyond_returned_sample() {
+        let test_dir = TestDir::new("task-list-aggregate-beyond-sample");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        for index in 0..(TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT + 5) {
+            create_persisted_task(
+                &state,
+                TaskKind::Ask,
+                ask_request_metadata(
+                    &format!("queued filler question {index}"),
+                    None,
+                    None,
+                    false,
+                    false,
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let embedding_wait = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-wait-beyond-sample"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &embedding_wait).await.unwrap();
+        let mut progress = TaskProgressSnapshot::phase("embedding")
+            .with_counter("embedding_vectors", 0, Some(10))
+            .with_wait_reason("embedding_throughput")
+            .with_recent_status("waiting for embedding model throughput");
+        if let Some(phase) = &mut progress.phase {
+            phase.started_at = "1".into();
+        }
+        record_task_progress(&state, &embedding_wait, progress).await;
+
+        let publish_wait = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-publish-beyond-sample"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &publish_wait).await.unwrap();
+        record_task_progress(
+            &state,
+            &publish_wait,
+            TaskProgressSnapshot::phase("ingest_index_publishing")
+                .with_counter("sources", 1, Some(1))
+                .with_wait_reason("post_publish_cleanup")
+                .with_recent_status("index publishing complete"),
+        )
+        .await;
+
+        let Json(response) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("active".into()),
+                limit: Some(20),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.total, TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT + 7);
+        assert!(!response.tasks.iter().any(|task| task.id == embedding_wait));
+        assert!(!response.tasks.iter().any(|task| task.id == publish_wait));
+        let aggregate = response.aggregate.expect("aggregate metadata is present");
+        assert_eq!(aggregate.embedding_wait.waiting, 1);
+        assert!(aggregate.embedding_wait.oldest_wait_ms.unwrap_or_default() > 60_000);
+        assert_eq!(
+            aggregate.embedding_wait.reason_buckets[0].reason,
+            "embedding_throughput"
+        );
+        assert_eq!(aggregate.stale_running.publish_complete_running, 1);
+        assert_eq!(
+            aggregate.stale_running.reason_buckets[0].reason,
+            "post_publish_cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_queue_turnover_metadata_reports_bounded_event_window() {
+        let test_dir = TestDir::new("active-queue-turnover-metadata");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let active = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-backfilled"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        let completed = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &completed).await.unwrap();
+        finish_task_success(
+            &state,
+            &completed,
+            ask_result_metadata("answer", 0, false, false),
+        )
+        .await
+        .unwrap();
+
+        let Json(response) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("active".into()),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.tasks[0].id, active);
+        let aggregate = response.aggregate.expect("aggregate metadata is present");
+        assert_eq!(
+            aggregate.turnover.window.event_limit,
+            TASK_QUEUE_TURNOVER_EVENT_LIMIT
+        );
+        assert!(
+            aggregate.turnover.window.event_sequence_floor
+                <= aggregate.turnover.window.event_sequence_ceiling
+        );
+        assert_eq!(aggregate.turnover.recent_terminalized, 1);
+        assert_eq!(aggregate.turnover.recent_backfilled, 1);
+    }
+
+    #[tokio::test]
+    async fn plateau_queue_integration_daemon_api_metadata_is_wire_serializable() {
+        let test_dir = TestDir::new("plateau-queue-integration-daemon-api");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let embedding_wait = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-embedding-wait"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &embedding_wait).await.unwrap();
+        record_task_progress(
+            &state,
+            &embedding_wait,
+            TaskProgressSnapshot::phase("embedding")
+                .with_counter("embedding_vectors", 0, Some(10))
+                .with_wait_reason("embedding_batch")
+                .with_recent_status("waiting for embedding batch"),
+        )
+        .await;
+
+        let publish_wait = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some("src-publish-wait"),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &publish_wait).await.unwrap();
+        record_task_progress(
+            &state,
+            &publish_wait,
+            TaskProgressSnapshot::phase("ingest_index_publishing")
+                .with_counter("sources", 1, Some(1))
+                .with_wait_reason("post_publish_cleanup")
+                .with_recent_status("index publishing complete"),
+        )
+        .await;
+
+        let completed = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &completed).await.unwrap();
+        finish_task_success(
+            &state,
+            &completed,
+            ask_result_metadata("answer", 0, false, false),
+        )
+        .await
+        .unwrap();
+
+        let Json(response) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("active".into()),
+                limit: Some(20),
+            }),
+        )
+        .await
+        .unwrap();
+        let wire_json = serde_json::to_string(&response).unwrap();
+        let decoded: TaskListResponse = serde_json::from_str(&wire_json).unwrap();
+
+        assert_eq!(decoded.total, 2);
+        let aggregate = decoded.aggregate.expect("aggregate metadata is present");
+        assert_eq!(aggregate.active_total, 2);
+        assert_eq!(aggregate.turnover.recent_terminalized, 1);
+        assert_eq!(aggregate.turnover.recent_backfilled, 2);
+        assert_eq!(aggregate.embedding_wait.waiting, 1);
+        assert_eq!(
+            aggregate.embedding_wait.reason_buckets[0].reason,
+            "embedding_batch"
+        );
+        assert_eq!(aggregate.stale_running.publish_complete_running, 1);
+        assert_eq!(
+            aggregate.stale_running.reason_buckets[0].reason,
+            "post_publish_cleanup"
+        );
+    }
+
     #[test]
     fn ask_request_defaults_retrieval_debug_off() {
         let req: AskRequest =
@@ -9101,6 +9608,10 @@ mod tests {
             panic!("expected source batch claim");
         };
         assert_eq!(tasks.len(), 2);
+        // The production batch executor holds this lease while finalizing outcomes.
+        // Without it, per-child terminalization can wake abandoned-child recovery
+        // while this fixture is still completing the same started batch.
+        let _worker = acquire_ingest_worker(&state).unwrap();
 
         finish_started_ingest_source_batch_outcomes(
             &state,

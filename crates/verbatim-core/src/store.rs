@@ -50,6 +50,43 @@ pub struct TaskListPage {
     pub total: usize,
 }
 
+/// Bounded queue turnover counts from the most recent task event sequence window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskTurnoverWindow {
+    pub event_sequence_floor: i64,
+    pub event_sequence_ceiling: i64,
+    pub event_limit: usize,
+    pub recent_succeeded: usize,
+    pub recent_failed: usize,
+    pub recent_cancelled: usize,
+    pub recent_backfilled: usize,
+}
+
+impl TaskTurnoverWindow {
+    pub fn recent_terminalized(&self) -> usize {
+        self.recent_succeeded
+            .saturating_add(self.recent_failed)
+            .saturating_add(self.recent_cancelled)
+    }
+}
+
+/// Bounded active-task metadata counts used by task-list plateau diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskActiveMetadataAggregate {
+    pub embedding_waiting: usize,
+    pub oldest_embedding_wait_ms: Option<u64>,
+    pub embedding_reason_buckets: Vec<TaskReasonCount>,
+    pub publish_complete_running: usize,
+    pub stale_reason_buckets: Vec<TaskReasonCount>,
+}
+
+/// Count for one task wait/stale reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskReasonCount {
+    pub reason: String,
+    pub count: usize,
+}
+
 pub struct SourceContentsReplacement<'a> {
     pub source: &'a Source,
     pub evidence: &'a [EvidenceUnit],
@@ -302,6 +339,35 @@ impl Store {
             "progress_json",
             "ALTER TABLE tasks ADD COLUMN progress_json TEXT",
         )?;
+        ensure_column(
+            &self.conn,
+            "tasks",
+            "progress_phase",
+            "ALTER TABLE tasks ADD COLUMN progress_phase TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "tasks",
+            "progress_wait_reason",
+            "ALTER TABLE tasks ADD COLUMN progress_wait_reason TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "tasks",
+            "progress_recent_status",
+            "ALTER TABLE tasks ADD COLUMN progress_recent_status TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "tasks",
+            "progress_phase_started_at",
+            "ALTER TABLE tasks ADD COLUMN progress_phase_started_at TEXT",
+        )?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS tasks_active_progress_metadata_idx
+                ON tasks(status, progress_phase, progress_wait_reason, progress_recent_status, progress_phase_started_at);",
+        )?;
+        backfill_task_progress_metadata(&self.conn)?;
         ensure_column(
             &self.conn,
             "chunks",
@@ -2063,14 +2129,30 @@ impl Store {
         let progress = progress.bounded().with_current_elapsed();
         let progress_json =
             serde_json::to_string(&progress).context("serialize task progress snapshot")?;
+        let progress_phase = progress.phase.as_ref().map(|phase| phase.name.as_str());
+        let progress_phase_started_at = progress
+            .phase
+            .as_ref()
+            .map(|phase| phase.started_at.as_str());
+        let progress_wait_reason = progress.wait_reason.as_deref();
+        let progress_recent_status = progress.recent_status.as_deref();
         let changed = self.conn.execute(
             "UPDATE tasks
-             SET progress_json = ?2, updated_at = ?3
-             WHERE id = ?1 AND status IN (?4, ?5)",
+             SET progress_json = ?2,
+                 updated_at = ?3,
+                 progress_phase = ?4,
+                 progress_wait_reason = ?5,
+                 progress_recent_status = ?6,
+                 progress_phase_started_at = ?7
+             WHERE id = ?1 AND status IN (?8, ?9)",
             params![
                 &task_id.0,
                 progress_json,
                 now,
+                progress_phase,
+                progress_wait_reason,
+                progress_recent_status,
+                progress_phase_started_at,
                 TaskStatus::Queued.as_str(),
                 TaskStatus::Running.as_str(),
             ],
@@ -2201,6 +2283,144 @@ impl Store {
         Ok(TaskListPage { tasks, total })
     }
 
+    pub fn task_turnover_window(&self, limit: usize) -> Result<TaskTurnoverWindow> {
+        let event_limit = limit.max(1);
+        let event_sequence_ceiling =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM task_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+        let event_sequence_floor = event_sequence_ceiling
+            .saturating_sub(sql_limit(event_limit).saturating_sub(1))
+            .max(0);
+        let mut window = TaskTurnoverWindow {
+            event_sequence_floor,
+            event_sequence_ceiling,
+            event_limit,
+            recent_succeeded: 0,
+            recent_failed: 0,
+            recent_cancelled: 0,
+            recent_backfilled: 0,
+        };
+        if event_sequence_ceiling == 0 {
+            return Ok(window);
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT e.event_type, t.status, COUNT(*)
+             FROM task_events e
+             JOIN tasks t ON t.id = e.task_id
+             WHERE e.id >= ?1 AND e.id <= ?2
+             GROUP BY e.event_type, t.status",
+        )?;
+        let rows = stmt.query_map(
+            params![event_sequence_floor, event_sequence_ceiling],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row_usize(row, 2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (event_type, status, count) = row?;
+            match event_type.as_str() {
+                "succeeded" => {
+                    window.recent_succeeded = window.recent_succeeded.saturating_add(count)
+                }
+                "failed" => window.recent_failed = window.recent_failed.saturating_add(count),
+                "cancelled" => {
+                    window.recent_cancelled = window.recent_cancelled.saturating_add(count);
+                }
+                "queued"
+                    if matches!(
+                        TaskStatus::from_store_str(&status),
+                        Some(TaskStatus::Queued | TaskStatus::Running)
+                    ) =>
+                {
+                    window.recent_backfilled = window.recent_backfilled.saturating_add(count);
+                }
+                _ => {}
+            }
+        }
+        Ok(window)
+    }
+
+    pub fn active_task_metadata_aggregate(
+        &self,
+        reason_bucket_limit: usize,
+    ) -> Result<TaskActiveMetadataAggregate> {
+        let reason_bucket_limit = sql_limit(reason_bucket_limit.max(1));
+        let (embedding_waiting, oldest_embedding_started_at) = self.conn.query_row(
+            "SELECT COUNT(*), MIN(progress_phase_started_at)
+             FROM tasks
+             WHERE status IN (?1, ?2)
+               AND progress_phase = 'embedding'
+               AND (progress_wait_reason IS NOT NULL OR progress_recent_status = 'waiting for embedding batch')",
+            params![TaskStatus::Queued.as_str(), TaskStatus::Running.as_str()],
+            |row| Ok((row_usize(row, 0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        let publish_complete_running = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM tasks
+             WHERE status = ?1
+               AND progress_recent_status = 'index publishing complete'",
+            params![TaskStatus::Running.as_str()],
+            |row| row_usize(row, 0),
+        )?;
+        Ok(TaskActiveMetadataAggregate {
+            embedding_waiting,
+            oldest_embedding_wait_ms: oldest_embedding_started_at
+                .as_deref()
+                .and_then(elapsed_ms_since_unix_seconds),
+            embedding_reason_buckets: self
+                .active_embedding_wait_reason_buckets(reason_bucket_limit)?,
+            publish_complete_running,
+            stale_reason_buckets: self
+                .publish_complete_running_reason_buckets(reason_bucket_limit)?,
+        })
+    }
+
+    fn active_embedding_wait_reason_buckets(&self, limit: i64) -> Result<Vec<TaskReasonCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(progress_wait_reason, 'embedding_batch') AS reason, COUNT(*)
+             FROM tasks
+             WHERE status IN (?1, ?2)
+               AND progress_phase = 'embedding'
+               AND (progress_wait_reason IS NOT NULL OR progress_recent_status = 'waiting for embedding batch')
+             GROUP BY reason
+             ORDER BY COUNT(*) DESC, reason
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                TaskStatus::Queued.as_str(),
+                TaskStatus::Running.as_str(),
+                limit
+            ],
+            row_to_reason_count,
+        )?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    fn publish_complete_running_reason_buckets(&self, limit: i64) -> Result<Vec<TaskReasonCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(progress_wait_reason, 'post_publish_follow_up') AS reason, COUNT(*)
+             FROM tasks
+             WHERE status = ?1
+               AND progress_recent_status = 'index publishing complete'
+             GROUP BY reason
+             ORDER BY COUNT(*) DESC, reason
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![TaskStatus::Running.as_str(), limit],
+            row_to_reason_count,
+        )?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
     pub fn queued_task_position(&self, task_id: &TaskId) -> Result<Option<usize>> {
         let task = self
             .conn
@@ -2293,7 +2513,17 @@ impl Store {
         let now = unix_timestamp_string();
         let changed = self.conn.execute(
             "UPDATE tasks
-             SET status = ?2, updated_at = ?3, started_at = NULL, finished_at = NULL, result_json = NULL, error = NULL, progress_json = NULL
+             SET status = ?2,
+                 updated_at = ?3,
+                 started_at = NULL,
+                 finished_at = NULL,
+                 result_json = NULL,
+                 error = NULL,
+                 progress_json = NULL,
+                 progress_phase = NULL,
+                 progress_wait_reason = NULL,
+                 progress_recent_status = NULL,
+                 progress_phase_started_at = NULL
              WHERE id = ?1 AND status = ?4",
             params![
                 &task_id.0,
@@ -2459,6 +2689,13 @@ fn row_to_task_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSummary>
     })
 }
 
+fn row_to_reason_count(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskReasonCount> {
+    Ok(TaskReasonCount {
+        reason: row.get(0)?,
+        count: row_usize(row, 1)?,
+    })
+}
+
 fn row_to_task_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEvent> {
     let payload_json: String = row.get(4)?;
     let payload = serde_json::from_str(&payload_json)
@@ -2497,6 +2734,23 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, alter_sql: &str) 
         }
     }
     conn.execute_batch(alter_sql)?;
+    Ok(())
+}
+
+fn backfill_task_progress_metadata(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks
+         SET progress_phase = json_extract(progress_json, '$.phase.name'),
+             progress_wait_reason = json_extract(progress_json, '$.wait_reason'),
+             progress_recent_status = json_extract(progress_json, '$.recent_status'),
+             progress_phase_started_at = json_extract(progress_json, '$.phase.started_at')
+         WHERE progress_json IS NOT NULL
+           AND progress_phase IS NULL
+           AND progress_wait_reason IS NULL
+           AND progress_recent_status IS NULL
+           AND progress_phase_started_at IS NULL",
+        [],
+    )?;
     Ok(())
 }
 
@@ -3459,6 +3713,21 @@ fn unix_timestamp_string() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
+fn unix_timestamp_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn elapsed_ms_since_unix_seconds(started_at: &str) -> Option<u64> {
+    let started_ms = started_at.parse::<u128>().ok()?.saturating_mul(1000);
+    unix_timestamp_millis()
+        .saturating_sub(started_ms)
+        .try_into()
+        .ok()
+}
+
 fn chunk_type_to_str(ct: &ChunkType) -> &'static str {
     match ct {
         ChunkType::Child => "Child",
@@ -3773,10 +4042,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     request_json TEXT NOT NULL,
     result_json TEXT,
     error TEXT,
-    progress_json TEXT
+    progress_json TEXT,
+    progress_phase TEXT,
+    progress_wait_reason TEXT,
+    progress_recent_status TEXT,
+    progress_phase_started_at TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_status_updated_idx
     ON tasks(status, updated_at);
+CREATE INDEX IF NOT EXISTS tasks_active_progress_metadata_idx
+    ON tasks(status, progress_phase, progress_wait_reason, progress_recent_status, progress_phase_started_at);
 CREATE TABLE IF NOT EXISTS task_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
