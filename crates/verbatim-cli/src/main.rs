@@ -401,7 +401,7 @@ where
         }
         Commands::Config { command } => run_config(command, stdout, client, local),
         Commands::Daemon { command } => run_daemon(command, stdout, client, local),
-        Commands::Task { command } => run_task(command, stdout, client),
+        Commands::Task { command } => run_task(command, stdout, client, local),
     }
 }
 
@@ -688,15 +688,36 @@ where
     }
 }
 
-fn run_task<W, C>(command: TaskCommand, stdout: &mut W, client: &C) -> Result<u8, CliError>
+fn run_task<W, C, L>(
+    command: TaskCommand,
+    stdout: &mut W,
+    client: &C,
+    local: &L,
+) -> Result<u8, CliError>
 where
     W: Write,
     C: DaemonClient,
+    L: LocalActions,
 {
     match command {
-        TaskCommand::List => {
+        TaskCommand::List { details } => {
             let response = client.list_tasks()?;
-            render::write_task_list(stdout, &response)?;
+            let history = local.load_task_list_history().ok().flatten();
+            let update = render::write_task_list(
+                stdout,
+                &response,
+                details,
+                history.as_ref(),
+                local.now_millis(),
+            )?;
+            match update {
+                render::TaskListHistoryUpdate::Store(history) => {
+                    let _ = local.store_task_list_history(&history);
+                }
+                render::TaskListHistoryUpdate::Clear => {
+                    let _ = local.clear_task_list_history();
+                }
+            }
         }
         TaskCommand::Show { task_id } => {
             let response = client.get_task(&task_id)?;
@@ -1068,9 +1089,10 @@ Task ids are returned by --background ingest/reindex/ask commands.
 
 const TASK_LIST_AFTER_HELP: &str = r#"Examples:
   verbatim task list
+  verbatim task list --details
 
-List shows active queued/running tasks with compact progress bars. It is capped
-to the first active tasks so a large ingest backlog stays readable.
+List shows an aggregate active task queue summary by default so a large backlog
+stays readable. Use --details to print the bounded per-task rows.
 "#;
 
 const TASK_SHOW_AFTER_HELP: &str = r#"Examples:
@@ -1653,12 +1675,16 @@ enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
-    /// List active queued/running tasks with compact progress bars.
+    /// List active queued/running tasks with aggregate progress.
     #[command(
-        about = "List active queued/running tasks with progress bars.",
+        about = "List active queued/running tasks with aggregate progress.",
         after_help = TASK_LIST_AFTER_HELP
     )]
-    List,
+    List {
+        /// Show bounded per-task detail rows after the aggregate summary.
+        #[arg(long, alias = "verbose", action = ArgAction::SetTrue)]
+        details: bool,
+    },
     /// Show task summary and phase spans.
     #[command(
         about = "Show task status, progress, result, and spans.",
@@ -2464,12 +2490,30 @@ mod tests {
     }
 
     #[test]
-    fn task_list_renders_active_tasks_with_progress_bars() {
+    fn task_list_defaults_to_aggregate_queue_progress() {
         let (code, stdout, stderr, client, _) = run_mock(["task", "list"]);
 
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
         assert_eq!(client.calls.borrow().as_slice(), ["list_tasks:active"]);
+        assert!(stdout.contains("Task queue:"));
+        assert!(!stdout.contains("Ingest queue:"));
+        assert!(stdout.contains("0/4"));
+        assert!(stdout.contains("0.0%"));
+        assert!(stdout.contains("ETA --"));
+        assert!(stdout.contains("Use `verbatim task list --details`"));
+        assert!(!stdout.contains("task-run"));
+        assert!(!stdout.contains("task-queued"));
+    }
+
+    #[test]
+    fn task_list_details_renders_active_tasks_with_progress_bars() {
+        let (code, stdout, stderr, client, _) = run_mock(["task", "list", "--details"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(client.calls.borrow().as_slice(), ["list_tasks:active"]);
+        assert!(stdout.contains("Task queue:"));
         assert!(stdout.contains("Active tasks:"));
         assert!(stdout.contains("task-run"));
         assert!(stdout.contains("running"));
@@ -2484,6 +2528,135 @@ mod tests {
         assert!(stdout.contains("task-done-counter"));
         assert!(stdout.contains("[####################] 100% (still running)"));
         assert!(stdout.contains("embedding complete"));
+    }
+
+    #[test]
+    fn task_list_aggregate_eta_uses_previous_sample_history() {
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+
+        *local.now_millis.borrow_mut() = 1_000;
+        let mut first = sample_task_list_response();
+        first.total = 10;
+        client.task_list_response.replace(Some(first));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("0/10"));
+        assert!(stdout.contains("ETA --"));
+
+        *local.now_millis.borrow_mut() = 301_000;
+        let mut second = sample_task_list_response();
+        second.total = 5;
+        client.task_list_response.replace(Some(second));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("5/10"));
+        assert!(stdout.contains("50.0%"));
+        assert!(stdout.contains("ETA 5m"));
+
+        let history = local.task_list_history.borrow().clone().unwrap();
+        assert_eq!(history.baseline_total, 10);
+        assert_eq!(history.previous_total, 5);
+        assert_eq!(history.sampled_at_ms, 301_000);
+        assert!(history.sampled_task_ids.contains(&"task-run".into()));
+    }
+
+    #[test]
+    fn task_list_discards_history_when_sampled_task_ids_do_not_overlap() {
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        *local.now_millis.borrow_mut() = 301_000;
+        local
+            .task_list_history
+            .replace(Some(render::TaskListAggregateHistory {
+                baseline_total: 10,
+                previous_total: 8,
+                sampled_at_ms: 1_000,
+                sampled_task_ids: vec!["task-old".into()],
+            }));
+        let mut current_queue = sample_task_list_response();
+        current_queue.total = 5;
+        client.task_list_response.replace(Some(current_queue));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("0/5"));
+        assert!(stdout.contains("ETA --"));
+        let history = local.task_list_history.borrow().clone().unwrap();
+        assert_eq!(history.baseline_total, 5);
+        assert_eq!(history.previous_total, 5);
+        assert_eq!(history.sampled_at_ms, 301_000);
+        assert!(history.sampled_task_ids.contains(&"task-run".into()));
+    }
+
+    #[test]
+    fn task_list_aggregate_history_resets_after_completion() {
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        local
+            .task_list_history
+            .replace(Some(render::TaskListAggregateHistory {
+                baseline_total: 10,
+                previous_total: 1,
+                sampled_at_ms: 301_000,
+                sampled_task_ids: vec!["task-run".into()],
+            }));
+        client.task_list_response.replace(Some(TaskListResponse {
+            total: 0,
+            tasks: Vec::new(),
+        }));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout, "No active tasks.\n");
+        assert!(local.task_list_history.borrow().is_none());
+    }
+
+    #[test]
+    fn task_list_ignores_optional_history_cache_load_and_store_errors() {
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        local.task_list_history_load_error.replace(true);
+        local.task_list_history_store_error.replace(true);
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("Task queue:"));
+        assert_eq!(
+            local.calls.borrow().as_slice(),
+            ["load_task_list_history", "store_task_list_history"]
+        );
+    }
+
+    #[test]
+    fn task_list_ignores_optional_history_cache_clear_errors() {
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        local.task_list_history_clear_error.replace(true);
+        client.task_list_response.replace(Some(TaskListResponse {
+            total: 0,
+            tasks: Vec::new(),
+        }));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(stdout, "No active tasks.\n");
+        assert_eq!(
+            local.calls.borrow().as_slice(),
+            ["load_task_list_history", "clear_task_list_history"]
+        );
     }
 
     #[test]
@@ -3020,6 +3193,25 @@ mod tests {
         )
     }
 
+    fn run_mock_with<I>(
+        args: I,
+        client: &MockDaemonClient,
+        local: &MockLocalActions,
+    ) -> (Result<u8, u8>, String, String)
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = run_with(args, &mut stdout, &mut stderr, client, local);
+        (
+            code,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
     #[derive(Default)]
     struct MockDaemonClient {
         calls: RefCell<Vec<String>>,
@@ -3033,6 +3225,7 @@ mod tests {
         last_watcher_update: RefCell<Option<CollectionWatcherUpdateRequest>>,
         list_error: Option<CliError>,
         health_error: Option<CliError>,
+        task_list_response: RefCell<Option<TaskListResponse>>,
     }
 
     impl DaemonClient for MockDaemonClient {
@@ -3257,7 +3450,11 @@ mod tests {
 
         fn list_tasks(&self) -> client::CliResult<TaskListResponse> {
             self.calls.borrow_mut().push("list_tasks:active".into());
-            Ok(sample_task_list_response())
+            Ok(self
+                .task_list_response
+                .borrow()
+                .clone()
+                .unwrap_or_else(sample_task_list_response))
         }
 
         fn get_task(&self, task_id: &str) -> client::CliResult<TaskSummaryResponse> {
@@ -3364,6 +3561,11 @@ mod tests {
     #[derive(Default)]
     struct MockLocalActions {
         calls: RefCell<Vec<String>>,
+        task_list_history: RefCell<Option<render::TaskListAggregateHistory>>,
+        task_list_history_load_error: RefCell<bool>,
+        task_list_history_store_error: RefCell<bool>,
+        task_list_history_clear_error: RefCell<bool>,
+        now_millis: RefCell<u64>,
     }
 
     impl LocalActions for MockLocalActions {
@@ -3387,6 +3589,47 @@ mod tests {
                 .borrow_mut()
                 .push(format!("daemon_install:{force}"));
             Ok(PathBuf::from("/tmp/verbatim.service"))
+        }
+
+        fn load_task_list_history(
+            &self,
+        ) -> client::CliResult<Option<render::TaskListAggregateHistory>> {
+            self.calls
+                .borrow_mut()
+                .push("load_task_list_history".into());
+            if *self.task_list_history_load_error.borrow() {
+                return Err(CliError::Api("task list history load failed".into()));
+            }
+            Ok(self.task_list_history.borrow().clone())
+        }
+
+        fn store_task_list_history(
+            &self,
+            history: &render::TaskListAggregateHistory,
+        ) -> client::CliResult<()> {
+            self.calls
+                .borrow_mut()
+                .push("store_task_list_history".into());
+            if *self.task_list_history_store_error.borrow() {
+                return Err(CliError::Api("task list history store failed".into()));
+            }
+            self.task_list_history.replace(Some(history.clone()));
+            Ok(())
+        }
+
+        fn clear_task_list_history(&self) -> client::CliResult<()> {
+            self.calls
+                .borrow_mut()
+                .push("clear_task_list_history".into());
+            if *self.task_list_history_clear_error.borrow() {
+                return Err(CliError::Api("task list history clear failed".into()));
+            }
+            self.task_list_history.replace(None);
+            Ok(())
+        }
+
+        fn now_millis(&self) -> u64 {
+            *self.now_millis.borrow()
         }
     }
 

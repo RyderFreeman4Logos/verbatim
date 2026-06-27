@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use verbatim_core::api::{
     AskResponse, CheckStaleResponse, CitationResponse, CollectionFilterResponse,
@@ -12,6 +13,31 @@ use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSy
 use verbatim_core::index_gc::{IndexGcPlanEntry, IndexGcSkippedEntry};
 use verbatim_core::task::{TaskEvent, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary};
 use verbatim_core::types::{BBox, OcrSourceStatus, RetrievalDebug, SourceLocator};
+
+/// Persisted sample used to estimate aggregate task-list progress across CLI calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskListAggregateHistory {
+    /// Highest active-task count observed for the current queue drain.
+    pub baseline_total: usize,
+    /// Active-task count from the previous task-list sample.
+    pub previous_total: usize,
+    /// Millisecond timestamp for the previous task-list sample.
+    pub sampled_at_ms: u64,
+    /// Stable sample of active task IDs used to avoid reusing history across queue drains.
+    #[serde(default)]
+    pub sampled_task_ids: Vec<String>,
+}
+
+const TASK_LIST_HISTORY_SAMPLE_TASKS: usize = 32;
+
+/// Persistence action requested after rendering a task list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskListHistoryUpdate {
+    /// Store the new sample as the next ETA baseline.
+    Store(TaskListAggregateHistory),
+    /// Clear any old sample because no active tasks remain.
+    Clear,
+}
 
 pub fn write_sources<W>(writer: &mut W, sources: &[SourceResponse]) -> std::io::Result<()>
 where
@@ -701,12 +727,28 @@ where
     writeln!(writer, "progress: {}", task_progress_summary(progress))
 }
 
-pub fn write_task_list<W>(writer: &mut W, response: &TaskListResponse) -> std::io::Result<()>
+pub fn write_task_list<W>(
+    writer: &mut W,
+    response: &TaskListResponse,
+    details: bool,
+    history: Option<&TaskListAggregateHistory>,
+    sampled_at_ms: u64,
+) -> std::io::Result<TaskListHistoryUpdate>
 where
     W: Write,
 {
     if response.tasks.is_empty() {
-        return writeln!(writer, "No active tasks.");
+        writeln!(writer, "No active tasks.")?;
+        return Ok(TaskListHistoryUpdate::Clear);
+    }
+    let summary = task_queue_summary(response, history, sampled_at_ms);
+    write_task_queue_summary(writer, &summary)?;
+    if !details {
+        writeln!(
+            writer,
+            "Use `verbatim task list --details` for per-task rows."
+        )?;
+        return Ok(TaskListHistoryUpdate::Store(summary.history));
     }
     writeln!(writer, "Active tasks:")?;
     for task in &response.tasks {
@@ -720,7 +762,128 @@ where
             response.total
         )?;
     }
-    Ok(())
+    Ok(TaskListHistoryUpdate::Store(summary.history))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskQueueSummary {
+    completed: usize,
+    total: usize,
+    percent_tenths: u64,
+    eta_seconds: Option<u64>,
+    history: TaskListAggregateHistory,
+}
+
+fn task_queue_summary(
+    response: &TaskListResponse,
+    history: Option<&TaskListAggregateHistory>,
+    sampled_at_ms: u64,
+) -> TaskQueueSummary {
+    let current_total = response.total.max(response.tasks.len());
+    let sampled_task_ids = sample_task_ids(response);
+    let reusable_history = history.filter(|history| {
+        history.baseline_total >= current_total
+            && history.previous_total >= current_total
+            && history.baseline_total > 0
+            && sampled_task_ids_overlap(history, &sampled_task_ids)
+    });
+    let baseline_total = reusable_history
+        .map(|history| history.baseline_total)
+        .unwrap_or(current_total);
+    let completed = baseline_total.saturating_sub(current_total);
+    let percent_tenths = if baseline_total == 0 {
+        0
+    } else {
+        ((completed as u128 * 1000) / baseline_total as u128) as u64
+    };
+    let eta_seconds = reusable_history.and_then(|history| {
+        if history.previous_total <= current_total || sampled_at_ms <= history.sampled_at_ms {
+            return None;
+        }
+        let completed_since_previous = history.previous_total - current_total;
+        let elapsed_ms = sampled_at_ms - history.sampled_at_ms;
+        if completed_since_previous == 0 || elapsed_ms == 0 {
+            return None;
+        }
+        let numerator = current_total as u128 * elapsed_ms as u128;
+        let denominator = completed_since_previous as u128 * 1000;
+        Some(numerator.div_ceil(denominator) as u64)
+    });
+    TaskQueueSummary {
+        completed,
+        total: baseline_total,
+        percent_tenths,
+        eta_seconds,
+        history: TaskListAggregateHistory {
+            baseline_total,
+            previous_total: current_total,
+            sampled_at_ms,
+            sampled_task_ids,
+        },
+    }
+}
+
+fn sample_task_ids(response: &TaskListResponse) -> Vec<String> {
+    response
+        .tasks
+        .iter()
+        .take(TASK_LIST_HISTORY_SAMPLE_TASKS)
+        .map(|task| task.id.0.clone())
+        .collect()
+}
+
+fn sampled_task_ids_overlap(
+    history: &TaskListAggregateHistory,
+    sampled_task_ids: &[String],
+) -> bool {
+    !history.sampled_task_ids.is_empty()
+        && !sampled_task_ids.is_empty()
+        && sampled_task_ids
+            .iter()
+            .any(|task_id| history.sampled_task_ids.contains(task_id))
+}
+
+fn write_task_queue_summary<W>(writer: &mut W, summary: &TaskQueueSummary) -> std::io::Result<()>
+where
+    W: Write,
+{
+    let percent = summary.percent_tenths as f64 / 10.0;
+    writeln!(
+        writer,
+        "Task queue: {} {}/{} {:.1}% ETA {}",
+        aggregate_progress_bar(percent),
+        summary.completed,
+        summary.total,
+        percent,
+        format_eta(summary.eta_seconds)
+    )
+}
+
+fn format_eta(eta_seconds: Option<u64>) -> String {
+    let Some(seconds) = eta_seconds else {
+        return "--".into();
+    };
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds.div_ceil(60);
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let remainder_minutes = minutes % 60;
+    if remainder_minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {remainder_minutes}m")
+    }
+}
+
+fn aggregate_progress_bar(percent: f64) -> String {
+    let clamped = percent.clamp(0.0, 100.0);
+    let filled = ((clamped / 100.0) * 20.0).floor() as usize;
+    let empty = 20usize.saturating_sub(filled);
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(empty))
 }
 
 pub fn write_task_summary<W>(
