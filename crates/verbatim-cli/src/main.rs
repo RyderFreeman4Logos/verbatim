@@ -107,6 +107,14 @@ fn rerank_override(rerank: bool, no_rerank: bool) -> Option<bool> {
     }
 }
 
+fn ask_context_controls_present(
+    limit: Option<usize>,
+    page_size: Option<usize>,
+    page: Option<usize>,
+) -> bool {
+    limit.is_some() || page_size.is_some() || page.is_some()
+}
+
 fn collection_filter_request(
     collection_names: Vec<String>,
     require_fresh: bool,
@@ -271,6 +279,9 @@ where
             show_retrieval,
             context_only,
             no_generate,
+            limit,
+            page_size,
+            page,
             format,
             background,
         } => {
@@ -290,9 +301,9 @@ where
                     source_id,
                     collection_filter,
                     embedding_profile_id: embedding_profile,
-                    limit: None,
-                    page_size: None,
-                    page: None,
+                    limit,
+                    page_size,
+                    page,
                     fast: false,
                     rerank: None,
                     dense_top_k: None,
@@ -304,6 +315,12 @@ where
                 let response = client.retrieve(&request)?;
                 write_retrieve_with_format(stdout, &response, format)?;
                 return Ok(0);
+            }
+
+            if ask_context_controls_present(limit, page_size, page) {
+                return Err(CliError::Api(
+                    "--limit, --page-size, and --page are only supported with --context-only or --no-generate".into(),
+                ));
             }
 
             if format.is_some() {
@@ -319,6 +336,9 @@ where
                 embedding_profile_id: embedding_profile,
                 show_retrieval,
                 context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
             };
             if background {
                 let response = client.submit_ask_task(&request)?;
@@ -933,13 +953,15 @@ const ASK_AFTER_HELP: &str = r#"Examples:
   verbatim ask "What does the report conclude?"
   verbatim ask --source-id <source-id> --show-retrieval "What supports it?"
   verbatim ask --collection articles "What evidence is relevant?"
-  verbatim ask --context-only "What evidence is relevant?"
+  verbatim ask --context-only --page 2 --page-size 5 "What evidence is relevant?"
   verbatim ask --no-generate --format json "What evidence is relevant?"
 
 Caveats:
   Normal ask invokes the configured chat model after retrieval.
   --context-only and --no-generate return retrieval context without chat
   generation; --background is not supported in that mode.
+  --limit, --page-size, and --page only apply with --context-only or
+  --no-generate.
   --format only applies with --context-only or --no-generate.
 "#;
 
@@ -1236,6 +1258,21 @@ enum Commands {
         /// Alias for --context-only; no chat model is invoked.
         #[arg(long = "no-generate", action = ArgAction::SetTrue)]
         no_generate: bool,
+        /// Maximum evidence/context entries to consider before pagination.
+        ///
+        /// Only applies with --context-only or --no-generate.
+        #[arg(long, value_parser = parse_nonzero_usize)]
+        limit: Option<usize>,
+        /// Evidence/context entries per page. Use 1 for agent-sized pages.
+        ///
+        /// Only applies with --context-only or --no-generate.
+        #[arg(long, value_parser = parse_nonzero_usize)]
+        page_size: Option<usize>,
+        /// 1-based context page number.
+        ///
+        /// Only applies with --context-only or --no-generate.
+        #[arg(long, value_parser = parse_nonzero_usize)]
+        page: Option<usize>,
         /// Context-only output format. JSON includes structured locator/provenance fields.
         #[arg(long, value_enum)]
         format: Option<RetrieveFormat>,
@@ -1964,6 +2001,10 @@ mod tests {
         assert!(ask_help.contains("Normal ask invokes the configured chat model"));
         assert!(ask_help.contains("--context-only"));
         assert!(ask_help.contains("--no-generate"));
+        assert!(ask_help.contains("--limit"));
+        assert!(ask_help.contains("--page-size"));
+        assert!(ask_help.contains("--page"));
+        assert!(ask_help.contains("only apply with --context-only or"));
         assert!(ask_help.contains("--format"));
 
         let (code, retrieve_help, stderr, _, _) = run_mock(["retrieve", "--help"]);
@@ -2354,6 +2395,9 @@ mod tests {
                 embedding_profile_id: None,
                 show_retrieval: false,
                 context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
             }
         );
         assert_eq!(client.calls.borrow().as_slice(), ["submit_ask_task"]);
@@ -2474,6 +2518,9 @@ mod tests {
                 embedding_profile_id: None,
                 show_retrieval: true,
                 context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
             }
         );
         assert!(stdout.contains("Answer [E1]."));
@@ -2669,6 +2716,12 @@ mod tests {
             "ask",
             "--context-only",
             "--show-retrieval",
+            "--page-size",
+            "1",
+            "--page",
+            "2",
+            "--limit",
+            "3",
             "-s",
             "src-1",
             "What",
@@ -2687,9 +2740,9 @@ mod tests {
                 source_id: Some("src-1".into()),
                 collection_filter: CollectionFilterRequest::default(),
                 embedding_profile_id: None,
-                limit: None,
-                page_size: None,
-                page: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(2),
                 fast: false,
                 rerank: None,
                 dense_top_k: None,
@@ -2700,9 +2753,24 @@ mod tests {
             }
         );
         assert!(stdout.contains("Context pack: task-1"));
+        assert!(stdout.contains("page: 2 page_size=1 limit=3"));
         assert!(stdout.contains("snippet: compact cited text"));
         assert!(stdout.contains("Retrieval Debug"));
         assert!(stdout.contains("Final evidence pack:"));
+    }
+
+    #[test]
+    fn ask_generation_rejects_context_pagination_controls() {
+        let (code, stdout, stderr, client, _) =
+            run_mock(["ask", "--page", "2", "What", "is", "cited?"]);
+
+        assert_eq!(code.unwrap_err(), 1);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("--page"));
+        assert!(stderr.contains("--context-only"));
+        assert!(client.calls.borrow().is_empty());
+        assert!(client.last_ask.borrow().is_none());
+        assert!(client.last_retrieve.borrow().is_none());
     }
 
     #[test]
@@ -2712,6 +2780,12 @@ mod tests {
             "--no-generate",
             "--format",
             "json",
+            "--limit",
+            "4",
+            "--page-size",
+            "2",
+            "--page",
+            "3",
             "What",
             "is",
             "cited?",
@@ -2722,6 +2796,9 @@ mod tests {
         assert_eq!(client.calls.borrow().as_slice(), ["retrieve"]);
         let request = client.last_retrieve.borrow();
         let request = request.as_ref().unwrap();
+        assert_eq!(request.limit, Some(4));
+        assert_eq!(request.page_size, Some(2));
+        assert_eq!(request.page, Some(3));
         assert!(request.include_locator);
         assert!(!request.include_debug);
         assert!(stdout.contains("\"results\""));
@@ -2758,6 +2835,9 @@ mod tests {
                 embedding_profile_id: Some("alt".into()),
                 show_retrieval: false,
                 context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
             }
         );
         assert!(stderr.is_empty());
