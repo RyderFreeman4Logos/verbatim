@@ -2413,6 +2413,8 @@ mod tests {
         assert!(stdout.contains("Task: task-1"));
         assert!(stdout.contains("phase=embedding"));
         assert!(stdout.contains("spans:"));
+        assert!(stdout.contains("estimated_logical_write_rows"));
+        assert!(stdout.contains("source_ingest_commit"));
 
         let (code, stdout, _, client, _) = run_mock(["task", "events", "task-1", "--after", "3"]);
         assert_eq!(code.unwrap(), 0);
@@ -3723,14 +3725,31 @@ mod tests {
                         .with_endpoint(TaskEndpointSummary::single_call("embedding", 12)),
                 ),
             },
-            spans: vec![TaskSpan {
-                sequence: 1,
-                task_id: TaskId("task-1".into()),
-                phase: "retrieval".into(),
-                started_at: "1".into(),
-                duration_ms: 7,
-                metadata: serde_json::json!({"result_count": 1}),
-            }],
+            spans: vec![
+                TaskSpan {
+                    sequence: 1,
+                    task_id: TaskId("task-1".into()),
+                    phase: "retrieval".into(),
+                    started_at: "1".into(),
+                    duration_ms: 7,
+                    metadata: serde_json::json!({"result_count": 1}),
+                },
+                TaskSpan {
+                    sequence: 2,
+                    task_id: TaskId("task-1".into()),
+                    phase: "db".into(),
+                    started_at: "1".into(),
+                    duration_ms: 11,
+                    metadata: serde_json::json!({
+                        "operation": "replace_source_contents",
+                        "io": {
+                            "scope": "source_ingest_commit",
+                            "estimated_logical_write_rows": 42,
+                            "logical_rows": { "chunks": 12 },
+                        },
+                    }),
+                },
+            ],
         }
     }
 
