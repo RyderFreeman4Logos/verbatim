@@ -100,6 +100,223 @@ struct PreparedIndexes {
     cache_stats: EmbeddingCacheStats,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct StagedIndexArtifactStats {
+    file_count: u64,
+    hnsw_bytes: u64,
+    total_bytes: u64,
+    manifest_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceCommitIoTelemetry {
+    evidence_count: u64,
+    evidence_text_bytes: u64,
+    chunk_count: u64,
+    child_chunk_count: u64,
+    chunk_text_bytes: u64,
+    context_text_bytes: u64,
+    link_count: u64,
+    image_artifact_count: u64,
+    image_artifact_file_count: u64,
+    image_artifact_bytes: u64,
+    image_artifact_files_written: u64,
+    image_artifact_bytes_written: u64,
+    graph_node_count: u64,
+    graph_edge_count: u64,
+    vector_count: u64,
+    vector_bytes: u64,
+}
+
+struct SourceCommitIoTelemetryInputs<'a> {
+    evidence: &'a [EvidenceUnit],
+    chunks: &'a [Chunk],
+    links: &'a [(ChunkId, EvidenceId)],
+    image_artifacts: &'a PreparedImageArtifacts,
+    graph_nodes: &'a [GraphNode],
+    graph_edges: &'a [GraphEdge],
+    vectors: &'a [VectorDocument],
+    written_image_files: &'a [WrittenImageFile],
+}
+
+impl SourceCommitIoTelemetry {
+    fn new(inputs: SourceCommitIoTelemetryInputs<'_>) -> Self {
+        let SourceCommitIoTelemetryInputs {
+            evidence,
+            chunks,
+            links,
+            image_artifacts,
+            graph_nodes,
+            graph_edges,
+            vectors,
+            written_image_files,
+        } = inputs;
+
+        let evidence_text_bytes = evidence.iter().fold(0_u64, |total, unit| {
+            total.saturating_add(usize_to_u64(unit.text.len()))
+        });
+        let chunk_text_bytes = chunks.iter().fold(0_u64, |total, chunk| {
+            total.saturating_add(usize_to_u64(chunk.text.len()))
+        });
+        let context_text_bytes = chunks.iter().fold(0_u64, |total, chunk| {
+            total.saturating_add(
+                chunk
+                    .context_text
+                    .as_ref()
+                    .map(|text| usize_to_u64(text.len()))
+                    .unwrap_or(0),
+            )
+        });
+        let image_artifact_bytes = image_artifacts.files.iter().fold(0_u64, |total, file| {
+            total.saturating_add(usize_to_u64(file.bytes.len()))
+        });
+        let image_artifact_files_written = written_image_files
+            .iter()
+            .filter(|file| !file.preexisting)
+            .count();
+        let image_artifact_bytes_written =
+            image_artifacts.files.iter().fold(0_u64, |total, file| {
+                let was_written = written_image_files.iter().any(|written| {
+                    !written.preexisting && written.absolute_path == file.absolute_path
+                });
+                if was_written {
+                    total.saturating_add(usize_to_u64(file.bytes.len()))
+                } else {
+                    total
+                }
+            });
+        let vector_bytes = vectors.iter().fold(0_u64, |total, vector| {
+            total.saturating_add(usize_to_u64(
+                vector
+                    .vector
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>()),
+            ))
+        });
+
+        Self {
+            evidence_count: usize_to_u64(evidence.len()),
+            evidence_text_bytes,
+            chunk_count: usize_to_u64(chunks.len()),
+            child_chunk_count: usize_to_u64(
+                chunks
+                    .iter()
+                    .filter(|chunk| chunk.chunk_type == ChunkType::Child)
+                    .count(),
+            ),
+            chunk_text_bytes,
+            context_text_bytes,
+            link_count: usize_to_u64(links.len()),
+            image_artifact_count: usize_to_u64(image_artifacts.artifacts.len()),
+            image_artifact_file_count: usize_to_u64(image_artifacts.files.len()),
+            image_artifact_bytes,
+            image_artifact_files_written: usize_to_u64(image_artifact_files_written),
+            image_artifact_bytes_written,
+            graph_node_count: usize_to_u64(graph_nodes.len()),
+            graph_edge_count: usize_to_u64(graph_edges.len()),
+            vector_count: usize_to_u64(vectors.len()),
+            vector_bytes,
+        }
+    }
+
+    fn db_metadata(
+        &self,
+        source_id: &SourceId,
+        profile_id: &EmbeddingProfileId,
+        generation: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "operation": "replace_source_contents",
+            "source_id": source_id.0.as_str(),
+            "embedding_profile_id": profile_id.as_str(),
+            "index_generation": generation,
+            "io": {
+                "scope": "source_ingest_commit",
+                "storage": "sqlite",
+                "replace_strategy": "delete_insert_source_cascade",
+                "estimated_logical_write_rows": self.estimated_logical_db_rows(),
+                "estimated_logical_payload_bytes": self.estimated_logical_payload_bytes(),
+                "logical_rows": {
+                    "sources": 1_u64,
+                    "evidence_units": self.evidence_count,
+                    "chunks": self.chunk_count,
+                    "child_chunks": self.child_chunk_count,
+                    "chunk_evidence_links": self.link_count,
+                    "image_artifacts": self.image_artifact_count,
+                    "graph_nodes": self.graph_node_count,
+                    "graph_edges": self.graph_edge_count,
+                    "chunk_vectors": self.vector_count,
+                    "source_embedding_statuses": 1_u64,
+                    "index_generation_updates": 1_u64,
+                },
+                "logical_bytes": {
+                    "evidence_text": self.evidence_text_bytes,
+                    "chunk_text": self.chunk_text_bytes,
+                    "chunk_context_text": self.context_text_bytes,
+                    "chunk_vectors": self.vector_bytes,
+                    "image_artifacts_prepared": self.image_artifact_bytes,
+                },
+            },
+        })
+    }
+
+    fn index_publish_metadata(
+        &self,
+        source_id: &SourceId,
+        profile_id: &EmbeddingProfileId,
+        generation: u64,
+        staged: StagedIndexArtifactStats,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "source_id": source_id.0.as_str(),
+            "embedding_profile_id": profile_id.as_str(),
+            "index_generation": generation,
+            "io": {
+                "scope": "source_ingest_index_publish",
+                "storage": "filesystem",
+                "publish_strategy": "stage_then_rename_generation_dir",
+                "staged_artifact_files": staged.file_count,
+                "staged_artifact_bytes": staged.total_bytes,
+                "hnsw_bytes": staged.hnsw_bytes,
+                "manifest_bytes": staged.manifest_bytes,
+                "image_artifact_files_prepared": self.image_artifact_file_count,
+                "image_artifact_files_written": self.image_artifact_files_written,
+                "image_artifact_bytes_prepared": self.image_artifact_bytes,
+                "image_artifact_bytes_written": self.image_artifact_bytes_written,
+                "estimated_logical_write_bytes": staged
+                    .total_bytes
+                    .saturating_add(staged.manifest_bytes)
+                    .saturating_add(self.image_artifact_bytes_written),
+            },
+        })
+    }
+
+    fn estimated_logical_db_rows(&self) -> u64 {
+        1_u64
+            .saturating_add(self.evidence_count)
+            .saturating_add(self.chunk_count)
+            .saturating_add(self.link_count)
+            .saturating_add(self.image_artifact_count)
+            .saturating_add(self.graph_node_count)
+            .saturating_add(self.graph_edge_count)
+            .saturating_add(self.vector_count)
+            .saturating_add(1)
+            .saturating_add(1)
+    }
+
+    fn estimated_logical_payload_bytes(&self) -> u64 {
+        self.evidence_text_bytes
+            .saturating_add(self.chunk_text_bytes)
+            .saturating_add(self.context_text_bytes)
+            .saturating_add(self.vector_bytes)
+            .saturating_add(self.image_artifact_bytes)
+    }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 struct PreparedVectors {
     vectors: Vec<VectorDocument>,
     cache_stats: EmbeddingCacheStats,
@@ -1468,6 +1685,16 @@ where
                     return Err(err);
                 }
             };
+        let io_telemetry = SourceCommitIoTelemetry::new(SourceCommitIoTelemetryInputs {
+            evidence: &evidence,
+            chunks: &chunks,
+            links: &links,
+            image_artifacts: &image_artifacts,
+            graph_nodes: &graph_nodes,
+            graph_edges: &graph_edges,
+            vectors: &prepared.vectors,
+            written_image_files: &written_image_files,
+        });
         let db_phase = PhaseTiming::start("db");
         self.record_task_progress(
             task_id,
@@ -1500,13 +1727,9 @@ where
         self.record_task_phase(
             task_id,
             db_phase,
-            serde_json::json!({
-                "operation": "replace_source_contents",
-                "source_id": source_id.0,
-                "embedding_profile_id": profile_id.as_str(),
-                "index_generation": generation,
-            }),
+            io_telemetry.db_metadata(&source_id, profile_id, generation),
         );
+        let staged_index_stats = staged_index_artifact_stats(&staged, generation);
         let cache_stats = prepared.cache_stats.clone();
         self.record_task_progress(
             task_id,
@@ -1528,11 +1751,12 @@ where
         self.record_task_phase(
             task_id,
             phase,
-            serde_json::json!({
-                "source_id": source_id.0,
-                "embedding_profile_id": profile_id.as_str(),
-                "index_generation": generation,
-            }),
+            io_telemetry.index_publish_metadata(
+                &source_id,
+                profile_id,
+                generation,
+                staged_index_stats,
+            ),
         );
         #[cfg(feature = "qdrant")]
         self.sync_qdrant_source(&source_id).await;
@@ -3047,6 +3271,23 @@ fn stage_prepared_index_artifacts(data_dir: &Path, prepared: &PreparedIndexes) -
     Ok(staging_dir)
 }
 
+fn staged_index_artifact_stats(staging_dir: &Path, generation: u64) -> StagedIndexArtifactStats {
+    let hnsw_bytes = match fs::metadata(staging_dir.join("vectors.hnsw")) {
+        Ok(metadata) => metadata.len(),
+        Err(_) => 0,
+    };
+    let manifest_bytes = match index_manifest_json_bytes(generation) {
+        Ok(bytes) => usize_to_u64(bytes.len()),
+        Err(_) => 0,
+    };
+    StagedIndexArtifactStats {
+        file_count: if hnsw_bytes == 0 { 0 } else { 1 },
+        hnsw_bytes,
+        total_bytes: hnsw_bytes,
+        manifest_bytes,
+    }
+}
+
 fn publish_staged_index_artifacts(
     data_dir: &Path,
     profile_id: &EmbeddingProfileId,
@@ -3112,7 +3353,7 @@ fn write_index_manifest(
 ) -> Result<()> {
     let path = index_manifest_path(data_dir, profile_id);
     let tmp_path = path.with_extension("json.tmp");
-    let data = serde_json::to_vec(&IndexManifest { generation })?;
+    let data = index_manifest_json_bytes(generation)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create index manifest dir: {}", parent.display()))?;
@@ -3127,6 +3368,10 @@ fn write_index_manifest(
         )
     })?;
     Ok(())
+}
+
+fn index_manifest_json_bytes(generation: u64) -> Result<Vec<u8>> {
+    serde_json::to_vec(&IndexManifest { generation }).map_err(Into::into)
 }
 
 fn hnsw_from_vectors(vectors: &[VectorDocument]) -> Result<HnswIndex> {
@@ -4982,6 +5227,86 @@ mod tests {
         assert_eq!(second_id, first_id);
         assert_eq!(sources.len(), 1);
         assert_eq!(stored_source.status, SourceStatus::Indexed);
+    }
+
+    #[tokio::test]
+    async fn ingest_source_records_commit_io_telemetry_spans() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let source_path = tempdir.path().join("io-telemetry.md");
+        fs::write(
+            &source_path,
+            "# I/O telemetry\n\nThis source creates chunks and vectors for ingest telemetry.",
+        )
+        .unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        let task_id = TaskId("task-io-telemetry".into());
+        pipeline
+            .store()
+            .create_task(
+                &task_id,
+                TaskKind::Ingest,
+                &serde_json::json!({ "source_id": source_id.0 }),
+            )
+            .unwrap();
+        pipeline.store().start_task(&task_id).unwrap();
+
+        pipeline
+            .ingest_source_with_task(&source_id, &task_id)
+            .await
+            .unwrap();
+
+        let spans = pipeline.store().list_task_spans(&task_id).unwrap();
+        let db_span = spans
+            .iter()
+            .find(|span| span.phase == "db")
+            .expect("ingest should record db span");
+        assert_eq!(db_span.metadata["operation"], "replace_source_contents");
+        assert_eq!(db_span.metadata["io"]["scope"], "source_ingest_commit");
+        assert_eq!(db_span.metadata["io"]["storage"], "sqlite");
+        assert_eq!(db_span.metadata["io"]["logical_rows"]["sources"], 1);
+        assert!(
+            db_span.metadata["io"]["logical_rows"]["chunks"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(
+            db_span.metadata["io"]["estimated_logical_write_rows"]
+                .as_u64()
+                .unwrap_or_default()
+                >= db_span.metadata["io"]["logical_rows"]["chunks"]
+                    .as_u64()
+                    .unwrap_or_default()
+        );
+
+        let publish_span = spans
+            .iter()
+            .find(|span| span.phase == "ingest_index_publishing")
+            .expect("ingest should record index publishing span");
+        assert_eq!(
+            publish_span.metadata["io"]["scope"],
+            "source_ingest_index_publish"
+        );
+        assert_eq!(publish_span.metadata["io"]["storage"], "filesystem");
+        assert!(
+            publish_span.metadata["io"]["staged_artifact_bytes"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(
+            publish_span.metadata["io"]["manifest_bytes"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
     }
 
     #[tokio::test]
