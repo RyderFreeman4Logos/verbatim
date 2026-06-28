@@ -511,6 +511,7 @@ mod tests {
             previous_total: 100,
             sampled_at_ms: 42,
             sampled_task_ids: vec!["task-current".into()],
+            completed: 20,
         };
 
         RealLocalActions.store_task_list_history(&history).unwrap();

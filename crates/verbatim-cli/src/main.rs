@@ -2600,6 +2600,7 @@ mod tests {
                 previous_total: 842,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: (0..32).map(|index| format!("old-task-{index}")).collect(),
+                completed: 0,
             }));
         let mut current_queue = sample_task_list_response();
         current_queue.total = 650;
@@ -2633,6 +2634,7 @@ mod tests {
                 previous_total: 5,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-old".into()],
+                completed: 0,
             }));
         let mut current_queue = sample_task_list_response();
         current_queue.total = 5;
@@ -2666,6 +2668,7 @@ mod tests {
                 previous_total: 1,
                 sampled_at_ms: 301_000,
                 sampled_task_ids: vec!["task-run".into()],
+                completed: 0,
             }));
         client.task_list_response.replace(Some(TaskListResponse {
             total: 0,
@@ -2693,6 +2696,7 @@ mod tests {
                 previous_total: 4,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-run".into()],
+                completed: 0,
             }));
         let mut response = sample_task_list_response();
         response.aggregate = Some(sample_task_list_aggregate(3, 3, 2, 125_000, 1));
@@ -2720,6 +2724,7 @@ mod tests {
                 previous_total: 4,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-run".into()],
+                completed: 0,
             }));
         let mut response = sample_task_list_response();
         response.aggregate = Some(sample_task_list_aggregate(0, 0, 0, 0, 0));
@@ -2742,6 +2747,7 @@ mod tests {
                 previous_total: 4,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-run".into()],
+                completed: 0,
             }));
         client
             .task_list_response
@@ -2767,6 +2773,7 @@ mod tests {
                 previous_total: 4,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-run".into()],
+                completed: 0,
             }));
         let mut daemon_response = sample_task_list_response();
         daemon_response.aggregate = Some(sample_task_list_aggregate(1, 1, 1, 65_000, 1));

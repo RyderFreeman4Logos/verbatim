@@ -26,6 +26,11 @@ pub struct TaskListAggregateHistory {
     /// Stable sample of active task IDs used to avoid reusing history across queue drains.
     #[serde(default)]
     pub sampled_task_ids: Vec<String>,
+    /// Completed-task count at the previous sample (`baseline_total - previous_total`).
+    /// Used as a fallback ETA throughput signal when the watcher backfills new tasks
+    /// and the active total does not shrink between samples.
+    #[serde(default)]
+    pub completed: usize,
 }
 
 const TASK_LIST_HISTORY_SAMPLE_TASKS: usize = 32;
@@ -784,10 +789,10 @@ fn task_queue_summary(
     let sampled_task_ids = sample_task_ids(response);
     let reusable_history = history.filter(|history| {
         history.baseline_total >= current_total
-            && history.previous_total >= current_total
             && history.baseline_total > 0
             && (history.previous_total > current_total
-                || sampled_task_ids_overlap(history, &sampled_task_ids))
+                || sampled_task_ids_overlap(history, &sampled_task_ids)
+                || history.completed > 0)
     });
     let baseline_total = reusable_history
         .map(|history| history.baseline_total)
@@ -799,16 +804,30 @@ fn task_queue_summary(
         ((completed as u128 * 1000) / baseline_total as u128) as u64
     };
     let eta_seconds = reusable_history.and_then(|history| {
-        if history.previous_total <= current_total || sampled_at_ms <= history.sampled_at_ms {
+        if sampled_at_ms <= history.sampled_at_ms {
             return None;
         }
-        let completed_since_previous = history.previous_total - current_total;
         let elapsed_ms = sampled_at_ms - history.sampled_at_ms;
-        if completed_since_previous == 0 || elapsed_ms == 0 {
+        if elapsed_ms == 0 {
+            return None;
+        }
+        // Prefer the absolute completion delta when the queue shrank
+        // between samples (the original, most reliable path).
+        if history.previous_total > current_total {
+            let completed_since_previous = history.previous_total - current_total;
+            let numerator = current_total as u128 * elapsed_ms as u128;
+            let denominator = completed_since_previous as u128 * 1000;
+            return Some(numerator.div_ceil(denominator) as u64);
+        }
+        // Fallback: the queue did not shrink between samples (new tasks were
+        // backfilled by the watcher), but we know the baseline completion count
+        // advanced.  Estimate throughput from the completion-count delta.
+        let completion_delta = completed.saturating_sub(history.completed);
+        if completion_delta == 0 {
             return None;
         }
         let numerator = current_total as u128 * elapsed_ms as u128;
-        let denominator = completed_since_previous as u128 * 1000;
+        let denominator = completion_delta as u128 * 1000;
         Some(numerator.div_ceil(denominator) as u64)
     });
     let reusable_active_total_unchanged = reusable_history.is_some_and(|history| {
@@ -837,6 +856,7 @@ fn task_queue_summary(
             previous_total: current_total,
             sampled_at_ms,
             sampled_task_ids,
+            completed,
         },
     }
 }
