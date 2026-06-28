@@ -3678,7 +3678,7 @@ where
         let prepared = self
             .prepare_vectors_for_chunks(profile_id, child_chunks)
             .await?;
-        let hnsw = hnsw_from_vectors(&prepared.vectors)?;
+        let hnsw = hnsw_from_vectors(prepared.vectors.clone())?;
 
         Ok(PreparedIndexes {
             hnsw,
@@ -3934,7 +3934,7 @@ where
             .filter(|document| document.source_id != *source_id)
             .collect::<Vec<_>>();
         all_vectors.extend(source_vectors.clone());
-        let hnsw = hnsw_from_vectors(&all_vectors)?;
+        let hnsw = hnsw_from_vectors(all_vectors)?;
         Ok(PreparedIndexes {
             hnsw,
             vectors: source_vectors,
@@ -3946,7 +3946,7 @@ where
         &self,
         vectors: Vec<VectorDocument>,
     ) -> Result<PreparedIndexes> {
-        let hnsw = hnsw_from_vectors(&vectors)?;
+        let hnsw = hnsw_from_vectors(vectors.clone())?;
         Ok(PreparedIndexes {
             hnsw,
             vectors,
@@ -4520,11 +4520,9 @@ fn index_manifest_json_bytes(generation: u64) -> Result<Vec<u8>> {
     serde_json::to_vec(&IndexManifest { generation }).map_err(Into::into)
 }
 
-fn hnsw_from_vectors(vectors: &[VectorDocument]) -> Result<HnswIndex> {
+fn hnsw_from_vectors(vectors: Vec<VectorDocument>) -> Result<HnswIndex> {
     let mut hnsw = HnswIndex::new();
-    for vector in vectors {
-        hnsw.upsert(vector.clone());
-    }
+    hnsw.replace_all(vectors);
     hnsw.build()?;
     Ok(hnsw)
 }
