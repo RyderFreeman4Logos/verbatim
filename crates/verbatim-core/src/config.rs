@@ -56,6 +56,7 @@ pub const DEFAULT_MODEL_RETRY_INITIAL_BACKOFF_MILLIS: u64 = 500;
 pub const DEFAULT_MODEL_RETRY_MAX_BACKOFF_MILLIS: u64 = 5_000;
 pub const DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS: u64 = 60;
 pub const DEFAULT_RESOURCE_QUEUE_TIMEOUT_SECONDS: u64 = 300;
+pub const SQLITE_WRITER_ACTIVE_CAPACITY: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelEndpointRuntimeConfig {
@@ -1060,7 +1061,7 @@ impl Default for DaemonConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonResourceConfig {
-    #[serde(default = "default_sqlite_writer_concurrency")]
+    #[serde(default = "default_sqlite_writer_concurrency", skip_serializing)]
     pub sqlite_writer_concurrency: usize,
     #[serde(default = "default_sqlite_writer_queue_capacity")]
     pub sqlite_writer_queue_capacity: usize,
@@ -1117,7 +1118,7 @@ impl Default for DaemonResourceConfig {
 impl DaemonResourceConfig {
     pub fn bounded(&self) -> Self {
         Self {
-            sqlite_writer_concurrency: self.sqlite_writer_concurrency.max(1),
+            sqlite_writer_concurrency: SQLITE_WRITER_ACTIVE_CAPACITY,
             sqlite_writer_queue_capacity: self.sqlite_writer_queue_capacity.max(1),
             sqlite_writer_queue_timeout_seconds: self.sqlite_writer_queue_timeout_seconds.max(1),
             sqlite_reader_concurrency: self.sqlite_reader_concurrency.max(1),
@@ -2224,6 +2225,27 @@ model_supports_vision = true
         let config: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
         let serialized = config.show().unwrap();
         let _reparsed: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    #[test]
+    fn sqlite_writer_concurrency_is_single_writer_and_not_rendered() {
+        let mut config = Config::default();
+        config.daemon.resources.sqlite_writer_concurrency = 32;
+        config.daemon.resources.sqlite_writer_queue_capacity = 7;
+        config.daemon.resources.sqlite_writer_queue_timeout_seconds = 11;
+
+        let bounded = config.daemon.resources.bounded();
+        assert_eq!(
+            bounded.sqlite_writer_concurrency,
+            SQLITE_WRITER_ACTIVE_CAPACITY
+        );
+        assert_eq!(bounded.sqlite_writer_queue_capacity, 7);
+        assert_eq!(bounded.sqlite_writer_queue_timeout_seconds, 11);
+
+        let rendered = config.show().unwrap();
+        assert!(!rendered.contains("sqlite_writer_concurrency"));
+        assert!(rendered.contains("sqlite_writer_queue_capacity = 7"));
+        assert!(rendered.contains("sqlite_writer_queue_timeout_seconds = 11"));
     }
 
     #[test]

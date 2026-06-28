@@ -44,7 +44,7 @@ use verbatim_core::collection::{
 };
 use verbatim_core::config::{
     self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, DaemonResourceConfig,
-    RerankConfig, RerankStrategy, RetrievalConfig,
+    RerankConfig, RerankStrategy, RetrievalConfig, SQLITE_WRITER_ACTIVE_CAPACITY,
 };
 use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::{
@@ -204,11 +204,7 @@ fn daemon_resources(config: &DaemonResourceConfig) -> DaemonResources {
         sqlite_writer: registry.resource(
             "sqlite_writer",
             "sqlite_write",
-            resource_limits(
-                config.sqlite_writer_concurrency,
-                config.sqlite_writer_queue_capacity,
-                config.sqlite_writer_queue_timeout_seconds,
-            ),
+            sqlite_writer_resource_limits(&config),
         ),
         sqlite_reader: registry.resource(
             "sqlite_reader",
@@ -253,11 +249,9 @@ fn daemon_resources(config: &DaemonResourceConfig) -> DaemonResources {
 
 fn configure_daemon_resources(resources: &DaemonResources, config: &DaemonResourceConfig) {
     let config = config.bounded();
-    resources.sqlite_writer.configure(resource_limits(
-        config.sqlite_writer_concurrency,
-        config.sqlite_writer_queue_capacity,
-        config.sqlite_writer_queue_timeout_seconds,
-    ));
+    resources
+        .sqlite_writer
+        .configure(sqlite_writer_resource_limits(&config));
     resources.sqlite_reader.configure(resource_limits(
         config.sqlite_reader_concurrency,
         config.sqlite_reader_queue_capacity,
@@ -291,6 +285,14 @@ fn resource_limits(
         queue_timeout: Duration::from_secs(queue_timeout_seconds),
     }
     .bounded()
+}
+
+fn sqlite_writer_resource_limits(config: &DaemonResourceConfig) -> ResourceLimitConfig {
+    resource_limits(
+        SQLITE_WRITER_ACTIVE_CAPACITY,
+        config.sqlite_writer_queue_capacity,
+        config.sqlite_writer_queue_timeout_seconds,
+    )
 }
 
 fn daemon_resource_snapshots(state: &SharedState) -> Vec<ResourceQueueSnapshot> {
@@ -6669,6 +6671,20 @@ mod tests {
         assert!(stdout.is_empty());
     }
 
+    #[test]
+    fn sqlite_writer_resource_limits_keep_single_active_writer() {
+        let mut config = DaemonResourceConfig::default();
+        config.sqlite_writer_concurrency = 32;
+        config.sqlite_writer_queue_capacity = 7;
+        config.sqlite_writer_queue_timeout_seconds = 11;
+
+        let limits = sqlite_writer_resource_limits(&config.bounded());
+
+        assert_eq!(limits.capacity, SQLITE_WRITER_ACTIVE_CAPACITY);
+        assert_eq!(limits.queue_capacity, 7);
+        assert_eq!(limits.queue_timeout, Duration::from_secs(11));
+    }
+
     #[tokio::test]
     async fn config_reload_applies_safe_changes_and_reports_metadata() {
         let test_dir = TestDir::new("config-reload-safe");
@@ -7267,6 +7283,10 @@ mod tests {
         let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
         config.daemon.resources.sqlite_writer_concurrency = 32;
         config.daemon.resources.sqlite_reader_concurrency = 32;
+        assert_eq!(
+            sqlite_writer_resource_limits(&config.daemon.resources.bounded()).capacity,
+            SQLITE_WRITER_ACTIVE_CAPACITY
+        );
         let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
         let state = test_state(config, test_dir.path(), pipeline);
         let task_id = create_persisted_task(
@@ -7298,6 +7318,7 @@ mod tests {
             .iter()
             .find(|resource| resource.name == "sqlite_writer")
             .expect("sqlite writer resource is reported");
+        assert_eq!(writer.capacity, SQLITE_WRITER_ACTIVE_CAPACITY);
         assert!(writer.active >= 1);
         let reader = health
             .resources
