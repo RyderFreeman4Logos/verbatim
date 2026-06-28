@@ -1610,12 +1610,47 @@ fn public_task_progress(
     progress: TaskProgressSnapshot,
     redaction: &TaskTelemetryRedaction,
 ) -> TaskProgressSnapshot {
-    let bounded = progress.bounded().with_current_elapsed();
-    let Ok(value) = serde_json::to_value(&bounded) else {
-        return TaskProgressSnapshot::default();
-    };
-    let redacted = public_task_telemetry_value(value, redaction);
-    serde_json::from_value(redacted).unwrap_or_default()
+    let mut progress = progress.bounded().with_current_elapsed();
+    if let Some(phase) = &mut progress.phase {
+        phase.name = public_task_progress_text(&phase.name, redaction);
+    }
+    for counter in &mut progress.counters {
+        counter.name = public_task_progress_text(&counter.name, redaction);
+    }
+    for endpoint in &mut progress.endpoints {
+        endpoint.name = public_task_progress_text(&endpoint.name, redaction);
+        endpoint.latest_error = endpoint
+            .latest_error
+            .as_deref()
+            .map(|error| public_task_progress_text(error, redaction));
+    }
+    if let Some(queue) = &mut progress.queue {
+        queue.active_worker_kind = queue
+            .active_worker_kind
+            .as_deref()
+            .map(|worker| public_task_progress_text(worker, redaction));
+        queue.blocking_reason = queue
+            .blocking_reason
+            .as_deref()
+            .map(|reason| public_task_progress_text(reason, redaction));
+    }
+    progress.active_worker_kind = progress
+        .active_worker_kind
+        .as_deref()
+        .map(|worker| public_task_progress_text(worker, redaction));
+    progress.wait_reason = progress
+        .wait_reason
+        .as_deref()
+        .map(|reason| public_task_progress_text(reason, redaction));
+    progress.recent_status = progress
+        .recent_status
+        .as_deref()
+        .map(|status| public_task_progress_text(status, redaction));
+    progress
+}
+
+fn public_task_progress_text(text: &str, redaction: &TaskTelemetryRedaction) -> String {
+    redact_task_telemetry_text(&sanitize_text(text), redaction)
 }
 
 fn task_private_source_id(task: &TaskSummary) -> Option<String> {
