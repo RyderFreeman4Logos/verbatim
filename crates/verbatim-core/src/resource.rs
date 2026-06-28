@@ -231,6 +231,16 @@ impl ObservableResource {
     }
 
     pub async fn acquire(self: &Arc<Self>) -> Result<ResourcePermit, ResourceQueueError> {
+        self.acquire_with_before_wait(|| {}).await
+    }
+
+    async fn acquire_with_before_wait<F>(
+        self: &Arc<Self>,
+        mut before_wait: F,
+    ) -> Result<ResourcePermit, ResourceQueueError>
+    where
+        F: FnMut(),
+    {
         let timeout = {
             let state = lock_unpoisoned(&self.state);
             state.queue_timeout
@@ -240,6 +250,8 @@ impl ObservableResource {
             let mut waiter = QueuedWaiter::new(Arc::clone(self));
             loop {
                 let notified = self.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 {
                     let mut state = lock_unpoisoned(&self.state);
                     if waiter.can_admit(&state) {
@@ -265,6 +277,7 @@ impl ObservableResource {
                         waiter.enqueue(&mut state);
                     }
                 }
+                before_wait();
                 notified.await;
             }
         })
@@ -751,6 +764,50 @@ mod tests {
         assert_eq!(completed_snapshot.queued, 0);
         assert_eq!(completed_snapshot.completed, 2);
         assert_eq!(completed_snapshot.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn async_acquire_observes_release_after_enqueue_before_wait() {
+        let resource = Arc::new(ObservableResource::new(
+            "lost_wake_resource",
+            "test_kind",
+            ResourceLimitConfig {
+                capacity: 1,
+                queue_capacity: 1,
+                queue_timeout: Duration::from_secs(5),
+            },
+        ));
+
+        let first = resource.acquire().await.expect("first permit");
+        let first = Arc::new(Mutex::new(Some(first)));
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter_resource = Arc::clone(&resource);
+        let first_for_waiter = Arc::clone(&first);
+        let released_for_waiter = Arc::clone(&released);
+
+        let waiter = tokio::spawn(async move {
+            waiter_resource
+                .acquire_with_before_wait(|| {
+                    if released_for_waiter.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    drop(first_for_waiter.lock().unwrap().take());
+                })
+                .await
+        });
+
+        let second = tokio::time::timeout(Duration::from_millis(250), waiter)
+            .await
+            .expect("front waiter wakes promptly after release")
+            .expect("waiter task joins")
+            .expect("waiter acquires without timing out");
+
+        assert!(released.load(Ordering::SeqCst));
+        let snapshot = resource.snapshot();
+        assert_eq!(snapshot.active, 1);
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.errors, 0);
+        drop(second);
     }
 
     #[test]

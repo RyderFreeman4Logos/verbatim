@@ -23,6 +23,7 @@ use crate::traits::{
     EmbeddingEndpointCapabilities, RerankCapabilityDiagnostics, RerankCapabilityState,
     RerankDiagnostics, RerankError, RerankRequestDiagnostics, RerankResponse,
 };
+use crate::types::hex_sha256;
 use crate::upstream::{
     capture_full_response, capture_response_prefix, sanitize_text, UpstreamRequestContext,
     DEFAULT_BODY_PREFIX_MAX_BYTES,
@@ -1461,10 +1462,10 @@ fn endpoint_resource_config(config: &ModelEndpointRuntimeConfig) -> ResourceLimi
 }
 
 fn endpoint_resource_name(base_url: &str, model: &str, capability: &'static str) -> String {
-    format!(
-        "model_endpoint:{capability}:{}:{model}",
-        normalized_endpoint_key(base_url)
-    )
+    let endpoint = normalized_endpoint_key(base_url);
+    let model = model.to_ascii_lowercase();
+    let fingerprint = hex_sha256(format!("{endpoint}\0{model}\0{capability}").as_bytes());
+    format!("model_endpoint:{capability}:{}", &fingerprint[..16])
 }
 
 fn provider_queue_error(operation: &'static str, error: ResourceQueueError) -> ProviderError {
@@ -2121,6 +2122,30 @@ mod tests {
         assert_eq!(left, same);
         assert_ne!(left, other_model);
         assert_ne!(left, other_capability);
+    }
+
+    #[test]
+    fn endpoint_resource_name_uses_stable_redacted_fingerprint() {
+        let name = endpoint_resource_name(
+            "HTTP://LOCALHOST:8080/v1/",
+            "Secret-Embedding-Model",
+            "embedding",
+        );
+        let same = endpoint_resource_name(
+            "http://localhost:8080/v1",
+            "secret-embedding-model",
+            "embedding",
+        );
+        let other_model =
+            endpoint_resource_name("http://localhost:8080/v1", "other-model", "embedding");
+
+        assert_eq!(name, same);
+        assert_ne!(name, other_model);
+        assert!(name.starts_with("model_endpoint:embedding:"));
+        assert!(!name.contains("localhost"));
+        assert!(!name.contains("8080"));
+        assert!(!name.contains("Secret-Embedding-Model"));
+        assert!(!name.contains("secret-embedding-model"));
     }
 
     fn embedding_model_with_runtime(

@@ -805,14 +805,18 @@ async fn index_gc(
 async fn index_status(
     State(state): State<SharedState>,
 ) -> Result<Json<IndexStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let handle = tokio::runtime::Handle::current();
-    let state_for_cache = Arc::clone(&state);
-    match with_exclusive_pipeline(&state, move |pipeline| {
-        refresh_embedding_profile_capabilities_blocking(&handle, pipeline)?;
-        pipeline.index_status()
-    })
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
+    refresh_live_embedding_profile_capabilities(
+        &state,
+        config.embedding.enabled,
+        &config.embedding.profile_id,
+    )
     .await
-    {
+    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let state_for_cache = Arc::clone(&state);
+    match with_exclusive_pipeline(&state, move |pipeline| pipeline.index_status()).await {
         Ok(response) => {
             update_index_status_cache(&state_for_cache, &response)
                 .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
@@ -1031,9 +1035,17 @@ fn is_source_not_found_error(source_id: &str, error: &anyhow::Error) -> bool {
 async fn check_stale(
     State(state): State<SharedState>,
 ) -> Result<Json<CheckStaleResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let handle = tokio::runtime::Handle::current();
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
+    refresh_live_embedding_profile_capabilities(
+        &state,
+        config.embedding.enabled,
+        &config.embedding.profile_id,
+    )
+    .await
+    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let (ids, profile_status) = with_exclusive_pipeline(&state, move |pipeline| {
-        refresh_embedding_profile_capabilities_blocking(&handle, pipeline)?;
         let ids = pipeline.check_stale()?;
         let profile_status = pipeline.index_status()?;
         Ok::<_, anyhow::Error>((ids, profile_status))
@@ -1362,10 +1374,17 @@ async fn background_ingest_batch_source_ids(
     force: bool,
     vectors_only: bool,
 ) -> Result<Vec<SourceId>> {
-    let handle = tokio::runtime::Handle::current();
+    if !force && !vectors_only {
+        let config = runtime_config_snapshot(state)?.config;
+        refresh_live_embedding_profile_capabilities(
+            state,
+            config.embedding.enabled,
+            &config.embedding.profile_id,
+        )
+        .await?;
+    }
     with_exclusive_pipeline(state, move |pipeline| {
         if !force && !vectors_only {
-            refresh_embedding_profile_capabilities_blocking(&handle, pipeline)?;
             pipeline.check_stale()?;
         }
         let sources = pipeline.store().list_sources()?;
@@ -5047,33 +5066,29 @@ fn parse_embedding_profile_id(
         .map_err(Into::into)
 }
 
-fn refresh_embedding_profile_capabilities_blocking(
-    runtime: &tokio::runtime::Handle,
-    pipeline: &mut IngestPipeline,
-) -> Result<()> {
-    runtime.block_on(pipeline.refresh_embedding_profile_capabilities())?;
-    Ok(())
-}
-
 async fn refresh_query_embedding_profile_capabilities(
     state: &SharedState,
     embedding_enabled: bool,
     embedding_profile_id: &EmbeddingProfileId,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    refresh_live_embedding_profile_capabilities(state, embedding_enabled, embedding_profile_id)
+        .await
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+async fn refresh_live_embedding_profile_capabilities(
+    state: &SharedState,
+    embedding_enabled: bool,
+    embedding_profile_id: &EmbeddingProfileId,
+) -> Result<()> {
     if !embedding_enabled {
         return Ok(());
     }
-    let config = runtime_config_snapshot(state)
-        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
-        .config;
+    let config = runtime_config_snapshot(state)?.config;
     let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
-    let capabilities = embed_client
-        .endpoint_capabilities()
-        .await
-        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let capabilities = embed_client.endpoint_capabilities().await?;
     apply_query_embedding_profile_capabilities(state, capabilities, embedding_profile_id.clone())
         .await
-        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))
 }
 
 async fn apply_query_embedding_profile_capabilities(
@@ -7862,6 +7877,101 @@ mod tests {
             .expect("query capability refresh completes after discovery release")
             .expect("query capability refresh task joins")
             .expect("query capability refresh succeeds");
+    }
+
+    #[tokio::test]
+    async fn index_status_capability_wait_does_not_hold_pipeline_slot() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("index-status-capability-wait-releases-pipeline");
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let before_model_requests = model_server.model_requests();
+        model_server.block_models();
+
+        let status_state = Arc::clone(&state);
+        let status_task = tokio::spawn(async move { index_status(State(status_state)).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model_server.model_requests() <= before_model_requests {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("index status reached blocked capability discovery");
+
+        assert_exclusive_pipeline_available(&state).await;
+
+        model_server.release_models();
+        let _response = tokio::time::timeout(Duration::from_secs(5), status_task)
+            .await
+            .expect("index status completes after discovery release")
+            .expect("index status task joins")
+            .expect("index status succeeds");
+    }
+
+    #[tokio::test]
+    async fn check_stale_capability_wait_does_not_hold_pipeline_slot() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("check-stale-capability-wait-releases-pipeline");
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let before_model_requests = model_server.model_requests();
+        model_server.block_models();
+
+        let check_state = Arc::clone(&state);
+        let check_task = tokio::spawn(async move { check_stale(State(check_state)).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model_server.model_requests() <= before_model_requests {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("check stale reached blocked capability discovery");
+
+        assert_exclusive_pipeline_available(&state).await;
+
+        model_server.release_models();
+        let _response = tokio::time::timeout(Duration::from_secs(5), check_task)
+            .await
+            .expect("check stale completes after discovery release")
+            .expect("check stale task joins")
+            .expect("check stale succeeds");
+    }
+
+    #[tokio::test]
+    async fn batch_source_selection_capability_wait_does_not_hold_pipeline_slot() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("batch-selection-capability-wait-releases-pipeline");
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let before_model_requests = model_server.model_requests();
+        model_server.block_models();
+
+        let select_state = Arc::clone(&state);
+        let select_task = tokio::spawn(async move {
+            background_ingest_batch_source_ids(&select_state, false, false).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model_server.model_requests() <= before_model_requests {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("batch source selection reached blocked capability discovery");
+
+        assert_exclusive_pipeline_available(&state).await;
+
+        model_server.release_models();
+        tokio::time::timeout(Duration::from_secs(5), select_task)
+            .await
+            .expect("batch source selection completes after discovery release")
+            .expect("batch source selection task joins")
+            .expect("batch source selection succeeds");
     }
 
     #[tokio::test]
