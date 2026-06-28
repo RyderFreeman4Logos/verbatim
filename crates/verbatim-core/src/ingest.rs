@@ -1620,14 +1620,6 @@ where
                 .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
-        self.record_task_progress(
-            task_id,
-            phase
-                .progress_snapshot()
-                .with_counter("sources", 0, Some(1))
-                .with_recent_status("parsing source")
-                .with_resource(task_resource_progress(&cpu_permit, "active")),
-        );
         let (mut evidence, prepared_image_artifacts, pdf_scan) = {
             let _cpu_permit = cpu_permit;
             let mut evidence = parser.parse(&source.path)?;
@@ -1728,14 +1720,6 @@ where
                 .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
-        self.record_task_progress(
-            task_id,
-            phase
-                .progress_snapshot()
-                .with_counter("evidence", searchable_evidence.len() as u64, None)
-                .with_recent_status("chunking evidence")
-                .with_resource(task_resource_progress(&cpu_permit, "active")),
-        );
         let output = {
             let _cpu_permit = cpu_permit;
             chunk_evidence(source_id, &searchable_evidence, &chunker_config)
@@ -1786,13 +1770,6 @@ where
                 .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
-        self.record_task_progress(
-            task_id,
-            phase
-                .progress_snapshot()
-                .with_recent_status("building evidence graph")
-                .with_resource(task_resource_progress(&cpu_permit, "active")),
-        );
         let caption_output = chunk_caption_evidence(source_id, &caption_evidence);
         chunks.extend(caption_output.chunks);
         links.extend(caption_output.links);
@@ -1808,15 +1785,6 @@ where
                 .map(|provider| provider.profile())
                 .as_ref(),
         );
-        self.record_task_event(
-            task_id,
-            "diagnostic",
-            "source ingest diagnostics",
-            serde_json::json!({
-                "source_id": source_id.0,
-                "diagnostics": ingest_diagnostics,
-            }),
-        );
         let (mut graph_nodes, mut graph_edges) = build_evidence_graph(
             &new_source,
             &evidence,
@@ -1826,6 +1794,15 @@ where
             &prepared_image_artifacts.text_proximities,
         );
         drop(cpu_permit);
+        self.record_task_event(
+            task_id,
+            "diagnostic",
+            "source ingest diagnostics",
+            serde_json::json!({
+                "source_id": source_id.0,
+                "diagnostics": ingest_diagnostics,
+            }),
+        );
         self.append_generated_graph(&new_source, &chunks, &mut graph_nodes, &mut graph_edges)
             .await;
         self.record_task_phase(
@@ -1916,15 +1893,6 @@ where
                 .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
-        self.record_task_progress(
-            task_id,
-            vector_build_phase
-                .progress_snapshot()
-                .with_counter("sources", 0, Some(1))
-                .with_recent_status("building vector index")
-                .with_active_worker_kind("ingest")
-                .with_resource(task_resource_progress(&cpu_permit, "active")),
-        );
         let prepared =
             self.prepare_source_indexes_from_vectors(profile_id, &source_id, vectors, cache_stats)?;
         let completed_cpu_resource = completed_resource_progress(&cpu_permit);
@@ -1941,15 +1909,6 @@ where
         );
         let index_publish_permit =
             acquire_ingest_resource("index_publish", "index_publish").await?;
-        self.record_task_progress(
-            task_id,
-            vector_build_phase
-                .progress_snapshot()
-                .with_counter("sources", 0, Some(1))
-                .with_recent_status("staging index artifacts")
-                .with_active_worker_kind("ingest")
-                .with_resource(task_resource_progress(&index_publish_permit, "active")),
-        );
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
         let completed_index_stage_resource = completed_resource_progress(&index_publish_permit);
         drop(index_publish_permit);
@@ -2073,15 +2032,6 @@ where
         );
         let index_publish_permit =
             acquire_ingest_resource("index_publish", "index_publish").await?;
-        self.record_task_progress(
-            task_id,
-            vector_publish_phase
-                .progress_snapshot()
-                .with_counter("sources", 0, Some(1))
-                .with_recent_status("publishing index artifacts")
-                .with_active_worker_kind("ingest")
-                .with_resource(task_resource_progress(&index_publish_permit, "active")),
-        );
         self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
         let completed_index_publish_resource = completed_resource_progress(&index_publish_permit);
         drop(index_publish_permit);
@@ -5942,6 +5892,18 @@ mod tests {
         )
     }
 
+    fn named_resource_for_test(name: &'static str, kind: &'static str) -> Arc<ObservableResource> {
+        global_resource_registry().resource(
+            name,
+            kind,
+            ResourceLimitConfig {
+                capacity: 1,
+                queue_capacity: 1,
+                queue_timeout: Duration::from_secs(5),
+            },
+        )
+    }
+
     fn release_after_short_wait(permit: ResourcePermit) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(25));
@@ -7995,11 +7957,11 @@ model = "local-vision"
                             resources.iter().any(|resource| {
                                 resource["name"] == "index_publish"
                                     && resource["kind"] == "index_publish"
-                                    && resource["state"] == "active"
+                                    && resource["state"] == "waiting"
                             })
                         })
             }),
-            "progress events should report active index_publish resource while staging artifacts"
+            "progress events should report pending index_publish resource before acquiring the permit"
         );
         let completed_resources = events
             .iter()
@@ -8085,6 +8047,45 @@ model = "local-vision"
             .any(|event| event.event_type == "resource_test"));
         let spans = pipeline.store().list_task_spans(&task_id).unwrap();
         assert!(spans.iter().any(|span| span.phase == "resource-gated-span"));
+    }
+
+    #[test]
+    fn telemetry_waits_for_sqlite_writer_before_non_sqlite_resource_acquire() {
+        for (resource_name, resource_kind) in
+            [("cpu_worker", "cpu"), ("index_publish", "index_publish")]
+        {
+            let writer = sqlite_writer_resource_for_test();
+            let resource = named_resource_for_test(resource_name, resource_kind);
+            let held_writer = writer.acquire_blocking().expect("held writer permit");
+            let completed = Arc::new(AtomicUsize::new(0));
+            let completed_in_thread = Arc::clone(&completed);
+
+            let telemetry_then_resource = thread::spawn(move || {
+                let _writer = acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")
+                    .expect("telemetry waits for sqlite writer");
+                let _resource = acquire_ingest_resource_blocking(resource_name, resource_kind)
+                    .expect("resource acquired only after telemetry write admission");
+                completed_in_thread.store(1, Ordering::Release);
+            });
+
+            thread::sleep(Duration::from_millis(25));
+            let snapshot = resource.snapshot();
+            assert_eq!(
+                snapshot.active, 0,
+                "{resource_name} should not be held while telemetry waits for sqlite_writer"
+            );
+            assert_eq!(
+                snapshot.queued, 0,
+                "{resource_name} should not queue while telemetry waits for sqlite_writer"
+            );
+            assert_eq!(completed.load(Ordering::Acquire), 0);
+
+            drop(held_writer);
+            telemetry_then_resource
+                .join()
+                .expect("telemetry/resource thread joins");
+            assert_eq!(completed.load(Ordering::Acquire), 1);
+        }
     }
 
     #[tokio::test]
