@@ -30,8 +30,44 @@ use crate::vision_caption::{CaptionAttempt, ImageCaption, ImageCaptionRecord, Im
 const LEGACY_EMBEDDING_PROFILE_CONFIG_HASH: &str = "legacy";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// SQLite page cache in KB (negative value tells SQLite the number is in KB).
+/// 64 MB = -65536 KB. Reduces disk I/O for the large `list_vector_documents_for_profile` scans.
+const SQLITE_CACHE_SIZE_KB: i64 = -65_536;
+
+/// Memory-mapped I/O limit: 256 MB. Lets the OS manage page eviction for the
+/// multi-GB database, reducing user-space RSS pressure.
+const SQLITE_MMAP_SIZE: i64 = 268_435_456;
+
+/// WAL autocheckpoint threshold in pages (default 1000).
+const SQLITE_WAL_AUTOCHECKPOINT: i64 = 1_000;
+
 pub struct Store {
     conn: Connection,
+}
+
+impl Store {
+    /// Apply performance-related SQLite PRAGMAs.
+    ///
+    /// - `journal_mode = WAL`: enables concurrent readers during writes.
+    /// - `synchronous = NORMAL`: used only when WAL was actually enabled.
+    /// - `mmap_size`: memory-mapped I/O for large databases, reducing RSS pressure.
+    /// - `cache_size`: larger page cache reduces disk reads for scan-heavy operations.
+    /// - `wal_autocheckpoint`: controls WAL file growth with periodic checkpointing.
+    fn apply_performance_pragmas(conn: &Connection) -> Result<()> {
+        let journal_mode: String =
+            conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        if journal_mode.eq_ignore_ascii_case("wal") {
+            conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+        } else {
+            conn.execute_batch("PRAGMA synchronous = FULL;")?;
+        }
+        conn.execute_batch(&format!("PRAGMA mmap_size = {SQLITE_MMAP_SIZE};"))?;
+        conn.execute_batch(&format!("PRAGMA cache_size = {SQLITE_CACHE_SIZE_KB};"))?;
+        conn.execute_batch(&format!(
+            "PRAGMA wal_autocheckpoint = {SQLITE_WAL_AUTOCHECKPOINT};"
+        ))?;
+        Ok(())
+    }
 }
 
 /// Task list status filter used by bounded task overview queries.
@@ -336,6 +372,7 @@ impl Store {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        Self::apply_performance_pragmas(&conn)?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -377,6 +414,7 @@ impl Store {
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        Self::apply_performance_pragmas(&conn)?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -4351,6 +4389,54 @@ mod tests {
             parser_used: Some("pdf_oxide".into()),
             last_ingested_at: None,
         }
+    }
+
+    #[test]
+    fn store_new_applies_wal_journal_mode() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_wal.db");
+        {
+            let store = Store::new(&db_path).unwrap();
+            let mode: String = store
+                .conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                mode.to_lowercase(),
+                "wal",
+                "Store::new should set journal_mode=WAL"
+            );
+            let sync: i64 = store
+                .conn
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                sync, 1,
+                "Store::new should set synchronous=NORMAL (value 1 in SQLite)"
+            );
+        }
+    }
+
+    #[test]
+    fn in_memory_store_uses_full_synchronous_when_wal_unavailable() {
+        let store = Store::in_memory().unwrap();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(
+            mode.to_lowercase(),
+            "wal",
+            "in-memory databases cannot enable WAL mode"
+        );
+        let sync: i64 = store
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            sync, 2,
+            "Store::in_memory should keep synchronous=FULL when WAL is unavailable"
+        );
     }
 
     #[test]
