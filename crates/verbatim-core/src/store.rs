@@ -30,8 +30,40 @@ use crate::vision_caption::{CaptionAttempt, ImageCaption, ImageCaptionRecord, Im
 const LEGACY_EMBEDDING_PROFILE_CONFIG_HASH: &str = "legacy";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// SQLite page cache in KB (negative value tells SQLite the number is in KB).
+/// 64 MB = -65536 KB. Reduces disk I/O for the large `list_vector_documents_for_profile` scans.
+const SQLITE_CACHE_SIZE_KB: i64 = -65_536;
+
+/// Memory-mapped I/O limit: 256 MB. Lets the OS manage page eviction for the
+/// multi-GB database, reducing user-space RSS pressure.
+const SQLITE_MMAP_SIZE: i64 = 268_435_456;
+
+/// WAL autocheckpoint threshold in pages (default 1000).
+const SQLITE_WAL_AUTOCHECKPOINT: i64 = 1_000;
+
 pub struct Store {
     conn: Connection,
+}
+
+impl Store {
+    /// Apply performance-related SQLite PRAGMAs.
+    ///
+    /// - `journal_mode = WAL`: enables concurrent readers during writes (mitigates
+    ///   `database is locked` under heavy write contention from concurrent ingest tasks).
+    /// - `synchronous = NORMAL`: safe in WAL mode, significantly faster than FULL.
+    /// - `mmap_size`: memory-mapped I/O for large databases, reducing RSS pressure.
+    /// - `cache_size`: larger page cache reduces disk reads for scan-heavy operations.
+    /// - `wal_autocheckpoint`: controls WAL file growth with periodic checkpointing.
+    fn apply_performance_pragmas(conn: &Connection) -> Result<()> {
+        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+        conn.execute_batch(&format!("PRAGMA mmap_size = {SQLITE_MMAP_SIZE};"))?;
+        conn.execute_batch(&format!("PRAGMA cache_size = {SQLITE_CACHE_SIZE_KB};"))?;
+        conn.execute_batch(&format!(
+            "PRAGMA wal_autocheckpoint = {SQLITE_WAL_AUTOCHECKPOINT};"
+        ))?;
+        Ok(())
+    }
 }
 
 /// Task list status filter used by bounded task overview queries.
@@ -336,6 +368,7 @@ impl Store {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        Self::apply_performance_pragmas(&conn)?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -377,6 +410,7 @@ impl Store {
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        Self::apply_performance_pragmas(&conn)?;
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
