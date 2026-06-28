@@ -4388,6 +4388,32 @@ mod tests {
     }
 
     #[test]
+    fn store_new_applies_wal_journal_mode() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_wal.db");
+        {
+            let store = Store::new(&db_path).unwrap();
+            let mode: String = store
+                .conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                mode.to_lowercase(),
+                "wal",
+                "Store::new should set journal_mode=WAL"
+            );
+            let sync: i64 = store
+                .conn
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                sync, 1,
+                "Store::new should set synchronous=NORMAL (value 1 in SQLite)"
+            );
+        }
+    }
+
+    #[test]
     fn readonly_open_existing_does_not_run_migrations() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("legacy.db");
