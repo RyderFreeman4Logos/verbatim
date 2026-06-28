@@ -1462,7 +1462,7 @@ where
             phase
                 .progress_snapshot()
                 .with_counter("sources", 0, Some(1))
-                .with_recent_status(format!("parsing source {}", source_id.0)),
+                .with_recent_status("parsing source"),
         );
         let mut evidence = parser.parse(&source.path)?;
         normalize_evidence_source_ids(&mut evidence, source_id);
@@ -2047,8 +2047,7 @@ where
                 Err(error)
             } else if source_vectors.len() != child_count {
                 Err(format!(
-                    "vector count mismatch for source {}: expected {}, got {}",
-                    source_id.0,
+                    "vector count mismatch for source: expected {}, got {}",
                     child_count,
                     source_vectors.len()
                 ))
@@ -2504,7 +2503,7 @@ where
                 task_id,
                 TaskProgressSnapshot::phase(IngestTaskStage::Ingest.as_str())
                     .with_counter("sources", completed as u64, Some(total as u64))
-                    .with_recent_status(format!("ingesting source {}", source_id.0)),
+                    .with_recent_status("ingesting source"),
             );
             let prepared_source = self.prepare_source_contents(source_id, task_id).await?;
             if self.should_flush_before_pending_push(
@@ -2649,10 +2648,7 @@ where
                                 outcome.embedding_cache.cache_misses as u64,
                                 None,
                             )
-                            .with_recent_status(format!(
-                                "finished source {}",
-                                source_outcome.source_id.0
-                            )),
+                            .with_recent_status("finished source"),
                     );
                 }
                 Err(error) => bail!(error),
@@ -2940,7 +2936,12 @@ where
             )
             .await?;
         if let Some((source_id, error)) = prepared.errors_by_source.iter().next() {
-            bail!("embedding failed for source {}: {error}", source_id.0);
+            tracing::warn!(
+                source = %source_id.0,
+                error = %error,
+                "embedding failed for source"
+            );
+            bail!("embedding failed for source: {error}");
         }
         if prepared.vectors.len() != child_chunks.len() {
             bail!(

@@ -1292,12 +1292,13 @@ async fn record_task_span(
             .task_store
             .lock()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let private_source_id = store
+        let redaction = store
             .get_task(&task_id)?
             .as_ref()
-            .and_then(task_private_source_id);
-        let metadata =
-            public_task_telemetry_value_for_source(metadata, private_source_id.as_deref());
+            .map(|task| task_telemetry_redaction(&store, task))
+            .transpose()?
+            .unwrap_or_default();
+        let metadata = public_task_telemetry_value(metadata, &redaction);
         store.insert_task_span(&task_id, &phase, &started_at, duration_ms, &metadata)?;
         Ok::<_, anyhow::Error>(())
     })
@@ -1548,37 +1549,72 @@ fn copy_task_request_field(
     }
 }
 
-fn public_task_summary(mut task: TaskSummary) -> TaskSummary {
-    let private_source_id = task_private_source_id(&task);
-    task.error = task.error.map(|error| {
-        bounded_error(&redact_task_telemetry_text(
-            &error,
-            private_source_id.as_deref(),
-        ))
-    });
-    task.request =
-        public_task_telemetry_value_for_source(task.request, private_source_id.as_deref());
+#[derive(Debug, Clone, Default)]
+struct TaskTelemetryRedaction {
+    private_source_ids: Vec<String>,
+}
+
+impl TaskTelemetryRedaction {
+    fn from_task(task: &TaskSummary) -> Self {
+        let mut redaction = Self::default();
+        if let Some(source_id) = task_private_source_id(task) {
+            redaction.add_source_id(source_id);
+        }
+        redaction
+    }
+
+    fn add_source_id(&mut self, source_id: impl Into<String>) {
+        let source_id = source_id.into();
+        if source_id.is_empty() || self.private_source_ids.contains(&source_id) {
+            return;
+        }
+        self.private_source_ids.push(source_id);
+        self.private_source_ids
+            .sort_by_key(|source_id| std::cmp::Reverse(source_id.len()));
+    }
+
+    fn redact_text(&self, text: &str) -> String {
+        let mut redacted = text.to_string();
+        for source_id in &self.private_source_ids {
+            redacted = redacted.replace(source_id, TASK_TELEMETRY_REDACTED);
+        }
+        redacted
+    }
+}
+
+fn task_telemetry_redaction(store: &Store, task: &TaskSummary) -> Result<TaskTelemetryRedaction> {
+    let mut redaction = TaskTelemetryRedaction::from_task(task);
+    if task.kind == TaskKind::Ingest && task_private_source_id(task).is_none() {
+        for source in store.list_sources()? {
+            redaction.add_source_id(source.id.0);
+        }
+    }
+    Ok(redaction)
+}
+
+fn public_task_summary(mut task: TaskSummary, redaction: &TaskTelemetryRedaction) -> TaskSummary {
+    task.error = task
+        .error
+        .map(|error| bounded_error(&redact_task_telemetry_text(&error, redaction)));
+    task.request = public_task_telemetry_value(task.request, redaction);
     task.result = task
         .result
-        .map(|result| public_task_telemetry_value_for_source(result, private_source_id.as_deref()));
+        .map(|result| public_task_telemetry_value(result, redaction));
     if let Some(progress) = task.progress.take() {
-        task.progress = Some(public_task_progress_for_source(
-            progress,
-            private_source_id.as_deref(),
-        ));
+        task.progress = Some(public_task_progress(progress, redaction));
     }
     task
 }
 
-fn public_task_progress_for_source(
+fn public_task_progress(
     progress: TaskProgressSnapshot,
-    private_source_id: Option<&str>,
+    redaction: &TaskTelemetryRedaction,
 ) -> TaskProgressSnapshot {
     let bounded = progress.bounded().with_current_elapsed();
     let Ok(value) = serde_json::to_value(&bounded) else {
         return TaskProgressSnapshot::default();
     };
-    let redacted = public_task_telemetry_value_for_source(value, private_source_id);
+    let redacted = public_task_telemetry_value(value, redaction);
     serde_json::from_value(redacted).unwrap_or_default()
 }
 
@@ -1592,39 +1628,39 @@ fn task_private_source_id(task: &TaskSummary) -> Option<String> {
 
 fn public_task_event_for_source(
     mut event: TaskEvent,
-    private_source_id: Option<&str>,
+    redaction: &TaskTelemetryRedaction,
 ) -> TaskEvent {
-    event.message = redact_task_telemetry_text(&event.message, private_source_id);
-    event.payload = public_task_telemetry_value_for_source(event.payload, private_source_id);
+    event.message = redact_task_telemetry_text(&event.message, redaction);
+    event.payload = public_task_telemetry_value(event.payload, redaction);
     event
 }
 
-fn public_task_span_for_source(mut span: TaskSpan, private_source_id: Option<&str>) -> TaskSpan {
-    span.metadata = public_task_telemetry_value_for_source(span.metadata, private_source_id);
+fn public_task_span(mut span: TaskSpan, redaction: &TaskTelemetryRedaction) -> TaskSpan {
+    span.metadata = public_task_telemetry_value(span.metadata, redaction);
     span
 }
 
-fn public_task_telemetry_value_for_source(
+fn public_task_telemetry_value(
     value: serde_json::Value,
-    private_source_id: Option<&str>,
+    redaction: &TaskTelemetryRedaction,
 ) -> serde_json::Value {
-    bounded_json(redact_task_telemetry_value(value, private_source_id))
+    bounded_json(redact_task_telemetry_value(value, redaction))
 }
 
 fn redact_task_telemetry_value(
     value: serde_json::Value,
-    private_source_id: Option<&str>,
+    redaction: &TaskTelemetryRedaction,
 ) -> serde_json::Value {
     match value {
-        serde_json::Value::Object(map) => redact_task_telemetry_object(map, private_source_id),
+        serde_json::Value::Object(map) => redact_task_telemetry_object(map, redaction),
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .into_iter()
-                .map(|item| redact_task_telemetry_value(item, private_source_id))
+                .map(|item| redact_task_telemetry_value(item, redaction))
                 .collect(),
         ),
         serde_json::Value::String(text) => {
-            serde_json::Value::String(redact_task_telemetry_text(&text, private_source_id))
+            serde_json::Value::String(redact_task_telemetry_text(&text, redaction))
         }
         other => other,
     }
@@ -1632,14 +1668,14 @@ fn redact_task_telemetry_value(
 
 fn redact_task_telemetry_object(
     map: serde_json::Map<String, serde_json::Value>,
-    private_source_id: Option<&str>,
+    redaction: &TaskTelemetryRedaction,
 ) -> serde_json::Value {
     let mut output = serde_json::Map::with_capacity(map.len());
     for (key, value) in map {
         let value = if is_private_task_telemetry_key(&key) {
             redacted_task_telemetry_value(value)
         } else {
-            redact_task_telemetry_value(value, private_source_id)
+            redact_task_telemetry_value(value, redaction)
         };
         output.insert(key, value);
     }
@@ -1661,12 +1697,8 @@ fn redacted_task_telemetry_value(value: serde_json::Value) -> serde_json::Value 
     }
 }
 
-fn redact_task_telemetry_text(text: &str, private_source_id: Option<&str>) -> String {
-    let Some(private_source_id) = private_source_id.filter(|source_id| !source_id.is_empty())
-    else {
-        return text.to_string();
-    };
-    text.replace(private_source_id, TASK_TELEMETRY_REDACTED)
+fn redact_task_telemetry_text(text: &str, redaction: &TaskTelemetryRedaction) -> String {
+    redaction.redact_text(text)
 }
 
 fn is_private_task_telemetry_key(key: &str) -> bool {
@@ -1715,12 +1747,12 @@ async fn task_summary_response(
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let private_source_id = task_private_source_id(&task);
-        let task = public_task_summary(with_queue_details(&store, task)?);
+        let redaction = task_telemetry_redaction(&store, &task)?;
+        let task = public_task_summary(with_queue_details(&store, task)?, &redaction);
         let spans = store
             .list_task_spans(&task_id)?
             .into_iter()
-            .map(|span| public_task_span_for_source(span, private_source_id.as_deref()))
+            .map(|span| public_task_span(span, &redaction))
             .collect();
         Ok::<_, anyhow::Error>(TaskSummaryResponse { task, spans })
     })
@@ -1760,8 +1792,11 @@ async fn list_tasks_handler(
         let tasks = page
             .tasks
             .into_iter()
-            .map(|task| with_queue_details(&store, task))
-            .map(|task| task.map(public_task_summary))
+            .map(|task| {
+                let task = with_queue_details(&store, task)?;
+                let redaction = task_telemetry_redaction(&store, &task)?;
+                Ok(public_task_summary(task, &redaction))
+            })
             .collect::<Result<Vec<_>>>()?;
         let aggregate = task_list_aggregate(&store)?;
         Ok::<_, anyhow::Error>(TaskListResponse {
@@ -1855,12 +1890,12 @@ async fn task_events_response(
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let private_source_id = task_private_source_id(&task);
+        let redaction = task_telemetry_redaction(&store, &task)?;
         let events =
             store.list_task_events(&task_id, after, limit.unwrap_or(TASK_WAIT_EVENT_LIMIT))?;
         let events = events
             .into_iter()
-            .map(|event| public_task_event_for_source(event, private_source_id.as_deref()))
+            .map(|event| public_task_event_for_source(event, &redaction))
             .collect();
         Ok::<_, anyhow::Error>(TaskEventsResponse { events })
     })
@@ -4704,25 +4739,25 @@ async fn task_wait_snapshot(
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let private_source_id = task_private_source_id(&task);
+        let redaction = task_telemetry_redaction(&store, &task)?;
         let task = with_queue_details(&store, task)?;
         let events = store
             .list_task_events(&task_id, after, limit)?
             .into_iter()
-            .map(|event| public_task_event_for_source(event, private_source_id.as_deref()))
+            .map(|event| public_task_event_for_source(event, &redaction))
             .collect();
         let spans = if task.status.is_terminal() {
             store
                 .list_task_spans(&task_id)?
                 .into_iter()
-                .map(|span| public_task_span_for_source(span, private_source_id.as_deref()))
+                .map(|span| public_task_span(span, &redaction))
                 .collect()
         } else {
             Vec::new()
         };
         let terminal = task.status.is_terminal();
         Ok::<_, anyhow::Error>(TaskWaitEvent {
-            task: public_task_summary(task),
+            task: public_task_summary(task, &redaction),
             events,
             spans,
             terminal,
@@ -6889,6 +6924,83 @@ mod tests {
             );
         }
         assert!(encoded.contains(TASK_TELEMETRY_REDACTED));
+    }
+
+    #[tokio::test]
+    async fn public_all_source_ingest_redacts_path_derived_source_id_from_progress() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("all-source-ingest-redacts-path-derived-source-id");
+        let marker = "issue-160-all-source-secret-path-marker";
+        let sensitive_text = "ISSUE160_ALL_SOURCE_DOCUMENT_TEXT_SENTINEL";
+        let source_path = test_dir.path().join(format!("{marker}.md"));
+        fs::write(
+            &source_path,
+            format!("# Heading\n\n{sensitive_text} all-source retrieval body\n"),
+        )
+        .unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        assert!(
+            source_id.0.contains(marker),
+            "test must use the production path-derived source id"
+        );
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let Json(response) = ingest_all(
+            State(Arc::clone(&state)),
+            Query(IngestQuery {
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.ingested, 1);
+        let Json(list) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("all".into()),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+        let task_id = list
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Ingest)
+            .expect("all-source ingest task should be listed")
+            .id
+            .clone();
+        let show = task_summary_response(&state, task_id.clone())
+            .await
+            .unwrap();
+        let events = task_events_response(&state, task_id.clone(), None, Some(100))
+            .await
+            .unwrap();
+        let wait = task_wait_snapshot(&state, task_id, None, 100)
+            .await
+            .unwrap();
+        let encoded = serde_json::to_string(&(show, list, events, wait)).unwrap();
+
+        for forbidden in [
+            marker,
+            source_id.0.as_str(),
+            source_path.to_str().unwrap(),
+            sensitive_text,
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "all-source public task telemetry leaked {forbidden}: {encoded}"
+            );
+        }
+        assert!(encoded.contains(TASK_TELEMETRY_REDACTED));
+        assert!(encoded.contains("parsing source"));
+        assert!(encoded.contains("ingesting source"));
+        assert!(encoded.contains("finished source"));
     }
 
     #[tokio::test]
