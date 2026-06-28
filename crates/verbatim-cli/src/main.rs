@@ -2763,11 +2763,11 @@ mod tests {
     }
 
     #[test]
-    fn task_list_eta_fallback_from_event_sequence_on_backfill_plateau() {
+    fn task_list_eta_stays_dash_on_backfill_plateau_without_monotonic_terminalized() {
         // Scenario: baseline had 10 tasks, previous sample had 8 active,
         // 2 completed and the watcher backfilled 2 more so the current
-        // active total is still 8.  The task-event sequence advanced from
-        // 100 to 200 over 60 seconds.  The ETA should be non-"--".
+        // active total is still 8.  Without a daemon-side monotonic
+        // terminalized counter, ETA cannot be reliably computed and stays "--".
         let client = MockDaemonClient::default();
         let local = MockLocalActions::default();
         *local.now_millis.borrow_mut() = 61_000;
@@ -2782,8 +2782,6 @@ mod tests {
             }));
 
         let mut response = sample_task_list_response();
-        // Override to simulate backfill plateau: total stayed at 8 but
-        // event_sequence_ceiling advanced to 200.
         response.total = 8;
         response.tasks.truncate(4);
         response.aggregate = Some(sample_task_list_aggregate_with_event_sequence(
@@ -2800,12 +2798,9 @@ mod tests {
 
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
-        // ETA should be present (not "--"): 8 tasks remaining at a rate of
-        // 100 events / 60s = ~1.67 events/s → ~4.8s per task → ~38s total.
-        // The exact number depends on rounding; we just verify it's not "--".
         assert!(
-            stdout.contains("ETA ") && !stdout.contains("ETA --"),
-            "expected ETA to be non-'--', got: {stdout}"
+            stdout.contains("ETA --"),
+            "expected ETA -- for plateau without monotonic terminalized counter, got: {stdout}"
         );
     }
 
