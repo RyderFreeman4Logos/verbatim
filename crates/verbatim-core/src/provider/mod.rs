@@ -53,6 +53,8 @@ pub enum ProviderError {
         operation: &'static str,
         timeout_seconds: u64,
     },
+    /// The application endpoint limiter rejected the request because its wait queue is full.
+    QueueFull { operation: &'static str },
     /// A streaming event contained invalid JSON.
     StreamDecode {
         operation: &'static str,
@@ -87,6 +89,7 @@ impl ProviderError {
             | Self::ResponseDecode { diagnostic, .. } => Some(diagnostic.as_ref()),
             Self::Configuration { .. }
             | Self::QueueTimeout { .. }
+            | Self::QueueFull { .. }
             | Self::StreamDecode { .. }
             | Self::MalformedResponse { .. } => None,
         }
@@ -109,6 +112,7 @@ impl ProviderError {
             Self::Configuration { .. }
             | Self::ResponseDecode { .. }
             | Self::QueueTimeout { .. }
+            | Self::QueueFull { .. }
             | Self::StreamDecode { .. }
             | Self::MalformedResponse { .. } => false,
         }
@@ -123,6 +127,7 @@ impl ProviderError {
             }
             Self::Configuration { .. }
             | Self::QueueTimeout { .. }
+            | Self::QueueFull { .. }
             | Self::StreamDecode { .. }
             | Self::MalformedResponse { .. } => {}
         }
@@ -180,6 +185,9 @@ impl fmt::Display for ProviderError {
                     "{operation} request timed out after waiting {timeout_seconds}s for model endpoint capacity"
                 )
             }
+            Self::QueueFull { operation } => {
+                write!(f, "{operation} model endpoint queue is full")
+            }
             Self::StreamDecode { operation, source } => {
                 write!(f, "failed to parse {operation} stream event: {source}")
             }
@@ -202,6 +210,7 @@ impl std::error::Error for ProviderError {
             Self::Configuration { .. }
             | Self::HttpStatus { .. }
             | Self::QueueTimeout { .. }
+            | Self::QueueFull { .. }
             | Self::MalformedResponse { .. } => None,
         }
     }

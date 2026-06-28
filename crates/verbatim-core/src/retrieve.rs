@@ -1532,6 +1532,7 @@ fn rerank_failure_reason(error: &anyhow::Error) -> String {
             ProviderError::HttpStatus { status, .. } => format!("http_status_{}", status.as_u16()),
             ProviderError::ResponseDecode { .. } => "invalid_json".to_string(),
             ProviderError::QueueTimeout { .. } => "queue_timeout".to_string(),
+            ProviderError::QueueFull { .. } => "queue_full".to_string(),
             ProviderError::StreamDecode { .. } | ProviderError::MalformedResponse { .. } => {
                 "invalid_response".to_string()
             }

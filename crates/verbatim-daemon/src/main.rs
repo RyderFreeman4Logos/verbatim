@@ -43,8 +43,8 @@ use verbatim_core::collection::{
     CollectionMemberCandidate, CollectionRecord, CollectionSyncPathInput,
 };
 use verbatim_core::config::{
-    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, RerankConfig, RerankStrategy,
-    RetrievalConfig,
+    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, DaemonResourceConfig,
+    RerankConfig, RerankStrategy, RetrievalConfig,
 };
 use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::{
@@ -55,9 +55,12 @@ use verbatim_core::index_gc::{apply_index_gc, plan_index_gc, IndexGcApplyReport}
 use verbatim_core::ingest::{IndexingOutcome, IngestPipeline, SourceIngestOutcome};
 use verbatim_core::ocr::source_ingest_diagnostics;
 use verbatim_core::provider::openai_compatible::{
-    OpenAiCompatibleLlmReranker, OpenAiCompatibleReranker,
+    model_endpoint_resource_snapshots, OpenAiCompatibleLlmReranker, OpenAiCompatibleReranker,
 };
 use verbatim_core::provider::ProviderError;
+use verbatim_core::resource::{
+    global_resource_registry, ObservableResource, ResourceLimitConfig, ResourceQueueSnapshot,
+};
 use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
 use verbatim_core::store::{Store, TaskListFilter};
 use verbatim_core::task::{
@@ -88,10 +91,12 @@ use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 // ---------------------------------------------------------------------------
 
 struct AppState {
-    /// Pipeline behind a std Mutex; accessed only inside `spawn_blocking`.
-    pipeline: std::sync::Mutex<IngestPipeline>,
-    /// Independent task metadata connection so queue operations do not wait for long ingest work.
+    /// Pipeline slot. Long indexing operations take ownership, release this mutex,
+    /// then restore the pipeline after completion.
+    pipeline: std::sync::Mutex<Option<IngestPipeline>>,
+    /// Independent task metadata connection for serialized writes.
     task_store: std::sync::Mutex<Store>,
+    resources: DaemonResources,
     ingest_queue_active: AtomicBool,
     /// Actual indexing worker occupancy, independent from persisted task status.
     ingest_worker_active: AtomicBool,
@@ -107,6 +112,15 @@ type SharedState = Arc<AppState>;
 struct RuntimeConfigState {
     config: Config,
     reload: ConfigReloadMetadata,
+}
+
+#[derive(Clone)]
+struct DaemonResources {
+    sqlite_writer: Arc<ObservableResource>,
+    sqlite_reader: Arc<ObservableResource>,
+    cpu_worker: Arc<ObservableResource>,
+    index_publish: Arc<ObservableResource>,
+    qdrant_upsert: Arc<ObservableResource>,
 }
 
 const ASK_STREAM_EVENT_BUFFER: usize = 32;
@@ -180,6 +194,208 @@ impl DebouncedCollectionSet {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn daemon_resources(config: &DaemonResourceConfig) -> DaemonResources {
+    let config = config.bounded();
+    let registry = global_resource_registry();
+    let resources = DaemonResources {
+        sqlite_writer: registry.resource(
+            "sqlite_writer",
+            "sqlite_write",
+            resource_limits(
+                config.sqlite_writer_concurrency,
+                config.sqlite_writer_queue_capacity,
+                config.sqlite_writer_queue_timeout_seconds,
+            ),
+        ),
+        sqlite_reader: registry.resource(
+            "sqlite_reader",
+            "sqlite_read",
+            resource_limits(
+                config.sqlite_reader_concurrency,
+                config.sqlite_reader_queue_capacity,
+                config.sqlite_reader_queue_timeout_seconds,
+            ),
+        ),
+        cpu_worker: registry.resource(
+            "cpu_worker",
+            "cpu",
+            resource_limits(
+                config.cpu_worker_concurrency,
+                config.cpu_worker_queue_capacity,
+                config.cpu_worker_queue_timeout_seconds,
+            ),
+        ),
+        index_publish: registry.resource(
+            "index_publish",
+            "index_publish",
+            resource_limits(
+                config.index_publish_concurrency,
+                config.index_publish_queue_capacity,
+                config.index_publish_queue_timeout_seconds,
+            ),
+        ),
+        qdrant_upsert: registry.resource(
+            "qdrant_upsert",
+            "qdrant_upsert",
+            resource_limits(
+                config.qdrant_upsert_concurrency,
+                config.qdrant_upsert_queue_capacity,
+                config.qdrant_upsert_queue_timeout_seconds,
+            ),
+        ),
+    };
+    configure_daemon_resources(&resources, &config);
+    resources
+}
+
+fn configure_daemon_resources(resources: &DaemonResources, config: &DaemonResourceConfig) {
+    let config = config.bounded();
+    resources.sqlite_writer.configure(resource_limits(
+        config.sqlite_writer_concurrency,
+        config.sqlite_writer_queue_capacity,
+        config.sqlite_writer_queue_timeout_seconds,
+    ));
+    resources.sqlite_reader.configure(resource_limits(
+        config.sqlite_reader_concurrency,
+        config.sqlite_reader_queue_capacity,
+        config.sqlite_reader_queue_timeout_seconds,
+    ));
+    resources.cpu_worker.configure(resource_limits(
+        config.cpu_worker_concurrency,
+        config.cpu_worker_queue_capacity,
+        config.cpu_worker_queue_timeout_seconds,
+    ));
+    resources.index_publish.configure(resource_limits(
+        config.index_publish_concurrency,
+        config.index_publish_queue_capacity,
+        config.index_publish_queue_timeout_seconds,
+    ));
+    resources.qdrant_upsert.configure(resource_limits(
+        config.qdrant_upsert_concurrency,
+        config.qdrant_upsert_queue_capacity,
+        config.qdrant_upsert_queue_timeout_seconds,
+    ));
+}
+
+fn resource_limits(
+    capacity: usize,
+    queue_capacity: usize,
+    queue_timeout_seconds: u64,
+) -> ResourceLimitConfig {
+    ResourceLimitConfig {
+        capacity,
+        queue_capacity,
+        queue_timeout: Duration::from_secs(queue_timeout_seconds),
+    }
+    .bounded()
+}
+
+fn daemon_resource_snapshots(state: &SharedState) -> Vec<ResourceQueueSnapshot> {
+    let mut snapshots = vec![
+        state.resources.sqlite_writer.snapshot(),
+        state.resources.sqlite_reader.snapshot(),
+        state.resources.cpu_worker.snapshot(),
+        state.resources.index_publish.snapshot(),
+    ];
+    if runtime_config_snapshot(state)
+        .map(|runtime| runtime.config.qdrant.enabled)
+        .unwrap_or(false)
+    {
+        snapshots.push(state.resources.qdrant_upsert.snapshot());
+    }
+    snapshots.extend(model_endpoint_resource_snapshots());
+    snapshots
+}
+
+fn pipeline_busy_error() -> anyhow::Error {
+    anyhow::anyhow!("ingest pipeline is busy with a long-running indexing operation")
+}
+
+fn pipeline_ref<'a>(
+    pipeline: &'a std::sync::MutexGuard<'_, Option<IngestPipeline>>,
+) -> Result<&'a IngestPipeline> {
+    pipeline.as_ref().ok_or_else(pipeline_busy_error)
+}
+
+fn pipeline_mut<'a>(
+    pipeline: &'a mut std::sync::MutexGuard<'_, Option<IngestPipeline>>,
+) -> Result<&'a mut IngestPipeline> {
+    pipeline.as_mut().ok_or_else(pipeline_busy_error)
+}
+
+fn take_pipeline(state: &SharedState) -> Result<IngestPipeline> {
+    state
+        .pipeline
+        .lock()
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .take()
+        .ok_or_else(pipeline_busy_error)
+}
+
+fn restore_pipeline(state: &SharedState, pipeline: IngestPipeline) -> Result<()> {
+    let mut slot = state
+        .pipeline
+        .lock()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if slot.is_some() {
+        bail!("ingest pipeline slot was unexpectedly occupied during restore");
+    }
+    *slot = Some(pipeline);
+    Ok(())
+}
+
+async fn with_exclusive_pipeline<T, F>(state: &SharedState, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut IngestPipeline) -> Result<T> + Send + 'static,
+{
+    let pipeline = take_pipeline(state)?;
+    let (pipeline, result) = tokio::task::spawn_blocking(move || {
+        let mut pipeline = pipeline;
+        let result = operation(&mut pipeline);
+        (pipeline, result)
+    })
+    .await
+    .context("join exclusive pipeline task")?;
+    restore_pipeline(state, pipeline)?;
+    result
+}
+
+async fn with_task_store_read<T, F>(state: &SharedState, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Store) -> Result<T> + Send + 'static,
+{
+    let permit = state.resources.sqlite_reader.acquire().await?;
+    let db_path = state.data_dir.join("verbatim.db");
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let store = Store::new(&db_path)?;
+        operation(&store)
+    })
+    .await
+    .context("join sqlite read resource task")?
+}
+
+async fn with_task_store_write<T, F>(state: &SharedState, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Store) -> Result<T> + Send + 'static,
+{
+    let permit = state.resources.sqlite_writer.acquire().await?;
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut store = state
+            .task_store
+            .lock()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        operation(&mut store)
+    })
+    .await
+    .context("join sqlite write resource task")?
 }
 
 fn unix_timestamp_string() -> String {
@@ -406,9 +622,10 @@ struct IngestBatchExpansionCandidate {
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".into(),
+        resources: daemon_resource_snapshots(&state),
     })
 }
 
@@ -436,6 +653,7 @@ async fn index_gc(
     let dry_run = req.dry_run;
     let (plan, apply) = tokio::task::spawn_blocking(move || {
         let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pipeline = pipeline_ref(&pipeline)?;
         if dry_run {
             let plan = plan_index_gc(&state.data_dir, pipeline.store(), policy)?;
             Ok::<_, anyhow::Error>((plan, IndexGcApplyReport::default()))
@@ -458,14 +676,11 @@ async fn index_status(
     State(state): State<SharedState>,
 ) -> Result<Json<IndexStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     let handle = tokio::runtime::Handle::current();
-    let state = Arc::clone(&state);
-    let response = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        refresh_embedding_profile_capabilities_blocking(&handle, &mut pipeline)?;
+    let response = with_exclusive_pipeline(&state, move |pipeline| {
+        refresh_embedding_profile_capabilities_blocking(&handle, pipeline)?;
         pipeline.index_status()
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(response))
 }
@@ -489,6 +704,8 @@ async fn index_delete_profile(
                 anyhow::anyhow!("{error}"),
             )
         })?;
+        let pipeline =
+            pipeline_ref(&pipeline).map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error))?;
         if *pipeline.active_embedding_profile_id() == profile_id {
             return Err(err(
                 StatusCode::CONFLICT,
@@ -505,6 +722,7 @@ async fn index_delete_profile(
     let allow_active = req.allow_active;
     let (plan, apply) = tokio::task::spawn_blocking(move || {
         let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pipeline = pipeline_mut(&mut pipeline)?;
         if dry_run {
             let plan = pipeline.plan_embedding_profile_delete(&profile_id)?;
             Ok::<_, anyhow::Error>((
@@ -530,8 +748,16 @@ async fn add_source(
     Json(req): Json<AddSourceRequest>,
 ) -> Result<(StatusCode, Json<AddSourceResponse>), (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(&state);
+    let sqlite_write_permit = state
+        .resources
+        .sqlite_writer
+        .acquire()
+        .await
+        .map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error.into()))?;
     let result = tokio::task::spawn_blocking(move || {
+        let _sqlite_write_permit = sqlite_write_permit;
         let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pipeline = pipeline_ref(&pipeline)?;
         let path = PathBuf::from(&req.path);
         pipeline.add_source(&path)
     })
@@ -548,11 +774,8 @@ async fn add_source(
 async fn list_sources(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<SourceResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    let sources = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let sources = pipeline
-            .store()
+    let sources = with_task_store_read(&state, |store| {
+        let sources = store
             .list_sources()?
             .into_iter()
             .map(|source| SourceResponse {
@@ -568,7 +791,6 @@ async fn list_sources(
         Ok::<_, anyhow::Error>(sources)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(sources))
@@ -578,18 +800,21 @@ async fn get_source(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<SourceResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
     let id_clone = id.clone();
-    let source = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let current_ocr_profile = pipeline.active_ocr_profile();
-        let source = pipeline.store().get_source(&SourceId(id_clone))?;
+    let current_ocr_profile = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config
+        .ocr;
+    let current_ocr_profile = current_ocr_profile
+        .enabled
+        .then(|| current_ocr_profile.profile());
+    let source = with_task_store_read(&state, move |store| {
+        let source = store.get_source(&SourceId(id_clone))?;
         source
-            .map(|source| source_response(pipeline.store(), source, current_ocr_profile.as_ref()))
+            .map(|source| source_response(store, source, current_ocr_profile.as_ref()))
             .transpose()
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match source {
@@ -634,6 +859,7 @@ async fn delete_source(
     let source_id = SourceId(id.clone());
     tokio::task::spawn_blocking(move || {
         let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pipeline = pipeline_mut(&mut pipeline)?;
         runtime.block_on(pipeline.remove_source(&source_id))
     })
     .await
@@ -661,16 +887,13 @@ async fn check_stale(
     State(state): State<SharedState>,
 ) -> Result<Json<CheckStaleResponse>, (StatusCode, Json<ErrorResponse>)> {
     let handle = tokio::runtime::Handle::current();
-    let state = Arc::clone(&state);
-    let (ids, profile_status) = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        refresh_embedding_profile_capabilities_blocking(&handle, &mut pipeline)?;
+    let (ids, profile_status) = with_exclusive_pipeline(&state, move |pipeline| {
+        refresh_embedding_profile_capabilities_blocking(&handle, pipeline)?;
         let ids = pipeline.check_stale()?;
         let profile_status = pipeline.index_status()?;
         Ok::<_, anyhow::Error>((ids, profile_status))
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(CheckStaleResponse {
@@ -683,16 +906,11 @@ async fn create_collection(
     State(state): State<SharedState>,
     Json(req): Json<CreateCollectionRequest>,
 ) -> Result<(StatusCode, Json<CollectionResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    let response = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let collection = pipeline
-            .store()
-            .create_collection(&req.name, &req.ignore_patterns)?;
-        collection_response(pipeline.store(), collection)
+    let response = with_task_store_write(&state, move |store| {
+        let collection = store.create_collection(&req.name, &req.ignore_patterns)?;
+        collection_response(store, collection)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -701,14 +919,9 @@ async fn create_collection(
 async fn list_collections(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<CollectionRecord>>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    let collections = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().list_collections()
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let collections = with_task_store_read(&state, |store| store.list_collections())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(collections))
 }
@@ -717,17 +930,14 @@ async fn get_collection(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<CollectionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
     let name_for_lookup = name.clone();
-    let response = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let collection = pipeline.store().get_collection(&name_for_lookup)?;
+    let response = with_task_store_read(&state, move |store| {
+        let collection = store.get_collection(&name_for_lookup)?;
         collection
-            .map(|collection| collection_response(pipeline.store(), collection))
+            .map(|collection| collection_response(store, collection))
             .transpose()
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match response {
@@ -743,18 +953,10 @@ async fn delete_collection(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let state_for_store = Arc::clone(&state);
     let name_for_error = name.clone();
-    let deleted = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().delete_collection(&name)
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let deleted = with_task_store_write(&state, move |store| store.delete_collection(&name))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if deleted {
         send_collection_watcher_command(&state, CollectionWatcherCommand::Refresh);
@@ -772,23 +974,16 @@ async fn add_collection_root(
     Path(name): Path<String>,
     Json(req): Json<AddCollectionRootRequest>,
 ) -> Result<Json<CollectionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state_for_store = Arc::clone(&state);
     let name_for_error = name.clone();
-    let response = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let response = with_task_store_write(&state, move |store| {
         let path = PathBuf::from(req.path);
-        pipeline.store().add_collection_root(&name, &path)?;
-        let collection = pipeline
-            .store()
+        store.add_collection_root(&name, &path)?;
+        let collection = store
             .get_collection(&name)?
             .with_context(|| format!("collection not found: {name}"))?;
-        collection_response(pipeline.store(), collection)
+        collection_response(store, collection)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| collection_error(&name_for_error, e))?;
 
     send_collection_watcher_command(&state, CollectionWatcherCommand::Refresh);
@@ -807,8 +1002,16 @@ async fn sync_collection(
         .into_iter()
         .map(collection_sync_path_input)
         .collect::<Vec<_>>();
+    let sqlite_write_permit = state
+        .resources
+        .sqlite_writer
+        .acquire()
+        .await
+        .map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error.into()))?;
     let report = tokio::task::spawn_blocking(move || {
+        let _sqlite_write_permit = sqlite_write_permit;
         let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pipeline = pipeline_ref(&pipeline)?;
         pipeline.sync_collection(&name, &inputs, req.max_depth)
     })
     .await
@@ -822,14 +1025,11 @@ async fn collection_status(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<CollectionStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
     let name_for_lookup = name.clone();
-    let status = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().collection_status(&name_for_lookup)
+    let status = with_task_store_read(&state, move |store| {
+        store.collection_status(&name_for_lookup)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match status {
@@ -844,17 +1044,9 @@ async fn collection_status(
 async fn list_collection_watcher_statuses(
     State(state): State<SharedState>,
 ) -> Result<Json<CollectionWatchersStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state_for_store = Arc::clone(&state);
-    let collections = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().list_collections()
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let collections = with_task_store_read(&state, |store| store.list_collections())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let statuses = state
         .collection_watcher
         .statuses
@@ -877,18 +1069,11 @@ async fn collection_watcher_status(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<CollectionWatcherResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state_for_store = Arc::clone(&state);
     let name_for_lookup = name.clone();
-    let collection = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().get_collection(&name_for_lookup)
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let collection =
+        with_task_store_read(&state, move |store| store.get_collection(&name_for_lookup))
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let Some(collection) = collection else {
         return Err(err(
             StatusCode::NOT_FOUND,
@@ -914,26 +1099,15 @@ async fn update_collection_watcher(
     Path(name): Path<String>,
     Json(req): Json<CollectionWatcherUpdateRequest>,
 ) -> Result<Json<CollectionWatcherResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state_for_store = Arc::clone(&state);
     let name_for_lookup = name.clone();
-    let collection = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let current = pipeline
-            .store()
+    let collection = with_task_store_write(&state, move |store| {
+        let current = store
             .get_collection(&name_for_lookup)?
             .with_context(|| format!("collection not found: {name_for_lookup}"))?;
         let auto_index_enabled = req.auto_index_enabled.unwrap_or(current.auto_index_enabled);
-        pipeline.store().update_collection_watch_settings(
-            &name_for_lookup,
-            req.enabled,
-            auto_index_enabled,
-        )
+        store.update_collection_watch_settings(&name_for_lookup, req.enabled, auto_index_enabled)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| collection_error(&name, e))?;
     let Some(collection) = collection else {
         return Err(err(
@@ -1004,19 +1178,13 @@ async fn create_persisted_task_with_id(
     kind: TaskKind,
     request: serde_json::Value,
 ) -> Result<TaskId, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let task = store.create_task(&task_id, kind, &request)?;
-        let payload = queued_event_payload(&store, task)?;
+        let payload = queued_event_payload(store, task)?;
         store.insert_task_event(&task_id, "queued", "task queued", &payload)?;
-        Ok::<_, anyhow::Error>(task_id)
+        Ok(task_id)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -1025,13 +1193,8 @@ async fn create_background_ingest_batch(
     req: TaskIngestRequest,
 ) -> Result<TaskId, (StatusCode, Json<ErrorResponse>)> {
     let parent_id = TaskId::new();
-    let state = Arc::clone(state);
     let parent_id_for_task = parent_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let parent_request = ingest_task_request_metadata_with_queue_claim_and_batch(
             None,
             req.force,
@@ -1041,13 +1204,12 @@ async fn create_background_ingest_batch(
             Some(&parent_id_for_task.0),
         );
         let parent = store.create_task(&parent_id_for_task, TaskKind::Ingest, &parent_request)?;
-        let payload = queued_event_payload(&store, parent)?;
+        let payload = queued_event_payload(store, parent)?;
         store.insert_task_event(&parent_id_for_task, "queued", "task queued", &payload)?;
 
-        Ok::<_, anyhow::Error>(parent_id_for_task)
+        Ok(parent_id_for_task)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -1057,11 +1219,9 @@ async fn background_ingest_batch_source_ids(
     vectors_only: bool,
 ) -> Result<Vec<SourceId>> {
     let handle = tokio::runtime::Handle::current();
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_exclusive_pipeline(state, move |pipeline| {
         if !force && !vectors_only {
-            refresh_embedding_profile_capabilities_blocking(&handle, &mut pipeline)?;
+            refresh_embedding_profile_capabilities_blocking(&handle, pipeline)?;
             pipeline.check_stale()?;
         }
         let sources = pipeline.store().list_sources()?;
@@ -1074,7 +1234,6 @@ async fn background_ingest_batch_source_ids(
         )
     })
     .await
-    .context("join ingest batch source expansion task")?
 }
 
 fn queued_event_payload(
@@ -1137,22 +1296,16 @@ async fn mark_task_started(
     state: &SharedState,
     task_id: &TaskId,
 ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let started = store.start_task(&task_id)?;
         if !started {
             return Ok(false);
         }
         store.insert_task_event(&task_id, "started", "task started", &serde_json::json!({}))?;
-        Ok::<_, anyhow::Error>(true)
+        Ok(true)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -1173,13 +1326,9 @@ async fn try_mark_ingest_task_started(
     state: &SharedState,
     task_id: &TaskId,
 ) -> Result<TaskStartOutcome, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
+    let state_for_active = Arc::clone(state);
     let task_id = task_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
@@ -1189,7 +1338,9 @@ async fn try_mark_ingest_task_started(
         if task.status != TaskStatus::Queued {
             return Ok(TaskStartOutcome::NotQueued);
         }
-        if state.ingest_worker_active.load(Ordering::Acquire)
+        if state_for_active
+            .ingest_worker_active
+            .load(Ordering::Acquire)
             || store.count_running_tasks(TaskKind::Ingest)? > 0
         {
             return Ok(TaskStartOutcome::BlockedByRunningIngest);
@@ -1198,10 +1349,9 @@ async fn try_mark_ingest_task_started(
             return Ok(TaskStartOutcome::BlockedByRunningIngest);
         }
         store.insert_task_event(&task_id, "started", "task started", &serde_json::json!({}))?;
-        Ok::<_, anyhow::Error>(TaskStartOutcome::Started)
+        Ok(TaskStartOutcome::Started)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         if e.to_string().contains("task not found") {
             err(StatusCode::NOT_FOUND, e)
@@ -1258,19 +1408,13 @@ async fn record_task_event(
     message: impl Into<String>,
     payload: serde_json::Value,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
     let message = message.into();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         store.insert_task_event(&task_id, event_type, &message, &payload)?;
-        Ok::<_, anyhow::Error>(())
+        Ok(())
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -1279,7 +1423,6 @@ async fn record_task_span(
     task_id: &TaskId,
     timing: verbatim_core::task::FinishedPhaseTiming,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
     let verbatim_core::task::FinishedPhaseTiming {
         phase,
@@ -1287,23 +1430,18 @@ async fn record_task_span(
         duration_ms,
         metadata,
     } = timing;
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let redaction = store
             .get_task(&task_id)?
             .as_ref()
-            .map(|task| task_telemetry_redaction(&store, task))
+            .map(|task| task_telemetry_redaction(store, task))
             .transpose()?
             .unwrap_or_default();
         let metadata = public_task_telemetry_value(metadata, &redaction);
         store.insert_task_span(&task_id, &phase, &started_at, duration_ms, &metadata)?;
-        Ok::<_, anyhow::Error>(())
+        Ok(())
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -1312,27 +1450,16 @@ async fn record_task_progress(
     task_id: &TaskId,
     progress: TaskProgressSnapshot,
 ) {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
     let task_id_for_log = task_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let result = with_task_store_write(state, move |store| {
         store.update_task_progress(&task_id, progress)?;
-        Ok::<_, anyhow::Error>(())
+        Ok(())
     })
     .await;
 
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            tracing::warn!(task_id = %task_id_for_log.0, error = %err, "failed to persist task progress");
-        }
-        Err(err) => {
-            tracing::warn!(task_id = %task_id_for_log.0, error = %err, "task progress writer panicked");
-        }
+    if let Err(err) = result {
+        tracing::warn!(task_id = %task_id_for_log.0, error = %err, "failed to persist task progress");
     }
 }
 
@@ -1366,14 +1493,9 @@ async fn finish_task_success(
     task_id: &TaskId,
     result: serde_json::Value,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let state_for_task = Arc::clone(state);
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
-    let should_wake_ingest_queue = tokio::task::spawn_blocking(move || {
-        let store = state_for_task
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let should_wake_ingest_queue = with_task_store_write(state, move |store| {
         let task = store.get_task(&task_id)?;
         let should_wake_ingest_queue = task
             .as_ref()
@@ -1384,19 +1506,13 @@ async fn finish_task_success(
         if task_changed {
             store.insert_task_event(&task_id, "succeeded", "task succeeded", &result)?;
             if let Some(timing) = terminalize_timing {
-                record_ingest_task_terminalize_span(
-                    &store,
-                    &task_id,
-                    timing,
-                    "finish_task_success",
-                );
+                record_ingest_task_terminalize_span(store, &task_id, timing, "finish_task_success");
             }
-            finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
+            finalize_ingest_batch_parent_if_complete(store, task.as_ref())?;
         }
-        Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
+        Ok(task_changed && should_wake_ingest_queue)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if should_wake_ingest_queue {
         schedule_ingest_queue(state_for_queue);
@@ -1427,15 +1543,10 @@ async fn finish_task_failed_with_upstream(
     error_message: &str,
     upstream_failure: Option<serde_json::Value>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let state_for_task = Arc::clone(state);
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
     let error_message = bounded_error(error_message);
-    let should_wake_ingest_queue = tokio::task::spawn_blocking(move || {
-        let store = state_for_task
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let should_wake_ingest_queue = with_task_store_write(state, move |store| {
         let task = store.get_task(&task_id)?;
         let upstream_failure = upstream_failure
             .map(|failure| upstream_failure_with_task_context(failure, &task_id, task.as_ref()));
@@ -1464,14 +1575,13 @@ async fn finish_task_failed_with_upstream(
             }
             store.insert_task_event(&task_id, "failed", "task failed", &payload)?;
             if let Some(timing) = terminalize_timing {
-                record_ingest_task_terminalize_span(&store, &task_id, timing, "finish_task_failed");
+                record_ingest_task_terminalize_span(store, &task_id, timing, "finish_task_failed");
             }
-            finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
+            finalize_ingest_batch_parent_if_complete(store, task.as_ref())?;
         }
-        Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
+        Ok(task_changed && should_wake_ingest_queue)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if should_wake_ingest_queue {
         schedule_ingest_queue(state_for_queue);
@@ -1646,6 +1756,11 @@ fn public_task_progress(
         .recent_status
         .as_deref()
         .map(|status| public_task_progress_text(status, redaction));
+    for resource in &mut progress.resources {
+        resource.name = public_task_progress_text(&resource.name, redaction);
+        resource.kind = public_task_progress_text(&resource.kind, redaction);
+        resource.state = public_task_progress_text(&resource.state, redaction);
+    }
     progress
 }
 
@@ -1773,26 +1888,20 @@ async fn task_summary_response(
     state: &SharedState,
     task_id: TaskId,
 ) -> Result<TaskSummaryResponse, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let redaction = task_telemetry_redaction(&store, &task)?;
-        let task = public_task_summary(with_queue_details(&store, task)?, &redaction);
+        let redaction = task_telemetry_redaction(store, &task)?;
+        let task = public_task_summary(with_queue_details(store, task)?, &redaction);
         let spans = store
             .list_task_spans(&task_id)?
             .into_iter()
             .map(|span| public_task_span(span, &redaction))
             .collect();
-        Ok::<_, anyhow::Error>(TaskSummaryResponse { task, spans })
+        Ok(TaskSummaryResponse { task, spans })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         if e.to_string().contains("task not found") {
             err(StatusCode::NOT_FOUND, e)
@@ -1812,12 +1921,7 @@ async fn list_tasks_handler(
     State(state): State<SharedState>,
     Query(query): Query<TaskListQuery>,
 ) -> Result<Json<TaskListResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(&state, move |store| {
         let filter = task_list_filter(query.status.as_deref())?;
         let limit = query
             .limit
@@ -1828,12 +1932,12 @@ async fn list_tasks_handler(
             .tasks
             .into_iter()
             .map(|task| {
-                let task = with_queue_details(&store, task)?;
-                let redaction = task_telemetry_redaction(&store, &task)?;
+                let task = with_queue_details(store, task)?;
+                let redaction = task_telemetry_redaction(store, &task)?;
                 Ok(public_task_summary(task, &redaction))
             })
             .collect::<Result<Vec<_>>>()?;
-        let aggregate = task_list_aggregate(&store)?;
+        let aggregate = task_list_aggregate(store)?;
         Ok::<_, anyhow::Error>(TaskListResponse {
             tasks,
             total: page.total,
@@ -1841,7 +1945,6 @@ async fn list_tasks_handler(
         })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map(Json)
     .map_err(|e| {
         if e.to_string().contains("unsupported task status filter") {
@@ -1916,26 +2019,20 @@ async fn task_events_response(
     after: Option<i64>,
     limit: Option<usize>,
 ) -> Result<TaskEventsResponse, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let redaction = task_telemetry_redaction(&store, &task)?;
+        let redaction = task_telemetry_redaction(store, &task)?;
         let events =
             store.list_task_events(&task_id, after, limit.unwrap_or(TASK_WAIT_EVENT_LIMIT))?;
         let events = events
             .into_iter()
             .map(|event| public_task_event_for_source(event, &redaction))
             .collect();
-        Ok::<_, anyhow::Error>(TaskEventsResponse { events })
+        Ok(TaskEventsResponse { events })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         if e.to_string().contains("task not found") {
             err(StatusCode::NOT_FOUND, e)
@@ -2270,13 +2367,8 @@ async fn resume_task_record(
     state: &SharedState,
     task_id: &TaskId,
 ) -> Result<ResumeTaskPlan, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
@@ -2301,10 +2393,9 @@ async fn resume_task_record(
             "task resumed and requeued by task id",
         );
         store.insert_task_event(&task_id, "resumed", "task resumed", &payload)?;
-        Ok::<_, anyhow::Error>(plan)
+        Ok(plan)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         let message = e.to_string();
         if message.contains("task not found") {
@@ -3187,18 +3278,10 @@ async fn resolve_query_scope(
         });
     }
 
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        resolve_query_scope_from_store(
-            pipeline.store(),
-            source_id,
-            collection_filter,
-            embedding_profile_id,
-        )
+    with_task_store_read(state, move |store| {
+        resolve_query_scope_from_store(store, source_id, collection_filter, embedding_profile_id)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(collection_filter_error)
 }
 
@@ -3599,19 +3682,14 @@ async fn recover_abandoned_running_source_batch_children(state: &SharedState) ->
     if state.ingest_worker_active.load(Ordering::Acquire) {
         return Ok(0);
     }
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        recover_abandoned_running_source_batch_children_in_store(&store)
-    })
+    with_task_store_write(
+        state,
+        recover_abandoned_running_source_batch_children_in_store,
+    )
     .await
-    .context("join abandoned ingest recovery task")?
 }
 
-fn recover_abandoned_running_source_batch_children_in_store(store: &Store) -> Result<usize> {
+fn recover_abandoned_running_source_batch_children_in_store(store: &mut Store) -> Result<usize> {
     let mut candidates = Vec::new();
     for task in store.tasks(TaskKind::Ingest)? {
         if task.status == TaskStatus::Running && parse_source_batch_child_request(&task)?.is_some()
@@ -3655,36 +3733,24 @@ async fn claim_startable_ingest_work(state: &SharedState) -> Result<Option<Claim
     }
     let config = runtime_config_snapshot(state)?.config;
     let batch_limit = ingest_source_batch_claim_limit(&config);
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        claim_next_queue_claimable_ingest_work(&store, batch_limit)
+    with_task_store_write(state, move |store| {
+        claim_next_queue_claimable_ingest_work(store, batch_limit)
     })
     .await
-    .context("join ingest queue claim task")?
 }
 
 async fn ingest_queue_ready_to_drain(state: &SharedState) -> Result<bool> {
     if state.ingest_worker_active.load(Ordering::Acquire) {
         return Ok(false);
     }
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(state, |store| {
         Ok::<_, anyhow::Error>(
             store.count_running_tasks(TaskKind::Ingest)? == 0
-                && (next_unexpanded_ingest_batch_parent(&store)?.is_some()
-                    || next_queue_claimable_ingest_task(&store)?.is_some()),
+                && (next_unexpanded_ingest_batch_parent(store)?.is_some()
+                    || next_queue_claimable_ingest_task(store)?.is_some()),
         )
     })
     .await
-    .context("join ingest queue readiness task")?
 }
 
 async fn expand_next_unexpanded_ingest_batch(state: &SharedState) -> Result<bool> {
@@ -3715,16 +3781,7 @@ async fn expand_next_unexpanded_ingest_batch(state: &SharedState) -> Result<bool
 async fn next_unexpanded_ingest_batch_parent_async(
     state: &SharedState,
 ) -> Result<Option<IngestBatchExpansionCandidate>> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        next_unexpanded_ingest_batch_parent(&store)
-    })
-    .await
-    .context("join ingest batch parent lookup task")?
+    with_task_store_read(state, next_unexpanded_ingest_batch_parent).await
 }
 
 async fn persist_ingest_batch_children(
@@ -3732,19 +3789,14 @@ async fn persist_ingest_batch_children(
     candidate: IngestBatchExpansionCandidate,
     source_ids: Vec<SourceId>,
 ) -> Result<bool> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         if store.count_running_tasks(TaskKind::Ingest)? > 0 {
             return Ok(false);
         }
         let Some(parent) = store.get_task(&candidate.task_id)? else {
             return Ok(false);
         };
-        let Some(candidate) = ingest_batch_expansion_candidate(&store, &parent)? else {
+        let Some(candidate) = ingest_batch_expansion_candidate(store, &parent)? else {
             return Ok(false);
         };
 
@@ -3759,7 +3811,7 @@ async fn persist_ingest_batch_children(
                 Some(&candidate.task_id.0),
             );
             let child = store.create_task(&child_id, TaskKind::Ingest, &child_request)?;
-            let payload = queued_event_payload(&store, child)?;
+            let payload = queued_event_payload(store, child)?;
             store.insert_task_event(&child_id, "queued", "task queued", &payload)?;
         }
 
@@ -3774,7 +3826,7 @@ async fn persist_ingest_batch_children(
                     &result,
                 )?;
                 record_ingest_task_terminalize_span(
-                    &store,
+                    store,
                     &candidate.task_id,
                     terminalize_timing,
                     "expand_empty_ingest_batch_parent",
@@ -3795,7 +3847,6 @@ async fn persist_ingest_batch_children(
         Ok::<_, anyhow::Error>(true)
     })
     .await
-    .context("join ingest batch child persistence task")?
 }
 
 fn parse_persisted_ingest_request(request: serde_json::Value) -> Result<PersistedIngestRequest> {
@@ -4111,15 +4162,10 @@ async fn validate_requested_source_exists(
     };
     let source_id = source_id.to_string();
     let lookup_id = SourceId(source_id.clone());
-    let state = Arc::clone(state);
-    let found = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().get_source(&lookup_id)
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .is_some();
+    let found = with_task_store_read(state, move |store| store.get_source(&lookup_id))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .is_some();
     if found {
         Ok(())
     } else {
@@ -4322,12 +4368,14 @@ async fn run_started_ingest_source_batch(
     source_tasks: Vec<(SourceId, TaskId)>,
 ) -> Result<Vec<SourceIngestOutcome>, (StatusCode, Json<ErrorResponse>)> {
     let _worker = acquire_ingest_worker(&state)?;
+    let pipeline =
+        take_pipeline(&state).map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error))?;
     let runtime = tokio::runtime::Handle::current();
     let state2 = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || {
-        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (pipeline, result) = tokio::task::spawn_blocking(move || {
+        let mut pipeline = pipeline;
         let state_for_reporter = Arc::clone(&state2);
-        Ok::<_, anyhow::Error>(runtime.block_on(pipeline.ingest_sources_with_tasks_reporting(
+        let result = runtime.block_on(pipeline.ingest_sources_with_tasks_reporting(
             &source_tasks,
             move |outcome| {
                 let state = Arc::clone(&state_for_reporter);
@@ -4337,11 +4385,14 @@ async fn run_started_ingest_source_batch(
                     }
                 }
             },
-        )))
+        ));
+        (pipeline, result)
     })
     .await
-    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.into()))?
-    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))
+    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.into()))?;
+    restore_pipeline(&state, pipeline)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(result)
 }
 
 async fn execute_reindex_task(
@@ -4407,7 +4458,6 @@ async fn run_indexing_operation(
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let _worker = acquire_ingest_worker(&state)?;
-    let state2 = Arc::clone(&state);
     let task_id2 = task_id.clone();
     let profile_id_for_task = profile_id.clone();
     let source_id = controls.source_id.clone();
@@ -4426,29 +4476,37 @@ async fn run_indexing_operation(
             .with_active_worker_kind(TaskKind::Ingest.as_str()),
     )
     .await;
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pipeline =
+        take_pipeline(&state).map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let (pipeline, outcome) = tokio::task::spawn_blocking(move || {
+        let mut pipeline = pipeline;
         if vectors_only {
             let source_filter = source_id.as_ref().map(|id| SourceId(id.clone()));
-            return runtime.block_on(
+            let result = runtime.block_on(
                 pipeline.build_embedding_profile(&profile_id_for_task, source_filter.as_ref()),
             );
+            return (pipeline, result);
         }
-        match source_id {
+        let result = match source_id {
             Some(id) => {
-                let embedding_cache =
-                    runtime.block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2))?;
-                Ok::<_, anyhow::Error>(IndexingOutcome {
-                    source_count: 1,
-                    embedding_cache,
-                })
+                match runtime.block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2)) {
+                    Ok(embedding_cache) => Ok(IndexingOutcome {
+                        source_count: 1,
+                        embedding_cache,
+                    }),
+                    Err(error) => Err(error),
+                }
             }
             None => runtime.block_on(pipeline.ingest_all_with_task(force, &task_id2)),
-        }
+        };
+        (pipeline, result)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| indexing_operation_error(source_id_for_error.as_deref(), e))?;
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
+    restore_pipeline(&state, pipeline)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let outcome =
+        outcome.map_err(|e| indexing_operation_error(source_id_for_error.as_deref(), e))?;
     let mut progress = timing
         .progress_snapshot()
         .with_counter(
@@ -4518,13 +4576,8 @@ async fn cancel_task_record(
     state: &SharedState,
     task_id: &TaskId,
 ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
@@ -4541,7 +4594,7 @@ async fn cancel_task_record(
             )?;
             if let Some(batch_id) = task_controlled_ingest_batch_id(&task) {
                 let cancelled_children =
-                    cancel_active_ingest_batch_children(&store, &task_id, &batch_id)?;
+                    cancel_active_ingest_batch_children(store, &task_id, &batch_id)?;
                 store.insert_task_event(
                     &task_id,
                     "batch_cancelled",
@@ -4553,13 +4606,12 @@ async fn cancel_task_record(
                 )?;
             }
             if let Some(timing) = terminalize_timing {
-                record_ingest_task_terminalize_span(&store, &task_id, timing, "cancel_task");
+                record_ingest_task_terminalize_span(store, &task_id, timing, "cancel_task");
             }
         }
-        Ok::<_, anyhow::Error>(changed)
+        Ok(changed)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         if e.to_string().contains("task not found") {
             err(StatusCode::NOT_FOUND, e)
@@ -4765,17 +4817,12 @@ async fn task_wait_snapshot(
     after: Option<i64>,
     limit: usize,
 ) -> Result<TaskWaitEvent, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let redaction = task_telemetry_redaction(&store, &task)?;
-        let task = with_queue_details(&store, task)?;
+        let redaction = task_telemetry_redaction(store, &task)?;
+        let task = with_queue_details(store, task)?;
         let events = store
             .list_task_events(&task_id, after, limit)?
             .into_iter()
@@ -4799,7 +4846,6 @@ async fn task_wait_snapshot(
         })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         if e.to_string().contains("task not found") {
             err(StatusCode::NOT_FOUND, e)
@@ -4860,17 +4906,14 @@ async fn refresh_query_embedding_profile_for_collection_filter(
         return Ok(());
     }
 
-    let state = Arc::clone(state);
     let embedding_profile_id = embedding_profile_id.clone();
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        refresh_embedding_profile_capabilities_blocking(&runtime, &mut pipeline)?;
+    with_exclusive_pipeline(state, move |pipeline| {
+        refresh_embedding_profile_capabilities_blocking(&runtime, pipeline)?;
         pipeline.select_embedding_profile(&embedding_profile_id)?;
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -4881,15 +4924,13 @@ async fn prepare_retrieve_context(
     embedding_profile_id: &EmbeddingProfileId,
     controls: &EffectiveRetrieveControls,
 ) -> Result<RetrievedContext, (StatusCode, Json<ErrorResponse>)> {
-    let state2 = Arc::clone(&state);
     let question2 = question.to_string();
     let embedding_profile_id = embedding_profile_id.clone();
     let controls = controls.clone();
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_exclusive_pipeline(&state, move |pipeline| {
         if controls.config.embedding.enabled {
-            refresh_embedding_profile_capabilities_blocking(&runtime, &mut pipeline)?;
+            refresh_embedding_profile_capabilities_blocking(&runtime, pipeline)?;
             pipeline.select_embedding_profile(&embedding_profile_id)?;
         }
         runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
@@ -4945,7 +4986,6 @@ async fn prepare_retrieve_context(
         })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -4978,63 +5018,62 @@ async fn prepare_generation_context(
     (StatusCode, Json<ErrorResponse>),
 > {
     // Retrieve first; this touches the !Send store and async embed client.
-    let state2 = Arc::clone(&state);
     let question2 = question.to_string();
     let embedding_profile_id = embedding_profile_id.clone();
     let config = config.clone();
+    let data_dir = state.data_dir.clone();
     let runtime = tokio::runtime::Handle::current();
-    let (results, generation_context, retrieval_debug) = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if config.embedding.enabled {
-            refresh_embedding_profile_capabilities_blocking(&runtime, &mut pipeline)?;
-            pipeline.select_embedding_profile(&embedding_profile_id)?;
-        }
-        runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
-        let lexical_index = pipeline.lexical_index();
-        let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
-        let retrieval = RetrievalPipeline::new_with_graph(
-            pipeline.vector_index(),
-            &lexical_index,
-            pipeline.store(),
-            &embed_client,
-            &config.retrieval,
-            &config.graph,
-        )
-        .with_embedding_enabled(config.embedding.enabled)
-        .with_vector_residency(config.vector_index.residency)
-        .require_embedding_profile(&embedding_profile_id)
-        .with_qdrant_search(&config.qdrant);
-        let source_filter_ref = source_filter.as_ref();
-        let (mut results, mut retrieval_debug) = run_generation_retrieval(
-            runtime,
-            retrieval,
-            &config.rerank,
-            &question2,
-            source_filter_ref,
-            show_retrieval,
-        )?;
-        if config.graph.global_search.enabled && source_filter_ref.is_none() {
-            let global_results =
-                GraphRagService::new(pipeline.store(), &config.graph.global_search)
-                    .global_search_results(&question2, None)?;
-            prepend_global_results(&mut results, global_results, &mut retrieval_debug);
-        }
-        let image_artifacts = collect_image_artifacts_for_results(&results, pipeline.store())?;
-        let image_attachments = select_image_attachments(
-            &results,
-            &image_artifacts,
-            &config.chat.vision_attachments,
-            |artifact| read_image_attachment_bytes(&state2.data_dir, artifact),
-        )?;
-        Ok::<_, anyhow::Error>((
-            results,
-            GenerationContext::new(image_artifacts, image_attachments),
-            retrieval_debug,
-        ))
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (results, generation_context, retrieval_debug) =
+        with_exclusive_pipeline(&state, move |pipeline| {
+            if config.embedding.enabled {
+                refresh_embedding_profile_capabilities_blocking(&runtime, pipeline)?;
+                pipeline.select_embedding_profile(&embedding_profile_id)?;
+            }
+            runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
+            let lexical_index = pipeline.lexical_index();
+            let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+            let retrieval = RetrievalPipeline::new_with_graph(
+                pipeline.vector_index(),
+                &lexical_index,
+                pipeline.store(),
+                &embed_client,
+                &config.retrieval,
+                &config.graph,
+            )
+            .with_embedding_enabled(config.embedding.enabled)
+            .with_vector_residency(config.vector_index.residency)
+            .require_embedding_profile(&embedding_profile_id)
+            .with_qdrant_search(&config.qdrant);
+            let source_filter_ref = source_filter.as_ref();
+            let (mut results, mut retrieval_debug) = run_generation_retrieval(
+                runtime,
+                retrieval,
+                &config.rerank,
+                &question2,
+                source_filter_ref,
+                show_retrieval,
+            )?;
+            if config.graph.global_search.enabled && source_filter_ref.is_none() {
+                let global_results =
+                    GraphRagService::new(pipeline.store(), &config.graph.global_search)
+                        .global_search_results(&question2, None)?;
+                prepend_global_results(&mut results, global_results, &mut retrieval_debug);
+            }
+            let image_artifacts = collect_image_artifacts_for_results(&results, pipeline.store())?;
+            let image_attachments = select_image_attachments(
+                &results,
+                &image_artifacts,
+                &config.chat.vision_attachments,
+                |artifact| read_image_attachment_bytes(&data_dir, artifact),
+            )?;
+            Ok::<_, anyhow::Error>((
+                results,
+                GenerationContext::new(image_artifacts, image_attachments),
+                retrieval_debug,
+            ))
+        })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok((results, generation_context, retrieval_debug))
 }
@@ -5379,19 +5418,17 @@ async fn get_evidence(
     State(state): State<SharedState>,
     Path(eid): Path<String>,
 ) -> Result<Json<EvidenceResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
     let eid_clone = eid.clone();
-    let (evidence, image_artifact) = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let evidence = pipeline.store().get_evidence(&EvidenceId(eid_clone))?;
+    let (evidence, image_artifact) = with_task_store_read(&state, move |store| {
+        let evidence = store.get_evidence(&EvidenceId(eid_clone))?;
         let image_artifact = match &evidence {
             Some(eu) => {
-                let direct = pipeline.store().get_image_artifact_by_evidence(&eu.id)?;
+                let direct = store.get_image_artifact_by_evidence(&eu.id)?;
                 match (direct, &eu.derived_from) {
                     (Some(artifact), _) => Some(artifact),
-                    (None, Some(source_evidence_id)) => pipeline
-                        .store()
-                        .get_image_artifact_by_evidence(source_evidence_id)?,
+                    (None, Some(source_evidence_id)) => {
+                        store.get_image_artifact_by_evidence(source_evidence_id)?
+                    }
                     (None, None) => None,
                 }
             }
@@ -5400,7 +5437,6 @@ async fn get_evidence(
         Ok::<_, anyhow::Error>((evidence, image_artifact))
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match evidence {
@@ -5773,20 +5809,16 @@ async fn build_collection_watch_plan(state: &SharedState) -> Result<CollectionWa
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .collect::<BTreeSet<_>>();
-    let state_for_store = Arc::clone(state);
-    let plan = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let collections = pipeline.store().list_collections()?;
+    let state_for_status = Arc::clone(state);
+    let plan = with_task_store_read(state, move |store| {
+        let collections = store.list_collections()?;
         let mut plan = CollectionWatchPlan::default();
         for collection in collections {
             let ignored_by_config =
                 !watcher_config.enabled || ignored_collections.contains(&collection.name);
             let mut watched_root_count = 0_usize;
             if collection.watch_enabled && !ignored_by_config {
-                let roots = pipeline.store().list_collection_roots(&collection.name)?;
+                let roots = store.list_collection_roots(&collection.name)?;
                 for root in roots {
                     for path in
                         watch_paths_for_collection_root(&root.path, root.canonical_path.as_ref())
@@ -5815,7 +5847,7 @@ async fn build_collection_watch_plan(state: &SharedState) -> Result<CollectionWa
                     }
                 }
             }
-            update_collection_watcher_status(&state_for_store, &collection.name, |status| {
+            update_collection_watcher_status(&state_for_status, &collection.name, |status| {
                 status.active =
                     collection.watch_enabled && !ignored_by_config && watched_root_count > 0;
                 status.ignored_by_config = ignored_by_config;
@@ -5824,8 +5856,7 @@ async fn build_collection_watch_plan(state: &SharedState) -> Result<CollectionWa
         }
         Ok::<_, anyhow::Error>(plan)
     })
-    .await
-    .context("join collection watch plan task")??;
+    .await?;
     Ok(plan)
 }
 
@@ -5900,6 +5931,7 @@ async fn maintain_collection_after_watch_event(
             .pipeline
             .lock()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pipeline = pipeline_mut(&mut pipeline)?;
         let collection = pipeline
             .store()
             .get_collection(&collection_name_for_sync)?
@@ -6017,13 +6049,8 @@ struct CollectionMaintenanceSyncOutcome {
 }
 
 async fn source_has_pending_ingest_task(state: &SharedState, source_id: &SourceId) -> Result<bool> {
-    let state = Arc::clone(state);
     let source_id = source_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(state, move |store| {
         for task in store.queued_tasks(TaskKind::Ingest)? {
             let request: PersistedIngestRequest = match serde_json::from_value(task.request) {
                 Ok(request) => request,
@@ -6038,7 +6065,6 @@ async fn source_has_pending_ingest_task(state: &SharedState, source_id: &SourceI
         Ok(false)
     })
     .await
-    .context("join pending ingest task lookup")?
 }
 
 // ---------------------------------------------------------------------------
@@ -6118,6 +6144,7 @@ async fn reload_config_from_path(state: &SharedState) -> Result<ConfigReloadMeta
             .pipeline
             .lock()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let pipeline = pipeline_mut(&mut pipeline)?;
         pipeline.reload_runtime_config(&next_config_for_pipeline)
     })
     .await
@@ -6147,6 +6174,10 @@ async fn reload_config_from_path(state: &SharedState) -> Result<ConfigReloadMeta
         runtime.config = next_config;
         runtime.reload = metadata.clone();
     }
+    configure_daemon_resources(
+        &state.resources,
+        &runtime_config_snapshot(state)?.config.daemon.resources,
+    );
     if collection_watcher_plan_changed {
         send_collection_watcher_command(state, CollectionWatcherCommand::Refresh);
     }
@@ -6337,8 +6368,9 @@ async fn run_daemon() -> Result<()> {
     let bind_addr = config.daemon.bind.clone();
 
     let state: SharedState = Arc::new(AppState {
-        pipeline: std::sync::Mutex::new(pipeline),
+        pipeline: std::sync::Mutex::new(Some(pipeline)),
         task_store: std::sync::Mutex::new(task_store),
+        resources: daemon_resources(&config.daemon.resources),
         ingest_queue_active: AtomicBool::new(false),
         ingest_worker_active: AtomicBool::new(false),
         collection_watcher: CollectionWatcherRuntime::default(),
@@ -7087,6 +7119,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_writer_activity_does_not_block_task_status_read() {
+        let test_dir = TestDir::new("writer-active-task-status-read");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.daemon.resources.sqlite_writer_concurrency = 32;
+        config.daemon.resources.sqlite_reader_concurrency = 32;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
+        let writer_permit = state
+            .resources
+            .sqlite_writer
+            .acquire()
+            .await
+            .expect("writer permit");
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            task_summary_response(&state, task_id.clone()),
+        )
+        .await
+        .expect("task status read does not wait behind writer resource")
+        .unwrap();
+
+        assert_eq!(response.task.id, task_id);
+        let Json(health) = health(State(Arc::clone(&state))).await;
+        let writer = health
+            .resources
+            .iter()
+            .find(|resource| resource.name == "sqlite_writer")
+            .expect("sqlite writer resource is reported");
+        assert!(writer.active >= 1);
+        let reader = health
+            .resources
+            .iter()
+            .find(|resource| resource.name == "sqlite_reader")
+            .expect("sqlite reader resource is reported");
+        assert!(reader.completed >= 1);
+        drop(writer_permit);
+    }
+
+    #[tokio::test]
+    async fn taken_pipeline_slot_does_not_block_task_status_read() {
+        let test_dir = TestDir::new("pipeline-busy-task-status-read");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
+        let pipeline = take_pipeline(&state).expect("take pipeline slot");
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            task_summary_response(&state, task_id.clone()),
+        )
+        .await
+        .expect("task status read does not wait behind pipeline slot")
+        .unwrap();
+
+        assert_eq!(response.task.id, task_id);
+        restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    #[tokio::test]
     async fn task_list_all_clamps_large_limit_and_reports_total() {
         let test_dir = TestDir::new("task-list-all-clamped");
         let config = retrieve_test_config("http://127.0.0.1:9/v1");
@@ -7821,6 +7927,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::NO_CONTENT);
         let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
         assert!(pipeline.store().get_source(&source_id).unwrap().is_none());
     }
 
@@ -7985,6 +8092,7 @@ mod tests {
         assert_eq!(outcome.added, 1);
         assert_eq!(outcome.queued_task_ids.len(), 1);
         let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
         assert_eq!(
             pipeline
                 .store()
@@ -8046,6 +8154,7 @@ mod tests {
         assert_eq!(sync.report.added, 1);
         let member_source_id = {
             let pipeline = state.pipeline.lock().unwrap();
+            let pipeline = pipeline.as_ref().unwrap();
             let members = pipeline
                 .store()
                 .list_collection_members("articles")
@@ -9079,6 +9188,7 @@ mod tests {
         assert_eq!(reindex_response.reindexed, 1);
         assert_eq!(ingest_response.ingested, 1);
         let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
         assert_eq!(
             pipeline
                 .store()
@@ -10605,8 +10715,9 @@ mod tests {
         config_path: PathBuf,
     ) -> SharedState {
         Arc::new(AppState {
-            pipeline: std::sync::Mutex::new(pipeline),
+            pipeline: std::sync::Mutex::new(Some(pipeline)),
             task_store: std::sync::Mutex::new(Store::new(&data_dir.join("verbatim.db")).unwrap()),
+            resources: daemon_resources(&config.daemon.resources),
             ingest_queue_active: AtomicBool::new(false),
             ingest_worker_active: AtomicBool::new(false),
             collection_watcher: CollectionWatcherRuntime::default(),
@@ -10946,6 +11057,7 @@ mod tests {
         use verbatim_core::collection::{CollectionMemberCandidate, CollectionSyncReport};
 
         let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
         let Some(source) = pipeline.store().get_source(source_id).unwrap() else {
             panic!("test source not found: {}", source_id.0);
         };

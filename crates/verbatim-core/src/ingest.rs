@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -43,6 +44,10 @@ use crate::ocr::{
 use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
+use crate::resource::{
+    global_resource_registry, ObservableResource, ResourceLimitConfig, ResourcePermit,
+    TaskResourceProgress,
+};
 use crate::store::{
     EmbeddingCacheEntry, EmbeddingProfileConfig, SourceContentsReplacement, Store,
     StoredEmbeddingProfileConfig,
@@ -319,6 +324,36 @@ impl SourceCommitIoTelemetry {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn ingest_resource(name: &'static str, kind: &'static str) -> Arc<ObservableResource> {
+    global_resource_registry().resource_or_insert(
+        name,
+        kind,
+        ResourceLimitConfig {
+            capacity: 1,
+            queue_capacity: 512,
+            queue_timeout: std::time::Duration::from_secs(300),
+        },
+    )
+}
+
+async fn acquire_ingest_resource(name: &'static str, kind: &'static str) -> Result<ResourcePermit> {
+    Ok(ingest_resource(name, kind).acquire().await?)
+}
+
+fn waiting_resource_progress(name: &'static str, kind: &'static str) -> TaskResourceProgress {
+    TaskResourceProgress::from_snapshot(
+        &ingest_resource(name, kind).snapshot(),
+        "waiting",
+        None,
+        None,
+    )
+}
+
+fn task_resource_progress(permit: &ResourcePermit, state: &'static str) -> TaskResourceProgress {
+    let snapshot = permit.snapshot();
+    TaskResourceProgress::from_snapshot(&snapshot, state, Some(permit.queue_wait_ms()), None)
 }
 
 struct PreparedVectors {
@@ -902,10 +937,12 @@ where
         self.embedding_profile_spec
             .apply_endpoint_capabilities(capabilities);
         let new_hash = self.embedding_profile_spec.config_hash();
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let reset_vectors = self.store.ensure_embedding_profile(
             &self.active_profile_id,
             self.embedding_profile_spec.as_store_config(),
         )?;
+        drop(sqlite_write_permit);
         if reset_vectors {
             self.hnsw.clear();
             self.loaded_profile_id = self.active_profile_id.clone();
@@ -1136,6 +1173,7 @@ where
             .collect::<Vec<_>>();
         let prepared = self.prepare_indexes_from_vectors(remaining_vectors)?;
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let generation = match self.store.remove_source_and_replace_vectors_for_profile(
             &active_profile_id,
             source_id,
@@ -1147,7 +1185,11 @@ where
                 return Err(err);
             }
         };
+        drop(sqlite_write_permit);
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         self.publish_committed_indexes(&active_profile_id, generation, staged, prepared)?;
+        drop(index_publish_permit);
         #[cfg(feature = "qdrant")]
         self.sync_qdrant_delete_source(source_id).await;
         remove_source_image_artifacts(&self.data_dir, source_id).with_context(|| {
@@ -1462,23 +1504,37 @@ where
             phase
                 .progress_snapshot()
                 .with_counter("sources", 0, Some(1))
-                .with_recent_status("parsing source"),
+                .with_recent_status("parsing source")
+                .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
-        let mut evidence = parser.parse(&source.path)?;
-        normalize_evidence_source_ids(&mut evidence, source_id);
-        let parsed_image_artifacts = extract_image_artifacts_for_ingest(
-            parser.as_ref(),
-            &source.path,
-            self.image_artifact_limits,
-        )?;
-        let prepared_image_artifacts = prepare_image_artifacts(
-            &self.data_dir,
-            source_id,
-            evidence.len() as u32,
-            parsed_image_artifacts,
-            self.image_artifact_limits,
-        )?;
-        let pdf_scan = pdf_scan_summary(&evidence, &prepared_image_artifacts.artifacts);
+        let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("parsing source")
+                .with_resource(task_resource_progress(&cpu_permit, "active")),
+        );
+        let (mut evidence, prepared_image_artifacts, pdf_scan) = {
+            let _cpu_permit = cpu_permit;
+            let mut evidence = parser.parse(&source.path)?;
+            normalize_evidence_source_ids(&mut evidence, source_id);
+            let parsed_image_artifacts = extract_image_artifacts_for_ingest(
+                parser.as_ref(),
+                &source.path,
+                self.image_artifact_limits,
+            )?;
+            let prepared_image_artifacts = prepare_image_artifacts(
+                &self.data_dir,
+                source_id,
+                evidence.len() as u32,
+                parsed_image_artifacts,
+                self.image_artifact_limits,
+            )?;
+            let pdf_scan = pdf_scan_summary(&evidence, &prepared_image_artifacts.artifacts);
+            (evidence, prepared_image_artifacts, pdf_scan)
+        };
         self.record_task_phase(
             task_id,
             phase,
@@ -1556,9 +1612,22 @@ where
             phase
                 .progress_snapshot()
                 .with_counter("evidence", searchable_evidence.len() as u64, None)
-                .with_recent_status("chunking evidence"),
+                .with_recent_status("chunking evidence")
+                .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
-        let output = chunk_evidence(source_id, &searchable_evidence, &chunker_config);
+        let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_counter("evidence", searchable_evidence.len() as u64, None)
+                .with_recent_status("chunking evidence")
+                .with_resource(task_resource_progress(&cpu_permit, "active")),
+        );
+        let output = {
+            let _cpu_permit = cpu_permit;
+            chunk_evidence(source_id, &searchable_evidence, &chunker_config)
+        };
         tracing::info!(chunk_count = output.chunks.len(), "chunked");
         self.record_task_phase(
             task_id,
@@ -1596,6 +1665,22 @@ where
             );
         }
 
+        let phase = PhaseTiming::start(IngestTaskStage::GraphExpansion.as_str());
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_recent_status("building evidence graph")
+                .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
+        );
+        let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_recent_status("building evidence graph")
+                .with_resource(task_resource_progress(&cpu_permit, "active")),
+        );
         let caption_output = chunk_caption_evidence(source_id, &caption_evidence);
         chunks.extend(caption_output.chunks);
         links.extend(caption_output.links);
@@ -1628,7 +1713,7 @@ where
             &prepared_image_artifacts.artifacts,
             &prepared_image_artifacts.text_proximities,
         );
-        let phase = PhaseTiming::start(IngestTaskStage::GraphExpansion.as_str());
+        drop(cpu_permit);
         self.append_generated_graph(&new_source, &chunks, &mut graph_nodes, &mut graph_edges)
             .await;
         self.record_task_phase(
@@ -1715,10 +1800,23 @@ where
                 .progress_snapshot()
                 .with_counter("sources", 0, Some(1))
                 .with_recent_status("building vector index")
-                .with_active_worker_kind("ingest"),
+                .with_active_worker_kind("ingest")
+                .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
-        let prepared =
-            self.prepare_source_indexes_from_vectors(profile_id, &source_id, vectors, cache_stats)?;
+        let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
+        self.record_task_progress(
+            task_id,
+            vector_build_phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("building vector index")
+                .with_active_worker_kind("ingest")
+                .with_resource(task_resource_progress(&cpu_permit, "active")),
+        );
+        let prepared = {
+            let _cpu_permit = cpu_permit;
+            self.prepare_source_indexes_from_vectors(profile_id, &source_id, vectors, cache_stats)?
+        };
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
         self.record_task_phase(
             task_id,
@@ -1757,6 +1855,16 @@ where
                 .with_recent_status("committing source contents")
                 .with_active_worker_kind("ingest"),
         );
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
+        self.record_task_progress(
+            task_id,
+            db_phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("committing source contents")
+                .with_active_worker_kind("ingest")
+                .with_resource(task_resource_progress(&sqlite_write_permit, "active")),
+        );
         let replacement_report =
             match self
                 .store
@@ -1778,6 +1886,7 @@ where
                     return Err(err);
                 }
             };
+        drop(sqlite_write_permit);
         let generation = replacement_report.generation;
         let lexical_update = replacement_report.lexical_update;
         self.record_task_phase(
@@ -1823,7 +1932,19 @@ where
                 .with_recent_status("publishing index artifacts")
                 .with_active_worker_kind("ingest"),
         );
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
+        self.record_task_progress(
+            task_id,
+            vector_publish_phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("publishing index artifacts")
+                .with_active_worker_kind("ingest")
+                .with_resource(task_resource_progress(&index_publish_permit, "active")),
+        );
         self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
+        drop(index_publish_permit);
         self.record_task_progress(
             task_id,
             vector_publish_phase
@@ -2774,21 +2895,26 @@ where
             "rebuilding local indexes"
         );
         let prepared = if self.embedding_enabled {
-            let prepared = self
-                .prepare_full_indexes_for_chunks(&active_profile_id, &child_chunks)
-                .await?;
+            self.prepare_full_indexes_for_chunks(&active_profile_id, &child_chunks)
+                .await?
+        } else {
+            self.prepare_indexes_from_vectors(Vec::new())?
+        };
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
+        if self.embedding_enabled {
             self.store
                 .replace_all_vector_documents_for_profile(&active_profile_id, &prepared.vectors)?;
             self.mark_profile_sources_embedded(&active_profile_id, &source_ids, &prepared.vectors)?;
-            prepared
         } else {
-            let prepared = self.prepare_indexes_from_vectors(Vec::new())?;
             self.store
                 .replace_all_vector_documents_for_profile(&active_profile_id, &[])?;
-            prepared
-        };
+        }
         self.lexical_index().rebuild_from_store(&self.store)?;
+        drop(sqlite_write_permit);
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         self.publish_prepared_indexes(&active_profile_id, prepared)?;
+        drop(index_publish_permit);
         #[cfg(feature = "qdrant")]
         self.sync_qdrant_all().await;
 
@@ -2804,7 +2930,11 @@ where
             bail!("embedding is disabled; enable [embedding] before building vectors");
         }
         self.refresh_embedding_profile_capabilities().await?;
-        let profile_reset = self.ensure_embedding_profile(profile_id)?;
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
+        let profile_reset = self
+            .store
+            .ensure_embedding_profile(profile_id, self.embedding_profile_spec.as_store_config())?;
+        drop(sqlite_write_permit);
         #[cfg(not(feature = "qdrant"))]
         let _ = profile_reset;
         let target_source_ids = match source_id {
@@ -2841,6 +2971,7 @@ where
             }
         };
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let generation = match source_id {
             Some(source_id) => self.store.replace_source_vector_documents_for_profile(
                 profile_id,
@@ -2858,10 +2989,17 @@ where
                 self.store.index_generation_for_profile(profile_id)?
             }
         };
+        drop(sqlite_write_permit);
         let cache_stats = prepared.cache_stats.clone();
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
+        drop(index_publish_permit);
         if *profile_id == self.active_profile_id {
+            let sqlite_write_permit =
+                acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
             self.clear_vector_only_stale_status(source_id)?;
+            drop(sqlite_write_permit);
         }
         #[cfg(feature = "qdrant")]
         {
@@ -2990,11 +3128,14 @@ where
                     &input.hash,
                 )? {
                     Some(vector) if vector.len() == expected_dimension => {
+                        let sqlite_write_permit =
+                            acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
                         self.store.record_embedding_cache_hit(
                             profile_id,
                             &profile_config_hash,
                             &input.hash,
                         )?;
+                        drop(sqlite_write_permit);
                         cache_stats.cache_hits += 1;
                         cache_stats.reused_chunks += 1;
                         let source_stats = cache_stats_by_source
@@ -3102,11 +3243,14 @@ where
                         }
                     }
                 }
+                let sqlite_write_permit =
+                    acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
                 self.store.upsert_embedding_cache_entries(
                     profile_id,
                     &profile_config_hash,
                     &cache_entries,
                 )?;
+                drop(sqlite_write_permit);
                 postprocess_timing = Some(postprocess_phase.finish(serde_json::json!({
                     "operation": "embedding_response_postprocess",
                     "source_count": request_source_ids.len(),
@@ -3283,7 +3427,9 @@ where
             qdrant
                 .delete_source_for_profile(profile_id, source_id)
                 .await?;
+            let qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
             qdrant.upsert_records(&records).await?;
+            drop(qdrant_permit);
             Ok(())
         }
         .await;
@@ -3324,7 +3470,9 @@ where
         let result: Result<()> = async {
             let records = records_from_store_for_profile(&self.store, profile_id, None)?;
             qdrant.delete_profile(profile_id).await?;
+            let qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
             qdrant.upsert_records(&records).await?;
+            drop(qdrant_permit);
             Ok(())
         }
         .await;

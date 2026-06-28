@@ -367,6 +367,7 @@ pub(super) fn capability_failure_reason(error: &ProviderError) -> String {
         }
         ProviderError::ResponseDecode { .. } => "discovery_invalid_json".to_string(),
         ProviderError::QueueTimeout { .. } => "discovery_queue_timeout".to_string(),
+        ProviderError::QueueFull { .. } => "discovery_queue_full".to_string(),
         ProviderError::StreamDecode { .. } | ProviderError::MalformedResponse { .. } => {
             "discovery_invalid_response".to_string()
         }

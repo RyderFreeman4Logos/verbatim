@@ -49,16 +49,20 @@ pub struct Config {
 
 pub const DEFAULT_TASK_WAIT_TIMEOUT_SECONDS: u64 = 1500;
 pub const DEFAULT_MODEL_ENDPOINT_MAX_CONCURRENT_REQUESTS: usize = 4;
+pub const DEFAULT_MODEL_ENDPOINT_QUEUE_CAPACITY: usize = 128;
 pub const DEFAULT_MODEL_ENDPOINT_QUEUE_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_MODEL_RETRY_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_MODEL_RETRY_INITIAL_BACKOFF_MILLIS: u64 = 500;
 pub const DEFAULT_MODEL_RETRY_MAX_BACKOFF_MILLIS: u64 = 5_000;
 pub const DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS: u64 = 60;
+pub const DEFAULT_RESOURCE_QUEUE_TIMEOUT_SECONDS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelEndpointRuntimeConfig {
     #[serde(default = "default_model_endpoint_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    #[serde(default = "default_model_endpoint_queue_capacity")]
+    pub queue_capacity: usize,
     #[serde(default = "default_model_endpoint_queue_timeout_seconds")]
     pub queue_timeout_seconds: u64,
     #[serde(default)]
@@ -69,6 +73,7 @@ impl Default for ModelEndpointRuntimeConfig {
     fn default() -> Self {
         Self {
             max_concurrent_requests: default_model_endpoint_max_concurrent_requests(),
+            queue_capacity: default_model_endpoint_queue_capacity(),
             queue_timeout_seconds: default_model_endpoint_queue_timeout_seconds(),
             retry: ModelRetryConfig::default(),
         }
@@ -79,6 +84,7 @@ impl ModelEndpointRuntimeConfig {
     pub fn bounded(&self) -> Self {
         Self {
             max_concurrent_requests: self.max_concurrent_requests.max(1),
+            queue_capacity: self.queue_capacity.max(1),
             queue_timeout_seconds: self.queue_timeout_seconds.max(1),
             retry: self.retry.bounded(),
         }
@@ -119,6 +125,10 @@ impl ModelRetryConfig {
 
 fn default_model_endpoint_max_concurrent_requests() -> usize {
     DEFAULT_MODEL_ENDPOINT_MAX_CONCURRENT_REQUESTS
+}
+
+fn default_model_endpoint_queue_capacity() -> usize {
+    DEFAULT_MODEL_ENDPOINT_QUEUE_CAPACITY
 }
 
 fn default_model_endpoint_queue_timeout_seconds() -> u64 {
@@ -1035,14 +1045,139 @@ fn default_qdrant_timeout_seconds() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
     pub bind: String,
+    #[serde(default)]
+    pub resources: DaemonResourceConfig,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:7700".into(),
+            resources: DaemonResourceConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonResourceConfig {
+    #[serde(default = "default_sqlite_writer_concurrency")]
+    pub sqlite_writer_concurrency: usize,
+    #[serde(default = "default_sqlite_writer_queue_capacity")]
+    pub sqlite_writer_queue_capacity: usize,
+    #[serde(default = "default_resource_queue_timeout_seconds")]
+    pub sqlite_writer_queue_timeout_seconds: u64,
+    #[serde(default = "default_sqlite_reader_concurrency")]
+    pub sqlite_reader_concurrency: usize,
+    #[serde(default = "default_sqlite_reader_queue_capacity")]
+    pub sqlite_reader_queue_capacity: usize,
+    #[serde(default = "default_resource_queue_timeout_seconds")]
+    pub sqlite_reader_queue_timeout_seconds: u64,
+    #[serde(default = "default_cpu_worker_concurrency")]
+    pub cpu_worker_concurrency: usize,
+    #[serde(default = "default_cpu_worker_queue_capacity")]
+    pub cpu_worker_queue_capacity: usize,
+    #[serde(default = "default_resource_queue_timeout_seconds")]
+    pub cpu_worker_queue_timeout_seconds: u64,
+    #[serde(default = "default_index_publish_concurrency")]
+    pub index_publish_concurrency: usize,
+    #[serde(default = "default_index_publish_queue_capacity")]
+    pub index_publish_queue_capacity: usize,
+    #[serde(default = "default_resource_queue_timeout_seconds")]
+    pub index_publish_queue_timeout_seconds: u64,
+    #[serde(default = "default_qdrant_upsert_concurrency")]
+    pub qdrant_upsert_concurrency: usize,
+    #[serde(default = "default_qdrant_upsert_queue_capacity")]
+    pub qdrant_upsert_queue_capacity: usize,
+    #[serde(default = "default_resource_queue_timeout_seconds")]
+    pub qdrant_upsert_queue_timeout_seconds: u64,
+}
+
+impl Default for DaemonResourceConfig {
+    fn default() -> Self {
+        Self {
+            sqlite_writer_concurrency: default_sqlite_writer_concurrency(),
+            sqlite_writer_queue_capacity: default_sqlite_writer_queue_capacity(),
+            sqlite_writer_queue_timeout_seconds: default_resource_queue_timeout_seconds(),
+            sqlite_reader_concurrency: default_sqlite_reader_concurrency(),
+            sqlite_reader_queue_capacity: default_sqlite_reader_queue_capacity(),
+            sqlite_reader_queue_timeout_seconds: default_resource_queue_timeout_seconds(),
+            cpu_worker_concurrency: default_cpu_worker_concurrency(),
+            cpu_worker_queue_capacity: default_cpu_worker_queue_capacity(),
+            cpu_worker_queue_timeout_seconds: default_resource_queue_timeout_seconds(),
+            index_publish_concurrency: default_index_publish_concurrency(),
+            index_publish_queue_capacity: default_index_publish_queue_capacity(),
+            index_publish_queue_timeout_seconds: default_resource_queue_timeout_seconds(),
+            qdrant_upsert_concurrency: default_qdrant_upsert_concurrency(),
+            qdrant_upsert_queue_capacity: default_qdrant_upsert_queue_capacity(),
+            qdrant_upsert_queue_timeout_seconds: default_resource_queue_timeout_seconds(),
+        }
+    }
+}
+
+impl DaemonResourceConfig {
+    pub fn bounded(&self) -> Self {
+        Self {
+            sqlite_writer_concurrency: self.sqlite_writer_concurrency.max(1),
+            sqlite_writer_queue_capacity: self.sqlite_writer_queue_capacity.max(1),
+            sqlite_writer_queue_timeout_seconds: self.sqlite_writer_queue_timeout_seconds.max(1),
+            sqlite_reader_concurrency: self.sqlite_reader_concurrency.max(1),
+            sqlite_reader_queue_capacity: self.sqlite_reader_queue_capacity.max(1),
+            sqlite_reader_queue_timeout_seconds: self.sqlite_reader_queue_timeout_seconds.max(1),
+            cpu_worker_concurrency: self.cpu_worker_concurrency.max(1),
+            cpu_worker_queue_capacity: self.cpu_worker_queue_capacity.max(1),
+            cpu_worker_queue_timeout_seconds: self.cpu_worker_queue_timeout_seconds.max(1),
+            index_publish_concurrency: self.index_publish_concurrency.max(1),
+            index_publish_queue_capacity: self.index_publish_queue_capacity.max(1),
+            index_publish_queue_timeout_seconds: self.index_publish_queue_timeout_seconds.max(1),
+            qdrant_upsert_concurrency: self.qdrant_upsert_concurrency.max(1),
+            qdrant_upsert_queue_capacity: self.qdrant_upsert_queue_capacity.max(1),
+            qdrant_upsert_queue_timeout_seconds: self.qdrant_upsert_queue_timeout_seconds.max(1),
+        }
+    }
+}
+
+fn default_sqlite_writer_concurrency() -> usize {
+    1
+}
+
+fn default_sqlite_writer_queue_capacity() -> usize {
+    512
+}
+
+fn default_sqlite_reader_concurrency() -> usize {
+    4
+}
+
+fn default_sqlite_reader_queue_capacity() -> usize {
+    512
+}
+
+fn default_cpu_worker_concurrency() -> usize {
+    2
+}
+
+fn default_cpu_worker_queue_capacity() -> usize {
+    128
+}
+
+fn default_index_publish_concurrency() -> usize {
+    1
+}
+
+fn default_index_publish_queue_capacity() -> usize {
+    128
+}
+
+fn default_qdrant_upsert_concurrency() -> usize {
+    1
+}
+
+fn default_qdrant_upsert_queue_capacity() -> usize {
+    128
+}
+
+fn default_resource_queue_timeout_seconds() -> u64 {
+    DEFAULT_RESOURCE_QUEUE_TIMEOUT_SECONDS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

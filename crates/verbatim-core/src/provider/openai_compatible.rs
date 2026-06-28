@@ -15,6 +15,10 @@ use crate::config::{
     ChatConfig, EmbeddingConfig, ModelEndpointRuntimeConfig, ModelRetryConfig, RerankConfig,
     VisionConfig,
 };
+use crate::resource::{
+    global_resource_registry, ObservableResource, ResourceLimitConfig, ResourcePermit,
+    ResourceQueueError, ResourceQueueSnapshot,
+};
 use crate::traits::{
     EmbeddingEndpointCapabilities, RerankCapabilityDiagnostics, RerankCapabilityState,
     RerankDiagnostics, RerankError, RerankRequestDiagnostics, RerankResponse,
@@ -70,6 +74,7 @@ impl OpenAiCompatibleChatModel {
                 &config.api_key,
                 config.timeout_seconds,
                 &config.endpoint_runtime,
+                "chat",
             ),
             temperature: config.temperature,
         }
@@ -92,6 +97,7 @@ impl OpenAiCompatibleVisionModel {
                     &config.api_key,
                     config.timeout_seconds,
                     &config.endpoint_runtime,
+                    "vision",
                 ),
                 temperature: config.temperature,
             },
@@ -121,6 +127,7 @@ impl OpenAiCompatibleEmbeddingModel {
                 &config.api_key,
                 config.timeout_seconds,
                 &config.endpoint_runtime,
+                "embedding",
             ),
             provider_kind: config.provider.clone(),
             dimension: config.dimension,
@@ -347,6 +354,7 @@ impl OpenAiCompatibleLlmReranker {
                     &config.api_key,
                     config.timeout_seconds,
                     &config.endpoint_runtime,
+                    "rerank",
                 ),
                 temperature: 0.0,
             },
@@ -363,6 +371,7 @@ impl OpenAiCompatibleReranker {
                 &config.api_key,
                 config.timeout_seconds,
                 &config.endpoint_runtime,
+                "rerank",
             ),
             provider: RerankProviderKind::from_provider(&config.provider),
             default_top_n: config.top_n,
@@ -1069,7 +1078,7 @@ impl OpenAiEndpoint {
     #[cfg(test)]
     fn new(base_url: &str, model: &str, api_key: &str, timeout_seconds: u64) -> Self {
         let config = ModelEndpointRuntimeConfig::default();
-        Self::new_with_options(base_url, model, api_key, timeout_seconds, &config)
+        Self::new_with_options(base_url, model, api_key, timeout_seconds, &config, "test")
     }
 
     fn new_with_options(
@@ -1078,10 +1087,12 @@ impl OpenAiEndpoint {
         api_key: &str,
         timeout_seconds: u64,
         config: &ModelEndpointRuntimeConfig,
+        capability: &'static str,
     ) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         let config = config.bounded();
-        let runtime = endpoint_runtime_registry().runtime_for(&base_url, &config);
+        let runtime =
+            endpoint_runtime_registry().runtime_for(&base_url, model, capability, &config);
         Self {
             runtime,
             base_url,
@@ -1344,38 +1355,49 @@ impl OpenAiEndpoint {
 #[derive(Clone, Debug)]
 struct ModelEndpointRuntime {
     client: Client,
-    limiter: Arc<EndpointLimiter>,
+    resource: Arc<ObservableResource>,
 }
 
 impl ModelEndpointRuntime {
     async fn acquire(&self, operation: &'static str) -> ProviderResult<EndpointPermit> {
-        self.limiter.acquire(operation).await
+        self.resource
+            .acquire()
+            .await
+            .map(|permit| EndpointPermit { _permit: permit })
+            .map_err(|error| provider_queue_error(operation, error))
     }
 
     fn configure(&self, config: &ModelEndpointRuntimeConfig) {
-        self.limiter.configure(config);
+        self.resource.configure(endpoint_resource_config(config));
     }
 }
 
 #[derive(Debug)]
-struct EndpointLimiterRegistry {
+struct EndpointResourceRegistry {
     runtimes: Mutex<HashMap<EndpointKey, Arc<ModelEndpointRuntime>>>,
 }
 
-impl EndpointLimiterRegistry {
+impl EndpointResourceRegistry {
     fn runtime_for(
         &self,
         base_url: &str,
+        model: &str,
+        capability: &'static str,
         config: &ModelEndpointRuntimeConfig,
     ) -> Arc<ModelEndpointRuntime> {
-        let key = EndpointKey::new(base_url);
+        let key = EndpointKey::new(base_url, model, capability);
         let mut runtimes = lock_unpoisoned(&self.runtimes);
         let runtime = runtimes
             .entry(key)
             .or_insert_with(|| {
+                let resource = global_resource_registry().resource(
+                    endpoint_resource_name(base_url, model, capability),
+                    "model_endpoint",
+                    endpoint_resource_config(config),
+                );
                 Arc::new(ModelEndpointRuntime {
                     client: Client::new(),
-                    limiter: Arc::new(EndpointLimiter::new(config)),
+                    resource,
                 })
             })
             .clone();
@@ -1384,116 +1406,83 @@ impl EndpointLimiterRegistry {
     }
 }
 
-fn endpoint_runtime_registry() -> &'static EndpointLimiterRegistry {
-    static REGISTRY: OnceLock<EndpointLimiterRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| EndpointLimiterRegistry {
+fn endpoint_runtime_registry() -> &'static EndpointResourceRegistry {
+    static REGISTRY: OnceLock<EndpointResourceRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| EndpointResourceRegistry {
         runtimes: Mutex::new(HashMap::new()),
     })
 }
 
 #[derive(Clone, Debug, Eq)]
-struct EndpointKey(String);
+struct EndpointKey {
+    endpoint: String,
+    model: String,
+    capability: &'static str,
+}
 
 impl EndpointKey {
-    fn new(base_url: &str) -> Self {
-        Self(normalized_endpoint_key(base_url))
+    fn new(base_url: &str, model: &str, capability: &'static str) -> Self {
+        Self {
+            endpoint: normalized_endpoint_key(base_url),
+            model: model.to_ascii_lowercase(),
+            capability,
+        }
     }
 }
 
 impl PartialEq for EndpointKey {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.endpoint == other.endpoint
+            && self.model == other.model
+            && self.capability == other.capability
     }
 }
 
 impl Hash for EndpointKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-#[derive(Debug)]
-struct EndpointLimiter {
-    state: Mutex<EndpointLimiterState>,
-    notify: tokio::sync::Notify,
-}
-
-#[derive(Debug)]
-struct EndpointLimiterState {
-    capacity: usize,
-    in_flight: usize,
-    queue_timeout: Duration,
-}
-
-impl EndpointLimiter {
-    fn new(config: &ModelEndpointRuntimeConfig) -> Self {
-        let config = config.bounded();
-        Self {
-            state: Mutex::new(EndpointLimiterState {
-                capacity: config.max_concurrent_requests,
-                in_flight: 0,
-                queue_timeout: Duration::from_secs(config.queue_timeout_seconds),
-            }),
-            notify: tokio::sync::Notify::new(),
-        }
-    }
-
-    fn configure(&self, config: &ModelEndpointRuntimeConfig) {
-        let config = config.bounded();
-        {
-            let mut state = lock_unpoisoned(&self.state);
-            state.capacity = config.max_concurrent_requests;
-            state.queue_timeout = Duration::from_secs(config.queue_timeout_seconds);
-        }
-        self.notify.notify_waiters();
-    }
-
-    async fn acquire(self: &Arc<Self>, operation: &'static str) -> ProviderResult<EndpointPermit> {
-        let timeout = {
-            let state = lock_unpoisoned(&self.state);
-            state.queue_timeout
-        };
-        let acquire = async {
-            loop {
-                let notified = self.notify.notified();
-                {
-                    let mut state = lock_unpoisoned(&self.state);
-                    if state.in_flight < state.capacity {
-                        state.in_flight += 1;
-                        return EndpointPermit {
-                            limiter: Arc::clone(self),
-                        };
-                    }
-                }
-                notified.await;
-            }
-        };
-        tokio::time::timeout(timeout, acquire)
-            .await
-            .map_err(|_| ProviderError::QueueTimeout {
-                operation,
-                timeout_seconds: timeout.as_secs(),
-            })
-    }
-
-    fn release(&self) {
-        {
-            let mut state = lock_unpoisoned(&self.state);
-            state.in_flight = state.in_flight.saturating_sub(1);
-        }
-        self.notify.notify_one();
+        self.endpoint.hash(state);
+        self.model.hash(state);
+        self.capability.hash(state);
     }
 }
 
 #[derive(Debug)]
 struct EndpointPermit {
-    limiter: Arc<EndpointLimiter>,
+    _permit: ResourcePermit,
 }
 
-impl Drop for EndpointPermit {
-    fn drop(&mut self) {
-        self.limiter.release();
+fn endpoint_resource_config(config: &ModelEndpointRuntimeConfig) -> ResourceLimitConfig {
+    let config = config.bounded();
+    ResourceLimitConfig {
+        capacity: config.max_concurrent_requests,
+        queue_capacity: config.queue_capacity,
+        queue_timeout: Duration::from_secs(config.queue_timeout_seconds),
     }
+}
+
+fn endpoint_resource_name(base_url: &str, model: &str, capability: &'static str) -> String {
+    format!(
+        "model_endpoint:{capability}:{}:{model}",
+        normalized_endpoint_key(base_url)
+    )
+}
+
+fn provider_queue_error(operation: &'static str, error: ResourceQueueError) -> ProviderError {
+    match error {
+        ResourceQueueError::Timeout { timeout, .. } => ProviderError::QueueTimeout {
+            operation,
+            timeout_seconds: timeout.as_secs(),
+        },
+        ResourceQueueError::Full { .. } => ProviderError::QueueFull { operation },
+    }
+}
+
+pub fn model_endpoint_resource_snapshots() -> Vec<ResourceQueueSnapshot> {
+    global_resource_registry()
+        .snapshots()
+        .into_iter()
+        .filter(|snapshot| snapshot.kind == "model_endpoint")
+        .collect()
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -2111,6 +2100,7 @@ mod tests {
     ) -> ModelEndpointRuntimeConfig {
         ModelEndpointRuntimeConfig {
             max_concurrent_requests,
+            queue_capacity: 128,
             queue_timeout_seconds: 1,
             retry: ModelRetryConfig {
                 max_retries,
@@ -2120,12 +2110,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn endpoint_key_normalizes_endpoint_model_and_separates_capability() {
+        let left = EndpointKey::new("HTTP://LOCALHOST:8080/v1/", "Embedding-Model", "embedding");
+        let same = EndpointKey::new("http://localhost:8080/v1", "embedding-model", "embedding");
+        let other_model = EndpointKey::new("http://localhost:8080/v1", "chat-model", "embedding");
+        let other_capability =
+            EndpointKey::new("http://localhost:8080/v1", "embedding-model", "rerank");
+
+        assert_eq!(left, same);
+        assert_ne!(left, other_model);
+        assert_ne!(left, other_capability);
+    }
+
     fn embedding_model_with_runtime(
         base_url: &str,
         runtime: &ModelEndpointRuntimeConfig,
     ) -> OpenAiCompatibleEmbeddingModel {
         OpenAiCompatibleEmbeddingModel {
-            endpoint: OpenAiEndpoint::new_with_options(base_url, "embedding-model", "", 5, runtime),
+            endpoint: OpenAiEndpoint::new_with_options(
+                base_url,
+                "embedding-model",
+                "",
+                5,
+                runtime,
+                "embedding",
+            ),
             provider_kind: "openai_compatible".into(),
             dimension: 3,
             normalize: false,
@@ -2141,18 +2151,27 @@ mod tests {
         runtime: &ModelEndpointRuntimeConfig,
     ) -> OpenAiCompatibleChatModel {
         OpenAiCompatibleChatModel {
-            endpoint: OpenAiEndpoint::new_with_options(base_url, "chat-model", "", 5, runtime),
+            endpoint: OpenAiEndpoint::new_with_options(
+                base_url,
+                "chat-model",
+                "",
+                5,
+                runtime,
+                "chat",
+            ),
             temperature: 0.0,
         }
     }
 
-    fn test_stream_permit() -> EndpointPermit {
-        let limiter = Arc::new(EndpointLimiter::new(&test_runtime_config(1, 0, 1)));
-        {
-            let mut state = lock_unpoisoned(&limiter.state);
-            state.in_flight += 1;
+    async fn test_stream_permit() -> EndpointPermit {
+        let resource = global_resource_registry().resource(
+            "model_endpoint:test_stream:chat",
+            "model_endpoint",
+            endpoint_resource_config(&test_runtime_config(1, 0, 1)),
+        );
+        EndpointPermit {
+            _permit: resource.acquire().await.expect("test stream permit"),
         }
-        EndpointPermit { limiter }
     }
 
     fn read_http_request(stream: &mut TcpStream) -> RecordedRequest {
@@ -3488,7 +3507,7 @@ mod tests {
         ])
         .boxed();
 
-        let events = sse_chat_stream(chunks, test_stream_permit())
+        let events = sse_chat_stream(chunks, test_stream_permit().await)
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -3524,7 +3543,7 @@ mod tests {
         ])
         .boxed();
 
-        let events = sse_chat_stream(chunks, test_stream_permit())
+        let events = sse_chat_stream(chunks, test_stream_permit().await)
             .collect::<Vec<_>>()
             .await
             .into_iter()
