@@ -140,6 +140,20 @@ impl HnswIndex {
         self.points = store.list_vector_documents_for_profile(profile_id)?;
         self.build()
     }
+
+    /// Bulk-replace all points by moving a Vec, avoiding per-document retain+push.
+    ///
+    /// This is O(n) instead of the O(n²) that calling `upsert` in a loop would cost,
+    /// and avoids cloning the vectors since ownership is moved.
+    pub fn replace_all(&mut self, documents: Vec<VectorDocument>) {
+        self.points = documents;
+        self.map = None;
+    }
+
+    /// Returns a slice of all stored vector documents.
+    pub fn points(&self) -> &[VectorDocument] {
+        &self.points
+    }
 }
 
 impl Default for HnswIndex {
