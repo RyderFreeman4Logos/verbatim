@@ -17,6 +17,7 @@ static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub const TASK_METADATA_MAX_BYTES: usize = 8192;
 pub const TASK_EVENT_MESSAGE_MAX_CHARS: usize = 512;
 pub const TASK_ERROR_MAX_CHARS: usize = 2048;
+pub const TASK_SPAN_MAX_PER_TASK: usize = 256;
 const TASK_STRING_MAX_CHARS: usize = 256;
 const TASK_UPSTREAM_BODY_PREFIX_MAX_CHARS: usize = 4096;
 const TASK_ARRAY_MAX_ITEMS: usize = 32;
@@ -106,6 +107,69 @@ impl TaskStatus {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestTaskStage {
+    Ingest,
+    Parse,
+    Ocr,
+    ImageCaption,
+    ContextualRetrieval,
+    GraphExpansion,
+    Chunk,
+    EmbeddingQueueWait,
+    EmbeddingRequest,
+    EmbeddingPostprocess,
+    SqliteWrite,
+    Bm25Index,
+    VectorIndex,
+    QdrantSync,
+    TaskTerminalize,
+    IngestCancelled,
+}
+
+impl IngestTaskStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ingest => "ingest",
+            Self::Parse => "parse",
+            Self::Ocr => "ocr",
+            Self::ImageCaption => "image_caption",
+            Self::ContextualRetrieval => "contextual_retrieval",
+            Self::GraphExpansion => "graph_expansion",
+            Self::Chunk => "chunk",
+            Self::EmbeddingQueueWait => "embedding_queue_wait",
+            Self::EmbeddingRequest => "embedding_request",
+            Self::EmbeddingPostprocess => "embedding_postprocess",
+            Self::SqliteWrite => "sqlite_write",
+            Self::Bm25Index => "bm25_index",
+            Self::VectorIndex => "vector_index",
+            Self::QdrantSync => "qdrant_sync",
+            Self::TaskTerminalize => "task_terminalize",
+            Self::IngestCancelled => "ingest_cancelled",
+        }
+    }
+}
+
+pub const INGEST_TASK_STAGE_NAMES: &[&str] = &[
+    IngestTaskStage::Ingest.as_str(),
+    IngestTaskStage::Parse.as_str(),
+    IngestTaskStage::Ocr.as_str(),
+    IngestTaskStage::ImageCaption.as_str(),
+    IngestTaskStage::ContextualRetrieval.as_str(),
+    IngestTaskStage::GraphExpansion.as_str(),
+    IngestTaskStage::Chunk.as_str(),
+    IngestTaskStage::EmbeddingQueueWait.as_str(),
+    IngestTaskStage::EmbeddingRequest.as_str(),
+    IngestTaskStage::EmbeddingPostprocess.as_str(),
+    IngestTaskStage::SqliteWrite.as_str(),
+    IngestTaskStage::Bm25Index.as_str(),
+    IngestTaskStage::VectorIndex.as_str(),
+    IngestTaskStage::QdrantSync.as_str(),
+    IngestTaskStage::TaskTerminalize.as_str(),
+    IngestTaskStage::IngestCancelled.as_str(),
+];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskSummary {
@@ -800,6 +864,29 @@ mod tests {
         assert!(encoded.contains("\"latest_error\""));
         assert!(encoded.len() <= TASK_METADATA_MAX_BYTES);
         assert!(bounded.phase.unwrap().elapsed_ms < 5_000);
+    }
+
+    #[test]
+    fn ingest_stage_contract_contains_required_low_cardinality_names() {
+        let required = [
+            "parse",
+            "chunk",
+            "embedding_queue_wait",
+            "embedding_request",
+            "embedding_postprocess",
+            "sqlite_write",
+            "bm25_index",
+            "vector_index",
+            "qdrant_sync",
+            "task_terminalize",
+        ];
+
+        for stage in required {
+            assert!(
+                INGEST_TASK_STAGE_NAMES.contains(&stage),
+                "missing ingest task stage {stage}"
+            );
+        }
     }
 
     #[test]

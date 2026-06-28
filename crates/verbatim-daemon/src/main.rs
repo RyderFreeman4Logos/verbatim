@@ -61,13 +61,13 @@ use verbatim_core::provider::ProviderError;
 use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
 use verbatim_core::store::{Store, TaskListFilter};
 use verbatim_core::task::{
-    ask_request_metadata, ask_result_metadata, bounded_error, ingest_result_metadata,
+    ask_request_metadata, ask_result_metadata, bounded_error, bounded_json, ingest_result_metadata,
     ingest_task_request_metadata_with_queue_claim,
     ingest_task_request_metadata_with_queue_claim_and_batch, reindex_result_metadata,
     reindex_task_request_metadata_with_queue_claim,
     reindex_task_request_metadata_with_queue_claim_and_batch, retrieve_request_metadata,
-    retrieve_result_metadata, PhaseTiming, TaskEndpointSummary, TaskId, TaskKind,
-    TaskProgressSnapshot, TaskStatus,
+    retrieve_result_metadata, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskEvent, TaskId,
+    TaskKind, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
 };
 use verbatim_core::types::{
     CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact,
@@ -112,6 +112,7 @@ struct RuntimeConfigState {
 const ASK_STREAM_EVENT_BUFFER: usize = 32;
 const TASK_WAIT_EVENT_BUFFER: usize = 16;
 const TASK_WAIT_EVENT_LIMIT: usize = 100;
+const TASK_TELEMETRY_REDACTED: &str = "<redacted>";
 const TASK_LIST_DEFAULT_LIMIT: usize = 20;
 const TASK_LIST_MAX_LIMIT: usize = 100;
 const TASK_QUEUE_TURNOVER_EVENT_LIMIT: usize = 1000;
@@ -1280,18 +1281,25 @@ async fn record_task_span(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(state);
     let task_id = task_id.clone();
+    let verbatim_core::task::FinishedPhaseTiming {
+        phase,
+        started_at,
+        duration_ms,
+        metadata,
+    } = timing;
     tokio::task::spawn_blocking(move || {
         let store = state
             .task_store
             .lock()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        store.insert_task_span(
-            &task_id,
-            &timing.phase,
-            &timing.started_at,
-            timing.duration_ms,
-            &timing.metadata,
-        )?;
+        let redaction = store
+            .get_task(&task_id)?
+            .as_ref()
+            .map(|task| task_telemetry_redaction(&store, task))
+            .transpose()?
+            .unwrap_or_default();
+        let metadata = public_task_telemetry_value(metadata, &redaction);
+        store.insert_task_span(&task_id, &phase, &started_at, duration_ms, &metadata)?;
         Ok::<_, anyhow::Error>(())
     })
     .await
@@ -1328,6 +1336,31 @@ async fn record_task_progress(
     }
 }
 
+fn record_ingest_task_terminalize_span(
+    store: &Store,
+    task_id: &TaskId,
+    timing: PhaseTiming,
+    operation: &'static str,
+) {
+    let finished = timing.finish(serde_json::json!({
+        "operation": operation,
+        "task_kind": TaskKind::Ingest.as_str(),
+    }));
+    if let Err(err) = store.insert_task_span(
+        task_id,
+        &finished.phase,
+        &finished.started_at,
+        finished.duration_ms,
+        &finished.metadata,
+    ) {
+        tracing::warn!(
+            task_id = %task_id.0,
+            error = %err,
+            "failed to persist ingest task terminalize span"
+        );
+    }
+}
+
 async fn finish_task_success(
     state: &SharedState,
     task_id: &TaskId,
@@ -1345,9 +1378,19 @@ async fn finish_task_success(
         let should_wake_ingest_queue = task
             .as_ref()
             .is_some_and(|task| task.kind == TaskKind::Ingest);
+        let terminalize_timing = should_wake_ingest_queue
+            .then(|| PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str()));
         let task_changed = store.finish_task_success(&task_id, &result)?;
         if task_changed {
             store.insert_task_event(&task_id, "succeeded", "task succeeded", &result)?;
+            if let Some(timing) = terminalize_timing {
+                record_ingest_task_terminalize_span(
+                    &store,
+                    &task_id,
+                    timing,
+                    "finish_task_success",
+                );
+            }
             finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
         }
         Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
@@ -1399,6 +1442,8 @@ async fn finish_task_failed_with_upstream(
         let should_wake_ingest_queue = task
             .as_ref()
             .is_some_and(|task| task.kind == TaskKind::Ingest);
+        let terminalize_timing = should_wake_ingest_queue
+            .then(|| PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str()));
         let resumability = task.as_ref().and_then(|task| {
             task_failure_resumability_metadata(task, Some(&error_message))
                 .ok()
@@ -1418,6 +1463,9 @@ async fn finish_task_failed_with_upstream(
                 payload["resumability"] = resumability;
             }
             store.insert_task_event(&task_id, "failed", "task failed", &payload)?;
+            if let Some(timing) = terminalize_timing {
+                record_ingest_task_terminalize_span(&store, &task_id, timing, "finish_task_failed");
+            }
             finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
         }
         Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
@@ -1501,6 +1549,226 @@ fn copy_task_request_field(
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct TaskTelemetryRedaction {
+    private_source_ids: Vec<String>,
+}
+
+impl TaskTelemetryRedaction {
+    fn from_task(task: &TaskSummary) -> Self {
+        let mut redaction = Self::default();
+        if let Some(source_id) = task_private_source_id(task) {
+            redaction.add_source_id(source_id);
+        }
+        redaction
+    }
+
+    fn add_source_id(&mut self, source_id: impl Into<String>) {
+        let source_id = source_id.into();
+        if source_id.is_empty() || self.private_source_ids.contains(&source_id) {
+            return;
+        }
+        self.private_source_ids.push(source_id);
+        self.private_source_ids
+            .sort_by_key(|source_id| std::cmp::Reverse(source_id.len()));
+    }
+
+    fn redact_text(&self, text: &str) -> String {
+        let mut redacted = text.to_string();
+        for source_id in &self.private_source_ids {
+            redacted = redacted.replace(source_id, TASK_TELEMETRY_REDACTED);
+        }
+        redacted
+    }
+}
+
+fn task_telemetry_redaction(store: &Store, task: &TaskSummary) -> Result<TaskTelemetryRedaction> {
+    let mut redaction = TaskTelemetryRedaction::from_task(task);
+    if task.kind == TaskKind::Ingest && task_private_source_id(task).is_none() {
+        for source in store.list_sources()? {
+            redaction.add_source_id(source.id.0);
+        }
+    }
+    Ok(redaction)
+}
+
+fn public_task_summary(mut task: TaskSummary, redaction: &TaskTelemetryRedaction) -> TaskSummary {
+    task.error = task
+        .error
+        .map(|error| bounded_error(&redact_task_telemetry_text(&error, redaction)));
+    task.request = public_task_telemetry_value(task.request, redaction);
+    task.result = task
+        .result
+        .map(|result| public_task_telemetry_value(result, redaction));
+    if let Some(progress) = task.progress.take() {
+        task.progress = Some(public_task_progress(progress, redaction));
+    }
+    task
+}
+
+fn public_task_progress(
+    progress: TaskProgressSnapshot,
+    redaction: &TaskTelemetryRedaction,
+) -> TaskProgressSnapshot {
+    let mut progress = progress.bounded().with_current_elapsed();
+    if let Some(phase) = &mut progress.phase {
+        phase.name = public_task_progress_text(&phase.name, redaction);
+    }
+    for counter in &mut progress.counters {
+        counter.name = public_task_progress_text(&counter.name, redaction);
+    }
+    for endpoint in &mut progress.endpoints {
+        endpoint.name = public_task_progress_text(&endpoint.name, redaction);
+        endpoint.latest_error = endpoint
+            .latest_error
+            .as_deref()
+            .map(|error| public_task_progress_text(error, redaction));
+    }
+    if let Some(queue) = &mut progress.queue {
+        queue.active_worker_kind = queue
+            .active_worker_kind
+            .as_deref()
+            .map(|worker| public_task_progress_text(worker, redaction));
+        queue.blocking_reason = queue
+            .blocking_reason
+            .as_deref()
+            .map(|reason| public_task_progress_text(reason, redaction));
+    }
+    progress.active_worker_kind = progress
+        .active_worker_kind
+        .as_deref()
+        .map(|worker| public_task_progress_text(worker, redaction));
+    progress.wait_reason = progress
+        .wait_reason
+        .as_deref()
+        .map(|reason| public_task_progress_text(reason, redaction));
+    progress.recent_status = progress
+        .recent_status
+        .as_deref()
+        .map(|status| public_task_progress_text(status, redaction));
+    progress
+}
+
+fn public_task_progress_text(text: &str, redaction: &TaskTelemetryRedaction) -> String {
+    redact_task_telemetry_text(&sanitize_text(text), redaction)
+}
+
+fn task_private_source_id(task: &TaskSummary) -> Option<String> {
+    task.request
+        .get("source_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|source_id| !source_id.is_empty())
+        .map(str::to_string)
+}
+
+fn public_task_event_for_source(
+    mut event: TaskEvent,
+    redaction: &TaskTelemetryRedaction,
+) -> TaskEvent {
+    event.message = redact_task_telemetry_text(&event.message, redaction);
+    event.payload = public_task_telemetry_value(event.payload, redaction);
+    event
+}
+
+fn public_task_span(mut span: TaskSpan, redaction: &TaskTelemetryRedaction) -> TaskSpan {
+    span.metadata = public_task_telemetry_value(span.metadata, redaction);
+    span
+}
+
+fn public_task_telemetry_value(
+    value: serde_json::Value,
+    redaction: &TaskTelemetryRedaction,
+) -> serde_json::Value {
+    bounded_json(redact_task_telemetry_value(value, redaction))
+}
+
+fn redact_task_telemetry_value(
+    value: serde_json::Value,
+    redaction: &TaskTelemetryRedaction,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => redact_task_telemetry_object(map, redaction),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_task_telemetry_value(item, redaction))
+                .collect(),
+        ),
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(redact_task_telemetry_text(&text, redaction))
+        }
+        other => other,
+    }
+}
+
+fn redact_task_telemetry_object(
+    map: serde_json::Map<String, serde_json::Value>,
+    redaction: &TaskTelemetryRedaction,
+) -> serde_json::Value {
+    let mut output = serde_json::Map::with_capacity(map.len());
+    for (key, value) in map {
+        let value = if is_private_task_telemetry_key(&key) {
+            redacted_task_telemetry_value(value)
+        } else {
+            redact_task_telemetry_value(value, redaction)
+        };
+        output.insert(key, value);
+    }
+    serde_json::Value::Object(output)
+}
+
+fn redacted_task_telemetry_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Null => serde_json::Value::Null,
+        serde_json::Value::Array(items) => serde_json::json!({
+            "redacted": true,
+            "count": items.len(),
+        }),
+        serde_json::Value::Object(map) => serde_json::json!({
+            "redacted": true,
+            "field_count": map.len(),
+        }),
+        _ => serde_json::Value::String(TASK_TELEMETRY_REDACTED.into()),
+    }
+}
+
+fn redact_task_telemetry_text(text: &str, redaction: &TaskTelemetryRedaction) -> String {
+    redaction.redact_text(text)
+}
+
+fn is_private_task_telemetry_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    matches!(
+        normalized.as_str(),
+        "sourceid"
+            | "sourceids"
+            | "sourcepath"
+            | "sourcepaths"
+            | "path"
+            | "paths"
+            | "pathorurl"
+            | "embedding"
+            | "embeddings"
+            | "vector"
+            | "vectors"
+            | "embeddingvector"
+            | "embeddingvectors"
+            | "vectorpayload"
+            | "vectorpayloads"
+            | "vectorvalue"
+            | "vectorvalues"
+    ) || normalized.ends_with("sourceid")
+        || normalized.ends_with("sourceids")
+        || normalized.ends_with("sourcepath")
+        || normalized.ends_with("sourcepaths")
+        || normalized.ends_with("embeddingvector")
+        || normalized.ends_with("embeddingvectors")
+        || normalized.ends_with("vectorpayload")
+        || normalized.ends_with("vectorpayloads")
+        || normalized.ends_with("vectorvalue")
+        || normalized.ends_with("vectorvalues")
+}
+
 async fn task_summary_response(
     state: &SharedState,
     task_id: TaskId,
@@ -1514,8 +1782,13 @@ async fn task_summary_response(
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let task = with_queue_details(&store, task)?;
-        let spans = store.list_task_spans(&task_id)?;
+        let redaction = task_telemetry_redaction(&store, &task)?;
+        let task = public_task_summary(with_queue_details(&store, task)?, &redaction);
+        let spans = store
+            .list_task_spans(&task_id)?
+            .into_iter()
+            .map(|span| public_task_span(span, &redaction))
+            .collect();
         Ok::<_, anyhow::Error>(TaskSummaryResponse { task, spans })
     })
     .await
@@ -1554,7 +1827,11 @@ async fn list_tasks_handler(
         let tasks = page
             .tasks
             .into_iter()
-            .map(|task| with_queue_details(&store, task))
+            .map(|task| {
+                let task = with_queue_details(&store, task)?;
+                let redaction = task_telemetry_redaction(&store, &task)?;
+                Ok(public_task_summary(task, &redaction))
+            })
             .collect::<Result<Vec<_>>>()?;
         let aggregate = task_list_aggregate(&store)?;
         Ok::<_, anyhow::Error>(TaskListResponse {
@@ -1645,11 +1922,16 @@ async fn task_events_response(
             .task_store
             .lock()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        store
+        let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
+        let redaction = task_telemetry_redaction(&store, &task)?;
         let events =
             store.list_task_events(&task_id, after, limit.unwrap_or(TASK_WAIT_EVENT_LIMIT))?;
+        let events = events
+            .into_iter()
+            .map(|event| public_task_event_for_source(event, &redaction))
+            .collect();
         Ok::<_, anyhow::Error>(TaskEventsResponse { events })
     })
     .await
@@ -3342,6 +3624,7 @@ fn recover_abandoned_running_source_batch_children_in_store(store: &Store) -> Re
     for task in candidates {
         let error_message = "abandoned running source-batch ingest task recovered without an active worker; failing task to unblock ingest queue";
         let resumability = task_failure_resumability_metadata(&task, Some(error_message))?;
+        let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
         if !store.finish_task_failed_with_result(&task.id, error_message, resumability.as_ref())? {
             continue;
         }
@@ -3354,6 +3637,12 @@ fn recover_abandoned_running_source_batch_children_in_store(store: &Store) -> Re
             payload["resumability"] = resumability.clone();
         }
         store.insert_task_event(&task.id, "failed", "task failed", &payload)?;
+        record_ingest_task_terminalize_span(
+            store,
+            &task.id,
+            terminalize_timing,
+            "recover_abandoned_source_batch_child",
+        );
         finalize_ingest_batch_parent_if_complete(store, Some(&task))?;
         recovered += 1;
     }
@@ -3476,6 +3765,7 @@ async fn persist_ingest_batch_children(
 
         if source_ids.is_empty() {
             let result = ingest_result_metadata(0, &EmbeddingCacheStats::default());
+            let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
             if store.finish_task_success(&candidate.task_id, &result)? {
                 store.insert_task_event(
                     &candidate.task_id,
@@ -3483,6 +3773,12 @@ async fn persist_ingest_batch_children(
                     "task succeeded",
                     &result,
                 )?;
+                record_ingest_task_terminalize_span(
+                    &store,
+                    &candidate.task_id,
+                    terminalize_timing,
+                    "expand_empty_ingest_batch_parent",
+                );
             }
             return Ok(true);
         }
@@ -4232,6 +4528,9 @@ async fn cancel_task_record(
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
+        let is_ingest_task = task.kind == TaskKind::Ingest;
+        let terminalize_timing =
+            is_ingest_task.then(|| PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str()));
         let changed = store.cancel_task(&task_id)?;
         if changed {
             store.insert_task_event(
@@ -4252,6 +4551,9 @@ async fn cancel_task_record(
                         "cancelled_children": cancelled_children,
                     }),
                 )?;
+            }
+            if let Some(timing) = terminalize_timing {
+                record_ingest_task_terminalize_span(&store, &task_id, timing, "cancel_task");
             }
         }
         Ok::<_, anyhow::Error>(changed)
@@ -4301,6 +4603,7 @@ fn cancel_active_ingest_batch_children(
 }
 
 fn cancel_ingest_batch_child(store: &Store, task_id: &TaskId, batch_id: &str) -> Result<bool> {
+    let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
     let changed = store.cancel_task(task_id)?;
     if changed {
         store.insert_task_event(
@@ -4309,6 +4612,12 @@ fn cancel_ingest_batch_child(store: &Store, task_id: &TaskId, batch_id: &str) ->
             "task cancelled because ingest batch was cancelled",
             &serde_json::json!({ "ingest_batch_id": batch_id }),
         )?;
+        record_ingest_task_terminalize_span(
+            store,
+            task_id,
+            terminalize_timing,
+            "cancel_ingest_batch_child",
+        );
     }
     Ok(changed)
 }
@@ -4360,6 +4669,7 @@ fn finalize_ingest_batch_parent_if_complete(
         return Ok(());
     }
 
+    let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
     let result = ingest_batch_result_metadata(&batch_id, &children);
     let has_failed_or_cancelled = children
         .iter()
@@ -4376,12 +4686,24 @@ fn finalize_ingest_batch_parent_if_complete(
                     "ingest_batch": result,
                 }),
             )?;
+            record_ingest_task_terminalize_span(
+                store,
+                &parent_id,
+                terminalize_timing,
+                "finalize_ingest_batch_parent_failed",
+            );
         }
         return Ok(());
     }
 
     if store.finish_task_success(&parent_id, &result)? {
         store.insert_task_event(&parent_id, "succeeded", "task succeeded", &result)?;
+        record_ingest_task_terminalize_span(
+            store,
+            &parent_id,
+            terminalize_timing,
+            "finalize_ingest_batch_parent_success",
+        );
     }
     Ok(())
 }
@@ -4452,16 +4774,25 @@ async fn task_wait_snapshot(
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
+        let redaction = task_telemetry_redaction(&store, &task)?;
         let task = with_queue_details(&store, task)?;
-        let events = store.list_task_events(&task_id, after, limit)?;
+        let events = store
+            .list_task_events(&task_id, after, limit)?
+            .into_iter()
+            .map(|event| public_task_event_for_source(event, &redaction))
+            .collect();
         let spans = if task.status.is_terminal() {
-            store.list_task_spans(&task_id)?
+            store
+                .list_task_spans(&task_id)?
+                .into_iter()
+                .map(|span| public_task_span(span, &redaction))
+                .collect()
         } else {
             Vec::new()
         };
         let terminal = task.status.is_terminal();
         Ok::<_, anyhow::Error>(TaskWaitEvent {
-            task,
+            task: public_task_summary(task, &redaction),
             events,
             spans,
             terminal,
@@ -6112,6 +6443,12 @@ mod tests {
         RetrievalRerankStatus, SourceLocator, VectorIndexResidency,
     };
 
+    fn has_task_terminalize_span(spans: &[verbatim_core::task::TaskSpan]) -> bool {
+        spans
+            .iter()
+            .any(|span| span.phase == IngestTaskStage::TaskTerminalize.as_str())
+    }
+
     #[test]
     fn version_flag_prints_package_version() {
         let mut stdout = Vec::new();
@@ -6479,6 +6816,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_task_success_records_terminalize_stage_span() {
+        let test_dir = TestDir::new("ingest-task-terminalize-span");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, true),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &task_id).await.unwrap();
+
+        finish_task_success(
+            &state,
+            &task_id,
+            ingest_result_metadata(1, &EmbeddingCacheStats::default()),
+        )
+        .await
+        .unwrap();
+
+        let response = task_summary_response(&state, task_id).await.unwrap();
+        assert!(response
+            .spans
+            .iter()
+            .any(|span| span.phase == IngestTaskStage::TaskTerminalize.as_str()));
+    }
+
+    #[tokio::test]
+    async fn public_task_telemetry_redacts_path_derived_source_id_and_vectors() {
+        let test_dir = TestDir::new("task-telemetry-redacts-path-derived-source-id");
+        let marker = "issue-160-secret-path-marker";
+        let fake_vector_value = "ISSUE160_FAKE_VECTOR_VALUE";
+        let sensitive_text = "ISSUE160_DOCUMENT_TEXT_SENTINEL";
+        let source_path = test_dir.path().join(format!("{marker}.md"));
+        fs::write(&source_path, sensitive_text).unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        assert!(
+            source_id.0.contains(marker),
+            "test must use the production path-derived source id"
+        );
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some(source_id.0.as_str()),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &task_id).await.unwrap();
+        record_task_progress(
+            &state,
+            &task_id,
+            TaskProgressSnapshot::phase(IngestTaskStage::Parse.as_str())
+                .with_recent_status(format!("parsing source {}", source_id.0)),
+        )
+        .await;
+        record_task_event(
+            &state,
+            &task_id,
+            "diagnostic",
+            "task diagnostic",
+            serde_json::json!({
+                "source_id": source_id.0.as_str(),
+                "source_path": source_path.display().to_string(),
+                "embedding_vector": [fake_vector_value],
+                "text": sensitive_text,
+            }),
+        )
+        .await
+        .unwrap();
+        record_task_span(
+            &state,
+            &task_id,
+            PhaseTiming::start(IngestTaskStage::EmbeddingPostprocess.as_str()).finish(
+                serde_json::json!({
+                    "source_id": source_id.0.as_str(),
+                    "source_path": source_path.display().to_string(),
+                    "embedding_vector": [fake_vector_value],
+                    "text": sensitive_text,
+                    "chunk_count": 1,
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let show = task_summary_response(&state, task_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            show.task.request["source_id"],
+            serde_json::Value::String(TASK_TELEMETRY_REDACTED.into())
+        );
+        assert_eq!(
+            show.spans[0].metadata["source_id"],
+            serde_json::Value::String(TASK_TELEMETRY_REDACTED.into())
+        );
+        assert_eq!(show.spans[0].metadata["embedding_vector"]["redacted"], true);
+        assert_eq!(
+            show.task
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.recent_status.as_deref()),
+            Some("parsing source <redacted>")
+        );
+        let Json(list) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("all".into()),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+        let events = task_events_response(&state, task_id.clone(), None, Some(10))
+            .await
+            .unwrap();
+        let wait = task_wait_snapshot(&state, task_id, None, 10).await.unwrap();
+        let encoded = serde_json::to_string(&(show, list, events, wait)).unwrap();
+
+        for forbidden in [
+            marker,
+            source_id.0.as_str(),
+            source_path.to_str().unwrap(),
+            fake_vector_value,
+            sensitive_text,
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "public task telemetry leaked {forbidden}: {encoded}"
+            );
+        }
+        assert!(encoded.contains(TASK_TELEMETRY_REDACTED));
+    }
+
+    #[tokio::test]
+    async fn public_all_source_ingest_redacts_path_derived_source_id_from_progress() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("all-source-ingest-redacts-path-derived-source-id");
+        let marker = "issue-160-all-source-secret-path-marker";
+        let sensitive_text = "ISSUE160_ALL_SOURCE_DOCUMENT_TEXT_SENTINEL";
+        let source_path = test_dir.path().join(format!("{marker}.md"));
+        fs::write(
+            &source_path,
+            format!("# Heading\n\n{sensitive_text} all-source retrieval body\n"),
+        )
+        .unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        assert!(
+            source_id.0.contains(marker),
+            "test must use the production path-derived source id"
+        );
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let Json(response) = ingest_all(
+            State(Arc::clone(&state)),
+            Query(IngestQuery {
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.ingested, 1);
+        let Json(list) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("all".into()),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+        let task_id = list
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Ingest)
+            .expect("all-source ingest task should be listed")
+            .id
+            .clone();
+        let show = task_summary_response(&state, task_id.clone())
+            .await
+            .unwrap();
+        let events = task_events_response(&state, task_id.clone(), None, Some(100))
+            .await
+            .unwrap();
+        let wait = task_wait_snapshot(&state, task_id, None, 100)
+            .await
+            .unwrap();
+        let encoded = serde_json::to_string(&(show, list, events, wait)).unwrap();
+
+        for forbidden in [
+            marker,
+            source_id.0.as_str(),
+            source_path.to_str().unwrap(),
+            sensitive_text,
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "all-source public task telemetry leaked {forbidden}: {encoded}"
+            );
+        }
+        assert!(encoded.contains(TASK_TELEMETRY_REDACTED));
+        assert!(encoded.contains("parsing source"));
+        assert!(encoded.contains("ingesting source"));
+        assert!(encoded.contains("finished source"));
+    }
+
+    #[tokio::test]
     async fn task_list_defaults_to_active_tasks_with_queue_details() {
         let test_dir = TestDir::new("task-list-active");
         let config = retrieve_test_config("http://127.0.0.1:9/v1");
@@ -6667,7 +7227,7 @@ mod tests {
         record_task_progress(
             &state,
             &task_id,
-            TaskProgressSnapshot::phase("ingest_index_publishing")
+            TaskProgressSnapshot::phase(IngestTaskStage::VectorIndex.as_str())
                 .with_counter("sources", 1, Some(1))
                 .with_wait_reason("post_publish_cleanup")
                 .with_recent_status("index publishing complete"),
@@ -6722,10 +7282,11 @@ mod tests {
             .await
             .unwrap();
             ensure_task_started(&state, &task_id).await.unwrap();
-            let mut progress = TaskProgressSnapshot::phase("embedding")
-                .with_counter("embedding_vectors", 0, Some(10))
-                .with_wait_reason(reason)
-                .with_recent_status("waiting for embedding batch");
+            let mut progress =
+                TaskProgressSnapshot::phase(IngestTaskStage::EmbeddingQueueWait.as_str())
+                    .with_counter("embedding_vectors", 0, Some(10))
+                    .with_wait_reason(reason)
+                    .with_recent_status("waiting for embedding batch");
             if let Some(phase) = &mut progress.phase {
                 phase.started_at = "1".into();
             }
@@ -6770,8 +7331,9 @@ mod tests {
         let state = test_state(config, test_dir.path(), pipeline);
 
         for index in 0..(TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT + 5) {
-            create_persisted_task(
+            create_persisted_task_with_id(
                 &state,
+                TaskId(format!("task-aggregate-filler-{index:03}")),
                 TaskKind::Ask,
                 ask_request_metadata(
                     &format!("queued filler question {index}"),
@@ -6785,8 +7347,9 @@ mod tests {
             .unwrap();
         }
 
-        let embedding_wait = create_persisted_task(
+        let embedding_wait = create_persisted_task_with_id(
             &state,
+            TaskId("task-zz-aggregate-embedding-wait".into()),
             TaskKind::Ingest,
             ingest_task_request_metadata_with_queue_claim(
                 Some("src-wait-beyond-sample"),
@@ -6799,17 +7362,19 @@ mod tests {
         .await
         .unwrap();
         ensure_task_started(&state, &embedding_wait).await.unwrap();
-        let mut progress = TaskProgressSnapshot::phase("embedding")
-            .with_counter("embedding_vectors", 0, Some(10))
-            .with_wait_reason("embedding_throughput")
-            .with_recent_status("waiting for embedding model throughput");
+        let mut progress =
+            TaskProgressSnapshot::phase(IngestTaskStage::EmbeddingQueueWait.as_str())
+                .with_counter("embedding_vectors", 0, Some(10))
+                .with_wait_reason("embedding_throughput")
+                .with_recent_status("waiting for embedding model throughput");
         if let Some(phase) = &mut progress.phase {
             phase.started_at = "1".into();
         }
         record_task_progress(&state, &embedding_wait, progress).await;
 
-        let publish_wait = create_persisted_task(
+        let publish_wait = create_persisted_task_with_id(
             &state,
+            TaskId("task-zz-aggregate-publish-wait".into()),
             TaskKind::Ingest,
             ingest_task_request_metadata_with_queue_claim(
                 Some("src-publish-beyond-sample"),
@@ -6825,7 +7390,7 @@ mod tests {
         record_task_progress(
             &state,
             &publish_wait,
-            TaskProgressSnapshot::phase("ingest_index_publishing")
+            TaskProgressSnapshot::phase(IngestTaskStage::VectorIndex.as_str())
                 .with_counter("sources", 1, Some(1))
                 .with_wait_reason("post_publish_cleanup")
                 .with_recent_status("index publishing complete"),
@@ -6944,7 +7509,7 @@ mod tests {
         record_task_progress(
             &state,
             &embedding_wait,
-            TaskProgressSnapshot::phase("embedding")
+            TaskProgressSnapshot::phase(IngestTaskStage::EmbeddingQueueWait.as_str())
                 .with_counter("embedding_vectors", 0, Some(10))
                 .with_wait_reason("embedding_batch")
                 .with_recent_status("waiting for embedding batch"),
@@ -6968,7 +7533,7 @@ mod tests {
         record_task_progress(
             &state,
             &publish_wait,
-            TaskProgressSnapshot::phase("ingest_index_publishing")
+            TaskProgressSnapshot::phase(IngestTaskStage::VectorIndex.as_str())
                 .with_counter("sources", 1, Some(1))
                 .with_wait_reason("post_publish_cleanup")
                 .with_recent_status("index publishing complete"),
@@ -9005,6 +9570,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_background_ingest_batch_parent_records_terminalize_span() {
+        let test_dir = TestDir::new("ingest-batch-empty-terminalize");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        state.ingest_queue_active.store(true, Ordering::Release);
+
+        let Json(created) = submit_ingest_task(
+            State(Arc::clone(&state)),
+            Json(TaskIngestRequest {
+                source_id: None,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+        state.ingest_queue_active.store(false, Ordering::Release);
+        let parent_id = TaskId(created.task_id);
+
+        assert!(expand_next_unexpanded_ingest_batch(&state).await.unwrap());
+        let parent_response = task_summary_response(&state, parent_id).await.unwrap();
+
+        assert_eq!(parent_response.task.status, TaskStatus::Succeeded);
+        assert!(has_task_terminalize_span(&parent_response.spans));
+    }
+
+    #[tokio::test]
     async fn public_background_ingest_batch_parent_succeeds_after_children_succeed() {
         let test_dir = TestDir::new("ingest-batch-public-parent-success");
         let first_path = test_dir.path().join("first.md");
@@ -9056,8 +9650,10 @@ mod tests {
         .await
         .unwrap();
 
-        let parent = task_summary_response(&state, parent_id).await.unwrap().task;
+        let parent_response = task_summary_response(&state, parent_id).await.unwrap();
+        let parent = parent_response.task;
         assert_eq!(parent.status, TaskStatus::Succeeded);
+        assert!(has_task_terminalize_span(&parent_response.spans));
         assert_eq!(parent.result.unwrap()["ingested"], 2);
     }
 
@@ -9313,7 +9909,7 @@ mod tests {
 
         assert_eq!(resumed.task.id, failed_id);
         assert_eq!(resumed.task.status, TaskStatus::Queued);
-        assert_eq!(resumed.task.request["source_id"], "src-1");
+        assert_eq!(resumed.task.request["source_id"], TASK_TELEMETRY_REDACTED);
         assert!(resumed.task.result.is_none());
         assert!(resumed.task.error.is_none());
         let events = task_events_response(&state, failed_id.clone(), None, Some(10))
@@ -9625,10 +10221,18 @@ mod tests {
         .await
         .unwrap();
 
-        let first = task_summary_response(&state, first_id).await.unwrap().task;
-        let second = task_summary_response(&state, second_id).await.unwrap().task;
+        let first_response = task_summary_response(&state, first_id.clone())
+            .await
+            .unwrap();
+        let second_response = task_summary_response(&state, second_id.clone())
+            .await
+            .unwrap();
+        let first = first_response.task;
+        let second = second_response.task;
         assert_eq!(first.status, TaskStatus::Succeeded);
         assert_eq!(second.status, TaskStatus::Failed);
+        assert!(has_task_terminalize_span(&first_response.spans));
+        assert!(has_task_terminalize_span(&second_response.spans));
         assert!(second
             .error
             .as_deref()
@@ -9805,14 +10409,14 @@ mod tests {
                 store
                     .update_task_progress(
                         &task.id,
-                        TaskProgressSnapshot::phase("embedding")
+                        TaskProgressSnapshot::phase(IngestTaskStage::EmbeddingPostprocess.as_str())
                             .with_recent_status("embedding complete"),
                     )
                     .unwrap();
                 store
                     .insert_task_span(
                         &task.id,
-                        "db",
+                        IngestTaskStage::SqliteWrite.as_str(),
                         &now,
                         1280,
                         &serde_json::json!({ "operation": "replace_source_contents" }),
@@ -9821,7 +10425,7 @@ mod tests {
                 store
                     .insert_task_span(
                         &task.id,
-                        "ingest_index_publishing",
+                        IngestTaskStage::VectorIndex.as_str(),
                         &now,
                         2058,
                         &serde_json::json!({}),
@@ -9843,8 +10447,10 @@ mod tests {
 
         assert_eq!(running_ingest_count(&state).await, 0);
         for child_id in child_ids {
-            let child = task_summary_response(&state, child_id).await.unwrap().task;
+            let child_response = task_summary_response(&state, child_id).await.unwrap();
+            let child = child_response.task;
             assert_eq!(child.status, TaskStatus::Failed);
+            assert!(has_task_terminalize_span(&child_response.spans));
             assert!(child
                 .error
                 .as_deref()
@@ -9853,6 +10459,8 @@ mod tests {
             assert_eq!(child.result.as_ref().unwrap()["resumable"], true);
         }
         wait_for_task_status(&state, &parent_id, TaskStatus::Failed).await;
+        let parent_response = task_summary_response(&state, parent_id).await.unwrap();
+        assert!(has_task_terminalize_span(&parent_response.spans));
         wait_for_task_status(&state, &followup_id, TaskStatus::Succeeded).await;
     }
 
