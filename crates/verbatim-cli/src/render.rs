@@ -799,8 +799,7 @@ fn task_queue_summary(
         history.baseline_total >= current_total
             && history.baseline_total > 0
             && (history.previous_total > current_total
-                || sampled_task_ids_overlap(history, &sampled_task_ids)
-                || history.last_event_sequence > 0)
+                || sampled_task_ids_overlap(history, &sampled_task_ids))
     });
     let baseline_total = reusable_history
         .map(|history| history.baseline_total)

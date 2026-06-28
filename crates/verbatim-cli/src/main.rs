@@ -2634,7 +2634,7 @@ mod tests {
                 previous_total: 5,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-old".into()],
-                last_event_sequence: 0,
+                last_event_sequence: 42,
             }));
         let mut current_queue = sample_task_list_response();
         current_queue.total = 5;
@@ -2777,7 +2777,7 @@ mod tests {
                 baseline_total: 10,
                 previous_total: 8,
                 sampled_at_ms: 1_000,
-                sampled_task_ids: vec!["task-a".into(), "task-b".into()],
+                sampled_task_ids: vec!["task-run".into()],
                 last_event_sequence: 100,
             }));
 
