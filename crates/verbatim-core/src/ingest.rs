@@ -2485,7 +2485,7 @@ where
             }
         }
         for committed in committed_sources {
-            cleanup_stale_source_image_artifacts(
+            if let Err(cleanup_error) = cleanup_stale_source_image_artifacts(
                 &self.data_dir,
                 &committed.source_id,
                 &committed.retained_image_artifacts,
@@ -2495,7 +2495,14 @@ where
                     "cleanup stale image artifacts after committed source ingest: {}",
                     committed.source_id.0
                 )
-            })?;
+            }) {
+                tracing::warn!(
+                    source = %committed.source_id.0,
+                    error = %cleanup_error,
+                    "stale image artifact cleanup failed after successful batched index publish; \
+                     source vectors and index generation remain valid",
+                );
+            }
             tracing::info!(source = %committed.source_id.0, "ingest complete");
         }
         Ok(generation)
@@ -6718,6 +6725,91 @@ mod tests {
                     .source_vectors_stale_for_profile(&profile, source_id)
                     .unwrap(),
                 "committed source must fail freshness after batched publish failure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_batch_publish_cleanup_failure_keeps_sources_embedded() {
+        // Regression: a post-publish stale-image-cleanup failure in the batched
+        // path must NOT be treated as an index publication failure. Once the
+        // HNSW generation has been published, committed sources must remain
+        // Embedded/fresh and outcomes must stay Ok.
+        let source_tempdir = tempfile::tempdir().unwrap();
+        // Use a real directory as data_dir so staging + publish succeed, then
+        // poison the per-source image artifact path so cleanup fails.
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            data_dir.path().to_path_buf(),
+        );
+        let first_path = source_tempdir.path().join("batch-cleanup-first.md");
+        let second_path = source_tempdir.path().join("batch-cleanup-second.md");
+        fs::write(&first_path, "# First\n\nAlpha batch cleanup vector body.").unwrap();
+        fs::write(&second_path, "# Second\n\nBeta batch cleanup vector body.").unwrap();
+        let first_id = pipeline.add_source(&first_path).unwrap();
+        let second_id = pipeline.add_source(&second_path).unwrap();
+        // Poison image artifact cleanup for both sources by turning their
+        // artifact directory paths into regular files.
+        write_blocking_image_artifact_path(data_dir.path(), &first_id);
+        write_blocking_image_artifact_path(data_dir.path(), &second_id);
+        let first_task = TaskId("task-batch-cleanup-first".into());
+        let second_task = TaskId("task-batch-cleanup-second".into());
+        for (task_id, source_id) in [(&first_task, &first_id), (&second_task, &second_id)] {
+            pipeline
+                .store()
+                .create_task(
+                    task_id,
+                    TaskKind::Ingest,
+                    &serde_json::json!({ "source_id": source_id.0 }),
+                )
+                .unwrap();
+            pipeline.store().start_task(task_id).unwrap();
+        }
+        let profile = EmbeddingProfileId::default_profile();
+        let generation_before = pipeline
+            .store()
+            .index_generation_for_profile(&profile)
+            .unwrap();
+
+        let outcomes = pipeline
+            .ingest_sources_with_tasks(&[
+                (first_id.clone(), first_task.clone()),
+                (second_id.clone(), second_task.clone()),
+            ])
+            .await;
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes.iter().all(|outcome| outcome.result.is_ok()),
+            "post-publish cleanup failure must not fail committed batch sources"
+        );
+        // The index generation was bumped exactly once for the batch.
+        assert_eq!(
+            pipeline
+                .store()
+                .index_generation_for_profile(&profile)
+                .unwrap(),
+            generation_before + 1,
+            "batched index publish must complete and bump the generation once"
+        );
+        for source_id in [&first_id, &second_id] {
+            assert_eq!(
+                pipeline
+                    .store()
+                    .count_vector_documents_for_profile(&profile, Some(source_id))
+                    .unwrap(),
+                1
+            );
+            assert!(
+                !pipeline
+                    .store()
+                    .source_vectors_stale_for_profile(&profile, source_id)
+                    .unwrap(),
+                "committed source must stay fresh after post-publish cleanup failure"
             );
         }
     }
