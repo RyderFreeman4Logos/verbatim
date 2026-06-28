@@ -433,12 +433,22 @@ where
     let config = runtime_config_snapshot(state)?.config;
     let data_dir = state.data_dir.clone();
     tokio::task::spawn_blocking(move || {
-        let _permit = permit;
         let mut pipeline = IngestPipeline::open_readonly(&config, &data_dir)?;
+        drop(permit);
         operation(&mut pipeline)
     })
     .await
     .context("join read-only query pipeline task")?
+}
+
+fn with_sqlite_reader_permit<T>(
+    resource: &Arc<ObservableResource>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _permit = resource
+        .acquire_blocking()
+        .context("acquire sqlite reader resource for query read")?;
+    operation()
 }
 
 async fn with_task_store_read<T, F>(state: &SharedState, operation: F) -> Result<T>
@@ -5134,13 +5144,16 @@ async fn prepare_retrieve_context(
     let question2 = question.to_string();
     let embedding_profile_id = embedding_profile_id.clone();
     let controls = controls.clone();
+    let sqlite_reader = Arc::clone(&state.resources.sqlite_reader);
     let runtime = tokio::runtime::Handle::current();
     with_query_pipeline(&state, move |pipeline| {
-        prepare_query_embedding_profile_readonly(
-            pipeline,
-            controls.config.embedding.enabled,
-            &embedding_profile_id,
-        )?;
+        with_sqlite_reader_permit(&sqlite_reader, || {
+            prepare_query_embedding_profile_readonly(
+                pipeline,
+                controls.config.embedding.enabled,
+                &embedding_profile_id,
+            )
+        })?;
         let lexical_index = pipeline.lexical_index();
         let embed_client = OpenAiEmbeddingClient::new(&controls.config.embedding);
         let retrieval = RetrievalPipeline::new_with_graph(
@@ -5154,6 +5167,7 @@ async fn prepare_retrieve_context(
         .with_embedding_enabled(controls.config.embedding.enabled)
         .with_vector_residency(controls.config.vector_index.residency)
         .require_embedding_profile(&embedding_profile_id)
+        .with_read_resource(Arc::clone(&sqlite_reader))
         .with_qdrant_search(&controls.config.qdrant);
         let source_filter_ref = source_filter.as_ref();
         let (mut results, mut debug) = match (
@@ -5178,14 +5192,17 @@ async fn prepare_retrieve_context(
                 .block_on(retrieval.search_source_set_with_debug(&question2, source_filter_ref))?,
         };
         if controls.config.graph.global_search.enabled && source_filter_ref.is_none() {
-            let global_results =
+            let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
                 GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
-                    .global_search_results(&question2, None)?;
+                    .global_search_results(&question2, None)
+            })?;
             let mut debug_option = Some(debug);
             prepend_global_results(&mut results, global_results, &mut debug_option);
             debug = debug_option.unwrap_or_else(empty_retrieval_debug);
         }
-        let source_paths = source_paths_for_results(&results, pipeline.store())?;
+        let source_paths = with_sqlite_reader_permit(&sqlite_reader, || {
+            source_paths_for_results(&results, pipeline.store())
+        })?;
         Ok::<_, anyhow::Error>(RetrievedContext {
             results,
             debug,
@@ -5235,14 +5252,17 @@ async fn prepare_generation_context(
     let embedding_profile_id = embedding_profile_id.clone();
     let config = config.clone();
     let data_dir = state.data_dir.clone();
+    let sqlite_reader = Arc::clone(&state.resources.sqlite_reader);
     let runtime = tokio::runtime::Handle::current();
     let (results, generation_context, retrieval_debug) =
         with_query_pipeline(&state, move |pipeline| {
-            prepare_query_embedding_profile_readonly(
-                pipeline,
-                config.embedding.enabled,
-                &embedding_profile_id,
-            )?;
+            with_sqlite_reader_permit(&sqlite_reader, || {
+                prepare_query_embedding_profile_readonly(
+                    pipeline,
+                    config.embedding.enabled,
+                    &embedding_profile_id,
+                )
+            })?;
             let lexical_index = pipeline.lexical_index();
             let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
             let retrieval = RetrievalPipeline::new_with_graph(
@@ -5256,6 +5276,7 @@ async fn prepare_generation_context(
             .with_embedding_enabled(config.embedding.enabled)
             .with_vector_residency(config.vector_index.residency)
             .require_embedding_profile(&embedding_profile_id)
+            .with_read_resource(Arc::clone(&sqlite_reader))
             .with_qdrant_search(&config.qdrant);
             let source_filter_ref = source_filter.as_ref();
             let (mut results, mut retrieval_debug) = run_generation_retrieval(
@@ -5267,12 +5288,15 @@ async fn prepare_generation_context(
                 show_retrieval,
             )?;
             if config.graph.global_search.enabled && source_filter_ref.is_none() {
-                let global_results =
+                let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
                     GraphRagService::new(pipeline.store(), &config.graph.global_search)
-                        .global_search_results(&question2, None)?;
+                        .global_search_results(&question2, None)
+                })?;
                 prepend_global_results(&mut results, global_results, &mut retrieval_debug);
             }
-            let image_artifacts = collect_image_artifacts_for_results(&results, pipeline.store())?;
+            let image_artifacts = with_sqlite_reader_permit(&sqlite_reader, || {
+                collect_image_artifacts_for_results(&results, pipeline.store())
+            })?;
             let image_attachments = select_image_attachments(
                 &results,
                 &image_artifacts,
@@ -7701,11 +7725,21 @@ mod tests {
             "Alpha retrieval evidence keeps the query embedding path active.",
         )
         .unwrap();
-        let config = retrieve_test_config(&model_server.base_url);
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.daemon.resources.sqlite_reader_concurrency = 1;
+        config.daemon.resources.sqlite_reader_queue_capacity = 1;
+        config.daemon.resources.sqlite_reader_queue_timeout_seconds = 5;
         let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
         let source_id = pipeline.add_source(&source_path).unwrap();
         pipeline.ingest_source(&source_id).await.unwrap();
         let state = test_state(config.clone(), test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
         let before_query_embeddings = model_server.embedding_requests();
         model_server.block_embeddings();
 
@@ -7752,6 +7786,30 @@ mod tests {
         .expect("retrieve reached blocked embedding provider");
 
         assert_exclusive_pipeline_available(&state).await;
+        let blocked_reader = state.resources.sqlite_reader.snapshot();
+        assert_eq!(
+            blocked_reader.active, 0,
+            "blocked embedding wait must not hold sqlite_reader"
+        );
+        assert_eq!(
+            blocked_reader.queued, 0,
+            "blocked embedding wait must not queue unrelated sqlite_reader work"
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            task_summary_response(&state, task_id.clone()),
+        )
+        .await
+        .expect("task status read remains responsive while embedding is blocked")
+        .unwrap();
+        assert_eq!(response.task.id, task_id);
+        let after_status_reader = state.resources.sqlite_reader.snapshot();
+        assert!(
+            after_status_reader.completed > blocked_reader.completed,
+            "task status read should be counted by sqlite_reader"
+        );
+        assert_eq!(after_status_reader.active, 0);
 
         model_server.release_embeddings();
         let context = tokio::time::timeout(Duration::from_secs(5), retrieve_task)
@@ -7760,6 +7818,11 @@ mod tests {
             .expect("retrieve task joins")
             .expect("retrieve context succeeds");
         assert!(!context.results.is_empty());
+        let completed_reader = state.resources.sqlite_reader.snapshot();
+        assert!(
+            completed_reader.completed > after_status_reader.completed,
+            "retrieve SQLite snapshot reads after provider release should be counted by sqlite_reader"
+        );
     }
 
     #[tokio::test]

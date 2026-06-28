@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 
 use crate::config::{GraphConfig, QdrantConfig, RerankConfig, RetrievalConfig};
 #[cfg(feature = "qdrant")]
 use crate::index::qdrant::{QdrantClient, QdrantHit};
 use crate::provider::ProviderError;
+use crate::resource::ObservableResource;
 use crate::store::Store;
 use crate::traits::{
     EmbeddingClient, LexicalIndex, RerankCapabilityState, RerankDiagnostics, RerankError,
@@ -42,6 +44,7 @@ pub struct RetrievalPipeline<'a> {
     reranker: Option<&'a dyn Reranker>,
     required_profile_id: Option<EmbeddingProfileId>,
     vector_residency: VectorIndexResidency,
+    read_resource: Option<Arc<ObservableResource>>,
     #[cfg(feature = "qdrant")]
     qdrant: Option<QdrantClient>,
 }
@@ -101,6 +104,7 @@ impl<'a> RetrievalPipeline<'a> {
             reranker: None,
             required_profile_id: None,
             vector_residency: VectorIndexResidency::ResidentHnsw,
+            read_resource: None,
             #[cfg(feature = "qdrant")]
             qdrant: None,
         }
@@ -126,6 +130,7 @@ impl<'a> RetrievalPipeline<'a> {
             reranker: None,
             required_profile_id: None,
             vector_residency: VectorIndexResidency::ResidentHnsw,
+            read_resource: None,
             #[cfg(feature = "qdrant")]
             qdrant: None,
         }
@@ -146,10 +151,25 @@ impl<'a> RetrievalPipeline<'a> {
         self
     }
 
+    pub fn with_read_resource(mut self, resource: Arc<ObservableResource>) -> Self {
+        self.read_resource = Some(resource);
+        self
+    }
+
     pub fn with_reranker(mut self, config: &'a RerankConfig, reranker: &'a dyn Reranker) -> Self {
         self.rerank_config = Some(config);
         self.reranker = Some(reranker);
         self
+    }
+
+    fn with_read_permit<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(resource) = &self.read_resource else {
+            return operation();
+        };
+        let _permit = resource
+            .acquire_blocking()
+            .context("acquire sqlite reader resource for retrieval read")?;
+        operation()
     }
 
     #[cfg(feature = "qdrant")]
@@ -226,15 +246,16 @@ impl<'a> RetrievalPipeline<'a> {
         if source_filter.is_some_and(HashSet::is_empty) {
             return Ok(empty_search_output(include_debug));
         }
-        if self.embedding_enabled {
-            self.ensure_required_profile_vectors(source_filter)?;
-        }
-
-        let all_child_count = if source_filter.is_some() {
-            self.store.list_child_chunks()?.len()
-        } else {
-            0
-        };
+        let all_child_count = self.with_read_permit(|| {
+            if self.embedding_enabled {
+                self.ensure_required_profile_vectors(source_filter)?;
+            }
+            if source_filter.is_some() {
+                Ok(self.store.list_child_chunks()?.len())
+            } else {
+                Ok(0)
+            }
+        })?;
         #[cfg(feature = "qdrant")]
         let qdrant_can_filter = self.qdrant.is_some();
         #[cfg(not(feature = "qdrant"))]
@@ -275,53 +296,66 @@ impl<'a> RetrievalPipeline<'a> {
                 (Vec::new(), None, RetrievalDenseVectorPath::Bm25Only)
             };
 
-        let bm25_results = self.lexical_index.search(query, bm25_top_k)?;
+        let (fused, bm25_hits, dense_hits, rrf_fused_hits) = self.with_read_permit(|| {
+            let bm25_results = self.lexical_index.search(query, bm25_top_k)?;
+            let mut fused = rrf_fusion(&dense_results, &bm25_results, self.config.rrf_k);
+            if let Some(source_ids) = source_filter {
+                fused.retain(|(chunk_id, _)| {
+                    self.store
+                        .get_chunk(chunk_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|chunk| source_ids.contains(&chunk.source_id))
+                });
+            }
 
-        let mut fused = rrf_fusion(&dense_results, &bm25_results, self.config.rrf_k);
-        if let Some(source_ids) = source_filter {
-            fused.retain(|(chunk_id, _)| {
-                self.store
-                    .get_chunk(chunk_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|chunk| source_ids.contains(&chunk.source_id))
-            });
-        }
-
-        let bm25_hits = if include_debug {
-            self.stage_debug_hits(&bm25_results, source_filter)?
-        } else {
-            Vec::new()
-        };
-        let dense_hits = if include_debug {
-            self.stage_debug_hits(&dense_results, source_filter)?
-        } else {
-            Vec::new()
-        };
-        let rrf_fused_hits = if include_debug {
-            self.fused_debug_hits(&fused, &dense_results, &bm25_results)?
-        } else {
-            Vec::new()
-        };
+            let bm25_hits = if include_debug {
+                self.stage_debug_hits(&bm25_results, source_filter)?
+            } else {
+                Vec::new()
+            };
+            let dense_hits = if include_debug {
+                self.stage_debug_hits(&dense_results, source_filter)?
+            } else {
+                Vec::new()
+            };
+            let rrf_fused_hits = if include_debug {
+                self.fused_debug_hits(&fused, &dense_results, &bm25_results)?
+            } else {
+                Vec::new()
+            };
+            Ok((fused, bm25_hits, dense_hits, rrf_fused_hits))
+        })?;
 
         let RerankOutcome {
             fused,
             debug: reranker_debug,
         } = self.rerank_fused(query, fused).await?;
 
-        let mut results = Vec::new();
-        for (rank, (chunk_id, score)) in fused.into_iter().enumerate() {
-            let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
-                continue;
+        let (results, graph_expanded_hits) = self.with_read_permit(|| {
+            let mut results = Vec::new();
+            for (rank, (chunk_id, score)) in fused.into_iter().enumerate() {
+                let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
+                    continue;
+                };
+                let result_rank = rank + 1;
+                let provenance = RetrievalProvenance::seed(
+                    result_rank,
+                    chunk.id.clone(),
+                    chunk.source_id.clone(),
+                );
+
+                results.push(self.result_for_chunk(chunk, score, provenance)?);
+            }
+
+            self.expand_graph_results(&mut results, source_filter)?;
+            let graph_expanded_hits = if include_debug {
+                graph_expansion_debug_hits(&results)
+            } else {
+                Vec::new()
             };
-            let result_rank = rank + 1;
-            let provenance =
-                RetrievalProvenance::seed(result_rank, chunk.id.clone(), chunk.source_id.clone());
-
-            results.push(self.result_for_chunk(chunk, score, provenance)?);
-        }
-
-        self.expand_graph_results(&mut results, source_filter)?;
+            Ok((results, graph_expanded_hits))
+        })?;
 
         let debug = if include_debug {
             Some(RetrievalDebug {
@@ -330,7 +364,7 @@ impl<'a> RetrievalPipeline<'a> {
                 bm25_hits,
                 dense_hits,
                 rrf_fused_hits,
-                graph_expanded_hits: graph_expansion_debug_hits(&results),
+                graph_expanded_hits,
                 reranker: reranker_debug,
                 final_evidence_pack: final_evidence_pack_debug(&results),
             })
@@ -378,7 +412,8 @@ impl<'a> RetrievalPipeline<'a> {
     ) -> Result<Vec<(ChunkId, f32)>> {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &self.qdrant {
-            let local_results = self.local_dense_search(query_vec, top_k, source_filter)?;
+            let local_results =
+                self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))?;
             if local_results.is_empty() {
                 return Ok(local_results);
             }
@@ -391,29 +426,34 @@ impl<'a> RetrievalPipeline<'a> {
                 }
             };
             let qdrant_source_filter = single_source_filter(source_filter);
-            let profile_generation = self.store.index_generation_for_profile(profile_id)?;
+            let profile_generation =
+                self.with_read_permit(|| self.store.index_generation_for_profile(profile_id))?;
             return match qdrant
                 .search(profile_id, query_vec, top_k, qdrant_source_filter)
                 .await
             {
-                Ok(results) => self.merge_preferred_dense_hits(
-                    profile_id,
-                    profile_generation,
-                    results,
-                    local_results,
-                    top_k,
-                    source_filter,
-                ),
+                Ok(results) => self.with_read_permit(|| {
+                    self.merge_preferred_dense_hits(
+                        profile_id,
+                        profile_generation,
+                        results,
+                        local_results,
+                        top_k,
+                        source_filter,
+                    )
+                }),
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
                         "qdrant search failed; falling back to local dense index"
                     );
-                    self.valid_dense_hits(local_results, top_k, source_filter)
+                    self.with_read_permit(|| {
+                        self.valid_dense_hits(local_results, top_k, source_filter)
+                    })
                 }
             };
         }
-        self.local_dense_search(query_vec, top_k, source_filter)
+        self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))
     }
 
     fn local_dense_search(
@@ -618,16 +658,19 @@ impl<'a> RetrievalPipeline<'a> {
             });
         };
 
-        let mut candidates = Vec::new();
-        for (chunk_id, _) in fused.iter().take(MAX_RERANK_CANDIDATE_CHUNKS) {
-            let Some(chunk) = self.store.get_chunk(chunk_id)? else {
-                continue;
-            };
-            candidates.push(RerankCandidate {
-                chunk_id: chunk_id.clone(),
-                text: rerank_document_text(&chunk),
-            });
-        }
+        let candidates = self.with_read_permit(|| {
+            let mut candidates = Vec::new();
+            for (chunk_id, _) in fused.iter().take(MAX_RERANK_CANDIDATE_CHUNKS) {
+                let Some(chunk) = self.store.get_chunk(chunk_id)? else {
+                    continue;
+                };
+                candidates.push(RerankCandidate {
+                    chunk_id: chunk_id.clone(),
+                    text: rerank_document_text(&chunk),
+                });
+            }
+            Ok(candidates)
+        })?;
 
         if candidates.is_empty() {
             return Ok(RerankOutcome {
