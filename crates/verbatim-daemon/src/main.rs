@@ -7331,8 +7331,9 @@ mod tests {
         let state = test_state(config, test_dir.path(), pipeline);
 
         for index in 0..(TASK_QUEUE_AGGREGATE_ACTIVE_SAMPLE_LIMIT + 5) {
-            create_persisted_task(
+            create_persisted_task_with_id(
                 &state,
+                TaskId(format!("task-aggregate-filler-{index:03}")),
                 TaskKind::Ask,
                 ask_request_metadata(
                     &format!("queued filler question {index}"),
@@ -7346,8 +7347,9 @@ mod tests {
             .unwrap();
         }
 
-        let embedding_wait = create_persisted_task(
+        let embedding_wait = create_persisted_task_with_id(
             &state,
+            TaskId("task-zz-aggregate-embedding-wait".into()),
             TaskKind::Ingest,
             ingest_task_request_metadata_with_queue_claim(
                 Some("src-wait-beyond-sample"),
@@ -7370,8 +7372,9 @@ mod tests {
         }
         record_task_progress(&state, &embedding_wait, progress).await;
 
-        let publish_wait = create_persisted_task(
+        let publish_wait = create_persisted_task_with_id(
             &state,
+            TaskId("task-zz-aggregate-publish-wait".into()),
             TaskKind::Ingest,
             ingest_task_request_metadata_with_queue_claim(
                 Some("src-publish-beyond-sample"),
