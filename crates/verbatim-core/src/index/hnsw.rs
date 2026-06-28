@@ -95,8 +95,14 @@ impl HnswIndex {
             .collect()
     }
 
+    /// Magic bytes prefixing bincode-serialized HNSW data for format detection.
+    const BINCODE_MAGIC: &[u8] = b"VRBH"; // Verbatim Binary Hnsw
+
     pub fn save(&self, path: &Path) -> Result<()> {
-        let data = serde_json::to_vec(&self.points).context("serialize HNSW data")?;
+        let payload = bincode::serialize(&self.points).context("serialize HNSW data (bincode)")?;
+        let mut data = Vec::with_capacity(Self::BINCODE_MAGIC.len() + payload.len());
+        data.extend_from_slice(Self::BINCODE_MAGIC);
+        data.extend_from_slice(&payload);
         std::fs::write(path, data).context("write HNSW index")?;
         Ok(())
     }
@@ -106,7 +112,14 @@ impl HnswIndex {
             return Ok(());
         }
         let data = std::fs::read(path).context("read HNSW index")?;
-        self.points = serde_json::from_slice(&data).context("deserialize HNSW data")?;
+        self.points = if data.starts_with(Self::BINCODE_MAGIC) {
+            // New bincode format.
+            bincode::deserialize(&data[Self::BINCODE_MAGIC.len()..])
+                .context("deserialize HNSW data (bincode)")?
+        } else {
+            // Legacy JSON format — backward compatibility.
+            serde_json::from_slice(&data).context("deserialize HNSW data (legacy JSON)")?
+        };
         self.build()?;
         Ok(())
     }
@@ -232,6 +245,10 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         index.save(tmp.path()).unwrap();
 
+        // Verify the file starts with bincode magic.
+        let raw = std::fs::read(tmp.path()).unwrap();
+        assert_eq!(&raw[..4], HnswIndex::BINCODE_MAGIC);
+
         let mut loaded = HnswIndex::new();
         loaded.load(tmp.path()).unwrap();
 
@@ -239,5 +256,26 @@ mod tests {
         let query = seeded_vec(4, 2);
         let results = loaded.search(&query, 1);
         assert_eq!(results[0].0 .0, "c-2");
+    }
+
+    #[test]
+    fn load_legacy_json_format() {
+        let mut index = HnswIndex::new();
+        for i in 0..3u64 {
+            index.add(&ChunkId(format!("legacy-{i}")), seeded_vec(4, i));
+        }
+
+        // Write in legacy JSON format (no magic prefix).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let json = serde_json::to_vec(&index.points).unwrap();
+        std::fs::write(tmp.path(), json).unwrap();
+
+        let mut loaded = HnswIndex::new();
+        loaded.load(tmp.path()).unwrap();
+
+        assert_eq!(loaded.len(), 3);
+        let query = seeded_vec(4, 1);
+        let results = loaded.search(&query, 1);
+        assert_eq!(results[0].0 .0, "legacy-1");
     }
 }
