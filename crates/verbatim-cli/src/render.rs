@@ -826,9 +826,17 @@ fn task_queue_summary(
             return Some(numerator.div_ceil(denominator) as u64);
         }
         // Fallback: the queue did not shrink (watcher backfilled new tasks), but
-        // the daemon's task-event sequence advanced.  Use the event delta as a
-        // proxy for throughput.  This is independent of the active-task total,
-        // so backfill masking does not affect it.
+        // the daemon reports recent terminalized events.  Use the event-sequence
+        // delta as a proxy for throughput, gated on recent_terminalized so that
+        // pure progress-chatter events do not produce a spurious ETA.
+        let recent_terminalized = response
+            .aggregate
+            .as_ref()
+            .map(|agg| agg.turnover.recent_terminalized)
+            .unwrap_or(0);
+        if recent_terminalized == 0 {
+            return None;
+        }
         let event_delta = current_event_sequence.saturating_sub(history.last_event_sequence);
         if event_delta == 0 || current_event_sequence == 0 {
             return None;

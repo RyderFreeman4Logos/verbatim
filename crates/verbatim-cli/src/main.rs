@@ -2810,6 +2810,45 @@ mod tests {
     }
 
     #[test]
+    fn task_list_eta_fallback_stays_dash_when_no_terminalized_events() {
+        // Plateau with overlapping IDs, advanced event sequence, but
+        // recent_terminalized=0 — no tasks completed.  ETA should stay "--".
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        *local.now_millis.borrow_mut() = 61_000;
+        local
+            .task_list_history
+            .replace(Some(render::TaskListAggregateHistory {
+                baseline_total: 10,
+                previous_total: 8,
+                sampled_at_ms: 1_000,
+                sampled_task_ids: vec!["task-run".into()],
+                last_event_sequence: 100,
+            }));
+        let mut response = sample_task_list_response();
+        response.total = 8;
+        response.tasks.truncate(4);
+        response.aggregate = Some(sample_task_list_aggregate_with_event_sequence(
+            0,   // terminalized — no completions
+            0,   // backfilled
+            0,   // embedding_waiting
+            0,   // oldest_embedding_wait_ms
+            0,   // publish_complete_running
+            200, // event_sequence_ceiling advanced (progress chatter only)
+        ));
+        client.task_list_response.replace(Some(response));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(
+            stdout.contains("ETA --"),
+            "expected ETA -- when no terminalized events, got: {stdout}"
+        );
+    }
+
+    #[test]
     fn plateau_queue_integration() {
         let local = MockLocalActions::default();
         *local.now_millis.borrow_mut() = 301_000;
