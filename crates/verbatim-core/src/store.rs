@@ -4141,8 +4141,6 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_status_updated_idx
     ON tasks(status, updated_at);
-CREATE INDEX IF NOT EXISTS tasks_active_progress_metadata_idx
-    ON tasks(status, progress_phase, progress_wait_reason, progress_recent_status, progress_phase_started_at);
 CREATE TABLE IF NOT EXISTS task_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -4579,6 +4577,119 @@ mod tests {
                 ),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn legacy_tasks_without_progress_metadata_columns_migrate_before_index_creation() {
+        let tempdir = tempdir().unwrap();
+        let db_path = tempdir.path().join("legacy-tasks.db");
+        let progress = TaskProgressSnapshot::phase(IngestTaskStage::EmbeddingQueueWait.as_str())
+            .with_wait_reason("embedding_batch")
+            .with_recent_status("waiting for embedding batch");
+        let progress_started_at = progress.phase.as_ref().unwrap().started_at.clone();
+        let progress_json = serde_json::to_string(&progress).unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    request_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT,
+                    progress_json TEXT
+                );
+                CREATE INDEX tasks_status_updated_idx
+                    ON tasks(status, updated_at);
+                ",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks
+                    (id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json)
+                 VALUES (?1, ?2, ?3, '1', '2', '1', NULL, '{}', NULL, NULL, ?4)",
+                params![
+                    "task-pre-160",
+                    TaskKind::Ingest.as_str(),
+                    TaskStatus::Running.as_str(),
+                    progress_json,
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = Store::new(&db_path).unwrap();
+        for column in [
+            "progress_phase",
+            "progress_wait_reason",
+            "progress_recent_status",
+            "progress_phase_started_at",
+        ] {
+            assert!(table_has_column(store.connection(), "tasks", column).unwrap());
+        }
+        let migrated_metadata = store
+            .connection()
+            .query_row(
+                "SELECT progress_phase, progress_wait_reason, progress_recent_status, progress_phase_started_at
+                 FROM tasks WHERE id = 'task-pre-160'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            migrated_metadata,
+            (
+                Some(IngestTaskStage::EmbeddingQueueWait.as_str().to_string()),
+                Some("embedding_batch".to_string()),
+                Some("waiting for embedding batch".to_string()),
+                Some(progress_started_at),
+            )
+        );
+        let index_exists = store
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'index' AND name = 'tasks_active_progress_metadata_idx'
+                )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
+
+        let summary = store
+            .get_task(&TaskId("task-pre-160".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.status, TaskStatus::Running);
+        assert_eq!(
+            summary
+                .progress
+                .and_then(|progress| progress.phase)
+                .map(|phase| phase.name),
+            Some(IngestTaskStage::EmbeddingQueueWait.as_str().to_string())
+        );
+        assert_eq!(
+            store
+                .active_task_metadata_aggregate(5)
+                .unwrap()
+                .embedding_waiting,
+            1
+        );
     }
 
     #[test]
