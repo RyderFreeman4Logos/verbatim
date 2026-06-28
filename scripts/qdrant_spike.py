@@ -48,7 +48,9 @@ MANIFEST_SCHEMA_VERSION = "qdrant-spike-manifest-v1"
 FAILURE_SCHEMA_VERSION = "qdrant-spike-failure-modes-v1"
 DEFAULT_OUTPUT_ROOT = Path("target/qdrant-spike")
 DEFAULT_QDRANT_URL = "http://127.0.0.1:6333"
+UNAVAILABLE_QDRANT_URL = "http://127.0.0.1:9"
 DEFAULT_QUERY = "Which evidence explains vector sink throughput and retrieval?"
+EXPECTED_CAPABILITY = "deterministic-spike"
 REAL_CONFIG_PATH = Path.home() / ".config" / "verbatim" / "config.toml"
 REAL_DATA_DIR = Path.home() / ".local" / "share" / "verbatim"
 FORBIDDEN_PAYLOAD_FIELDS = {
@@ -440,6 +442,11 @@ def run_variant(
                 write_bytes / (1024 * 1024) / source_count,
                 6,
             ),
+            "cpu_scope": "local_harness_process_only",
+            "physical_write_scope": "local_harness_process_and_sqlite_profile_only",
+            "qdrant_service_cpu_core_sec_per_source": None,
+            "qdrant_service_physical_write_mib_per_source": None,
+            "external_service_unmeasured": variant in {"qdrant-cache", "qdrant-primary"},
             "retrieve_latency": latency_summary(retrieve_samples),
             "run_duration_seconds": round(duration_seconds, 6),
         },
@@ -462,6 +469,14 @@ def run_variant(
             "local_vector_rows": local_vector_rows,
             "primary_vector_sink": "qdrant" if variant == "qdrant-primary" else "sqlite",
             "hnsw_primary_write": False,
+            "external_service_unmeasured": variant in {"qdrant-cache", "qdrant-primary"},
+            "service_cpu_core_sec_per_source": None,
+            "service_physical_write_mib_per_source": None,
+        },
+        "measurement_scope": {
+            "cpu_core_sec_per_source": "local harness process only; remote Qdrant service CPU is not included",
+            "physical_write_mib_per_source": "local harness process and isolated SQLite/profile writes only; remote Qdrant service writes are not included",
+            "qdrant_service_metrics": "unmeasured unless qdrant_service_* fields are non-null",
         },
         "artifacts": {
             "results_json": str(paths["results_path"]),
@@ -486,19 +501,8 @@ def run_failure_modes(
     paths = manifest_paths(manifest)
     paths["variant_dir"].mkdir(parents=True, exist_ok=True)
 
-    unavailable = QdrantHttp("http://127.0.0.1:9", qdrant_collection(manifest), 0.2)
-    unavailable_available = unavailable.is_available()
     cases: list[dict[str, JsonValue]] = [
-        {
-            "case": "qdrant_unavailable",
-            "expected": "cache mode falls back to local; primary mode fails explicitly",
-            "observed": (
-                "port 9 unavailable; cache fallback selected and primary would fail closed"
-                if not unavailable_available
-                else "unexpected service on port 9"
-            ),
-            "verdict": "pass" if not unavailable_available else "fail",
-        }
+        qdrant_unavailable_case(output_root / "failure-modes-unavailable")
     ]
 
     reset_case = collection_reset_case(manifest, qdrant_url)
@@ -517,6 +521,66 @@ def run_failure_modes(
     print(f"failure_modes_json={output_path}")
     print(f"FAILURE_MODES_JSON={json.dumps(report, sort_keys=True)}")
     return report
+
+
+def qdrant_unavailable_case(output_root: Path) -> dict[str, JsonValue]:
+    cache_result: dict[str, JsonValue] | None = None
+    cache_error: str | None = None
+    primary_error: str | None = None
+    try:
+        cache_result = run_variant(
+            "qdrant-cache",
+            output_root=output_root,
+            qdrant_url=UNAVAILABLE_QDRANT_URL,
+        )
+    except SpikeError as exc:
+        cache_error = str(exc)
+
+    try:
+        run_variant(
+            "qdrant-primary",
+            output_root=output_root,
+            qdrant_url=UNAVAILABLE_QDRANT_URL,
+        )
+    except SpikeError as exc:
+        primary_error = str(exc)
+
+    cache_fell_back = False
+    cache_final_evidence = 0
+    cache_qdrant_available: bool | None = None
+    cache_result_path: str | None = None
+    if cache_result is not None:
+        qdrant = cache_result.get("qdrant", {})
+        correctness = cache_result.get("correctness", {})
+        artifacts = cache_result.get("artifacts", {})
+        if isinstance(qdrant, dict):
+            cache_qdrant_available = bool(qdrant.get("available"))
+            cache_fell_back = (
+                qdrant.get("available") is False
+                and isinstance(qdrant.get("error"), str)
+                and "fell back to local search" in str(qdrant.get("error"))
+            )
+        if isinstance(correctness, dict):
+            cache_final_evidence = int(correctness.get("final_evidence_count", 0))
+        if isinstance(artifacts, dict):
+            cache_result_path = str(artifacts.get("results_json", ""))
+
+    primary_failed_closed = primary_error is not None and "qdrant-primary requires reachable Qdrant" in primary_error
+    verdict = "pass" if cache_fell_back and cache_final_evidence > 0 and primary_failed_closed else "fail"
+    return {
+        "case": "qdrant_unavailable",
+        "expected": "cache mode executes local fallback; primary mode executes fail-closed path",
+        "observed": {
+            "cache_result_path": cache_result_path,
+            "cache_error": cache_error,
+            "cache_qdrant_available": cache_qdrant_available,
+            "cache_fell_back_to_local": cache_fell_back,
+            "cache_final_evidence_count": cache_final_evidence,
+            "primary_error": primary_error,
+            "primary_failed_closed": primary_failed_closed,
+        },
+        "verdict": verdict,
+    }
 
 
 def collection_reset_case(manifest: dict[str, JsonValue], qdrant_url: str) -> dict[str, JsonValue]:
@@ -556,19 +620,32 @@ def stale_remote_hit_case(output_root: Path) -> dict[str, JsonValue]:
             create_schema(conn)
             chunks = ingest_fixture(conn, "qdrant-primary", manifest)
             current_generation = current_profile_generation(conn)
+            conn.execute(
+                "UPDATE chunks SET capability = ? WHERE id = ?",
+                ("wrong-capability", chunks[1].chunk_id),
+            )
+            conn.commit()
             fake_hits = [
                 RemoteHit(chunks[0].chunk_id, 0.99, current_generation - 1),
                 RemoteHit("missing-chunk", 0.98, current_generation),
+                RemoteHit(chunks[1].chunk_id, 0.97, current_generation),
             ]
             evidence, counters = hydrate_remote_hits(conn, fake_hits, current_generation, manifest)
         finally:
             conn.close()
-    rejected = counters["stale_generation_rejected"] + counters["missing_chunk_rejected"]
+    rejected = (
+        counters["stale_generation_rejected"]
+        + counters["missing_chunk_rejected"]
+        + counters["capability_mismatch_rejected"]
+    )
     return {
         "case": "stale_remote_hits",
-        "expected": "stale generation and missing remote hits are rejected before final evidence",
-        "observed": f"final_evidence={len(evidence)} rejected={rejected}",
-        "verdict": "pass" if not evidence and rejected == 2 else "fail",
+        "expected": "stale generation, missing, and capability-mismatch remote hits are rejected before final evidence",
+        "observed": (
+            f"final_evidence={len(evidence)} rejected={rejected} "
+            f"capability_mismatch_rejected={counters['capability_mismatch_rejected']}"
+        ),
+        "verdict": "pass" if not evidence and rejected == 3 else "fail",
     }
 
 
@@ -765,7 +842,7 @@ def ingest_fixture(
                     record.text,
                     record.text_preview,
                     collection_id,
-                    "deterministic-spike",
+                    EXPECTED_CAPABILITY,
                 ),
             )
             if variant in {"local", "qdrant-cache"}:
@@ -939,14 +1016,20 @@ def measure_retrieve_latency(
     }
     current_generation = current_profile_generation(conn)
     qdrant = QdrantHttp(qdrant_url, qdrant_collection(manifest), 1.0) if qdrant_available else None
+    if variant == "qdrant-primary" and qdrant is None:
+        raise SpikeError("qdrant-primary requires remote search before retrieval measurement")
     for _ in range(RETRIEVE_ITERATIONS):
         started = time.perf_counter()
         if qdrant is not None and variant in {"qdrant-cache", "qdrant-primary"}:
             try:
                 remote_hits = qdrant.search(deterministic_vector(DEFAULT_QUERY), 5)
-            except SpikeError:
+            except SpikeError as exc:
+                if variant == "qdrant-primary":
+                    raise SpikeError("qdrant-primary remote search failed") from exc
                 remote_hits = []
             evidence, counters = hydrate_remote_hits(conn, remote_hits, current_generation, manifest)
+            if variant == "qdrant-primary" and not evidence:
+                raise SpikeError("qdrant-primary remote search returned no hydrated evidence")
             if not evidence and variant == "qdrant-cache":
                 evidence = local_dense_search(conn, DEFAULT_QUERY, 5)
         else:
@@ -967,8 +1050,16 @@ def measure_retrieve_latency(
     }
     correctness_value["evidence_hydration_required"] = variant in {"qdrant-cache", "qdrant-primary"}
     correctness_value["stale_or_mismatch_hits_entered_final_evidence"] = False
-    correctness_value["verdict"] = "pass"
+    correctness_value["verdict"] = correctness_verdict(variant, correctness)
     return samples, correctness_value, qdrant.stats if qdrant is not None else QdrantStats.empty()
+
+
+def correctness_verdict(variant: str, correctness: dict[str, int]) -> str:
+    if variant == "qdrant-primary" and correctness.get("hydrated_remote_hits", 0) == 0:
+        return "fail"
+    if correctness.get("final_evidence_count", 0) == 0:
+        return "fail"
+    return "pass"
 
 
 def local_dense_search(
@@ -1026,7 +1117,7 @@ def hydrate_remote_hits(
             continue
         row = conn.execute(
             """
-            SELECT id, source_id, text_preview, collection_id, capability
+        SELECT id, source_id, text_preview, collection_id, capability
             FROM chunks
             WHERE id = ?
             """,
@@ -1036,7 +1127,11 @@ def hydrate_remote_hits(
             counters["missing_chunk_rejected"] += 1
             continue
         source_id = str(row[1])
-        if source_id not in allowed_sources or str(row[3]) != collection_id:
+        if (
+            source_id not in allowed_sources
+            or str(row[3]) != collection_id
+            or str(row[4]) != EXPECTED_CAPABILITY
+        ):
             counters["capability_mismatch_rejected"] += 1
             continue
         counters["hydrated_remote_hits"] += 1
@@ -1191,6 +1286,51 @@ class HarnessTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(row[0], 0)
 
+    def test_primary_retrieve_requires_remote_hydrated_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="verbatim-qdrant-test-") as tmp:
+            manifest = build_manifest("qdrant-primary", Path(tmp) / "qdrant-spike")
+            paths = manifest_paths(manifest)
+            paths["data_dir"].mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(paths["data_dir"] / "verbatim-spike.db")
+            try:
+                create_schema(conn)
+                ingest_fixture(conn, "qdrant-primary", manifest)
+                with self.assertRaisesRegex(SpikeError, "requires remote search"):
+                    measure_retrieve_latency(
+                        conn,
+                        manifest,
+                        "qdrant-primary",
+                        UNAVAILABLE_QDRANT_URL,
+                        qdrant_available=False,
+                    )
+            finally:
+                conn.close()
+
+    def test_hydration_rejects_capability_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="verbatim-qdrant-test-") as tmp:
+            manifest = build_manifest("qdrant-primary", Path(tmp) / "qdrant-spike")
+            paths = manifest_paths(manifest)
+            paths["data_dir"].mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(paths["data_dir"] / "verbatim-spike.db")
+            try:
+                create_schema(conn)
+                chunks = ingest_fixture(conn, "qdrant-primary", manifest)
+                conn.execute(
+                    "UPDATE chunks SET capability = ? WHERE id = ?",
+                    ("wrong-capability", chunks[0].chunk_id),
+                )
+                conn.commit()
+                evidence, counters = hydrate_remote_hits(
+                    conn,
+                    [RemoteHit(chunks[0].chunk_id, 0.99, current_profile_generation(conn))],
+                    current_profile_generation(conn),
+                    manifest,
+                )
+            finally:
+                conn.close()
+        self.assertEqual(evidence, [])
+        self.assertEqual(counters["capability_mismatch_rejected"], 1)
+
     def test_payload_privacy(self) -> None:
         manifest = build_manifest("qdrant-cache")
         with tempfile.TemporaryDirectory(prefix="verbatim-qdrant-test-") as tmp:
@@ -1213,6 +1353,14 @@ class HarnessTests(unittest.TestCase):
         cases = {case["case"]: case for case in report["cases"]}  # type: ignore[index]
         self.assertEqual(set(cases), {"qdrant_unavailable", "collection_reset", "stale_remote_hits"})
         self.assertEqual(report["verdict"], "pass")
+        unavailable = cases["qdrant_unavailable"]
+        observed = unavailable["observed"]
+        self.assertIsInstance(observed, dict)
+        self.assertTrue(observed["cache_fell_back_to_local"])  # type: ignore[index]
+        self.assertGreater(observed["cache_final_evidence_count"], 0)  # type: ignore[index]
+        self.assertTrue(observed["primary_failed_closed"])  # type: ignore[index]
+        stale = cases["stale_remote_hits"]
+        self.assertIn("capability_mismatch_rejected=1", str(stale["observed"]))
 
     def assert_required_metrics(self, result: dict[str, JsonValue]) -> None:
         metrics = result["metrics"]
@@ -1224,11 +1372,17 @@ class HarnessTests(unittest.TestCase):
             "cpu_core_sec_per_source",
             "physical_write_mib_per_source",
             "retrieve_latency",
+            "cpu_scope",
+            "physical_write_scope",
+            "qdrant_service_cpu_core_sec_per_source",
+            "qdrant_service_physical_write_mib_per_source",
+            "external_service_unmeasured",
         ):
             self.assertIn(key, metrics)
         retrieve_latency = metrics["retrieve_latency"]  # type: ignore[index]
         self.assertIn("p50_ms", retrieve_latency)
         self.assertIn("p95_ms", retrieve_latency)
+        self.assertEqual(metrics["cpu_scope"], "local_harness_process_only")
 
 
 def main(argv: list[str] | None = None) -> int:

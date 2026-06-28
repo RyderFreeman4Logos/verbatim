@@ -35,6 +35,8 @@ Required result fields are under these JSON paths:
 - `metrics.retrieve_latency.p50_ms`
 - `metrics.retrieve_latency.p95_ms`
 
+`metrics.cpu_core_sec_per_source` and `metrics.physical_write_mib_per_source` are local harness/client measurements only. Qdrant service CPU and physical writes are reported separately as `metrics.qdrant_service_cpu_core_sec_per_source`, `metrics.qdrant_service_physical_write_mib_per_source`, and `metrics.external_service_unmeasured`. When the Qdrant service fields are null, the local-client numbers must not be treated as total system CPU or total system write amplification.
+
 ## Latest Local Run
 
 Raw result artifacts are intentionally uncommitted.
@@ -45,28 +47,30 @@ Run environment:
 - Image used: `qdrant/qdrant:latest`, pulled with digest `sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c`.
 - Fixture: 4 deterministic sources, 6 chunks/vectors, `fixture_hash=86c0895847cd967902266dd0bd34a5f9df88e099e309aa039f2c16d0eb6435f8`.
 
-| Variant | Artifact | source/sec | chunks/sec | vectors/sec | CPU core-sec/source | write MiB/source | retrieve p50/p95 ms | run seconds | Qdrant ops | Failure verdict |
+| Variant | Artifact | source/sec | chunks/sec | vectors/sec | local client CPU core-sec/source | local client/profile write MiB/source | retrieve p50/p95 ms | run seconds | Qdrant ops | Failure verdict |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| `local` | `target/qdrant-spike/local/results.json` | 1.216852 | 1.825278 | 1.825278 | 0.003497 | 0.241211 | 0.069 / 0.188 | 3.287170 | `{}` | `pass` |
-| `qdrant-cache` | `target/qdrant-spike/qdrant-cache/results.json` | 0.606758 | 0.910138 | 0.910138 | 0.004734 | 0.127930 | 1.113 / 1.608 | 6.592410 | `availability_check=1, collection_create=1, collection_delete=1, search_requests=9, upsert_requests=1, upsert_points=6` | `pass` |
-| `qdrant-primary` | `target/qdrant-spike/qdrant-primary/results.json` | 0.633657 | 0.950486 | 0.950486 | 0.004569 | 0.194336 | 0.964 / 1.773 | 6.312560 | `availability_check=1, collection_create=1, collection_delete=1, search_requests=9, upsert_requests=1, upsert_points=6` | `pass` |
+| `local` | `target/qdrant-spike/local/results.json` | 44.650088 | 66.975132 | 66.975132 | 0.001540 | 0.237305 | 0.034 / 0.133 | 0.089585 | `{}` | `pass` |
+| `qdrant-cache` | `target/qdrant-spike/qdrant-cache/results.json` | 6.257754 | 9.386631 | 9.386631 | 0.003795 | 0.233398 | 1.648 / 3.224 | 0.639207 | `availability_check=1, collection_create=1, collection_delete=1, search_requests=9, upsert_requests=1, upsert_points=6` | `pass` |
+| `qdrant-primary` | `target/qdrant-spike/qdrant-primary/results.json` | 5.472629 | 8.208943 | 8.208943 | 0.005881 | 0.229492 | 4.709 / 5.952 | 0.730910 | `availability_check=1, collection_create=1, collection_delete=1, search_requests=9, upsert_requests=1, upsert_points=6` | `pass` |
 
-Every numeric table value must trace directly to the matching `results.json` field path listed above. If Qdrant is unavailable, the table must stay explicit about skipped remote timings rather than substituting simulated numbers.
+Every numeric table value must trace directly to the matching `results.json` field path listed above. If Qdrant is unavailable, the table must stay explicit about skipped remote timings rather than substituting simulated numbers. Qdrant service CPU/write totals are not inferred from local client process counters.
 
 The micro-fixture is deliberately small, so source/chunk/vector throughput is dominated by SQLite fsync, process scheduling, and Qdrant collection setup. Treat the table as a repeatability and correctness smoke result, not as production throughput evidence.
 
 Additional result paths:
 
-- `qdrant.operation_timing_ms.search_requests`: 9.467 ms for cache, 8.530 ms for primary.
-- `qdrant.operation_timing_ms.upsert_requests`: 4.392 ms for cache, 5.017 ms for primary.
+- `qdrant.operation_timing_ms.search_requests`: 14.534 ms for cache, 33.684 ms for primary.
+- `qdrant.operation_timing_ms.upsert_requests`: 18.229 ms for cache, 17.602 ms for primary.
 - `qdrant.local_vector_rows`: 6 for local/cache, 0 for primary.
+- `metrics.external_service_unmeasured`: `false` for local, `true` for cache/primary.
+- `correctness.hydrated_remote_hits`: 45 for cache and primary.
 - `privacy.verdict`: `pass` for all variants.
 - `correctness.verdict`: `pass` for all variants.
 
 ## Adversarial Self-Review
 
 - Measurement bias: valid finding. The committed fixture is too small and setup/fsync dominates throughput. The report documents this and does not claim production throughput.
-- Stale correctness: no unresolved finding. Remote hits hydrate through SQLite and stale/missing hits are rejected in `--failure-modes`.
+- Stale correctness: no unresolved finding. Remote hits hydrate through SQLite and stale/missing/capability-mismatch hits are rejected in `--failure-modes`.
 - Privacy payload: no unresolved finding. The harness rejects forbidden payload fields and enforces a 240-character preview bound.
 - Default behavior drift: no unresolved finding. Production Rust ingest/retrieve code is unchanged; qdrant-primary exists only behind `--variant qdrant-primary`.
 - False performance wins: valid risk. The recommendation does not treat lower primary local vector rows as enough to promote Qdrant because retrieve latency and total run time did not improve.
@@ -79,13 +83,13 @@ The harness checks collection freshness before retrieve measurement:
 - stale source/profile generation;
 - unembedded source members.
 
-Remote Qdrant hits are never final evidence by themselves. They must hydrate through the local SQLite chunk table and match the current profile generation and fixture collection before entering final evidence. Stale generation hits, missing chunk hits, and collection/capability mismatches are rejected and counted in `correctness`.
+Remote Qdrant hits are never final evidence by themselves. They must hydrate through the local SQLite chunk table and match the current profile generation, fixture collection, and expected capability before entering final evidence. Stale generation hits, missing chunk hits, and collection/capability mismatches are rejected and counted in `correctness`.
 
 `just bench-qdrant-spike --failure-modes` covers:
 
 - Qdrant unavailable: cache mode falls back to local; primary mode fails explicitly.
 - Collection reset: remote search after reset must not return stale final evidence.
-- Stale remote hits: stale generation and missing chunk hits are rejected before final evidence.
+- Stale remote hits: stale generation, missing chunk, and capability-mismatch hits are rejected before final evidence.
 
 ## Privacy
 
@@ -104,13 +108,13 @@ Qdrant payload inspection runs for cache and primary records. Allowed payload fi
 
 Recommendation: **defer Qdrant**.
 
-Current evidence does not justify promoting Qdrant to the primary vector sink. The primary prototype proved the shape is testable (`qdrant.local_vector_rows=0`) and privacy/correctness gates can pass, but on this small fixture Qdrant adds remote reset/upsert/search work and retrieve latency is higher than local. The fixture is too small to make a production throughput claim, so the right decision is to defer Qdrant and first run the harness against a representative ingest collection. The existing architecture should remain unchanged: local vectors stay authoritative and Qdrant remains optional.
+Current evidence does not justify promoting Qdrant to the primary vector sink. The primary prototype proved the shape is testable (`qdrant.local_vector_rows=0`) and privacy/correctness gates can pass, but on this small fixture Qdrant adds remote reset/upsert/search work and retrieve latency is higher than local. The fixture is too small to make a production throughput claim, and Qdrant service CPU/write resources were not included in the local-client counters, so the right decision is to defer Qdrant and first run the harness against a representative ingest collection with explicit service-side measurement. The existing architecture should remain unchanged: local vectors stay authoritative and Qdrant remains optional.
 
 Tradeoffs:
 
 - Throughput: local was faster on this fixture; Qdrant variants were dominated by remote setup and SQLite metadata work.
-- CPU: Qdrant variants consumed slightly more local CPU per source in this run.
-- Write amplification: qdrant-primary skipped local vector rows, but total measured write MiB did not show a decisive production-scale win.
+- CPU: Qdrant variants consumed slightly more local harness/client CPU per source in this run; Qdrant service CPU was unmeasured.
+- Write amplification: qdrant-primary skipped local vector rows, but the reported write metric covers only local harness/profile writes; Qdrant service physical writes were unmeasured.
 - Retrieve latency: local p50/p95 was lower than both Qdrant variants.
 - Correctness: all variants passed hydration, generation freshness, and failure-mode checks.
 - Failure modes: cache fallback and primary fail-closed behavior are covered by `failure-modes.json`.
