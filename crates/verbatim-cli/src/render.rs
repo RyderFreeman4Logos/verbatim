@@ -26,11 +26,13 @@ pub struct TaskListAggregateHistory {
     /// Stable sample of active task IDs used to avoid reusing history across queue drains.
     #[serde(default)]
     pub sampled_task_ids: Vec<String>,
-    /// Completed-task count at the previous sample (`baseline_total - previous_total`).
-    /// Used as a fallback ETA throughput signal when the watcher backfills new tasks
-    /// and the active total does not shrink between samples.
+    /// Highest `task_events.id` observed at the previous sample (0 if unavailable).
+    ///
+    /// This is a daemon-provided monotonically advancing event sequence number.
+    /// Unlike `baseline_total - current_total`, it is not masked by watcher backfilling
+    /// and serves as a reliable throughput signal for ETA estimation on plateau queues.
     #[serde(default)]
-    pub completed: usize,
+    pub last_event_sequence: i64,
 }
 
 const TASK_LIST_HISTORY_SAMPLE_TASKS: usize = 32;
@@ -787,12 +789,18 @@ fn task_queue_summary(
 ) -> TaskQueueSummary {
     let current_total = response.total.max(response.tasks.len());
     let sampled_task_ids = sample_task_ids(response);
+    // Monotonically advancing daemon event sequence (0 when aggregate is absent).
+    let current_event_sequence = response
+        .aggregate
+        .as_ref()
+        .map(|agg| agg.turnover.window.event_sequence_ceiling)
+        .unwrap_or(0);
     let reusable_history = history.filter(|history| {
         history.baseline_total >= current_total
             && history.baseline_total > 0
             && (history.previous_total > current_total
                 || sampled_task_ids_overlap(history, &sampled_task_ids)
-                || history.completed > 0)
+                || history.last_event_sequence > 0)
     });
     let baseline_total = reusable_history
         .map(|history| history.baseline_total)
@@ -811,23 +819,23 @@ fn task_queue_summary(
         if elapsed_ms == 0 {
             return None;
         }
-        // Prefer the absolute completion delta when the queue shrank
-        // between samples (the original, most reliable path).
+        // Primary path: the queue shrank between samples — throughput is unambiguous.
         if history.previous_total > current_total {
             let completed_since_previous = history.previous_total - current_total;
             let numerator = current_total as u128 * elapsed_ms as u128;
             let denominator = completed_since_previous as u128 * 1000;
             return Some(numerator.div_ceil(denominator) as u64);
         }
-        // Fallback: the queue did not shrink between samples (new tasks were
-        // backfilled by the watcher), but we know the baseline completion count
-        // advanced.  Estimate throughput from the completion-count delta.
-        let completion_delta = completed.saturating_sub(history.completed);
-        if completion_delta == 0 {
+        // Fallback: the queue did not shrink (watcher backfilled new tasks), but
+        // the daemon's task-event sequence advanced.  Use the event delta as a
+        // proxy for throughput.  This is independent of the active-task total,
+        // so backfill masking does not affect it.
+        let event_delta = current_event_sequence.saturating_sub(history.last_event_sequence);
+        if event_delta == 0 || current_event_sequence == 0 {
             return None;
         }
         let numerator = current_total as u128 * elapsed_ms as u128;
-        let denominator = completion_delta as u128 * 1000;
+        let denominator = event_delta as u128 * 1000;
         Some(numerator.div_ceil(denominator) as u64)
     });
     let reusable_active_total_unchanged = reusable_history.is_some_and(|history| {
@@ -856,7 +864,7 @@ fn task_queue_summary(
             previous_total: current_total,
             sampled_at_ms,
             sampled_task_ids,
-            completed,
+            last_event_sequence: current_event_sequence,
         },
     }
 }

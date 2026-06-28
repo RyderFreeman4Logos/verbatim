@@ -2600,7 +2600,7 @@ mod tests {
                 previous_total: 842,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: (0..32).map(|index| format!("old-task-{index}")).collect(),
-                completed: 0,
+                last_event_sequence: 0,
             }));
         let mut current_queue = sample_task_list_response();
         current_queue.total = 650;
@@ -2634,7 +2634,7 @@ mod tests {
                 previous_total: 5,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-old".into()],
-                completed: 0,
+                last_event_sequence: 0,
             }));
         let mut current_queue = sample_task_list_response();
         current_queue.total = 5;
@@ -2668,7 +2668,7 @@ mod tests {
                 previous_total: 1,
                 sampled_at_ms: 301_000,
                 sampled_task_ids: vec!["task-run".into()],
-                completed: 0,
+                last_event_sequence: 0,
             }));
         client.task_list_response.replace(Some(TaskListResponse {
             total: 0,
@@ -2696,7 +2696,7 @@ mod tests {
                 previous_total: 4,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-run".into()],
-                completed: 0,
+                last_event_sequence: 0,
             }));
         let mut response = sample_task_list_response();
         response.aggregate = Some(sample_task_list_aggregate(3, 3, 2, 125_000, 1));
@@ -2724,7 +2724,7 @@ mod tests {
                 previous_total: 4,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-run".into()],
-                completed: 0,
+                last_event_sequence: 0,
             }));
         let mut response = sample_task_list_response();
         response.aggregate = Some(sample_task_list_aggregate(0, 0, 0, 0, 0));
@@ -2747,7 +2747,7 @@ mod tests {
                 previous_total: 4,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-run".into()],
-                completed: 0,
+                last_event_sequence: 0,
             }));
         client
             .task_list_response
@@ -2763,6 +2763,53 @@ mod tests {
     }
 
     #[test]
+    fn task_list_eta_fallback_from_event_sequence_on_backfill_plateau() {
+        // Scenario: baseline had 10 tasks, previous sample had 8 active,
+        // 2 completed and the watcher backfilled 2 more so the current
+        // active total is still 8.  The task-event sequence advanced from
+        // 100 to 200 over 60 seconds.  The ETA should be non-"--".
+        let client = MockDaemonClient::default();
+        let local = MockLocalActions::default();
+        *local.now_millis.borrow_mut() = 61_000;
+        local
+            .task_list_history
+            .replace(Some(render::TaskListAggregateHistory {
+                baseline_total: 10,
+                previous_total: 8,
+                sampled_at_ms: 1_000,
+                sampled_task_ids: vec!["task-a".into(), "task-b".into()],
+                last_event_sequence: 100,
+            }));
+
+        let mut response = sample_task_list_response();
+        // Override to simulate backfill plateau: total stayed at 8 but
+        // event_sequence_ceiling advanced to 200.
+        response.total = 8;
+        response.tasks.truncate(4);
+        response.aggregate = Some(sample_task_list_aggregate_with_event_sequence(
+            2,   // terminalized
+            2,   // backfilled
+            0,   // embedding_waiting
+            0,   // oldest_embedding_wait_ms
+            0,   // publish_complete_running
+            200, // event_sequence_ceiling
+        ));
+        client.task_list_response.replace(Some(response));
+
+        let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        // ETA should be present (not "--"): 8 tasks remaining at a rate of
+        // 100 events / 60s = ~1.67 events/s → ~4.8s per task → ~38s total.
+        // The exact number depends on rounding; we just verify it's not "--".
+        assert!(
+            stdout.contains("ETA ") && !stdout.contains("ETA --"),
+            "expected ETA to be non-'--', got: {stdout}"
+        );
+    }
+
+    #[test]
     fn plateau_queue_integration() {
         let local = MockLocalActions::default();
         *local.now_millis.borrow_mut() = 301_000;
@@ -2773,7 +2820,7 @@ mod tests {
                 previous_total: 4,
                 sampled_at_ms: 1_000,
                 sampled_task_ids: vec!["task-run".into()],
-                completed: 0,
+                last_event_sequence: 0,
             }));
         let mut daemon_response = sample_task_list_response();
         daemon_response.aggregate = Some(sample_task_list_aggregate(1, 1, 1, 65_000, 1));
@@ -4319,6 +4366,24 @@ mod tests {
         oldest_embedding_wait_ms: u64,
         publish_complete_running: usize,
     ) -> TaskListAggregate {
+        sample_task_list_aggregate_with_event_sequence(
+            terminalized,
+            backfilled,
+            embedding_waiting,
+            oldest_embedding_wait_ms,
+            publish_complete_running,
+            42,
+        )
+    }
+
+    fn sample_task_list_aggregate_with_event_sequence(
+        terminalized: usize,
+        backfilled: usize,
+        embedding_waiting: usize,
+        oldest_embedding_wait_ms: u64,
+        publish_complete_running: usize,
+        event_sequence_ceiling: i64,
+    ) -> TaskListAggregate {
         let embedding_reasons = match embedding_waiting {
             0 => Vec::new(),
             1 => vec![TaskReasonBucket {
@@ -4351,7 +4416,7 @@ mod tests {
             turnover: TaskQueueTurnover {
                 window: TaskQueueTurnoverWindow {
                     event_sequence_floor: 7,
-                    event_sequence_ceiling: 42,
+                    event_sequence_ceiling,
                     event_limit: 1000,
                 },
                 recent_terminalized: terminalized,
