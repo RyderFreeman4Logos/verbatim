@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -128,6 +128,7 @@ pub struct ObservableResource {
     name: String,
     kind: String,
     state: Mutex<ResourceState>,
+    condvar: Condvar,
     notify: tokio::sync::Notify,
     metrics: ResourceMetrics,
     created_at: Instant,
@@ -150,6 +151,7 @@ impl ObservableResource {
                 active: 0,
                 queued: 0,
             }),
+            condvar: Condvar::new(),
             notify: tokio::sync::Notify::new(),
             metrics: ResourceMetrics::default(),
             created_at: Instant::now(),
@@ -164,6 +166,7 @@ impl ObservableResource {
             state.queue_capacity = config.queue_capacity;
             state.queue_timeout = config.queue_timeout;
         }
+        self.condvar.notify_all();
         self.notify.notify_waiters();
     }
 
@@ -218,6 +221,7 @@ impl ObservableResource {
                     state.queued = state.queued.saturating_sub(1);
                 }
                 self.metrics.record_error();
+                self.condvar.notify_one();
                 self.notify.notify_one();
                 Err(ResourceQueueError::Timeout {
                     name: self.name.clone(),
@@ -225,6 +229,64 @@ impl ObservableResource {
                     timeout,
                 })
             }
+        }
+    }
+
+    pub fn acquire_blocking(self: &Arc<Self>) -> Result<ResourcePermit, ResourceQueueError> {
+        let timeout = {
+            let state = lock_unpoisoned(&self.state);
+            state.queue_timeout
+        };
+        let wait_started = Instant::now();
+        let mut enqueued = false;
+        let mut state = lock_unpoisoned(&self.state);
+        loop {
+            if state.active < state.capacity {
+                state.active += 1;
+                if enqueued {
+                    state.queued = state.queued.saturating_sub(1);
+                }
+                let queue_wait_ms = elapsed_ms(wait_started);
+                self.metrics.record_queue_wait(queue_wait_ms);
+                return Ok(ResourcePermit {
+                    resource: Arc::clone(self),
+                    service_started: Instant::now(),
+                    queue_wait_ms,
+                });
+            }
+
+            if !enqueued {
+                if state.queued >= state.queue_capacity {
+                    self.metrics.record_error();
+                    return Err(ResourceQueueError::Full {
+                        name: self.name.clone(),
+                        kind: self.kind.clone(),
+                        queue_capacity: state.queue_capacity,
+                    });
+                }
+                state.queued += 1;
+                enqueued = true;
+            }
+
+            let elapsed = wait_started.elapsed();
+            if elapsed >= timeout {
+                state.queued = state.queued.saturating_sub(1);
+                self.metrics.record_error();
+                self.condvar.notify_one();
+                self.notify.notify_one();
+                return Err(ResourceQueueError::Timeout {
+                    name: self.name.clone(),
+                    kind: self.kind.clone(),
+                    timeout,
+                });
+            }
+
+            let remaining = timeout.saturating_sub(elapsed);
+            let (next_state, _) = match self.condvar.wait_timeout(state, remaining) {
+                Ok(wait_result) => wait_result,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state = next_state;
         }
     }
 
@@ -262,6 +324,7 @@ impl ObservableResource {
             let mut state = lock_unpoisoned(&self.state);
             state.active = state.active.saturating_sub(1);
         }
+        self.condvar.notify_one();
         self.notify.notify_one();
     }
 }
@@ -484,5 +547,37 @@ mod tests {
         assert_eq!(snapshot.active, 1);
         assert_eq!(snapshot.queued, 0);
         assert_eq!(snapshot.errors, 1);
+    }
+
+    #[test]
+    fn blocking_acquire_waits_and_reports_queue_time() {
+        let resource = Arc::new(ObservableResource::new(
+            "blocking_resource",
+            "test_kind",
+            ResourceLimitConfig {
+                capacity: 1,
+                queue_capacity: 1,
+                queue_timeout: Duration::from_secs(5),
+            },
+        ));
+
+        let first = resource.acquire_blocking().expect("first permit");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            drop(first);
+        });
+
+        let second = resource
+            .acquire_blocking()
+            .expect("second permit waits for release");
+        assert!(second.queue_wait_ms() > 0);
+        drop(second);
+        release.join().expect("release thread joins");
+
+        let snapshot = resource.snapshot();
+        assert_eq!(snapshot.completed, 2);
+        assert_eq!(snapshot.active, 0);
+        assert!(snapshot.queue_wait_ms_total > 0);
+        assert!(snapshot.service_ms_total > 0);
     }
 }

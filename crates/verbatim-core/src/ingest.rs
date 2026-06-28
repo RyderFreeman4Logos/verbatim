@@ -342,6 +342,13 @@ async fn acquire_ingest_resource(name: &'static str, kind: &'static str) -> Resu
     Ok(ingest_resource(name, kind).acquire().await?)
 }
 
+fn acquire_ingest_resource_blocking(
+    name: &'static str,
+    kind: &'static str,
+) -> Result<ResourcePermit> {
+    Ok(ingest_resource(name, kind).acquire_blocking()?)
+}
+
 fn waiting_resource_progress(name: &'static str, kind: &'static str) -> TaskResourceProgress {
     TaskResourceProgress::from_snapshot(
         &ingest_resource(name, kind).snapshot(),
@@ -1339,8 +1346,13 @@ where
         }
         let mut stale = stale_set.into_iter().collect::<Vec<_>>();
         stale.sort_by(|left, right| left.0.cmp(&right.0));
-        for id in &stale {
-            self.store.update_source_status(id, &SourceStatus::Stale)?;
+        if !stale.is_empty() {
+            let sqlite_write_permit =
+                acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
+            for id in &stale {
+                self.store.update_source_status(id, &SourceStatus::Stale)?;
+            }
+            drop(sqlite_write_permit);
         }
         Ok(stale)
     }
@@ -1980,7 +1992,7 @@ where
                 .with_active_worker_kind("ingest"),
         );
         let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
-        self.record_task_progress(
+        self.record_task_progress_with_writer_permit(
             task_id,
             db_phase
                 .progress_snapshot()
@@ -1988,6 +2000,7 @@ where
                 .with_recent_status("committing source contents")
                 .with_active_worker_kind("ingest")
                 .with_resource(task_resource_progress(&sqlite_write_permit, "active")),
+            &sqlite_write_permit,
         );
         let replacement_report =
             match self
@@ -2955,6 +2968,20 @@ where
         let Some(task_id) = task_id else {
             return;
         };
+        let Ok(sqlite_write_permit) =
+            self.acquire_task_metadata_write_permit(task_id, "task phase timing")
+        else {
+            return;
+        };
+        self.record_finished_task_phase_with_writer_permit(task_id, finished, &sqlite_write_permit);
+    }
+
+    fn record_finished_task_phase_with_writer_permit(
+        &self,
+        task_id: &TaskId,
+        finished: crate::task::FinishedPhaseTiming,
+        _sqlite_write_permit: &ResourcePermit,
+    ) {
         if let Err(err) = self.store.insert_task_span(
             task_id,
             &finished.phase,
@@ -2972,6 +2999,23 @@ where
     }
 
     fn record_task_progress(&self, task_id: Option<&TaskId>, progress: TaskProgressSnapshot) {
+        let Some(task_id) = task_id else {
+            return;
+        };
+        let Ok(sqlite_write_permit) =
+            self.acquire_task_metadata_write_permit(task_id, "task progress")
+        else {
+            return;
+        };
+        self.record_task_progress_with_writer_permit(Some(task_id), progress, &sqlite_write_permit);
+    }
+
+    fn record_task_progress_with_writer_permit(
+        &self,
+        task_id: Option<&TaskId>,
+        progress: TaskProgressSnapshot,
+        _sqlite_write_permit: &ResourcePermit,
+    ) {
         let Some(task_id) = task_id else {
             return;
         };
@@ -2994,6 +3038,28 @@ where
         let Some(task_id) = task_id else {
             return;
         };
+        let Ok(sqlite_write_permit) =
+            self.acquire_task_metadata_write_permit(task_id, "task event")
+        else {
+            return;
+        };
+        self.record_task_event_with_writer_permit(
+            task_id,
+            event_type,
+            message,
+            payload,
+            &sqlite_write_permit,
+        );
+    }
+
+    fn record_task_event_with_writer_permit(
+        &self,
+        task_id: &TaskId,
+        event_type: &str,
+        message: &str,
+        payload: serde_json::Value,
+        _sqlite_write_permit: &ResourcePermit,
+    ) {
         if let Err(err) = self
             .store
             .insert_task_event(task_id, event_type, message, &payload)
@@ -3005,6 +3071,19 @@ where
                 "failed to persist task event"
             );
         }
+    }
+
+    fn acquire_task_metadata_write_permit(
+        &self,
+        task_id: &TaskId,
+        operation: &'static str,
+    ) -> Result<ResourcePermit> {
+        acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write").with_context(|| {
+            format!(
+                "acquire sqlite writer resource for {operation}: {}",
+                task_id.0
+            )
+        })
     }
 
     fn record_resource_timing(&self, task_id: Option<&TaskId>, resource: TaskResourceProgress) {
@@ -3769,6 +3848,8 @@ where
             }
             let attempt =
                 CaptionAttempt::skipped("vision caption provider is disabled or not configured");
+            let sqlite_write_permit =
+                acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
             self.store.upsert_image_caption_attempt(
                 &artifact.content_hash,
                 &self.vision_caption_model,
@@ -3776,6 +3857,7 @@ where
                 &self.vision_caption_prompt_hash,
                 &attempt,
             )?;
+            drop(sqlite_write_permit);
             return Ok(None);
         };
 
@@ -3784,11 +3866,14 @@ where
             &self.vision_caption_model,
             &self.vision_caption_prompt_hash,
         )? {
+            let sqlite_write_permit =
+                acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
             self.store.record_image_caption_cache_hit(
                 &artifact.content_hash,
                 &self.vision_caption_model,
                 &self.vision_caption_prompt_hash,
             )?;
+            drop(sqlite_write_permit);
             if let Some(caption) = record.caption {
                 return Ok(Some(caption_derived_evidence(
                     source_id,
@@ -3803,6 +3888,7 @@ where
 
         let attempt = request_image_caption(model.as_ref(), &file.bytes, &artifact.mime_type).await;
 
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         self.store.upsert_image_caption_attempt(
             &artifact.content_hash,
             &self.vision_caption_model,
@@ -3810,6 +3896,7 @@ where
             &self.vision_caption_prompt_hash,
             &attempt,
         )?;
+        drop(sqlite_write_permit);
 
         if attempt.status != ImageCaptionStatus::Success {
             tracing::warn!(
@@ -5841,6 +5928,43 @@ mod tests {
             })
             .collect::<Vec<_>>();
         store.replace_all_vector_documents(&vectors).unwrap();
+    }
+
+    fn sqlite_writer_resource_for_test() -> Arc<ObservableResource> {
+        global_resource_registry().resource(
+            "sqlite_writer",
+            "sqlite_write",
+            ResourceLimitConfig {
+                capacity: 1,
+                queue_capacity: 1,
+                queue_timeout: Duration::from_secs(5),
+            },
+        )
+    }
+
+    fn release_after_short_wait(permit: ResourcePermit) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            drop(permit);
+        })
+    }
+
+    fn assert_sqlite_writer_waits_for_test<F>(resource: &Arc<ObservableResource>, write: F)
+    where
+        F: FnOnce(),
+    {
+        let before = resource.snapshot().queue_wait_ms_total;
+        let held = resource.acquire_blocking().expect("held writer permit");
+        let release = release_after_short_wait(held);
+
+        write();
+
+        release.join().expect("writer release thread joins");
+        let after = resource.snapshot();
+        assert!(
+            after.queue_wait_ms_total > before,
+            "expected write to wait through sqlite_writer queue; before={before}, after={after:?}"
+        );
     }
 
     fn test_config() -> Config {
@@ -7905,6 +8029,62 @@ model = "local-vision"
             }),
             "completed resource timings should include index_publish service time, got {completed_resources:?}"
         );
+    }
+
+    #[test]
+    fn task_metadata_writes_wait_for_sqlite_writer_resource() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let task_id = TaskId("task-resource-gated-metadata".into());
+        pipeline
+            .store()
+            .create_task(&task_id, TaskKind::Ingest, &serde_json::json!({}))
+            .unwrap();
+        let resource = sqlite_writer_resource_for_test();
+
+        assert_sqlite_writer_waits_for_test(&resource, || {
+            pipeline.record_task_progress(
+                Some(&task_id),
+                TaskProgressSnapshot::phase("resource-gated-progress")
+                    .with_recent_status("writer gated progress"),
+            );
+        });
+        assert_sqlite_writer_waits_for_test(&resource, || {
+            pipeline.record_task_event(
+                Some(&task_id),
+                "resource_test",
+                "writer gated event",
+                serde_json::json!({"source": "test"}),
+            );
+        });
+        assert_sqlite_writer_waits_for_test(&resource, || {
+            pipeline.record_task_phase(
+                Some(&task_id),
+                PhaseTiming::start("resource-gated-span"),
+                serde_json::json!({"source": "test"}),
+            );
+        });
+
+        let task = pipeline.store().get_task(&task_id).unwrap().unwrap();
+        assert_eq!(
+            task.progress.unwrap().recent_status.as_deref(),
+            Some("writer gated progress")
+        );
+        let events = pipeline
+            .store()
+            .list_task_events(&task_id, None, 20)
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "resource_test"));
+        let spans = pipeline.store().list_task_spans(&task_id).unwrap();
+        assert!(spans.iter().any(|span| span.phase == "resource-gated-span"));
     }
 
     #[tokio::test]
