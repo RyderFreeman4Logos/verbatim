@@ -1101,7 +1101,14 @@ where
     }
 
     pub fn select_embedding_profile(&mut self, profile_id: &EmbeddingProfileId) -> Result<()> {
+        let sqlite_write_permit =
+            acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
         let _ = self.ensure_embedding_profile(profile_id)?;
+        drop(sqlite_write_permit);
+        self.load_embedding_profile_index(profile_id)
+    }
+
+    fn load_embedding_profile_index(&mut self, profile_id: &EmbeddingProfileId) -> Result<()> {
         if self.loaded_profile_id == *profile_id {
             return Ok(());
         }
@@ -1119,17 +1126,7 @@ where
         &mut self,
         profile_id: &EmbeddingProfileId,
     ) -> Result<()> {
-        if self.loaded_profile_id == *profile_id {
-            return Ok(());
-        }
-        self.hnsw = load_vector_index_for_residency(
-            self.vector_residency,
-            &self.data_dir,
-            &self.store,
-            profile_id,
-        )?;
-        self.loaded_profile_id = profile_id.clone();
-        Ok(())
+        self.load_embedding_profile_index(profile_id)
     }
 
     pub fn lexical_index(&self) -> SqliteFtsIndex<'_> {
@@ -6831,6 +6828,31 @@ mod tests {
         pipeline.select_embedding_profile(&alt_profile).unwrap();
 
         assert_eq!(pipeline.hnsw().len(), 2);
+    }
+
+    #[test]
+    fn select_embedding_profile_waits_for_sqlite_writer_resource() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let profile_id = EmbeddingProfileId::new("writer-gated-select").unwrap();
+        let writer = sqlite_writer_resource_for_test();
+
+        assert_sqlite_writer_waits_for_test(&writer, || {
+            pipeline.select_embedding_profile(&profile_id).unwrap();
+        });
+
+        assert_eq!(pipeline.loaded_profile_id, profile_id);
+        assert!(pipeline
+            .store()
+            .load_embedding_profile_config(&profile_id)
+            .unwrap()
+            .is_some());
     }
 
     #[derive(Debug)]
