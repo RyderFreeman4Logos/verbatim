@@ -4,7 +4,7 @@
 //! queue wait and service timing, and releases capacity through RAII. Callers
 //! keep domain work outside this module so resource boundaries stay explicit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -125,44 +125,54 @@ impl std::error::Error for ResourceQueueError {}
 
 struct QueuedWaiter {
     resource: Arc<ObservableResource>,
-    enqueued: bool,
+    ticket: Option<u64>,
 }
 
 impl QueuedWaiter {
     fn new(resource: Arc<ObservableResource>) -> Self {
         Self {
             resource,
-            enqueued: false,
+            ticket: None,
         }
     }
 
     fn is_enqueued(&self) -> bool {
-        self.enqueued
+        self.ticket.is_some()
+    }
+
+    fn can_admit(&self, state: &ResourceState) -> bool {
+        if state.active >= state.capacity {
+            return false;
+        }
+        match self.ticket {
+            Some(ticket) => state.wait_queue.front().copied() == Some(ticket),
+            None => state.wait_queue.is_empty(),
+        }
     }
 
     fn enqueue(&mut self, state: &mut ResourceState) {
-        state.queued += 1;
-        self.enqueued = true;
+        let ticket = state.next_waiter_ticket;
+        state.next_waiter_ticket = state.next_waiter_ticket.wrapping_add(1);
+        state.wait_queue.push_back(ticket);
+        self.ticket = Some(ticket);
     }
 
     fn admit(&mut self, state: &mut ResourceState) {
-        if self.enqueued {
-            state.queued = state.queued.saturating_sub(1);
-            self.enqueued = false;
+        if let Some(ticket) = self.ticket.take() {
+            remove_waiter_ticket(state, ticket);
         }
     }
 
     fn cancel(&mut self) {
-        if !self.enqueued {
+        let Some(ticket) = self.ticket.take() else {
             return;
-        }
+        };
         {
             let mut state = lock_unpoisoned(&self.resource.state);
-            state.queued = state.queued.saturating_sub(1);
+            remove_waiter_ticket(&mut state, ticket);
         }
-        self.enqueued = false;
-        self.resource.condvar.notify_one();
-        self.resource.notify.notify_one();
+        self.resource.condvar.notify_all();
+        self.resource.notify.notify_waiters();
     }
 }
 
@@ -198,7 +208,8 @@ impl ObservableResource {
                 queue_capacity: config.queue_capacity,
                 queue_timeout: config.queue_timeout,
                 active: 0,
-                queued: 0,
+                wait_queue: VecDeque::new(),
+                next_waiter_ticket: 0,
             }),
             condvar: Condvar::new(),
             notify: tokio::sync::Notify::new(),
@@ -231,7 +242,7 @@ impl ObservableResource {
                 let notified = self.notify.notified();
                 {
                     let mut state = lock_unpoisoned(&self.state);
-                    if state.active < state.capacity {
+                    if waiter.can_admit(&state) {
                         state.active += 1;
                         waiter.admit(&mut state);
                         let queue_wait_ms = elapsed_ms(wait_started);
@@ -243,7 +254,7 @@ impl ObservableResource {
                         });
                     }
                     if !waiter.is_enqueued() {
-                        if state.queued >= state.queue_capacity {
+                        if state.wait_queue.len() >= state.queue_capacity {
                             self.metrics.record_error();
                             return Err(ResourceQueueError::Full {
                                 name: self.name.clone(),
@@ -263,8 +274,8 @@ impl ObservableResource {
             Ok(result) => result,
             Err(_) => {
                 self.metrics.record_error();
-                self.condvar.notify_one();
-                self.notify.notify_one();
+                self.condvar.notify_all();
+                self.notify.notify_waiters();
                 Err(ResourceQueueError::Timeout {
                     name: self.name.clone(),
                     kind: self.kind.clone(),
@@ -280,14 +291,12 @@ impl ObservableResource {
             state.queue_timeout
         };
         let wait_started = Instant::now();
-        let mut enqueued = false;
+        let mut waiter = QueuedWaiter::new(Arc::clone(self));
         let mut state = lock_unpoisoned(&self.state);
         loop {
-            if state.active < state.capacity {
+            if waiter.can_admit(&state) {
                 state.active += 1;
-                if enqueued {
-                    state.queued = state.queued.saturating_sub(1);
-                }
+                waiter.admit(&mut state);
                 let queue_wait_ms = elapsed_ms(wait_started);
                 self.metrics.record_queue_wait(queue_wait_ms);
                 return Ok(ResourcePermit {
@@ -297,8 +306,8 @@ impl ObservableResource {
                 });
             }
 
-            if !enqueued {
-                if state.queued >= state.queue_capacity {
+            if !waiter.is_enqueued() {
+                if state.wait_queue.len() >= state.queue_capacity {
                     self.metrics.record_error();
                     return Err(ResourceQueueError::Full {
                         name: self.name.clone(),
@@ -306,16 +315,12 @@ impl ObservableResource {
                         queue_capacity: state.queue_capacity,
                     });
                 }
-                state.queued += 1;
-                enqueued = true;
+                waiter.enqueue(&mut state);
             }
 
             let elapsed = wait_started.elapsed();
             if elapsed >= timeout {
-                state.queued = state.queued.saturating_sub(1);
                 self.metrics.record_error();
-                self.condvar.notify_one();
-                self.notify.notify_one();
                 return Err(ResourceQueueError::Timeout {
                     name: self.name.clone(),
                     kind: self.kind.clone(),
@@ -341,7 +346,7 @@ impl ObservableResource {
             kind: self.kind.clone(),
             capacity: state.capacity,
             queue_capacity: state.queue_capacity,
-            queued: state.queued,
+            queued: state.wait_queue.len(),
             active: state.active,
             completed,
             errors: self.metrics.errors.load(Ordering::Relaxed),
@@ -366,8 +371,8 @@ impl ObservableResource {
             let mut state = lock_unpoisoned(&self.state);
             state.active = state.active.saturating_sub(1);
         }
-        self.condvar.notify_one();
-        self.notify.notify_one();
+        self.condvar.notify_all();
+        self.notify.notify_waiters();
     }
 }
 
@@ -404,7 +409,23 @@ struct ResourceState {
     queue_capacity: usize,
     queue_timeout: Duration,
     active: usize,
-    queued: usize,
+    wait_queue: VecDeque<u64>,
+    next_waiter_ticket: u64,
+}
+
+fn remove_waiter_ticket(state: &mut ResourceState, ticket: u64) {
+    if state.wait_queue.front().copied() == Some(ticket) {
+        state.wait_queue.pop_front();
+        return;
+    }
+
+    if let Some(index) = state
+        .wait_queue
+        .iter()
+        .position(|queued_ticket| *queued_ticket == ticket)
+    {
+        state.wait_queue.remove(index);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -521,6 +542,20 @@ fn optional_metric(value: u64) -> Option<u64> {
 mod tests {
     use super::*;
 
+    async fn wait_for_queued(resource: &Arc<ObservableResource>, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if resource.snapshot().queued == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "resource queue did not reach expected depth {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn bounded_queue_reports_wait_active_throughput_and_errors() {
         let resource = Arc::new(ObservableResource::new(
@@ -567,6 +602,70 @@ mod tests {
         assert!(completed_snapshot.last_queue_wait_ms.is_some());
         assert!(completed_snapshot.last_service_ms.is_some());
         assert!(completed_snapshot.throughput_per_minute > 0.0);
+    }
+
+    #[tokio::test]
+    async fn async_acquire_honors_existing_queued_waiter_before_later_arrival() {
+        let resource = Arc::new(ObservableResource::new(
+            "async_fairness_resource",
+            "test_kind",
+            ResourceLimitConfig {
+                capacity: 1,
+                queue_capacity: 2,
+                queue_timeout: Duration::from_secs(5),
+            },
+        ));
+
+        let first = resource.acquire().await.expect("first permit");
+        let early_resource = Arc::clone(&resource);
+        let (early_acquired_tx, early_acquired_rx) = tokio::sync::oneshot::channel();
+        let (early_release_tx, early_release_rx) = tokio::sync::oneshot::channel();
+        let early = tokio::spawn(async move {
+            let permit = early_resource
+                .acquire()
+                .await
+                .expect("early waiter acquires");
+            let _ = early_acquired_tx.send(());
+            let _ = early_release_rx.await;
+            drop(permit);
+        });
+        wait_for_queued(&resource, 1).await;
+
+        let late_resource = Arc::clone(&resource);
+        let (late_acquired_tx, late_acquired_rx) = tokio::sync::oneshot::channel();
+        let late = tokio::spawn(async move {
+            let permit = late_resource.acquire().await.expect("late waiter acquires");
+            let _ = late_acquired_tx.send(());
+            permit
+        });
+        wait_for_queued(&resource, 2).await;
+
+        drop(first);
+        tokio::pin!(late_acquired_rx);
+        tokio::select! {
+            early_acquired = early_acquired_rx => {
+                early_acquired.expect("early waiter reports acquisition");
+            }
+            late_acquired = &mut late_acquired_rx => {
+                panic!("later caller acquired before the existing queued waiter: {late_acquired:?}");
+            }
+        }
+
+        early_release_tx
+            .send(())
+            .expect("early waiter still holds the permit");
+        late_acquired_rx
+            .await
+            .expect("late waiter reports acquisition after early release");
+        early.await.expect("early waiter task joins");
+        let late_permit = late.await.expect("late waiter task joins");
+        drop(late_permit);
+
+        let snapshot = resource.snapshot();
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.queued, 0);
+        assert_eq!(snapshot.completed, 3);
+        assert_eq!(snapshot.errors, 0);
     }
 
     #[tokio::test]
@@ -684,5 +783,34 @@ mod tests {
         assert_eq!(snapshot.active, 0);
         assert!(snapshot.queue_wait_ms_total > 0);
         assert!(snapshot.service_ms_total > 0);
+    }
+
+    #[test]
+    fn blocking_acquire_does_not_bypass_existing_queue_when_capacity_is_idle() {
+        let resource = Arc::new(ObservableResource::new(
+            "blocking_fairness_resource",
+            "test_kind",
+            ResourceLimitConfig {
+                capacity: 1,
+                queue_capacity: 1,
+                queue_timeout: Duration::from_secs(5),
+            },
+        ));
+
+        {
+            let mut state = lock_unpoisoned(&resource.state);
+            state.wait_queue.push_back(0);
+            state.next_waiter_ticket = 1;
+        }
+
+        let err = resource
+            .acquire_blocking()
+            .expect_err("later blocking caller cannot bypass existing queued waiter");
+        assert!(matches!(err, ResourceQueueError::Full { .. }));
+
+        let snapshot = resource.snapshot();
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.queued, 1);
+        assert_eq!(snapshot.errors, 1);
     }
 }
