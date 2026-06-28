@@ -61,13 +61,13 @@ use verbatim_core::provider::ProviderError;
 use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
 use verbatim_core::store::{Store, TaskListFilter};
 use verbatim_core::task::{
-    ask_request_metadata, ask_result_metadata, bounded_error, ingest_result_metadata,
+    ask_request_metadata, ask_result_metadata, bounded_error, bounded_json, ingest_result_metadata,
     ingest_task_request_metadata_with_queue_claim,
     ingest_task_request_metadata_with_queue_claim_and_batch, reindex_result_metadata,
     reindex_task_request_metadata_with_queue_claim,
     reindex_task_request_metadata_with_queue_claim_and_batch, retrieve_request_metadata,
-    retrieve_result_metadata, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskId, TaskKind,
-    TaskProgressSnapshot, TaskStatus,
+    retrieve_result_metadata, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskEvent, TaskId,
+    TaskKind, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
 };
 use verbatim_core::types::{
     CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact,
@@ -112,6 +112,7 @@ struct RuntimeConfigState {
 const ASK_STREAM_EVENT_BUFFER: usize = 32;
 const TASK_WAIT_EVENT_BUFFER: usize = 16;
 const TASK_WAIT_EVENT_LIMIT: usize = 100;
+const TASK_TELEMETRY_REDACTED: &str = "<redacted>";
 const TASK_LIST_DEFAULT_LIMIT: usize = 20;
 const TASK_LIST_MAX_LIMIT: usize = 100;
 const TASK_QUEUE_TURNOVER_EVENT_LIMIT: usize = 1000;
@@ -1280,18 +1281,24 @@ async fn record_task_span(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(state);
     let task_id = task_id.clone();
+    let verbatim_core::task::FinishedPhaseTiming {
+        phase,
+        started_at,
+        duration_ms,
+        metadata,
+    } = timing;
     tokio::task::spawn_blocking(move || {
         let store = state
             .task_store
             .lock()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        store.insert_task_span(
-            &task_id,
-            &timing.phase,
-            &timing.started_at,
-            timing.duration_ms,
-            &timing.metadata,
-        )?;
+        let private_source_id = store
+            .get_task(&task_id)?
+            .as_ref()
+            .and_then(task_private_source_id);
+        let metadata =
+            public_task_telemetry_value_for_source(metadata, private_source_id.as_deref());
+        store.insert_task_span(&task_id, &phase, &started_at, duration_ms, &metadata)?;
         Ok::<_, anyhow::Error>(())
     })
     .await
@@ -1541,6 +1548,145 @@ fn copy_task_request_field(
     }
 }
 
+fn public_task_summary(mut task: TaskSummary) -> TaskSummary {
+    let private_source_id = task_private_source_id(&task);
+    task.error = task.error.map(|error| {
+        bounded_error(&redact_task_telemetry_text(
+            &error,
+            private_source_id.as_deref(),
+        ))
+    });
+    task.request =
+        public_task_telemetry_value_for_source(task.request, private_source_id.as_deref());
+    task.result = task
+        .result
+        .map(|result| public_task_telemetry_value_for_source(result, private_source_id.as_deref()));
+    if let Some(progress) = task.progress.take() {
+        task.progress = Some(progress.bounded().with_current_elapsed());
+    }
+    task
+}
+
+fn task_private_source_id(task: &TaskSummary) -> Option<String> {
+    task.request
+        .get("source_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|source_id| !source_id.is_empty())
+        .map(str::to_string)
+}
+
+fn public_task_event_for_source(
+    mut event: TaskEvent,
+    private_source_id: Option<&str>,
+) -> TaskEvent {
+    event.message = redact_task_telemetry_text(&event.message, private_source_id);
+    event.payload = public_task_telemetry_value_for_source(event.payload, private_source_id);
+    event
+}
+
+fn public_task_span_for_source(mut span: TaskSpan, private_source_id: Option<&str>) -> TaskSpan {
+    span.metadata = public_task_telemetry_value_for_source(span.metadata, private_source_id);
+    span
+}
+
+fn public_task_telemetry_value_for_source(
+    value: serde_json::Value,
+    private_source_id: Option<&str>,
+) -> serde_json::Value {
+    bounded_json(redact_task_telemetry_value(value, private_source_id))
+}
+
+fn redact_task_telemetry_value(
+    value: serde_json::Value,
+    private_source_id: Option<&str>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => redact_task_telemetry_object(map, private_source_id),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_task_telemetry_value(item, private_source_id))
+                .collect(),
+        ),
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(redact_task_telemetry_text(&text, private_source_id))
+        }
+        other => other,
+    }
+}
+
+fn redact_task_telemetry_object(
+    map: serde_json::Map<String, serde_json::Value>,
+    private_source_id: Option<&str>,
+) -> serde_json::Value {
+    let mut output = serde_json::Map::with_capacity(map.len());
+    for (key, value) in map {
+        let value = if is_private_task_telemetry_key(&key) {
+            redacted_task_telemetry_value(value)
+        } else {
+            redact_task_telemetry_value(value, private_source_id)
+        };
+        output.insert(key, value);
+    }
+    serde_json::Value::Object(output)
+}
+
+fn redacted_task_telemetry_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Null => serde_json::Value::Null,
+        serde_json::Value::Array(items) => serde_json::json!({
+            "redacted": true,
+            "count": items.len(),
+        }),
+        serde_json::Value::Object(map) => serde_json::json!({
+            "redacted": true,
+            "field_count": map.len(),
+        }),
+        _ => serde_json::Value::String(TASK_TELEMETRY_REDACTED.into()),
+    }
+}
+
+fn redact_task_telemetry_text(text: &str, private_source_id: Option<&str>) -> String {
+    let Some(private_source_id) = private_source_id.filter(|source_id| !source_id.is_empty())
+    else {
+        return text.to_string();
+    };
+    text.replace(private_source_id, TASK_TELEMETRY_REDACTED)
+}
+
+fn is_private_task_telemetry_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+    matches!(
+        normalized.as_str(),
+        "sourceid"
+            | "sourceids"
+            | "sourcepath"
+            | "sourcepaths"
+            | "path"
+            | "paths"
+            | "pathorurl"
+            | "embedding"
+            | "embeddings"
+            | "vector"
+            | "vectors"
+            | "embeddingvector"
+            | "embeddingvectors"
+            | "vectorpayload"
+            | "vectorpayloads"
+            | "vectorvalue"
+            | "vectorvalues"
+    ) || normalized.ends_with("sourceid")
+        || normalized.ends_with("sourceids")
+        || normalized.ends_with("sourcepath")
+        || normalized.ends_with("sourcepaths")
+        || normalized.ends_with("embeddingvector")
+        || normalized.ends_with("embeddingvectors")
+        || normalized.ends_with("vectorpayload")
+        || normalized.ends_with("vectorpayloads")
+        || normalized.ends_with("vectorvalue")
+        || normalized.ends_with("vectorvalues")
+}
+
 async fn task_summary_response(
     state: &SharedState,
     task_id: TaskId,
@@ -1554,8 +1700,13 @@ async fn task_summary_response(
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let task = with_queue_details(&store, task)?;
-        let spans = store.list_task_spans(&task_id)?;
+        let private_source_id = task_private_source_id(&task);
+        let task = public_task_summary(with_queue_details(&store, task)?);
+        let spans = store
+            .list_task_spans(&task_id)?
+            .into_iter()
+            .map(|span| public_task_span_for_source(span, private_source_id.as_deref()))
+            .collect();
         Ok::<_, anyhow::Error>(TaskSummaryResponse { task, spans })
     })
     .await
@@ -1595,6 +1746,7 @@ async fn list_tasks_handler(
             .tasks
             .into_iter()
             .map(|task| with_queue_details(&store, task))
+            .map(|task| task.map(public_task_summary))
             .collect::<Result<Vec<_>>>()?;
         let aggregate = task_list_aggregate(&store)?;
         Ok::<_, anyhow::Error>(TaskListResponse {
@@ -1685,11 +1837,16 @@ async fn task_events_response(
             .task_store
             .lock()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        store
+        let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
+        let private_source_id = task_private_source_id(&task);
         let events =
             store.list_task_events(&task_id, after, limit.unwrap_or(TASK_WAIT_EVENT_LIMIT))?;
+        let events = events
+            .into_iter()
+            .map(|event| public_task_event_for_source(event, private_source_id.as_deref()))
+            .collect();
         Ok::<_, anyhow::Error>(TaskEventsResponse { events })
     })
     .await
@@ -4532,16 +4689,25 @@ async fn task_wait_snapshot(
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
+        let private_source_id = task_private_source_id(&task);
         let task = with_queue_details(&store, task)?;
-        let events = store.list_task_events(&task_id, after, limit)?;
+        let events = store
+            .list_task_events(&task_id, after, limit)?
+            .into_iter()
+            .map(|event| public_task_event_for_source(event, private_source_id.as_deref()))
+            .collect();
         let spans = if task.status.is_terminal() {
-            store.list_task_spans(&task_id)?
+            store
+                .list_task_spans(&task_id)?
+                .into_iter()
+                .map(|span| public_task_span_for_source(span, private_source_id.as_deref()))
+                .collect()
         } else {
             Vec::new()
         };
         let terminal = task.status.is_terminal();
         Ok::<_, anyhow::Error>(TaskWaitEvent {
-            task,
+            task: public_task_summary(task),
             events,
             spans,
             terminal,
@@ -6592,6 +6758,114 @@ mod tests {
             .spans
             .iter()
             .any(|span| span.phase == IngestTaskStage::TaskTerminalize.as_str()));
+    }
+
+    #[tokio::test]
+    async fn public_task_telemetry_redacts_path_derived_source_id_and_vectors() {
+        let test_dir = TestDir::new("task-telemetry-redacts-path-derived-source-id");
+        let marker = "issue-160-secret-path-marker";
+        let fake_vector_value = "ISSUE160_FAKE_VECTOR_VALUE";
+        let sensitive_text = "ISSUE160_DOCUMENT_TEXT_SENTINEL";
+        let source_path = test_dir.path().join(format!("{marker}.md"));
+        fs::write(&source_path, sensitive_text).unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        assert!(
+            source_id.0.contains(marker),
+            "test must use the production path-derived source id"
+        );
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some(source_id.0.as_str()),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        record_task_progress(
+            &state,
+            &task_id,
+            TaskProgressSnapshot::phase(IngestTaskStage::Parse.as_str())
+                .with_recent_status("parsing source"),
+        )
+        .await;
+        record_task_event(
+            &state,
+            &task_id,
+            "diagnostic",
+            "task diagnostic",
+            serde_json::json!({
+                "source_id": source_id.0.as_str(),
+                "source_path": source_path.display().to_string(),
+                "embedding_vector": [fake_vector_value],
+                "text": sensitive_text,
+            }),
+        )
+        .await
+        .unwrap();
+        record_task_span(
+            &state,
+            &task_id,
+            PhaseTiming::start(IngestTaskStage::EmbeddingPostprocess.as_str()).finish(
+                serde_json::json!({
+                    "source_id": source_id.0.as_str(),
+                    "source_path": source_path.display().to_string(),
+                    "embedding_vector": [fake_vector_value],
+                    "text": sensitive_text,
+                    "chunk_count": 1,
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let show = task_summary_response(&state, task_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            show.task.request["source_id"],
+            serde_json::Value::String(TASK_TELEMETRY_REDACTED.into())
+        );
+        assert_eq!(
+            show.spans[0].metadata["source_id"],
+            serde_json::Value::String(TASK_TELEMETRY_REDACTED.into())
+        );
+        assert_eq!(show.spans[0].metadata["embedding_vector"]["redacted"], true);
+        let Json(list) = list_tasks_handler(
+            State(Arc::clone(&state)),
+            Query(TaskListQuery {
+                status: Some("all".into()),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+        let events = task_events_response(&state, task_id.clone(), None, Some(10))
+            .await
+            .unwrap();
+        let wait = task_wait_snapshot(&state, task_id, None, 10).await.unwrap();
+        let encoded = serde_json::to_string(&(show, list, events, wait)).unwrap();
+
+        for forbidden in [
+            marker,
+            source_id.0.as_str(),
+            source_path.to_str().unwrap(),
+            fake_vector_value,
+            sensitive_text,
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "public task telemetry leaked {forbidden}: {encoded}"
+            );
+        }
+        assert!(encoded.contains(TASK_TELEMETRY_REDACTED));
     }
 
     #[tokio::test]
@@ -9462,7 +9736,7 @@ mod tests {
 
         assert_eq!(resumed.task.id, failed_id);
         assert_eq!(resumed.task.status, TaskStatus::Queued);
-        assert_eq!(resumed.task.request["source_id"], "src-1");
+        assert_eq!(resumed.task.request["source_id"], TASK_TELEMETRY_REDACTED);
         assert!(resumed.task.result.is_none());
         assert!(resumed.task.error.is_none());
         let events = task_events_response(&state, failed_id.clone(), None, Some(10))
