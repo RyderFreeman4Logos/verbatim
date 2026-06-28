@@ -348,6 +348,32 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// Run related read queries against one SQLite snapshot.
+    pub fn with_read_snapshot<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.conn
+            .execute_batch("BEGIN DEFERRED TRANSACTION")
+            .context("begin read snapshot")?;
+        let result = operation(self);
+        match result {
+            Ok(value) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .context("commit read snapshot")?;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = self.conn.execute_batch("ROLLBACK") {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "rollback read snapshot failed after operation error: {rollback_error}"
+                        )
+                    });
+                }
+                Err(error)
+            }
+        }
+    }
+
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;

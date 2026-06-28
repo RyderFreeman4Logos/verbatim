@@ -2078,26 +2078,28 @@ async fn list_tasks_handler(
     Query(query): Query<TaskListQuery>,
 ) -> Result<Json<TaskListResponse>, (StatusCode, Json<ErrorResponse>)> {
     with_task_store_read(&state, move |store| {
-        let filter = task_list_filter(query.status.as_deref())?;
-        let limit = query
-            .limit
-            .unwrap_or(TASK_LIST_DEFAULT_LIMIT)
-            .clamp(1, TASK_LIST_MAX_LIMIT);
-        let page = store.list_tasks_page(filter, limit)?;
-        let tasks = page
-            .tasks
-            .into_iter()
-            .map(|task| {
-                let task = with_queue_details(store, task)?;
-                let redaction = task_telemetry_redaction(store, &task)?;
-                Ok(public_task_summary(task, &redaction))
+        store.with_read_snapshot(|store| {
+            let filter = task_list_filter(query.status.as_deref())?;
+            let limit = query
+                .limit
+                .unwrap_or(TASK_LIST_DEFAULT_LIMIT)
+                .clamp(1, TASK_LIST_MAX_LIMIT);
+            let page = store.list_tasks_page(filter, limit)?;
+            let tasks = page
+                .tasks
+                .into_iter()
+                .map(|task| {
+                    let task = with_queue_details(store, task)?;
+                    let redaction = task_telemetry_redaction(store, &task)?;
+                    Ok(public_task_summary(task, &redaction))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let aggregate = task_list_aggregate(store)?;
+            Ok::<_, anyhow::Error>(TaskListResponse {
+                tasks,
+                total: page.total,
+                aggregate: Some(aggregate),
             })
-            .collect::<Result<Vec<_>>>()?;
-        let aggregate = task_list_aggregate(store)?;
-        Ok::<_, anyhow::Error>(TaskListResponse {
-            tasks,
-            total: page.total,
-            aggregate: Some(aggregate),
         })
     })
     .await
