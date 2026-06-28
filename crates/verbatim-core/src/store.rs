@@ -770,111 +770,35 @@ impl Store {
         &self,
         replacement: SourceContentsReplacement<'_>,
     ) -> Result<SourceContentsReplacementReport> {
-        let SourceContentsReplacement {
-            source,
-            evidence,
-            chunks,
-            embedding_profile_id,
-            vectors,
-            links,
-            image_artifacts,
-            graph_nodes,
-            graph_edges,
-        } = replacement;
-        let mut lexical_update =
-            SourceLexicalIndexUpdate::start(self.count_lexical_documents_for_source(&source.id)?);
+        let deleted_child_chunks =
+            self.count_lexical_documents_for_source(&replacement.source.id)?;
         let tx = self.conn.unchecked_transaction()?;
-        let lexical_delete_started = Instant::now();
-        tx.execute("DELETE FROM sources WHERE id = ?1", params![&source.id.0])?;
-        lexical_update.add_elapsed_since(lexical_delete_started);
-        tx.execute(
-            "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                &source.id.0,
-                source.path.to_str().unwrap_or(""),
-                &source.hash,
-                status_to_str(&source.status),
-                &source.parser_used,
-                &source.last_ingested_at,
-            ],
-        )?;
-
-        insert_evidence_units_tx(&tx, evidence)?;
-
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO chunks (id, source_id, chunk_hash, embedding_input_hash, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
-            )?;
-            for chunk in chunks {
-                let heading_json =
-                    serde_json::to_string(&chunk.heading_path).context("serialize heading_path")?;
-                if chunk.chunk_type == ChunkType::Child {
-                    let lexical_insert_started = Instant::now();
-                    stmt.execute(params![
-                        &chunk.id.0,
-                        &chunk.source_id.0,
-                        &chunk.chunk_hash,
-                        &chunk.embedding_input_hash,
-                        &chunk.text,
-                        &chunk.context_text,
-                        chunk.token_count,
-                        chunk_type_to_str(&chunk.chunk_type),
-                        chunk.parent_chunk_id.as_ref().map(|id| &id.0),
-                        heading_json,
-                    ])?;
-                    lexical_update.add_elapsed_since(lexical_insert_started);
-                    lexical_update.indexed_child_chunks =
-                        lexical_update.indexed_child_chunks.saturating_add(1);
-                } else {
-                    stmt.execute(params![
-                        &chunk.id.0,
-                        &chunk.source_id.0,
-                        &chunk.chunk_hash,
-                        &chunk.embedding_input_hash,
-                        &chunk.text,
-                        &chunk.context_text,
-                        chunk.token_count,
-                        chunk_type_to_str(&chunk.chunk_type),
-                        chunk.parent_chunk_id.as_ref().map(|id| &id.0),
-                        heading_json,
-                    ])?;
-                }
-            }
-        }
-
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO chunk_evidence (chunk_id, evidence_unit_id) VALUES (?1, ?2)",
-            )?;
-            for (chunk_id, evidence_id) in links {
-                stmt.execute(params![&chunk_id.0, &evidence_id.0])?;
-            }
-        }
-
-        insert_image_artifacts_tx(&tx, image_artifacts)?;
-        upsert_graph_nodes_tx(&tx, graph_nodes)?;
-        upsert_graph_edges_tx(&tx, graph_edges)?;
-        replace_source_vector_documents_for_profile_tx(
-            &tx,
-            embedding_profile_id,
-            &source.id,
-            vectors,
-        )?;
-        set_source_embedding_status_tx(
-            &tx,
-            embedding_profile_id,
-            &source.id,
-            SourceEmbeddingStatus::Embedded,
-            vectors.len(),
-            None,
-        )?;
-
+        let lexical_update = replace_source_contents_tx(&tx, replacement, deleted_child_chunks)?;
         let generation = bump_all_profile_index_generations(&tx)?;
         tx.commit()?;
         Ok(SourceContentsReplacementReport {
             generation,
             lexical_update,
         })
+    }
+
+    pub fn replace_source_contents_without_generation(
+        &self,
+        replacement: SourceContentsReplacement<'_>,
+    ) -> Result<SourceLexicalIndexUpdate> {
+        let deleted_child_chunks =
+            self.count_lexical_documents_for_source(&replacement.source.id)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let lexical_update = replace_source_contents_tx(&tx, replacement, deleted_child_chunks)?;
+        tx.commit()?;
+        Ok(lexical_update)
+    }
+
+    pub fn bump_all_profile_index_generations(&self) -> Result<u64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let generation = bump_all_profile_index_generations(&tx)?;
+        tx.commit()?;
+        Ok(generation)
     }
 
     pub fn index_generation(&self) -> Result<u64> {
@@ -2077,6 +2001,31 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn set_source_embedding_failures(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_vector_counts: &[(SourceId, usize)],
+        error_message: &str,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        set_source_embedding_failures_tx(&tx, profile_id, source_vector_counts, error_message)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn set_source_embedding_failures_and_bump_all_profile_index_generations(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source_vector_counts: &[(SourceId, usize)],
+        error_message: &str,
+    ) -> Result<u64> {
+        let tx = self.conn.unchecked_transaction()?;
+        set_source_embedding_failures_tx(&tx, profile_id, source_vector_counts, error_message)?;
+        let generation = bump_all_profile_index_generations(&tx)?;
+        tx.commit()?;
+        Ok(generation)
+    }
+
     // --- Task ---
 
     pub fn create_task(
@@ -3114,6 +3063,105 @@ fn backfill_embedding_profile_instruction_hashes(conn: &Connection) -> Result<()
     Ok(())
 }
 
+fn replace_source_contents_tx(
+    tx: &Transaction<'_>,
+    replacement: SourceContentsReplacement<'_>,
+    deleted_child_chunks: usize,
+) -> Result<SourceLexicalIndexUpdate> {
+    let SourceContentsReplacement {
+        source,
+        evidence,
+        chunks,
+        embedding_profile_id,
+        vectors,
+        links,
+        image_artifacts,
+        graph_nodes,
+        graph_edges,
+    } = replacement;
+    let mut lexical_update = SourceLexicalIndexUpdate::start(deleted_child_chunks);
+    let lexical_delete_started = Instant::now();
+    tx.execute("DELETE FROM sources WHERE id = ?1", params![&source.id.0])?;
+    lexical_update.add_elapsed_since(lexical_delete_started);
+    tx.execute(
+        "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            &source.id.0,
+            source.path.to_str().unwrap_or(""),
+            &source.hash,
+            status_to_str(&source.status),
+            &source.parser_used,
+            &source.last_ingested_at,
+        ],
+    )?;
+
+    insert_evidence_units_tx(tx, evidence)?;
+
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO chunks (id, source_id, chunk_hash, embedding_input_hash, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+        )?;
+        for chunk in chunks {
+            let heading_json =
+                serde_json::to_string(&chunk.heading_path).context("serialize heading_path")?;
+            if chunk.chunk_type == ChunkType::Child {
+                let lexical_insert_started = Instant::now();
+                stmt.execute(params![
+                    &chunk.id.0,
+                    &chunk.source_id.0,
+                    &chunk.chunk_hash,
+                    &chunk.embedding_input_hash,
+                    &chunk.text,
+                    &chunk.context_text,
+                    chunk.token_count,
+                    chunk_type_to_str(&chunk.chunk_type),
+                    chunk.parent_chunk_id.as_ref().map(|id| &id.0),
+                    heading_json,
+                ])?;
+                lexical_update.add_elapsed_since(lexical_insert_started);
+                lexical_update.indexed_child_chunks =
+                    lexical_update.indexed_child_chunks.saturating_add(1);
+            } else {
+                stmt.execute(params![
+                    &chunk.id.0,
+                    &chunk.source_id.0,
+                    &chunk.chunk_hash,
+                    &chunk.embedding_input_hash,
+                    &chunk.text,
+                    &chunk.context_text,
+                    chunk.token_count,
+                    chunk_type_to_str(&chunk.chunk_type),
+                    chunk.parent_chunk_id.as_ref().map(|id| &id.0),
+                    heading_json,
+                ])?;
+            }
+        }
+    }
+
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO chunk_evidence (chunk_id, evidence_unit_id) VALUES (?1, ?2)",
+        )?;
+        for (chunk_id, evidence_id) in links {
+            stmt.execute(params![&chunk_id.0, &evidence_id.0])?;
+        }
+    }
+
+    insert_image_artifacts_tx(tx, image_artifacts)?;
+    upsert_graph_nodes_tx(tx, graph_nodes)?;
+    upsert_graph_edges_tx(tx, graph_edges)?;
+    replace_source_vector_documents_for_profile_tx(tx, embedding_profile_id, &source.id, vectors)?;
+    set_source_embedding_status_tx(
+        tx,
+        embedding_profile_id,
+        &source.id,
+        SourceEmbeddingStatus::Embedded,
+        vectors.len(),
+        None,
+    )?;
+    Ok(lexical_update)
+}
+
 fn insert_evidence_units_tx(tx: &Transaction<'_>, units: &[EvidenceUnit]) -> Result<()> {
     let mut stmt = tx.prepare(
         "INSERT INTO evidence_units (id, source_id, kind, locator_json, text, text_hash, heading_path_json, position, derived_from_evidence_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
@@ -3726,6 +3774,25 @@ fn set_source_embedding_status_tx(
             error_message,
         ],
     )?;
+    Ok(())
+}
+
+fn set_source_embedding_failures_tx(
+    tx: &Transaction<'_>,
+    profile_id: &EmbeddingProfileId,
+    source_vector_counts: &[(SourceId, usize)],
+    error_message: &str,
+) -> Result<()> {
+    for (source_id, vector_count) in source_vector_counts {
+        set_source_embedding_status_tx(
+            tx,
+            profile_id,
+            source_id,
+            SourceEmbeddingStatus::Failed,
+            *vector_count,
+            Some(error_message),
+        )?;
+    }
     Ok(())
 }
 
