@@ -72,6 +72,7 @@ use verbatim_core::task::{
     retrieve_result_metadata, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskEvent, TaskId,
     TaskKind, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
 };
+use verbatim_core::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 use verbatim_core::types::{
     CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact,
     RetrievalDebug, RetrievalDenseVectorPath, RetrievalEvidenceRole, RetrievalResult, SourceId,
@@ -423,51 +424,19 @@ where
         .context("join exclusive pipeline task")?
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QueryPipelineMode {
-    Exclusive,
-    ReadOnlySnapshot,
-}
-
-enum QueryPipelineAttempt<T, F> {
-    Completed(Result<T>),
-    Busy(F),
-}
-
 async fn with_query_pipeline<T, F>(state: &SharedState, operation: F) -> Result<T>
 where
     T: Send + 'static,
-    F: FnOnce(&mut IngestPipeline, QueryPipelineMode) -> Result<T> + Send + 'static,
+    F: FnOnce(&mut IngestPipeline) -> Result<T> + Send + 'static,
 {
-    let exclusive_state = Arc::clone(state);
-    let attempt = tokio::task::spawn_blocking(move || match PipelineLease::take(exclusive_state) {
-        Ok(mut lease) => {
-            let result = match lease.pipeline.as_mut() {
-                Some(pipeline) => operation(pipeline, QueryPipelineMode::Exclusive),
-                None => Err(pipeline_busy_error()),
-            };
-            let restore = lease.restore();
-            QueryPipelineAttempt::Completed(restore.and(result))
-        }
-        Err(error) if is_pipeline_busy_error(&error) => QueryPipelineAttempt::Busy(operation),
-        Err(error) => QueryPipelineAttempt::Completed(Err(error)),
+    let config = runtime_config_snapshot(state)?.config;
+    let data_dir = state.data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut pipeline = IngestPipeline::open_readonly(&config, &data_dir)?;
+        operation(&mut pipeline)
     })
     .await
-    .context("join query pipeline task")?;
-
-    match attempt {
-        QueryPipelineAttempt::Completed(result) => result,
-        QueryPipelineAttempt::Busy(operation) => {
-            let config = runtime_config_snapshot(state)?.config;
-            let data_dir = state.data_dir.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut pipeline = IngestPipeline::open_readonly(&config, &data_dir)?;
-                operation(&mut pipeline, QueryPipelineMode::ReadOnlySnapshot)
-            })
-            .await
-            .context("join read-only query pipeline task")?
-        }
-    }
+    .context("join read-only query pipeline task")?
 }
 
 async fn with_task_store_read<T, F>(state: &SharedState, operation: F) -> Result<T>
@@ -5074,26 +5043,60 @@ fn refresh_embedding_profile_capabilities_blocking(
     Ok(())
 }
 
-fn prepare_query_embedding_profile_blocking(
-    runtime: &tokio::runtime::Handle,
+async fn refresh_query_embedding_profile_capabilities(
+    state: &SharedState,
+    embedding_enabled: bool,
+    embedding_profile_id: &EmbeddingProfileId,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if !embedding_enabled {
+        return Ok(());
+    }
+    let config = runtime_config_snapshot(state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
+    let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+    let capabilities = embed_client
+        .endpoint_capabilities()
+        .await
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    apply_query_embedding_profile_capabilities(state, capabilities, embedding_profile_id.clone())
+        .await
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+async fn apply_query_embedding_profile_capabilities(
+    state: &SharedState,
+    capabilities: EmbeddingEndpointCapabilities,
+    embedding_profile_id: EmbeddingProfileId,
+) -> Result<()> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || match PipelineLease::take(state) {
+        Ok(mut lease) => {
+            let result = match lease.pipeline.as_mut() {
+                Some(pipeline) => {
+                    pipeline.apply_embedding_profile_capabilities(capabilities)?;
+                    pipeline.select_embedding_profile(&embedding_profile_id)?;
+                    Ok(())
+                }
+                None => Err(pipeline_busy_error()),
+            };
+            let restore = lease.restore();
+            restore.and(result)
+        }
+        Err(error) if is_pipeline_busy_error(&error) => Ok(()),
+        Err(error) => Err(error),
+    })
+    .await
+    .context("join query embedding profile capability apply task")?
+}
+
+fn prepare_query_embedding_profile_readonly(
     pipeline: &mut IngestPipeline,
-    mode: QueryPipelineMode,
     embedding_enabled: bool,
     embedding_profile_id: &EmbeddingProfileId,
 ) -> Result<()> {
     if embedding_enabled {
-        match mode {
-            QueryPipelineMode::Exclusive => {
-                refresh_embedding_profile_capabilities_blocking(runtime, pipeline)?;
-                pipeline.select_embedding_profile(embedding_profile_id)?;
-            }
-            QueryPipelineMode::ReadOnlySnapshot => {
-                pipeline.select_embedding_profile_readonly(embedding_profile_id)?;
-            }
-        }
-    }
-    if mode == QueryPipelineMode::Exclusive {
-        runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
+        pipeline.select_embedding_profile_readonly(embedding_profile_id)?;
     }
     Ok(())
 }
@@ -5109,19 +5112,8 @@ async fn refresh_query_embedding_profile_for_collection_filter(
     }
 
     let embedding_profile_id = embedding_profile_id.clone();
-    let runtime = tokio::runtime::Handle::current();
-    with_query_pipeline(state, move |pipeline, mode| {
-        prepare_query_embedding_profile_blocking(
-            &runtime,
-            pipeline,
-            mode,
-            embedding_enabled,
-            &embedding_profile_id,
-        )?;
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+    refresh_query_embedding_profile_capabilities(state, embedding_enabled, &embedding_profile_id)
+        .await
 }
 
 async fn prepare_retrieve_context(
@@ -5131,15 +5123,19 @@ async fn prepare_retrieve_context(
     embedding_profile_id: &EmbeddingProfileId,
     controls: &EffectiveRetrieveControls,
 ) -> Result<RetrievedContext, (StatusCode, Json<ErrorResponse>)> {
+    refresh_query_embedding_profile_capabilities(
+        &state,
+        controls.config.embedding.enabled,
+        embedding_profile_id,
+    )
+    .await?;
     let question2 = question.to_string();
     let embedding_profile_id = embedding_profile_id.clone();
     let controls = controls.clone();
     let runtime = tokio::runtime::Handle::current();
-    with_query_pipeline(&state, move |pipeline, mode| {
-        prepare_query_embedding_profile_blocking(
-            &runtime,
+    with_query_pipeline(&state, move |pipeline| {
+        prepare_query_embedding_profile_readonly(
             pipeline,
-            mode,
             controls.config.embedding.enabled,
             &embedding_profile_id,
         )?;
@@ -5227,17 +5223,21 @@ async fn prepare_generation_context(
     (StatusCode, Json<ErrorResponse>),
 > {
     // Retrieve first; this touches the !Send store and async embed client.
+    refresh_query_embedding_profile_capabilities(
+        &state,
+        config.embedding.enabled,
+        embedding_profile_id,
+    )
+    .await?;
     let question2 = question.to_string();
     let embedding_profile_id = embedding_profile_id.clone();
     let config = config.clone();
     let data_dir = state.data_dir.clone();
     let runtime = tokio::runtime::Handle::current();
     let (results, generation_context, retrieval_debug) =
-        with_query_pipeline(&state, move |pipeline, mode| {
-            prepare_query_embedding_profile_blocking(
-                &runtime,
+        with_query_pipeline(&state, move |pipeline| {
+            prepare_query_embedding_profile_readonly(
                 pipeline,
-                mode,
                 config.embedding.enabled,
                 &embedding_profile_id,
             )?;
@@ -7553,6 +7553,116 @@ mod tests {
             RetrievalDenseVectorPath::Bm25Only
         );
         restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    #[tokio::test]
+    async fn retrieve_model_wait_does_not_hold_pipeline_slot_when_query_starts_first() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("retrieve-model-wait-releases-pipeline");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Alpha retrieval evidence keeps the query embedding path active.",
+        )
+        .unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        let state = test_state(config.clone(), test_dir.path(), pipeline);
+        let before_query_embeddings = model_server.embedding_requests();
+        model_server.block_embeddings();
+
+        let controls = resolve_retrieve_controls(
+            &RetrieveRequest {
+                question: "Alpha retrieval question?".into(),
+                source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(1),
+                fast: false,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: true,
+                include_locator: false,
+            },
+            &config,
+        )
+        .unwrap();
+        let query_state = Arc::clone(&state);
+        let embedding_profile_id = config.embedding.profile_id.clone();
+        let source_filter = HashSet::from([source_id.clone()]);
+        let retrieve_task = tokio::spawn(async move {
+            prepare_retrieve_context(
+                query_state,
+                "Alpha retrieval question?",
+                Some(source_filter),
+                &embedding_profile_id,
+                &controls,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model_server.embedding_requests() <= before_query_embeddings {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retrieve reached blocked embedding provider");
+
+        assert_exclusive_pipeline_available(&state).await;
+
+        model_server.release_embeddings();
+        let context = tokio::time::timeout(Duration::from_secs(5), retrieve_task)
+            .await
+            .expect("retrieve completes after embedding release")
+            .expect("retrieve task joins")
+            .expect("retrieve context succeeds");
+        assert!(!context.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_capability_wait_does_not_hold_pipeline_slot_when_query_starts_first() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("query-capability-wait-releases-pipeline");
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config.clone(), test_dir.path(), pipeline);
+        let before_model_requests = model_server.model_requests();
+        model_server.block_models();
+
+        let refresh_state = Arc::clone(&state);
+        let embedding_profile_id = config.embedding.profile_id.clone();
+        let refresh_task = tokio::spawn(async move {
+            refresh_query_embedding_profile_capabilities(
+                &refresh_state,
+                true,
+                &embedding_profile_id,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model_server.model_requests() <= before_model_requests {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("query refresh reached blocked capability discovery");
+
+        assert_exclusive_pipeline_available(&state).await;
+
+        model_server.release_models();
+        tokio::time::timeout(Duration::from_secs(5), refresh_task)
+            .await
+            .expect("query capability refresh completes after discovery release")
+            .expect("query capability refresh task joins")
+            .expect("query capability refresh succeeds");
     }
 
     #[tokio::test]
@@ -11340,7 +11450,12 @@ mod tests {
 
     struct MockModelServer {
         base_url: String,
+        model_requests: Arc<AtomicUsize>,
+        model_blocked: Arc<AtomicBool>,
+        model_release: Arc<tokio::sync::Notify>,
         embedding_requests: Arc<AtomicUsize>,
+        embedding_blocked: Arc<AtomicBool>,
+        embedding_release: Arc<tokio::sync::Notify>,
         chat_requests: Arc<AtomicUsize>,
         handle: tokio::task::JoinHandle<()>,
     }
@@ -11357,13 +11472,20 @@ mod tests {
         async fn start_with_chat_response(dimension: usize, chat_response: Option<String>) -> Self {
             let state = MockModelState {
                 dimension,
+                model_requests: Arc::new(AtomicUsize::new(0)),
+                model_blocked: Arc::new(AtomicBool::new(false)),
+                model_release: Arc::new(tokio::sync::Notify::new()),
                 embedding_requests: Arc::new(AtomicUsize::new(0)),
+                embedding_blocked: Arc::new(AtomicBool::new(false)),
+                embedding_release: Arc::new(tokio::sync::Notify::new()),
                 chat_requests: Arc::new(AtomicUsize::new(0)),
                 chat_response,
             };
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let app = Router::new()
+                .route("/models", get(mock_models))
+                .route("/v1/models", get(mock_models))
                 .route("/v1/embeddings", post(mock_embeddings))
                 .route("/v1/chat/completions", post(mock_chat))
                 .with_state(state.clone());
@@ -11373,14 +11495,41 @@ mod tests {
 
             Self {
                 base_url: format!("http://{addr}/v1"),
+                model_requests: state.model_requests,
+                model_blocked: state.model_blocked,
+                model_release: state.model_release,
                 embedding_requests: state.embedding_requests,
+                embedding_blocked: state.embedding_blocked,
+                embedding_release: state.embedding_release,
                 chat_requests: state.chat_requests,
                 handle,
             }
         }
 
+        fn model_requests(&self) -> usize {
+            self.model_requests.load(Ordering::SeqCst)
+        }
+
+        fn block_models(&self) {
+            self.model_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_models(&self) {
+            self.model_blocked.store(false, Ordering::SeqCst);
+            self.model_release.notify_waiters();
+        }
+
         fn embedding_requests(&self) -> usize {
             self.embedding_requests.load(Ordering::SeqCst)
+        }
+
+        fn block_embeddings(&self) {
+            self.embedding_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_embeddings(&self) {
+            self.embedding_blocked.store(false, Ordering::SeqCst);
+            self.embedding_release.notify_waiters();
         }
 
         fn chat_requests(&self) -> usize {
@@ -11397,9 +11546,29 @@ mod tests {
     #[derive(Clone)]
     struct MockModelState {
         dimension: usize,
+        model_requests: Arc<AtomicUsize>,
+        model_blocked: Arc<AtomicBool>,
+        model_release: Arc<tokio::sync::Notify>,
         embedding_requests: Arc<AtomicUsize>,
+        embedding_blocked: Arc<AtomicBool>,
+        embedding_release: Arc<tokio::sync::Notify>,
         chat_requests: Arc<AtomicUsize>,
         chat_response: Option<String>,
+    }
+
+    async fn mock_models(State(state): State<MockModelState>) -> Json<serde_json::Value> {
+        state.model_requests.fetch_add(1, Ordering::SeqCst);
+        if state.model_blocked.load(Ordering::SeqCst) {
+            state.model_release.notified().await;
+        }
+        Json(serde_json::json!({
+            "data": [
+                {
+                    "id": "test-embedding",
+                    "root": "test-embedding"
+                }
+            ]
+        }))
     }
 
     async fn mock_embeddings(
@@ -11407,6 +11576,9 @@ mod tests {
         Json(payload): Json<serde_json::Value>,
     ) -> Json<serde_json::Value> {
         state.embedding_requests.fetch_add(1, Ordering::SeqCst);
+        if state.embedding_blocked.load(Ordering::SeqCst) {
+            state.embedding_release.notified().await;
+        }
         let input_count = payload
             .get("input")
             .and_then(serde_json::Value::as_array)

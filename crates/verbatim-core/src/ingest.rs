@@ -1058,6 +1058,36 @@ where
         Ok(previous_hash != new_hash)
     }
 
+    /// Apply already-discovered embedding endpoint capabilities without doing
+    /// provider I/O while the live pipeline slot is held.
+    pub fn apply_embedding_profile_capabilities(
+        &mut self,
+        capabilities: EmbeddingEndpointCapabilities,
+    ) -> Result<bool> {
+        if !self.embedding_enabled {
+            return Ok(false);
+        }
+        let previous_hash = self.embedding_profile_spec.config_hash();
+        self.embedding_profile_spec
+            .apply_endpoint_capabilities(capabilities);
+        let new_hash = self.embedding_profile_spec.config_hash();
+        let sqlite_write_permit =
+            acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
+        let reset_vectors = self.store.ensure_embedding_profile(
+            &self.active_profile_id,
+            self.embedding_profile_spec.as_store_config(),
+        )?;
+        drop(sqlite_write_permit);
+        if reset_vectors {
+            self.hnsw.clear();
+            self.loaded_profile_id = self.active_profile_id.clone();
+            #[cfg(feature = "qdrant")]
+            self.pending_qdrant_profile_syncs
+                .push(self.active_profile_id.clone());
+        }
+        Ok(previous_hash != new_hash)
+    }
+
     pub fn vector_index(&self) -> &dyn VectorIndex {
         &self.hnsw
     }
