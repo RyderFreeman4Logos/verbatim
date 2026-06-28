@@ -357,21 +357,70 @@ fn restore_pipeline(state: &SharedState, pipeline: IngestPipeline) -> Result<()>
     Ok(())
 }
 
+fn pipeline_access_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    if is_pipeline_busy_error(&error) {
+        err(StatusCode::SERVICE_UNAVAILABLE, error)
+    } else {
+        err(StatusCode::INTERNAL_SERVER_ERROR, error)
+    }
+}
+
+struct PipelineLease {
+    state: SharedState,
+    pipeline: Option<IngestPipeline>,
+}
+
+impl PipelineLease {
+    fn take(state: SharedState) -> Result<Self> {
+        let pipeline = take_pipeline(&state)?;
+        Ok(Self {
+            state,
+            pipeline: Some(pipeline),
+        })
+    }
+
+    fn restore(mut self) -> Result<()> {
+        let pipeline = self.pipeline.take().ok_or_else(pipeline_busy_error)?;
+        restore_pipeline(&self.state, pipeline)
+    }
+}
+
+impl Drop for PipelineLease {
+    fn drop(&mut self) {
+        let Some(pipeline) = self.pipeline.take() else {
+            return;
+        };
+        if let Err(error) = restore_pipeline(&self.state, pipeline) {
+            tracing::error!(
+                error = %error,
+                "failed to restore ingest pipeline slot while dropping pipeline lease"
+            );
+        }
+    }
+}
+
+fn run_with_pipeline<T, F>(state: SharedState, operation: F) -> Result<T>
+where
+    F: FnOnce(&mut IngestPipeline) -> Result<T>,
+{
+    let mut lease = PipelineLease::take(state)?;
+    let result = {
+        let pipeline = lease.pipeline.as_mut().ok_or_else(pipeline_busy_error)?;
+        operation(pipeline)
+    };
+    lease.restore()?;
+    result
+}
+
 async fn with_exclusive_pipeline<T, F>(state: &SharedState, operation: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&mut IngestPipeline) -> Result<T> + Send + 'static,
 {
-    let pipeline = take_pipeline(state)?;
-    let (pipeline, result) = tokio::task::spawn_blocking(move || {
-        let mut pipeline = pipeline;
-        let result = operation(&mut pipeline);
-        (pipeline, result)
-    })
-    .await
-    .context("join exclusive pipeline task")?;
-    restore_pipeline(state, pipeline)?;
-    result
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || run_with_pipeline(state, operation))
+        .await
+        .context("join exclusive pipeline task")?
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,24 +429,35 @@ enum QueryPipelineMode {
     ReadOnlySnapshot,
 }
 
+enum QueryPipelineAttempt<T, F> {
+    Completed(Result<T>),
+    Busy(F),
+}
+
 async fn with_query_pipeline<T, F>(state: &SharedState, operation: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&mut IngestPipeline, QueryPipelineMode) -> Result<T> + Send + 'static,
 {
-    match take_pipeline(state) {
-        Ok(pipeline) => {
-            let (pipeline, result) = tokio::task::spawn_blocking(move || {
-                let mut pipeline = pipeline;
-                let result = operation(&mut pipeline, QueryPipelineMode::Exclusive);
-                (pipeline, result)
-            })
-            .await
-            .context("join query pipeline task")?;
-            restore_pipeline(state, pipeline)?;
-            result
+    let exclusive_state = Arc::clone(state);
+    let attempt = tokio::task::spawn_blocking(move || match PipelineLease::take(exclusive_state) {
+        Ok(mut lease) => {
+            let result = match lease.pipeline.as_mut() {
+                Some(pipeline) => operation(pipeline, QueryPipelineMode::Exclusive),
+                None => Err(pipeline_busy_error()),
+            };
+            let restore = lease.restore();
+            QueryPipelineAttempt::Completed(restore.and(result))
         }
-        Err(error) if is_pipeline_busy_error(&error) => {
+        Err(error) if is_pipeline_busy_error(&error) => QueryPipelineAttempt::Busy(operation),
+        Err(error) => QueryPipelineAttempt::Completed(Err(error)),
+    })
+    .await
+    .context("join query pipeline task")?;
+
+    match attempt {
+        QueryPipelineAttempt::Completed(result) => result,
+        QueryPipelineAttempt::Busy(operation) => {
             let config = runtime_config_snapshot(state)?.config;
             let data_dir = state.data_dir.clone();
             tokio::task::spawn_blocking(move || {
@@ -407,7 +467,6 @@ where
             .await
             .context("join read-only query pipeline task")?
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -4465,31 +4524,30 @@ async fn run_started_ingest_source_batch(
     source_tasks: Vec<(SourceId, TaskId)>,
 ) -> Result<Vec<SourceIngestOutcome>, (StatusCode, Json<ErrorResponse>)> {
     let _worker = acquire_ingest_worker(&state)?;
-    let pipeline =
-        take_pipeline(&state).map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error))?;
     let runtime = tokio::runtime::Handle::current();
-    let state2 = Arc::clone(&state);
-    let (pipeline, result, index_status) = tokio::task::spawn_blocking(move || {
-        let mut pipeline = pipeline;
-        let state_for_reporter = Arc::clone(&state2);
-        let result = runtime.block_on(pipeline.ingest_sources_with_tasks_reporting(
-            &source_tasks,
-            move |outcome| {
-                let state = Arc::clone(&state_for_reporter);
-                async move {
-                    if let Err(error) = finish_source_batch_task_outcome(&state, outcome).await {
-                        tracing::error!(error = %error, "failed to stream-finalize source batch task outcome");
+    let state_for_reporter = Arc::clone(&state);
+    let state_for_pipeline = Arc::clone(&state);
+    let (result, index_status) = tokio::task::spawn_blocking(move || {
+        run_with_pipeline(state_for_pipeline, move |pipeline| {
+            let state_for_reporter = Arc::clone(&state_for_reporter);
+            let result = runtime.block_on(pipeline.ingest_sources_with_tasks_reporting(
+                &source_tasks,
+                move |outcome| {
+                    let state = Arc::clone(&state_for_reporter);
+                    async move {
+                        if let Err(error) = finish_source_batch_task_outcome(&state, outcome).await {
+                            tracing::error!(error = %error, "failed to stream-finalize source batch task outcome");
+                        }
                     }
-                }
-            },
-        ));
-        let index_status = initial_index_status_cache(&pipeline);
-        (pipeline, result, index_status)
+                },
+            ));
+            let index_status = initial_index_status_cache(pipeline);
+            Ok((result, index_status))
+        })
     })
     .await
-    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.into()))?;
-    restore_pipeline(&state, pipeline)
-        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.into()))?
+    .map_err(pipeline_access_error)?;
     if let Some(index_status) = index_status {
         if let Err(error) = update_index_status_cache(&state, &index_status) {
             tracing::warn!(error = %error, "failed to update index status cache after source batch");
@@ -4579,37 +4637,38 @@ async fn run_indexing_operation(
             .with_active_worker_kind(TaskKind::Ingest.as_str()),
     )
     .await;
-    let pipeline =
-        take_pipeline(&state).map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error))?;
-    let (pipeline, outcome, index_status) = tokio::task::spawn_blocking(move || {
-        let mut pipeline = pipeline;
-        if vectors_only {
-            let source_filter = source_id.as_ref().map(|id| SourceId(id.clone()));
-            let result = runtime.block_on(
-                pipeline.build_embedding_profile(&profile_id_for_task, source_filter.as_ref()),
-            );
-            let index_status = initial_index_status_cache(&pipeline);
-            return (pipeline, result, index_status);
-        }
-        let result = match source_id {
-            Some(id) => {
-                match runtime.block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2)) {
-                    Ok(embedding_cache) => Ok(IndexingOutcome {
-                        source_count: 1,
-                        embedding_cache,
-                    }),
-                    Err(error) => Err(error),
-                }
+    let state_for_pipeline = Arc::clone(&state);
+    let (outcome, index_status) = tokio::task::spawn_blocking(move || {
+        run_with_pipeline(state_for_pipeline, move |pipeline| {
+            if vectors_only {
+                let source_filter = source_id.as_ref().map(|id| SourceId(id.clone()));
+                let result = runtime.block_on(
+                    pipeline.build_embedding_profile(&profile_id_for_task, source_filter.as_ref()),
+                );
+                let index_status = initial_index_status_cache(pipeline);
+                return Ok((result, index_status));
             }
-            None => runtime.block_on(pipeline.ingest_all_with_task(force, &task_id2)),
-        };
-        let index_status = initial_index_status_cache(&pipeline);
-        (pipeline, result, index_status)
+            let result = match source_id {
+                Some(id) => {
+                    match runtime
+                        .block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2))
+                    {
+                        Ok(embedding_cache) => Ok(IndexingOutcome {
+                            source_count: 1,
+                            embedding_cache,
+                        }),
+                        Err(error) => Err(error),
+                    }
+                }
+                None => runtime.block_on(pipeline.ingest_all_with_task(force, &task_id2)),
+            };
+            let index_status = initial_index_status_cache(pipeline);
+            Ok((result, index_status))
+        })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
-    restore_pipeline(&state, pipeline)
-        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(pipeline_access_error)?;
     if let Some(index_status) = index_status {
         if let Err(error) = update_index_status_cache(&state, &index_status) {
             tracing::warn!(error = %error, "failed to update index status cache after indexing operation");
@@ -6673,10 +6732,12 @@ mod tests {
 
     #[test]
     fn sqlite_writer_resource_limits_keep_single_active_writer() {
-        let mut config = DaemonResourceConfig::default();
-        config.sqlite_writer_concurrency = 32;
-        config.sqlite_writer_queue_capacity = 7;
-        config.sqlite_writer_queue_timeout_seconds = 11;
+        let config = DaemonResourceConfig {
+            sqlite_writer_concurrency: 32,
+            sqlite_writer_queue_capacity: 7,
+            sqlite_writer_queue_timeout_seconds: 11,
+            ..DaemonResourceConfig::default()
+        };
 
         let limits = sqlite_writer_resource_limits(&config.bounded());
 
@@ -7354,6 +7415,65 @@ mod tests {
 
         assert_eq!(response.task.id, task_id);
         restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    async fn assert_exclusive_pipeline_available(state: &SharedState) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match with_exclusive_pipeline(state, |_pipeline| Ok::<_, anyhow::Error>(())).await {
+                Ok(()) => return,
+                Err(error) if is_pipeline_busy_error(&error) && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("exclusive pipeline did not recover: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_exclusive_pipeline_owner_restores_slot() {
+        let test_dir = TestDir::new("pipeline-owner-cancel-restore");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let (taken_tx, taken_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_state = Arc::clone(&state);
+        let owner = tokio::spawn(async move {
+            with_exclusive_pipeline(&worker_state, move |_pipeline| {
+                taken_tx.send(()).expect("signal pipeline taken");
+                release_rx.recv().expect("wait for release signal");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), taken_rx)
+            .await
+            .expect("worker takes pipeline")
+            .expect("worker signal remains alive");
+        owner.abort();
+        release_tx.send(()).expect("release worker");
+        let join_error = owner.await.expect_err("owner future was aborted");
+        assert!(join_error.is_cancelled());
+
+        assert_exclusive_pipeline_available(&state).await;
+    }
+
+    #[tokio::test]
+    async fn panicking_exclusive_pipeline_worker_restores_slot() {
+        let test_dir = TestDir::new("pipeline-worker-panic-restore");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let result = with_exclusive_pipeline(&state, |_pipeline| -> Result<()> {
+            panic!("test panic after taking pipeline")
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_exclusive_pipeline_available(&state).await;
     }
 
     #[tokio::test]
