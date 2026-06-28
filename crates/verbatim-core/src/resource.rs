@@ -278,6 +278,10 @@ impl ResourcePermit {
         self.queue_wait_ms
     }
 
+    pub fn service_ms(&self) -> u64 {
+        elapsed_ms(self.service_started)
+    }
+
     pub fn snapshot(&self) -> ResourceQueueSnapshot {
         self.resource.snapshot()
     }

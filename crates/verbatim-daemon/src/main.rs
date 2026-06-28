@@ -372,6 +372,43 @@ where
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryPipelineMode {
+    Exclusive,
+    ReadOnlySnapshot,
+}
+
+async fn with_query_pipeline<T, F>(state: &SharedState, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut IngestPipeline, QueryPipelineMode) -> Result<T> + Send + 'static,
+{
+    match take_pipeline(state) {
+        Ok(pipeline) => {
+            let (pipeline, result) = tokio::task::spawn_blocking(move || {
+                let mut pipeline = pipeline;
+                let result = operation(&mut pipeline, QueryPipelineMode::Exclusive);
+                (pipeline, result)
+            })
+            .await
+            .context("join query pipeline task")?;
+            restore_pipeline(state, pipeline)?;
+            result
+        }
+        Err(error) if is_pipeline_busy_error(&error) => {
+            let config = runtime_config_snapshot(state)?.config;
+            let data_dir = state.data_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut pipeline = IngestPipeline::open_readonly(&config, &data_dir)?;
+                operation(&mut pipeline, QueryPipelineMode::ReadOnlySnapshot)
+            })
+            .await
+            .context("join read-only query pipeline task")?
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn with_task_store_read<T, F>(state: &SharedState, operation: F) -> Result<T>
 where
     T: Send + 'static,
@@ -4967,6 +5004,30 @@ fn refresh_embedding_profile_capabilities_blocking(
     Ok(())
 }
 
+fn prepare_query_embedding_profile_blocking(
+    runtime: &tokio::runtime::Handle,
+    pipeline: &mut IngestPipeline,
+    mode: QueryPipelineMode,
+    embedding_enabled: bool,
+    embedding_profile_id: &EmbeddingProfileId,
+) -> Result<()> {
+    if embedding_enabled {
+        match mode {
+            QueryPipelineMode::Exclusive => {
+                refresh_embedding_profile_capabilities_blocking(runtime, pipeline)?;
+                pipeline.select_embedding_profile(embedding_profile_id)?;
+            }
+            QueryPipelineMode::ReadOnlySnapshot => {
+                pipeline.select_embedding_profile_readonly(embedding_profile_id)?;
+            }
+        }
+    }
+    if mode == QueryPipelineMode::Exclusive {
+        runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
+    }
+    Ok(())
+}
+
 async fn refresh_query_embedding_profile_for_collection_filter(
     state: &SharedState,
     collection_filter: &CollectionFilterRequest,
@@ -4979,9 +5040,14 @@ async fn refresh_query_embedding_profile_for_collection_filter(
 
     let embedding_profile_id = embedding_profile_id.clone();
     let runtime = tokio::runtime::Handle::current();
-    with_exclusive_pipeline(state, move |pipeline| {
-        refresh_embedding_profile_capabilities_blocking(&runtime, pipeline)?;
-        pipeline.select_embedding_profile(&embedding_profile_id)?;
+    with_query_pipeline(state, move |pipeline, mode| {
+        prepare_query_embedding_profile_blocking(
+            &runtime,
+            pipeline,
+            mode,
+            embedding_enabled,
+            &embedding_profile_id,
+        )?;
         Ok::<_, anyhow::Error>(())
     })
     .await
@@ -4999,12 +5065,14 @@ async fn prepare_retrieve_context(
     let embedding_profile_id = embedding_profile_id.clone();
     let controls = controls.clone();
     let runtime = tokio::runtime::Handle::current();
-    with_exclusive_pipeline(&state, move |pipeline| {
-        if controls.config.embedding.enabled {
-            refresh_embedding_profile_capabilities_blocking(&runtime, pipeline)?;
-            pipeline.select_embedding_profile(&embedding_profile_id)?;
-        }
-        runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
+    with_query_pipeline(&state, move |pipeline, mode| {
+        prepare_query_embedding_profile_blocking(
+            &runtime,
+            pipeline,
+            mode,
+            controls.config.embedding.enabled,
+            &embedding_profile_id,
+        )?;
         let lexical_index = pipeline.lexical_index();
         let embed_client = OpenAiEmbeddingClient::new(&controls.config.embedding);
         let retrieval = RetrievalPipeline::new_with_graph(
@@ -5095,12 +5163,14 @@ async fn prepare_generation_context(
     let data_dir = state.data_dir.clone();
     let runtime = tokio::runtime::Handle::current();
     let (results, generation_context, retrieval_debug) =
-        with_exclusive_pipeline(&state, move |pipeline| {
-            if config.embedding.enabled {
-                refresh_embedding_profile_capabilities_blocking(&runtime, pipeline)?;
-                pipeline.select_embedding_profile(&embedding_profile_id)?;
-            }
-            runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
+        with_query_pipeline(&state, move |pipeline, mode| {
+            prepare_query_embedding_profile_blocking(
+                &runtime,
+                pipeline,
+                mode,
+                config.embedding.enabled,
+                &embedding_profile_id,
+            )?;
             let lexical_index = pipeline.lexical_index();
             let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
             let retrieval = RetrievalPipeline::new_with_graph(
@@ -7286,6 +7356,55 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.contains("last-known index status")));
+        restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    #[tokio::test]
+    async fn taken_pipeline_slot_does_not_block_retrieve_read_snapshot() {
+        let test_dir = TestDir::new("pipeline-busy-retrieve-snapshot");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        config.rerank.enabled = false;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config.clone(), test_dir.path(), pipeline);
+        let pipeline = take_pipeline(&state).expect("take pipeline slot");
+        let req = RetrieveRequest {
+            question: "empty corpus query".into(),
+            source_id: None,
+            collection_filter: CollectionFilterRequest::default(),
+            embedding_profile_id: None,
+            limit: None,
+            page_size: None,
+            page: None,
+            fast: false,
+            rerank: Some(false),
+            dense_top_k: None,
+            bm25_top_k: None,
+            rerank_top_n: None,
+            include_debug: true,
+            include_locator: false,
+        };
+        let controls = resolve_retrieve_controls(&req, &config).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            prepare_retrieve_context(
+                Arc::clone(&state),
+                &req.question,
+                None,
+                &config.embedding.profile_id,
+                &controls,
+            ),
+        )
+        .await
+        .expect("retrieve read snapshot should not wait behind pipeline slot")
+        .expect("retrieve read snapshot should not report pipeline busy");
+
+        assert!(result.results.is_empty());
+        assert_eq!(
+            result.debug.dense_vector_path,
+            RetrievalDenseVectorPath::Bm25Only
+        );
         restore_pipeline(&state, pipeline).expect("restore pipeline slot");
     }
 

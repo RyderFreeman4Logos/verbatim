@@ -356,6 +356,16 @@ fn task_resource_progress(permit: &ResourcePermit, state: &'static str) -> TaskR
     TaskResourceProgress::from_snapshot(&snapshot, state, Some(permit.queue_wait_ms()), None)
 }
 
+fn completed_resource_progress(permit: &ResourcePermit) -> TaskResourceProgress {
+    let snapshot = permit.snapshot();
+    TaskResourceProgress::from_snapshot(
+        &snapshot,
+        "completed",
+        Some(permit.queue_wait_ms()),
+        Some(permit.service_ms()),
+    )
+}
+
 struct PreparedVectors {
     vectors: Vec<VectorDocument>,
     cache_stats: EmbeddingCacheStats,
@@ -843,6 +853,76 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         })
     }
 
+    pub fn open_readonly(config: &Config, data_dir: &Path) -> Result<Self> {
+        let db_path = data_dir.join("verbatim.db");
+        let store = Store::open_existing_readonly(&db_path)?;
+
+        let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+        let active_profile_id = config.embedding.profile_id.clone();
+        let mut embedding_profile_spec = EmbeddingProfileSpec::from_config(&config.embedding);
+        if let Some(stored) = store.load_embedding_profile_config(&active_profile_id)? {
+            embedding_profile_spec.apply_stored_profile_config(&stored);
+        }
+
+        let hnsw = load_vector_index_for_residency(
+            config.vector_index.residency,
+            data_dir,
+            &store,
+            &active_profile_id,
+        )?;
+
+        let context_gen = if config.context.enabled {
+            Some(ContextGenerator::new(&config.chat))
+        } else {
+            None
+        };
+        let (vision_model, vision_caption_model) = configured_vision_model(config);
+        let ocr_provider = configured_ocr_provider(&config.ocr)?;
+        let graph_extraction_config = config.graph.extraction.clone();
+        let graph_extractor = if graph_extraction_config.enabled && config.chat.enabled {
+            Some(GraphExtractor::from_config(&config.chat))
+        } else {
+            None
+        };
+        #[cfg(feature = "qdrant")]
+        let qdrant = QdrantClient::from_config(&config.qdrant);
+        #[cfg(feature = "qdrant")]
+        let pending_qdrant_profile_syncs = Vec::new();
+
+        Ok(Self {
+            store,
+            hnsw,
+            vector_residency: config.vector_index.residency,
+            loaded_profile_id: active_profile_id.clone(),
+            active_profile_id,
+            embedding_profile_spec,
+            embedding_enabled: config.embedding.enabled,
+            embed_client,
+            context_gen,
+            vision_model,
+            graph_extractor,
+            graph_extraction_config,
+            #[cfg(feature = "qdrant")]
+            qdrant,
+            #[cfg(feature = "qdrant")]
+            pending_qdrant_profile_syncs,
+            vision_caption_model,
+            vision_caption_prompt_hash: vision_caption_prompt_hash(),
+            ocr_provider,
+            data_dir: data_dir.to_path_buf(),
+            image_artifact_limits: config.parser.image_artifacts,
+            index_gc_policy: config.index_gc.policy(),
+            embedding_batch_size: config.embedding.batch_size.max(1),
+            embedding_max_concurrent_requests: config
+                .embedding
+                .endpoint_runtime
+                .bounded()
+                .max_concurrent_requests,
+            #[cfg(test)]
+            source_commit_observer: None,
+        })
+    }
+
     pub fn reload_runtime_config(&mut self, config: &Config) -> Result<()> {
         self.embed_client = OpenAiEmbeddingClient::new(&config.embedding);
         self.embedding_enabled = config.embedding.enabled;
@@ -969,6 +1049,23 @@ where
 
     pub fn select_embedding_profile(&mut self, profile_id: &EmbeddingProfileId) -> Result<()> {
         let _ = self.ensure_embedding_profile(profile_id)?;
+        if self.loaded_profile_id == *profile_id {
+            return Ok(());
+        }
+        self.hnsw = load_vector_index_for_residency(
+            self.vector_residency,
+            &self.data_dir,
+            &self.store,
+            profile_id,
+        )?;
+        self.loaded_profile_id = profile_id.clone();
+        Ok(())
+    }
+
+    pub fn select_embedding_profile_readonly(
+        &mut self,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<()> {
         if self.loaded_profile_id == *profile_id {
             return Ok(());
         }
@@ -1816,10 +1913,11 @@ where
                 .with_active_worker_kind("ingest")
                 .with_resource(task_resource_progress(&cpu_permit, "active")),
         );
-        let prepared = {
-            let _cpu_permit = cpu_permit;
-            self.prepare_source_indexes_from_vectors(profile_id, &source_id, vectors, cache_stats)?
-        };
+        let prepared =
+            self.prepare_source_indexes_from_vectors(profile_id, &source_id, vectors, cache_stats)?;
+        let completed_cpu_resource = completed_resource_progress(&cpu_permit);
+        drop(cpu_permit);
+        self.record_resource_timing(task_id, completed_cpu_resource);
         self.record_task_progress(
             task_id,
             vector_build_phase
@@ -1841,7 +1939,9 @@ where
                 .with_resource(task_resource_progress(&index_publish_permit, "active")),
         );
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let completed_index_stage_resource = completed_resource_progress(&index_publish_permit);
         drop(index_publish_permit);
+        self.record_resource_timing(task_id, completed_index_stage_resource);
         self.record_task_phase(
             task_id,
             vector_build_phase,
@@ -1910,7 +2010,9 @@ where
                     return Err(err);
                 }
             };
+        let completed_sqlite_resource = completed_resource_progress(&sqlite_write_permit);
         drop(sqlite_write_permit);
+        self.record_resource_timing(task_id, completed_sqlite_resource);
         let generation = replacement_report.generation;
         let lexical_update = replacement_report.lexical_update;
         self.record_task_phase(
@@ -1968,7 +2070,9 @@ where
                 .with_resource(task_resource_progress(&index_publish_permit, "active")),
         );
         self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
+        let completed_index_publish_resource = completed_resource_progress(&index_publish_permit);
         drop(index_publish_permit);
+        self.record_resource_timing(task_id, completed_index_publish_resource);
         self.record_task_progress(
             task_id,
             vector_publish_phase
@@ -2901,6 +3005,15 @@ where
                 "failed to persist task event"
             );
         }
+    }
+
+    fn record_resource_timing(&self, task_id: Option<&TaskId>, resource: TaskResourceProgress) {
+        self.record_task_event(
+            task_id,
+            "resource",
+            "resource timing",
+            serde_json::json!({ "resource": resource }),
+        );
     }
 
     pub async fn rebuild_indexes_from_store(&mut self) -> Result<()> {
@@ -7763,6 +7876,34 @@ model = "local-vision"
                         })
             }),
             "progress events should report active index_publish resource while staging artifacts"
+        );
+        let completed_resources = events
+            .iter()
+            .filter(|event| event.event_type == "resource")
+            .filter_map(|event| event.payload.get("resource"))
+            .filter(|resource| resource["state"] == "completed")
+            .collect::<Vec<_>>();
+        assert!(
+            completed_resources.len() >= 2,
+            "expected multiple completed resource timing events, got {completed_resources:?}"
+        );
+        assert!(
+            completed_resources.iter().any(|resource| {
+                resource["name"] == "sqlite_writer"
+                    && resource["kind"] == "sqlite_write"
+                    && resource["queue_wait_ms"].is_u64()
+                    && resource["service_ms"].is_u64()
+            }),
+            "completed resource timings should include sqlite_writer service time, got {completed_resources:?}"
+        );
+        assert!(
+            completed_resources.iter().any(|resource| {
+                resource["name"] == "index_publish"
+                    && resource["kind"] == "index_publish"
+                    && resource["queue_wait_ms"].is_u64()
+                    && resource["service_ms"].is_u64()
+            }),
+            "completed resource timings should include index_publish service time, got {completed_resources:?}"
         );
     }
 
