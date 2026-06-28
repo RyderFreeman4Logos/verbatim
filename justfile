@@ -134,6 +134,10 @@ deny:
 # Testing
 # ==============================================================================
 
+# Run the Qdrant primary vector sink spike harness.
+bench-qdrant-spike *args:
+    python3 scripts/qdrant_spike.py {{args}}
+
 # Run all workspace tests.
 test:
     cargo nextest run --workspace --no-tests=warn
