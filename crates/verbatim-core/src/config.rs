@@ -1323,7 +1323,10 @@ impl Config {
         next.embedding.api_key = candidate.embedding.api_key.clone();
         next.embedding.capability_cache_ttl_seconds =
             candidate.embedding.capability_cache_ttl_seconds;
-        next.embedding.endpoint_runtime = candidate.embedding.endpoint_runtime.clone();
+        next.embedding.endpoint_runtime = reload_safe_endpoint_runtime_config(
+            &self.embedding.endpoint_runtime,
+            &candidate.embedding.endpoint_runtime,
+        );
 
         next.retrieval = candidate.retrieval.clone();
 
@@ -1335,9 +1338,21 @@ impl Config {
         next.graph.global_search = candidate.graph.global_search.clone();
 
         next.rerank = candidate.rerank.clone();
+        next.rerank.endpoint_runtime = reload_safe_endpoint_runtime_config(
+            &self.rerank.endpoint_runtime,
+            &candidate.rerank.endpoint_runtime,
+        );
         next.context = candidate.context.clone();
         next.vision = candidate.vision.clone();
+        next.vision.endpoint_runtime = reload_safe_endpoint_runtime_config(
+            &self.vision.endpoint_runtime,
+            &candidate.vision.endpoint_runtime,
+        );
         next.chat = candidate.chat.clone();
+        next.chat.endpoint_runtime = reload_safe_endpoint_runtime_config(
+            &self.chat.endpoint_runtime,
+            &candidate.chat.endpoint_runtime,
+        );
         next.verifier = candidate.verifier.clone();
         next.index_gc = candidate.index_gc.clone();
         next.cli = candidate.cli.clone();
@@ -1345,6 +1360,15 @@ impl Config {
 
         next
     }
+}
+
+fn reload_safe_endpoint_runtime_config(
+    current: &ModelEndpointRuntimeConfig,
+    candidate: &ModelEndpointRuntimeConfig,
+) -> ModelEndpointRuntimeConfig {
+    let mut next = candidate.clone();
+    next.queue_capacity = current.queue_capacity;
+    next
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2380,6 +2404,52 @@ model_supports_vision = true
         assert_eq!(
             applied.vector_index.residency,
             current.vector_index.residency
+        );
+    }
+
+    #[test]
+    fn reload_plan_preserves_restart_required_endpoint_queue_capacities() {
+        let current: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        let mut candidate = current.clone();
+        candidate.embedding.endpoint_runtime.queue_capacity = 17;
+        candidate.rerank.endpoint_runtime.queue_capacity = 19;
+        candidate.vision.endpoint_runtime.queue_capacity = 23;
+        candidate.chat.endpoint_runtime.queue_capacity = 29;
+
+        let plan = current.reload_plan(&candidate).unwrap();
+
+        assert!(plan.reload_safe_keys.is_empty());
+        let keys = plan
+            .restart_required_keys
+            .iter()
+            .map(|change| change.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "chat.queue_capacity",
+                "embedding.queue_capacity",
+                "rerank.queue_capacity",
+                "vision.queue_capacity"
+            ]
+        );
+
+        let applied = current.apply_reload_safe_changes(&candidate);
+        assert_eq!(
+            applied.embedding.endpoint_runtime.queue_capacity,
+            current.embedding.endpoint_runtime.queue_capacity
+        );
+        assert_eq!(
+            applied.rerank.endpoint_runtime.queue_capacity,
+            current.rerank.endpoint_runtime.queue_capacity
+        );
+        assert_eq!(
+            applied.vision.endpoint_runtime.queue_capacity,
+            current.vision.endpoint_runtime.queue_capacity
+        );
+        assert_eq!(
+            applied.chat.endpoint_runtime.queue_capacity,
+            current.chat.endpoint_runtime.queue_capacity
         );
     }
 }

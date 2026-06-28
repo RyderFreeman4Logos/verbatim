@@ -429,9 +429,11 @@ where
     T: Send + 'static,
     F: FnOnce(&mut IngestPipeline) -> Result<T> + Send + 'static,
 {
+    let permit = state.resources.sqlite_reader.acquire().await?;
     let config = runtime_config_snapshot(state)?.config;
     let data_dir = state.data_dir.clone();
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let mut pipeline = IngestPipeline::open_readonly(&config, &data_dir)?;
         operation(&mut pipeline)
     })
@@ -6926,6 +6928,56 @@ mod tests {
             .contains("restart or reindex required"));
     }
 
+    #[tokio::test]
+    async fn config_reload_reports_endpoint_queue_capacities_without_applying_them() {
+        let test_dir = TestDir::new("config-reload-endpoint-queue-capacity");
+        let config_path = test_dir.path().join("config.toml");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.endpoint_runtime.queue_capacity = 5;
+        config.rerank.endpoint_runtime.queue_capacity = 7;
+        config.vision.endpoint_runtime.queue_capacity = 11;
+        config.chat.endpoint_runtime.queue_capacity = 13;
+        fs::write(&config_path, config.show().unwrap()).unwrap();
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state =
+            test_state_with_config_path(config.clone(), test_dir.path(), pipeline, config_path);
+
+        let mut candidate = config.clone();
+        candidate.embedding.endpoint_runtime.queue_capacity = 17;
+        candidate.rerank.endpoint_runtime.queue_capacity = 19;
+        candidate.vision.endpoint_runtime.queue_capacity = 23;
+        candidate.chat.endpoint_runtime.queue_capacity = 29;
+        fs::write(&state.config_path, candidate.show().unwrap()).unwrap();
+
+        let metadata = reload_config_from_path(&state).await.unwrap();
+        let snapshot = runtime_config_snapshot(&state).unwrap();
+        let restart_required_keys = metadata
+            .last_restart_required_keys
+            .iter()
+            .map(|change| change.key.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(metadata.last_applied_reload_safe_keys.is_empty());
+        assert_eq!(
+            restart_required_keys,
+            vec![
+                "chat.queue_capacity",
+                "embedding.queue_capacity",
+                "rerank.queue_capacity",
+                "vision.queue_capacity"
+            ]
+        );
+        assert_eq!(snapshot.config.embedding.endpoint_runtime.queue_capacity, 5);
+        assert_eq!(snapshot.config.rerank.endpoint_runtime.queue_capacity, 7);
+        assert_eq!(snapshot.config.vision.endpoint_runtime.queue_capacity, 11);
+        assert_eq!(snapshot.config.chat.endpoint_runtime.queue_capacity, 13);
+        assert!(metadata
+            .last_reload_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("restart or reindex required"));
+    }
+
     #[test]
     fn config_watch_event_ignores_access_events_for_active_config_path() {
         let (_test_dir, state) = config_watch_test_state("config-watch-access");
@@ -7553,6 +7605,90 @@ mod tests {
             RetrievalDenseVectorPath::Bm25Only
         );
         restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    #[tokio::test]
+    async fn retrieve_read_snapshot_uses_sqlite_reader_resource() {
+        let test_dir = TestDir::new("retrieve-uses-sqlite-reader-resource");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        config.rerank.enabled = false;
+        config.daemon.resources.sqlite_reader_concurrency = 1;
+        config.daemon.resources.sqlite_reader_queue_capacity = 1;
+        config.daemon.resources.sqlite_reader_queue_timeout_seconds = 5;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config.clone(), test_dir.path(), pipeline);
+        let held_reader = state
+            .resources
+            .sqlite_reader
+            .acquire()
+            .await
+            .expect("hold sqlite reader permit");
+        let req = RetrieveRequest {
+            question: "empty corpus query".into(),
+            source_id: None,
+            collection_filter: CollectionFilterRequest::default(),
+            embedding_profile_id: None,
+            limit: None,
+            page_size: None,
+            page: None,
+            fast: false,
+            rerank: Some(false),
+            dense_top_k: None,
+            bm25_top_k: None,
+            rerank_top_n: None,
+            include_debug: true,
+            include_locator: false,
+        };
+        let controls = resolve_retrieve_controls(&req, &config).unwrap();
+        let query_state = Arc::clone(&state);
+        let question = req.question.clone();
+        let embedding_profile_id = config.embedding.profile_id.clone();
+        let retrieve_task = tokio::spawn(async move {
+            prepare_retrieve_context(
+                query_state,
+                &question,
+                None,
+                &embedding_profile_id,
+                &controls,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Json(response) = health(State(Arc::clone(&state))).await;
+                let reader = response
+                    .resources
+                    .iter()
+                    .find(|resource| resource.name == "sqlite_reader")
+                    .expect("sqlite reader resource is reported");
+                if reader.active == 1 && reader.queued == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retrieve is queued behind sqlite reader resource");
+
+        drop(held_reader);
+        let result = tokio::time::timeout(Duration::from_secs(2), retrieve_task)
+            .await
+            .expect("retrieve completes after sqlite reader release")
+            .expect("retrieve task joins")
+            .expect("retrieve context succeeds");
+        assert!(result.results.is_empty());
+
+        let Json(response) = health(State(Arc::clone(&state))).await;
+        let reader = response
+            .resources
+            .iter()
+            .find(|resource| resource.name == "sqlite_reader")
+            .expect("sqlite reader resource is reported");
+        assert_eq!(reader.active, 0);
+        assert_eq!(reader.queued, 0);
+        assert!(reader.completed >= 2);
     }
 
     #[tokio::test]
