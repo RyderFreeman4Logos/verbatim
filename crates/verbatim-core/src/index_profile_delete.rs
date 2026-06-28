@@ -379,9 +379,9 @@ mod tests {
             .replace_source_contents(SourceContentsReplacement {
                 source: &source,
                 evidence: &[evidence],
-                chunks: &[chunk.clone()],
+                chunks: std::slice::from_ref(&chunk),
                 embedding_profile_id: profile_id,
-                vectors: &[vector.clone()],
+                vectors: std::slice::from_ref(&vector),
                 links: &[(chunk.id.clone(), EvidenceId("ev-1".to_string()))],
                 image_artifacts: &[],
                 graph_nodes: &[],
