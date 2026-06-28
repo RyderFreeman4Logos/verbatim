@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{
     params, params_from_iter,
     types::{Type, Value},
-    Connection, OptionalExtension, Row, Transaction,
+    Connection, OpenFlags, OptionalExtension, Row, Transaction,
 };
 use serde::de::DeserializeOwned;
 
@@ -339,6 +339,13 @@ impl Store {
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
+    }
+
+    pub fn open_existing_readonly(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA query_only = ON;")?;
+        Ok(Self { conn })
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -4251,6 +4258,37 @@ mod tests {
             parser_used: Some("pdf_oxide".into()),
             last_ingested_at: None,
         }
+    }
+
+    #[test]
+    fn readonly_open_existing_does_not_run_migrations() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    request_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT
+                );",
+            )
+            .unwrap();
+        }
+
+        let readonly = Store::open_existing_readonly(&db_path).unwrap();
+        assert!(!table_has_column(readonly.connection(), "tasks", "progress_json").unwrap());
+        drop(readonly);
+
+        let migrated = Store::new(&db_path).unwrap();
+        assert!(table_has_column(migrated.connection(), "tasks", "progress_json").unwrap());
     }
 
     fn sample_evidence(source_id: &str) -> Vec<EvidenceUnit> {

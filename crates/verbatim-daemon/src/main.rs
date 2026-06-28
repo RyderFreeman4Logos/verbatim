@@ -96,6 +96,7 @@ struct AppState {
     pipeline: std::sync::Mutex<Option<IngestPipeline>>,
     /// Independent task metadata connection for serialized writes.
     task_store: std::sync::Mutex<Store>,
+    index_status_cache: std::sync::RwLock<Option<IndexStatusResponse>>,
     resources: DaemonResources,
     ingest_queue_active: AtomicBool,
     /// Actual indexing worker occupancy, independent from persisted task status.
@@ -309,8 +310,16 @@ fn daemon_resource_snapshots(state: &SharedState) -> Vec<ResourceQueueSnapshot> 
     snapshots
 }
 
+const PIPELINE_BUSY_ERROR: &str = "ingest pipeline is busy with a long-running indexing operation";
+
 fn pipeline_busy_error() -> anyhow::Error {
-    anyhow::anyhow!("ingest pipeline is busy with a long-running indexing operation")
+    anyhow::anyhow!(PIPELINE_BUSY_ERROR)
+}
+
+fn is_pipeline_busy_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == PIPELINE_BUSY_ERROR)
 }
 
 fn pipeline_ref<'a>(
@@ -372,11 +381,48 @@ where
     let db_path = state.data_dir.join("verbatim.db");
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let store = Store::new(&db_path)?;
+        let store = Store::open_existing_readonly(&db_path)?;
         operation(&store)
     })
     .await
     .context("join sqlite read resource task")?
+}
+
+fn initial_index_status_cache(pipeline: &IngestPipeline) -> Option<IndexStatusResponse> {
+    match pipeline.index_status() {
+        Ok(response) => Some(response),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to initialize index status cache");
+            None
+        }
+    }
+}
+
+fn update_index_status_cache(state: &SharedState, response: &IndexStatusResponse) -> Result<()> {
+    let mut cache = state
+        .index_status_cache
+        .write()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    *cache = Some(response.clone());
+    Ok(())
+}
+
+fn cached_index_status(state: &SharedState) -> Result<Option<IndexStatusResponse>> {
+    let cache = state
+        .index_status_cache
+        .read()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(cache.clone())
+}
+
+fn cached_index_status_for_busy_pipeline(state: &SharedState) -> Result<IndexStatusResponse> {
+    let mut response = cached_index_status(state)?
+        .with_context(|| "index status is unavailable until the first live status snapshot")?;
+    response.messages.push(
+        "Serving last-known index status because the ingest pipeline is busy with a long-running indexing operation."
+            .to_string(),
+    );
+    Ok(response)
 }
 
 async fn with_task_store_write<T, F>(state: &SharedState, operation: F) -> Result<T>
@@ -676,13 +722,25 @@ async fn index_status(
     State(state): State<SharedState>,
 ) -> Result<Json<IndexStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
     let handle = tokio::runtime::Handle::current();
-    let response = with_exclusive_pipeline(&state, move |pipeline| {
+    let state_for_cache = Arc::clone(&state);
+    match with_exclusive_pipeline(&state, move |pipeline| {
         refresh_embedding_profile_capabilities_blocking(&handle, pipeline)?;
         pipeline.index_status()
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(response))
+    {
+        Ok(response) => {
+            update_index_status_cache(&state_for_cache, &response)
+                .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            Ok(Json(response))
+        }
+        Err(error) if is_pipeline_busy_error(&error) => {
+            cached_index_status_for_busy_pipeline(&state_for_cache)
+                .map(Json)
+                .map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error))
+        }
+        Err(error) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, error)),
+    }
 }
 
 async fn index_delete_profile(
@@ -4372,7 +4430,7 @@ async fn run_started_ingest_source_batch(
         take_pipeline(&state).map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error))?;
     let runtime = tokio::runtime::Handle::current();
     let state2 = Arc::clone(&state);
-    let (pipeline, result) = tokio::task::spawn_blocking(move || {
+    let (pipeline, result, index_status) = tokio::task::spawn_blocking(move || {
         let mut pipeline = pipeline;
         let state_for_reporter = Arc::clone(&state2);
         let result = runtime.block_on(pipeline.ingest_sources_with_tasks_reporting(
@@ -4386,12 +4444,18 @@ async fn run_started_ingest_source_batch(
                 }
             },
         ));
-        (pipeline, result)
+        let index_status = initial_index_status_cache(&pipeline);
+        (pipeline, result, index_status)
     })
     .await
     .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.into()))?;
     restore_pipeline(&state, pipeline)
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if let Some(index_status) = index_status {
+        if let Err(error) = update_index_status_cache(&state, &index_status) {
+            tracing::warn!(error = %error, "failed to update index status cache after source batch");
+        }
+    }
     Ok(result)
 }
 
@@ -4478,14 +4542,15 @@ async fn run_indexing_operation(
     .await;
     let pipeline =
         take_pipeline(&state).map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error))?;
-    let (pipeline, outcome) = tokio::task::spawn_blocking(move || {
+    let (pipeline, outcome, index_status) = tokio::task::spawn_blocking(move || {
         let mut pipeline = pipeline;
         if vectors_only {
             let source_filter = source_id.as_ref().map(|id| SourceId(id.clone()));
             let result = runtime.block_on(
                 pipeline.build_embedding_profile(&profile_id_for_task, source_filter.as_ref()),
             );
-            return (pipeline, result);
+            let index_status = initial_index_status_cache(&pipeline);
+            return (pipeline, result, index_status);
         }
         let result = match source_id {
             Some(id) => {
@@ -4499,12 +4564,18 @@ async fn run_indexing_operation(
             }
             None => runtime.block_on(pipeline.ingest_all_with_task(force, &task_id2)),
         };
-        (pipeline, result)
+        let index_status = initial_index_status_cache(&pipeline);
+        (pipeline, result, index_status)
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?;
     restore_pipeline(&state, pipeline)
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if let Some(index_status) = index_status {
+        if let Err(error) = update_index_status_cache(&state, &index_status) {
+            tracing::warn!(error = %error, "failed to update index status cache after indexing operation");
+        }
+    }
     let outcome =
         outcome.map_err(|e| indexing_operation_error(source_id_for_error.as_deref(), e))?;
     let mut progress = timing
@@ -6363,6 +6434,7 @@ async fn run_daemon() -> Result<()> {
     if let Err(error) = apply_index_gc(&data_dir, pipeline.store(), config.index_gc.policy()) {
         tracing::warn!(error = %error, "startup index generation garbage collection failed");
     }
+    let index_status_cache = initial_index_status_cache(&pipeline);
     let task_store = Store::new(&data_dir.join("verbatim.db"))?;
 
     let bind_addr = config.daemon.bind.clone();
@@ -6370,6 +6442,7 @@ async fn run_daemon() -> Result<()> {
     let state: SharedState = Arc::new(AppState {
         pipeline: std::sync::Mutex::new(Some(pipeline)),
         task_store: std::sync::Mutex::new(task_store),
+        index_status_cache: std::sync::RwLock::new(index_status_cache),
         resources: daemon_resources(&config.daemon.resources),
         ingest_queue_active: AtomicBool::new(false),
         ingest_worker_active: AtomicBool::new(false),
@@ -7189,6 +7262,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.task.id, task_id);
+        restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    #[tokio::test]
+    async fn taken_pipeline_slot_serves_cached_index_status() {
+        let test_dir = TestDir::new("pipeline-busy-index-status");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let pipeline = take_pipeline(&state).expect("take pipeline slot");
+
+        let Json(response) = tokio::time::timeout(
+            Duration::from_millis(250),
+            index_status(State(Arc::clone(&state))),
+        )
+        .await
+        .expect("index status read does not wait behind pipeline slot")
+        .unwrap();
+
+        assert_eq!(response.source_count, 0);
+        assert!(response
+            .messages
+            .iter()
+            .any(|message| message.contains("last-known index status")));
         restore_pipeline(&state, pipeline).expect("restore pipeline slot");
     }
 
@@ -8091,8 +8188,8 @@ mod tests {
 
         assert_eq!(outcome.added, 1);
         assert_eq!(outcome.queued_task_ids.len(), 1);
-        let pipeline = state.pipeline.lock().unwrap();
-        let pipeline = pipeline.as_ref().unwrap();
+        let pipeline_guard = state.pipeline.lock().unwrap();
+        let pipeline = pipeline_guard.as_ref().unwrap();
         assert_eq!(
             pipeline
                 .store()
@@ -8101,7 +8198,7 @@ mod tests {
                 .len(),
             1
         );
-        drop(pipeline);
+        drop(pipeline_guard);
         let store = state.task_store.lock().unwrap();
         let queued = store.queued_tasks(TaskKind::Ingest).unwrap();
         assert!(queued.iter().any(|task| {
@@ -8391,6 +8488,8 @@ mod tests {
         let source = state
             .pipeline
             .lock()
+            .unwrap()
+            .as_ref()
             .unwrap()
             .store()
             .get_source(&source_id)
@@ -9091,6 +9190,8 @@ mod tests {
             .pipeline
             .lock()
             .unwrap()
+            .as_ref()
+            .unwrap()
             .store()
             .list_sources()
             .unwrap();
@@ -9376,6 +9477,8 @@ mod tests {
         let counts = state
             .pipeline
             .lock()
+            .unwrap()
+            .as_ref()
             .unwrap()
             .store()
             .embedding_profile_storage_counts(&profile)
@@ -10714,9 +10817,11 @@ mod tests {
         pipeline: IngestPipeline,
         config_path: PathBuf,
     ) -> SharedState {
+        let index_status_cache = initial_index_status_cache(&pipeline);
         Arc::new(AppState {
             pipeline: std::sync::Mutex::new(Some(pipeline)),
             task_store: std::sync::Mutex::new(Store::new(&data_dir.join("verbatim.db")).unwrap()),
+            index_status_cache: std::sync::RwLock::new(index_status_cache),
             resources: daemon_resources(&config.daemon.resources),
             ingest_queue_active: AtomicBool::new(false),
             ingest_worker_active: AtomicBool::new(false),
@@ -11040,6 +11145,8 @@ mod tests {
         state
             .pipeline
             .lock()
+            .unwrap()
+            .as_ref()
             .unwrap()
             .store()
             .count_vector_documents_for_profile(

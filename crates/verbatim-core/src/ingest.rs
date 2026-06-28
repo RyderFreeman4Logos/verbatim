@@ -1172,7 +1172,10 @@ where
             .filter(|document| document.source_id != *source_id)
             .collect::<Vec<_>>();
         let prepared = self.prepare_indexes_from_vectors(remaining_vectors)?;
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        drop(index_publish_permit);
         let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let generation = match self.store.remove_source_and_replace_vectors_for_profile(
             &active_profile_id,
@@ -1817,7 +1820,28 @@ where
             let _cpu_permit = cpu_permit;
             self.prepare_source_indexes_from_vectors(profile_id, &source_id, vectors, cache_stats)?
         };
+        self.record_task_progress(
+            task_id,
+            vector_build_phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("staging index artifacts")
+                .with_active_worker_kind("ingest")
+                .with_resource(waiting_resource_progress("index_publish", "index_publish")),
+        );
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
+        self.record_task_progress(
+            task_id,
+            vector_build_phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("staging index artifacts")
+                .with_active_worker_kind("ingest")
+                .with_resource(task_resource_progress(&index_publish_permit, "active")),
+        );
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        drop(index_publish_permit);
         self.record_task_phase(
             task_id,
             vector_build_phase,
@@ -2970,7 +2994,10 @@ where
                     .await?
             }
         };
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        drop(index_publish_permit);
         let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let generation = match source_id {
             Some(source_id) => self.store.replace_source_vector_documents_for_profile(
@@ -7719,6 +7746,23 @@ model = "local-vision"
         assert!(
             phases.contains(&IngestTaskStage::VectorIndex.as_str()),
             "progress phases should include vector index publishing, got {phases:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "progress"
+                    && event.payload["phase"]["name"] == IngestTaskStage::VectorIndex.as_str()
+                    && event.payload["recent_status"] == "staging index artifacts"
+                    && event.payload["resources"]
+                        .as_array()
+                        .is_some_and(|resources| {
+                            resources.iter().any(|resource| {
+                                resource["name"] == "index_publish"
+                                    && resource["kind"] == "index_publish"
+                                    && resource["state"] == "active"
+                            })
+                        })
+            }),
+            "progress events should report active index_publish resource while staging artifacts"
         );
     }
 
