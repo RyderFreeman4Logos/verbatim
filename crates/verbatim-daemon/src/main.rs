@@ -66,7 +66,7 @@ use verbatim_core::task::{
     ingest_task_request_metadata_with_queue_claim_and_batch, reindex_result_metadata,
     reindex_task_request_metadata_with_queue_claim,
     reindex_task_request_metadata_with_queue_claim_and_batch, retrieve_request_metadata,
-    retrieve_result_metadata, PhaseTiming, TaskEndpointSummary, TaskId, TaskKind,
+    retrieve_result_metadata, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskId, TaskKind,
     TaskProgressSnapshot, TaskStatus,
 };
 use verbatim_core::types::{
@@ -1345,10 +1345,31 @@ async fn finish_task_success(
         let should_wake_ingest_queue = task
             .as_ref()
             .is_some_and(|task| task.kind == TaskKind::Ingest);
+        let terminalize_timing = should_wake_ingest_queue
+            .then(|| PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str()));
         let task_changed = store.finish_task_success(&task_id, &result)?;
         if task_changed {
             store.insert_task_event(&task_id, "succeeded", "task succeeded", &result)?;
             finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
+            if let Some(timing) = terminalize_timing {
+                let finished = timing.finish(serde_json::json!({
+                    "operation": "finish_task_success",
+                    "task_kind": TaskKind::Ingest.as_str(),
+                }));
+                if let Err(err) = store.insert_task_span(
+                    &task_id,
+                    &finished.phase,
+                    &finished.started_at,
+                    finished.duration_ms,
+                    &finished.metadata,
+                ) {
+                    tracing::warn!(
+                        task_id = %task_id.0,
+                        error = %err,
+                        "failed to persist ingest task terminalize span"
+                    );
+                }
+            }
         }
         Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
     })
@@ -1399,6 +1420,8 @@ async fn finish_task_failed_with_upstream(
         let should_wake_ingest_queue = task
             .as_ref()
             .is_some_and(|task| task.kind == TaskKind::Ingest);
+        let terminalize_timing = should_wake_ingest_queue
+            .then(|| PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str()));
         let resumability = task.as_ref().and_then(|task| {
             task_failure_resumability_metadata(task, Some(&error_message))
                 .ok()
@@ -1419,6 +1442,25 @@ async fn finish_task_failed_with_upstream(
             }
             store.insert_task_event(&task_id, "failed", "task failed", &payload)?;
             finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
+            if let Some(timing) = terminalize_timing {
+                let finished = timing.finish(serde_json::json!({
+                    "operation": "finish_task_failed",
+                    "task_kind": TaskKind::Ingest.as_str(),
+                }));
+                if let Err(err) = store.insert_task_span(
+                    &task_id,
+                    &finished.phase,
+                    &finished.started_at,
+                    finished.duration_ms,
+                    &finished.metadata,
+                ) {
+                    tracing::warn!(
+                        task_id = %task_id.0,
+                        error = %err,
+                        "failed to persist ingest task terminalize span"
+                    );
+                }
+            }
         }
         Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
     })
@@ -4232,6 +4274,9 @@ async fn cancel_task_record(
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
+        let is_ingest_task = task.kind == TaskKind::Ingest;
+        let terminalize_timing =
+            is_ingest_task.then(|| PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str()));
         let changed = store.cancel_task(&task_id)?;
         if changed {
             store.insert_task_event(
@@ -4252,6 +4297,25 @@ async fn cancel_task_record(
                         "cancelled_children": cancelled_children,
                     }),
                 )?;
+            }
+            if let Some(timing) = terminalize_timing {
+                let finished = timing.finish(serde_json::json!({
+                    "operation": "cancel_task",
+                    "task_kind": TaskKind::Ingest.as_str(),
+                }));
+                if let Err(err) = store.insert_task_span(
+                    &task_id,
+                    &finished.phase,
+                    &finished.started_at,
+                    finished.duration_ms,
+                    &finished.metadata,
+                ) {
+                    tracing::warn!(
+                        task_id = %task_id.0,
+                        error = %err,
+                        "failed to persist ingest task terminalize span"
+                    );
+                }
             }
         }
         Ok::<_, anyhow::Error>(changed)
@@ -4301,6 +4365,7 @@ fn cancel_active_ingest_batch_children(
 }
 
 fn cancel_ingest_batch_child(store: &Store, task_id: &TaskId, batch_id: &str) -> Result<bool> {
+    let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
     let changed = store.cancel_task(task_id)?;
     if changed {
         store.insert_task_event(
@@ -4309,6 +4374,23 @@ fn cancel_ingest_batch_child(store: &Store, task_id: &TaskId, batch_id: &str) ->
             "task cancelled because ingest batch was cancelled",
             &serde_json::json!({ "ingest_batch_id": batch_id }),
         )?;
+        let finished = terminalize_timing.finish(serde_json::json!({
+            "operation": "cancel_ingest_batch_child",
+            "task_kind": TaskKind::Ingest.as_str(),
+        }));
+        if let Err(err) = store.insert_task_span(
+            task_id,
+            &finished.phase,
+            &finished.started_at,
+            finished.duration_ms,
+            &finished.metadata,
+        ) {
+            tracing::warn!(
+                task_id = %task_id.0,
+                error = %err,
+                "failed to persist ingest task terminalize span"
+            );
+        }
     }
     Ok(changed)
 }
@@ -6479,6 +6561,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_task_success_records_terminalize_stage_span() {
+        let test_dir = TestDir::new("ingest-task-terminalize-span");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, true),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &task_id).await.unwrap();
+
+        finish_task_success(
+            &state,
+            &task_id,
+            ingest_result_metadata(1, &EmbeddingCacheStats::default()),
+        )
+        .await
+        .unwrap();
+
+        let response = task_summary_response(&state, task_id).await.unwrap();
+        assert!(response
+            .spans
+            .iter()
+            .any(|span| span.phase == IngestTaskStage::TaskTerminalize.as_str()));
+    }
+
+    #[tokio::test]
     async fn task_list_defaults_to_active_tasks_with_queue_details() {
         let test_dir = TestDir::new("task-list-active");
         let config = retrieve_test_config("http://127.0.0.1:9/v1");
@@ -6667,7 +6779,7 @@ mod tests {
         record_task_progress(
             &state,
             &task_id,
-            TaskProgressSnapshot::phase("ingest_index_publishing")
+            TaskProgressSnapshot::phase(IngestTaskStage::VectorIndex.as_str())
                 .with_counter("sources", 1, Some(1))
                 .with_wait_reason("post_publish_cleanup")
                 .with_recent_status("index publishing complete"),
@@ -6722,10 +6834,11 @@ mod tests {
             .await
             .unwrap();
             ensure_task_started(&state, &task_id).await.unwrap();
-            let mut progress = TaskProgressSnapshot::phase("embedding")
-                .with_counter("embedding_vectors", 0, Some(10))
-                .with_wait_reason(reason)
-                .with_recent_status("waiting for embedding batch");
+            let mut progress =
+                TaskProgressSnapshot::phase(IngestTaskStage::EmbeddingQueueWait.as_str())
+                    .with_counter("embedding_vectors", 0, Some(10))
+                    .with_wait_reason(reason)
+                    .with_recent_status("waiting for embedding batch");
             if let Some(phase) = &mut progress.phase {
                 phase.started_at = "1".into();
             }
@@ -6799,10 +6912,11 @@ mod tests {
         .await
         .unwrap();
         ensure_task_started(&state, &embedding_wait).await.unwrap();
-        let mut progress = TaskProgressSnapshot::phase("embedding")
-            .with_counter("embedding_vectors", 0, Some(10))
-            .with_wait_reason("embedding_throughput")
-            .with_recent_status("waiting for embedding model throughput");
+        let mut progress =
+            TaskProgressSnapshot::phase(IngestTaskStage::EmbeddingQueueWait.as_str())
+                .with_counter("embedding_vectors", 0, Some(10))
+                .with_wait_reason("embedding_throughput")
+                .with_recent_status("waiting for embedding model throughput");
         if let Some(phase) = &mut progress.phase {
             phase.started_at = "1".into();
         }
@@ -6825,7 +6939,7 @@ mod tests {
         record_task_progress(
             &state,
             &publish_wait,
-            TaskProgressSnapshot::phase("ingest_index_publishing")
+            TaskProgressSnapshot::phase(IngestTaskStage::VectorIndex.as_str())
                 .with_counter("sources", 1, Some(1))
                 .with_wait_reason("post_publish_cleanup")
                 .with_recent_status("index publishing complete"),
@@ -6944,7 +7058,7 @@ mod tests {
         record_task_progress(
             &state,
             &embedding_wait,
-            TaskProgressSnapshot::phase("embedding")
+            TaskProgressSnapshot::phase(IngestTaskStage::EmbeddingQueueWait.as_str())
                 .with_counter("embedding_vectors", 0, Some(10))
                 .with_wait_reason("embedding_batch")
                 .with_recent_status("waiting for embedding batch"),
@@ -6968,7 +7082,7 @@ mod tests {
         record_task_progress(
             &state,
             &publish_wait,
-            TaskProgressSnapshot::phase("ingest_index_publishing")
+            TaskProgressSnapshot::phase(IngestTaskStage::VectorIndex.as_str())
                 .with_counter("sources", 1, Some(1))
                 .with_wait_reason("post_publish_cleanup")
                 .with_recent_status("index publishing complete"),
@@ -9805,14 +9919,14 @@ mod tests {
                 store
                     .update_task_progress(
                         &task.id,
-                        TaskProgressSnapshot::phase("embedding")
+                        TaskProgressSnapshot::phase(IngestTaskStage::EmbeddingPostprocess.as_str())
                             .with_recent_status("embedding complete"),
                     )
                     .unwrap();
                 store
                     .insert_task_span(
                         &task.id,
-                        "db",
+                        IngestTaskStage::SqliteWrite.as_str(),
                         &now,
                         1280,
                         &serde_json::json!({ "operation": "replace_source_contents" }),
@@ -9821,7 +9935,7 @@ mod tests {
                 store
                     .insert_task_span(
                         &task.id,
-                        "ingest_index_publishing",
+                        IngestTaskStage::VectorIndex.as_str(),
                         &now,
                         2058,
                         &serde_json::json!({}),

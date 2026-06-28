@@ -1094,14 +1094,15 @@ const TASK_LIST_AFTER_HELP: &str = r#"Examples:
 List shows an aggregate active task queue summary by default so a large backlog
 stays readable. The daemon may also report active total plateau explanations,
 bounded turnover/backfill, waiting reason buckets, and stale running tasks. Use
---details to print the bounded per-task rows.
+--details to print bounded per-task rows, including current ingest stage and
+elapsed stage time when available.
 "#;
 
 const TASK_SHOW_AFTER_HELP: &str = r#"Examples:
   verbatim task show <task-id>
 
 Show prints the current task status, request/result summary, progress snapshot,
-and phase spans.
+and bounded phase spans such as ingest stage timings.
 "#;
 
 const TASK_EVENTS_AFTER_HELP: &str = r#"Examples:
@@ -1109,7 +1110,8 @@ const TASK_EVENTS_AFTER_HELP: &str = r#"Examples:
   verbatim task events --after 42 <task-id>
 
 Events are ordered by sequence. Use --after to resume from the last sequence you
-already consumed.
+already consumed. Progress events include current ingest stage and elapsed time
+without source text or vector payloads.
 "#;
 
 const TASK_WAIT_AFTER_HELP: &str = r#"Examples:
@@ -1801,8 +1803,8 @@ mod tests {
     };
     use verbatim_core::config::ConfigReloadMetadata;
     use verbatim_core::task::{
-        TaskEndpointSummary, TaskEvent, TaskId, TaskKind, TaskProgressSnapshot, TaskSpan,
-        TaskStatus, TaskSummary,
+        IngestTaskStage, TaskEndpointSummary, TaskEvent, TaskId, TaskKind, TaskProgressSnapshot,
+        TaskSpan, TaskStatus, TaskSummary,
     };
     use verbatim_core::types::{SourceId, SourceLocator};
 
@@ -4202,7 +4204,7 @@ mod tests {
                 TaskSpan {
                     sequence: 2,
                     task_id: TaskId("task-1".into()),
-                    phase: "db".into(),
+                    phase: IngestTaskStage::SqliteWrite.as_str().into(),
                     started_at: "1".into(),
                     duration_ms: 11,
                     metadata: serde_json::json!({

@@ -16,8 +16,8 @@ use crate::collection::{
     CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus, CollectionSyncReport,
 };
 use crate::task::{
-    bounded_error, bounded_json, bounded_message, TaskEvent, TaskId, TaskKind,
-    TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
+    bounded_error, bounded_json, bounded_message, IngestTaskStage, TaskEvent, TaskId, TaskKind,
+    TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary, TASK_SPAN_MAX_PER_TASK,
 };
 use crate::traits::VectorDocument;
 use crate::types::{
@@ -1867,6 +1867,15 @@ impl Store {
         Ok(count.try_into().unwrap_or_default())
     }
 
+    pub fn count_lexical_documents_for_source(&self, source_id: &SourceId) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunk_fts WHERE source_id = ?1",
+            params![&source_id.0],
+            |row| row.get(0),
+        )?;
+        Ok(count.try_into().unwrap_or_default())
+    }
+
     pub fn get_embedding_cache_vector(
         &self,
         profile_id: &EmbeddingProfileId,
@@ -2356,9 +2365,13 @@ impl Store {
             "SELECT COUNT(*), MIN(progress_phase_started_at)
              FROM tasks
              WHERE status IN (?1, ?2)
-               AND progress_phase = 'embedding'
+               AND progress_phase = ?3
                AND (progress_wait_reason IS NOT NULL OR progress_recent_status = 'waiting for embedding batch')",
-            params![TaskStatus::Queued.as_str(), TaskStatus::Running.as_str()],
+            params![
+                TaskStatus::Queued.as_str(),
+                TaskStatus::Running.as_str(),
+                IngestTaskStage::EmbeddingQueueWait.as_str()
+            ],
             |row| Ok((row_usize(row, 0)?, row.get::<_, Option<String>>(1)?)),
         )?;
         let publish_complete_running = self.conn.query_row(
@@ -2387,16 +2400,17 @@ impl Store {
             "SELECT COALESCE(progress_wait_reason, 'embedding_batch') AS reason, COUNT(*)
              FROM tasks
              WHERE status IN (?1, ?2)
-               AND progress_phase = 'embedding'
+               AND progress_phase = ?3
                AND (progress_wait_reason IS NOT NULL OR progress_recent_status = 'waiting for embedding batch')
              GROUP BY reason
              ORDER BY COUNT(*) DESC, reason
-             LIMIT ?3",
+             LIMIT ?4",
         )?;
         let rows = stmt.query_map(
             params![
                 TaskStatus::Queued.as_str(),
                 TaskStatus::Running.as_str(),
+                IngestTaskStage::EmbeddingQueueWait.as_str(),
                 limit
             ],
             row_to_reason_count,
@@ -2610,6 +2624,25 @@ impl Store {
         duration_ms: u64,
         metadata: &serde_json::Value,
     ) -> Result<TaskSpan> {
+        let existing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM task_spans WHERE task_id = ?1",
+            params![&task_id.0],
+            |row| row.get(0),
+        )?;
+        if existing >= TASK_SPAN_MAX_PER_TASK as i64 {
+            return Ok(TaskSpan {
+                sequence: 0,
+                task_id: task_id.clone(),
+                phase: phase.to_string(),
+                started_at: started_at.to_string(),
+                duration_ms,
+                metadata: serde_json::json!({
+                    "dropped": true,
+                    "reason": "task_span_limit_reached",
+                    "max_spans": TASK_SPAN_MAX_PER_TASK,
+                }),
+            });
+        }
         let metadata = bounded_json(metadata.clone());
         let metadata_json =
             serde_json::to_string(&metadata).context("serialize task span metadata")?;
@@ -4972,6 +5005,32 @@ mod tests {
         let spans = store.list_task_spans(&task_id).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].metadata["model"], "qwen");
+    }
+
+    #[test]
+    fn task_spans_are_capped_per_task() {
+        let store = Store::in_memory().unwrap();
+        let task_id = TaskId("task-span-cap".into());
+        store
+            .create_task(&task_id, TaskKind::Ingest, &serde_json::json!({}))
+            .unwrap();
+
+        for index in 0..TASK_SPAN_MAX_PER_TASK + 3 {
+            store
+                .insert_task_span(
+                    &task_id,
+                    IngestTaskStage::Parse.as_str(),
+                    "1",
+                    index as u64,
+                    &serde_json::json!({"index": index}),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.list_task_spans(&task_id).unwrap().len(),
+            TASK_SPAN_MAX_PER_TASK
+        );
     }
 
     #[test]
