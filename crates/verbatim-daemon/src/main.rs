@@ -794,20 +794,25 @@ async fn index_gc(
     let policy_config = config.index_gc;
     let policy = policy_config.policy();
     let state = Arc::clone(&state);
+    let data_dir = state.data_dir.clone();
+    let resources = state.resources.clone();
     let dry_run = req.dry_run;
     let (plan, apply) = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let pipeline = pipeline_ref(&pipeline)?;
-        if dry_run {
-            let plan = plan_index_gc(&state.data_dir, pipeline.store(), policy)?;
-            Ok::<_, anyhow::Error>((plan, IndexGcApplyReport::default()))
-        } else {
-            apply_index_gc(&state.data_dir, pipeline.store(), policy)
-        }
+        run_with_pipeline(state, move |pipeline| {
+            if dry_run {
+                let plan = plan_index_gc(&data_dir, pipeline.store(), policy)?;
+                Ok::<_, anyhow::Error>((plan, IndexGcApplyReport::default()))
+            } else {
+                let index_publish_permit = resources.index_publish.acquire_blocking()?;
+                let result = apply_index_gc(&data_dir, pipeline.store(), policy);
+                drop(index_publish_permit);
+                result
+            }
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(pipeline_access_error)?;
     Ok(Json(IndexGcResponse {
         dry_run,
         policy: policy_config,
@@ -877,21 +882,21 @@ async fn index_delete_profile(
     let dry_run = req.dry_run;
     let allow_active = req.allow_active;
     let (plan, apply) = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let pipeline = pipeline_mut(&mut pipeline)?;
-        if dry_run {
-            let plan = pipeline.plan_embedding_profile_delete(&profile_id)?;
-            Ok::<_, anyhow::Error>((
-                plan,
-                verbatim_core::index_profile_delete::IndexProfileDeleteApplyReport::default(),
-            ))
-        } else {
-            pipeline.delete_embedding_profile_index_data(&profile_id, allow_active)
-        }
+        run_with_pipeline(state, move |pipeline| {
+            if dry_run {
+                let plan = pipeline.plan_embedding_profile_delete(&profile_id)?;
+                Ok::<_, anyhow::Error>((
+                    plan,
+                    verbatim_core::index_profile_delete::IndexProfileDeleteApplyReport::default(),
+                ))
+            } else {
+                pipeline.delete_embedding_profile_index_data(&profile_id, allow_active)
+            }
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(pipeline_access_error)?;
     Ok(Json(IndexProfileDeleteResponse {
         dry_run,
         plan,
@@ -904,22 +909,19 @@ async fn add_source(
     Json(req): Json<AddSourceRequest>,
 ) -> Result<(StatusCode, Json<AddSourceResponse>), (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(&state);
-    let sqlite_write_permit = state
-        .resources
-        .sqlite_writer
-        .acquire()
-        .await
-        .map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error.into()))?;
     let result = tokio::task::spawn_blocking(move || {
-        let _sqlite_write_permit = sqlite_write_permit;
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let pipeline = pipeline_ref(&pipeline)?;
         let path = PathBuf::from(&req.path);
-        pipeline.add_source(&path)
+        run_with_pipeline(state, move |pipeline| pipeline.add_source(&path))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    .map_err(|e| {
+        if is_pipeline_busy_error(&e) {
+            pipeline_access_error(e)
+        } else {
+            err(StatusCode::BAD_REQUEST, e)
+        }
+    })?;
 
     Ok((
         StatusCode::CREATED,
@@ -1014,13 +1016,19 @@ async fn delete_source(
     let runtime = tokio::runtime::Handle::current();
     let source_id = SourceId(id.clone());
     tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let pipeline = pipeline_mut(&mut pipeline)?;
-        runtime.block_on(pipeline.remove_source(&source_id))
+        run_with_pipeline(state, move |pipeline| {
+            runtime.block_on(pipeline.remove_source(&source_id))
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| source_remove_error(&id, e))?;
+    .map_err(|e| {
+        if is_pipeline_busy_error(&e) {
+            pipeline_access_error(e)
+        } else {
+            source_remove_error(&id, e)
+        }
+    })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1158,21 +1166,20 @@ async fn sync_collection(
         .into_iter()
         .map(collection_sync_path_input)
         .collect::<Vec<_>>();
-    let sqlite_write_permit = state
-        .resources
-        .sqlite_writer
-        .acquire()
-        .await
-        .map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error.into()))?;
     let report = tokio::task::spawn_blocking(move || {
-        let _sqlite_write_permit = sqlite_write_permit;
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let pipeline = pipeline_ref(&pipeline)?;
-        pipeline.sync_collection(&name, &inputs, req.max_depth)
+        run_with_pipeline(state, move |pipeline| {
+            pipeline.sync_collection(&name, &inputs, req.max_depth)
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| collection_error(&name_for_error, e))?;
+    .map_err(|e| {
+        if is_pipeline_busy_error(&e) {
+            pipeline_access_error(e)
+        } else {
+            collection_error(&name_for_error, e)
+        }
+    })?;
 
     Ok(Json(CollectionSyncResponse { report }))
 }
@@ -6131,75 +6138,72 @@ async fn maintain_collection_after_watch_event(
     let collection_name_for_sync = collection_name.clone();
     let sync_outcome = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Handle::current();
-        let mut pipeline = state_for_sync
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let pipeline = pipeline_mut(&mut pipeline)?;
-        let collection = pipeline
-            .store()
-            .get_collection(&collection_name_for_sync)?
-            .with_context(|| format!("collection not found: {collection_name_for_sync}"))?;
-        if !collection.watch_enabled || !watcher_config_for_sync.enabled {
-            return Ok::<_, anyhow::Error>(CollectionMaintenanceSyncOutcome::default());
-        }
-        if watcher_config_for_sync
-            .ignore_collections
-            .iter()
-            .any(|name| name == &collection.name)
-        {
-            return Ok(CollectionMaintenanceSyncOutcome::default());
-        }
-        let old_members = pipeline
-            .store()
-            .list_collection_members(&collection_name_for_sync)?;
-        let report = pipeline.sync_collection_with_extra_ignores(
-            &collection_name_for_sync,
-            &[],
-            Some(watcher_config_for_sync.max_depth.max(1)),
-            &watcher_config_for_sync.ignore_paths,
-        )?;
-        let new_members = pipeline
-            .store()
-            .list_collection_members(&collection_name_for_sync)?;
-        let new_candidates = new_members
-            .iter()
-            .map(|member| CollectionMemberCandidate {
-                source_id: member.source_id.clone(),
-                logical_path: member.logical_path.clone(),
-                source_path: member.source_path.clone(),
-            })
-            .collect::<Vec<_>>();
-        let diff = diff_collection_members(&old_members, &new_candidates);
-        let stale = pipeline.check_stale()?;
-        let member_source_ids = new_members
-            .iter()
-            .map(|member| member.source_id.clone())
-            .collect::<HashSet<_>>();
-        let mut source_ids_to_ingest = diff
-            .added
-            .iter()
-            .map(|candidate| candidate.source_id.clone())
-            .chain(
-                stale
-                    .into_iter()
-                    .filter(|source_id| member_source_ids.contains(source_id)),
-            )
-            .collect::<BTreeSet<_>>();
-        for removed in &diff.removed {
-            if !removed.source_path.exists()
-                && pipeline.store().get_source(&removed.source_id)?.is_some()
-            {
-                runtime.block_on(pipeline.remove_source(&removed.source_id))?;
-                source_ids_to_ingest.remove(&removed.source_id);
+        run_with_pipeline(state_for_sync, move |pipeline| {
+            let collection = pipeline
+                .store()
+                .get_collection(&collection_name_for_sync)?
+                .with_context(|| format!("collection not found: {collection_name_for_sync}"))?;
+            if !collection.watch_enabled || !watcher_config_for_sync.enabled {
+                return Ok::<_, anyhow::Error>(CollectionMaintenanceSyncOutcome::default());
             }
-        }
-        Ok(CollectionMaintenanceSyncOutcome {
-            added: report.added,
-            removed: report.removed,
-            unchanged: report.unchanged,
-            auto_index_enabled: collection.auto_index_enabled,
-            source_ids_to_ingest: source_ids_to_ingest.into_iter().collect(),
+            if watcher_config_for_sync
+                .ignore_collections
+                .iter()
+                .any(|name| name == &collection.name)
+            {
+                return Ok(CollectionMaintenanceSyncOutcome::default());
+            }
+            let old_members = pipeline
+                .store()
+                .list_collection_members(&collection_name_for_sync)?;
+            let report = pipeline.sync_collection_with_extra_ignores(
+                &collection_name_for_sync,
+                &[],
+                Some(watcher_config_for_sync.max_depth.max(1)),
+                &watcher_config_for_sync.ignore_paths,
+            )?;
+            let new_members = pipeline
+                .store()
+                .list_collection_members(&collection_name_for_sync)?;
+            let new_candidates = new_members
+                .iter()
+                .map(|member| CollectionMemberCandidate {
+                    source_id: member.source_id.clone(),
+                    logical_path: member.logical_path.clone(),
+                    source_path: member.source_path.clone(),
+                })
+                .collect::<Vec<_>>();
+            let diff = diff_collection_members(&old_members, &new_candidates);
+            let stale = pipeline.check_stale()?;
+            let member_source_ids = new_members
+                .iter()
+                .map(|member| member.source_id.clone())
+                .collect::<HashSet<_>>();
+            let mut source_ids_to_ingest = diff
+                .added
+                .iter()
+                .map(|candidate| candidate.source_id.clone())
+                .chain(
+                    stale
+                        .into_iter()
+                        .filter(|source_id| member_source_ids.contains(source_id)),
+                )
+                .collect::<BTreeSet<_>>();
+            for removed in &diff.removed {
+                if !removed.source_path.exists()
+                    && pipeline.store().get_source(&removed.source_id)?.is_some()
+                {
+                    runtime.block_on(pipeline.remove_source(&removed.source_id))?;
+                    source_ids_to_ingest.remove(&removed.source_id);
+                }
+            }
+            Ok(CollectionMaintenanceSyncOutcome {
+                added: report.added,
+                removed: report.removed,
+                unchanged: report.unchanged,
+                auto_index_enabled: collection.auto_index_enabled,
+                source_ids_to_ingest: source_ids_to_ingest.into_iter().collect(),
+            })
         })
     })
     .await
@@ -8271,6 +8275,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_source_missing_path_does_not_wait_for_sqlite_writer() {
+        let test_dir = TestDir::new("add-source-no-writer-wait");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let writer_permit = state
+            .resources
+            .sqlite_writer
+            .acquire()
+            .await
+            .expect("hold sqlite writer permit");
+
+        let (status, Json(body)) = tokio::time::timeout(
+            Duration::from_millis(250),
+            add_source(
+                State(Arc::clone(&state)),
+                Json(AddSourceRequest {
+                    path: test_dir.path().join("missing.md").display().to_string(),
+                }),
+            ),
+        )
+        .await
+        .expect("add_source validates missing path before writer admission")
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("resolve path"));
+        drop(writer_permit);
+    }
+
+    #[tokio::test]
     async fn delete_source_existing_removes_source() {
         let test_dir = TestDir::new("delete-existing-source");
         let source_path = test_dir.path().join("doc.md");
@@ -8288,6 +8323,97 @@ mod tests {
         let pipeline = state.pipeline.lock().unwrap();
         let pipeline = pipeline.as_ref().unwrap();
         assert!(pipeline.store().get_source(&source_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_source_publish_wait_serves_cached_index_status() {
+        let test_dir = TestDir::new("delete-source-publish-wait-status");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(&source_path, "delete me while publish waits").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let publish_permit = state
+            .resources
+            .index_publish
+            .acquire()
+            .await
+            .expect("hold index publish permit");
+        let delete_state = Arc::clone(&state);
+        let delete_source_id = source_id.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_source(State(delete_state), Path(delete_source_id.0)).await
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let slot_taken = state.pipeline.lock().unwrap().is_none();
+            if slot_taken {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "delete_source did not take the pipeline slot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let Json(response) = tokio::time::timeout(
+            Duration::from_millis(250),
+            index_status(State(Arc::clone(&state))),
+        )
+        .await
+        .expect("index status falls back while delete_source waits on publish")
+        .unwrap();
+        assert!(response
+            .messages
+            .iter()
+            .any(|message| message.contains("last-known index status")));
+
+        drop(publish_permit);
+        let status = tokio::time::timeout(Duration::from_secs(5), delete_task)
+            .await
+            .expect("delete_source completes after publish permit release")
+            .expect("delete task joins")
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
+        assert!(pipeline.store().get_source(&source_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_collection_missing_collection_does_not_wait_for_sqlite_writer() {
+        let test_dir = TestDir::new("sync-collection-no-writer-wait");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let writer_permit = state
+            .resources
+            .sqlite_writer
+            .acquire()
+            .await
+            .expect("hold sqlite writer permit");
+
+        let (status, Json(body)) = tokio::time::timeout(
+            Duration::from_millis(250),
+            sync_collection(
+                State(Arc::clone(&state)),
+                Path("missing".into()),
+                Json(CollectionSyncRequest {
+                    paths: Vec::new(),
+                    max_depth: None,
+                }),
+            ),
+        )
+        .await
+        .expect("sync_collection validates missing collection before writer admission")
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.error, "collection not found: missing");
+        drop(writer_permit);
     }
 
     #[tokio::test]

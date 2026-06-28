@@ -112,14 +112,32 @@ pub fn apply_index_profile_delete(
         );
     }
 
+    let mut report = apply_index_profile_delete_artifacts(data_dir, profile_id, &plan)?;
+    apply_index_profile_delete_sqlite(store, profile_id, &mut report)?;
+    Ok((plan, report))
+}
+
+pub fn apply_index_profile_delete_artifacts(
+    data_dir: &Path,
+    profile_id: &EmbeddingProfileId,
+    plan: &IndexProfileDeletePlan,
+) -> Result<IndexProfileDeleteApplyReport> {
     let mut report = IndexProfileDeleteApplyReport::default();
     if let Some(artifact) = &plan.artifact {
         remove_profile_artifact(data_dir, profile_id, artifact)?;
         report.reclaimed_bytes = artifact.approximate_bytes;
         report.removed_artifacts.push(artifact.clone());
     }
+    Ok(report)
+}
+
+pub fn apply_index_profile_delete_sqlite(
+    store: &Store,
+    profile_id: &EmbeddingProfileId,
+    report: &mut IndexProfileDeleteApplyReport,
+) -> Result<()> {
     report.sqlite = store.delete_embedding_profile_index_data(profile_id)?;
-    Ok((plan, report))
+    Ok(())
 }
 
 fn remove_profile_artifact(

@@ -34,8 +34,8 @@ use crate::index::qdrant::{records_from_store_for_profile, QdrantClient};
 use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::index_gc::{apply_index_gc, IndexGcPolicy};
 use crate::index_profile_delete::{
-    apply_index_profile_delete, plan_index_profile_delete, IndexProfileDeleteApplyReport,
-    IndexProfileDeletePlan,
+    apply_index_profile_delete_artifacts, apply_index_profile_delete_sqlite,
+    plan_index_profile_delete, IndexProfileDeleteApplyReport, IndexProfileDeletePlan,
 };
 use crate::ocr::{
     configured_ocr_provider, ocr_evidence_from_output, ocr_profile_stale, ocr_required_pages,
@@ -994,18 +994,34 @@ where
         profile_id: &EmbeddingProfileId,
         allow_active: bool,
     ) -> Result<(IndexProfileDeletePlan, IndexProfileDeleteApplyReport)> {
-        let result = apply_index_profile_delete(
+        let plan = plan_index_profile_delete(
             &self.data_dir,
             &self.store,
             profile_id,
             &self.active_profile_id,
-            allow_active,
         )?;
+        if plan.active_profile && !allow_active {
+            bail!(
+                "refusing to delete active embedding profile {}; pass allow_active to clear active profile artifacts",
+                profile_id
+            );
+        }
+
+        let index_publish_permit =
+            acquire_ingest_resource_blocking("index_publish", "index_publish")?;
+        let mut apply = apply_index_profile_delete_artifacts(&self.data_dir, profile_id, &plan)?;
+        drop(index_publish_permit);
+
+        let sqlite_write_permit =
+            acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
+        apply_index_profile_delete_sqlite(&self.store, profile_id, &mut apply)?;
+        drop(sqlite_write_permit);
+
         if self.loaded_profile_id == *profile_id || self.active_profile_id == *profile_id {
             self.hnsw.clear();
             self.loaded_profile_id = profile_id.clone();
         }
-        Ok(result)
+        Ok((plan, apply))
     }
 
     pub fn active_ocr_profile(&self) -> Option<crate::types::OcrProfile> {
@@ -1218,7 +1234,10 @@ where
             parser_used: None,
             last_ingested_at: None,
         };
+        let sqlite_write_permit =
+            acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
         self.store.add_source(&source)?;
+        drop(sqlite_write_permit);
         Ok(id)
     }
 
@@ -1260,8 +1279,15 @@ where
             }
         }
         let report = CollectionSyncReport::from_discovery(&discovery, settings.max_depth);
-        self.store
-            .replace_collection_members(collection_name, &discovery.candidates, report)
+        let sqlite_write_permit =
+            acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
+        let report = self.store.replace_collection_members(
+            collection_name,
+            &discovery.candidates,
+            report,
+        )?;
+        drop(sqlite_write_permit);
+        Ok(report)
     }
 
     pub async fn remove_source(&mut self, source_id: &SourceId) -> Result<()> {
@@ -8086,6 +8112,69 @@ model = "local-vision"
                 .expect("telemetry/resource thread joins");
             assert_eq!(completed.load(Ordering::Acquire), 1);
         }
+    }
+
+    #[test]
+    fn profile_delete_waits_for_sqlite_writer_without_holding_index_publish() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let profile_id = EmbeddingProfileId::new("delete-me").unwrap();
+        pipeline
+            .store()
+            .ensure_embedding_profile(
+                &profile_id,
+                test_embedding_profile_spec(2).as_store_config(),
+            )
+            .unwrap();
+        let writer = sqlite_writer_resource_for_test();
+        let index_publish = named_resource_for_test("index_publish", "index_publish");
+        let before = writer.snapshot().queue_wait_ms_total;
+        let held_writer = writer.acquire_blocking().expect("held writer permit");
+        let delete_completed = Arc::new(AtomicUsize::new(0));
+        let delete_completed_in_thread = Arc::clone(&delete_completed);
+        let profile_id_for_thread = profile_id.clone();
+        let delete_thread = thread::spawn(move || {
+            let result =
+                pipeline.delete_embedding_profile_index_data(&profile_id_for_thread, false);
+            delete_completed_in_thread.store(1, Ordering::Release);
+            result
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if writer.snapshot().queued == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "profile delete did not queue on sqlite_writer"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let publish_snapshot = index_publish.snapshot();
+        assert_eq!(publish_snapshot.active, 0);
+        assert_eq!(publish_snapshot.queued, 0);
+        assert_eq!(delete_completed.load(Ordering::Acquire), 0);
+
+        drop(held_writer);
+        let (plan, report) = delete_thread
+            .join()
+            .expect("profile delete thread joins")
+            .expect("profile delete succeeds");
+        assert_eq!(plan.profile_id, profile_id.as_str());
+        assert_eq!(report.removed_artifacts.len(), 0);
+        assert_eq!(delete_completed.load(Ordering::Acquire), 1);
+        assert!(
+            writer.snapshot().queue_wait_ms_total > before,
+            "profile delete should wait through sqlite_writer queue"
+        );
     }
 
     #[tokio::test]

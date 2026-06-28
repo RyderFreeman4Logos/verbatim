@@ -123,6 +123,55 @@ impl fmt::Display for ResourceQueueError {
 
 impl std::error::Error for ResourceQueueError {}
 
+struct QueuedWaiter {
+    resource: Arc<ObservableResource>,
+    enqueued: bool,
+}
+
+impl QueuedWaiter {
+    fn new(resource: Arc<ObservableResource>) -> Self {
+        Self {
+            resource,
+            enqueued: false,
+        }
+    }
+
+    fn is_enqueued(&self) -> bool {
+        self.enqueued
+    }
+
+    fn enqueue(&mut self, state: &mut ResourceState) {
+        state.queued += 1;
+        self.enqueued = true;
+    }
+
+    fn admit(&mut self, state: &mut ResourceState) {
+        if self.enqueued {
+            state.queued = state.queued.saturating_sub(1);
+            self.enqueued = false;
+        }
+    }
+
+    fn cancel(&mut self) {
+        if !self.enqueued {
+            return;
+        }
+        {
+            let mut state = lock_unpoisoned(&self.resource.state);
+            state.queued = state.queued.saturating_sub(1);
+        }
+        self.enqueued = false;
+        self.resource.condvar.notify_one();
+        self.resource.notify.notify_one();
+    }
+}
+
+impl Drop for QueuedWaiter {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 #[derive(Debug)]
 pub struct ObservableResource {
     name: String,
@@ -176,17 +225,15 @@ impl ObservableResource {
             state.queue_timeout
         };
         let wait_started = Instant::now();
-        let mut enqueued = false;
         let admitted = tokio::time::timeout(timeout, async {
+            let mut waiter = QueuedWaiter::new(Arc::clone(self));
             loop {
                 let notified = self.notify.notified();
                 {
                     let mut state = lock_unpoisoned(&self.state);
                     if state.active < state.capacity {
                         state.active += 1;
-                        if enqueued {
-                            state.queued = state.queued.saturating_sub(1);
-                        }
+                        waiter.admit(&mut state);
                         let queue_wait_ms = elapsed_ms(wait_started);
                         self.metrics.record_queue_wait(queue_wait_ms);
                         return Ok(ResourcePermit {
@@ -195,7 +242,7 @@ impl ObservableResource {
                             queue_wait_ms,
                         });
                     }
-                    if !enqueued {
+                    if !waiter.is_enqueued() {
                         if state.queued >= state.queue_capacity {
                             self.metrics.record_error();
                             return Err(ResourceQueueError::Full {
@@ -204,8 +251,7 @@ impl ObservableResource {
                                 queue_capacity: state.queue_capacity,
                             });
                         }
-                        state.queued += 1;
-                        enqueued = true;
+                        waiter.enqueue(&mut state);
                     }
                 }
                 notified.await;
@@ -216,10 +262,6 @@ impl ObservableResource {
         match admitted {
             Ok(result) => result,
             Err(_) => {
-                if enqueued {
-                    let mut state = lock_unpoisoned(&self.state);
-                    state.queued = state.queued.saturating_sub(1);
-                }
                 self.metrics.record_error();
                 self.condvar.notify_one();
                 self.notify.notify_one();
@@ -547,6 +589,69 @@ mod tests {
         assert_eq!(snapshot.active, 1);
         assert_eq!(snapshot.queued, 0);
         assert_eq!(snapshot.errors, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_async_acquire_removes_waiter_from_queue() {
+        let resource = Arc::new(ObservableResource::new(
+            "cancelled_resource",
+            "test_kind",
+            ResourceLimitConfig {
+                capacity: 1,
+                queue_capacity: 1,
+                queue_timeout: Duration::from_secs(5),
+            },
+        ));
+
+        let first = resource.acquire().await.expect("first permit");
+        let waiter_resource = Arc::clone(&resource);
+        let waiter = tokio::spawn(async move { waiter_resource.acquire().await });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if resource.snapshot().queued == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waiter did not enter resource queue"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        waiter.abort();
+        let join = waiter.await.expect_err("waiter future was cancelled");
+        assert!(join.is_cancelled());
+        let cancelled_snapshot = resource.snapshot();
+        assert_eq!(cancelled_snapshot.active, 1);
+        assert_eq!(cancelled_snapshot.queued, 0);
+
+        let replacement_resource = Arc::clone(&resource);
+        let replacement = tokio::spawn(async move { replacement_resource.acquire().await });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if resource.snapshot().queued == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement waiter did not enter resource queue"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), replacement)
+            .await
+            .expect("replacement waiter is admitted")
+            .expect("replacement task joins")
+            .expect("replacement acquire succeeds");
+        drop(second);
+
+        let completed_snapshot = resource.snapshot();
+        assert_eq!(completed_snapshot.active, 0);
+        assert_eq!(completed_snapshot.queued, 0);
+        assert_eq!(completed_snapshot.completed, 2);
+        assert_eq!(completed_snapshot.errors, 0);
     }
 
     #[test]
