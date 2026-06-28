@@ -513,7 +513,7 @@ def run_failure_modes(
         "schema_version": FAILURE_SCHEMA_VERSION,
         "manifest": manifest,
         "cases": cases,
-        "verdict": "pass" if all(case["verdict"] == "pass" for case in cases) else "fail",
+        "verdict": aggregate_failure_verdict(cases),
     }
     output_path = paths["variant_dir"] / "failure-modes.json"
     output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -521,6 +521,17 @@ def run_failure_modes(
     print(f"failure_modes_json={output_path}")
     print(f"FAILURE_MODES_JSON={json.dumps(report, sort_keys=True)}")
     return report
+
+
+def aggregate_failure_verdict(cases: list[dict[str, JsonValue]]) -> str:
+    verdicts = {str(case.get("verdict", "fail")) for case in cases}
+    if verdicts == {"pass"}:
+        return "pass"
+    if "fail" in verdicts:
+        return "fail"
+    if verdicts & {"not_covered", "skipped"}:
+        return "not_covered"
+    return "fail"
 
 
 def qdrant_unavailable_case(output_root: Path) -> dict[str, JsonValue]:
@@ -579,18 +590,25 @@ def qdrant_unavailable_case(output_root: Path) -> dict[str, JsonValue]:
             "primary_error": primary_error,
             "primary_failed_closed": primary_failed_closed,
         },
+        "covered": True,
         "verdict": verdict,
     }
 
 
 def collection_reset_case(manifest: dict[str, JsonValue], qdrant_url: str) -> dict[str, JsonValue]:
-    qdrant = QdrantHttp(qdrant_url, qdrant_collection(manifest), 1.0)
+    qdrant = QdrantHttp(qdrant_url, qdrant_collection(manifest))
     if not qdrant.is_available():
         return {
             "case": "collection_reset",
             "expected": "remote collection reset does not return stale evidence",
-            "observed": "Qdrant unavailable; primary path would fail closed and cache path would use local fallback",
-            "verdict": "pass",
+            "observed": {
+                "qdrant_available": False,
+                "reset_exercised": False,
+                "search_exercised": False,
+                "reason": "Qdrant unavailable; reset coverage requires a reachable Qdrant service",
+            },
+            "covered": False,
+            "verdict": "not_covered",
         }
     try:
         qdrant.reset_collection(VECTOR_DIMENSION)
@@ -605,7 +623,13 @@ def collection_reset_case(manifest: dict[str, JsonValue], qdrant_url: str) -> di
     return {
         "case": "collection_reset",
         "expected": "after reset, remote search returns no final evidence until re-upsert and hydration",
-        "observed": f"remote_hit_count={len(hits)}",
+        "observed": {
+            "qdrant_available": True,
+            "reset_exercised": True,
+            "search_exercised": True,
+            "remote_hit_count": len(hits),
+        },
+        "covered": True,
         "verdict": "pass" if not hits else "fail",
     }
 
@@ -645,6 +669,7 @@ def stale_remote_hit_case(output_root: Path) -> dict[str, JsonValue]:
             f"final_evidence={len(evidence)} rejected={rejected} "
             f"capability_mismatch_rejected={counters['capability_mismatch_rejected']}"
         ),
+        "covered": True,
         "verdict": "pass" if not evidence and rejected == 3 else "fail",
     }
 
@@ -1352,15 +1377,67 @@ class HarnessTests(unittest.TestCase):
             report = run_failure_modes(Path(tmp) / "qdrant-spike", "http://127.0.0.1:9")
         cases = {case["case"]: case for case in report["cases"]}  # type: ignore[index]
         self.assertEqual(set(cases), {"qdrant_unavailable", "collection_reset", "stale_remote_hits"})
-        self.assertEqual(report["verdict"], "pass")
+        self.assertEqual(report["verdict"], "not_covered")
         unavailable = cases["qdrant_unavailable"]
         observed = unavailable["observed"]
         self.assertIsInstance(observed, dict)
         self.assertTrue(observed["cache_fell_back_to_local"])  # type: ignore[index]
         self.assertGreater(observed["cache_final_evidence_count"], 0)  # type: ignore[index]
         self.assertTrue(observed["primary_failed_closed"])  # type: ignore[index]
+        self.assertEqual(unavailable["verdict"], "pass")
+        reset = cases["collection_reset"]
+        reset_observed = reset["observed"]
+        self.assertEqual(reset["verdict"], "not_covered")
+        self.assertFalse(reset["covered"])
+        self.assertIsInstance(reset_observed, dict)
+        self.assertFalse(reset_observed["reset_exercised"])  # type: ignore[index]
         stale = cases["stale_remote_hits"]
         self.assertIn("capability_mismatch_rejected=1", str(stale["observed"]))
+
+    def test_collection_reset_pass_requires_exercised_reset(self) -> None:
+        manifest = build_manifest("qdrant-cache")
+        calls: dict[str, JsonValue] = {
+            "reset_dimension": None,
+            "search_limit": None,
+        }
+        original_qdrant_http = QdrantHttp
+
+        class FakeQdrantHttp:
+            def __init__(
+                self,
+                base_url: str,
+                collection: str,
+                timeout_seconds: float = 2.0,
+            ) -> None:
+                calls["base_url"] = base_url
+                calls["collection"] = collection
+                calls["timeout_seconds"] = timeout_seconds
+
+            def is_available(self) -> bool:
+                return True
+
+            def reset_collection(self, dimension: int) -> None:
+                calls["reset_dimension"] = dimension
+
+            def search(self, query_vector: list[float], limit: int) -> list[RemoteHit]:
+                calls["search_limit"] = limit
+                calls["query_dimension"] = len(query_vector)
+                return []
+
+        try:
+            globals()["QdrantHttp"] = FakeQdrantHttp
+            case = collection_reset_case(manifest, DEFAULT_QDRANT_URL)
+        finally:
+            globals()["QdrantHttp"] = original_qdrant_http
+
+        observed = case["observed"]
+        self.assertEqual(case["verdict"], "pass")
+        self.assertTrue(case["covered"])
+        self.assertEqual(calls["reset_dimension"], VECTOR_DIMENSION)
+        self.assertEqual(calls["search_limit"], 5)
+        self.assertIsInstance(observed, dict)
+        self.assertTrue(observed["reset_exercised"])  # type: ignore[index]
+        self.assertTrue(observed["search_exercised"])  # type: ignore[index]
 
     def assert_required_metrics(self, result: dict[str, JsonValue]) -> None:
         metrics = result["metrics"]

@@ -85,7 +85,9 @@ The harness checks collection freshness before retrieve measurement:
 
 Remote Qdrant hits are never final evidence by themselves. They must hydrate through the local SQLite chunk table and match the current profile generation, fixture collection, and expected capability before entering final evidence. Stale generation hits, missing chunk hits, and collection/capability mismatches are rejected and counted in `correctness`.
 
-`just bench-qdrant-spike --failure-modes` covers:
+`just bench-qdrant-spike --failure-modes` reports full `pass` only when every required case is actually covered. If Qdrant is unavailable, the unavailable failover case can pass, but the collection-reset case is reported as `not_covered` and the overall failure-mode verdict is not `pass`.
+
+The latest local Docker run covered:
 
 - Qdrant unavailable: cache mode falls back to local; primary mode fails explicitly.
 - Collection reset: remote search after reset must not return stale final evidence.
@@ -117,7 +119,7 @@ Tradeoffs:
 - Write amplification: qdrant-primary skipped local vector rows, but the reported write metric covers only local harness/profile writes; Qdrant service physical writes were unmeasured.
 - Retrieve latency: local p50/p95 was lower than both Qdrant variants.
 - Correctness: all variants passed hydration, generation freshness, and failure-mode checks.
-- Failure modes: cache fallback and primary fail-closed behavior are covered by `failure-modes.json`.
+- Failure modes: the local Docker run covered cache fallback, primary fail-closed behavior, collection reset, and stale-hit rejection in `failure-modes.json`; unavailable-only runs report reset as `not_covered`.
 - Privacy: payloads contain only stable IDs, bounded headings/previews, and profile generation; no raw text or private paths.
 
 Follow-up issues after merge:
