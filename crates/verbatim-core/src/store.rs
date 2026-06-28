@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{
@@ -97,6 +97,38 @@ pub struct SourceContentsReplacement<'a> {
     pub image_artifacts: &'a [ImageArtifact],
     pub graph_nodes: &'a [GraphNode],
     pub graph_edges: &'a [GraphEdge],
+}
+
+/// Result of replacing one source's stored contents and derived indexes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceContentsReplacementReport {
+    pub generation: u64,
+    pub lexical_update: SourceLexicalIndexUpdate,
+}
+
+/// Bounded timing for SQLite FTS updates triggered by source content replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLexicalIndexUpdate {
+    pub started_at: String,
+    pub duration_ms: u64,
+    pub deleted_child_chunks: usize,
+    pub indexed_child_chunks: usize,
+}
+
+impl SourceLexicalIndexUpdate {
+    fn start(deleted_child_chunks: usize) -> Self {
+        Self {
+            started_at: unix_timestamp_string(),
+            duration_ms: 0,
+            deleted_child_chunks,
+            indexed_child_chunks: 0,
+        }
+    }
+
+    fn add_elapsed_since(&mut self, started: Instant) {
+        let elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        self.duration_ms = self.duration_ms.saturating_add(elapsed_ms);
+    }
 }
 
 /// Stable configuration that defines an embedding profile's vector semantics.
@@ -704,7 +736,7 @@ impl Store {
     pub fn replace_source_contents(
         &self,
         replacement: SourceContentsReplacement<'_>,
-    ) -> Result<u64> {
+    ) -> Result<SourceContentsReplacementReport> {
         let SourceContentsReplacement {
             source,
             evidence,
@@ -716,8 +748,12 @@ impl Store {
             graph_nodes,
             graph_edges,
         } = replacement;
+        let mut lexical_update =
+            SourceLexicalIndexUpdate::start(self.count_lexical_documents_for_source(&source.id)?);
         let tx = self.conn.unchecked_transaction()?;
+        let lexical_delete_started = Instant::now();
         tx.execute("DELETE FROM sources WHERE id = ?1", params![&source.id.0])?;
+        lexical_update.add_elapsed_since(lexical_delete_started);
         tx.execute(
             "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -739,18 +775,37 @@ impl Store {
             for chunk in chunks {
                 let heading_json =
                     serde_json::to_string(&chunk.heading_path).context("serialize heading_path")?;
-                stmt.execute(params![
-                    &chunk.id.0,
-                    &chunk.source_id.0,
-                    &chunk.chunk_hash,
-                    &chunk.embedding_input_hash,
-                    &chunk.text,
-                    &chunk.context_text,
-                    chunk.token_count,
-                    chunk_type_to_str(&chunk.chunk_type),
-                    chunk.parent_chunk_id.as_ref().map(|id| &id.0),
-                    heading_json,
-                ])?;
+                if chunk.chunk_type == ChunkType::Child {
+                    let lexical_insert_started = Instant::now();
+                    stmt.execute(params![
+                        &chunk.id.0,
+                        &chunk.source_id.0,
+                        &chunk.chunk_hash,
+                        &chunk.embedding_input_hash,
+                        &chunk.text,
+                        &chunk.context_text,
+                        chunk.token_count,
+                        chunk_type_to_str(&chunk.chunk_type),
+                        chunk.parent_chunk_id.as_ref().map(|id| &id.0),
+                        heading_json,
+                    ])?;
+                    lexical_update.add_elapsed_since(lexical_insert_started);
+                    lexical_update.indexed_child_chunks =
+                        lexical_update.indexed_child_chunks.saturating_add(1);
+                } else {
+                    stmt.execute(params![
+                        &chunk.id.0,
+                        &chunk.source_id.0,
+                        &chunk.chunk_hash,
+                        &chunk.embedding_input_hash,
+                        &chunk.text,
+                        &chunk.context_text,
+                        chunk.token_count,
+                        chunk_type_to_str(&chunk.chunk_type),
+                        chunk.parent_chunk_id.as_ref().map(|id| &id.0),
+                        heading_json,
+                    ])?;
+                }
             }
         }
 
@@ -783,7 +838,10 @@ impl Store {
 
         let generation = bump_all_profile_index_generations(&tx)?;
         tx.commit()?;
-        Ok(generation)
+        Ok(SourceContentsReplacementReport {
+            generation,
+            lexical_update,
+        })
     }
 
     pub fn index_generation(&self) -> Result<u64> {

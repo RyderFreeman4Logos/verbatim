@@ -2540,6 +2540,7 @@ mod tests {
         assert!(stdout.contains("task-run"));
         assert!(stdout.contains("running"));
         assert!(stdout.contains("[##########----------]  50%"));
+        assert!(stdout.contains("embedding elapsed=0ms"));
         assert!(stdout.contains("embedding_vectors 4/8"));
         assert!(stdout.contains("task-queued"));
         assert!(stdout.contains("queue #12"));

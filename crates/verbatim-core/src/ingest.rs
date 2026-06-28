@@ -1757,50 +1757,60 @@ where
                 .with_recent_status("committing source contents")
                 .with_active_worker_kind("ingest"),
         );
-        let generation = match self
-            .store
-            .replace_source_contents(SourceContentsReplacement {
-                source: &source,
-                evidence: &evidence,
-                chunks: &chunks,
-                embedding_profile_id: profile_id,
-                vectors: &prepared.vectors,
-                links: &links,
-                image_artifacts: &image_artifacts.artifacts,
-                graph_nodes: &graph_nodes,
-                graph_edges: &graph_edges,
-            }) {
-            Ok(generation) => generation,
-            Err(err) => {
-                cleanup_written_image_files(&written_image_files);
-                let _ = remove_dir_if_exists(&staged);
-                return Err(err);
-            }
-        };
+        let replacement_report =
+            match self
+                .store
+                .replace_source_contents(SourceContentsReplacement {
+                    source: &source,
+                    evidence: &evidence,
+                    chunks: &chunks,
+                    embedding_profile_id: profile_id,
+                    vectors: &prepared.vectors,
+                    links: &links,
+                    image_artifacts: &image_artifacts.artifacts,
+                    graph_nodes: &graph_nodes,
+                    graph_edges: &graph_edges,
+                }) {
+                Ok(generation) => generation,
+                Err(err) => {
+                    cleanup_written_image_files(&written_image_files);
+                    let _ = remove_dir_if_exists(&staged);
+                    return Err(err);
+                }
+            };
+        let generation = replacement_report.generation;
+        let lexical_update = replacement_report.lexical_update;
         self.record_task_phase(
             task_id,
             db_phase,
             io_telemetry.db_metadata(&source_id, profile_id, generation),
         );
-        let bm25_phase = PhaseTiming::start(IngestTaskStage::Bm25Index.as_str());
         self.record_task_progress(
             task_id,
-            bm25_phase
-                .progress_snapshot()
-                .with_counter("sources", 0, Some(1))
-                .with_recent_status("verifying lexical index")
+            TaskProgressSnapshot::phase(IngestTaskStage::Bm25Index.as_str())
+                .with_counter(
+                    "indexed_child_chunks",
+                    usize_to_u64(lexical_update.indexed_child_chunks),
+                    None,
+                )
+                .with_recent_status("lexical index updated")
                 .with_active_worker_kind("ingest"),
         );
-        let indexed_child_chunks = self.store.count_lexical_documents_for_source(&source_id)?;
-        self.record_task_phase(
+        self.record_finished_task_phase(
             task_id,
-            bm25_phase,
-            serde_json::json!({
-                "operation": "sqlite_fts_triggered_chunk_index",
-                "backend": "sqlite_fts5",
-                "source_id": source_id.0.as_str(),
-                "indexed_child_chunks": indexed_child_chunks,
-            }),
+            FinishedPhaseTiming {
+                phase: IngestTaskStage::Bm25Index.as_str().into(),
+                started_at: lexical_update.started_at,
+                duration_ms: lexical_update.duration_ms,
+                metadata: serde_json::json!({
+                    "operation": "sqlite_fts_triggered_chunk_index",
+                    "backend": "sqlite_fts5",
+                    "source_id": source_id.0.as_str(),
+                    "triggered_by": ["delete_source_cascade", "insert_child_chunks"],
+                    "deleted_child_chunks": lexical_update.deleted_child_chunks,
+                    "indexed_child_chunks": lexical_update.indexed_child_chunks,
+                }),
+            },
         );
         let staged_index_stats = staged_index_artifact_stats(&staged, generation);
         let cache_stats = prepared.cache_stats.clone();
@@ -5692,7 +5702,15 @@ mod tests {
             .iter()
             .find(|span| span.phase == IngestTaskStage::Bm25Index.as_str())
             .expect("ingest should record bm25 index span");
+        assert_eq!(
+            bm25_span.metadata["operation"],
+            "sqlite_fts_triggered_chunk_index"
+        );
         assert_eq!(bm25_span.metadata["backend"], "sqlite_fts5");
+        assert_eq!(
+            bm25_span.metadata["triggered_by"],
+            serde_json::json!(["delete_source_cascade", "insert_child_chunks"])
+        );
         assert!(
             bm25_span.metadata["indexed_child_chunks"]
                 .as_u64()

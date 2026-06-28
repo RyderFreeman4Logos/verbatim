@@ -1222,7 +1222,7 @@ fn unknown_task_progress_bar() -> String {
 fn task_progress_list_detail(task: &TaskSummary, progress: &TaskProgressSnapshot) -> String {
     let mut parts = Vec::new();
     if let Some(phase) = &progress.phase {
-        parts.push(phase.name.clone());
+        parts.push(format!("{} elapsed={}ms", phase.name, phase.elapsed_ms));
     }
     if let Some(position) = task
         .queue_position

@@ -1328,6 +1328,31 @@ async fn record_task_progress(
     }
 }
 
+fn record_ingest_task_terminalize_span(
+    store: &Store,
+    task_id: &TaskId,
+    timing: PhaseTiming,
+    operation: &'static str,
+) {
+    let finished = timing.finish(serde_json::json!({
+        "operation": operation,
+        "task_kind": TaskKind::Ingest.as_str(),
+    }));
+    if let Err(err) = store.insert_task_span(
+        task_id,
+        &finished.phase,
+        &finished.started_at,
+        finished.duration_ms,
+        &finished.metadata,
+    ) {
+        tracing::warn!(
+            task_id = %task_id.0,
+            error = %err,
+            "failed to persist ingest task terminalize span"
+        );
+    }
+}
+
 async fn finish_task_success(
     state: &SharedState,
     task_id: &TaskId,
@@ -1350,26 +1375,15 @@ async fn finish_task_success(
         let task_changed = store.finish_task_success(&task_id, &result)?;
         if task_changed {
             store.insert_task_event(&task_id, "succeeded", "task succeeded", &result)?;
-            finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
             if let Some(timing) = terminalize_timing {
-                let finished = timing.finish(serde_json::json!({
-                    "operation": "finish_task_success",
-                    "task_kind": TaskKind::Ingest.as_str(),
-                }));
-                if let Err(err) = store.insert_task_span(
+                record_ingest_task_terminalize_span(
+                    &store,
                     &task_id,
-                    &finished.phase,
-                    &finished.started_at,
-                    finished.duration_ms,
-                    &finished.metadata,
-                ) {
-                    tracing::warn!(
-                        task_id = %task_id.0,
-                        error = %err,
-                        "failed to persist ingest task terminalize span"
-                    );
-                }
+                    timing,
+                    "finish_task_success",
+                );
             }
+            finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
         }
         Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
     })
@@ -1441,26 +1455,10 @@ async fn finish_task_failed_with_upstream(
                 payload["resumability"] = resumability;
             }
             store.insert_task_event(&task_id, "failed", "task failed", &payload)?;
-            finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
             if let Some(timing) = terminalize_timing {
-                let finished = timing.finish(serde_json::json!({
-                    "operation": "finish_task_failed",
-                    "task_kind": TaskKind::Ingest.as_str(),
-                }));
-                if let Err(err) = store.insert_task_span(
-                    &task_id,
-                    &finished.phase,
-                    &finished.started_at,
-                    finished.duration_ms,
-                    &finished.metadata,
-                ) {
-                    tracing::warn!(
-                        task_id = %task_id.0,
-                        error = %err,
-                        "failed to persist ingest task terminalize span"
-                    );
-                }
+                record_ingest_task_terminalize_span(&store, &task_id, timing, "finish_task_failed");
             }
+            finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
         }
         Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
     })
@@ -3384,6 +3382,7 @@ fn recover_abandoned_running_source_batch_children_in_store(store: &Store) -> Re
     for task in candidates {
         let error_message = "abandoned running source-batch ingest task recovered without an active worker; failing task to unblock ingest queue";
         let resumability = task_failure_resumability_metadata(&task, Some(error_message))?;
+        let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
         if !store.finish_task_failed_with_result(&task.id, error_message, resumability.as_ref())? {
             continue;
         }
@@ -3396,6 +3395,12 @@ fn recover_abandoned_running_source_batch_children_in_store(store: &Store) -> Re
             payload["resumability"] = resumability.clone();
         }
         store.insert_task_event(&task.id, "failed", "task failed", &payload)?;
+        record_ingest_task_terminalize_span(
+            store,
+            &task.id,
+            terminalize_timing,
+            "recover_abandoned_source_batch_child",
+        );
         finalize_ingest_batch_parent_if_complete(store, Some(&task))?;
         recovered += 1;
     }
@@ -3518,6 +3523,7 @@ async fn persist_ingest_batch_children(
 
         if source_ids.is_empty() {
             let result = ingest_result_metadata(0, &EmbeddingCacheStats::default());
+            let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
             if store.finish_task_success(&candidate.task_id, &result)? {
                 store.insert_task_event(
                     &candidate.task_id,
@@ -3525,6 +3531,12 @@ async fn persist_ingest_batch_children(
                     "task succeeded",
                     &result,
                 )?;
+                record_ingest_task_terminalize_span(
+                    &store,
+                    &candidate.task_id,
+                    terminalize_timing,
+                    "expand_empty_ingest_batch_parent",
+                );
             }
             return Ok(true);
         }
@@ -4299,23 +4311,7 @@ async fn cancel_task_record(
                 )?;
             }
             if let Some(timing) = terminalize_timing {
-                let finished = timing.finish(serde_json::json!({
-                    "operation": "cancel_task",
-                    "task_kind": TaskKind::Ingest.as_str(),
-                }));
-                if let Err(err) = store.insert_task_span(
-                    &task_id,
-                    &finished.phase,
-                    &finished.started_at,
-                    finished.duration_ms,
-                    &finished.metadata,
-                ) {
-                    tracing::warn!(
-                        task_id = %task_id.0,
-                        error = %err,
-                        "failed to persist ingest task terminalize span"
-                    );
-                }
+                record_ingest_task_terminalize_span(&store, &task_id, timing, "cancel_task");
             }
         }
         Ok::<_, anyhow::Error>(changed)
@@ -4374,23 +4370,12 @@ fn cancel_ingest_batch_child(store: &Store, task_id: &TaskId, batch_id: &str) ->
             "task cancelled because ingest batch was cancelled",
             &serde_json::json!({ "ingest_batch_id": batch_id }),
         )?;
-        let finished = terminalize_timing.finish(serde_json::json!({
-            "operation": "cancel_ingest_batch_child",
-            "task_kind": TaskKind::Ingest.as_str(),
-        }));
-        if let Err(err) = store.insert_task_span(
+        record_ingest_task_terminalize_span(
+            store,
             task_id,
-            &finished.phase,
-            &finished.started_at,
-            finished.duration_ms,
-            &finished.metadata,
-        ) {
-            tracing::warn!(
-                task_id = %task_id.0,
-                error = %err,
-                "failed to persist ingest task terminalize span"
-            );
-        }
+            terminalize_timing,
+            "cancel_ingest_batch_child",
+        );
     }
     Ok(changed)
 }
@@ -4442,6 +4427,7 @@ fn finalize_ingest_batch_parent_if_complete(
         return Ok(());
     }
 
+    let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
     let result = ingest_batch_result_metadata(&batch_id, &children);
     let has_failed_or_cancelled = children
         .iter()
@@ -4458,12 +4444,24 @@ fn finalize_ingest_batch_parent_if_complete(
                     "ingest_batch": result,
                 }),
             )?;
+            record_ingest_task_terminalize_span(
+                store,
+                &parent_id,
+                terminalize_timing,
+                "finalize_ingest_batch_parent_failed",
+            );
         }
         return Ok(());
     }
 
     if store.finish_task_success(&parent_id, &result)? {
         store.insert_task_event(&parent_id, "succeeded", "task succeeded", &result)?;
+        record_ingest_task_terminalize_span(
+            store,
+            &parent_id,
+            terminalize_timing,
+            "finalize_ingest_batch_parent_success",
+        );
     }
     Ok(())
 }
@@ -6193,6 +6191,12 @@ mod tests {
         RetrievalDenseVectorPath, RetrievalEvidenceRole, RetrievalProvenance,
         RetrievalRerankStatus, SourceLocator, VectorIndexResidency,
     };
+
+    fn has_task_terminalize_span(spans: &[verbatim_core::task::TaskSpan]) -> bool {
+        spans
+            .iter()
+            .any(|span| span.phase == IngestTaskStage::TaskTerminalize.as_str())
+    }
 
     #[test]
     fn version_flag_prints_package_version() {
@@ -9119,6 +9123,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_background_ingest_batch_parent_records_terminalize_span() {
+        let test_dir = TestDir::new("ingest-batch-empty-terminalize");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        state.ingest_queue_active.store(true, Ordering::Release);
+
+        let Json(created) = submit_ingest_task(
+            State(Arc::clone(&state)),
+            Json(TaskIngestRequest {
+                source_id: None,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+        state.ingest_queue_active.store(false, Ordering::Release);
+        let parent_id = TaskId(created.task_id);
+
+        assert!(expand_next_unexpanded_ingest_batch(&state).await.unwrap());
+        let parent_response = task_summary_response(&state, parent_id).await.unwrap();
+
+        assert_eq!(parent_response.task.status, TaskStatus::Succeeded);
+        assert!(has_task_terminalize_span(&parent_response.spans));
+    }
+
+    #[tokio::test]
     async fn public_background_ingest_batch_parent_succeeds_after_children_succeed() {
         let test_dir = TestDir::new("ingest-batch-public-parent-success");
         let first_path = test_dir.path().join("first.md");
@@ -9170,8 +9203,10 @@ mod tests {
         .await
         .unwrap();
 
-        let parent = task_summary_response(&state, parent_id).await.unwrap().task;
+        let parent_response = task_summary_response(&state, parent_id).await.unwrap();
+        let parent = parent_response.task;
         assert_eq!(parent.status, TaskStatus::Succeeded);
+        assert!(has_task_terminalize_span(&parent_response.spans));
         assert_eq!(parent.result.unwrap()["ingested"], 2);
     }
 
@@ -9739,10 +9774,18 @@ mod tests {
         .await
         .unwrap();
 
-        let first = task_summary_response(&state, first_id).await.unwrap().task;
-        let second = task_summary_response(&state, second_id).await.unwrap().task;
+        let first_response = task_summary_response(&state, first_id.clone())
+            .await
+            .unwrap();
+        let second_response = task_summary_response(&state, second_id.clone())
+            .await
+            .unwrap();
+        let first = first_response.task;
+        let second = second_response.task;
         assert_eq!(first.status, TaskStatus::Succeeded);
         assert_eq!(second.status, TaskStatus::Failed);
+        assert!(has_task_terminalize_span(&first_response.spans));
+        assert!(has_task_terminalize_span(&second_response.spans));
         assert!(second
             .error
             .as_deref()
@@ -9957,8 +10000,10 @@ mod tests {
 
         assert_eq!(running_ingest_count(&state).await, 0);
         for child_id in child_ids {
-            let child = task_summary_response(&state, child_id).await.unwrap().task;
+            let child_response = task_summary_response(&state, child_id).await.unwrap();
+            let child = child_response.task;
             assert_eq!(child.status, TaskStatus::Failed);
+            assert!(has_task_terminalize_span(&child_response.spans));
             assert!(child
                 .error
                 .as_deref()
@@ -9967,6 +10012,8 @@ mod tests {
             assert_eq!(child.result.as_ref().unwrap()["resumable"], true);
         }
         wait_for_task_status(&state, &parent_id, TaskStatus::Failed).await;
+        let parent_response = task_summary_response(&state, parent_id).await.unwrap();
+        assert!(has_task_terminalize_span(&parent_response.spans));
         wait_for_task_status(&state, &followup_id, TaskStatus::Succeeded).await;
     }
 
