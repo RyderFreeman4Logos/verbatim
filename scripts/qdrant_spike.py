@@ -358,13 +358,11 @@ def run_variant(
     dry_run: bool = False,
 ) -> dict[str, JsonValue]:
     manifest = build_manifest(variant, output_root, qdrant_url)
+    paths = assert_isolated_manifest_paths(manifest)
     if dry_run:
         print_dry_run(manifest)
         return manifest
 
-    paths = manifest_paths(manifest)
-    assert_isolated_path(paths["config_path"])
-    assert_isolated_path(paths["data_dir"])
     reset_variant_dir(paths["variant_dir"])
     paths["fixture_dir"].mkdir(parents=True, exist_ok=True)
     paths["data_dir"].mkdir(parents=True, exist_ok=True)
@@ -498,7 +496,7 @@ def run_failure_modes(
     qdrant_url: str = DEFAULT_QDRANT_URL,
 ) -> dict[str, JsonValue]:
     manifest = build_manifest("qdrant-cache", output_root, qdrant_url)
-    paths = manifest_paths(manifest)
+    paths = assert_isolated_manifest_paths(manifest)
     paths["variant_dir"].mkdir(parents=True, exist_ok=True)
 
     cases: list[dict[str, JsonValue]] = [
@@ -692,6 +690,13 @@ def manifest_paths(manifest: dict[str, JsonValue]) -> dict[str, Path]:
         "fixture_dir": Path(str(paths_value["fixture_dir"])),
         "results_path": results_path,
     }
+
+
+def assert_isolated_manifest_paths(manifest: dict[str, JsonValue]) -> dict[str, Path]:
+    paths = manifest_paths(manifest)
+    for path in paths.values():
+        assert_isolated_path(path)
+    return paths
 
 
 def qdrant_collection(manifest: dict[str, JsonValue]) -> str:
@@ -1293,6 +1298,14 @@ class HarnessTests(unittest.TestCase):
         manifest = build_manifest("qdrant-primary")
         self.assertTrue(manifest["experimental_mode"])
         self.assertIn("qdrant_primary", str(manifest["expected_qdrant_collection_id"]))
+
+    def test_dry_run_rejects_unsafe_output_root(self) -> None:
+        with self.assertRaisesRegex(SpikeError, "real Verbatim data dir"):
+            run_variant("local", output_root=REAL_DATA_DIR, dry_run=True)
+
+    def test_failure_modes_reject_unsafe_output_root_before_writes(self) -> None:
+        with self.assertRaisesRegex(SpikeError, "real Verbatim data dir"):
+            run_failure_modes(REAL_DATA_DIR, "http://127.0.0.1:9")
 
     def test_result_schema_and_primary_skip_local_vectors(self) -> None:
         with tempfile.TemporaryDirectory(prefix="verbatim-qdrant-test-") as tmp:

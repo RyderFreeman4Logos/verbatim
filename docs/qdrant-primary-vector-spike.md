@@ -23,7 +23,7 @@ just bench-qdrant-spike --variant qdrant-cache
 just bench-qdrant-spike --variant qdrant-primary
 ```
 
-The harness writes only under `target/qdrant-spike/<variant>/` by default. It emits a machine-readable `RUN_MANIFEST_JSON=...` line on dry-run and writes `results.json` for measured runs.
+The harness writes only under `target/qdrant-spike/<variant>/` by default. Custom `--output-root` values are validated before dry-run output, directory creation, or report writes, and real Verbatim config/data paths are rejected. It emits a machine-readable `RUN_MANIFEST_JSON=...` line on dry-run and writes `results.json` for measured runs.
 
 Required result fields are under these JSON paths:
 
