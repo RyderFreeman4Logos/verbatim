@@ -10,6 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::resource::TaskResourceProgress;
 use crate::types::{hex_sha256, EmbeddingCacheStats};
 
 static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -227,6 +228,8 @@ pub struct TaskProgressSnapshot {
     pub wait_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<TaskResourceProgress>,
 }
 
 impl TaskProgressSnapshot {
@@ -297,6 +300,23 @@ impl TaskProgressSnapshot {
         self
     }
 
+    pub fn with_resource(mut self, resource: TaskResourceProgress) -> Self {
+        self.set_resource(resource);
+        self
+    }
+
+    pub fn set_resource(&mut self, resource: TaskResourceProgress) {
+        if let Some(existing) = self
+            .resources
+            .iter_mut()
+            .find(|existing| existing.name == resource.name)
+        {
+            *existing = resource;
+            return;
+        }
+        self.resources.push(resource);
+    }
+
     pub fn with_queue(
         mut self,
         position: usize,
@@ -350,6 +370,12 @@ impl TaskProgressSnapshot {
             .recent_status
             .as_deref()
             .map(|status| bounded_chars(status, TASK_EVENT_MESSAGE_MAX_CHARS));
+        self.resources.truncate(TASK_ARRAY_MAX_ITEMS);
+        for resource in &mut self.resources {
+            resource.name = bounded_chars(&resource.name, TASK_STRING_MAX_CHARS);
+            resource.kind = bounded_chars(&resource.kind, TASK_STRING_MAX_CHARS);
+            resource.state = bounded_chars(&resource.state, TASK_STRING_MAX_CHARS);
+        }
         self
     }
 

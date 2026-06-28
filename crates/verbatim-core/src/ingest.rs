@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -33,8 +34,8 @@ use crate::index::qdrant::{records_from_store_for_profile, QdrantClient};
 use crate::index::sqlite_fts::SqliteFtsIndex;
 use crate::index_gc::{apply_index_gc, IndexGcPolicy};
 use crate::index_profile_delete::{
-    apply_index_profile_delete, plan_index_profile_delete, IndexProfileDeleteApplyReport,
-    IndexProfileDeletePlan,
+    apply_index_profile_delete_artifacts, apply_index_profile_delete_sqlite,
+    plan_index_profile_delete, IndexProfileDeleteApplyReport, IndexProfileDeletePlan,
 };
 use crate::ocr::{
     configured_ocr_provider, ocr_evidence_from_output, ocr_profile_stale, ocr_required_pages,
@@ -43,6 +44,10 @@ use crate::ocr::{
 use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
 use crate::provider::VisionModel;
+use crate::resource::{
+    global_resource_registry, ObservableResource, ResourceLimitConfig, ResourcePermit,
+    TaskResourceProgress,
+};
 use crate::store::{
     EmbeddingCacheEntry, EmbeddingProfileConfig, SourceContentsReplacement, Store,
     StoredEmbeddingProfileConfig,
@@ -319,6 +324,53 @@ impl SourceCommitIoTelemetry {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn ingest_resource(name: &'static str, kind: &'static str) -> Arc<ObservableResource> {
+    global_resource_registry().resource_or_insert(
+        name,
+        kind,
+        ResourceLimitConfig {
+            capacity: 1,
+            queue_capacity: 512,
+            queue_timeout: std::time::Duration::from_secs(300),
+        },
+    )
+}
+
+async fn acquire_ingest_resource(name: &'static str, kind: &'static str) -> Result<ResourcePermit> {
+    Ok(ingest_resource(name, kind).acquire().await?)
+}
+
+fn acquire_ingest_resource_blocking(
+    name: &'static str,
+    kind: &'static str,
+) -> Result<ResourcePermit> {
+    Ok(ingest_resource(name, kind).acquire_blocking()?)
+}
+
+fn waiting_resource_progress(name: &'static str, kind: &'static str) -> TaskResourceProgress {
+    TaskResourceProgress::from_snapshot(
+        &ingest_resource(name, kind).snapshot(),
+        "waiting",
+        None,
+        None,
+    )
+}
+
+fn task_resource_progress(permit: &ResourcePermit, state: &'static str) -> TaskResourceProgress {
+    let snapshot = permit.snapshot();
+    TaskResourceProgress::from_snapshot(&snapshot, state, Some(permit.queue_wait_ms()), None)
+}
+
+fn completed_resource_progress(permit: &ResourcePermit) -> TaskResourceProgress {
+    let snapshot = permit.snapshot();
+    TaskResourceProgress::from_snapshot(
+        &snapshot,
+        "completed",
+        Some(permit.queue_wait_ms()),
+        Some(permit.service_ms()),
+    )
 }
 
 struct PreparedVectors {
@@ -808,6 +860,76 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         })
     }
 
+    pub fn open_readonly(config: &Config, data_dir: &Path) -> Result<Self> {
+        let db_path = data_dir.join("verbatim.db");
+        let store = Store::open_existing_readonly(&db_path)?;
+
+        let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+        let active_profile_id = config.embedding.profile_id.clone();
+        let mut embedding_profile_spec = EmbeddingProfileSpec::from_config(&config.embedding);
+        if let Some(stored) = store.load_embedding_profile_config(&active_profile_id)? {
+            embedding_profile_spec.apply_stored_profile_config(&stored);
+        }
+
+        let hnsw = load_vector_index_for_residency(
+            config.vector_index.residency,
+            data_dir,
+            &store,
+            &active_profile_id,
+        )?;
+
+        let context_gen = if config.context.enabled {
+            Some(ContextGenerator::new(&config.chat))
+        } else {
+            None
+        };
+        let (vision_model, vision_caption_model) = configured_vision_model(config);
+        let ocr_provider = configured_ocr_provider(&config.ocr)?;
+        let graph_extraction_config = config.graph.extraction.clone();
+        let graph_extractor = if graph_extraction_config.enabled && config.chat.enabled {
+            Some(GraphExtractor::from_config(&config.chat))
+        } else {
+            None
+        };
+        #[cfg(feature = "qdrant")]
+        let qdrant = QdrantClient::from_config(&config.qdrant);
+        #[cfg(feature = "qdrant")]
+        let pending_qdrant_profile_syncs = Vec::new();
+
+        Ok(Self {
+            store,
+            hnsw,
+            vector_residency: config.vector_index.residency,
+            loaded_profile_id: active_profile_id.clone(),
+            active_profile_id,
+            embedding_profile_spec,
+            embedding_enabled: config.embedding.enabled,
+            embed_client,
+            context_gen,
+            vision_model,
+            graph_extractor,
+            graph_extraction_config,
+            #[cfg(feature = "qdrant")]
+            qdrant,
+            #[cfg(feature = "qdrant")]
+            pending_qdrant_profile_syncs,
+            vision_caption_model,
+            vision_caption_prompt_hash: vision_caption_prompt_hash(),
+            ocr_provider,
+            data_dir: data_dir.to_path_buf(),
+            image_artifact_limits: config.parser.image_artifacts,
+            index_gc_policy: config.index_gc.policy(),
+            embedding_batch_size: config.embedding.batch_size.max(1),
+            embedding_max_concurrent_requests: config
+                .embedding
+                .endpoint_runtime
+                .bounded()
+                .max_concurrent_requests,
+            #[cfg(test)]
+            source_commit_observer: None,
+        })
+    }
+
     pub fn reload_runtime_config(&mut self, config: &Config) -> Result<()> {
         self.embed_client = OpenAiEmbeddingClient::new(&config.embedding);
         self.embedding_enabled = config.embedding.enabled;
@@ -872,18 +994,34 @@ where
         profile_id: &EmbeddingProfileId,
         allow_active: bool,
     ) -> Result<(IndexProfileDeletePlan, IndexProfileDeleteApplyReport)> {
-        let result = apply_index_profile_delete(
+        let plan = plan_index_profile_delete(
             &self.data_dir,
             &self.store,
             profile_id,
             &self.active_profile_id,
-            allow_active,
         )?;
+        if plan.active_profile && !allow_active {
+            bail!(
+                "refusing to delete active embedding profile {}; pass allow_active to clear active profile artifacts",
+                profile_id
+            );
+        }
+
+        let index_publish_permit =
+            acquire_ingest_resource_blocking("index_publish", "index_publish")?;
+        let mut apply = apply_index_profile_delete_artifacts(&self.data_dir, profile_id, &plan)?;
+        drop(index_publish_permit);
+
+        let sqlite_write_permit =
+            acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
+        apply_index_profile_delete_sqlite(&self.store, profile_id, &mut apply)?;
+        drop(sqlite_write_permit);
+
         if self.loaded_profile_id == *profile_id || self.active_profile_id == *profile_id {
             self.hnsw.clear();
             self.loaded_profile_id = profile_id.clone();
         }
-        Ok(result)
+        Ok((plan, apply))
     }
 
     pub fn active_ocr_profile(&self) -> Option<crate::types::OcrProfile> {
@@ -902,10 +1040,12 @@ where
         self.embedding_profile_spec
             .apply_endpoint_capabilities(capabilities);
         let new_hash = self.embedding_profile_spec.config_hash();
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let reset_vectors = self.store.ensure_embedding_profile(
             &self.active_profile_id,
             self.embedding_profile_spec.as_store_config(),
         )?;
+        drop(sqlite_write_permit);
         if reset_vectors {
             self.hnsw.clear();
             self.loaded_profile_id = self.active_profile_id.clone();
@@ -914,6 +1054,36 @@ where
                 let profile_id = self.active_profile_id.clone();
                 self.sync_qdrant_profile_all(&profile_id).await;
             }
+        }
+        Ok(previous_hash != new_hash)
+    }
+
+    /// Apply already-discovered embedding endpoint capabilities without doing
+    /// provider I/O while the live pipeline slot is held.
+    pub fn apply_embedding_profile_capabilities(
+        &mut self,
+        capabilities: EmbeddingEndpointCapabilities,
+    ) -> Result<bool> {
+        if !self.embedding_enabled {
+            return Ok(false);
+        }
+        let previous_hash = self.embedding_profile_spec.config_hash();
+        self.embedding_profile_spec
+            .apply_endpoint_capabilities(capabilities);
+        let new_hash = self.embedding_profile_spec.config_hash();
+        let sqlite_write_permit =
+            acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
+        let reset_vectors = self.store.ensure_embedding_profile(
+            &self.active_profile_id,
+            self.embedding_profile_spec.as_store_config(),
+        )?;
+        drop(sqlite_write_permit);
+        if reset_vectors {
+            self.hnsw.clear();
+            self.loaded_profile_id = self.active_profile_id.clone();
+            #[cfg(feature = "qdrant")]
+            self.pending_qdrant_profile_syncs
+                .push(self.active_profile_id.clone());
         }
         Ok(previous_hash != new_hash)
     }
@@ -931,7 +1101,14 @@ where
     }
 
     pub fn select_embedding_profile(&mut self, profile_id: &EmbeddingProfileId) -> Result<()> {
+        let sqlite_write_permit =
+            acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
         let _ = self.ensure_embedding_profile(profile_id)?;
+        drop(sqlite_write_permit);
+        self.load_embedding_profile_index(profile_id)
+    }
+
+    fn load_embedding_profile_index(&mut self, profile_id: &EmbeddingProfileId) -> Result<()> {
         if self.loaded_profile_id == *profile_id {
             return Ok(());
         }
@@ -943,6 +1120,13 @@ where
         )?;
         self.loaded_profile_id = profile_id.clone();
         Ok(())
+    }
+
+    pub fn select_embedding_profile_readonly(
+        &mut self,
+        profile_id: &EmbeddingProfileId,
+    ) -> Result<()> {
+        self.load_embedding_profile_index(profile_id)
     }
 
     pub fn lexical_index(&self) -> SqliteFtsIndex<'_> {
@@ -1077,7 +1261,10 @@ where
             parser_used: None,
             last_ingested_at: None,
         };
+        let sqlite_write_permit =
+            acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
         self.store.add_source(&source)?;
+        drop(sqlite_write_permit);
         Ok(id)
     }
 
@@ -1119,8 +1306,15 @@ where
             }
         }
         let report = CollectionSyncReport::from_discovery(&discovery, settings.max_depth);
-        self.store
-            .replace_collection_members(collection_name, &discovery.candidates, report)
+        let sqlite_write_permit =
+            acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
+        let report = self.store.replace_collection_members(
+            collection_name,
+            &discovery.candidates,
+            report,
+        )?;
+        drop(sqlite_write_permit);
+        Ok(report)
     }
 
     pub async fn remove_source(&mut self, source_id: &SourceId) -> Result<()> {
@@ -1135,7 +1329,11 @@ where
             .filter(|document| document.source_id != *source_id)
             .collect::<Vec<_>>();
         let prepared = self.prepare_indexes_from_vectors(remaining_vectors)?;
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        drop(index_publish_permit);
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let generation = match self.store.remove_source_and_replace_vectors_for_profile(
             &active_profile_id,
             source_id,
@@ -1147,7 +1345,11 @@ where
                 return Err(err);
             }
         };
+        drop(sqlite_write_permit);
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         self.publish_committed_indexes(&active_profile_id, generation, staged, prepared)?;
+        drop(index_publish_permit);
         #[cfg(feature = "qdrant")]
         self.sync_qdrant_delete_source(source_id).await;
         remove_source_image_artifacts(&self.data_dir, source_id).with_context(|| {
@@ -1197,8 +1399,13 @@ where
         }
         let mut stale = stale_set.into_iter().collect::<Vec<_>>();
         stale.sort_by(|left, right| left.0.cmp(&right.0));
-        for id in &stale {
-            self.store.update_source_status(id, &SourceStatus::Stale)?;
+        if !stale.is_empty() {
+            let sqlite_write_permit =
+                acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")?;
+            for id in &stale {
+                self.store.update_source_status(id, &SourceStatus::Stale)?;
+            }
+            drop(sqlite_write_permit);
         }
         Ok(stale)
     }
@@ -1462,23 +1669,29 @@ where
             phase
                 .progress_snapshot()
                 .with_counter("sources", 0, Some(1))
-                .with_recent_status("parsing source"),
+                .with_recent_status("parsing source")
+                .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
-        let mut evidence = parser.parse(&source.path)?;
-        normalize_evidence_source_ids(&mut evidence, source_id);
-        let parsed_image_artifacts = extract_image_artifacts_for_ingest(
-            parser.as_ref(),
-            &source.path,
-            self.image_artifact_limits,
-        )?;
-        let prepared_image_artifacts = prepare_image_artifacts(
-            &self.data_dir,
-            source_id,
-            evidence.len() as u32,
-            parsed_image_artifacts,
-            self.image_artifact_limits,
-        )?;
-        let pdf_scan = pdf_scan_summary(&evidence, &prepared_image_artifacts.artifacts);
+        let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
+        let (mut evidence, prepared_image_artifacts, pdf_scan) = {
+            let _cpu_permit = cpu_permit;
+            let mut evidence = parser.parse(&source.path)?;
+            normalize_evidence_source_ids(&mut evidence, source_id);
+            let parsed_image_artifacts = extract_image_artifacts_for_ingest(
+                parser.as_ref(),
+                &source.path,
+                self.image_artifact_limits,
+            )?;
+            let prepared_image_artifacts = prepare_image_artifacts(
+                &self.data_dir,
+                source_id,
+                evidence.len() as u32,
+                parsed_image_artifacts,
+                self.image_artifact_limits,
+            )?;
+            let pdf_scan = pdf_scan_summary(&evidence, &prepared_image_artifacts.artifacts);
+            (evidence, prepared_image_artifacts, pdf_scan)
+        };
         self.record_task_phase(
             task_id,
             phase,
@@ -1556,9 +1769,14 @@ where
             phase
                 .progress_snapshot()
                 .with_counter("evidence", searchable_evidence.len() as u64, None)
-                .with_recent_status("chunking evidence"),
+                .with_recent_status("chunking evidence")
+                .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
-        let output = chunk_evidence(source_id, &searchable_evidence, &chunker_config);
+        let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
+        let output = {
+            let _cpu_permit = cpu_permit;
+            chunk_evidence(source_id, &searchable_evidence, &chunker_config)
+        };
         tracing::info!(chunk_count = output.chunks.len(), "chunked");
         self.record_task_phase(
             task_id,
@@ -1596,6 +1814,15 @@ where
             );
         }
 
+        let phase = PhaseTiming::start(IngestTaskStage::GraphExpansion.as_str());
+        self.record_task_progress(
+            task_id,
+            phase
+                .progress_snapshot()
+                .with_recent_status("building evidence graph")
+                .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
+        );
+        let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
         let caption_output = chunk_caption_evidence(source_id, &caption_evidence);
         chunks.extend(caption_output.chunks);
         links.extend(caption_output.links);
@@ -1611,6 +1838,15 @@ where
                 .map(|provider| provider.profile())
                 .as_ref(),
         );
+        let (mut graph_nodes, mut graph_edges) = build_evidence_graph(
+            &new_source,
+            &evidence,
+            &chunks,
+            &links,
+            &prepared_image_artifacts.artifacts,
+            &prepared_image_artifacts.text_proximities,
+        );
+        drop(cpu_permit);
         self.record_task_event(
             task_id,
             "diagnostic",
@@ -1620,15 +1856,6 @@ where
                 "diagnostics": ingest_diagnostics,
             }),
         );
-        let (mut graph_nodes, mut graph_edges) = build_evidence_graph(
-            &new_source,
-            &evidence,
-            &chunks,
-            &links,
-            &prepared_image_artifacts.artifacts,
-            &prepared_image_artifacts.text_proximities,
-        );
-        let phase = PhaseTiming::start(IngestTaskStage::GraphExpansion.as_str());
         self.append_generated_graph(&new_source, &chunks, &mut graph_nodes, &mut graph_edges)
             .await;
         self.record_task_phase(
@@ -1715,11 +1942,30 @@ where
                 .progress_snapshot()
                 .with_counter("sources", 0, Some(1))
                 .with_recent_status("building vector index")
-                .with_active_worker_kind("ingest"),
+                .with_active_worker_kind("ingest")
+                .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
+        let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
         let prepared =
             self.prepare_source_indexes_from_vectors(profile_id, &source_id, vectors, cache_stats)?;
+        let completed_cpu_resource = completed_resource_progress(&cpu_permit);
+        drop(cpu_permit);
+        self.record_resource_timing(task_id, completed_cpu_resource);
+        self.record_task_progress(
+            task_id,
+            vector_build_phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("staging index artifacts")
+                .with_active_worker_kind("ingest")
+                .with_resource(waiting_resource_progress("index_publish", "index_publish")),
+        );
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let completed_index_stage_resource = completed_resource_progress(&index_publish_permit);
+        drop(index_publish_permit);
+        self.record_resource_timing(task_id, completed_index_stage_resource);
         self.record_task_phase(
             task_id,
             vector_build_phase,
@@ -1757,6 +2003,17 @@ where
                 .with_recent_status("committing source contents")
                 .with_active_worker_kind("ingest"),
         );
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
+        self.record_task_progress_with_writer_permit(
+            task_id,
+            db_phase
+                .progress_snapshot()
+                .with_counter("sources", 0, Some(1))
+                .with_recent_status("committing source contents")
+                .with_active_worker_kind("ingest")
+                .with_resource(task_resource_progress(&sqlite_write_permit, "active")),
+            &sqlite_write_permit,
+        );
         let replacement_report =
             match self
                 .store
@@ -1778,6 +2035,9 @@ where
                     return Err(err);
                 }
             };
+        let completed_sqlite_resource = completed_resource_progress(&sqlite_write_permit);
+        drop(sqlite_write_permit);
+        self.record_resource_timing(task_id, completed_sqlite_resource);
         let generation = replacement_report.generation;
         let lexical_update = replacement_report.lexical_update;
         self.record_task_phase(
@@ -1823,7 +2083,12 @@ where
                 .with_recent_status("publishing index artifacts")
                 .with_active_worker_kind("ingest"),
         );
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
+        let completed_index_publish_resource = completed_resource_progress(&index_publish_permit);
+        drop(index_publish_permit);
+        self.record_resource_timing(task_id, completed_index_publish_resource);
         self.record_task_progress(
             task_id,
             vector_publish_phase
@@ -2706,6 +2971,20 @@ where
         let Some(task_id) = task_id else {
             return;
         };
+        let Ok(sqlite_write_permit) =
+            self.acquire_task_metadata_write_permit(task_id, "task phase timing")
+        else {
+            return;
+        };
+        self.record_finished_task_phase_with_writer_permit(task_id, finished, &sqlite_write_permit);
+    }
+
+    fn record_finished_task_phase_with_writer_permit(
+        &self,
+        task_id: &TaskId,
+        finished: crate::task::FinishedPhaseTiming,
+        _sqlite_write_permit: &ResourcePermit,
+    ) {
         if let Err(err) = self.store.insert_task_span(
             task_id,
             &finished.phase,
@@ -2723,6 +3002,23 @@ where
     }
 
     fn record_task_progress(&self, task_id: Option<&TaskId>, progress: TaskProgressSnapshot) {
+        let Some(task_id) = task_id else {
+            return;
+        };
+        let Ok(sqlite_write_permit) =
+            self.acquire_task_metadata_write_permit(task_id, "task progress")
+        else {
+            return;
+        };
+        self.record_task_progress_with_writer_permit(Some(task_id), progress, &sqlite_write_permit);
+    }
+
+    fn record_task_progress_with_writer_permit(
+        &self,
+        task_id: Option<&TaskId>,
+        progress: TaskProgressSnapshot,
+        _sqlite_write_permit: &ResourcePermit,
+    ) {
         let Some(task_id) = task_id else {
             return;
         };
@@ -2745,6 +3041,28 @@ where
         let Some(task_id) = task_id else {
             return;
         };
+        let Ok(sqlite_write_permit) =
+            self.acquire_task_metadata_write_permit(task_id, "task event")
+        else {
+            return;
+        };
+        self.record_task_event_with_writer_permit(
+            task_id,
+            event_type,
+            message,
+            payload,
+            &sqlite_write_permit,
+        );
+    }
+
+    fn record_task_event_with_writer_permit(
+        &self,
+        task_id: &TaskId,
+        event_type: &str,
+        message: &str,
+        payload: serde_json::Value,
+        _sqlite_write_permit: &ResourcePermit,
+    ) {
         if let Err(err) = self
             .store
             .insert_task_event(task_id, event_type, message, &payload)
@@ -2756,6 +3074,28 @@ where
                 "failed to persist task event"
             );
         }
+    }
+
+    fn acquire_task_metadata_write_permit(
+        &self,
+        task_id: &TaskId,
+        operation: &'static str,
+    ) -> Result<ResourcePermit> {
+        acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write").with_context(|| {
+            format!(
+                "acquire sqlite writer resource for {operation}: {}",
+                task_id.0
+            )
+        })
+    }
+
+    fn record_resource_timing(&self, task_id: Option<&TaskId>, resource: TaskResourceProgress) {
+        self.record_task_event(
+            task_id,
+            "resource",
+            "resource timing",
+            serde_json::json!({ "resource": resource }),
+        );
     }
 
     pub async fn rebuild_indexes_from_store(&mut self) -> Result<()> {
@@ -2774,21 +3114,26 @@ where
             "rebuilding local indexes"
         );
         let prepared = if self.embedding_enabled {
-            let prepared = self
-                .prepare_full_indexes_for_chunks(&active_profile_id, &child_chunks)
-                .await?;
+            self.prepare_full_indexes_for_chunks(&active_profile_id, &child_chunks)
+                .await?
+        } else {
+            self.prepare_indexes_from_vectors(Vec::new())?
+        };
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
+        if self.embedding_enabled {
             self.store
                 .replace_all_vector_documents_for_profile(&active_profile_id, &prepared.vectors)?;
             self.mark_profile_sources_embedded(&active_profile_id, &source_ids, &prepared.vectors)?;
-            prepared
         } else {
-            let prepared = self.prepare_indexes_from_vectors(Vec::new())?;
             self.store
                 .replace_all_vector_documents_for_profile(&active_profile_id, &[])?;
-            prepared
-        };
+        }
         self.lexical_index().rebuild_from_store(&self.store)?;
+        drop(sqlite_write_permit);
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         self.publish_prepared_indexes(&active_profile_id, prepared)?;
+        drop(index_publish_permit);
         #[cfg(feature = "qdrant")]
         self.sync_qdrant_all().await;
 
@@ -2804,7 +3149,11 @@ where
             bail!("embedding is disabled; enable [embedding] before building vectors");
         }
         self.refresh_embedding_profile_capabilities().await?;
-        let profile_reset = self.ensure_embedding_profile(profile_id)?;
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
+        let profile_reset = self
+            .store
+            .ensure_embedding_profile(profile_id, self.embedding_profile_spec.as_store_config())?;
+        drop(sqlite_write_permit);
         #[cfg(not(feature = "qdrant"))]
         let _ = profile_reset;
         let target_source_ids = match source_id {
@@ -2840,7 +3189,11 @@ where
                     .await?
             }
         };
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        drop(index_publish_permit);
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let generation = match source_id {
             Some(source_id) => self.store.replace_source_vector_documents_for_profile(
                 profile_id,
@@ -2858,10 +3211,17 @@ where
                 self.store.index_generation_for_profile(profile_id)?
             }
         };
+        drop(sqlite_write_permit);
         let cache_stats = prepared.cache_stats.clone();
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
         self.publish_committed_indexes(profile_id, generation, staged, prepared)?;
+        drop(index_publish_permit);
         if *profile_id == self.active_profile_id {
+            let sqlite_write_permit =
+                acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
             self.clear_vector_only_stale_status(source_id)?;
+            drop(sqlite_write_permit);
         }
         #[cfg(feature = "qdrant")]
         {
@@ -2990,11 +3350,14 @@ where
                     &input.hash,
                 )? {
                     Some(vector) if vector.len() == expected_dimension => {
+                        let sqlite_write_permit =
+                            acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
                         self.store.record_embedding_cache_hit(
                             profile_id,
                             &profile_config_hash,
                             &input.hash,
                         )?;
+                        drop(sqlite_write_permit);
                         cache_stats.cache_hits += 1;
                         cache_stats.reused_chunks += 1;
                         let source_stats = cache_stats_by_source
@@ -3102,11 +3465,14 @@ where
                         }
                     }
                 }
+                let sqlite_write_permit =
+                    acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
                 self.store.upsert_embedding_cache_entries(
                     profile_id,
                     &profile_config_hash,
                     &cache_entries,
                 )?;
+                drop(sqlite_write_permit);
                 postprocess_timing = Some(postprocess_phase.finish(serde_json::json!({
                     "operation": "embedding_response_postprocess",
                     "source_count": request_source_ids.len(),
@@ -3283,7 +3649,9 @@ where
             qdrant
                 .delete_source_for_profile(profile_id, source_id)
                 .await?;
+            let qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
             qdrant.upsert_records(&records).await?;
+            drop(qdrant_permit);
             Ok(())
         }
         .await;
@@ -3324,7 +3692,9 @@ where
         let result: Result<()> = async {
             let records = records_from_store_for_profile(&self.store, profile_id, None)?;
             qdrant.delete_profile(profile_id).await?;
+            let qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
             qdrant.upsert_records(&records).await?;
+            drop(qdrant_permit);
             Ok(())
         }
         .await;
@@ -3481,6 +3851,8 @@ where
             }
             let attempt =
                 CaptionAttempt::skipped("vision caption provider is disabled or not configured");
+            let sqlite_write_permit =
+                acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
             self.store.upsert_image_caption_attempt(
                 &artifact.content_hash,
                 &self.vision_caption_model,
@@ -3488,6 +3860,7 @@ where
                 &self.vision_caption_prompt_hash,
                 &attempt,
             )?;
+            drop(sqlite_write_permit);
             return Ok(None);
         };
 
@@ -3496,11 +3869,14 @@ where
             &self.vision_caption_model,
             &self.vision_caption_prompt_hash,
         )? {
+            let sqlite_write_permit =
+                acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
             self.store.record_image_caption_cache_hit(
                 &artifact.content_hash,
                 &self.vision_caption_model,
                 &self.vision_caption_prompt_hash,
             )?;
+            drop(sqlite_write_permit);
             if let Some(caption) = record.caption {
                 return Ok(Some(caption_derived_evidence(
                     source_id,
@@ -3515,6 +3891,7 @@ where
 
         let attempt = request_image_caption(model.as_ref(), &file.bytes, &artifact.mime_type).await;
 
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         self.store.upsert_image_caption_attempt(
             &artifact.content_hash,
             &self.vision_caption_model,
@@ -3522,6 +3899,7 @@ where
             &self.vision_caption_prompt_hash,
             &attempt,
         )?;
+        drop(sqlite_write_permit);
 
         if attempt.status != ImageCaptionStatus::Success {
             tracing::warn!(
@@ -5555,6 +5933,55 @@ mod tests {
         store.replace_all_vector_documents(&vectors).unwrap();
     }
 
+    fn sqlite_writer_resource_for_test() -> Arc<ObservableResource> {
+        global_resource_registry().resource(
+            "sqlite_writer",
+            "sqlite_write",
+            ResourceLimitConfig {
+                capacity: 1,
+                queue_capacity: 1,
+                queue_timeout: Duration::from_secs(5),
+            },
+        )
+    }
+
+    fn named_resource_for_test(name: &'static str, kind: &'static str) -> Arc<ObservableResource> {
+        global_resource_registry().resource(
+            name,
+            kind,
+            ResourceLimitConfig {
+                capacity: 1,
+                queue_capacity: 1,
+                queue_timeout: Duration::from_secs(5),
+            },
+        )
+    }
+
+    fn release_after_short_wait(permit: ResourcePermit) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            drop(permit);
+        })
+    }
+
+    fn assert_sqlite_writer_waits_for_test<F>(resource: &Arc<ObservableResource>, write: F)
+    where
+        F: FnOnce(),
+    {
+        let before = resource.snapshot().queue_wait_ms_total;
+        let held = resource.acquire_blocking().expect("held writer permit");
+        let release = release_after_short_wait(held);
+
+        write();
+
+        release.join().expect("writer release thread joins");
+        let after = resource.snapshot();
+        assert!(
+            after.queue_wait_ms_total > before,
+            "expected write to wait through sqlite_writer queue; before={before}, after={after:?}"
+        );
+    }
+
     fn test_config() -> Config {
         Config {
             store: Default::default(),
@@ -6401,6 +6828,31 @@ mod tests {
         pipeline.select_embedding_profile(&alt_profile).unwrap();
 
         assert_eq!(pipeline.hnsw().len(), 2);
+    }
+
+    #[test]
+    fn select_embedding_profile_waits_for_sqlite_writer_resource() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let profile_id = EmbeddingProfileId::new("writer-gated-select").unwrap();
+        let writer = sqlite_writer_resource_for_test();
+
+        assert_sqlite_writer_waits_for_test(&writer, || {
+            pipeline.select_embedding_profile(&profile_id).unwrap();
+        });
+
+        assert_eq!(pipeline.loaded_profile_id, profile_id);
+        assert!(pipeline
+            .store()
+            .load_embedding_profile_config(&profile_id)
+            .unwrap()
+            .is_some());
     }
 
     #[derive(Debug)]
@@ -7571,6 +8023,209 @@ model = "local-vision"
         assert!(
             phases.contains(&IngestTaskStage::VectorIndex.as_str()),
             "progress phases should include vector index publishing, got {phases:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == "progress"
+                    && event.payload["phase"]["name"] == IngestTaskStage::VectorIndex.as_str()
+                    && event.payload["recent_status"] == "staging index artifacts"
+                    && event.payload["resources"]
+                        .as_array()
+                        .is_some_and(|resources| {
+                            resources.iter().any(|resource| {
+                                resource["name"] == "index_publish"
+                                    && resource["kind"] == "index_publish"
+                                    && resource["state"] == "waiting"
+                            })
+                        })
+            }),
+            "progress events should report pending index_publish resource before acquiring the permit"
+        );
+        let completed_resources = events
+            .iter()
+            .filter(|event| event.event_type == "resource")
+            .filter_map(|event| event.payload.get("resource"))
+            .filter(|resource| resource["state"] == "completed")
+            .collect::<Vec<_>>();
+        assert!(
+            completed_resources.len() >= 2,
+            "expected multiple completed resource timing events, got {completed_resources:?}"
+        );
+        assert!(
+            completed_resources.iter().any(|resource| {
+                resource["name"] == "sqlite_writer"
+                    && resource["kind"] == "sqlite_write"
+                    && resource["queue_wait_ms"].is_u64()
+                    && resource["service_ms"].is_u64()
+            }),
+            "completed resource timings should include sqlite_writer service time, got {completed_resources:?}"
+        );
+        assert!(
+            completed_resources.iter().any(|resource| {
+                resource["name"] == "index_publish"
+                    && resource["kind"] == "index_publish"
+                    && resource["queue_wait_ms"].is_u64()
+                    && resource["service_ms"].is_u64()
+            }),
+            "completed resource timings should include index_publish service time, got {completed_resources:?}"
+        );
+    }
+
+    #[test]
+    fn task_metadata_writes_wait_for_sqlite_writer_resource() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let task_id = TaskId("task-resource-gated-metadata".into());
+        pipeline
+            .store()
+            .create_task(&task_id, TaskKind::Ingest, &serde_json::json!({}))
+            .unwrap();
+        let resource = sqlite_writer_resource_for_test();
+
+        assert_sqlite_writer_waits_for_test(&resource, || {
+            pipeline.record_task_progress(
+                Some(&task_id),
+                TaskProgressSnapshot::phase("resource-gated-progress")
+                    .with_recent_status("writer gated progress"),
+            );
+        });
+        assert_sqlite_writer_waits_for_test(&resource, || {
+            pipeline.record_task_event(
+                Some(&task_id),
+                "resource_test",
+                "writer gated event",
+                serde_json::json!({"source": "test"}),
+            );
+        });
+        assert_sqlite_writer_waits_for_test(&resource, || {
+            pipeline.record_task_phase(
+                Some(&task_id),
+                PhaseTiming::start("resource-gated-span"),
+                serde_json::json!({"source": "test"}),
+            );
+        });
+
+        let task = pipeline.store().get_task(&task_id).unwrap().unwrap();
+        assert_eq!(
+            task.progress.unwrap().recent_status.as_deref(),
+            Some("writer gated progress")
+        );
+        let events = pipeline
+            .store()
+            .list_task_events(&task_id, None, 20)
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "resource_test"));
+        let spans = pipeline.store().list_task_spans(&task_id).unwrap();
+        assert!(spans.iter().any(|span| span.phase == "resource-gated-span"));
+    }
+
+    #[test]
+    fn telemetry_waits_for_sqlite_writer_before_non_sqlite_resource_acquire() {
+        for (resource_name, resource_kind) in
+            [("cpu_worker", "cpu"), ("index_publish", "index_publish")]
+        {
+            let writer = sqlite_writer_resource_for_test();
+            let resource = named_resource_for_test(resource_name, resource_kind);
+            let held_writer = writer.acquire_blocking().expect("held writer permit");
+            let completed = Arc::new(AtomicUsize::new(0));
+            let completed_in_thread = Arc::clone(&completed);
+
+            let telemetry_then_resource = thread::spawn(move || {
+                let _writer = acquire_ingest_resource_blocking("sqlite_writer", "sqlite_write")
+                    .expect("telemetry waits for sqlite writer");
+                let _resource = acquire_ingest_resource_blocking(resource_name, resource_kind)
+                    .expect("resource acquired only after telemetry write admission");
+                completed_in_thread.store(1, Ordering::Release);
+            });
+
+            thread::sleep(Duration::from_millis(25));
+            let snapshot = resource.snapshot();
+            assert_eq!(
+                snapshot.active, 0,
+                "{resource_name} should not be held while telemetry waits for sqlite_writer"
+            );
+            assert_eq!(
+                snapshot.queued, 0,
+                "{resource_name} should not queue while telemetry waits for sqlite_writer"
+            );
+            assert_eq!(completed.load(Ordering::Acquire), 0);
+
+            drop(held_writer);
+            telemetry_then_resource
+                .join()
+                .expect("telemetry/resource thread joins");
+            assert_eq!(completed.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[test]
+    fn profile_delete_waits_for_sqlite_writer_without_holding_index_publish() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let profile_id = EmbeddingProfileId::new("delete-me").unwrap();
+        pipeline
+            .store()
+            .ensure_embedding_profile(
+                &profile_id,
+                test_embedding_profile_spec(2).as_store_config(),
+            )
+            .unwrap();
+        let writer = sqlite_writer_resource_for_test();
+        let index_publish = named_resource_for_test("index_publish", "index_publish");
+        let before = writer.snapshot().queue_wait_ms_total;
+        let held_writer = writer.acquire_blocking().expect("held writer permit");
+        let delete_completed = Arc::new(AtomicUsize::new(0));
+        let delete_completed_in_thread = Arc::clone(&delete_completed);
+        let profile_id_for_thread = profile_id.clone();
+        let delete_thread = thread::spawn(move || {
+            let result =
+                pipeline.delete_embedding_profile_index_data(&profile_id_for_thread, false);
+            delete_completed_in_thread.store(1, Ordering::Release);
+            result
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if writer.snapshot().queued == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "profile delete did not queue on sqlite_writer"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let publish_snapshot = index_publish.snapshot();
+        assert_eq!(publish_snapshot.active, 0);
+        assert_eq!(publish_snapshot.queued, 0);
+        assert_eq!(delete_completed.load(Ordering::Acquire), 0);
+
+        drop(held_writer);
+        let (plan, report) = delete_thread
+            .join()
+            .expect("profile delete thread joins")
+            .expect("profile delete succeeds");
+        assert_eq!(plan.profile_id, profile_id.as_str());
+        assert_eq!(report.removed_artifacts.len(), 0);
+        assert_eq!(delete_completed.load(Ordering::Acquire), 1);
+        assert!(
+            writer.snapshot().queue_wait_ms_total > before,
+            "profile delete should wait through sqlite_writer queue"
         );
     }
 

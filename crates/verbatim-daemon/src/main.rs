@@ -43,8 +43,8 @@ use verbatim_core::collection::{
     CollectionMemberCandidate, CollectionRecord, CollectionSyncPathInput,
 };
 use verbatim_core::config::{
-    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, RerankConfig, RerankStrategy,
-    RetrievalConfig,
+    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, DaemonResourceConfig,
+    RerankConfig, RerankStrategy, RetrievalConfig, SQLITE_WRITER_ACTIVE_CAPACITY,
 };
 use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::{
@@ -55,9 +55,12 @@ use verbatim_core::index_gc::{apply_index_gc, plan_index_gc, IndexGcApplyReport}
 use verbatim_core::ingest::{IndexingOutcome, IngestPipeline, SourceIngestOutcome};
 use verbatim_core::ocr::source_ingest_diagnostics;
 use verbatim_core::provider::openai_compatible::{
-    OpenAiCompatibleLlmReranker, OpenAiCompatibleReranker,
+    model_endpoint_resource_snapshots, OpenAiCompatibleLlmReranker, OpenAiCompatibleReranker,
 };
 use verbatim_core::provider::ProviderError;
+use verbatim_core::resource::{
+    global_resource_registry, ObservableResource, ResourceLimitConfig, ResourceQueueSnapshot,
+};
 use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
 use verbatim_core::store::{Store, TaskListFilter};
 use verbatim_core::task::{
@@ -69,6 +72,7 @@ use verbatim_core::task::{
     retrieve_result_metadata, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskEvent, TaskId,
     TaskKind, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
 };
+use verbatim_core::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 use verbatim_core::types::{
     CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId, EvidenceKind, ImageArtifact,
     RetrievalDebug, RetrievalDenseVectorPath, RetrievalEvidenceRole, RetrievalResult, SourceId,
@@ -88,10 +92,13 @@ use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 // ---------------------------------------------------------------------------
 
 struct AppState {
-    /// Pipeline behind a std Mutex; accessed only inside `spawn_blocking`.
-    pipeline: std::sync::Mutex<IngestPipeline>,
-    /// Independent task metadata connection so queue operations do not wait for long ingest work.
+    /// Pipeline slot. Long indexing operations take ownership, release this mutex,
+    /// then restore the pipeline after completion.
+    pipeline: std::sync::Mutex<Option<IngestPipeline>>,
+    /// Independent task metadata connection for serialized writes.
     task_store: std::sync::Mutex<Store>,
+    index_status_cache: std::sync::RwLock<Option<IndexStatusResponse>>,
+    resources: DaemonResources,
     ingest_queue_active: AtomicBool,
     /// Actual indexing worker occupancy, independent from persisted task status.
     ingest_worker_active: AtomicBool,
@@ -107,6 +114,15 @@ type SharedState = Arc<AppState>;
 struct RuntimeConfigState {
     config: Config,
     reload: ConfigReloadMetadata,
+}
+
+#[derive(Clone)]
+struct DaemonResources {
+    sqlite_writer: Arc<ObservableResource>,
+    sqlite_reader: Arc<ObservableResource>,
+    cpu_worker: Arc<ObservableResource>,
+    index_publish: Arc<ObservableResource>,
+    qdrant_upsert: Arc<ObservableResource>,
 }
 
 const ASK_STREAM_EVENT_BUFFER: usize = 32;
@@ -180,6 +196,331 @@ impl DebouncedCollectionSet {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn daemon_resources(config: &DaemonResourceConfig) -> DaemonResources {
+    let config = config.bounded();
+    let registry = global_resource_registry();
+    let resources = DaemonResources {
+        sqlite_writer: registry.resource(
+            "sqlite_writer",
+            "sqlite_write",
+            sqlite_writer_resource_limits(&config),
+        ),
+        sqlite_reader: registry.resource(
+            "sqlite_reader",
+            "sqlite_read",
+            resource_limits(
+                config.sqlite_reader_concurrency,
+                config.sqlite_reader_queue_capacity,
+                config.sqlite_reader_queue_timeout_seconds,
+            ),
+        ),
+        cpu_worker: registry.resource(
+            "cpu_worker",
+            "cpu",
+            resource_limits(
+                config.cpu_worker_concurrency,
+                config.cpu_worker_queue_capacity,
+                config.cpu_worker_queue_timeout_seconds,
+            ),
+        ),
+        index_publish: registry.resource(
+            "index_publish",
+            "index_publish",
+            resource_limits(
+                config.index_publish_concurrency,
+                config.index_publish_queue_capacity,
+                config.index_publish_queue_timeout_seconds,
+            ),
+        ),
+        qdrant_upsert: registry.resource(
+            "qdrant_upsert",
+            "qdrant_upsert",
+            resource_limits(
+                config.qdrant_upsert_concurrency,
+                config.qdrant_upsert_queue_capacity,
+                config.qdrant_upsert_queue_timeout_seconds,
+            ),
+        ),
+    };
+    configure_daemon_resources(&resources, &config);
+    resources
+}
+
+fn configure_daemon_resources(resources: &DaemonResources, config: &DaemonResourceConfig) {
+    let config = config.bounded();
+    resources
+        .sqlite_writer
+        .configure(sqlite_writer_resource_limits(&config));
+    resources.sqlite_reader.configure(resource_limits(
+        config.sqlite_reader_concurrency,
+        config.sqlite_reader_queue_capacity,
+        config.sqlite_reader_queue_timeout_seconds,
+    ));
+    resources.cpu_worker.configure(resource_limits(
+        config.cpu_worker_concurrency,
+        config.cpu_worker_queue_capacity,
+        config.cpu_worker_queue_timeout_seconds,
+    ));
+    resources.index_publish.configure(resource_limits(
+        config.index_publish_concurrency,
+        config.index_publish_queue_capacity,
+        config.index_publish_queue_timeout_seconds,
+    ));
+    resources.qdrant_upsert.configure(resource_limits(
+        config.qdrant_upsert_concurrency,
+        config.qdrant_upsert_queue_capacity,
+        config.qdrant_upsert_queue_timeout_seconds,
+    ));
+}
+
+fn resource_limits(
+    capacity: usize,
+    queue_capacity: usize,
+    queue_timeout_seconds: u64,
+) -> ResourceLimitConfig {
+    ResourceLimitConfig {
+        capacity,
+        queue_capacity,
+        queue_timeout: Duration::from_secs(queue_timeout_seconds),
+    }
+    .bounded()
+}
+
+fn sqlite_writer_resource_limits(config: &DaemonResourceConfig) -> ResourceLimitConfig {
+    resource_limits(
+        SQLITE_WRITER_ACTIVE_CAPACITY,
+        config.sqlite_writer_queue_capacity,
+        config.sqlite_writer_queue_timeout_seconds,
+    )
+}
+
+fn daemon_resource_snapshots(state: &SharedState) -> Vec<ResourceQueueSnapshot> {
+    let mut snapshots = vec![
+        state.resources.sqlite_writer.snapshot(),
+        state.resources.sqlite_reader.snapshot(),
+        state.resources.cpu_worker.snapshot(),
+        state.resources.index_publish.snapshot(),
+    ];
+    if runtime_config_snapshot(state)
+        .map(|runtime| runtime.config.qdrant.enabled)
+        .unwrap_or(false)
+    {
+        snapshots.push(state.resources.qdrant_upsert.snapshot());
+    }
+    snapshots.extend(model_endpoint_resource_snapshots());
+    snapshots
+}
+
+const PIPELINE_BUSY_ERROR: &str = "ingest pipeline is busy with a long-running indexing operation";
+
+fn pipeline_busy_error() -> anyhow::Error {
+    anyhow::anyhow!(PIPELINE_BUSY_ERROR)
+}
+
+fn is_pipeline_busy_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == PIPELINE_BUSY_ERROR)
+}
+
+fn pipeline_ref<'a>(
+    pipeline: &'a std::sync::MutexGuard<'_, Option<IngestPipeline>>,
+) -> Result<&'a IngestPipeline> {
+    pipeline.as_ref().ok_or_else(pipeline_busy_error)
+}
+
+fn pipeline_mut<'a>(
+    pipeline: &'a mut std::sync::MutexGuard<'_, Option<IngestPipeline>>,
+) -> Result<&'a mut IngestPipeline> {
+    pipeline.as_mut().ok_or_else(pipeline_busy_error)
+}
+
+fn take_pipeline(state: &SharedState) -> Result<IngestPipeline> {
+    state
+        .pipeline
+        .lock()
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .take()
+        .ok_or_else(pipeline_busy_error)
+}
+
+fn restore_pipeline(state: &SharedState, pipeline: IngestPipeline) -> Result<()> {
+    let mut slot = state
+        .pipeline
+        .lock()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if slot.is_some() {
+        bail!("ingest pipeline slot was unexpectedly occupied during restore");
+    }
+    *slot = Some(pipeline);
+    Ok(())
+}
+
+fn pipeline_access_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    if is_pipeline_busy_error(&error) {
+        err(StatusCode::SERVICE_UNAVAILABLE, error)
+    } else {
+        err(StatusCode::INTERNAL_SERVER_ERROR, error)
+    }
+}
+
+struct PipelineLease {
+    state: SharedState,
+    pipeline: Option<IngestPipeline>,
+}
+
+impl PipelineLease {
+    fn take(state: SharedState) -> Result<Self> {
+        let pipeline = take_pipeline(&state)?;
+        Ok(Self {
+            state,
+            pipeline: Some(pipeline),
+        })
+    }
+
+    fn restore(mut self) -> Result<()> {
+        let pipeline = self.pipeline.take().ok_or_else(pipeline_busy_error)?;
+        restore_pipeline(&self.state, pipeline)
+    }
+}
+
+impl Drop for PipelineLease {
+    fn drop(&mut self) {
+        let Some(pipeline) = self.pipeline.take() else {
+            return;
+        };
+        if let Err(error) = restore_pipeline(&self.state, pipeline) {
+            tracing::error!(
+                error = %error,
+                "failed to restore ingest pipeline slot while dropping pipeline lease"
+            );
+        }
+    }
+}
+
+fn run_with_pipeline<T, F>(state: SharedState, operation: F) -> Result<T>
+where
+    F: FnOnce(&mut IngestPipeline) -> Result<T>,
+{
+    let mut lease = PipelineLease::take(state)?;
+    let result = {
+        let pipeline = lease.pipeline.as_mut().ok_or_else(pipeline_busy_error)?;
+        operation(pipeline)
+    };
+    lease.restore()?;
+    result
+}
+
+async fn with_exclusive_pipeline<T, F>(state: &SharedState, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut IngestPipeline) -> Result<T> + Send + 'static,
+{
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || run_with_pipeline(state, operation))
+        .await
+        .context("join exclusive pipeline task")?
+}
+
+async fn with_query_pipeline<T, F>(state: &SharedState, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut IngestPipeline) -> Result<T> + Send + 'static,
+{
+    let permit = state.resources.sqlite_reader.acquire().await?;
+    let config = runtime_config_snapshot(state)?.config;
+    let data_dir = state.data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut pipeline = IngestPipeline::open_readonly(&config, &data_dir)?;
+        drop(permit);
+        operation(&mut pipeline)
+    })
+    .await
+    .context("join read-only query pipeline task")?
+}
+
+fn with_sqlite_reader_permit<T>(
+    resource: &Arc<ObservableResource>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _permit = resource
+        .acquire_blocking()
+        .context("acquire sqlite reader resource for query read")?;
+    operation()
+}
+
+async fn with_task_store_read<T, F>(state: &SharedState, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Store) -> Result<T> + Send + 'static,
+{
+    let permit = state.resources.sqlite_reader.acquire().await?;
+    let db_path = state.data_dir.join("verbatim.db");
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let store = Store::open_existing_readonly(&db_path)?;
+        operation(&store)
+    })
+    .await
+    .context("join sqlite read resource task")?
+}
+
+fn initial_index_status_cache(pipeline: &IngestPipeline) -> Option<IndexStatusResponse> {
+    match pipeline.index_status() {
+        Ok(response) => Some(response),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to initialize index status cache");
+            None
+        }
+    }
+}
+
+fn update_index_status_cache(state: &SharedState, response: &IndexStatusResponse) -> Result<()> {
+    let mut cache = state
+        .index_status_cache
+        .write()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    *cache = Some(response.clone());
+    Ok(())
+}
+
+fn cached_index_status(state: &SharedState) -> Result<Option<IndexStatusResponse>> {
+    let cache = state
+        .index_status_cache
+        .read()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(cache.clone())
+}
+
+fn cached_index_status_for_busy_pipeline(state: &SharedState) -> Result<IndexStatusResponse> {
+    let mut response = cached_index_status(state)?
+        .with_context(|| "index status is unavailable until the first live status snapshot")?;
+    response.messages.push(
+        "Serving last-known index status because the ingest pipeline is busy with a long-running indexing operation."
+            .to_string(),
+    );
+    Ok(response)
+}
+
+async fn with_task_store_write<T, F>(state: &SharedState, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Store) -> Result<T> + Send + 'static,
+{
+    let permit = state.resources.sqlite_writer.acquire().await?;
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut store = state
+            .task_store
+            .lock()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        operation(&mut store)
+    })
+    .await
+    .context("join sqlite write resource task")?
 }
 
 fn unix_timestamp_string() -> String {
@@ -406,9 +747,10 @@ struct IngestBatchExpansionCandidate {
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".into(),
+        resources: daemon_resource_snapshots(&state),
     })
 }
 
@@ -433,19 +775,25 @@ async fn index_gc(
     let policy_config = config.index_gc;
     let policy = policy_config.policy();
     let state = Arc::clone(&state);
+    let data_dir = state.data_dir.clone();
+    let resources = state.resources.clone();
     let dry_run = req.dry_run;
     let (plan, apply) = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if dry_run {
-            let plan = plan_index_gc(&state.data_dir, pipeline.store(), policy)?;
-            Ok::<_, anyhow::Error>((plan, IndexGcApplyReport::default()))
-        } else {
-            apply_index_gc(&state.data_dir, pipeline.store(), policy)
-        }
+        run_with_pipeline(state, move |pipeline| {
+            if dry_run {
+                let plan = plan_index_gc(&data_dir, pipeline.store(), policy)?;
+                Ok::<_, anyhow::Error>((plan, IndexGcApplyReport::default()))
+            } else {
+                let index_publish_permit = resources.index_publish.acquire_blocking()?;
+                let result = apply_index_gc(&data_dir, pipeline.store(), policy);
+                drop(index_publish_permit);
+                result
+            }
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(pipeline_access_error)?;
     Ok(Json(IndexGcResponse {
         dry_run,
         policy: policy_config,
@@ -457,17 +805,30 @@ async fn index_gc(
 async fn index_status(
     State(state): State<SharedState>,
 ) -> Result<Json<IndexStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let handle = tokio::runtime::Handle::current();
-    let state = Arc::clone(&state);
-    let response = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        refresh_embedding_profile_capabilities_blocking(&handle, &mut pipeline)?;
-        pipeline.index_status()
-    })
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
+    refresh_live_embedding_profile_capabilities(
+        &state,
+        config.embedding.enabled,
+        &config.embedding.profile_id,
+    )
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(response))
+    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let state_for_cache = Arc::clone(&state);
+    match with_exclusive_pipeline(&state, move |pipeline| pipeline.index_status()).await {
+        Ok(response) => {
+            update_index_status_cache(&state_for_cache, &response)
+                .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            Ok(Json(response))
+        }
+        Err(error) if is_pipeline_busy_error(&error) => {
+            cached_index_status_for_busy_pipeline(&state_for_cache)
+                .map(Json)
+                .map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error))
+        }
+        Err(error) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, error)),
+    }
 }
 
 async fn index_delete_profile(
@@ -489,6 +850,8 @@ async fn index_delete_profile(
                 anyhow::anyhow!("{error}"),
             )
         })?;
+        let pipeline =
+            pipeline_ref(&pipeline).map_err(|error| err(StatusCode::SERVICE_UNAVAILABLE, error))?;
         if *pipeline.active_embedding_profile_id() == profile_id {
             return Err(err(
                 StatusCode::CONFLICT,
@@ -504,20 +867,21 @@ async fn index_delete_profile(
     let dry_run = req.dry_run;
     let allow_active = req.allow_active;
     let (plan, apply) = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if dry_run {
-            let plan = pipeline.plan_embedding_profile_delete(&profile_id)?;
-            Ok::<_, anyhow::Error>((
-                plan,
-                verbatim_core::index_profile_delete::IndexProfileDeleteApplyReport::default(),
-            ))
-        } else {
-            pipeline.delete_embedding_profile_index_data(&profile_id, allow_active)
-        }
+        run_with_pipeline(state, move |pipeline| {
+            if dry_run {
+                let plan = pipeline.plan_embedding_profile_delete(&profile_id)?;
+                Ok::<_, anyhow::Error>((
+                    plan,
+                    verbatim_core::index_profile_delete::IndexProfileDeleteApplyReport::default(),
+                ))
+            } else {
+                pipeline.delete_embedding_profile_index_data(&profile_id, allow_active)
+            }
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(pipeline_access_error)?;
     Ok(Json(IndexProfileDeleteResponse {
         dry_run,
         plan,
@@ -531,13 +895,18 @@ async fn add_source(
 ) -> Result<(StatusCode, Json<AddSourceResponse>), (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         let path = PathBuf::from(&req.path);
-        pipeline.add_source(&path)
+        run_with_pipeline(state, move |pipeline| pipeline.add_source(&path))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    .map_err(|e| {
+        if is_pipeline_busy_error(&e) {
+            pipeline_access_error(e)
+        } else {
+            err(StatusCode::BAD_REQUEST, e)
+        }
+    })?;
 
     Ok((
         StatusCode::CREATED,
@@ -548,11 +917,8 @@ async fn add_source(
 async fn list_sources(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<SourceResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    let sources = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let sources = pipeline
-            .store()
+    let sources = with_task_store_read(&state, |store| {
+        let sources = store
             .list_sources()?
             .into_iter()
             .map(|source| SourceResponse {
@@ -568,7 +934,6 @@ async fn list_sources(
         Ok::<_, anyhow::Error>(sources)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(sources))
@@ -578,18 +943,21 @@ async fn get_source(
     State(state): State<SharedState>,
     Path(id): Path<String>,
 ) -> Result<Json<SourceResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
     let id_clone = id.clone();
-    let source = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let current_ocr_profile = pipeline.active_ocr_profile();
-        let source = pipeline.store().get_source(&SourceId(id_clone))?;
+    let current_ocr_profile = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config
+        .ocr;
+    let current_ocr_profile = current_ocr_profile
+        .enabled
+        .then(|| current_ocr_profile.profile());
+    let source = with_task_store_read(&state, move |store| {
+        let source = store.get_source(&SourceId(id_clone))?;
         source
-            .map(|source| source_response(pipeline.store(), source, current_ocr_profile.as_ref()))
+            .map(|source| source_response(store, source, current_ocr_profile.as_ref()))
             .transpose()
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match source {
@@ -633,12 +1001,19 @@ async fn delete_source(
     let runtime = tokio::runtime::Handle::current();
     let source_id = SourceId(id.clone());
     tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        runtime.block_on(pipeline.remove_source(&source_id))
+        run_with_pipeline(state, move |pipeline| {
+            runtime.block_on(pipeline.remove_source(&source_id))
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| source_remove_error(&id, e))?;
+    .map_err(|e| {
+        if is_pipeline_busy_error(&e) {
+            pipeline_access_error(e)
+        } else {
+            source_remove_error(&id, e)
+        }
+    })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -660,17 +1035,22 @@ fn is_source_not_found_error(source_id: &str, error: &anyhow::Error) -> bool {
 async fn check_stale(
     State(state): State<SharedState>,
 ) -> Result<Json<CheckStaleResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let handle = tokio::runtime::Handle::current();
-    let state = Arc::clone(&state);
-    let (ids, profile_status) = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        refresh_embedding_profile_capabilities_blocking(&handle, &mut pipeline)?;
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
+    refresh_live_embedding_profile_capabilities(
+        &state,
+        config.embedding.enabled,
+        &config.embedding.profile_id,
+    )
+    .await
+    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let (ids, profile_status) = with_exclusive_pipeline(&state, move |pipeline| {
         let ids = pipeline.check_stale()?;
         let profile_status = pipeline.index_status()?;
         Ok::<_, anyhow::Error>((ids, profile_status))
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(CheckStaleResponse {
@@ -683,16 +1063,11 @@ async fn create_collection(
     State(state): State<SharedState>,
     Json(req): Json<CreateCollectionRequest>,
 ) -> Result<(StatusCode, Json<CollectionResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    let response = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let collection = pipeline
-            .store()
-            .create_collection(&req.name, &req.ignore_patterns)?;
-        collection_response(pipeline.store(), collection)
+    let response = with_task_store_write(&state, move |store| {
+        let collection = store.create_collection(&req.name, &req.ignore_patterns)?;
+        collection_response(store, collection)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -701,14 +1076,9 @@ async fn create_collection(
 async fn list_collections(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<CollectionRecord>>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    let collections = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().list_collections()
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let collections = with_task_store_read(&state, |store| store.list_collections())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(collections))
 }
@@ -717,17 +1087,14 @@ async fn get_collection(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<CollectionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
     let name_for_lookup = name.clone();
-    let response = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let collection = pipeline.store().get_collection(&name_for_lookup)?;
+    let response = with_task_store_read(&state, move |store| {
+        let collection = store.get_collection(&name_for_lookup)?;
         collection
-            .map(|collection| collection_response(pipeline.store(), collection))
+            .map(|collection| collection_response(store, collection))
             .transpose()
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match response {
@@ -743,18 +1110,10 @@ async fn delete_collection(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let state_for_store = Arc::clone(&state);
     let name_for_error = name.clone();
-    let deleted = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().delete_collection(&name)
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let deleted = with_task_store_write(&state, move |store| store.delete_collection(&name))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if deleted {
         send_collection_watcher_command(&state, CollectionWatcherCommand::Refresh);
@@ -772,23 +1131,16 @@ async fn add_collection_root(
     Path(name): Path<String>,
     Json(req): Json<AddCollectionRootRequest>,
 ) -> Result<Json<CollectionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state_for_store = Arc::clone(&state);
     let name_for_error = name.clone();
-    let response = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let response = with_task_store_write(&state, move |store| {
         let path = PathBuf::from(req.path);
-        pipeline.store().add_collection_root(&name, &path)?;
-        let collection = pipeline
-            .store()
+        store.add_collection_root(&name, &path)?;
+        let collection = store
             .get_collection(&name)?
             .with_context(|| format!("collection not found: {name}"))?;
-        collection_response(pipeline.store(), collection)
+        collection_response(store, collection)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| collection_error(&name_for_error, e))?;
 
     send_collection_watcher_command(&state, CollectionWatcherCommand::Refresh);
@@ -808,12 +1160,19 @@ async fn sync_collection(
         .map(collection_sync_path_input)
         .collect::<Vec<_>>();
     let report = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.sync_collection(&name, &inputs, req.max_depth)
+        run_with_pipeline(state, move |pipeline| {
+            pipeline.sync_collection(&name, &inputs, req.max_depth)
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| collection_error(&name_for_error, e))?;
+    .map_err(|e| {
+        if is_pipeline_busy_error(&e) {
+            pipeline_access_error(e)
+        } else {
+            collection_error(&name_for_error, e)
+        }
+    })?;
 
     Ok(Json(CollectionSyncResponse { report }))
 }
@@ -822,14 +1181,11 @@ async fn collection_status(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<CollectionStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
     let name_for_lookup = name.clone();
-    let status = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().collection_status(&name_for_lookup)
+    let status = with_task_store_read(&state, move |store| {
+        store.collection_status(&name_for_lookup)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match status {
@@ -844,17 +1200,9 @@ async fn collection_status(
 async fn list_collection_watcher_statuses(
     State(state): State<SharedState>,
 ) -> Result<Json<CollectionWatchersStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state_for_store = Arc::clone(&state);
-    let collections = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().list_collections()
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let collections = with_task_store_read(&state, |store| store.list_collections())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let statuses = state
         .collection_watcher
         .statuses
@@ -877,18 +1225,11 @@ async fn collection_watcher_status(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<CollectionWatcherResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state_for_store = Arc::clone(&state);
     let name_for_lookup = name.clone();
-    let collection = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().get_collection(&name_for_lookup)
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let collection =
+        with_task_store_read(&state, move |store| store.get_collection(&name_for_lookup))
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let Some(collection) = collection else {
         return Err(err(
             StatusCode::NOT_FOUND,
@@ -914,26 +1255,15 @@ async fn update_collection_watcher(
     Path(name): Path<String>,
     Json(req): Json<CollectionWatcherUpdateRequest>,
 ) -> Result<Json<CollectionWatcherResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state_for_store = Arc::clone(&state);
     let name_for_lookup = name.clone();
-    let collection = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let current = pipeline
-            .store()
+    let collection = with_task_store_write(&state, move |store| {
+        let current = store
             .get_collection(&name_for_lookup)?
             .with_context(|| format!("collection not found: {name_for_lookup}"))?;
         let auto_index_enabled = req.auto_index_enabled.unwrap_or(current.auto_index_enabled);
-        pipeline.store().update_collection_watch_settings(
-            &name_for_lookup,
-            req.enabled,
-            auto_index_enabled,
-        )
+        store.update_collection_watch_settings(&name_for_lookup, req.enabled, auto_index_enabled)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| collection_error(&name, e))?;
     let Some(collection) = collection else {
         return Err(err(
@@ -1004,19 +1334,13 @@ async fn create_persisted_task_with_id(
     kind: TaskKind,
     request: serde_json::Value,
 ) -> Result<TaskId, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let task = store.create_task(&task_id, kind, &request)?;
-        let payload = queued_event_payload(&store, task)?;
+        let payload = queued_event_payload(store, task)?;
         store.insert_task_event(&task_id, "queued", "task queued", &payload)?;
-        Ok::<_, anyhow::Error>(task_id)
+        Ok(task_id)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -1025,13 +1349,8 @@ async fn create_background_ingest_batch(
     req: TaskIngestRequest,
 ) -> Result<TaskId, (StatusCode, Json<ErrorResponse>)> {
     let parent_id = TaskId::new();
-    let state = Arc::clone(state);
     let parent_id_for_task = parent_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let parent_request = ingest_task_request_metadata_with_queue_claim_and_batch(
             None,
             req.force,
@@ -1041,13 +1360,12 @@ async fn create_background_ingest_batch(
             Some(&parent_id_for_task.0),
         );
         let parent = store.create_task(&parent_id_for_task, TaskKind::Ingest, &parent_request)?;
-        let payload = queued_event_payload(&store, parent)?;
+        let payload = queued_event_payload(store, parent)?;
         store.insert_task_event(&parent_id_for_task, "queued", "task queued", &payload)?;
 
-        Ok::<_, anyhow::Error>(parent_id_for_task)
+        Ok(parent_id_for_task)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -1056,12 +1374,17 @@ async fn background_ingest_batch_source_ids(
     force: bool,
     vectors_only: bool,
 ) -> Result<Vec<SourceId>> {
-    let handle = tokio::runtime::Handle::current();
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !force && !vectors_only {
+        let config = runtime_config_snapshot(state)?.config;
+        refresh_live_embedding_profile_capabilities(
+            state,
+            config.embedding.enabled,
+            &config.embedding.profile_id,
+        )
+        .await?;
+    }
+    with_exclusive_pipeline(state, move |pipeline| {
         if !force && !vectors_only {
-            refresh_embedding_profile_capabilities_blocking(&handle, &mut pipeline)?;
             pipeline.check_stale()?;
         }
         let sources = pipeline.store().list_sources()?;
@@ -1074,7 +1397,6 @@ async fn background_ingest_batch_source_ids(
         )
     })
     .await
-    .context("join ingest batch source expansion task")?
 }
 
 fn queued_event_payload(
@@ -1137,22 +1459,16 @@ async fn mark_task_started(
     state: &SharedState,
     task_id: &TaskId,
 ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let started = store.start_task(&task_id)?;
         if !started {
             return Ok(false);
         }
         store.insert_task_event(&task_id, "started", "task started", &serde_json::json!({}))?;
-        Ok::<_, anyhow::Error>(true)
+        Ok(true)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -1173,13 +1489,9 @@ async fn try_mark_ingest_task_started(
     state: &SharedState,
     task_id: &TaskId,
 ) -> Result<TaskStartOutcome, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
+    let state_for_active = Arc::clone(state);
     let task_id = task_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
@@ -1189,7 +1501,9 @@ async fn try_mark_ingest_task_started(
         if task.status != TaskStatus::Queued {
             return Ok(TaskStartOutcome::NotQueued);
         }
-        if state.ingest_worker_active.load(Ordering::Acquire)
+        if state_for_active
+            .ingest_worker_active
+            .load(Ordering::Acquire)
             || store.count_running_tasks(TaskKind::Ingest)? > 0
         {
             return Ok(TaskStartOutcome::BlockedByRunningIngest);
@@ -1198,10 +1512,9 @@ async fn try_mark_ingest_task_started(
             return Ok(TaskStartOutcome::BlockedByRunningIngest);
         }
         store.insert_task_event(&task_id, "started", "task started", &serde_json::json!({}))?;
-        Ok::<_, anyhow::Error>(TaskStartOutcome::Started)
+        Ok(TaskStartOutcome::Started)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         if e.to_string().contains("task not found") {
             err(StatusCode::NOT_FOUND, e)
@@ -1258,19 +1571,13 @@ async fn record_task_event(
     message: impl Into<String>,
     payload: serde_json::Value,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
     let message = message.into();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         store.insert_task_event(&task_id, event_type, &message, &payload)?;
-        Ok::<_, anyhow::Error>(())
+        Ok(())
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -1279,7 +1586,6 @@ async fn record_task_span(
     task_id: &TaskId,
     timing: verbatim_core::task::FinishedPhaseTiming,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
     let verbatim_core::task::FinishedPhaseTiming {
         phase,
@@ -1287,23 +1593,18 @@ async fn record_task_span(
         duration_ms,
         metadata,
     } = timing;
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let redaction = store
             .get_task(&task_id)?
             .as_ref()
-            .map(|task| task_telemetry_redaction(&store, task))
+            .map(|task| task_telemetry_redaction(store, task))
             .transpose()?
             .unwrap_or_default();
         let metadata = public_task_telemetry_value(metadata, &redaction);
         store.insert_task_span(&task_id, &phase, &started_at, duration_ms, &metadata)?;
-        Ok::<_, anyhow::Error>(())
+        Ok(())
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -1312,27 +1613,16 @@ async fn record_task_progress(
     task_id: &TaskId,
     progress: TaskProgressSnapshot,
 ) {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
     let task_id_for_log = task_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let result = with_task_store_write(state, move |store| {
         store.update_task_progress(&task_id, progress)?;
-        Ok::<_, anyhow::Error>(())
+        Ok(())
     })
     .await;
 
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            tracing::warn!(task_id = %task_id_for_log.0, error = %err, "failed to persist task progress");
-        }
-        Err(err) => {
-            tracing::warn!(task_id = %task_id_for_log.0, error = %err, "task progress writer panicked");
-        }
+    if let Err(err) = result {
+        tracing::warn!(task_id = %task_id_for_log.0, error = %err, "failed to persist task progress");
     }
 }
 
@@ -1366,14 +1656,9 @@ async fn finish_task_success(
     task_id: &TaskId,
     result: serde_json::Value,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let state_for_task = Arc::clone(state);
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
-    let should_wake_ingest_queue = tokio::task::spawn_blocking(move || {
-        let store = state_for_task
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let should_wake_ingest_queue = with_task_store_write(state, move |store| {
         let task = store.get_task(&task_id)?;
         let should_wake_ingest_queue = task
             .as_ref()
@@ -1384,19 +1669,13 @@ async fn finish_task_success(
         if task_changed {
             store.insert_task_event(&task_id, "succeeded", "task succeeded", &result)?;
             if let Some(timing) = terminalize_timing {
-                record_ingest_task_terminalize_span(
-                    &store,
-                    &task_id,
-                    timing,
-                    "finish_task_success",
-                );
+                record_ingest_task_terminalize_span(store, &task_id, timing, "finish_task_success");
             }
-            finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
+            finalize_ingest_batch_parent_if_complete(store, task.as_ref())?;
         }
-        Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
+        Ok(task_changed && should_wake_ingest_queue)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if should_wake_ingest_queue {
         schedule_ingest_queue(state_for_queue);
@@ -1427,15 +1706,10 @@ async fn finish_task_failed_with_upstream(
     error_message: &str,
     upstream_failure: Option<serde_json::Value>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let state_for_task = Arc::clone(state);
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
     let error_message = bounded_error(error_message);
-    let should_wake_ingest_queue = tokio::task::spawn_blocking(move || {
-        let store = state_for_task
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let should_wake_ingest_queue = with_task_store_write(state, move |store| {
         let task = store.get_task(&task_id)?;
         let upstream_failure = upstream_failure
             .map(|failure| upstream_failure_with_task_context(failure, &task_id, task.as_ref()));
@@ -1464,14 +1738,13 @@ async fn finish_task_failed_with_upstream(
             }
             store.insert_task_event(&task_id, "failed", "task failed", &payload)?;
             if let Some(timing) = terminalize_timing {
-                record_ingest_task_terminalize_span(&store, &task_id, timing, "finish_task_failed");
+                record_ingest_task_terminalize_span(store, &task_id, timing, "finish_task_failed");
             }
-            finalize_ingest_batch_parent_if_complete(&store, task.as_ref())?;
+            finalize_ingest_batch_parent_if_complete(store, task.as_ref())?;
         }
-        Ok::<_, anyhow::Error>(task_changed && should_wake_ingest_queue)
+        Ok(task_changed && should_wake_ingest_queue)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if should_wake_ingest_queue {
         schedule_ingest_queue(state_for_queue);
@@ -1646,6 +1919,11 @@ fn public_task_progress(
         .recent_status
         .as_deref()
         .map(|status| public_task_progress_text(status, redaction));
+    for resource in &mut progress.resources {
+        resource.name = public_task_progress_text(&resource.name, redaction);
+        resource.kind = public_task_progress_text(&resource.kind, redaction);
+        resource.state = public_task_progress_text(&resource.state, redaction);
+    }
     progress
 }
 
@@ -1773,26 +2051,20 @@ async fn task_summary_response(
     state: &SharedState,
     task_id: TaskId,
 ) -> Result<TaskSummaryResponse, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let redaction = task_telemetry_redaction(&store, &task)?;
-        let task = public_task_summary(with_queue_details(&store, task)?, &redaction);
+        let redaction = task_telemetry_redaction(store, &task)?;
+        let task = public_task_summary(with_queue_details(store, task)?, &redaction);
         let spans = store
             .list_task_spans(&task_id)?
             .into_iter()
             .map(|span| public_task_span(span, &redaction))
             .collect();
-        Ok::<_, anyhow::Error>(TaskSummaryResponse { task, spans })
+        Ok(TaskSummaryResponse { task, spans })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         if e.to_string().contains("task not found") {
             err(StatusCode::NOT_FOUND, e)
@@ -1812,36 +2084,32 @@ async fn list_tasks_handler(
     State(state): State<SharedState>,
     Query(query): Query<TaskListQuery>,
 ) -> Result<Json<TaskListResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let filter = task_list_filter(query.status.as_deref())?;
-        let limit = query
-            .limit
-            .unwrap_or(TASK_LIST_DEFAULT_LIMIT)
-            .clamp(1, TASK_LIST_MAX_LIMIT);
-        let page = store.list_tasks_page(filter, limit)?;
-        let tasks = page
-            .tasks
-            .into_iter()
-            .map(|task| {
-                let task = with_queue_details(&store, task)?;
-                let redaction = task_telemetry_redaction(&store, &task)?;
-                Ok(public_task_summary(task, &redaction))
+    with_task_store_read(&state, move |store| {
+        store.with_read_snapshot(|store| {
+            let filter = task_list_filter(query.status.as_deref())?;
+            let limit = query
+                .limit
+                .unwrap_or(TASK_LIST_DEFAULT_LIMIT)
+                .clamp(1, TASK_LIST_MAX_LIMIT);
+            let page = store.list_tasks_page(filter, limit)?;
+            let tasks = page
+                .tasks
+                .into_iter()
+                .map(|task| {
+                    let task = with_queue_details(store, task)?;
+                    let redaction = task_telemetry_redaction(store, &task)?;
+                    Ok(public_task_summary(task, &redaction))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let aggregate = task_list_aggregate(store)?;
+            Ok::<_, anyhow::Error>(TaskListResponse {
+                tasks,
+                total: page.total,
+                aggregate: Some(aggregate),
             })
-            .collect::<Result<Vec<_>>>()?;
-        let aggregate = task_list_aggregate(&store)?;
-        Ok::<_, anyhow::Error>(TaskListResponse {
-            tasks,
-            total: page.total,
-            aggregate: Some(aggregate),
         })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map(Json)
     .map_err(|e| {
         if e.to_string().contains("unsupported task status filter") {
@@ -1916,26 +2184,20 @@ async fn task_events_response(
     after: Option<i64>,
     limit: Option<usize>,
 ) -> Result<TaskEventsResponse, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let redaction = task_telemetry_redaction(&store, &task)?;
+        let redaction = task_telemetry_redaction(store, &task)?;
         let events =
             store.list_task_events(&task_id, after, limit.unwrap_or(TASK_WAIT_EVENT_LIMIT))?;
         let events = events
             .into_iter()
             .map(|event| public_task_event_for_source(event, &redaction))
             .collect();
-        Ok::<_, anyhow::Error>(TaskEventsResponse { events })
+        Ok(TaskEventsResponse { events })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         if e.to_string().contains("task not found") {
             err(StatusCode::NOT_FOUND, e)
@@ -2270,13 +2532,8 @@ async fn resume_task_record(
     state: &SharedState,
     task_id: &TaskId,
 ) -> Result<ResumeTaskPlan, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
@@ -2301,10 +2558,9 @@ async fn resume_task_record(
             "task resumed and requeued by task id",
         );
         store.insert_task_event(&task_id, "resumed", "task resumed", &payload)?;
-        Ok::<_, anyhow::Error>(plan)
+        Ok(plan)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         let message = e.to_string();
         if message.contains("task not found") {
@@ -3187,18 +3443,10 @@ async fn resolve_query_scope(
         });
     }
 
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        resolve_query_scope_from_store(
-            pipeline.store(),
-            source_id,
-            collection_filter,
-            embedding_profile_id,
-        )
+    with_task_store_read(state, move |store| {
+        resolve_query_scope_from_store(store, source_id, collection_filter, embedding_profile_id)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(collection_filter_error)
 }
 
@@ -3599,19 +3847,14 @@ async fn recover_abandoned_running_source_batch_children(state: &SharedState) ->
     if state.ingest_worker_active.load(Ordering::Acquire) {
         return Ok(0);
     }
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        recover_abandoned_running_source_batch_children_in_store(&store)
-    })
+    with_task_store_write(
+        state,
+        recover_abandoned_running_source_batch_children_in_store,
+    )
     .await
-    .context("join abandoned ingest recovery task")?
 }
 
-fn recover_abandoned_running_source_batch_children_in_store(store: &Store) -> Result<usize> {
+fn recover_abandoned_running_source_batch_children_in_store(store: &mut Store) -> Result<usize> {
     let mut candidates = Vec::new();
     for task in store.tasks(TaskKind::Ingest)? {
         if task.status == TaskStatus::Running && parse_source_batch_child_request(&task)?.is_some()
@@ -3655,36 +3898,24 @@ async fn claim_startable_ingest_work(state: &SharedState) -> Result<Option<Claim
     }
     let config = runtime_config_snapshot(state)?.config;
     let batch_limit = ingest_source_batch_claim_limit(&config);
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        claim_next_queue_claimable_ingest_work(&store, batch_limit)
+    with_task_store_write(state, move |store| {
+        claim_next_queue_claimable_ingest_work(store, batch_limit)
     })
     .await
-    .context("join ingest queue claim task")?
 }
 
 async fn ingest_queue_ready_to_drain(state: &SharedState) -> Result<bool> {
     if state.ingest_worker_active.load(Ordering::Acquire) {
         return Ok(false);
     }
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(state, |store| {
         Ok::<_, anyhow::Error>(
             store.count_running_tasks(TaskKind::Ingest)? == 0
-                && (next_unexpanded_ingest_batch_parent(&store)?.is_some()
-                    || next_queue_claimable_ingest_task(&store)?.is_some()),
+                && (next_unexpanded_ingest_batch_parent(store)?.is_some()
+                    || next_queue_claimable_ingest_task(store)?.is_some()),
         )
     })
     .await
-    .context("join ingest queue readiness task")?
 }
 
 async fn expand_next_unexpanded_ingest_batch(state: &SharedState) -> Result<bool> {
@@ -3715,16 +3946,7 @@ async fn expand_next_unexpanded_ingest_batch(state: &SharedState) -> Result<bool
 async fn next_unexpanded_ingest_batch_parent_async(
     state: &SharedState,
 ) -> Result<Option<IngestBatchExpansionCandidate>> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        next_unexpanded_ingest_batch_parent(&store)
-    })
-    .await
-    .context("join ingest batch parent lookup task")?
+    with_task_store_read(state, next_unexpanded_ingest_batch_parent).await
 }
 
 async fn persist_ingest_batch_children(
@@ -3732,19 +3954,14 @@ async fn persist_ingest_batch_children(
     candidate: IngestBatchExpansionCandidate,
     source_ids: Vec<SourceId>,
 ) -> Result<bool> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         if store.count_running_tasks(TaskKind::Ingest)? > 0 {
             return Ok(false);
         }
         let Some(parent) = store.get_task(&candidate.task_id)? else {
             return Ok(false);
         };
-        let Some(candidate) = ingest_batch_expansion_candidate(&store, &parent)? else {
+        let Some(candidate) = ingest_batch_expansion_candidate(store, &parent)? else {
             return Ok(false);
         };
 
@@ -3759,7 +3976,7 @@ async fn persist_ingest_batch_children(
                 Some(&candidate.task_id.0),
             );
             let child = store.create_task(&child_id, TaskKind::Ingest, &child_request)?;
-            let payload = queued_event_payload(&store, child)?;
+            let payload = queued_event_payload(store, child)?;
             store.insert_task_event(&child_id, "queued", "task queued", &payload)?;
         }
 
@@ -3774,7 +3991,7 @@ async fn persist_ingest_batch_children(
                     &result,
                 )?;
                 record_ingest_task_terminalize_span(
-                    &store,
+                    store,
                     &candidate.task_id,
                     terminalize_timing,
                     "expand_empty_ingest_batch_parent",
@@ -3795,7 +4012,6 @@ async fn persist_ingest_batch_children(
         Ok::<_, anyhow::Error>(true)
     })
     .await
-    .context("join ingest batch child persistence task")?
 }
 
 fn parse_persisted_ingest_request(request: serde_json::Value) -> Result<PersistedIngestRequest> {
@@ -4111,15 +4327,10 @@ async fn validate_requested_source_exists(
     };
     let source_id = source_id.to_string();
     let lookup_id = SourceId(source_id.clone());
-    let state = Arc::clone(state);
-    let found = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipeline.store().get_source(&lookup_id)
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .is_some();
+    let found = with_task_store_read(state, move |store| store.get_source(&lookup_id))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .is_some();
     if found {
         Ok(())
     } else {
@@ -4323,25 +4534,35 @@ async fn run_started_ingest_source_batch(
 ) -> Result<Vec<SourceIngestOutcome>, (StatusCode, Json<ErrorResponse>)> {
     let _worker = acquire_ingest_worker(&state)?;
     let runtime = tokio::runtime::Handle::current();
-    let state2 = Arc::clone(&state);
-    tokio::task::spawn_blocking(move || {
-        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let state_for_reporter = Arc::clone(&state2);
-        Ok::<_, anyhow::Error>(runtime.block_on(pipeline.ingest_sources_with_tasks_reporting(
-            &source_tasks,
-            move |outcome| {
-                let state = Arc::clone(&state_for_reporter);
-                async move {
-                    if let Err(error) = finish_source_batch_task_outcome(&state, outcome).await {
-                        tracing::error!(error = %error, "failed to stream-finalize source batch task outcome");
+    let state_for_reporter = Arc::clone(&state);
+    let state_for_pipeline = Arc::clone(&state);
+    let (result, index_status) = tokio::task::spawn_blocking(move || {
+        run_with_pipeline(state_for_pipeline, move |pipeline| {
+            let state_for_reporter = Arc::clone(&state_for_reporter);
+            let result = runtime.block_on(pipeline.ingest_sources_with_tasks_reporting(
+                &source_tasks,
+                move |outcome| {
+                    let state = Arc::clone(&state_for_reporter);
+                    async move {
+                        if let Err(error) = finish_source_batch_task_outcome(&state, outcome).await {
+                            tracing::error!(error = %error, "failed to stream-finalize source batch task outcome");
+                        }
                     }
-                }
-            },
-        )))
+                },
+            ));
+            let index_status = initial_index_status_cache(pipeline);
+            Ok((result, index_status))
+        })
     })
     .await
     .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error.into()))?
-    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))
+    .map_err(pipeline_access_error)?;
+    if let Some(index_status) = index_status {
+        if let Err(error) = update_index_status_cache(&state, &index_status) {
+            tracing::warn!(error = %error, "failed to update index status cache after source batch");
+        }
+    }
+    Ok(result)
 }
 
 async fn execute_reindex_task(
@@ -4407,7 +4628,6 @@ async fn run_indexing_operation(
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let _worker = acquire_ingest_worker(&state)?;
-    let state2 = Arc::clone(&state);
     let task_id2 = task_id.clone();
     let profile_id_for_task = profile_id.clone();
     let source_id = controls.source_id.clone();
@@ -4426,29 +4646,45 @@ async fn run_indexing_operation(
             .with_active_worker_kind(TaskKind::Ingest.as_str()),
     )
     .await;
-    let outcome = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if vectors_only {
-            let source_filter = source_id.as_ref().map(|id| SourceId(id.clone()));
-            return runtime.block_on(
-                pipeline.build_embedding_profile(&profile_id_for_task, source_filter.as_ref()),
-            );
-        }
-        match source_id {
-            Some(id) => {
-                let embedding_cache =
-                    runtime.block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2))?;
-                Ok::<_, anyhow::Error>(IndexingOutcome {
-                    source_count: 1,
-                    embedding_cache,
-                })
+    let state_for_pipeline = Arc::clone(&state);
+    let (outcome, index_status) = tokio::task::spawn_blocking(move || {
+        run_with_pipeline(state_for_pipeline, move |pipeline| {
+            if vectors_only {
+                let source_filter = source_id.as_ref().map(|id| SourceId(id.clone()));
+                let result = runtime.block_on(
+                    pipeline.build_embedding_profile(&profile_id_for_task, source_filter.as_ref()),
+                );
+                let index_status = initial_index_status_cache(pipeline);
+                return Ok((result, index_status));
             }
-            None => runtime.block_on(pipeline.ingest_all_with_task(force, &task_id2)),
-        }
+            let result = match source_id {
+                Some(id) => {
+                    match runtime
+                        .block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2))
+                    {
+                        Ok(embedding_cache) => Ok(IndexingOutcome {
+                            source_count: 1,
+                            embedding_cache,
+                        }),
+                        Err(error) => Err(error),
+                    }
+                }
+                None => runtime.block_on(pipeline.ingest_all_with_task(force, &task_id2)),
+            };
+            let index_status = initial_index_status_cache(pipeline);
+            Ok((result, index_status))
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| indexing_operation_error(source_id_for_error.as_deref(), e))?;
+    .map_err(pipeline_access_error)?;
+    if let Some(index_status) = index_status {
+        if let Err(error) = update_index_status_cache(&state, &index_status) {
+            tracing::warn!(error = %error, "failed to update index status cache after indexing operation");
+        }
+    }
+    let outcome =
+        outcome.map_err(|e| indexing_operation_error(source_id_for_error.as_deref(), e))?;
     let mut progress = timing
         .progress_snapshot()
         .with_counter(
@@ -4518,13 +4754,8 @@ async fn cancel_task_record(
     state: &SharedState,
     task_id: &TaskId,
 ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
     let task_id = task_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_write(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
@@ -4541,7 +4772,7 @@ async fn cancel_task_record(
             )?;
             if let Some(batch_id) = task_controlled_ingest_batch_id(&task) {
                 let cancelled_children =
-                    cancel_active_ingest_batch_children(&store, &task_id, &batch_id)?;
+                    cancel_active_ingest_batch_children(store, &task_id, &batch_id)?;
                 store.insert_task_event(
                     &task_id,
                     "batch_cancelled",
@@ -4553,13 +4784,12 @@ async fn cancel_task_record(
                 )?;
             }
             if let Some(timing) = terminalize_timing {
-                record_ingest_task_terminalize_span(&store, &task_id, timing, "cancel_task");
+                record_ingest_task_terminalize_span(store, &task_id, timing, "cancel_task");
             }
         }
-        Ok::<_, anyhow::Error>(changed)
+        Ok(changed)
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         if e.to_string().contains("task not found") {
             err(StatusCode::NOT_FOUND, e)
@@ -4765,17 +4995,12 @@ async fn task_wait_snapshot(
     after: Option<i64>,
     limit: usize,
 ) -> Result<TaskWaitEvent, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
-        let redaction = task_telemetry_redaction(&store, &task)?;
-        let task = with_queue_details(&store, task)?;
+        let redaction = task_telemetry_redaction(store, &task)?;
+        let task = with_queue_details(store, task)?;
         let events = store
             .list_task_events(&task_id, after, limit)?
             .into_iter()
@@ -4799,7 +5024,6 @@ async fn task_wait_snapshot(
         })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| {
         if e.to_string().contains("task not found") {
             err(StatusCode::NOT_FOUND, e)
@@ -4842,11 +5066,65 @@ fn parse_embedding_profile_id(
         .map_err(Into::into)
 }
 
-fn refresh_embedding_profile_capabilities_blocking(
-    runtime: &tokio::runtime::Handle,
-    pipeline: &mut IngestPipeline,
+async fn refresh_query_embedding_profile_capabilities(
+    state: &SharedState,
+    embedding_enabled: bool,
+    embedding_profile_id: &EmbeddingProfileId,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    refresh_live_embedding_profile_capabilities(state, embedding_enabled, embedding_profile_id)
+        .await
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+async fn refresh_live_embedding_profile_capabilities(
+    state: &SharedState,
+    embedding_enabled: bool,
+    embedding_profile_id: &EmbeddingProfileId,
 ) -> Result<()> {
-    runtime.block_on(pipeline.refresh_embedding_profile_capabilities())?;
+    if !embedding_enabled {
+        return Ok(());
+    }
+    let config = runtime_config_snapshot(state)?.config;
+    let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+    let capabilities = embed_client.endpoint_capabilities().await?;
+    apply_query_embedding_profile_capabilities(state, capabilities, embedding_profile_id.clone())
+        .await
+}
+
+async fn apply_query_embedding_profile_capabilities(
+    state: &SharedState,
+    capabilities: EmbeddingEndpointCapabilities,
+    embedding_profile_id: EmbeddingProfileId,
+) -> Result<()> {
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || match PipelineLease::take(state) {
+        Ok(mut lease) => {
+            let result = match lease.pipeline.as_mut() {
+                Some(pipeline) => {
+                    pipeline.apply_embedding_profile_capabilities(capabilities)?;
+                    pipeline.select_embedding_profile(&embedding_profile_id)?;
+                    Ok(())
+                }
+                None => Err(pipeline_busy_error()),
+            };
+            let restore = lease.restore();
+            restore.and(result)
+        }
+        Err(error) if is_pipeline_busy_error(&error) => Ok(()),
+        Err(error) => Err(error),
+    })
+    .await
+    .context("join query embedding profile capability apply task")?
+}
+
+fn prepare_query_embedding_profile_readonly(
+    pipeline: &mut IngestPipeline,
+    embedding_enabled: bool,
+    embedding_profile_id: &EmbeddingProfileId,
+) -> Result<()> {
+    if embedding_enabled {
+        pipeline.select_embedding_profile_readonly(embedding_profile_id)?;
+    }
     Ok(())
 }
 
@@ -4860,18 +5138,9 @@ async fn refresh_query_embedding_profile_for_collection_filter(
         return Ok(());
     }
 
-    let state = Arc::clone(state);
     let embedding_profile_id = embedding_profile_id.clone();
-    let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        let mut pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        refresh_embedding_profile_capabilities_blocking(&runtime, &mut pipeline)?;
-        pipeline.select_embedding_profile(&embedding_profile_id)?;
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+    refresh_query_embedding_profile_capabilities(state, embedding_enabled, &embedding_profile_id)
+        .await
 }
 
 async fn prepare_retrieve_context(
@@ -4881,18 +5150,25 @@ async fn prepare_retrieve_context(
     embedding_profile_id: &EmbeddingProfileId,
     controls: &EffectiveRetrieveControls,
 ) -> Result<RetrievedContext, (StatusCode, Json<ErrorResponse>)> {
-    let state2 = Arc::clone(&state);
+    refresh_query_embedding_profile_capabilities(
+        &state,
+        controls.config.embedding.enabled,
+        embedding_profile_id,
+    )
+    .await?;
     let question2 = question.to_string();
     let embedding_profile_id = embedding_profile_id.clone();
     let controls = controls.clone();
+    let sqlite_reader = Arc::clone(&state.resources.sqlite_reader);
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if controls.config.embedding.enabled {
-            refresh_embedding_profile_capabilities_blocking(&runtime, &mut pipeline)?;
-            pipeline.select_embedding_profile(&embedding_profile_id)?;
-        }
-        runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
+    with_query_pipeline(&state, move |pipeline| {
+        with_sqlite_reader_permit(&sqlite_reader, || {
+            prepare_query_embedding_profile_readonly(
+                pipeline,
+                controls.config.embedding.enabled,
+                &embedding_profile_id,
+            )
+        })?;
         let lexical_index = pipeline.lexical_index();
         let embed_client = OpenAiEmbeddingClient::new(&controls.config.embedding);
         let retrieval = RetrievalPipeline::new_with_graph(
@@ -4906,6 +5182,7 @@ async fn prepare_retrieve_context(
         .with_embedding_enabled(controls.config.embedding.enabled)
         .with_vector_residency(controls.config.vector_index.residency)
         .require_embedding_profile(&embedding_profile_id)
+        .with_read_resource(Arc::clone(&sqlite_reader))
         .with_qdrant_search(&controls.config.qdrant);
         let source_filter_ref = source_filter.as_ref();
         let (mut results, mut debug) = match (
@@ -4930,14 +5207,17 @@ async fn prepare_retrieve_context(
                 .block_on(retrieval.search_source_set_with_debug(&question2, source_filter_ref))?,
         };
         if controls.config.graph.global_search.enabled && source_filter_ref.is_none() {
-            let global_results =
+            let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
                 GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
-                    .global_search_results(&question2, None)?;
+                    .global_search_results(&question2, None)
+            })?;
             let mut debug_option = Some(debug);
             prepend_global_results(&mut results, global_results, &mut debug_option);
             debug = debug_option.unwrap_or_else(empty_retrieval_debug);
         }
-        let source_paths = source_paths_for_results(&results, pipeline.store())?;
+        let source_paths = with_sqlite_reader_permit(&sqlite_reader, || {
+            source_paths_for_results(&results, pipeline.store())
+        })?;
         Ok::<_, anyhow::Error>(RetrievedContext {
             results,
             debug,
@@ -4945,7 +5225,6 @@ async fn prepare_retrieve_context(
         })
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
@@ -4978,63 +5257,75 @@ async fn prepare_generation_context(
     (StatusCode, Json<ErrorResponse>),
 > {
     // Retrieve first; this touches the !Send store and async embed client.
-    let state2 = Arc::clone(&state);
+    refresh_query_embedding_profile_capabilities(
+        &state,
+        config.embedding.enabled,
+        embedding_profile_id,
+    )
+    .await?;
     let question2 = question.to_string();
     let embedding_profile_id = embedding_profile_id.clone();
     let config = config.clone();
+    let data_dir = state.data_dir.clone();
+    let sqlite_reader = Arc::clone(&state.resources.sqlite_reader);
     let runtime = tokio::runtime::Handle::current();
-    let (results, generation_context, retrieval_debug) = tokio::task::spawn_blocking(move || {
-        let mut pipeline = state2.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        if config.embedding.enabled {
-            refresh_embedding_profile_capabilities_blocking(&runtime, &mut pipeline)?;
-            pipeline.select_embedding_profile(&embedding_profile_id)?;
-        }
-        runtime.block_on(pipeline.sync_pending_qdrant_profile_resets());
-        let lexical_index = pipeline.lexical_index();
-        let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
-        let retrieval = RetrievalPipeline::new_with_graph(
-            pipeline.vector_index(),
-            &lexical_index,
-            pipeline.store(),
-            &embed_client,
-            &config.retrieval,
-            &config.graph,
-        )
-        .with_embedding_enabled(config.embedding.enabled)
-        .with_vector_residency(config.vector_index.residency)
-        .require_embedding_profile(&embedding_profile_id)
-        .with_qdrant_search(&config.qdrant);
-        let source_filter_ref = source_filter.as_ref();
-        let (mut results, mut retrieval_debug) = run_generation_retrieval(
-            runtime,
-            retrieval,
-            &config.rerank,
-            &question2,
-            source_filter_ref,
-            show_retrieval,
-        )?;
-        if config.graph.global_search.enabled && source_filter_ref.is_none() {
-            let global_results =
-                GraphRagService::new(pipeline.store(), &config.graph.global_search)
-                    .global_search_results(&question2, None)?;
-            prepend_global_results(&mut results, global_results, &mut retrieval_debug);
-        }
-        let image_artifacts = collect_image_artifacts_for_results(&results, pipeline.store())?;
-        let image_attachments = select_image_attachments(
-            &results,
-            &image_artifacts,
-            &config.chat.vision_attachments,
-            |artifact| read_image_attachment_bytes(&state2.data_dir, artifact),
-        )?;
-        Ok::<_, anyhow::Error>((
-            results,
-            GenerationContext::new(image_artifacts, image_attachments),
-            retrieval_debug,
-        ))
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (results, generation_context, retrieval_debug) =
+        with_query_pipeline(&state, move |pipeline| {
+            with_sqlite_reader_permit(&sqlite_reader, || {
+                prepare_query_embedding_profile_readonly(
+                    pipeline,
+                    config.embedding.enabled,
+                    &embedding_profile_id,
+                )
+            })?;
+            let lexical_index = pipeline.lexical_index();
+            let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
+            let retrieval = RetrievalPipeline::new_with_graph(
+                pipeline.vector_index(),
+                &lexical_index,
+                pipeline.store(),
+                &embed_client,
+                &config.retrieval,
+                &config.graph,
+            )
+            .with_embedding_enabled(config.embedding.enabled)
+            .with_vector_residency(config.vector_index.residency)
+            .require_embedding_profile(&embedding_profile_id)
+            .with_read_resource(Arc::clone(&sqlite_reader))
+            .with_qdrant_search(&config.qdrant);
+            let source_filter_ref = source_filter.as_ref();
+            let (mut results, mut retrieval_debug) = run_generation_retrieval(
+                runtime,
+                retrieval,
+                &config.rerank,
+                &question2,
+                source_filter_ref,
+                show_retrieval,
+            )?;
+            if config.graph.global_search.enabled && source_filter_ref.is_none() {
+                let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
+                    GraphRagService::new(pipeline.store(), &config.graph.global_search)
+                        .global_search_results(&question2, None)
+                })?;
+                prepend_global_results(&mut results, global_results, &mut retrieval_debug);
+            }
+            let image_artifacts = with_sqlite_reader_permit(&sqlite_reader, || {
+                collect_image_artifacts_for_results(&results, pipeline.store())
+            })?;
+            let image_attachments = select_image_attachments(
+                &results,
+                &image_artifacts,
+                &config.chat.vision_attachments,
+                |artifact| read_image_attachment_bytes(&data_dir, artifact),
+            )?;
+            Ok::<_, anyhow::Error>((
+                results,
+                GenerationContext::new(image_artifacts, image_attachments),
+                retrieval_debug,
+            ))
+        })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok((results, generation_context, retrieval_debug))
 }
@@ -5379,19 +5670,17 @@ async fn get_evidence(
     State(state): State<SharedState>,
     Path(eid): Path<String>,
 ) -> Result<Json<EvidenceResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
     let eid_clone = eid.clone();
-    let (evidence, image_artifact) = tokio::task::spawn_blocking(move || {
-        let pipeline = state.pipeline.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let evidence = pipeline.store().get_evidence(&EvidenceId(eid_clone))?;
+    let (evidence, image_artifact) = with_task_store_read(&state, move |store| {
+        let evidence = store.get_evidence(&EvidenceId(eid_clone))?;
         let image_artifact = match &evidence {
             Some(eu) => {
-                let direct = pipeline.store().get_image_artifact_by_evidence(&eu.id)?;
+                let direct = store.get_image_artifact_by_evidence(&eu.id)?;
                 match (direct, &eu.derived_from) {
                     (Some(artifact), _) => Some(artifact),
-                    (None, Some(source_evidence_id)) => pipeline
-                        .store()
-                        .get_image_artifact_by_evidence(source_evidence_id)?,
+                    (None, Some(source_evidence_id)) => {
+                        store.get_image_artifact_by_evidence(source_evidence_id)?
+                    }
                     (None, None) => None,
                 }
             }
@@ -5400,7 +5689,6 @@ async fn get_evidence(
         Ok::<_, anyhow::Error>((evidence, image_artifact))
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match evidence {
@@ -5773,20 +6061,16 @@ async fn build_collection_watch_plan(state: &SharedState) -> Result<CollectionWa
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .collect::<BTreeSet<_>>();
-    let state_for_store = Arc::clone(state);
-    let plan = tokio::task::spawn_blocking(move || {
-        let pipeline = state_for_store
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let collections = pipeline.store().list_collections()?;
+    let state_for_status = Arc::clone(state);
+    let plan = with_task_store_read(state, move |store| {
+        let collections = store.list_collections()?;
         let mut plan = CollectionWatchPlan::default();
         for collection in collections {
             let ignored_by_config =
                 !watcher_config.enabled || ignored_collections.contains(&collection.name);
             let mut watched_root_count = 0_usize;
             if collection.watch_enabled && !ignored_by_config {
-                let roots = pipeline.store().list_collection_roots(&collection.name)?;
+                let roots = store.list_collection_roots(&collection.name)?;
                 for root in roots {
                     for path in
                         watch_paths_for_collection_root(&root.path, root.canonical_path.as_ref())
@@ -5815,7 +6099,7 @@ async fn build_collection_watch_plan(state: &SharedState) -> Result<CollectionWa
                     }
                 }
             }
-            update_collection_watcher_status(&state_for_store, &collection.name, |status| {
+            update_collection_watcher_status(&state_for_status, &collection.name, |status| {
                 status.active =
                     collection.watch_enabled && !ignored_by_config && watched_root_count > 0;
                 status.ignored_by_config = ignored_by_config;
@@ -5824,8 +6108,7 @@ async fn build_collection_watch_plan(state: &SharedState) -> Result<CollectionWa
         }
         Ok::<_, anyhow::Error>(plan)
     })
-    .await
-    .context("join collection watch plan task")??;
+    .await?;
     Ok(plan)
 }
 
@@ -5896,74 +6179,72 @@ async fn maintain_collection_after_watch_event(
     let collection_name_for_sync = collection_name.clone();
     let sync_outcome = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Handle::current();
-        let mut pipeline = state_for_sync
-            .pipeline
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let collection = pipeline
-            .store()
-            .get_collection(&collection_name_for_sync)?
-            .with_context(|| format!("collection not found: {collection_name_for_sync}"))?;
-        if !collection.watch_enabled || !watcher_config_for_sync.enabled {
-            return Ok::<_, anyhow::Error>(CollectionMaintenanceSyncOutcome::default());
-        }
-        if watcher_config_for_sync
-            .ignore_collections
-            .iter()
-            .any(|name| name == &collection.name)
-        {
-            return Ok(CollectionMaintenanceSyncOutcome::default());
-        }
-        let old_members = pipeline
-            .store()
-            .list_collection_members(&collection_name_for_sync)?;
-        let report = pipeline.sync_collection_with_extra_ignores(
-            &collection_name_for_sync,
-            &[],
-            Some(watcher_config_for_sync.max_depth.max(1)),
-            &watcher_config_for_sync.ignore_paths,
-        )?;
-        let new_members = pipeline
-            .store()
-            .list_collection_members(&collection_name_for_sync)?;
-        let new_candidates = new_members
-            .iter()
-            .map(|member| CollectionMemberCandidate {
-                source_id: member.source_id.clone(),
-                logical_path: member.logical_path.clone(),
-                source_path: member.source_path.clone(),
-            })
-            .collect::<Vec<_>>();
-        let diff = diff_collection_members(&old_members, &new_candidates);
-        let stale = pipeline.check_stale()?;
-        let member_source_ids = new_members
-            .iter()
-            .map(|member| member.source_id.clone())
-            .collect::<HashSet<_>>();
-        let mut source_ids_to_ingest = diff
-            .added
-            .iter()
-            .map(|candidate| candidate.source_id.clone())
-            .chain(
-                stale
-                    .into_iter()
-                    .filter(|source_id| member_source_ids.contains(source_id)),
-            )
-            .collect::<BTreeSet<_>>();
-        for removed in &diff.removed {
-            if !removed.source_path.exists()
-                && pipeline.store().get_source(&removed.source_id)?.is_some()
-            {
-                runtime.block_on(pipeline.remove_source(&removed.source_id))?;
-                source_ids_to_ingest.remove(&removed.source_id);
+        run_with_pipeline(state_for_sync, move |pipeline| {
+            let collection = pipeline
+                .store()
+                .get_collection(&collection_name_for_sync)?
+                .with_context(|| format!("collection not found: {collection_name_for_sync}"))?;
+            if !collection.watch_enabled || !watcher_config_for_sync.enabled {
+                return Ok::<_, anyhow::Error>(CollectionMaintenanceSyncOutcome::default());
             }
-        }
-        Ok(CollectionMaintenanceSyncOutcome {
-            added: report.added,
-            removed: report.removed,
-            unchanged: report.unchanged,
-            auto_index_enabled: collection.auto_index_enabled,
-            source_ids_to_ingest: source_ids_to_ingest.into_iter().collect(),
+            if watcher_config_for_sync
+                .ignore_collections
+                .iter()
+                .any(|name| name == &collection.name)
+            {
+                return Ok(CollectionMaintenanceSyncOutcome::default());
+            }
+            let old_members = pipeline
+                .store()
+                .list_collection_members(&collection_name_for_sync)?;
+            let report = pipeline.sync_collection_with_extra_ignores(
+                &collection_name_for_sync,
+                &[],
+                Some(watcher_config_for_sync.max_depth.max(1)),
+                &watcher_config_for_sync.ignore_paths,
+            )?;
+            let new_members = pipeline
+                .store()
+                .list_collection_members(&collection_name_for_sync)?;
+            let new_candidates = new_members
+                .iter()
+                .map(|member| CollectionMemberCandidate {
+                    source_id: member.source_id.clone(),
+                    logical_path: member.logical_path.clone(),
+                    source_path: member.source_path.clone(),
+                })
+                .collect::<Vec<_>>();
+            let diff = diff_collection_members(&old_members, &new_candidates);
+            let stale = pipeline.check_stale()?;
+            let member_source_ids = new_members
+                .iter()
+                .map(|member| member.source_id.clone())
+                .collect::<HashSet<_>>();
+            let mut source_ids_to_ingest = diff
+                .added
+                .iter()
+                .map(|candidate| candidate.source_id.clone())
+                .chain(
+                    stale
+                        .into_iter()
+                        .filter(|source_id| member_source_ids.contains(source_id)),
+                )
+                .collect::<BTreeSet<_>>();
+            for removed in &diff.removed {
+                if !removed.source_path.exists()
+                    && pipeline.store().get_source(&removed.source_id)?.is_some()
+                {
+                    runtime.block_on(pipeline.remove_source(&removed.source_id))?;
+                    source_ids_to_ingest.remove(&removed.source_id);
+                }
+            }
+            Ok(CollectionMaintenanceSyncOutcome {
+                added: report.added,
+                removed: report.removed,
+                unchanged: report.unchanged,
+                auto_index_enabled: collection.auto_index_enabled,
+                source_ids_to_ingest: source_ids_to_ingest.into_iter().collect(),
+            })
         })
     })
     .await
@@ -6017,13 +6298,8 @@ struct CollectionMaintenanceSyncOutcome {
 }
 
 async fn source_has_pending_ingest_task(state: &SharedState, source_id: &SourceId) -> Result<bool> {
-    let state = Arc::clone(state);
     let source_id = source_id.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = state
-            .task_store
-            .lock()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    with_task_store_read(state, move |store| {
         for task in store.queued_tasks(TaskKind::Ingest)? {
             let request: PersistedIngestRequest = match serde_json::from_value(task.request) {
                 Ok(request) => request,
@@ -6038,7 +6314,6 @@ async fn source_has_pending_ingest_task(state: &SharedState, source_id: &SourceI
         Ok(false)
     })
     .await
-    .context("join pending ingest task lookup")?
 }
 
 // ---------------------------------------------------------------------------
@@ -6118,6 +6393,7 @@ async fn reload_config_from_path(state: &SharedState) -> Result<ConfigReloadMeta
             .pipeline
             .lock()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let pipeline = pipeline_mut(&mut pipeline)?;
         pipeline.reload_runtime_config(&next_config_for_pipeline)
     })
     .await
@@ -6147,6 +6423,10 @@ async fn reload_config_from_path(state: &SharedState) -> Result<ConfigReloadMeta
         runtime.config = next_config;
         runtime.reload = metadata.clone();
     }
+    configure_daemon_resources(
+        &state.resources,
+        &runtime_config_snapshot(state)?.config.daemon.resources,
+    );
     if collection_watcher_plan_changed {
         send_collection_watcher_command(state, CollectionWatcherCommand::Refresh);
     }
@@ -6332,13 +6612,16 @@ async fn run_daemon() -> Result<()> {
     if let Err(error) = apply_index_gc(&data_dir, pipeline.store(), config.index_gc.policy()) {
         tracing::warn!(error = %error, "startup index generation garbage collection failed");
     }
+    let index_status_cache = initial_index_status_cache(&pipeline);
     let task_store = Store::new(&data_dir.join("verbatim.db"))?;
 
     let bind_addr = config.daemon.bind.clone();
 
     let state: SharedState = Arc::new(AppState {
-        pipeline: std::sync::Mutex::new(pipeline),
+        pipeline: std::sync::Mutex::new(Some(pipeline)),
         task_store: std::sync::Mutex::new(task_store),
+        index_status_cache: std::sync::RwLock::new(index_status_cache),
+        resources: daemon_resources(&config.daemon.resources),
         ingest_queue_active: AtomicBool::new(false),
         ingest_worker_active: AtomicBool::new(false),
         collection_watcher: CollectionWatcherRuntime::default(),
@@ -6492,6 +6775,22 @@ mod tests {
 
         assert!(!handled);
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn sqlite_writer_resource_limits_keep_single_active_writer() {
+        let config = DaemonResourceConfig {
+            sqlite_writer_concurrency: 32,
+            sqlite_writer_queue_capacity: 7,
+            sqlite_writer_queue_timeout_seconds: 11,
+            ..DaemonResourceConfig::default()
+        };
+
+        let limits = sqlite_writer_resource_limits(&config.bounded());
+
+        assert_eq!(limits.capacity, SQLITE_WRITER_ACTIVE_CAPACITY);
+        assert_eq!(limits.queue_capacity, 7);
+        assert_eq!(limits.queue_timeout, Duration::from_secs(11));
     }
 
     #[tokio::test]
@@ -6661,6 +6960,56 @@ mod tests {
             vec!["retrieval.dense_top_k"]
         );
         assert_eq!(metadata.last_restart_required_keys[0].key, "daemon.bind");
+        assert!(metadata
+            .last_reload_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("restart or reindex required"));
+    }
+
+    #[tokio::test]
+    async fn config_reload_reports_endpoint_queue_capacities_without_applying_them() {
+        let test_dir = TestDir::new("config-reload-endpoint-queue-capacity");
+        let config_path = test_dir.path().join("config.toml");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.endpoint_runtime.queue_capacity = 5;
+        config.rerank.endpoint_runtime.queue_capacity = 7;
+        config.vision.endpoint_runtime.queue_capacity = 11;
+        config.chat.endpoint_runtime.queue_capacity = 13;
+        fs::write(&config_path, config.show().unwrap()).unwrap();
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state =
+            test_state_with_config_path(config.clone(), test_dir.path(), pipeline, config_path);
+
+        let mut candidate = config.clone();
+        candidate.embedding.endpoint_runtime.queue_capacity = 17;
+        candidate.rerank.endpoint_runtime.queue_capacity = 19;
+        candidate.vision.endpoint_runtime.queue_capacity = 23;
+        candidate.chat.endpoint_runtime.queue_capacity = 29;
+        fs::write(&state.config_path, candidate.show().unwrap()).unwrap();
+
+        let metadata = reload_config_from_path(&state).await.unwrap();
+        let snapshot = runtime_config_snapshot(&state).unwrap();
+        let restart_required_keys = metadata
+            .last_restart_required_keys
+            .iter()
+            .map(|change| change.key.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(metadata.last_applied_reload_safe_keys.is_empty());
+        assert_eq!(
+            restart_required_keys,
+            vec![
+                "chat.queue_capacity",
+                "embedding.queue_capacity",
+                "rerank.queue_capacity",
+                "vision.queue_capacity"
+            ]
+        );
+        assert_eq!(snapshot.config.embedding.endpoint_runtime.queue_capacity, 5);
+        assert_eq!(snapshot.config.rerank.endpoint_runtime.queue_capacity, 7);
+        assert_eq!(snapshot.config.vision.endpoint_runtime.queue_capacity, 11);
+        assert_eq!(snapshot.config.chat.endpoint_runtime.queue_capacity, 13);
         assert!(metadata
             .last_reload_error
             .as_deref()
@@ -7084,6 +7433,545 @@ mod tests {
             queued.blocking_reason.as_deref(),
             Some("waiting for running ingest task to finish")
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_writer_activity_does_not_block_task_status_read() {
+        let test_dir = TestDir::new("writer-active-task-status-read");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.daemon.resources.sqlite_writer_concurrency = 32;
+        config.daemon.resources.sqlite_reader_concurrency = 32;
+        assert_eq!(
+            sqlite_writer_resource_limits(&config.daemon.resources.bounded()).capacity,
+            SQLITE_WRITER_ACTIVE_CAPACITY
+        );
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
+        let writer_permit = state
+            .resources
+            .sqlite_writer
+            .acquire()
+            .await
+            .expect("writer permit");
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            task_summary_response(&state, task_id.clone()),
+        )
+        .await
+        .expect("task status read does not wait behind writer resource")
+        .unwrap();
+
+        assert_eq!(response.task.id, task_id);
+        let Json(health) = health(State(Arc::clone(&state))).await;
+        let writer = health
+            .resources
+            .iter()
+            .find(|resource| resource.name == "sqlite_writer")
+            .expect("sqlite writer resource is reported");
+        assert_eq!(writer.capacity, SQLITE_WRITER_ACTIVE_CAPACITY);
+        assert!(writer.active >= 1);
+        let reader = health
+            .resources
+            .iter()
+            .find(|resource| resource.name == "sqlite_reader")
+            .expect("sqlite reader resource is reported");
+        assert!(reader.completed >= 1);
+        drop(writer_permit);
+    }
+
+    #[tokio::test]
+    async fn taken_pipeline_slot_does_not_block_task_status_read() {
+        let test_dir = TestDir::new("pipeline-busy-task-status-read");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
+        let pipeline = take_pipeline(&state).expect("take pipeline slot");
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            task_summary_response(&state, task_id.clone()),
+        )
+        .await
+        .expect("task status read does not wait behind pipeline slot")
+        .unwrap();
+
+        assert_eq!(response.task.id, task_id);
+        restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    async fn assert_exclusive_pipeline_available(state: &SharedState) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match with_exclusive_pipeline(state, |_pipeline| Ok::<_, anyhow::Error>(())).await {
+                Ok(()) => return,
+                Err(error) if is_pipeline_busy_error(&error) && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("exclusive pipeline did not recover: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_exclusive_pipeline_owner_restores_slot() {
+        let test_dir = TestDir::new("pipeline-owner-cancel-restore");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let (taken_tx, taken_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_state = Arc::clone(&state);
+        let owner = tokio::spawn(async move {
+            with_exclusive_pipeline(&worker_state, move |_pipeline| {
+                taken_tx.send(()).expect("signal pipeline taken");
+                release_rx.recv().expect("wait for release signal");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), taken_rx)
+            .await
+            .expect("worker takes pipeline")
+            .expect("worker signal remains alive");
+        owner.abort();
+        release_tx.send(()).expect("release worker");
+        let join_error = owner.await.expect_err("owner future was aborted");
+        assert!(join_error.is_cancelled());
+
+        assert_exclusive_pipeline_available(&state).await;
+    }
+
+    #[tokio::test]
+    async fn panicking_exclusive_pipeline_worker_restores_slot() {
+        let test_dir = TestDir::new("pipeline-worker-panic-restore");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let result = with_exclusive_pipeline(&state, |_pipeline| -> Result<()> {
+            panic!("test panic after taking pipeline")
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_exclusive_pipeline_available(&state).await;
+    }
+
+    #[tokio::test]
+    async fn taken_pipeline_slot_serves_cached_index_status() {
+        let test_dir = TestDir::new("pipeline-busy-index-status");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let pipeline = take_pipeline(&state).expect("take pipeline slot");
+
+        let Json(response) = tokio::time::timeout(
+            Duration::from_millis(250),
+            index_status(State(Arc::clone(&state))),
+        )
+        .await
+        .expect("index status read does not wait behind pipeline slot")
+        .unwrap();
+
+        assert_eq!(response.source_count, 0);
+        assert!(response
+            .messages
+            .iter()
+            .any(|message| message.contains("last-known index status")));
+        restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    #[tokio::test]
+    async fn taken_pipeline_slot_does_not_block_retrieve_read_snapshot() {
+        let test_dir = TestDir::new("pipeline-busy-retrieve-snapshot");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        config.rerank.enabled = false;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config.clone(), test_dir.path(), pipeline);
+        let pipeline = take_pipeline(&state).expect("take pipeline slot");
+        let req = RetrieveRequest {
+            question: "empty corpus query".into(),
+            source_id: None,
+            collection_filter: CollectionFilterRequest::default(),
+            embedding_profile_id: None,
+            limit: None,
+            page_size: None,
+            page: None,
+            fast: false,
+            rerank: Some(false),
+            dense_top_k: None,
+            bm25_top_k: None,
+            rerank_top_n: None,
+            include_debug: true,
+            include_locator: false,
+        };
+        let controls = resolve_retrieve_controls(&req, &config).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            prepare_retrieve_context(
+                Arc::clone(&state),
+                &req.question,
+                None,
+                &config.embedding.profile_id,
+                &controls,
+            ),
+        )
+        .await
+        .expect("retrieve read snapshot should not wait behind pipeline slot")
+        .expect("retrieve read snapshot should not report pipeline busy");
+
+        assert!(result.results.is_empty());
+        assert_eq!(
+            result.debug.dense_vector_path,
+            RetrievalDenseVectorPath::Bm25Only
+        );
+        restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    #[tokio::test]
+    async fn retrieve_read_snapshot_uses_sqlite_reader_resource() {
+        let test_dir = TestDir::new("retrieve-uses-sqlite-reader-resource");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        config.rerank.enabled = false;
+        config.daemon.resources.sqlite_reader_concurrency = 1;
+        config.daemon.resources.sqlite_reader_queue_capacity = 1;
+        config.daemon.resources.sqlite_reader_queue_timeout_seconds = 5;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config.clone(), test_dir.path(), pipeline);
+        let held_reader = state
+            .resources
+            .sqlite_reader
+            .acquire()
+            .await
+            .expect("hold sqlite reader permit");
+        let req = RetrieveRequest {
+            question: "empty corpus query".into(),
+            source_id: None,
+            collection_filter: CollectionFilterRequest::default(),
+            embedding_profile_id: None,
+            limit: None,
+            page_size: None,
+            page: None,
+            fast: false,
+            rerank: Some(false),
+            dense_top_k: None,
+            bm25_top_k: None,
+            rerank_top_n: None,
+            include_debug: true,
+            include_locator: false,
+        };
+        let controls = resolve_retrieve_controls(&req, &config).unwrap();
+        let query_state = Arc::clone(&state);
+        let question = req.question.clone();
+        let embedding_profile_id = config.embedding.profile_id.clone();
+        let retrieve_task = tokio::spawn(async move {
+            prepare_retrieve_context(
+                query_state,
+                &question,
+                None,
+                &embedding_profile_id,
+                &controls,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let Json(response) = health(State(Arc::clone(&state))).await;
+                let reader = response
+                    .resources
+                    .iter()
+                    .find(|resource| resource.name == "sqlite_reader")
+                    .expect("sqlite reader resource is reported");
+                if reader.active == 1 && reader.queued == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retrieve is queued behind sqlite reader resource");
+
+        drop(held_reader);
+        let result = tokio::time::timeout(Duration::from_secs(2), retrieve_task)
+            .await
+            .expect("retrieve completes after sqlite reader release")
+            .expect("retrieve task joins")
+            .expect("retrieve context succeeds");
+        assert!(result.results.is_empty());
+
+        let Json(response) = health(State(Arc::clone(&state))).await;
+        let reader = response
+            .resources
+            .iter()
+            .find(|resource| resource.name == "sqlite_reader")
+            .expect("sqlite reader resource is reported");
+        assert_eq!(reader.active, 0);
+        assert_eq!(reader.queued, 0);
+        assert!(reader.completed >= 2);
+    }
+
+    #[tokio::test]
+    async fn retrieve_model_wait_does_not_hold_pipeline_slot_when_query_starts_first() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("retrieve-model-wait-releases-pipeline");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Alpha retrieval evidence keeps the query embedding path active.",
+        )
+        .unwrap();
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.daemon.resources.sqlite_reader_concurrency = 1;
+        config.daemon.resources.sqlite_reader_queue_capacity = 1;
+        config.daemon.resources.sqlite_reader_queue_timeout_seconds = 5;
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        let state = test_state(config.clone(), test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("What is cited?", None, None, false, false),
+        )
+        .await
+        .unwrap();
+        let before_query_embeddings = model_server.embedding_requests();
+        model_server.block_embeddings();
+
+        let controls = resolve_retrieve_controls(
+            &RetrieveRequest {
+                question: "Alpha retrieval question?".into(),
+                source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(1),
+                page: Some(1),
+                fast: false,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                include_debug: true,
+                include_locator: false,
+            },
+            &config,
+        )
+        .unwrap();
+        let query_state = Arc::clone(&state);
+        let embedding_profile_id = config.embedding.profile_id.clone();
+        let source_filter = HashSet::from([source_id.clone()]);
+        let retrieve_task = tokio::spawn(async move {
+            prepare_retrieve_context(
+                query_state,
+                "Alpha retrieval question?",
+                Some(source_filter),
+                &embedding_profile_id,
+                &controls,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model_server.embedding_requests() <= before_query_embeddings {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retrieve reached blocked embedding provider");
+
+        assert_exclusive_pipeline_available(&state).await;
+        let blocked_reader = state.resources.sqlite_reader.snapshot();
+        assert_eq!(
+            blocked_reader.active, 0,
+            "blocked embedding wait must not hold sqlite_reader"
+        );
+        assert_eq!(
+            blocked_reader.queued, 0,
+            "blocked embedding wait must not queue unrelated sqlite_reader work"
+        );
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            task_summary_response(&state, task_id.clone()),
+        )
+        .await
+        .expect("task status read remains responsive while embedding is blocked")
+        .unwrap();
+        assert_eq!(response.task.id, task_id);
+        let after_status_reader = state.resources.sqlite_reader.snapshot();
+        assert!(
+            after_status_reader.completed > blocked_reader.completed,
+            "task status read should be counted by sqlite_reader"
+        );
+        assert_eq!(after_status_reader.active, 0);
+
+        model_server.release_embeddings();
+        let context = tokio::time::timeout(Duration::from_secs(5), retrieve_task)
+            .await
+            .expect("retrieve completes after embedding release")
+            .expect("retrieve task joins")
+            .expect("retrieve context succeeds");
+        assert!(!context.results.is_empty());
+        let completed_reader = state.resources.sqlite_reader.snapshot();
+        assert!(
+            completed_reader.completed > after_status_reader.completed,
+            "retrieve SQLite snapshot reads after provider release should be counted by sqlite_reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_capability_wait_does_not_hold_pipeline_slot_when_query_starts_first() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("query-capability-wait-releases-pipeline");
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config.clone(), test_dir.path(), pipeline);
+        let before_model_requests = model_server.model_requests();
+        model_server.block_models();
+
+        let refresh_state = Arc::clone(&state);
+        let embedding_profile_id = config.embedding.profile_id.clone();
+        let refresh_task = tokio::spawn(async move {
+            refresh_query_embedding_profile_capabilities(
+                &refresh_state,
+                true,
+                &embedding_profile_id,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model_server.model_requests() <= before_model_requests {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("query refresh reached blocked capability discovery");
+
+        assert_exclusive_pipeline_available(&state).await;
+
+        model_server.release_models();
+        tokio::time::timeout(Duration::from_secs(5), refresh_task)
+            .await
+            .expect("query capability refresh completes after discovery release")
+            .expect("query capability refresh task joins")
+            .expect("query capability refresh succeeds");
+    }
+
+    #[tokio::test]
+    async fn index_status_capability_wait_does_not_hold_pipeline_slot() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("index-status-capability-wait-releases-pipeline");
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let before_model_requests = model_server.model_requests();
+        model_server.block_models();
+
+        let status_state = Arc::clone(&state);
+        let status_task = tokio::spawn(async move { index_status(State(status_state)).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model_server.model_requests() <= before_model_requests {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("index status reached blocked capability discovery");
+
+        assert_exclusive_pipeline_available(&state).await;
+
+        model_server.release_models();
+        let _response = tokio::time::timeout(Duration::from_secs(5), status_task)
+            .await
+            .expect("index status completes after discovery release")
+            .expect("index status task joins")
+            .expect("index status succeeds");
+    }
+
+    #[tokio::test]
+    async fn check_stale_capability_wait_does_not_hold_pipeline_slot() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("check-stale-capability-wait-releases-pipeline");
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let before_model_requests = model_server.model_requests();
+        model_server.block_models();
+
+        let check_state = Arc::clone(&state);
+        let check_task = tokio::spawn(async move { check_stale(State(check_state)).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model_server.model_requests() <= before_model_requests {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("check stale reached blocked capability discovery");
+
+        assert_exclusive_pipeline_available(&state).await;
+
+        model_server.release_models();
+        let _response = tokio::time::timeout(Duration::from_secs(5), check_task)
+            .await
+            .expect("check stale completes after discovery release")
+            .expect("check stale task joins")
+            .expect("check stale succeeds");
+    }
+
+    #[tokio::test]
+    async fn batch_source_selection_capability_wait_does_not_hold_pipeline_slot() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("batch-selection-capability-wait-releases-pipeline");
+        let config = retrieve_test_config(&model_server.base_url);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let before_model_requests = model_server.model_requests();
+        model_server.block_models();
+
+        let select_state = Arc::clone(&state);
+        let select_task = tokio::spawn(async move {
+            background_ingest_batch_source_ids(&select_state, false, false).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model_server.model_requests() <= before_model_requests {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("batch source selection reached blocked capability discovery");
+
+        assert_exclusive_pipeline_available(&state).await;
+
+        model_server.release_models();
+        tokio::time::timeout(Duration::from_secs(5), select_task)
+            .await
+            .expect("batch source selection completes after discovery release")
+            .expect("batch source selection task joins")
+            .expect("batch source selection succeeds");
     }
 
     #[tokio::test]
@@ -7806,6 +8694,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_source_missing_path_does_not_wait_for_sqlite_writer() {
+        let test_dir = TestDir::new("add-source-no-writer-wait");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let writer_permit = state
+            .resources
+            .sqlite_writer
+            .acquire()
+            .await
+            .expect("hold sqlite writer permit");
+
+        let (status, Json(body)) = tokio::time::timeout(
+            Duration::from_millis(250),
+            add_source(
+                State(Arc::clone(&state)),
+                Json(AddSourceRequest {
+                    path: test_dir.path().join("missing.md").display().to_string(),
+                }),
+            ),
+        )
+        .await
+        .expect("add_source validates missing path before writer admission")
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("resolve path"));
+        drop(writer_permit);
+    }
+
+    #[tokio::test]
     async fn delete_source_existing_removes_source() {
         let test_dir = TestDir::new("delete-existing-source");
         let source_path = test_dir.path().join("doc.md");
@@ -7821,7 +8740,99 @@ mod tests {
 
         assert_eq!(status, StatusCode::NO_CONTENT);
         let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
         assert!(pipeline.store().get_source(&source_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_source_publish_wait_serves_cached_index_status() {
+        let test_dir = TestDir::new("delete-source-publish-wait-status");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(&source_path, "delete me while publish waits").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let publish_permit = state
+            .resources
+            .index_publish
+            .acquire()
+            .await
+            .expect("hold index publish permit");
+        let delete_state = Arc::clone(&state);
+        let delete_source_id = source_id.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_source(State(delete_state), Path(delete_source_id.0)).await
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let slot_taken = state.pipeline.lock().unwrap().is_none();
+            if slot_taken {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "delete_source did not take the pipeline slot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let Json(response) = tokio::time::timeout(
+            Duration::from_millis(250),
+            index_status(State(Arc::clone(&state))),
+        )
+        .await
+        .expect("index status falls back while delete_source waits on publish")
+        .unwrap();
+        assert!(response
+            .messages
+            .iter()
+            .any(|message| message.contains("last-known index status")));
+
+        drop(publish_permit);
+        let status = tokio::time::timeout(Duration::from_secs(5), delete_task)
+            .await
+            .expect("delete_source completes after publish permit release")
+            .expect("delete task joins")
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
+        assert!(pipeline.store().get_source(&source_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_collection_missing_collection_does_not_wait_for_sqlite_writer() {
+        let test_dir = TestDir::new("sync-collection-no-writer-wait");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let writer_permit = state
+            .resources
+            .sqlite_writer
+            .acquire()
+            .await
+            .expect("hold sqlite writer permit");
+
+        let (status, Json(body)) = tokio::time::timeout(
+            Duration::from_millis(250),
+            sync_collection(
+                State(Arc::clone(&state)),
+                Path("missing".into()),
+                Json(CollectionSyncRequest {
+                    paths: Vec::new(),
+                    max_depth: None,
+                }),
+            ),
+        )
+        .await
+        .expect("sync_collection validates missing collection before writer admission")
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.error, "collection not found: missing");
+        drop(writer_permit);
     }
 
     #[tokio::test]
@@ -7984,7 +8995,8 @@ mod tests {
 
         assert_eq!(outcome.added, 1);
         assert_eq!(outcome.queued_task_ids.len(), 1);
-        let pipeline = state.pipeline.lock().unwrap();
+        let pipeline_guard = state.pipeline.lock().unwrap();
+        let pipeline = pipeline_guard.as_ref().unwrap();
         assert_eq!(
             pipeline
                 .store()
@@ -7993,7 +9005,7 @@ mod tests {
                 .len(),
             1
         );
-        drop(pipeline);
+        drop(pipeline_guard);
         let store = state.task_store.lock().unwrap();
         let queued = store.queued_tasks(TaskKind::Ingest).unwrap();
         assert!(queued.iter().any(|task| {
@@ -8046,6 +9058,7 @@ mod tests {
         assert_eq!(sync.report.added, 1);
         let member_source_id = {
             let pipeline = state.pipeline.lock().unwrap();
+            let pipeline = pipeline.as_ref().unwrap();
             let members = pipeline
                 .store()
                 .list_collection_members("articles")
@@ -8282,6 +9295,8 @@ mod tests {
         let source = state
             .pipeline
             .lock()
+            .unwrap()
+            .as_ref()
             .unwrap()
             .store()
             .get_source(&source_id)
@@ -8982,6 +9997,8 @@ mod tests {
             .pipeline
             .lock()
             .unwrap()
+            .as_ref()
+            .unwrap()
             .store()
             .list_sources()
             .unwrap();
@@ -9079,6 +10096,7 @@ mod tests {
         assert_eq!(reindex_response.reindexed, 1);
         assert_eq!(ingest_response.ingested, 1);
         let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
         assert_eq!(
             pipeline
                 .store()
@@ -9266,6 +10284,8 @@ mod tests {
         let counts = state
             .pipeline
             .lock()
+            .unwrap()
+            .as_ref()
             .unwrap()
             .store()
             .embedding_profile_storage_counts(&profile)
@@ -10604,9 +11624,12 @@ mod tests {
         pipeline: IngestPipeline,
         config_path: PathBuf,
     ) -> SharedState {
+        let index_status_cache = initial_index_status_cache(&pipeline);
         Arc::new(AppState {
-            pipeline: std::sync::Mutex::new(pipeline),
+            pipeline: std::sync::Mutex::new(Some(pipeline)),
             task_store: std::sync::Mutex::new(Store::new(&data_dir.join("verbatim.db")).unwrap()),
+            index_status_cache: std::sync::RwLock::new(index_status_cache),
+            resources: daemon_resources(&config.daemon.resources),
             ingest_queue_active: AtomicBool::new(false),
             ingest_worker_active: AtomicBool::new(false),
             collection_watcher: CollectionWatcherRuntime::default(),
@@ -10736,7 +11759,12 @@ mod tests {
 
     struct MockModelServer {
         base_url: String,
+        model_requests: Arc<AtomicUsize>,
+        model_blocked: Arc<AtomicBool>,
+        model_release: Arc<tokio::sync::Notify>,
         embedding_requests: Arc<AtomicUsize>,
+        embedding_blocked: Arc<AtomicBool>,
+        embedding_release: Arc<tokio::sync::Notify>,
         chat_requests: Arc<AtomicUsize>,
         handle: tokio::task::JoinHandle<()>,
     }
@@ -10753,13 +11781,20 @@ mod tests {
         async fn start_with_chat_response(dimension: usize, chat_response: Option<String>) -> Self {
             let state = MockModelState {
                 dimension,
+                model_requests: Arc::new(AtomicUsize::new(0)),
+                model_blocked: Arc::new(AtomicBool::new(false)),
+                model_release: Arc::new(tokio::sync::Notify::new()),
                 embedding_requests: Arc::new(AtomicUsize::new(0)),
+                embedding_blocked: Arc::new(AtomicBool::new(false)),
+                embedding_release: Arc::new(tokio::sync::Notify::new()),
                 chat_requests: Arc::new(AtomicUsize::new(0)),
                 chat_response,
             };
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let app = Router::new()
+                .route("/models", get(mock_models))
+                .route("/v1/models", get(mock_models))
                 .route("/v1/embeddings", post(mock_embeddings))
                 .route("/v1/chat/completions", post(mock_chat))
                 .with_state(state.clone());
@@ -10769,14 +11804,41 @@ mod tests {
 
             Self {
                 base_url: format!("http://{addr}/v1"),
+                model_requests: state.model_requests,
+                model_blocked: state.model_blocked,
+                model_release: state.model_release,
                 embedding_requests: state.embedding_requests,
+                embedding_blocked: state.embedding_blocked,
+                embedding_release: state.embedding_release,
                 chat_requests: state.chat_requests,
                 handle,
             }
         }
 
+        fn model_requests(&self) -> usize {
+            self.model_requests.load(Ordering::SeqCst)
+        }
+
+        fn block_models(&self) {
+            self.model_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_models(&self) {
+            self.model_blocked.store(false, Ordering::SeqCst);
+            self.model_release.notify_waiters();
+        }
+
         fn embedding_requests(&self) -> usize {
             self.embedding_requests.load(Ordering::SeqCst)
+        }
+
+        fn block_embeddings(&self) {
+            self.embedding_blocked.store(true, Ordering::SeqCst);
+        }
+
+        fn release_embeddings(&self) {
+            self.embedding_blocked.store(false, Ordering::SeqCst);
+            self.embedding_release.notify_waiters();
         }
 
         fn chat_requests(&self) -> usize {
@@ -10793,9 +11855,29 @@ mod tests {
     #[derive(Clone)]
     struct MockModelState {
         dimension: usize,
+        model_requests: Arc<AtomicUsize>,
+        model_blocked: Arc<AtomicBool>,
+        model_release: Arc<tokio::sync::Notify>,
         embedding_requests: Arc<AtomicUsize>,
+        embedding_blocked: Arc<AtomicBool>,
+        embedding_release: Arc<tokio::sync::Notify>,
         chat_requests: Arc<AtomicUsize>,
         chat_response: Option<String>,
+    }
+
+    async fn mock_models(State(state): State<MockModelState>) -> Json<serde_json::Value> {
+        state.model_requests.fetch_add(1, Ordering::SeqCst);
+        if state.model_blocked.load(Ordering::SeqCst) {
+            state.model_release.notified().await;
+        }
+        Json(serde_json::json!({
+            "data": [
+                {
+                    "id": "test-embedding",
+                    "root": "test-embedding"
+                }
+            ]
+        }))
     }
 
     async fn mock_embeddings(
@@ -10803,6 +11885,9 @@ mod tests {
         Json(payload): Json<serde_json::Value>,
     ) -> Json<serde_json::Value> {
         state.embedding_requests.fetch_add(1, Ordering::SeqCst);
+        if state.embedding_blocked.load(Ordering::SeqCst) {
+            state.embedding_release.notified().await;
+        }
         let input_count = payload
             .get("input")
             .and_then(serde_json::Value::as_array)
@@ -10930,6 +12015,8 @@ mod tests {
             .pipeline
             .lock()
             .unwrap()
+            .as_ref()
+            .unwrap()
             .store()
             .count_vector_documents_for_profile(
                 &EmbeddingProfileId::default_profile(),
@@ -10946,6 +12033,7 @@ mod tests {
         use verbatim_core::collection::{CollectionMemberCandidate, CollectionSyncReport};
 
         let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
         let Some(source) = pipeline.store().get_source(source_id).unwrap() else {
             panic!("test source not found: {}", source_id.0);
         };

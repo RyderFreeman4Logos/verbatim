@@ -15,6 +15,7 @@ pub mod ingest;
 pub mod ocr;
 pub mod parser;
 pub mod provider;
+pub mod resource;
 pub mod retrieve;
 pub mod store;
 pub mod task;

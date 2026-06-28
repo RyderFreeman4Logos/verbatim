@@ -1454,7 +1454,24 @@ pub fn write_health<W>(writer: &mut W, health: &HealthResponse) -> std::io::Resu
 where
     W: Write,
 {
-    writeln!(writer, "Daemon status: {}", health.status)
+    writeln!(writer, "Daemon status: {}", health.status)?;
+    if !health.resources.is_empty() {
+        writeln!(writer, "Resources:")?;
+        for resource in &health.resources {
+            writeln!(
+                writer,
+                "  {} active={} queued={} completed={} errors={} wait_ms={} service_ms={}",
+                resource.name,
+                resource.active,
+                resource.queued,
+                resource.completed,
+                resource.errors,
+                resource.last_queue_wait_ms.unwrap_or(0),
+                resource.last_service_ms.unwrap_or(0)
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub fn write_ask_response<W>(writer: &mut W, response: &AskResponse) -> std::io::Result<()>
