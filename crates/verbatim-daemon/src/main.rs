@@ -1562,9 +1562,24 @@ fn public_task_summary(mut task: TaskSummary) -> TaskSummary {
         .result
         .map(|result| public_task_telemetry_value_for_source(result, private_source_id.as_deref()));
     if let Some(progress) = task.progress.take() {
-        task.progress = Some(progress.bounded().with_current_elapsed());
+        task.progress = Some(public_task_progress_for_source(
+            progress,
+            private_source_id.as_deref(),
+        ));
     }
     task
+}
+
+fn public_task_progress_for_source(
+    progress: TaskProgressSnapshot,
+    private_source_id: Option<&str>,
+) -> TaskProgressSnapshot {
+    let bounded = progress.bounded().with_current_elapsed();
+    let Ok(value) = serde_json::to_value(&bounded) else {
+        return TaskProgressSnapshot::default();
+    };
+    let redacted = public_task_telemetry_value_for_source(value, private_source_id);
+    serde_json::from_value(redacted).unwrap_or_default()
 }
 
 fn task_private_source_id(task: &TaskSummary) -> Option<String> {
@@ -6789,11 +6804,12 @@ mod tests {
         )
         .await
         .unwrap();
+        ensure_task_started(&state, &task_id).await.unwrap();
         record_task_progress(
             &state,
             &task_id,
             TaskProgressSnapshot::phase(IngestTaskStage::Parse.as_str())
-                .with_recent_status("parsing source"),
+                .with_recent_status(format!("parsing source {}", source_id.0)),
         )
         .await;
         record_task_event(
@@ -6838,6 +6854,13 @@ mod tests {
             serde_json::Value::String(TASK_TELEMETRY_REDACTED.into())
         );
         assert_eq!(show.spans[0].metadata["embedding_vector"]["redacted"], true);
+        assert_eq!(
+            show.task
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.recent_status.as_deref()),
+            Some("parsing source <redacted>")
+        );
         let Json(list) = list_tasks_handler(
             State(Arc::clone(&state)),
             Query(TaskListQuery {
