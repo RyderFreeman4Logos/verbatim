@@ -3854,6 +3854,56 @@ async fn recover_abandoned_running_source_batch_children(state: &SharedState) ->
     .await
 }
 
+/// Fail all ingest tasks stuck in `running` status from a previous daemon
+/// session.  On startup no worker is active, so any `running` task is an
+/// orphan that will permanently block the ingest queue (#182).
+async fn recover_orphaned_running_tasks(state: &SharedState) -> Result<usize> {
+    with_task_store_write(state, |store| {
+        let mut candidates = Vec::new();
+        for task in store.tasks(TaskKind::Ingest)? {
+            if task.status == TaskStatus::Running {
+                candidates.push(task);
+            }
+        }
+
+        let mut recovered = 0;
+        for task in candidates {
+            let error_message = "orphaned running ingest task from previous daemon session; \
+                 no active worker can resume it — failing to unblock ingest queue";
+            let resumability = task_failure_resumability_metadata(&task, Some(error_message))
+                .ok()
+                .flatten();
+            let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
+            if !store.finish_task_failed_with_result(
+                &task.id,
+                error_message,
+                resumability.as_ref(),
+            )? {
+                continue;
+            }
+
+            let mut payload = serde_json::json!({
+                "error": bounded_error(error_message),
+                "recovery": "orphaned_running_task_on_startup",
+            });
+            if let Some(resumability) = &resumability {
+                payload["resumability"] = resumability.clone();
+            }
+            store.insert_task_event(&task.id, "failed", "task failed", &payload)?;
+            record_ingest_task_terminalize_span(
+                store,
+                &task.id,
+                terminalize_timing,
+                "recover_orphaned_running_task",
+            );
+            finalize_ingest_batch_parent_if_complete(store, Some(&task))?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    })
+    .await
+}
+
 fn recover_abandoned_running_source_batch_children_in_store(store: &mut Store) -> Result<usize> {
     let mut candidates = Vec::new();
     for task in store.tasks(TaskKind::Ingest)? {
@@ -6632,6 +6682,23 @@ async fn run_daemon() -> Result<()> {
         config_path,
         data_dir,
     });
+    // Fail orphaned ingest tasks left in `running` status by a previous daemon
+    // session that was killed before completing them.  Without this, the stale
+    // running task blocks the entire ingest queue because every queue-drain path
+    // refuses to start new work while a running task exists (#182).
+    match recover_orphaned_running_tasks(&state).await {
+        Ok(0) => {}
+        Ok(recovered) => {
+            tracing::warn!(
+                recovered,
+                "failed orphaned running ingest tasks from previous daemon session"
+            );
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to recover orphaned running ingest tasks");
+        }
+    }
+
     let _config_watcher = start_config_watcher(Arc::clone(&state))?;
     let _collection_watcher = start_collection_watcher(Arc::clone(&state))?;
     schedule_ingest_queue(Arc::clone(&state));
