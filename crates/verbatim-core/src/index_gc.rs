@@ -9,7 +9,16 @@ use serde::{Deserialize, Serialize};
 use crate::store::Store;
 use crate::types::EmbeddingProfileId;
 
-pub const DEFAULT_INDEX_GC_RETAIN_PREVIOUS_GENERATIONS: usize = 2;
+/// Number of previous index generations to keep on disk for rollback safety.
+///
+/// Previous default was 2 (current + 2 previous = 3 concurrent generations,
+/// ~1.2GB disk/RAM for HNSW at 18K vectors).  Reducing to 1 halves the
+/// rollback window while still allowing one-step rollback after a bad ingest.
+/// The primary memory cost during ingest is the in-flight rebuild holding the
+/// old and new HnswIndex simultaneously; lowering this constant reduces disk
+/// footprint and GC churn but does not eliminate the rebuild-time memory spike
+/// (#183 — that requires incremental HNSW or a lazy-load architecture).
+pub const DEFAULT_INDEX_GC_RETAIN_PREVIOUS_GENERATIONS: usize = 1;
 pub const DEFAULT_INDEX_GC_STALE_STAGING_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
