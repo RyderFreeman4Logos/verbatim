@@ -1778,7 +1778,7 @@ impl Store {
         profile_id: &EmbeddingProfileId,
     ) -> Result<Vec<VectorDocument>> {
         let mut stmt = self.conn.prepare(
-            "SELECT chunk_id, source_id, vector_json
+            "SELECT chunk_id, source_id, vector_blob, vector_json
              FROM chunk_vectors
              WHERE profile_id = ?1
              ORDER BY source_id, chunk_id",
@@ -1787,17 +1787,25 @@ impl Store {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })?;
 
         let mut result = Vec::new();
         for row in rows {
-            let (chunk_id, source_id, vector_json) = row?;
+            let (chunk_id, source_id, vector_blob, vector_json) = row?;
+            let vector = if let Some(blob) = vector_blob.as_ref().filter(|b| !b.is_empty()) {
+                blob_to_vector(blob)?
+            } else if let Some(json) = vector_json {
+                serde_json::from_str(&json).context("parse stored vector")?
+            } else {
+                anyhow::bail!("chunk {chunk_id} has neither vector_blob nor vector_json");
+            };
             result.push(VectorDocument {
                 chunk_id: ChunkId(chunk_id),
                 source_id: SourceId(source_id),
-                vector: serde_json::from_str(&vector_json).context("parse stored vector")?,
+                vector,
             });
         }
         Ok(result)
@@ -1844,7 +1852,7 @@ impl Store {
                 source_ids.sort_unstable();
                 let placeholders = vec!["?"; source_ids.len()].join(", ");
                 let sql = format!(
-                    "SELECT chunk_id, vector_json
+                    "SELECT chunk_id, vector_blob, vector_json
                      FROM chunk_vectors
                      WHERE profile_id = ? AND source_id IN ({placeholders})
                      ORDER BY source_id, chunk_id"
@@ -1854,11 +1862,22 @@ impl Store {
                 params.extend(source_ids.into_iter().map(str::to_string));
                 let mut stmt = self.conn.prepare(&sql)?;
                 let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
                 })?;
                 for row in rows {
-                    let (chunk_id, vector_json) = row?;
-                    let vector = parse_stored_vector(&chunk_id, &vector_json)?;
+                    let (chunk_id, vector_blob, vector_json) = row?;
+                    let vector = if let Some(blob) = vector_blob.as_ref().filter(|b| !b.is_empty())
+                    {
+                        blob_to_vector(blob)?
+                    } else {
+                        let json = vector_json
+                            .ok_or_else(|| anyhow::anyhow!("missing vector for {chunk_id}"))?;
+                        parse_stored_vector(&chunk_id, &json)?
+                    };
                     push_top_vector_hit(
                         &mut hits,
                         top_k,
@@ -1869,17 +1888,28 @@ impl Store {
             }
             None => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT chunk_id, vector_json
+                    "SELECT chunk_id, vector_blob, vector_json
                      FROM chunk_vectors
                      WHERE profile_id = ?1
                      ORDER BY source_id, chunk_id",
                 )?;
                 let rows = stmt.query_map(params![profile_id.as_str()], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
                 })?;
                 for row in rows {
-                    let (chunk_id, vector_json) = row?;
-                    let vector = parse_stored_vector(&chunk_id, &vector_json)?;
+                    let (chunk_id, vector_blob, vector_json) = row?;
+                    let vector = if let Some(blob) = vector_blob.as_ref().filter(|b| !b.is_empty())
+                    {
+                        blob_to_vector(blob)?
+                    } else {
+                        let json = vector_json
+                            .ok_or_else(|| anyhow::anyhow!("missing vector for {chunk_id}"))?;
+                        parse_stored_vector(&chunk_id, &json)?
+                    };
                     push_top_vector_hit(
                         &mut hits,
                         top_k,
@@ -1935,10 +1965,10 @@ impl Store {
         profile_config_hash: &str,
         embedding_input_hash: &str,
     ) -> Result<Option<Vec<f32>>> {
-        let vector_json = self
+        let row = self
             .conn
             .query_row(
-                "SELECT vector_json
+                "SELECT vector_blob, vector_json
                  FROM embedding_cache
                  WHERE profile_id = ?1
                    AND profile_config_hash = ?2
@@ -1948,12 +1978,24 @@ impl Store {
                     profile_config_hash,
                     embedding_input_hash,
                 ],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
             .optional()?;
-        vector_json
-            .map(|json| serde_json::from_str(&json).context("parse cached embedding vector"))
-            .transpose()
+        row.map(|(blob, json)| {
+            if let Some(b) = blob.as_ref().filter(|b| !b.is_empty()) {
+                blob_to_vector(b)
+            } else if let Some(j) = json {
+                serde_json::from_str(&j).context("parse cached embedding vector")
+            } else {
+                anyhow::bail!("embedding cache row has neither blob nor json")
+            }
+        })
+        .transpose()
     }
 
     pub fn record_embedding_cache_hit(
@@ -1994,21 +2036,24 @@ impl Store {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO embedding_cache
-                    (profile_id, profile_config_hash, embedding_input_hash, vector_json, dimension, cache_hits, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)
+                    (profile_id, profile_config_hash, embedding_input_hash, vector_json, vector_blob, dimension, cache_hits, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)
                  ON CONFLICT(profile_id, profile_config_hash, embedding_input_hash) DO UPDATE SET
                     vector_json = excluded.vector_json,
+                    vector_blob = excluded.vector_blob,
                     dimension = excluded.dimension,
                     updated_at = excluded.updated_at",
             )?;
             for entry in entries {
                 let vector_json =
                     serde_json::to_string(&entry.vector).context("serialize cached vector")?;
+                let vector_blob = vector_to_blob(&entry.vector);
                 stmt.execute(params![
                     profile_id.as_str(),
                     profile_config_hash,
                     &entry.embedding_input_hash,
                     vector_json,
+                    vector_blob,
                     sql_usize(entry.vector.len()),
                     &now,
                 ])?;
@@ -3028,6 +3073,68 @@ fn migrate_embedding_profile_tables(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS chunk_vectors_profile_source_idx
             ON chunk_vectors(profile_id, source_id);",
     )?;
+
+    // ── Vector BLOB migration (#171) ───────────────────────────────
+    // Add vector_blob BLOB columns alongside the legacy vector_json TEXT
+    // columns, then backfill from JSON in Rust (SQL can't parse JSON arrays
+    // to little-endian f32 bytes).  New writes go to vector_blob; reads
+    // prefer vector_blob and fall back to vector_json for compatibility.
+    if !table_has_column(conn, "chunk_vectors", "vector_blob")? {
+        conn.execute_batch("ALTER TABLE chunk_vectors ADD COLUMN vector_blob BLOB;")?;
+    }
+    if !table_has_column(conn, "embedding_cache", "vector_blob")? {
+        conn.execute_batch("ALTER TABLE embedding_cache ADD COLUMN vector_blob BLOB;")?;
+    }
+    // Backfill chunk_vectors.vector_blob from vector_json.
+    backfill_vector_blobs(conn, "chunk_vectors")?;
+    // Backfill embedding_cache.vector_blob from vector_json.
+    backfill_vector_blobs(conn, "embedding_cache")?;
+    Ok(())
+}
+
+/// Populate the vector_blob column from vector_json for rows where
+/// vector_blob IS NULL and vector_json is non-empty.
+fn backfill_vector_blobs(conn: &Connection, table: &str) -> Result<()> {
+    // Query rows needing backfill in batches to avoid loading the entire
+    // table into memory at once.  Uses unchecked_transaction() which works
+    // on a shared &Connection reference (we hold no other active tx).
+    loop {
+        let mut select = conn.prepare(&format!(
+            "SELECT rowid, vector_json FROM {table}
+             WHERE vector_blob IS NULL AND vector_json IS NOT NULL AND vector_json != ''
+             LIMIT 500"
+        ))?;
+        let rows: Vec<(i64, String)> = select
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(select);
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(&format!(
+                "UPDATE {table} SET vector_blob = ?1 WHERE rowid = ?2"
+            ))?;
+            for (rowid, json) in &rows {
+                match serde_json::from_str::<Vec<f32>>(json) {
+                    Ok(vector) => {
+                        let blob = vector_to_blob(&vector);
+                        stmt.execute(params![blob, rowid])?;
+                    }
+                    Err(_) => {
+                        // Mark malformed JSON as processed with an empty BLOB
+                        // so it doesn't cause an infinite loop on re-query.
+                        stmt.execute(params![Vec::<u8>::new(), rowid])?;
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -3685,6 +3792,33 @@ fn parse_stored_vector(chunk_id: &str, vector_json: &str) -> Result<Vec<f32>> {
         .with_context(|| format!("parse stored vector for chunk {chunk_id}"))
 }
 
+/// Serialize a vector as a compact little-endian f32 BLOB.
+fn vector_to_blob(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for &val in vector {
+        bytes.extend_from_slice(&val.to_le_bytes());
+    }
+    bytes
+}
+
+/// Deserialize a little-endian f32 BLOB back into a Vec<f32>.
+fn blob_to_vector(blob: &[u8]) -> Result<Vec<f32>> {
+    if !blob.len().is_multiple_of(4) {
+        anyhow::bail!("vector BLOB length {} is not a multiple of 4", blob.len());
+    }
+    let mut result = Vec::with_capacity(blob.len() / 4);
+    for chunk in blob.chunks_exact(4) {
+        // chunks_exact(4) guarantees 4-byte slices; the is_multiple_of
+        // guard above already verified blob.len() is divisible by 4.
+        let bytes: [u8; 4] = match chunk.try_into() {
+            Ok(arr) => arr,
+            Err(_) => continue, // unreachable given guards above
+        };
+        result.push(f32::from_le_bytes(bytes));
+    }
+    Ok(result)
+}
+
 fn vector_search_score(query: &[f32], vector: &[f32]) -> f32 {
     let distance = query
         .iter()
@@ -3767,17 +3901,19 @@ fn insert_vector_documents_for_profile_tx(
 ) -> Result<()> {
     let mut stmt = tx
         .prepare(
-            "INSERT INTO chunk_vectors (profile_id, chunk_id, source_id, vector_json)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO chunk_vectors (profile_id, chunk_id, source_id, vector_json, vector_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .context("prepare vector insert")?;
     for vector in vectors {
         let vector_json = serde_json::to_string(&vector.vector).context("serialize vector")?;
+        let vector_blob = vector_to_blob(&vector.vector);
         stmt.execute(params![
             profile_id.as_str(),
             &vector.chunk_id.0,
             &vector.source_id.0,
             vector_json,
+            vector_blob,
         ])
         .with_context(|| format!("insert vector for chunk {}", vector.chunk_id.0))?;
     }
@@ -4439,6 +4575,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vector_blob_roundtrip_preserves_values() {
+        // Verify vector_to_blob → blob_to_vector round-trips exactly.
+        let vector = vec![1.5f32, -2.3, 0.0, 42.0, f32::INFINITY, f32::NEG_INFINITY];
+        let blob = vector_to_blob(&vector);
+        let recovered = blob_to_vector(&blob).unwrap();
+        assert_eq!(vector, recovered);
+    }
+
+    #[test]
+    fn vector_blob_migration_backfills_existing_json_vectors() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_blob_migrate.db");
+        // Create store and insert a vector (writes both json and blob).
+        {
+            let store = Store::new(&db_path).unwrap();
+            let profile = EmbeddingProfileId::default_profile();
+            // Insert prerequisite source + chunk rows.
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at)
+                 VALUES ('s1', '/tmp/x', 'h', 'Indexed', 'test', NULL)",
+                    [],
+                )
+                .unwrap();
+            store.conn.execute(
+                "INSERT INTO chunks (id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json)
+                 VALUES ('c1', 's1', 'text', NULL, 1, 'Leaf', NULL, '[]')",
+                [],
+            ).unwrap();
+            let vectors = vec![VectorDocument {
+                chunk_id: ChunkId("c1".into()),
+                source_id: SourceId("s1".into()),
+                vector: vec![1.0f32, 2.0, 3.0],
+            }];
+            store
+                .replace_all_vector_documents_for_profile(&profile, &vectors)
+                .unwrap();
+        }
+        // Wipe vector_blob, then re-open (triggers migration backfill).
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute("UPDATE chunk_vectors SET vector_blob = NULL", [])
+                .unwrap();
+        }
+        let store = Store::new(&db_path).unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+        let docs = store.list_vector_documents_for_profile(&profile).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].vector, vec![1.0f32, 2.0, 3.0]);
+    }
     #[test]
     fn readonly_open_existing_does_not_run_migrations() {
         let dir = tempdir().unwrap();
