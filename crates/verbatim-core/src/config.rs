@@ -1759,7 +1759,7 @@ prefer_for_search = false
 timeout_seconds = 5
 
 [index_gc]
-retain_previous_generations = 2
+retain_previous_generations = 1
 stale_staging_seconds = 86400
 
 [cli]
@@ -1910,7 +1910,7 @@ mod tests {
         assert_eq!(config.qdrant.collection, "verbatim");
         assert!(!config.qdrant.prefer_for_search);
         assert_eq!(config.qdrant.timeout_seconds, 5);
-        assert_eq!(config.index_gc.retain_previous_generations, 2);
+        assert_eq!(config.index_gc.retain_previous_generations, 1);
         assert_eq!(config.index_gc.stale_staging_seconds, 86_400);
         assert!(config.collection_watcher.enabled);
         assert_eq!(config.collection_watcher.debounce_millis, 500);
@@ -2331,7 +2331,7 @@ model_supports_vision = true
         candidate.embedding.base_url = "http://127.0.0.1:18002/v1".into();
         candidate.embedding.capability_cache_ttl_seconds = 5;
         candidate.embedding.endpoint_runtime.queue_timeout_seconds = 60;
-        candidate.index_gc.retain_previous_generations = 1;
+        candidate.index_gc.retain_previous_generations = 0;
         candidate.index_gc.stale_staging_seconds = 3_600;
 
         let plan = current.reload_plan(&candidate).unwrap();
@@ -2360,7 +2360,7 @@ model_supports_vision = true
         assert_eq!(applied.embedding.base_url, "http://127.0.0.1:18002/v1");
         assert_eq!(applied.embedding.capability_cache_ttl_seconds, 5);
         assert_eq!(applied.embedding.endpoint_runtime.queue_timeout_seconds, 60);
-        assert_eq!(applied.index_gc.retain_previous_generations, 1);
+        assert_eq!(applied.index_gc.retain_previous_generations, 0);
         assert_eq!(applied.index_gc.stale_staging_seconds, 3_600);
     }
 
