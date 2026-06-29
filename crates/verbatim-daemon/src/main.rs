@@ -6452,20 +6452,25 @@ async fn source_has_active_ingest_task(
     source_hash: Option<&str>,
 ) -> Result<bool> {
     let source_id = source_id.clone();
-    let source_hash = source_hash.map(str::to_string);
+    let candidate_source_hash = source_hash.map(str::to_string);
     with_task_store_read(state, move |store| {
-        let Some(source_hash) = source_hash.as_deref() else {
-            return Ok(false);
-        };
         for task in store.active_tasks(TaskKind::Ingest)? {
             let request: PersistedIngestRequest = match serde_json::from_value(task.request) {
                 Ok(request) => request,
                 Err(_) => continue,
             };
-            if request.operation.as_deref().unwrap_or("ingest") == "ingest"
-                && request.source_id.as_deref() == Some(source_id.0.as_str())
-                && request.source_hash.as_deref() == Some(source_hash)
+            if request.operation.as_deref().unwrap_or("ingest") != "ingest"
+                || request.source_id.as_deref() != Some(source_id.0.as_str())
             {
+                continue;
+            }
+
+            let active_source_hash = request.source_hash.as_deref();
+            let matching_hashes = match (candidate_source_hash.as_deref(), active_source_hash) {
+                (Some(candidate_hash), Some(active_hash)) => candidate_hash == active_hash,
+                _ => false,
+            };
+            if active_source_hash.is_none() || matching_hashes {
                 return Ok(true);
             }
         }
@@ -9485,6 +9490,99 @@ mod tests {
         ensure_ingest_task_started(&state, &running_id)
             .await
             .unwrap();
+        let _ = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let outcome = maintain_collection_after_watch_event(&state, "articles")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.queued_task_ids, Vec::<String>::new());
+        let store = state.task_store.lock().unwrap();
+        let active_for_source = store
+            .active_tasks(TaskKind::Ingest)
+            .unwrap()
+            .into_iter()
+            .filter(|task| {
+                task.request
+                    .get("source_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_id.0.as_str())
+            })
+            .count();
+        assert_eq!(active_for_source, 1);
+    }
+
+    #[tokio::test]
+    async fn collection_watcher_maintenance_skips_hashless_production_ingest_intent() {
+        let test_dir = TestDir::new("collection-watcher-hashless-production-intent");
+        let root = test_dir.path().join("articles");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("one.md"), "one production source").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(sync) = sync_collection(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionSyncRequest {
+                paths: Vec::new(),
+                max_depth: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync.report.added, 1);
+        let source_id = collection_member_ids_for_test(&state, "articles").0;
+        state.ingest_queue_active.store(true, Ordering::Release);
+        let Json(created) = submit_ingest_task(
+            State(Arc::clone(&state)),
+            Json(TaskIngestRequest {
+                source_id: Some(source_id.0.clone()),
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+        state.ingest_queue_active.store(false, Ordering::Release);
+        let running = claim_startable_ingest_task(&state).await.unwrap().unwrap();
+        assert_eq!(running.id.0, created.task_id);
+        assert_eq!(
+            running
+                .request
+                .get("source_hash")
+                .and_then(serde_json::Value::as_str),
+            None
+        );
         let _ = update_collection_watcher(
             State(Arc::clone(&state)),
             Path("articles".into()),
