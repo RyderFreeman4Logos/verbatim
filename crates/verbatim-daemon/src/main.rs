@@ -52,7 +52,9 @@ use verbatim_core::generate::{
 };
 use verbatim_core::graphrag::GraphRagService;
 use verbatim_core::index_gc::{apply_index_gc, plan_index_gc, IndexGcApplyReport};
-use verbatim_core::ingest::{IndexingOutcome, IngestPipeline, SourceIngestOutcome};
+use verbatim_core::ingest::{
+    IndexingOutcome, IngestPipeline, SourceIngestFreshness, SourceIngestOutcome,
+};
 use verbatim_core::ocr::source_ingest_diagnostics;
 use verbatim_core::provider::openai_compatible::{
     model_endpoint_resource_snapshots, OpenAiCompatibleLlmReranker, OpenAiCompatibleReranker,
@@ -678,6 +680,8 @@ struct PersistedIngestRequest {
     operation: Option<String>,
     #[serde(default)]
     source_id: Option<String>,
+    #[serde(default)]
+    source_hash: Option<String>,
     #[serde(default)]
     force: bool,
     #[serde(default)]
@@ -6270,30 +6274,68 @@ async fn maintain_collection_after_watch_event(
                 .iter()
                 .map(|member| member.source_id.clone())
                 .collect::<HashSet<_>>();
-            let mut source_ids_to_ingest = diff
-                .added
-                .iter()
-                .map(|candidate| candidate.source_id.clone())
-                .chain(
-                    stale
-                        .into_iter()
-                        .filter(|source_id| member_source_ids.contains(source_id)),
-                )
-                .collect::<BTreeSet<_>>();
+            let mut ingest_candidates = BTreeMap::new();
+            for candidate in &diff.added {
+                match pipeline.source_ingest_freshness(&candidate.source_id)? {
+                    SourceIngestFreshness::NeedsIngest(reason) => {
+                        let candidate = collection_maintenance_ingest_candidate(
+                            pipeline,
+                            candidate.source_id.clone(),
+                            reason.as_str(),
+                        )?;
+                        ingest_candidates
+                            .entry(candidate.source_id.clone())
+                            .or_insert(candidate);
+                    }
+                    SourceIngestFreshness::Fresh => {
+                        tracing::info!(
+                            collection = %collection_name_for_sync,
+                            source = %candidate.source_id.0,
+                            reason = SourceIngestFreshness::Fresh.as_str(),
+                            "collection watcher skipped unchanged source ingest"
+                        );
+                    }
+                    SourceIngestFreshness::Missing => {
+                        tracing::info!(
+                            collection = %collection_name_for_sync,
+                            source = %candidate.source_id.0,
+                            reason = SourceIngestFreshness::Missing.as_str(),
+                            "collection watcher skipped missing source ingest"
+                        );
+                    }
+                }
+            }
+            for source_id in stale
+                .into_iter()
+                .filter(|source_id| member_source_ids.contains(source_id))
+            {
+                let candidate =
+                    collection_maintenance_ingest_candidate(pipeline, source_id, "stale")?;
+                ingest_candidates
+                    .entry(candidate.source_id.clone())
+                    .or_insert(candidate);
+            }
             for removed in &diff.removed {
                 if !removed.source_path.exists()
                     && pipeline.store().get_source(&removed.source_id)?.is_some()
                 {
                     runtime.block_on(pipeline.remove_source(&removed.source_id))?;
-                    source_ids_to_ingest.remove(&removed.source_id);
+                    ingest_candidates.remove(&removed.source_id);
                 }
             }
+            let skipped_unchanged_ingest = new_members
+                .iter()
+                .filter(|member| !ingest_candidates.contains_key(&member.source_id))
+                .filter_map(|member| pipeline.source_ingest_freshness(&member.source_id).ok())
+                .filter(|freshness| *freshness == SourceIngestFreshness::Fresh)
+                .count();
             Ok(CollectionMaintenanceSyncOutcome {
                 added: report.added,
                 removed: report.removed,
                 unchanged: report.unchanged,
                 auto_index_enabled: collection.auto_index_enabled,
-                source_ids_to_ingest: source_ids_to_ingest.into_iter().collect(),
+                skipped_unchanged_ingest,
+                ingest_candidates: ingest_candidates.into_values().collect(),
             })
         })
     })
@@ -6309,24 +6351,31 @@ async fn maintain_collection_after_watch_event(
     if !sync_outcome.auto_index_enabled {
         return Ok(outcome);
     }
-    for source_id in sync_outcome
-        .source_ids_to_ingest
+    if sync_outcome.skipped_unchanged_ingest > 0 {
+        tracing::info!(
+            collection = %collection_name,
+            skipped_unchanged = sync_outcome.skipped_unchanged_ingest,
+            "collection watcher skipped unchanged sources during auto-index maintenance"
+        );
+    }
+    for candidate in sync_outcome
+        .ingest_candidates
         .into_iter()
         .take(watcher_config.max_queued_tasks.max(1))
     {
-        if source_has_pending_ingest_task(state, &source_id).await? {
+        if source_has_active_ingest_task(
+            state,
+            &candidate.source_id,
+            candidate.source_hash.as_deref(),
+        )
+        .await?
+        {
             continue;
         }
         let task_id = create_persisted_task(
             state,
             TaskKind::Ingest,
-            ingest_task_request_metadata_with_queue_claim(
-                Some(&source_id.0),
-                false,
-                None,
-                false,
-                true,
-            ),
+            collection_watcher_ingest_request_metadata(&collection_name, &candidate),
         )
         .await
         .map_err(|(_, Json(error))| anyhow::anyhow!(error.error))?;
@@ -6344,19 +6393,80 @@ struct CollectionMaintenanceSyncOutcome {
     removed: usize,
     unchanged: usize,
     auto_index_enabled: bool,
-    source_ids_to_ingest: Vec<SourceId>,
+    skipped_unchanged_ingest: usize,
+    ingest_candidates: Vec<CollectionMaintenanceIngestCandidate>,
 }
 
-async fn source_has_pending_ingest_task(state: &SharedState, source_id: &SourceId) -> Result<bool> {
+struct CollectionMaintenanceIngestCandidate {
+    source_id: SourceId,
+    reason: &'static str,
+    source_hash: Option<String>,
+}
+
+fn collection_maintenance_ingest_candidate(
+    pipeline: &IngestPipeline,
+    source_id: SourceId,
+    reason: &'static str,
+) -> Result<CollectionMaintenanceIngestCandidate> {
+    let source_hash = pipeline
+        .store()
+        .get_source(&source_id)?
+        .map(|source| source.hash);
+    Ok(CollectionMaintenanceIngestCandidate {
+        source_id,
+        reason,
+        source_hash,
+    })
+}
+
+fn collection_watcher_ingest_request_metadata(
+    collection_name: &str,
+    candidate: &CollectionMaintenanceIngestCandidate,
+) -> serde_json::Value {
+    let mut request = ingest_task_request_metadata_with_queue_claim(
+        Some(&candidate.source_id.0),
+        false,
+        None,
+        false,
+        true,
+    );
+    if let serde_json::Value::Object(map) = &mut request {
+        map.insert(
+            "collection_name".into(),
+            serde_json::Value::String(collection_name.to_string()),
+        );
+        map.insert(
+            "enqueue_reason".into(),
+            serde_json::Value::String(candidate.reason.to_string()),
+        );
+        if let Some(source_hash) = &candidate.source_hash {
+            map.insert(
+                "source_hash".into(),
+                serde_json::Value::String(source_hash.clone()),
+            );
+        }
+    }
+    bounded_json(request)
+}
+
+async fn source_has_active_ingest_task(
+    state: &SharedState,
+    source_id: &SourceId,
+    source_hash: Option<&str>,
+) -> Result<bool> {
     let source_id = source_id.clone();
+    let source_hash = source_hash.map(str::to_string);
     with_task_store_read(state, move |store| {
-        for task in store.queued_tasks(TaskKind::Ingest)? {
+        for task in store.active_tasks(TaskKind::Ingest)? {
             let request: PersistedIngestRequest = match serde_json::from_value(task.request) {
                 Ok(request) => request,
                 Err(_) => continue,
             };
             if request.operation.as_deref().unwrap_or("ingest") == "ingest"
                 && request.source_id.as_deref() == Some(source_id.0.as_str())
+                && (source_hash.is_none()
+                    || request.source_hash.is_none()
+                    || request.source_hash.as_deref() == source_hash.as_deref())
             {
                 return Ok(true);
             }
@@ -9177,6 +9287,242 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn collection_watcher_maintenance_skips_added_member_when_source_is_fresh() {
+        let test_dir = TestDir::new("collection-watcher-fresh-added-member");
+        let root = test_dir.path().join("articles");
+        let source_path = root.join("one.md");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source_path, "one fresh source").unwrap();
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let source_id = run_with_pipeline(Arc::clone(&state), |pipeline| {
+            pipeline.add_source(&source_path)
+        })
+        .unwrap();
+        ingest_source_for_test(&state, &source_id).await;
+        let _ = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let outcome = maintain_collection_after_watch_event(&state, "articles")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.added, 1);
+        assert_eq!(outcome.queued_task_ids, Vec::<String>::new());
+        let store = state.task_store.lock().unwrap();
+        let active_duplicate = store
+            .active_tasks(TaskKind::Ingest)
+            .unwrap()
+            .into_iter()
+            .filter(|task| {
+                task.request
+                    .get("source_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_id.0.as_str())
+            })
+            .count();
+        assert_eq!(active_duplicate, 0);
+    }
+
+    #[tokio::test]
+    async fn collection_watcher_maintenance_queues_only_new_and_modified_sources() {
+        let test_dir = TestDir::new("collection-watcher-new-modified");
+        let root = test_dir.path().join("articles");
+        let unchanged_path = root.join("one.md");
+        let modified_path = root.join("two.md");
+        let added_path = root.join("three.md");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&unchanged_path, "one unchanged source").unwrap();
+        fs::write(&modified_path, "two original source").unwrap();
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(sync) = sync_collection(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionSyncRequest {
+                paths: Vec::new(),
+                max_depth: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync.report.added, 2);
+        let (unchanged_id, modified_id) = collection_member_ids_for_test(&state, "articles");
+        ingest_source_for_test(&state, &unchanged_id).await;
+        ingest_source_for_test(&state, &modified_id).await;
+        fs::write(&modified_path, "two modified source").unwrap();
+        fs::write(&added_path, "three new source").unwrap();
+        let _ = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+
+        let outcome = maintain_collection_after_watch_event(&state, "articles")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.queued_task_ids.len(), 2);
+        let added_id = SourceId::from_path(&fs::canonicalize(&added_path).unwrap());
+        let queued_source_ids = queued_source_ids_for_test(&state);
+        assert!(queued_source_ids.contains(&modified_id));
+        assert!(queued_source_ids.contains(&added_id));
+        assert!(!queued_source_ids.contains(&unchanged_id));
+    }
+
+    #[tokio::test]
+    async fn collection_watcher_maintenance_skips_running_source_ingest_intent() {
+        let test_dir = TestDir::new("collection-watcher-running-source-intent");
+        let root = test_dir.path().join("articles");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("one.md"), "one pending source").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(sync) = sync_collection(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionSyncRequest {
+                paths: Vec::new(),
+                max_depth: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync.report.added, 1);
+        let source_id = collection_member_ids_for_test(&state, "articles").0;
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some(&source_id.0),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+        let _ = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let outcome = maintain_collection_after_watch_event(&state, "articles")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.queued_task_ids, Vec::<String>::new());
+        let store = state.task_store.lock().unwrap();
+        let active_for_source = store
+            .active_tasks(TaskKind::Ingest)
+            .unwrap()
+            .into_iter()
+            .filter(|task| {
+                task.request
+                    .get("source_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_id.0.as_str())
+            })
+            .count();
+        assert_eq!(active_for_source, 1);
+    }
+
     #[test]
     fn collection_watcher_debounce_coalesces_collection_names() {
         let mut debounced = DebouncedCollectionSet::default();
@@ -11673,6 +12019,74 @@ mod tests {
 
     fn test_state(config: Config, data_dir: &FsPath, pipeline: IngestPipeline) -> SharedState {
         test_state_with_config_path(config, data_dir, pipeline, data_dir.join("config.toml"))
+    }
+
+    async fn ingest_source_for_test(state: &SharedState, source_id: &SourceId) {
+        let task_id = create_persisted_task(
+            state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some(&source_id.0),
+                false,
+                None,
+                false,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        let response = execute_ingest_task(
+            Arc::clone(state),
+            task_id,
+            IndexingTaskControls {
+                source_id: Some(source_id.0.clone()),
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+                ingest_batch_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.ingested, 1);
+    }
+
+    fn collection_member_ids_for_test(
+        state: &SharedState,
+        collection_name: &str,
+    ) -> (SourceId, SourceId) {
+        let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
+        let members = pipeline
+            .store()
+            .list_collection_members(collection_name)
+            .unwrap();
+        assert!(!members.is_empty());
+        let mut source_ids = members
+            .into_iter()
+            .map(|member| member.source_id)
+            .collect::<Vec<_>>();
+        if source_ids.len() == 1 {
+            let only = source_ids.remove(0);
+            return (only.clone(), only);
+        }
+        assert_eq!(source_ids.len(), 2);
+        (source_ids.remove(0), source_ids.remove(0))
+    }
+
+    fn queued_source_ids_for_test(state: &SharedState) -> Vec<SourceId> {
+        let store = state.task_store.lock().unwrap();
+        store
+            .queued_tasks(TaskKind::Ingest)
+            .unwrap()
+            .into_iter()
+            .filter_map(|task| {
+                task.request
+                    .get("source_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|id| SourceId(id.to_string()))
+            })
+            .collect()
     }
 
     fn config_watch_test_state(name: &str) -> (TestDir, SharedState) {

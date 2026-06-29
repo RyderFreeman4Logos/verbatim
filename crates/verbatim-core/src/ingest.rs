@@ -437,6 +437,49 @@ pub struct SourceIngestOutcome {
     pub result: std::result::Result<EmbeddingCacheStats, String>,
 }
 
+/// Freshness state for deciding whether an ingest task is necessary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceIngestFreshness {
+    Fresh,
+    Missing,
+    NeedsIngest(SourceIngestStaleReason),
+}
+
+impl SourceIngestFreshness {
+    /// Stable machine-readable reason for logs and task metadata.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Missing => "missing",
+            Self::NeedsIngest(reason) => reason.as_str(),
+        }
+    }
+
+    pub fn needs_ingest(self) -> bool {
+        matches!(self, Self::NeedsIngest(_))
+    }
+}
+
+/// Reason a source needs parse/vector ingest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceIngestStaleReason {
+    HashChanged,
+    NotIndexed,
+    VectorsStale,
+    OcrStale,
+}
+
+impl SourceIngestStaleReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HashChanged => "hash_changed",
+            Self::NotIndexed => "not_indexed",
+            Self::VectorsStale => "vectors_stale",
+            Self::OcrStale => "ocr_stale",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EmbeddingProfileSpec {
     provider: String,
@@ -1439,6 +1482,53 @@ where
         Ok(stale)
     }
 
+    /// Return whether a source currently needs ingest work without mutating source status.
+    pub fn source_ingest_freshness(&self, source_id: &SourceId) -> Result<SourceIngestFreshness> {
+        let Some(source) = self.store.get_source(source_id)? else {
+            return Ok(SourceIngestFreshness::Missing);
+        };
+        if !source.path.exists() {
+            return Ok(SourceIngestFreshness::Missing);
+        }
+        let current_hash = file_hash(&source.path)?;
+        if current_hash != source.hash {
+            return Ok(SourceIngestFreshness::NeedsIngest(
+                SourceIngestStaleReason::HashChanged,
+            ));
+        }
+        if source.status != SourceStatus::Indexed || source.parser_used.is_none() {
+            return Ok(SourceIngestFreshness::NeedsIngest(
+                SourceIngestStaleReason::NotIndexed,
+            ));
+        }
+        if self.embedding_enabled
+            && self
+                .store
+                .source_vectors_stale_for_profile(&self.active_profile_id, source_id)?
+        {
+            return Ok(SourceIngestFreshness::NeedsIngest(
+                SourceIngestStaleReason::VectorsStale,
+            ));
+        }
+        if let Some(provider) = &self.ocr_provider {
+            let profile = provider.profile();
+            let evidence = self.store.list_evidence_by_source(source_id)?;
+            let image_artifacts = self.store.list_image_artifacts_by_source(source_id)?;
+            let diagnostics = source_ingest_diagnostics(
+                &source.path,
+                &evidence,
+                &image_artifacts,
+                Some(&profile),
+            );
+            if ocr_profile_stale(&diagnostics, Some(&profile)) {
+                return Ok(SourceIngestFreshness::NeedsIngest(
+                    SourceIngestStaleReason::OcrStale,
+                ));
+            }
+        }
+        Ok(SourceIngestFreshness::Fresh)
+    }
+
     pub fn index_status(&self) -> Result<IndexStatusResponse> {
         let sources = self.store.list_sources()?;
         let mut current_hashes = HashMap::new();
@@ -1943,6 +2033,75 @@ where
         })
     }
 
+    fn prepared_source_is_noop_ingest(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source: &Source,
+        child_chunk_count: usize,
+        cache_stats: &EmbeddingCacheStats,
+    ) -> Result<bool> {
+        if !self.embedding_enabled
+            || cache_stats.changed_chunks != 0
+            || cache_stats.cache_misses != 0
+            || cache_stats.embedded_chunks != 0
+            || cache_stats.reused_chunks != child_chunk_count
+        {
+            return Ok(false);
+        }
+        let Some(existing) = self.store.get_source(&source.id)? else {
+            return Ok(false);
+        };
+        if existing.status != SourceStatus::Indexed
+            || existing.hash != source.hash
+            || existing.parser_used != source.parser_used
+        {
+            return Ok(false);
+        }
+        Ok(!self
+            .store
+            .source_vectors_stale_for_profile(profile_id, &source.id)?)
+    }
+
+    fn record_noop_source_ingest(
+        &self,
+        task_id: Option<&TaskId>,
+        profile_id: &EmbeddingProfileId,
+        source_id: &SourceId,
+        child_chunk_count: usize,
+        cache_stats: &EmbeddingCacheStats,
+    ) {
+        tracing::info!(
+            source = %source_id.0,
+            embedding_profile_id = %profile_id,
+            reused_chunks = cache_stats.reused_chunks,
+            changed_chunks = cache_stats.changed_chunks,
+            "skipping unchanged source ingest before vector index publish"
+        );
+        self.record_task_progress(
+            task_id,
+            TaskProgressSnapshot::phase(IngestTaskStage::TaskTerminalize.as_str())
+                .with_counter("sources", 1, Some(1))
+                .with_counter("reused_chunks", cache_stats.reused_chunks as u64, None)
+                .with_counter("changed_chunks", cache_stats.changed_chunks as u64, None)
+                .with_recent_status("source unchanged; vector index publish skipped")
+                .with_active_worker_kind("ingest"),
+        );
+        self.record_task_event(
+            task_id,
+            "noop",
+            "source ingest skipped because content and metadata are unchanged",
+            serde_json::json!({
+                "operation": "source_ingest_noop",
+                "reason": "unchanged_source",
+                "source_id": source_id.0.as_str(),
+                "embedding_profile_id": profile_id.as_str(),
+                "child_chunks": child_chunk_count,
+                "embedding_cache": cache_stats,
+                "vector_index_published": false,
+            }),
+        );
+    }
+
     async fn commit_prepared_source(
         &mut self,
         profile_id: &EmbeddingProfileId,
@@ -1950,6 +2109,21 @@ where
         vectors: Vec<VectorDocument>,
         cache_stats: EmbeddingCacheStats,
     ) -> Result<EmbeddingCacheStats> {
+        if self.prepared_source_is_noop_ingest(
+            profile_id,
+            &prepared_source.source,
+            prepared_source.child_chunks.len(),
+            &cache_stats,
+        )? {
+            self.record_noop_source_ingest(
+                prepared_source.task_id.as_ref(),
+                profile_id,
+                &prepared_source.source.id,
+                prepared_source.child_chunks.len(),
+                &cache_stats,
+            );
+            return Ok(cache_stats);
+        }
         let PreparedSourceIngest {
             task_id,
             source,
@@ -2689,31 +2863,51 @@ where
                     total_sources,
                     Some(&source_id),
                 ) {
-                    Ok(()) if batched_index_publish => match self
-                        .commit_prepared_source_without_index_publish(
+                    Ok(()) => {
+                        match self.prepared_source_is_noop_ingest(
                             profile_id,
-                            committable_source,
-                            source_vectors,
-                            source_cache_stats.clone(),
-                        )
-                        .await
-                    {
-                        Ok(committed) => {
-                            let stats = committed.cache_stats.clone();
-                            batched_committed_sources.push(committed);
-                            Ok(stats)
+                            &committable_source.source,
+                            child_count,
+                            &source_cache_stats,
+                        ) {
+                            Ok(true) => {
+                                self.record_noop_source_ingest(
+                                    task_id.as_ref(),
+                                    profile_id,
+                                    &source_id,
+                                    child_count,
+                                    &source_cache_stats,
+                                );
+                                Ok(source_cache_stats.clone())
+                            }
+                            Ok(false) if batched_index_publish => match self
+                                .commit_prepared_source_without_index_publish(
+                                    profile_id,
+                                    committable_source,
+                                    source_vectors,
+                                    source_cache_stats.clone(),
+                                )
+                                .await
+                            {
+                                Ok(committed) => {
+                                    let stats = committed.cache_stats.clone();
+                                    batched_committed_sources.push(committed);
+                                    Ok(stats)
+                                }
+                                Err(error) => Err(error.to_string()),
+                            },
+                            Ok(false) => self
+                                .commit_prepared_source(
+                                    profile_id,
+                                    committable_source,
+                                    source_vectors,
+                                    source_cache_stats.clone(),
+                                )
+                                .await
+                                .map_err(|error| error.to_string()),
+                            Err(error) => Err(error.to_string()),
                         }
-                        Err(error) => Err(error.to_string()),
-                    },
-                    Ok(()) => self
-                        .commit_prepared_source(
-                            profile_id,
-                            committable_source,
-                            source_vectors,
-                            source_cache_stats.clone(),
-                        )
-                        .await
-                        .map_err(|error| error.to_string()),
+                    }
                     Err(error) => Err(error.to_string()),
                 }
             };
@@ -9662,6 +9856,77 @@ model = "local-vision"
         assert_eq!(third.reused_chunks, 2);
         assert_eq!(third.embedded_chunks, 0);
         assert_eq!(embedding.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unchanged_reingest_skips_vector_index_publish() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("doc.md");
+        std::fs::write(&path, "# Alpha\n\nAlpha body.\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let embedding = RecordingEmbeddingClient::new();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            embedding.clone(),
+            tempdir.path().to_path_buf(),
+        );
+        let source_id = pipeline.add_source(&path).unwrap();
+        let first_task = TaskId("task-noop-first".into());
+        pipeline
+            .store()
+            .create_task(
+                &first_task,
+                TaskKind::Ingest,
+                &serde_json::json!({ "source_id": source_id.0 }),
+            )
+            .unwrap();
+        pipeline.store().start_task(&first_task).unwrap();
+        let first = pipeline
+            .ingest_source_with_task(&source_id, &first_task)
+            .await
+            .unwrap();
+        assert_eq!(first.changed_chunks, 1);
+        let generation_after_first = pipeline.store().index_generation().unwrap();
+
+        let second_task = TaskId("task-noop-second".into());
+        pipeline
+            .store()
+            .create_task(
+                &second_task,
+                TaskKind::Ingest,
+                &serde_json::json!({ "source_id": source_id.0 }),
+            )
+            .unwrap();
+        pipeline.store().start_task(&second_task).unwrap();
+        let second = pipeline
+            .ingest_source_with_task(&source_id, &second_task)
+            .await
+            .unwrap();
+
+        assert_eq!(second.cache_hits, 1);
+        assert_eq!(second.cache_misses, 0);
+        assert_eq!(second.reused_chunks, 1);
+        assert_eq!(second.changed_chunks, 0);
+        assert_eq!(second.embedded_chunks, 0);
+        assert_eq!(
+            pipeline.store().index_generation().unwrap(),
+            generation_after_first
+        );
+        assert_eq!(embedding.calls().len(), 1);
+        let second_spans = pipeline.store().list_task_spans(&second_task).unwrap();
+        assert!(!second_spans
+            .iter()
+            .any(|span| span.phase == IngestTaskStage::VectorIndex.as_str()));
+        let second_events = pipeline
+            .store()
+            .list_task_events(&second_task, None, 100)
+            .unwrap();
+        assert!(second_events.iter().any(|event| {
+            event.event_type == "noop"
+                && event.payload["operation"] == "source_ingest_noop"
+                && event.payload["vector_index_published"] == false
+        }));
     }
 
     fn child_chunk_for_heading<'a>(chunks: &'a [Chunk], heading: &str) -> &'a Chunk {
