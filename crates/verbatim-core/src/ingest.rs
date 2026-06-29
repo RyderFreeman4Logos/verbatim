@@ -445,6 +445,13 @@ pub enum SourceIngestFreshness {
     NeedsIngest(SourceIngestStaleReason),
 }
 
+/// Current source freshness plus the file fingerprint used to decide it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceIngestSnapshot {
+    pub freshness: SourceIngestFreshness,
+    pub current_hash: Option<String>,
+}
+
 impl SourceIngestFreshness {
     /// Stable machine-readable reason for logs and task metadata.
     pub fn as_str(self) -> &'static str {
@@ -1484,31 +1491,48 @@ where
 
     /// Return whether a source currently needs ingest work without mutating source status.
     pub fn source_ingest_freshness(&self, source_id: &SourceId) -> Result<SourceIngestFreshness> {
+        Ok(self.source_ingest_snapshot(source_id)?.freshness)
+    }
+
+    /// Return current source freshness and the current file hash used for the decision.
+    pub fn source_ingest_snapshot(&self, source_id: &SourceId) -> Result<SourceIngestSnapshot> {
         let Some(source) = self.store.get_source(source_id)? else {
-            return Ok(SourceIngestFreshness::Missing);
+            return Ok(SourceIngestSnapshot {
+                freshness: SourceIngestFreshness::Missing,
+                current_hash: None,
+            });
         };
         if !source.path.exists() {
-            return Ok(SourceIngestFreshness::Missing);
+            return Ok(SourceIngestSnapshot {
+                freshness: SourceIngestFreshness::Missing,
+                current_hash: None,
+            });
         }
-        let current_hash = file_hash(&source.path)?;
-        if current_hash != source.hash {
-            return Ok(SourceIngestFreshness::NeedsIngest(
-                SourceIngestStaleReason::HashChanged,
-            ));
+        let current_hash_value = file_hash(&source.path)?;
+        let current_hash = Some(current_hash_value.clone());
+        if current_hash_value != source.hash {
+            return Ok(SourceIngestSnapshot {
+                freshness: SourceIngestFreshness::NeedsIngest(SourceIngestStaleReason::HashChanged),
+                current_hash,
+            });
         }
         if source.status != SourceStatus::Indexed || source.parser_used.is_none() {
-            return Ok(SourceIngestFreshness::NeedsIngest(
-                SourceIngestStaleReason::NotIndexed,
-            ));
+            return Ok(SourceIngestSnapshot {
+                freshness: SourceIngestFreshness::NeedsIngest(SourceIngestStaleReason::NotIndexed),
+                current_hash,
+            });
         }
         if self.embedding_enabled
             && self
                 .store
                 .source_vectors_stale_for_profile(&self.active_profile_id, source_id)?
         {
-            return Ok(SourceIngestFreshness::NeedsIngest(
-                SourceIngestStaleReason::VectorsStale,
-            ));
+            return Ok(SourceIngestSnapshot {
+                freshness: SourceIngestFreshness::NeedsIngest(
+                    SourceIngestStaleReason::VectorsStale,
+                ),
+                current_hash,
+            });
         }
         if let Some(provider) = &self.ocr_provider {
             let profile = provider.profile();
@@ -1521,12 +1545,18 @@ where
                 Some(&profile),
             );
             if ocr_profile_stale(&diagnostics, Some(&profile)) {
-                return Ok(SourceIngestFreshness::NeedsIngest(
-                    SourceIngestStaleReason::OcrStale,
-                ));
+                return Ok(SourceIngestSnapshot {
+                    freshness: SourceIngestFreshness::NeedsIngest(
+                        SourceIngestStaleReason::OcrStale,
+                    ),
+                    current_hash,
+                });
             }
         }
-        Ok(SourceIngestFreshness::Fresh)
+        Ok(SourceIngestSnapshot {
+            freshness: SourceIngestFreshness::Fresh,
+            current_hash,
+        })
     }
 
     pub fn index_status(&self) -> Result<IndexStatusResponse> {
