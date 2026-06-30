@@ -68,7 +68,7 @@ use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeli
 use verbatim_core::store::{Store, TaskListFilter};
 use verbatim_core::task::{
     ask_request_metadata, ask_result_metadata, bounded_error, bounded_json, ingest_result_metadata,
-    ingest_task_request_metadata_with_queue_claim,
+    ingest_result_metadata_with_skips, ingest_task_request_metadata_with_queue_claim,
     ingest_task_request_metadata_with_queue_claim_and_batch, reindex_result_metadata,
     reindex_task_request_metadata_with_queue_claim,
     reindex_task_request_metadata_with_queue_claim_and_batch, retrieve_request_metadata,
@@ -1387,6 +1387,12 @@ struct BackgroundIngestSourceCandidate {
     source_hash: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct BackgroundIngestBatchExpansion {
+    sources: Vec<BackgroundIngestSourceCandidate>,
+    skipped_missing_sources: Vec<SourceId>,
+}
+
 async fn source_hash_for_ingest_task_metadata(
     state: &SharedState,
     source_id: &str,
@@ -1416,7 +1422,7 @@ async fn background_ingest_batch_sources(
     state: &SharedState,
     force: bool,
     vectors_only: bool,
-) -> Result<Vec<BackgroundIngestSourceCandidate>> {
+) -> Result<BackgroundIngestBatchExpansion> {
     if !force && !vectors_only {
         let config = runtime_config_snapshot(state)?.config;
         refresh_live_embedding_profile_capabilities(
@@ -1426,22 +1432,38 @@ async fn background_ingest_batch_sources(
         )
         .await?;
     }
+    let runtime = tokio::runtime::Handle::current();
     with_exclusive_pipeline(state, move |pipeline| {
+        let skipped_missing_sources = if vectors_only {
+            Vec::new()
+        } else {
+            runtime.block_on(pipeline.remove_missing_sources_for_all_source_ingest(None))?
+        };
         if !force && !vectors_only {
             pipeline.check_stale()?;
         }
         let sources = pipeline.store().list_sources()?;
-        sources
-            .into_iter()
-            .filter(|source| vectors_only || force || source.status != SourceStatus::Indexed)
-            .map(|source| {
-                let source_hash = pipeline.source_ingest_snapshot(&source.id)?.current_hash;
-                Ok(BackgroundIngestSourceCandidate {
+        let mut expansion = BackgroundIngestBatchExpansion {
+            skipped_missing_sources,
+            ..Default::default()
+        };
+        for source in sources {
+            let source_file_exists = source.path.exists();
+            if vectors_only
+                || (source_file_exists && (force || source.status != SourceStatus::Indexed))
+            {
+                let source_hash = if source_file_exists {
+                    pipeline.source_ingest_snapshot(&source.id)?.current_hash
+                } else {
+                    None
+                };
+                expansion.sources.push(BackgroundIngestSourceCandidate {
                     source_id: source.id,
                     source_hash,
-                })
-            })
-            .collect()
+                });
+            }
+        }
+        Ok(expansion)
     })
     .await
 }
@@ -4029,10 +4051,10 @@ async fn expand_next_unexpanded_ingest_batch(state: &SharedState) -> Result<bool
         return Ok(false);
     };
 
-    let sources =
+    let expansion =
         match background_ingest_batch_sources(state, candidate.force, candidate.vectors_only).await
         {
-            Ok(sources) => sources,
+            Ok(expansion) => expansion,
             Err(error) => {
                 finish_task_failed(state, &candidate.task_id, &error.to_string())
                     .await
@@ -4041,7 +4063,7 @@ async fn expand_next_unexpanded_ingest_batch(state: &SharedState) -> Result<bool
             }
         };
 
-    persist_ingest_batch_children(state, candidate, sources).await
+    persist_ingest_batch_children(state, candidate, expansion).await
 }
 
 async fn next_unexpanded_ingest_batch_parent_async(
@@ -4053,7 +4075,7 @@ async fn next_unexpanded_ingest_batch_parent_async(
 async fn persist_ingest_batch_children(
     state: &SharedState,
     candidate: IngestBatchExpansionCandidate,
-    sources: Vec<BackgroundIngestSourceCandidate>,
+    expansion: BackgroundIngestBatchExpansion,
 ) -> Result<bool> {
     with_task_store_write(state, move |store| {
         if store.count_running_tasks(TaskKind::Ingest)? > 0 {
@@ -4066,7 +4088,7 @@ async fn persist_ingest_batch_children(
             return Ok(false);
         };
 
-        for source in &sources {
+        for source in &expansion.sources {
             let child_id = TaskId::new();
             let child_request = ingest_task_request_metadata_with_source_hash(
                 ingest_task_request_metadata_with_queue_claim_and_batch(
@@ -4084,7 +4106,17 @@ async fn persist_ingest_batch_children(
             store.insert_task_event(&child_id, "queued", "task queued", &payload)?;
         }
 
-        if sources.is_empty() {
+        for source_id in &expansion.skipped_missing_sources {
+            persist_skipped_missing_ingest_child(
+                store,
+                &candidate.task_id,
+                candidate.embedding_profile_id.as_deref(),
+                candidate.vectors_only,
+                source_id,
+            )?;
+        }
+
+        if expansion.sources.is_empty() && expansion.skipped_missing_sources.is_empty() {
             let result = ingest_result_metadata(0, &EmbeddingCacheStats::default());
             let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
             if store.finish_task_success(&candidate.task_id, &result)? {
@@ -4109,13 +4141,59 @@ async fn persist_ingest_batch_children(
             "batch_expanded",
             "ingest batch children queued",
             &serde_json::json!({
-                "ingest_batch_id": candidate.task_id.0,
-                "children": sources.len(),
+                "ingest_batch_id": candidate.task_id.0.as_str(),
+                "children": expansion.sources.len() + expansion.skipped_missing_sources.len(),
+                "source_children": expansion.sources.len(),
+                "skipped_missing_sources": expansion.skipped_missing_sources.len(),
             }),
         )?;
+
+        if expansion.sources.is_empty() {
+            let child = ingest_batch_children(store, &candidate.task_id.0)?
+                .into_iter()
+                .find(|task| task.status == TaskStatus::Succeeded);
+            finalize_ingest_batch_parent_if_complete(store, child.as_ref())?;
+            return Ok(true);
+        }
         Ok::<_, anyhow::Error>(true)
     })
     .await
+}
+
+fn persist_skipped_missing_ingest_child(
+    store: &mut Store,
+    parent_id: &TaskId,
+    embedding_profile_id: Option<&str>,
+    vectors_only: bool,
+    source_id: &SourceId,
+) -> Result<()> {
+    let child_id = TaskId::new();
+    let child_request = ingest_task_request_metadata_with_queue_claim_and_batch(
+        Some(source_id.0.as_str()),
+        false,
+        embedding_profile_id,
+        vectors_only,
+        false,
+        Some(&parent_id.0),
+    );
+    let child = store.create_task(&child_id, TaskKind::Ingest, &child_request)?;
+    let payload = queued_event_payload(store, child)?;
+    store.insert_task_event(&child_id, "queued", "task queued", &payload)?;
+    let result = ingest_result_metadata_with_skips(0, &EmbeddingCacheStats::default(), 1);
+    if store.finish_task_success(&child_id, &result)? {
+        store.insert_task_event(
+            &child_id,
+            "skipped",
+            "source skipped: missing file",
+            &serde_json::json!({
+                "source_id": source_id.0.as_str(),
+                "reason": "missing_source",
+                "ingest_batch_id": parent_id.0.as_str(),
+            }),
+        )?;
+        store.insert_task_event(&child_id, "succeeded", "task succeeded", &result)?;
+    }
+    Ok(())
 }
 
 fn parse_persisted_ingest_request(request: serde_json::Value) -> Result<PersistedIngestRequest> {
@@ -4474,7 +4552,11 @@ async fn execute_started_ingest_task(
     finish_task_success(
         &state,
         task_id,
-        ingest_result_metadata(response.ingested, &outcome.embedding_cache),
+        ingest_result_metadata_with_skips(
+            response.ingested,
+            &outcome.embedding_cache,
+            outcome.skipped_missing_sources,
+        ),
     )
     .await?;
     tracing::debug!(
@@ -4768,6 +4850,7 @@ async fn run_indexing_operation(
                     {
                         Ok(embedding_cache) => Ok(IndexingOutcome {
                             source_count: 1,
+                            skipped_missing_sources: 0,
                             embedding_cache,
                         }),
                         Err(error) => Err(error),
@@ -5051,18 +5134,26 @@ fn ingest_batch_result_metadata(
     let mut succeeded = 0;
     let mut failed = 0;
     let mut cancelled = 0;
+    let mut skipped_missing_sources = 0;
 
     for child in children {
         match child.status {
             TaskStatus::Succeeded => {
                 succeeded += 1;
-                ingested += child
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.get("ingested"))
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .unwrap_or(1);
+                if let Some(result) = child.result.as_ref() {
+                    ingested += result
+                        .get("ingested")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(1);
+                    skipped_missing_sources += result
+                        .get("skipped_missing_sources")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or_default();
+                } else {
+                    ingested += 1;
+                }
                 if let Some(stats) = child
                     .result
                     .as_ref()
@@ -5089,6 +5180,10 @@ fn ingest_batch_result_metadata(
         map.insert("succeeded_children".into(), serde_json::json!(succeeded));
         map.insert("failed_children".into(), serde_json::json!(failed));
         map.insert("cancelled_children".into(), serde_json::json!(cancelled));
+        map.insert(
+            "skipped_missing_sources".into(),
+            serde_json::json!(skipped_missing_sources),
+        );
     }
     result
 }
@@ -6973,7 +7068,7 @@ mod tests {
     use verbatim_core::types::{
         Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind, EvidenceUnit,
         RetrievalDenseVectorPath, RetrievalEvidenceRole, RetrievalProvenance,
-        RetrievalRerankStatus, SourceLocator, VectorIndexResidency,
+        RetrievalRerankStatus, Source, SourceLocator, VectorIndexResidency,
     };
 
     fn has_task_terminalize_span(spans: &[verbatim_core::task::TaskSpan]) -> bool {
@@ -10492,6 +10587,7 @@ mod tests {
             .await
             .unwrap();
         let expanded_source_ids = expanded
+            .sources
             .iter()
             .map(|candidate| candidate.source_id.clone())
             .collect::<Vec<_>>();
@@ -11903,6 +11999,255 @@ mod tests {
         assert_eq!(parent.status, TaskStatus::Succeeded);
         assert!(has_task_terminalize_span(&parent_response.spans));
         assert_eq!(parent.result.unwrap()["ingested"], 2);
+    }
+
+    #[tokio::test]
+    async fn background_ingest_batch_indexes_json_source_and_succeeds_parent() {
+        use verbatim_core::collection::{CollectionMemberCandidate, CollectionSyncReport};
+
+        let test_dir = TestDir::new("ingest-batch-json-source");
+        let source_path = test_dir.path().join("article.json");
+        fs::write(
+            &source_path,
+            serde_json::json!({
+                "title": "Durable JSON article",
+                "body": "JSON collection members should not fail all-source ingest"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.store().create_collection("articles", &[]).unwrap();
+        pipeline
+            .store()
+            .replace_collection_members(
+                "articles",
+                &[CollectionMemberCandidate {
+                    source_id: source_id.clone(),
+                    logical_path: "article.json".into(),
+                    source_path: fs::canonicalize(&source_path).unwrap(),
+                }],
+                CollectionSyncReport {
+                    member_count: 0,
+                    added: 0,
+                    removed: 0,
+                    unchanged: 0,
+                    scanned_roots: 1,
+                    max_depth: 32,
+                    skipped: Vec::new(),
+                },
+            )
+            .unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        state.ingest_queue_active.store(true, Ordering::Release);
+
+        let Json(created) = submit_ingest_task(
+            State(Arc::clone(&state)),
+            Json(TaskIngestRequest {
+                source_id: None,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+        state.ingest_queue_active.store(false, Ordering::Release);
+        let parent_id = TaskId(created.task_id);
+        assert!(expand_next_unexpanded_ingest_batch(&state).await.unwrap());
+        let children = ingest_batch_children_for_test(&state, &parent_id);
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].request["source_id"].as_str(),
+            Some(source_id.0.as_str())
+        );
+
+        schedule_ingest_queue(Arc::clone(&state));
+        wait_for_ingest_queue_idle(&state).await;
+        wait_for_task_status(&state, &parent_id, TaskStatus::Succeeded).await;
+
+        let parent = task_summary_response(&state, parent_id).await.unwrap().task;
+        assert_eq!(parent.result.unwrap()["failed_children"], 0);
+        let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
+        let source = pipeline.store().get_source(&source_id).unwrap().unwrap();
+        assert_eq!(source.status, SourceStatus::Indexed);
+        assert_eq!(source.parser_used.as_deref(), Some("json"));
+        assert!(pipeline.check_stale().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_ingest_batch_prunes_missing_source_removed_by_collection_sync() {
+        use verbatim_core::collection::{CollectionMemberCandidate, CollectionSyncReport};
+
+        let test_dir = TestDir::new("ingest-batch-missing-source");
+        let missing_path = test_dir.path().join("removed.md");
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = SourceId("removed-md".into());
+        pipeline
+            .store()
+            .add_source(&Source {
+                id: source_id.clone(),
+                path: missing_path.clone(),
+                hash: "old-hash".into(),
+                status: SourceStatus::Stale,
+                parser_used: Some("markdown".into()),
+                last_ingested_at: None,
+            })
+            .unwrap();
+        pipeline.store().create_collection("articles", &[]).unwrap();
+        let report = || CollectionSyncReport {
+            member_count: 0,
+            added: 0,
+            removed: 0,
+            unchanged: 0,
+            scanned_roots: 1,
+            max_depth: 32,
+            skipped: Vec::new(),
+        };
+        pipeline
+            .store()
+            .replace_collection_members(
+                "articles",
+                &[CollectionMemberCandidate {
+                    source_id: source_id.clone(),
+                    logical_path: "removed.md".into(),
+                    source_path: missing_path,
+                }],
+                report(),
+            )
+            .unwrap();
+        pipeline
+            .store()
+            .replace_collection_members("articles", &[], report())
+            .unwrap();
+        assert!(pipeline
+            .store()
+            .list_collection_members("articles")
+            .unwrap()
+            .is_empty());
+        let state = test_state(config, test_dir.path(), pipeline);
+        state.ingest_queue_active.store(true, Ordering::Release);
+
+        let Json(created) = submit_ingest_task(
+            State(Arc::clone(&state)),
+            Json(TaskIngestRequest {
+                source_id: None,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+        state.ingest_queue_active.store(false, Ordering::Release);
+        let parent_id = TaskId(created.task_id);
+
+        assert!(expand_next_unexpanded_ingest_batch(&state).await.unwrap());
+
+        let parent = task_summary_response(&state, parent_id).await.unwrap().task;
+        assert_eq!(parent.status, TaskStatus::Succeeded);
+        let result = parent.result.unwrap();
+        assert_eq!(result["ingested"], 0);
+        assert_eq!(result["skipped_missing_sources"], 1);
+        assert_eq!(result["failed_children"], 0);
+        let children = ingest_batch_children_for_test(
+            &state,
+            &TaskId(result["ingest_batch_id"].as_str().unwrap().into()),
+        );
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, TaskStatus::Succeeded);
+        assert_eq!(
+            children[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .get("skipped_missing_sources"),
+            Some(&serde_json::json!(1))
+        );
+        let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
+        assert!(pipeline.store().get_source(&source_id).unwrap().is_none());
+        assert!(pipeline.check_stale().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_vectors_only_ingest_keeps_missing_source_with_stored_chunks() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("ingest-batch-vectors-only-missing-source");
+        let source_path = test_dir.path().join("removed.txt");
+        fs::write(
+            &source_path,
+            "vector-only rebuild should use stored chunks even when source path is gone. "
+                .repeat(80),
+        )
+        .unwrap();
+        let config = retrieve_test_config(&model_server.base_url);
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        let child_count = pipeline
+            .store()
+            .list_child_chunks()
+            .unwrap()
+            .into_iter()
+            .filter(|chunk| chunk.source_id == source_id)
+            .count();
+        assert!(child_count > 0);
+        fs::remove_file(&source_path).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        state.ingest_queue_active.store(true, Ordering::Release);
+
+        let Json(created) = submit_ingest_task(
+            State(Arc::clone(&state)),
+            Json(TaskIngestRequest {
+                source_id: None,
+                force: false,
+                embedding_profile_id: Some("alt-batch".into()),
+                vectors_only: true,
+            }),
+        )
+        .await
+        .unwrap();
+        state.ingest_queue_active.store(false, Ordering::Release);
+        let parent_id = TaskId(created.task_id);
+
+        assert!(expand_next_unexpanded_ingest_batch(&state).await.unwrap());
+        let children = ingest_batch_children_for_test(&state, &parent_id);
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].request["source_id"].as_str(),
+            Some(source_id.0.as_str())
+        );
+        assert!(children[0].request.get("source_hash").is_none());
+
+        schedule_ingest_queue(Arc::clone(&state));
+        wait_for_ingest_queue_idle(&state).await;
+        wait_for_task_status(&state, &parent_id, TaskStatus::Succeeded).await;
+
+        let parent = task_summary_response(&state, parent_id).await.unwrap().task;
+        let result = parent.result.unwrap();
+        assert_eq!(result["ingested"], 1);
+        assert_eq!(result["skipped_missing_sources"], 0);
+        assert_eq!(result["failed_children"], 0);
+        let pipeline = state.pipeline.lock().unwrap();
+        let pipeline = pipeline.as_ref().unwrap();
+        assert!(pipeline.store().get_source(&source_id).unwrap().is_some());
+        assert_eq!(
+            pipeline
+                .store()
+                .count_vector_documents_for_profile(
+                    &EmbeddingProfileId::new("alt-batch").unwrap(),
+                    Some(&source_id),
+                )
+                .unwrap(),
+            child_count
+        );
     }
 
     #[tokio::test]
