@@ -6405,23 +6405,15 @@ async fn maintain_collection_after_watch_event(
         .into_iter()
         .take(watcher_config.max_queued_tasks.max(1))
     {
-        if source_has_active_ingest_task(
+        if let Some(task_id) = create_collection_watcher_ingest_task_if_no_active_intent(
             state,
-            &candidate.source_id,
-            candidate.source_hash.as_deref(),
+            &collection_name,
+            candidate,
         )
         .await?
         {
-            continue;
+            outcome.queued_task_ids.push(task_id.0);
         }
-        let task_id = create_persisted_task(
-            state,
-            TaskKind::Ingest,
-            collection_watcher_ingest_request_metadata(&collection_name, &candidate),
-        )
-        .await
-        .map_err(|(_, Json(error))| anyhow::anyhow!(error.error))?;
-        outcome.queued_task_ids.push(task_id.0);
     }
     if !outcome.queued_task_ids.is_empty() {
         schedule_ingest_queue(Arc::clone(state));
@@ -6485,38 +6477,57 @@ fn collection_watcher_ingest_request_metadata(
     bounded_json(request)
 }
 
-async fn source_has_active_ingest_task(
+async fn create_collection_watcher_ingest_task_if_no_active_intent(
     state: &SharedState,
+    collection_name: &str,
+    candidate: CollectionMaintenanceIngestCandidate,
+) -> Result<Option<TaskId>> {
+    let collection_name = collection_name.to_string();
+    with_task_store_write(state, move |store| {
+        if store_has_active_ingest_task(
+            store,
+            &candidate.source_id,
+            candidate.source_hash.as_deref(),
+        )? {
+            return Ok(None);
+        }
+        let task_id = TaskId::new();
+        let task = store.create_task(
+            &task_id,
+            TaskKind::Ingest,
+            &collection_watcher_ingest_request_metadata(&collection_name, &candidate),
+        )?;
+        let payload = queued_event_payload(store, task)?;
+        store.insert_task_event(&task_id, "queued", "task queued", &payload)?;
+        Ok(Some(task_id))
+    })
+    .await
+}
+
+fn store_has_active_ingest_task(
+    store: &Store,
     source_id: &SourceId,
     source_hash: Option<&str>,
 ) -> Result<bool> {
-    let source_id = source_id.clone();
-    let candidate_source_hash = source_hash.map(str::to_string);
-    with_task_store_read(state, move |store| {
-        for task in store.active_tasks(TaskKind::Ingest)? {
-            let request: PersistedIngestRequest = match serde_json::from_value(task.request) {
-                Ok(request) => request,
-                Err(_) => continue,
-            };
-            if request.operation.as_deref().unwrap_or("ingest") != "ingest"
-                || request.source_id.as_deref() != Some(source_id.0.as_str())
-            {
-                continue;
-            }
-
-            if request.vectors_only {
-                continue;
-            }
-            if active_ingest_matches_source_hash(
-                candidate_source_hash.as_deref(),
-                request.source_hash.as_deref(),
-            ) {
-                return Ok(true);
-            }
+    for task in store.active_tasks(TaskKind::Ingest)? {
+        let request: PersistedIngestRequest = match serde_json::from_value(task.request) {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        if request.operation.as_deref().unwrap_or("ingest") != "ingest"
+            || request.source_id.as_deref() != Some(source_id.0.as_str())
+        {
+            continue;
         }
-        Ok(false)
-    })
-    .await
+
+        if request.vectors_only {
+            continue;
+        }
+        if active_ingest_matches_source_hash(source_hash, request.source_hash.as_deref()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn active_ingest_matches_source_hash(
@@ -9488,6 +9499,161 @@ mod tests {
         assert!(queued_source_ids.contains(&modified_id));
         assert!(queued_source_ids.contains(&added_id));
         assert!(!queued_source_ids.contains(&unchanged_id));
+    }
+
+    #[tokio::test]
+    async fn collection_watcher_maintenance_repeated_same_fingerprint_queues_once() {
+        let test_dir = TestDir::new("collection-watcher-repeated-source-fingerprint");
+        let root = test_dir.path().join("articles");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("one.md"), "one pending source").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(sync) = sync_collection(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionSyncRequest {
+                paths: Vec::new(),
+                max_depth: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync.report.added, 1);
+        let source_id = collection_member_ids_for_test(&state, "articles").0;
+        let source_hash = current_source_hash_for_test(&state, &source_id);
+        let _ = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+
+        let first = maintain_collection_after_watch_event(&state, "articles")
+            .await
+            .unwrap();
+        let second = maintain_collection_after_watch_event(&state, "articles")
+            .await
+            .unwrap();
+
+        assert_eq!(first.queued_task_ids.len(), 1);
+        assert_eq!(second.queued_task_ids, Vec::<String>::new());
+        assert_eq!(
+            active_ingest_intent_count_for_test(&state, &source_id, &source_hash),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_watcher_atomic_enqueue_dedupes_concurrent_same_fingerprint() {
+        let test_dir = TestDir::new("collection-watcher-concurrent-source-fingerprint");
+        let root = test_dir.path().join("articles");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("one.md"), "one pending source").unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(sync) = sync_collection(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionSyncRequest {
+                paths: Vec::new(),
+                max_depth: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync.report.added, 1);
+        let source_id = collection_member_ids_for_test(&state, "articles").0;
+        let source_hash = current_source_hash_for_test(&state, &source_id);
+        let worker_count = 8;
+        let barrier = Arc::new(tokio::sync::Barrier::new(worker_count));
+        let mut handles = Vec::new();
+        for _ in 0..worker_count {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            let source_id = source_id.clone();
+            let source_hash = source_hash.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                create_collection_watcher_ingest_task_if_no_active_intent(
+                    &state,
+                    "articles",
+                    CollectionMaintenanceIngestCandidate {
+                        source_id,
+                        reason: "stale",
+                        source_hash: Some(source_hash),
+                    },
+                )
+                .await
+            }));
+        }
+
+        let mut created = Vec::new();
+        for handle in handles {
+            if let Some(task_id) = handle.await.unwrap().unwrap() {
+                created.push(task_id);
+            }
+        }
+
+        assert_eq!(created.len(), 1);
+        assert_eq!(
+            active_ingest_intent_count_for_test(&state, &source_id, &source_hash),
+            1
+        );
     }
 
     #[tokio::test]
@@ -12674,6 +12840,33 @@ mod tests {
                     .map(|id| SourceId(id.to_string()))
             })
             .collect()
+    }
+
+    fn active_ingest_intent_count_for_test(
+        state: &SharedState,
+        source_id: &SourceId,
+        source_hash: &str,
+    ) -> usize {
+        let store = state.task_store.lock().unwrap();
+        store
+            .active_tasks(TaskKind::Ingest)
+            .unwrap()
+            .into_iter()
+            .filter(|task| {
+                let Ok(request) =
+                    serde_json::from_value::<PersistedIngestRequest>(task.request.clone())
+                else {
+                    return false;
+                };
+                request.operation.as_deref().unwrap_or("ingest") == "ingest"
+                    && request.source_id.as_deref() == Some(source_id.0.as_str())
+                    && !request.vectors_only
+                    && active_ingest_matches_source_hash(
+                        Some(source_hash),
+                        request.source_hash.as_deref(),
+                    )
+            })
+            .count()
     }
 
     fn current_source_hash_for_test(state: &SharedState, source_id: &SourceId) -> String {
