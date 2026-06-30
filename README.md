@@ -124,9 +124,14 @@ just install-local-daemon
 
 This installs release binaries to `~/.local/bin` by default, restarts the
 `systemd --user` daemon, and verifies health. `VERBATIM_SYSTEMD_USER_SERVICE`
-selects both the user unit name and the service restarted. Optional local hooks
-can be installed with `just install-local-daemon-hook post-merge` or
-`post-push`; they are opt-in because they restart the local daemon.
+selects both the user unit name and the service restarted. The readiness check
+waits up to 90 seconds by default so populated local indexes have time to open;
+set `VERBATIM_LOCAL_DAEMON_READINESS_TIMEOUT_SECONDS=<seconds>` to override it
+with a positive integer bound. On timeout, the recipe prints the selected
+service unit plus recent `systemctl --user status` and `journalctl --user -u`
+diagnostics before failing. Optional local hooks can be installed with
+`just install-local-daemon-hook post-merge` or `post-push`; they are opt-in
+because they restart the local daemon.
 
 The default generated unit is written to
 `~/.config/systemd/user/verbatim.service` unless `XDG_CONFIG_HOME` changes that

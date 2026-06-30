@@ -107,7 +107,12 @@ It builds release `verbatim` and `verbatim-daemon`, installs them to
 status`. Use `VERBATIM_LOCAL_BIN_DIR=/path/to/bin` or
 `VERBATIM_SYSTEMD_USER_SERVICE=name` for non-default local setups; the service
 name selects both `~/.config/systemd/user/<name>.service` and the
-`systemctl --user` target. If the selected unit is missing and unit writes are
+`systemctl --user` target. The readiness check waits up to 90 seconds by
+default; set `VERBATIM_LOCAL_DAEMON_READINESS_TIMEOUT_SECONDS=<seconds>` to a
+positive integer when a local populated DB/index needs a different bounded
+startup window. If readiness times out, the recipe reports the selected service
+unit and prints recent `systemctl --user status` plus `journalctl --user -u`
+diagnostics before failing. If the selected unit is missing and unit writes are
 disabled, or if the selected unit points at a different `verbatim-daemon`, the
 recipe fails before installing binaries instead of silently installing to the
 wrong path; set
