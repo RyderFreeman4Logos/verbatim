@@ -3,11 +3,11 @@ use std::io::{self, Write};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use verbatim_core::api::{
-    AskResponse, CheckStaleResponse, CitationResponse, CollectionFilterResponse,
-    CollectionResultProvenance, CollectionWatcherStatus, ConfigResponse, EvidenceResponse,
-    HealthResponse, IndexGcResponse, IndexProfileDeleteResponse, IndexStatusResponse,
-    IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse, TaskCreatedResponse,
-    TaskListAggregate, TaskListResponse, TaskReasonBucket, TaskWaitEvent,
+    AddCollectionRootResponse, AskResponse, CheckStaleResponse, CitationResponse,
+    CollectionFilterResponse, CollectionResultProvenance, CollectionWatcherStatus, ConfigResponse,
+    EvidenceResponse, HealthResponse, IndexGcResponse, IndexProfileDeleteResponse,
+    IndexStatusResponse, IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse,
+    TaskCreatedResponse, TaskListAggregate, TaskListResponse, TaskReasonBucket, TaskWaitEvent,
 };
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::index_gc::{IndexGcPlanEntry, IndexGcSkippedEntry};
@@ -182,6 +182,31 @@ where
             )?;
         }
     }
+    Ok(())
+}
+
+pub fn write_collection_root_summary<W>(
+    writer: &mut W,
+    response: &AddCollectionRootResponse,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer, "Collection root:")?;
+    writeln!(writer, "  collection: {}", response.collection_name)?;
+    writeln!(
+        writer,
+        "  action: {}",
+        if response.added {
+            "added"
+        } else {
+            "already_present"
+        }
+    )?;
+    writeln!(writer, "  path: {}", response.root.path.display())?;
+    writeln!(writer, "  kind: {}", response.root.kind.as_str())?;
+    writeln!(writer, "  roots: {}", response.root_count)?;
+    writeln!(writer, "  members: {}", response.member_count)?;
     Ok(())
 }
 
