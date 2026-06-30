@@ -462,7 +462,7 @@ where
                     path: absolute_cli_path(&path)?.display().to_string(),
                 },
             )?;
-            render::write_collection(stdout, &response)?;
+            render::write_collection_root_summary(stdout, &response)?;
         }
         CollectionCommand::List => {
             let collections = client.list_collections()?;
@@ -1786,8 +1786,8 @@ mod tests {
 
     use serde_json::Value;
     use verbatim_core::api::{
-        AddCollectionRootRequest, AddSourceResponse, CheckStaleResponse, CitationResponse,
-        CollectionResponse, CollectionStatusResponse, CollectionSyncRequest,
+        AddCollectionRootRequest, AddCollectionRootResponse, AddSourceResponse, CheckStaleResponse,
+        CitationResponse, CollectionResponse, CollectionStatusResponse, CollectionSyncRequest,
         CollectionSyncResponse, CollectionWatcherResponse, CollectionWatcherStatus,
         CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
         CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse, ReindexRequest,
@@ -2260,7 +2260,14 @@ mod tests {
             client.last_collection_root.borrow().as_ref().unwrap().path,
             "/tmp/articles"
         );
-        assert!(stdout.contains("Roots:"));
+        assert!(stdout.contains("Collection root:"));
+        assert!(stdout.contains("action: added"));
+        assert!(stdout.contains("collection: articles"));
+        assert!(stdout.contains("path: /tmp/articles"));
+        assert!(stdout.contains("kind: directory"));
+        assert!(stdout.contains("roots: 1"));
+        assert!(stdout.contains("members: 1"));
+        assert!(!stdout.contains("Members:"));
         assert!(stderr.is_empty());
 
         let (code, stdout, stderr, client, _) = run_mock(["collection", "list"]);
@@ -2314,6 +2321,50 @@ mod tests {
             ["delete_collection:articles"]
         );
         assert!(stdout.contains("Deleted collection: articles"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn collection_add_root_existing_output_is_bounded_for_large_membership() {
+        let client = MockDaemonClient::default();
+        client
+            .collection_root_response
+            .replace(Some(AddCollectionRootResponse {
+                collection_name: "articles".into(),
+                root: sample_collection_root(),
+                root_count: 1,
+                member_count: 2_250,
+                added: false,
+            }));
+        let local = MockLocalActions::default();
+
+        let (code, stdout, stderr) = run_mock_with(
+            ["collection", "add-root", "articles", "/tmp/articles"],
+            &client,
+            &local,
+        );
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["add_collection_root:articles"]
+        );
+        assert!(stdout.contains("Collection root:"));
+        assert!(stdout.contains("action: already_present"));
+        assert!(stdout.contains("collection: articles"));
+        assert!(stdout.contains("path: /tmp/articles"));
+        assert!(stdout.contains("kind: directory"));
+        assert!(stdout.contains("roots: 1"));
+        assert!(stdout.contains("members: 2250"));
+        assert!(!stdout.contains("Members:"));
+        assert!(!stdout.contains("logical="));
+        assert!(!stdout.contains("/tmp/articles/member-2249.md"));
+        assert!(stdout.len() < 512, "stdout was {} bytes", stdout.len());
+        assert!(
+            stdout.lines().count() <= 8,
+            "stdout was {} lines:\n{stdout}",
+            stdout.lines().count()
+        );
         assert!(stderr.is_empty());
     }
 
@@ -3534,6 +3585,7 @@ mod tests {
         last_index_profile_delete: RefCell<Option<IndexProfileDeleteRequest>>,
         last_collection_create: RefCell<Option<CreateCollectionRequest>>,
         last_collection_root: RefCell<Option<AddCollectionRootRequest>>,
+        collection_root_response: RefCell<Option<AddCollectionRootResponse>>,
         last_collection_sync: RefCell<Option<CollectionSyncRequest>>,
         last_watcher_update: RefCell<Option<CollectionWatcherUpdateRequest>>,
         list_error: Option<CliError>,
@@ -3586,12 +3638,16 @@ mod tests {
             &self,
             name: &str,
             request: &AddCollectionRootRequest,
-        ) -> client::CliResult<CollectionResponse> {
+        ) -> client::CliResult<AddCollectionRootResponse> {
             self.calls
                 .borrow_mut()
                 .push(format!("add_collection_root:{name}"));
             self.last_collection_root.replace(Some(request.clone()));
-            Ok(sample_collection_response())
+            Ok(self
+                .collection_root_response
+                .borrow()
+                .clone()
+                .unwrap_or_else(sample_add_collection_root_response))
         }
 
         fn list_collections(&self) -> client::CliResult<Vec<CollectionRecord>> {
@@ -4010,17 +4066,31 @@ mod tests {
         }
     }
 
+    fn sample_collection_root() -> CollectionRoot {
+        CollectionRoot {
+            collection_name: "articles".into(),
+            path: PathBuf::from("/tmp/articles"),
+            canonical_path: Some(PathBuf::from("/tmp/articles")),
+            kind: CollectionRootKind::Directory,
+            added_at: "1".into(),
+            updated_at: "2".into(),
+        }
+    }
+
+    fn sample_add_collection_root_response() -> AddCollectionRootResponse {
+        AddCollectionRootResponse {
+            collection_name: "articles".into(),
+            root: sample_collection_root(),
+            root_count: 1,
+            member_count: 1,
+            added: true,
+        }
+    }
+
     fn sample_collection_response() -> CollectionResponse {
         CollectionResponse {
             collection: sample_collection_record(),
-            roots: vec![CollectionRoot {
-                collection_name: "articles".into(),
-                path: PathBuf::from("/tmp/articles"),
-                canonical_path: Some(PathBuf::from("/tmp/articles")),
-                kind: CollectionRootKind::Directory,
-                added_at: "1".into(),
-                updated_at: "2".into(),
-            }],
+            roots: vec![sample_collection_root()],
             members: vec![verbatim_core::collection::CollectionMember {
                 collection_name: "articles".into(),
                 source_id: SourceId("src-1".into()),

@@ -9,14 +9,14 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use verbatim_core::api::{
-    AddCollectionRootRequest, AddSourceRequest, AddSourceResponse, ApiHttpMethod, AskRequest,
-    CheckStaleResponse, CollectionApiEndpoint, CollectionResponse, CollectionStatusResponse,
-    CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
-    CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
-    CreateCollectionRequest, EvidenceResponse, HealthResponse, IndexGcRequest, IndexGcResponse,
-    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
-    ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse, SourceResponse,
-    TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskListResponse,
+    AddCollectionRootRequest, AddCollectionRootResponse, AddSourceRequest, AddSourceResponse,
+    ApiHttpMethod, AskRequest, CheckStaleResponse, CollectionApiEndpoint, CollectionResponse,
+    CollectionStatusResponse, CollectionSyncRequest, CollectionSyncResponse,
+    CollectionWatcherResponse, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
+    ConfigResponse, CreateCollectionRequest, EvidenceResponse, HealthResponse, IndexGcRequest,
+    IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse,
+    IngestResponse, ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse,
+    SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskListResponse,
     TaskSummaryResponse,
 };
 use verbatim_core::collection::CollectionRecord;
@@ -89,7 +89,7 @@ pub trait DaemonClient {
         &self,
         name: &str,
         request: &AddCollectionRootRequest,
-    ) -> CliResult<CollectionResponse>;
+    ) -> CliResult<AddCollectionRootResponse>;
     fn list_collections(&self) -> CliResult<Vec<CollectionRecord>>;
     fn get_collection(&self, name: &str) -> CliResult<CollectionResponse>;
     fn delete_collection(&self, name: &str) -> CliResult<()>;
@@ -350,7 +350,7 @@ impl DaemonClient for HttpDaemonClient {
         &self,
         name: &str,
         request: &AddCollectionRootRequest,
-    ) -> CliResult<CollectionResponse> {
+    ) -> CliResult<AddCollectionRootResponse> {
         let route = CollectionApiEndpoint::AddCollectionRoot;
         self.request_json(collection_method(route), &route.path(name), Some(request))
     }
@@ -1187,6 +1187,13 @@ mod tests {
             "{\"collection\":{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"},",
             "\"roots\":[],\"members\":[]}"
         );
+        let collection_root = concat!(
+            "{\"collection_name\":\"articles\",",
+            "\"root\":{\"collection_name\":\"articles\",\"path\":\"/tmp/articles\",",
+            "\"canonical_path\":\"/tmp/articles\",\"kind\":\"directory\",",
+            "\"added_at\":\"1\",\"updated_at\":\"2\"},",
+            "\"root_count\":1,\"member_count\":1,\"added\":true}"
+        );
         let collection_list = "[{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}]";
         let sync = concat!(
             "{\"report\":{\"member_count\":1,\"added\":1,\"removed\":0,\"unchanged\":0,",
@@ -1208,7 +1215,7 @@ mod tests {
         let watchers = format!("{{\"watchers\":[{watcher_status}]}}");
         let server = TestServer::respond_many(vec![
             json_response("201 Created", collection),
-            json_response("200 OK", collection),
+            json_response("200 OK", collection_root),
             json_response("200 OK", collection_list),
             json_response("200 OK", collection),
             "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
@@ -1231,7 +1238,7 @@ mod tests {
                 .name,
             "articles"
         );
-        assert_eq!(
+        assert!(
             client
                 .add_collection_root(
                     "articles",
@@ -1240,9 +1247,7 @@ mod tests {
                     },
                 )
                 .unwrap()
-                .collection
-                .name,
-            "articles"
+                .added
         );
         assert_eq!(client.list_collections().unwrap()[0].name, "articles");
         assert_eq!(

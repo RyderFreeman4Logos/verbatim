@@ -234,6 +234,15 @@ pub struct AddCollectionRootRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddCollectionRootResponse {
+    pub collection_name: String,
+    pub root: CollectionRoot,
+    pub root_count: usize,
+    pub member_count: usize,
+    pub added: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionSyncPathRequest {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

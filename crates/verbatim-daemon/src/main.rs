@@ -23,16 +23,17 @@ use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 
 use verbatim_core::api::{
-    AddCollectionRootRequest, AddSourceRequest, AddSourceResponse, AppliedCollectionFilterResponse,
-    AskCitationEvent, AskErrorEvent, AskRequest, AskResponse, AskTokenEvent, CheckStaleResponse,
-    CitationResponse, CollectionApiEndpoint, CollectionFilterRequest, CollectionFilterResponse,
-    CollectionResponse, CollectionResultProvenance, CollectionStatusResponse,
-    CollectionSyncPathRequest, CollectionSyncRequest, CollectionSyncResponse,
-    CollectionWatcherResponse, CollectionWatcherStatus, CollectionWatcherUpdateRequest,
-    CollectionWatchersStatusResponse, ConfigResponse, CreateCollectionRequest, ErrorResponse,
-    EvidenceResponse, HealthResponse, ImageArtifactResponse, IndexGcRequest, IndexGcResponse,
-    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
-    ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
+    AddCollectionRootRequest, AddCollectionRootResponse, AddSourceRequest, AddSourceResponse,
+    AppliedCollectionFilterResponse, AskCitationEvent, AskErrorEvent, AskRequest, AskResponse,
+    AskTokenEvent, CheckStaleResponse, CitationResponse, CollectionApiEndpoint,
+    CollectionFilterRequest, CollectionFilterResponse, CollectionResponse,
+    CollectionResultProvenance, CollectionStatusResponse, CollectionSyncPathRequest,
+    CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
+    CollectionWatcherStatus, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
+    ConfigResponse, CreateCollectionRequest, ErrorResponse, EvidenceResponse, HealthResponse,
+    ImageArtifactResponse, IndexGcRequest, IndexGcResponse, IndexProfileDeleteRequest,
+    IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse, ReindexRequest,
+    ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
     RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
     TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskIngestRequest, TaskListAggregate,
     TaskListResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
@@ -1134,15 +1135,22 @@ async fn add_collection_root(
     State(state): State<SharedState>,
     Path(name): Path<String>,
     Json(req): Json<AddCollectionRootRequest>,
-) -> Result<Json<CollectionResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<AddCollectionRootResponse>, (StatusCode, Json<ErrorResponse>)> {
     let name_for_error = name.clone();
     let response = with_task_store_write(&state, move |store| {
         let path = PathBuf::from(req.path);
-        store.add_collection_root(&name, &path)?;
-        let collection = store
-            .get_collection(&name)?
+        let already_present = store.get_collection_root(&name, &path)?.is_some();
+        let root = store.add_collection_root(&name, &path)?;
+        let status = store
+            .collection_status(&name)?
             .with_context(|| format!("collection not found: {name}"))?;
-        collection_response(store, collection)
+        Ok(AddCollectionRootResponse {
+            collection_name: status.collection.name,
+            root,
+            root_count: status.root_count,
+            member_count: status.member_count,
+            added: !already_present,
+        })
     })
     .await
     .map_err(|e| collection_error(&name_for_error, e))?;
@@ -9108,7 +9116,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(with_root.roots.len(), 1);
+        assert!(with_root.added);
+        assert_eq!(with_root.root_count, 1);
+        assert_eq!(with_root.member_count, 0);
 
         let Json(sync) = sync_collection(
             State(Arc::clone(&state)),
@@ -9134,6 +9144,100 @@ mod tests {
             .unwrap();
         assert_eq!(status.status.member_count, 1);
         assert_eq!(status.status.root_count, 1);
+    }
+
+    #[tokio::test]
+    async fn add_collection_root_existing_response_is_compact_with_many_members() {
+        let test_dir = TestDir::new("collection-root-compact");
+        let root = test_dir.path().join("articles");
+        fs::create_dir_all(&root).unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let (status, Json(created)) = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created.collection.name, "articles");
+
+        let Json(first_add) = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(first_add.added);
+        assert_eq!(first_add.root_count, 1);
+        assert_eq!(first_add.member_count, 0);
+
+        let member_root = root.clone();
+        with_task_store_write(&state, move |store| {
+            let candidates = (0..128)
+                .map(|index| {
+                    let source_id = SourceId(format!("src-{index}"));
+                    let source_path = member_root.join(format!("member-{index}.md"));
+                    store.add_source(&verbatim_core::types::Source {
+                        id: source_id.clone(),
+                        path: source_path.clone(),
+                        hash: format!("hash-{index}"),
+                        status: SourceStatus::Pending,
+                        parser_used: None,
+                        last_ingested_at: None,
+                    })?;
+                    Ok(CollectionMemberCandidate {
+                        source_id,
+                        logical_path: format!("member-{index}.md"),
+                        source_path,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            store.replace_collection_members(
+                "articles",
+                &candidates,
+                verbatim_core::collection::CollectionSyncReport {
+                    member_count: 0,
+                    added: 0,
+                    removed: 0,
+                    unchanged: 0,
+                    scanned_roots: 1,
+                    max_depth: 32,
+                    skipped: Vec::new(),
+                },
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let Json(existing_add) = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(!existing_add.added);
+        assert_eq!(existing_add.collection_name, "articles");
+        assert_eq!(existing_add.root.path, root);
+        assert_eq!(existing_add.root.kind.as_str(), "directory");
+        assert_eq!(existing_add.root_count, 1);
+        assert_eq!(existing_add.member_count, 128);
+        let wire = serde_json::to_string(&existing_add).unwrap();
+        assert!(!wire.contains("\"members\":["));
+        assert!(!wire.contains("member-127.md"));
     }
 
     #[tokio::test]
