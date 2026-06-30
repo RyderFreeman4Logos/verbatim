@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -426,6 +427,7 @@ struct EmbeddingBatchMetrics {
 #[derive(Debug, Clone, Default)]
 pub struct IndexingOutcome {
     pub source_count: usize,
+    pub skipped_missing_sources: usize,
     pub embedding_cache: EmbeddingCacheStats,
 }
 
@@ -1438,6 +1440,48 @@ where
             )
         })?;
         Ok(())
+    }
+
+    pub async fn remove_missing_sources_for_all_source_ingest(
+        &mut self,
+        task_id: Option<&TaskId>,
+    ) -> Result<Vec<SourceId>> {
+        self.remove_missing_sources_for_all_source_ingest_with(task_id, source_path_is_missing)
+            .await
+    }
+
+    async fn remove_missing_sources_for_all_source_ingest_with(
+        &mut self,
+        task_id: Option<&TaskId>,
+        mut source_path_is_missing: impl FnMut(&Path) -> Result<bool>,
+    ) -> Result<Vec<SourceId>> {
+        let missing_source_ids = self
+            .store
+            .list_sources()?
+            .into_iter()
+            .filter_map(|source| match source_path_is_missing(&source.path) {
+                Ok(true) => Some(Ok(source.id)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let total = missing_source_ids.len();
+        for (index, source_id) in missing_source_ids.iter().enumerate() {
+            tracing::warn!(
+                source = %source_id.0,
+                "removing missing source before all-source ingest"
+            );
+            self.record_task_progress(
+                task_id,
+                TaskProgressSnapshot::phase(IngestTaskStage::Ingest.as_str())
+                    .with_counter("missing_sources", index as u64, Some(total as u64))
+                    .with_recent_status("removing missing source"),
+            );
+            self.remove_source(source_id)
+                .await
+                .with_context(|| format!("remove missing source: {}", source_id.0))?;
+        }
+        Ok(missing_source_ids)
     }
 
     pub fn check_stale(&self) -> Result<Vec<SourceId>> {
@@ -3372,6 +3416,10 @@ where
         task_id: Option<&TaskId>,
     ) -> Result<IndexingOutcome> {
         self.refresh_embedding_profile_capabilities().await?;
+        let skipped_missing_sources = self
+            .remove_missing_sources_for_all_source_ingest(task_id)
+            .await?
+            .len();
         if !force {
             self.check_stale()?;
         }
@@ -3386,6 +3434,7 @@ where
         let total = to_ingest.len();
         let mut outcome = IndexingOutcome {
             source_count: total,
+            skipped_missing_sources,
             embedding_cache: EmbeddingCacheStats::default(),
         };
         let active_profile_id = self.active_profile_id.clone();
@@ -3863,6 +3912,7 @@ where
         }
         Ok(IndexingOutcome {
             source_count: target_source_ids.len(),
+            skipped_missing_sources: 0,
             embedding_cache: cache_stats,
         })
     }
@@ -5999,6 +6049,16 @@ fn file_hash(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(&data);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn source_path_is_missing(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => {
+            Err(error).with_context(|| format!("check source path metadata: {}", path.display()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8840,6 +8900,124 @@ model = "local-vision"
                         })
                     })
         }));
+    }
+
+    #[tokio::test]
+    async fn ingest_all_indexes_json_source_as_searchable_text() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let source_path = tempdir.path().join("article.json");
+        fs::write(
+            &source_path,
+            serde_json::json!({
+                "title": "Cognitive arbitrage",
+                "body": {
+                    "summary": "JSON collection members should be searchable",
+                    "tags": ["retrieval", "durable collections"]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+
+        let outcome = pipeline.ingest_all(false).await.unwrap();
+
+        assert_eq!(outcome.source_count, 1);
+        let source = pipeline.store().get_source(&source_id).unwrap().unwrap();
+        assert_eq!(source.status, SourceStatus::Indexed);
+        assert_eq!(source.parser_used.as_deref(), Some("json"));
+        let evidence = pipeline
+            .store()
+            .list_evidence_by_source(&source_id)
+            .unwrap();
+        assert_eq!(evidence.len(), 4);
+        assert!(evidence
+            .iter()
+            .any(|unit| unit.text.contains("Cognitive arbitrage")));
+        assert!(!pipeline
+            .lexical_index()
+            .search("durable collections", 5)
+            .unwrap()
+            .is_empty());
+        assert!(pipeline.check_stale().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_all_prunes_missing_registered_source_without_failure() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let missing_path = tempdir.path().join("removed.md");
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        pipeline
+            .store()
+            .add_source(&Source {
+                id: SourceId("removed-md".into()),
+                path: missing_path,
+                hash: "old-hash".into(),
+                status: SourceStatus::Stale,
+                parser_used: Some("markdown".into()),
+                last_ingested_at: None,
+            })
+            .unwrap();
+
+        let outcome = pipeline.ingest_all(false).await.unwrap();
+
+        assert_eq!(outcome.source_count, 0);
+        assert_eq!(outcome.skipped_missing_sources, 1);
+        assert!(pipeline
+            .store()
+            .get_source(&SourceId("removed-md".into()))
+            .unwrap()
+            .is_none());
+        assert!(pipeline.check_stale().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_source_cleanup_preserves_source_on_metadata_error() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let source_path = tempdir.path().join("inaccessible.md");
+        fs::write(&source_path, "source exists but metadata failed").unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        let source_id = SourceId("inaccessible-md".into());
+        pipeline
+            .store()
+            .add_source(&Source {
+                id: source_id.clone(),
+                path: source_path.clone(),
+                hash: "old-hash".into(),
+                status: SourceStatus::Stale,
+                parser_used: Some("markdown".into()),
+                last_ingested_at: None,
+            })
+            .unwrap();
+
+        let error = pipeline
+            .remove_missing_sources_for_all_source_ingest_with(None, |_| {
+                Err(std::io::Error::new(ErrorKind::PermissionDenied, "metadata denied").into())
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("metadata denied"));
+        assert!(pipeline.store().get_source(&source_id).unwrap().is_some());
     }
 
     #[tokio::test]

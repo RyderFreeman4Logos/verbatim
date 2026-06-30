@@ -712,8 +712,17 @@ pub fn reindex_task_request_metadata_with_queue_claim_and_batch(
 }
 
 pub fn ingest_result_metadata(ingested: usize, embedding_cache: &EmbeddingCacheStats) -> Value {
+    ingest_result_metadata_with_skips(ingested, embedding_cache, 0)
+}
+
+pub fn ingest_result_metadata_with_skips(
+    ingested: usize,
+    embedding_cache: &EmbeddingCacheStats,
+    skipped_missing_sources: usize,
+) -> Value {
     bounded_json(json!({
         "ingested": ingested,
+        "skipped_missing_sources": skipped_missing_sources,
         "embedding_cache": embedding_cache,
     }))
 }
