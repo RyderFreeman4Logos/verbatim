@@ -180,6 +180,7 @@ install-local-daemon:
     bin_dir="${VERBATIM_LOCAL_BIN_DIR:-${HOME}/.local/bin}"
     service="${VERBATIM_SYSTEMD_USER_SERVICE:-verbatim}"
     write_unit="${VERBATIM_LOCAL_DAEMON_WRITE_UNIT:-auto}"
+    readiness_timeout="${VERBATIM_LOCAL_DAEMON_READINESS_TIMEOUT_SECONDS-90}"
 
     case "${write_unit}" in
         auto|0|1|true|false) ;;
@@ -188,6 +189,11 @@ install-local-daemon:
             exit 2
             ;;
     esac
+    if [[ ! "${readiness_timeout}" =~ ^[0-9]+$ ]] || (( 10#${readiness_timeout} <= 0 )); then
+        echo "VERBATIM_LOCAL_DAEMON_READINESS_TIMEOUT_SECONDS must be a positive integer number of seconds" >&2
+        exit 2
+    fi
+    readiness_timeout=$((10#${readiness_timeout}))
 
     case "${service}" in
         ""|*/*)
@@ -263,14 +269,18 @@ install-local-daemon:
 
     "${cli_bin}" --version
     "${daemon_bin}" --version
-    for _ in {1..20}; do
+    for ((attempt = 1; attempt <= readiness_timeout; attempt++)); do
         if PATH="${bin_dir}:${PATH}" "${cli_bin}" daemon status; then
             echo "Local ${service_unit} daemon deployed from ${daemon_bin}"
             exit 0
         fi
         sleep 1
     done
-    echo "${service_unit} restarted but did not pass daemon status within 20 seconds" >&2
+    echo "${service_unit} restarted but did not pass daemon status within ${readiness_timeout} seconds" >&2
+    echo "systemctl --user status ${service_unit} --no-pager -l:" >&2
+    systemctl --user status "${service_unit}" --no-pager -l >&2 || true
+    echo "journalctl --user -u ${service_unit} --no-pager -n 80:" >&2
+    journalctl --user -u "${service_unit}" --no-pager -n 80 >&2 || true
     exit 1
 
 # Install an opt-in local post-merge or post-push hook that runs `just install-local-daemon`.
