@@ -9,6 +9,7 @@ use crate::collection::{
 use crate::config::ConfigReloadMetadata;
 use crate::index_gc::{IndexGcApplyReport, IndexGcConfig, IndexGcPlan};
 use crate::index_profile_delete::{IndexProfileDeleteApplyReport, IndexProfileDeletePlan};
+use crate::memory_budget::MemoryBudgetSnapshot;
 use crate::resource::ResourceQueueSnapshot;
 use crate::task::{TaskEvent, TaskSpan, TaskSummary};
 use crate::types::{
@@ -716,6 +717,8 @@ impl From<ImageArtifact> for ImageArtifactResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
+    #[serde(default)]
+    pub memory_budget: MemoryBudgetSnapshot,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<ResourceQueueSnapshot>,
 }

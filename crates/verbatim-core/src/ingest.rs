@@ -38,6 +38,7 @@ use crate::index_profile_delete::{
     apply_index_profile_delete_artifacts, apply_index_profile_delete_sqlite,
     plan_index_profile_delete, IndexProfileDeleteApplyReport, IndexProfileDeletePlan,
 };
+use crate::memory_budget::{MemoryBudget, MemoryReservationGuard};
 use crate::ocr::{
     configured_ocr_provider, ocr_evidence_from_output, ocr_profile_stale, ocr_required_pages,
     pdf_scan_summary, source_ingest_diagnostics, OcrPageRequest, OcrProvider,
@@ -97,6 +98,7 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     index_gc_policy: IndexGcPolicy,
     embedding_batch_size: usize,
     embedding_max_concurrent_requests: usize,
+    memory_budget: MemoryBudget,
     #[cfg(test)]
     source_commit_observer: Option<SourceCommitObserver>,
 }
@@ -108,6 +110,7 @@ struct PreparedIndexes {
     hnsw: HnswIndex,
     vectors: Vec<VectorDocument>,
     cache_stats: EmbeddingCacheStats,
+    _memory_reservation: Option<MemoryReservationGuard>,
 }
 
 struct BatchedCommittedSource {
@@ -413,6 +416,12 @@ struct PreparedVectors {
     postprocess_timing: Option<FinishedPhaseTiming>,
     request_count: usize,
     max_vectors_per_request: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EmbeddingExecutionControls {
+    batch_size: usize,
+    max_concurrent_requests: usize,
 }
 
 struct EmbeddingBatchMetrics {
@@ -936,6 +945,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
                 .endpoint_runtime
                 .bounded()
                 .max_concurrent_requests,
+            memory_budget: MemoryBudget::from_config(&config.daemon.resources),
             #[cfg(test)]
             source_commit_observer: None,
         })
@@ -1006,6 +1016,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
                 .endpoint_runtime
                 .bounded()
                 .max_concurrent_requests,
+            memory_budget: MemoryBudget::from_config(&config.daemon.resources),
             #[cfg(test)]
             source_commit_observer: None,
         })
@@ -1029,6 +1040,8 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             .endpoint_runtime
             .bounded()
             .max_concurrent_requests;
+        self.memory_budget
+            .configure_from(&config.daemon.resources)?;
         self.graph_extractor = if self.graph_extraction_config.enabled && config.chat.enabled {
             Some(GraphExtractor::from_config(&config.chat))
         } else {
@@ -1056,6 +1069,10 @@ where
 
     pub fn active_embedding_profile_id(&self) -> &EmbeddingProfileId {
         &self.active_profile_id
+    }
+
+    pub fn memory_budget(&self) -> MemoryBudget {
+        self.memory_budget.clone()
     }
 
     pub fn plan_embedding_profile_delete(
@@ -1251,6 +1268,12 @@ where
             index_gc_policy: IndexGcPolicy::default(),
             embedding_batch_size: 16,
             embedding_max_concurrent_requests: 4,
+            memory_budget: MemoryBudget::new(
+                None,
+                crate::config::MemoryBudgetEnforcement::SlowWarn,
+                std::time::Duration::from_millis(500),
+                25,
+            ),
             #[cfg(test)]
             source_commit_observer: None,
         }
@@ -1270,6 +1293,12 @@ where
     #[cfg(test)]
     fn with_embedding_enabled(mut self, enabled: bool) -> Self {
         self.embedding_enabled = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_memory_budget(mut self, memory_budget: MemoryBudget) -> Self {
+        self.memory_budget = memory_budget;
         self
     }
 
@@ -2611,11 +2640,28 @@ where
             );
         }
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
+        let memory_reservation = match self.vector_residency {
+            VectorIndexResidency::LowMemory => None,
+            VectorIndexResidency::ResidentHnsw => {
+                let vector_count = self
+                    .store
+                    .count_vector_documents_for_profile(profile_id, None)?;
+                let guard = self.reserve_vector_memory(
+                    format!("ingest:batched_publish:{}", profile_id.as_str()),
+                    "ingest:batched_publish",
+                    vector_count,
+                )?;
+                let all_vectors = self.store.list_vector_documents_for_profile(profile_id)?;
+                Some((guard, all_vectors))
+            }
+        };
         let prepared = match self.vector_residency {
             VectorIndexResidency::LowMemory => self.prepare_indexes_from_vectors(Vec::new())?,
             VectorIndexResidency::ResidentHnsw => {
-                let all_vectors = self.store.list_vector_documents_for_profile(profile_id)?;
-                self.prepare_indexes_from_vectors(all_vectors)?
+                let (_, all_vectors) = memory_reservation
+                    .as_ref()
+                    .expect("resident_hnsw always produces memory_reservation");
+                self.prepare_indexes_from_vectors(all_vectors.clone())?
             }
         };
         let completed_cpu_resource = completed_resource_progress(&cpu_permit);
@@ -2808,6 +2854,7 @@ where
             .prepare_vectors_for_chunks_partial(
                 profile_id,
                 &child_chunks,
+                self.embedding_execution_controls(),
                 |batches, request_count, max_vectors_per_request| {
                     self.record_embedding_throughput_wait(
                         &source_progress,
@@ -3949,13 +3996,50 @@ where
         Ok(())
     }
 
+    fn reserve_vector_memory(
+        &self,
+        key: String,
+        owner: &'static str,
+        vector_count: usize,
+    ) -> Result<Option<MemoryReservationGuard>> {
+        let estimated_mb = estimate_vector_memory_mb(vector_count, self.embed_client.dimension());
+        if estimated_mb == 0 {
+            return Ok(None);
+        }
+        let guard = self
+            .memory_budget
+            .try_reserve(key, owner, estimated_mb)
+            .with_context(|| format!("reserve memory budget for {owner}"))?;
+        if guard.degraded() {
+            tracing::warn!(
+                owner = guard.owner(),
+                estimated_mb = guard.estimated_mb(),
+                "memory budget pressure will reduce ingest throughput without lowering retrieval quality"
+            );
+        }
+        Ok(Some(guard))
+    }
+
     async fn prepare_full_indexes_for_chunks(
         &self,
         profile_id: &EmbeddingProfileId,
         child_chunks: &[Chunk],
     ) -> Result<PreparedIndexes> {
+        let memory_reservation = self.reserve_vector_memory(
+            format!("ingest:full_index:{}", profile_id.as_str()),
+            "ingest:full_index",
+            child_chunks.len(),
+        )?;
+        let controls = if memory_reservation
+            .as_ref()
+            .is_some_and(MemoryReservationGuard::degraded)
+        {
+            self.memory_constrained_embedding_controls()
+        } else {
+            self.embedding_execution_controls()
+        };
         let prepared = self
-            .prepare_vectors_for_chunks(profile_id, child_chunks)
+            .prepare_vectors_for_chunks_with_controls(profile_id, child_chunks, controls)
             .await?;
         let hnsw = match self.vector_residency {
             VectorIndexResidency::LowMemory => HnswIndex::new(),
@@ -3966,6 +4050,7 @@ where
             hnsw,
             vectors: prepared.vectors,
             cache_stats: prepared.cache_stats,
+            _memory_reservation: memory_reservation,
         })
     }
 
@@ -3974,10 +4059,25 @@ where
         profile_id: &EmbeddingProfileId,
         child_chunks: &[Chunk],
     ) -> Result<PreparedVectors> {
+        self.prepare_vectors_for_chunks_with_controls(
+            profile_id,
+            child_chunks,
+            self.embedding_execution_controls(),
+        )
+        .await
+    }
+
+    async fn prepare_vectors_for_chunks_with_controls(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        child_chunks: &[Chunk],
+        controls: EmbeddingExecutionControls,
+    ) -> Result<PreparedVectors> {
         let prepared = self
             .prepare_vectors_for_chunks_partial(
                 profile_id,
                 child_chunks,
+                controls,
                 |_, _, _| {},
                 |_, _, _| {},
                 |_, _, _| {},
@@ -4001,10 +4101,25 @@ where
         Ok(prepared)
     }
 
+    fn embedding_execution_controls(&self) -> EmbeddingExecutionControls {
+        EmbeddingExecutionControls {
+            batch_size: self.embedding_batch_size,
+            max_concurrent_requests: self.embedding_max_concurrent_requests,
+        }
+    }
+
+    fn memory_constrained_embedding_controls(&self) -> EmbeddingExecutionControls {
+        EmbeddingExecutionControls {
+            batch_size: 1,
+            max_concurrent_requests: 1,
+        }
+    }
+
     async fn prepare_vectors_for_chunks_partial<F, G, H>(
         &self,
         profile_id: &EmbeddingProfileId,
         child_chunks: &[Chunk],
+        controls: EmbeddingExecutionControls,
         mut record_throughput_wait: F,
         mut record_request_started: G,
         mut record_postprocess_started: H,
@@ -4073,7 +4188,7 @@ where
             }
 
             if !misses.is_empty() {
-                let batches = embedding_input_batches(misses, self.embedding_batch_size);
+                let batches = embedding_input_batches(misses, controls.batch_size);
                 request_count = batches.len();
                 max_vectors_per_request = batches.iter().map(Vec::len).max().unwrap_or(0);
                 let request_input_count = batches.iter().map(Vec::len).sum::<usize>();
@@ -4106,7 +4221,7 @@ where
                         }
                         Ok((batch_index, batch, embeddings))
                     })
-                    .buffered(self.embedding_max_concurrent_requests)
+                    .buffered(controls.max_concurrent_requests.max(1))
                     .collect::<Vec<_>>()
                     .await;
                 request_timing = Some(request_phase.finish(serde_json::json!({
@@ -4115,7 +4230,7 @@ where
                     "input_count": request_input_count,
                     "requests": request_count,
                     "max_vectors_per_request": max_vectors_per_request,
-                    "max_concurrent_requests": self.embedding_max_concurrent_requests,
+                    "max_concurrent_requests": controls.max_concurrent_requests.max(1),
                 })));
 
                 record_postprocess_started(&request_source_ids, request_count, request_input_count);
@@ -4209,6 +4324,26 @@ where
         source_vectors: Vec<VectorDocument>,
         cache_stats: EmbeddingCacheStats,
     ) -> Result<PreparedIndexes> {
+        let vector_count = match self.vector_residency {
+            VectorIndexResidency::LowMemory => source_vectors.len(),
+            VectorIndexResidency::ResidentHnsw => self
+                .store
+                .count_vector_documents_for_profile(profile_id, None)?
+                .saturating_sub(
+                    self.store
+                        .count_vector_documents_for_profile(profile_id, Some(source_id))?,
+                )
+                .saturating_add(source_vectors.len()),
+        };
+        let memory_reservation = self.reserve_vector_memory(
+            format!(
+                "ingest:source_index:{}:{}",
+                profile_id.as_str(),
+                source_id.0
+            ),
+            "ingest:source_index",
+            vector_count,
+        )?;
         let hnsw = match self.vector_residency {
             VectorIndexResidency::LowMemory => HnswIndex::new(),
             VectorIndexResidency::ResidentHnsw => {
@@ -4226,6 +4361,7 @@ where
             hnsw,
             vectors: source_vectors,
             cache_stats,
+            _memory_reservation: memory_reservation,
         })
     }
 
@@ -4241,6 +4377,7 @@ where
             hnsw,
             vectors,
             cache_stats: EmbeddingCacheStats::default(),
+            _memory_reservation: None,
         })
     }
 
@@ -4902,6 +5039,19 @@ fn embedding_request_count(input_count: usize, batch_size: usize) -> u64 {
         return 0;
     }
     input_count.div_ceil(batch_size.max(1)) as u64
+}
+
+fn estimate_vector_memory_mb(vector_count: usize, embedding_dimensions: usize) -> usize {
+    if vector_count == 0 || embedding_dimensions == 0 {
+        return 0;
+    }
+    let bytes = (vector_count as u128)
+        .saturating_mul(embedding_dimensions as u128)
+        .saturating_mul(std::mem::size_of::<f32>() as u128)
+        .saturating_mul(2);
+    let mib = 1024_u128 * 1024_u128;
+    let mb = bytes.saturating_add(mib - 1).saturating_div(mib);
+    usize::try_from(mb).unwrap_or(usize::MAX).max(1)
 }
 
 fn embedding_input_batches(
@@ -6797,6 +6947,94 @@ mod tests {
         assert_eq!(second_id, first_id);
         assert_eq!(sources.len(), 1);
         assert_eq!(stored_source.status, SourceStatus::Indexed);
+    }
+
+    #[test]
+    fn vector_memory_estimate_uses_two_f32_copies_and_rounds_up() {
+        assert_eq!(estimate_vector_memory_mb(0, 4096), 0);
+        assert_eq!(estimate_vector_memory_mb(1, 2), 1);
+        assert_eq!(estimate_vector_memory_mb(128, 1024), 1);
+        assert_eq!(estimate_vector_memory_mb(129, 1024), 2);
+    }
+
+    #[tokio::test]
+    async fn prepare_full_indexes_marks_reservation_degraded_under_slow_warn_pressure() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let memory_budget = MemoryBudget::new(
+            Some(1),
+            crate::config::MemoryBudgetEnforcement::SlowWarn,
+            Duration::from_millis(500),
+            25,
+        );
+        let pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_memory_budget(memory_budget.clone());
+        let source_id = SourceId("src-memory-slow-warn".into());
+        let evidence_id = EvidenceId("evidence-memory-slow-warn".into());
+        let chunks = vec![test_child(
+            &source_id,
+            "chunk-memory-slow-warn",
+            &evidence_id,
+            "memory pressure text",
+        )];
+
+        let prepared = pipeline
+            .prepare_full_indexes_for_chunks(&EmbeddingProfileId::default_profile(), &chunks)
+            .await
+            .unwrap();
+
+        assert!(prepared
+            ._memory_reservation
+            .as_ref()
+            .is_some_and(MemoryReservationGuard::degraded));
+        assert_eq!(memory_budget.reserved_mb(), 1);
+        drop(prepared);
+        assert_eq!(memory_budget.reserved_mb(), 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_full_indexes_fails_clearly_when_memory_budget_is_exceeded() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let memory_budget = MemoryBudget::new(
+            Some(1),
+            crate::config::MemoryBudgetEnforcement::Fail,
+            Duration::from_millis(500),
+            25,
+        );
+        let pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_memory_budget(memory_budget);
+        let source_id = SourceId("src-memory-fail".into());
+        let evidence_id = EvidenceId("evidence-memory-fail".into());
+        let chunks = vec![test_child(
+            &source_id,
+            "chunk-memory-fail",
+            &evidence_id,
+            "memory fail text",
+        )];
+
+        let error = match pipeline
+            .prepare_full_indexes_for_chunks(&EmbeddingProfileId::default_profile(), &chunks)
+            .await
+        {
+            Ok(_) => panic!("expected memory budget failure"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("memory budget exceeded"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -11670,6 +11908,7 @@ model = "local-vision"
                     hnsw: HnswIndex::new(),
                     vectors: Vec::new(),
                     cache_stats: EmbeddingCacheStats::default(),
+                    _memory_reservation: None,
                 },
             )
             .unwrap();
@@ -11692,6 +11931,7 @@ model = "local-vision"
                     hnsw: HnswIndex::new(),
                     vectors: Vec::new(),
                     cache_stats: EmbeddingCacheStats::default(),
+                    _memory_reservation: None,
                 },
             )
             .unwrap();
