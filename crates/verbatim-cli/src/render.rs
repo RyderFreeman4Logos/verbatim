@@ -1503,6 +1503,33 @@ where
     W: Write,
 {
     writeln!(writer, "Daemon status: {}", health.status)?;
+    let budget = &health.memory_budget;
+    let limit = budget
+        .limit_mb
+        .map(|limit| format!("{limit} MB"))
+        .unwrap_or_else(|| "unbounded".to_string());
+    let available = budget
+        .available_mb
+        .map(|available| format!("{available} MB"))
+        .unwrap_or_else(|| "unbounded".to_string());
+    writeln!(
+        writer,
+        "Memory budget: limit={} rss={} MB reserved={} MB available={} enforcement={:?}",
+        limit, budget.rss_mb, budget.reserved_mb, available, budget.enforcement
+    )?;
+    if !budget.active_reservations.is_empty() {
+        writeln!(writer, "Memory reservations:")?;
+        for reservation in &budget.active_reservations {
+            writeln!(
+                writer,
+                "  {} owner={} estimated={} MB age_ms={}",
+                reservation.key,
+                reservation.owner,
+                reservation.estimated_mb,
+                reservation.reserved_for_millis
+            )?;
+        }
+    }
     if !health.resources.is_empty() {
         writeln!(writer, "Resources:")?;
         for resource in &health.resources {

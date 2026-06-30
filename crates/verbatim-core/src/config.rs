@@ -1059,8 +1059,32 @@ impl Default for DaemonConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryBudgetEnforcement {
+    Off,
+    SlowWarn,
+    Warn,
+    Defer,
+    Fail,
+}
+
+impl Default for MemoryBudgetEnforcement {
+    fn default() -> Self {
+        default_memory_budget_enforcement()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonResourceConfig {
+    #[serde(default)]
+    pub memory_budget_mb: Option<usize>,
+    #[serde(default = "default_memory_budget_enforcement")]
+    pub memory_budget_enforcement: MemoryBudgetEnforcement,
+    #[serde(default = "default_memory_budget_poll_millis")]
+    pub memory_budget_poll_millis: u64,
+    #[serde(default = "default_memory_reservation_margin_percent")]
+    pub memory_reservation_margin_percent: u8,
     #[serde(default = "default_sqlite_writer_concurrency", skip_serializing)]
     pub sqlite_writer_concurrency: usize,
     #[serde(default = "default_sqlite_writer_queue_capacity")]
@@ -1096,6 +1120,10 @@ pub struct DaemonResourceConfig {
 impl Default for DaemonResourceConfig {
     fn default() -> Self {
         Self {
+            memory_budget_mb: None,
+            memory_budget_enforcement: default_memory_budget_enforcement(),
+            memory_budget_poll_millis: default_memory_budget_poll_millis(),
+            memory_reservation_margin_percent: default_memory_reservation_margin_percent(),
             sqlite_writer_concurrency: default_sqlite_writer_concurrency(),
             sqlite_writer_queue_capacity: default_sqlite_writer_queue_capacity(),
             sqlite_writer_queue_timeout_seconds: default_resource_queue_timeout_seconds(),
@@ -1118,6 +1146,10 @@ impl Default for DaemonResourceConfig {
 impl DaemonResourceConfig {
     pub fn bounded(&self) -> Self {
         Self {
+            memory_budget_mb: self.memory_budget_mb,
+            memory_budget_enforcement: self.memory_budget_enforcement,
+            memory_budget_poll_millis: self.memory_budget_poll_millis.max(1),
+            memory_reservation_margin_percent: self.memory_reservation_margin_percent.min(100),
             sqlite_writer_concurrency: SQLITE_WRITER_ACTIVE_CAPACITY,
             sqlite_writer_queue_capacity: self.sqlite_writer_queue_capacity.max(1),
             sqlite_writer_queue_timeout_seconds: self.sqlite_writer_queue_timeout_seconds.max(1),
@@ -1135,6 +1167,18 @@ impl DaemonResourceConfig {
             qdrant_upsert_queue_timeout_seconds: self.qdrant_upsert_queue_timeout_seconds.max(1),
         }
     }
+}
+
+pub fn default_memory_budget_enforcement() -> MemoryBudgetEnforcement {
+    MemoryBudgetEnforcement::SlowWarn
+}
+
+pub fn default_memory_budget_poll_millis() -> u64 {
+    500
+}
+
+pub fn default_memory_reservation_margin_percent() -> u8 {
+    25
 }
 
 fn default_sqlite_writer_concurrency() -> usize {
@@ -1316,6 +1360,14 @@ impl Config {
     pub fn apply_reload_safe_changes(&self, candidate: &Self) -> Self {
         let mut next = self.clone();
 
+        next.daemon.resources.memory_budget_mb = candidate.daemon.resources.memory_budget_mb;
+        next.daemon.resources.memory_budget_enforcement =
+            candidate.daemon.resources.memory_budget_enforcement;
+        next.daemon.resources.memory_budget_poll_millis =
+            candidate.daemon.resources.memory_budget_poll_millis;
+        next.daemon.resources.memory_reservation_margin_percent =
+            candidate.daemon.resources.memory_reservation_margin_percent;
+
         next.embedding.enabled = candidate.embedding.enabled;
         next.embedding.base_url = candidate.embedding.base_url.clone();
         next.embedding.batch_size = candidate.embedding.batch_size;
@@ -1445,7 +1497,11 @@ fn collect_changed_config_keys(
 fn is_reload_safe_key(key: &str) -> bool {
     matches!(
         key,
-        "embedding.base_url"
+        "daemon.resources.memory_budget_mb"
+            | "daemon.resources.memory_budget_enforcement"
+            | "daemon.resources.memory_budget_poll_millis"
+            | "daemon.resources.memory_reservation_margin_percent"
+            | "embedding.base_url"
             | "embedding.enabled"
             | "embedding.batch_size"
             | "embedding.timeout_seconds"
@@ -1770,6 +1826,11 @@ task_wait_timeout_seconds = 1500
 [daemon]
 bind = "127.0.0.1:7700"
 
+[daemon.resources]
+memory_budget_enforcement = "slow_warn"
+memory_budget_poll_millis = 500
+memory_reservation_margin_percent = 25
+
 [collection_watcher]
 enabled = true
 debounce_millis = 500
@@ -1800,6 +1861,16 @@ mod tests {
         assert_eq!(config.parser.image_artifacts.max_image_width, 10_000);
         assert_eq!(config.parser.image_artifacts.max_image_height, 10_000);
         assert_eq!(config.parser.image_artifacts.max_image_pixels, 100_000_000);
+        assert_eq!(config.daemon.resources.memory_budget_mb, None);
+        assert_eq!(
+            config.daemon.resources.memory_budget_enforcement,
+            MemoryBudgetEnforcement::SlowWarn
+        );
+        assert_eq!(config.daemon.resources.memory_budget_poll_millis, 500);
+        assert_eq!(
+            config.daemon.resources.memory_reservation_margin_percent,
+            25
+        );
         assert!(config.embedding.enabled);
         assert_eq!(config.embedding.provider, "openai_compatible");
         assert_eq!(config.embedding.base_url, "http://127.0.0.1:8002/v1");
@@ -2273,6 +2344,37 @@ model_supports_vision = true
     }
 
     #[test]
+    fn daemon_memory_budget_config_roundtrips_through_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[daemon]
+bind = "127.0.0.1:7700"
+[daemon.resources]
+memory_budget_mb = 2048
+memory_budget_enforcement = "fail"
+memory_budget_poll_millis = 250
+memory_reservation_margin_percent = 10
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.daemon.resources.memory_budget_mb, Some(2048));
+        assert_eq!(
+            config.daemon.resources.memory_budget_enforcement,
+            MemoryBudgetEnforcement::Fail
+        );
+        assert_eq!(config.daemon.resources.memory_budget_poll_millis, 250);
+        assert_eq!(
+            config.daemon.resources.memory_reservation_margin_percent,
+            10
+        );
+
+        let serialized = config.show().unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.daemon.resources, config.daemon.resources);
+    }
+
+    #[test]
     fn default_template_places_capability_cache_ttl_under_model_tables() {
         let template: toml::Value = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
 
@@ -2333,6 +2435,8 @@ model_supports_vision = true
         candidate.embedding.endpoint_runtime.queue_timeout_seconds = 60;
         candidate.index_gc.retain_previous_generations = 0;
         candidate.index_gc.stale_staging_seconds = 3_600;
+        candidate.daemon.resources.memory_budget_mb = Some(2048);
+        candidate.daemon.resources.memory_budget_enforcement = MemoryBudgetEnforcement::Fail;
 
         let plan = current.reload_plan(&candidate).unwrap();
 
@@ -2342,6 +2446,8 @@ model_supports_vision = true
                 "chat.max_concurrent_requests",
                 "chat.retry.max_retries",
                 "chat.timeout_seconds",
+                "daemon.resources.memory_budget_enforcement",
+                "daemon.resources.memory_budget_mb",
                 "embedding.base_url",
                 "embedding.capability_cache_ttl_seconds",
                 "embedding.queue_timeout_seconds",
@@ -2362,6 +2468,11 @@ model_supports_vision = true
         assert_eq!(applied.embedding.endpoint_runtime.queue_timeout_seconds, 60);
         assert_eq!(applied.index_gc.retain_previous_generations, 0);
         assert_eq!(applied.index_gc.stale_staging_seconds, 3_600);
+        assert_eq!(applied.daemon.resources.memory_budget_mb, Some(2048));
+        assert_eq!(
+            applied.daemon.resources.memory_budget_enforcement,
+            MemoryBudgetEnforcement::Fail
+        );
     }
 
     #[test]

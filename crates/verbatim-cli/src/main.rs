@@ -3923,6 +3923,7 @@ mod tests {
             self.calls.borrow_mut().push("health".into());
             Ok(HealthResponse {
                 status: "ok".into(),
+                memory_budget: Default::default(),
                 resources: Vec::new(),
             })
         }

@@ -56,6 +56,7 @@ use verbatim_core::index_gc::{apply_index_gc, plan_index_gc, IndexGcApplyReport}
 use verbatim_core::ingest::{
     IndexingOutcome, IngestPipeline, SourceIngestFreshness, SourceIngestOutcome,
 };
+use verbatim_core::memory_budget::MemoryBudget;
 use verbatim_core::ocr::source_ingest_diagnostics;
 use verbatim_core::provider::openai_compatible::{
     model_endpoint_resource_snapshots, OpenAiCompatibleLlmReranker, OpenAiCompatibleReranker,
@@ -102,6 +103,7 @@ struct AppState {
     task_store: std::sync::Mutex<Store>,
     index_status_cache: std::sync::RwLock<Option<IndexStatusResponse>>,
     resources: DaemonResources,
+    memory_budget: MemoryBudget,
     ingest_queue_active: AtomicBool,
     /// Actual indexing worker occupancy, independent from persisted task status.
     ingest_worker_active: AtomicBool,
@@ -755,6 +757,7 @@ struct IngestBatchExpansionCandidate {
 async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".into(),
+        memory_budget: state.memory_budget.snapshot(),
         resources: daemon_resource_snapshots(&state),
     })
 }
@@ -6755,6 +6758,9 @@ async fn reload_config_from_path(state: &SharedState) -> Result<ConfigReloadMeta
         &state.resources,
         &runtime_config_snapshot(state)?.config.daemon.resources,
     );
+    state
+        .memory_budget
+        .configure_from(&runtime_config_snapshot(state)?.config.daemon.resources)?;
     if collection_watcher_plan_changed {
         send_collection_watcher_command(state, CollectionWatcherCommand::Refresh);
     }
@@ -6937,6 +6943,7 @@ async fn run_daemon() -> Result<()> {
     let config = Config::load_from(&config_path).context("failed to load config")?;
     let data_dir = config::data_dir(&config);
     let pipeline = IngestPipeline::new(&config, &data_dir)?;
+    let memory_budget = pipeline.memory_budget();
     if let Err(error) = apply_index_gc(&data_dir, pipeline.store(), config.index_gc.policy()) {
         tracing::warn!(error = %error, "startup index generation garbage collection failed");
     }
@@ -6950,6 +6957,7 @@ async fn run_daemon() -> Result<()> {
         task_store: std::sync::Mutex::new(task_store),
         index_status_cache: std::sync::RwLock::new(index_status_cache),
         resources: daemon_resources(&config.daemon.resources),
+        memory_budget,
         ingest_queue_active: AtomicBool::new(false),
         ingest_worker_active: AtomicBool::new(false),
         collection_watcher: CollectionWatcherRuntime::default(),
@@ -6960,6 +6968,7 @@ async fn run_daemon() -> Result<()> {
         config_path,
         data_dir,
     });
+    let _memory_budget_sampler = state.memory_budget.start_rss_sampler();
     // Fail orphaned ingest tasks left in `running` status by a previous daemon
     // session that was killed before completing them.  Without this, the stale
     // running task blocks the entire ingest queue because every queue-drain path
@@ -13373,11 +13382,13 @@ mod tests {
         config_path: PathBuf,
     ) -> SharedState {
         let index_status_cache = initial_index_status_cache(&pipeline);
+        let memory_budget = pipeline.memory_budget();
         Arc::new(AppState {
             pipeline: std::sync::Mutex::new(Some(pipeline)),
             task_store: std::sync::Mutex::new(Store::new(&data_dir.join("verbatim.db")).unwrap()),
             index_status_cache: std::sync::RwLock::new(index_status_cache),
             resources: daemon_resources(&config.daemon.resources),
+            memory_budget,
             ingest_queue_active: AtomicBool::new(false),
             ingest_worker_active: AtomicBool::new(false),
             collection_watcher: CollectionWatcherRuntime::default(),
