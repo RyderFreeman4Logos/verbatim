@@ -1412,7 +1412,7 @@ where
         let prepared = self.prepare_indexes_from_vectors(remaining_vectors)?;
         let index_publish_permit =
             acquire_ingest_resource("index_publish", "index_publish").await?;
-        let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let staged = self.stage_prepared_index_artifacts_for_residency(&prepared)?;
         drop(index_publish_permit);
         let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let generation = match self.store.remove_source_and_replace_vectors_for_profile(
@@ -1422,7 +1422,7 @@ where
         ) {
             Ok(generation) => generation,
             Err(err) => {
-                let _ = remove_dir_if_exists(&staged);
+                remove_staged_index_artifacts(&staged);
                 return Err(err);
             }
         };
@@ -2239,7 +2239,7 @@ where
         );
         let index_publish_permit =
             acquire_ingest_resource("index_publish", "index_publish").await?;
-        let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let staged = self.stage_prepared_index_artifacts_for_residency(&prepared)?;
         let completed_index_stage_resource = completed_resource_progress(&index_publish_permit);
         drop(index_publish_permit);
         self.record_resource_timing(task_id, completed_index_stage_resource);
@@ -2257,7 +2257,7 @@ where
             match write_image_artifact_files(&image_artifacts.files, self.image_artifact_limits) {
                 Ok(written) => written,
                 Err(err) => {
-                    let _ = remove_dir_if_exists(&staged);
+                    remove_staged_index_artifacts(&staged);
                     return Err(err);
                 }
             };
@@ -2308,7 +2308,7 @@ where
                 Ok(generation) => generation,
                 Err(err) => {
                     cleanup_written_image_files(&written_image_files);
-                    let _ = remove_dir_if_exists(&staged);
+                    remove_staged_index_artifacts(&staged);
                     return Err(err);
                 }
             };
@@ -2349,7 +2349,7 @@ where
                 }),
             },
         );
-        let staged_index_stats = staged_index_artifact_stats(&staged, generation);
+        let staged_index_stats = staged_index_artifact_stats(staged.as_deref(), generation);
         let cache_stats = prepared.cache_stats.clone();
         let vector_publish_phase = PhaseTiming::start(IngestTaskStage::VectorIndex.as_str());
         self.record_task_progress(
@@ -2611,8 +2611,13 @@ where
             );
         }
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
-        let all_vectors = self.store.list_vector_documents_for_profile(profile_id)?;
-        let prepared = self.prepare_indexes_from_vectors(all_vectors)?;
+        let prepared = match self.vector_residency {
+            VectorIndexResidency::LowMemory => self.prepare_indexes_from_vectors(Vec::new())?,
+            VectorIndexResidency::ResidentHnsw => {
+                let all_vectors = self.store.list_vector_documents_for_profile(profile_id)?;
+                self.prepare_indexes_from_vectors(all_vectors)?
+            }
+        };
         let completed_cpu_resource = completed_resource_progress(&cpu_permit);
         drop(cpu_permit);
         for committed in committed_sources {
@@ -2630,7 +2635,7 @@ where
                     .with_resource(task_resource_progress(&index_stage_permit, "active")),
             );
         }
-        let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let staged = self.stage_prepared_index_artifacts_for_residency(&prepared)?;
         let completed_index_stage_resource = completed_resource_progress(&index_stage_permit);
         drop(index_stage_permit);
         for committed in committed_sources {
@@ -2643,7 +2648,7 @@ where
         let generation = match self.store.bump_all_profile_index_generations() {
             Ok(generation) => generation,
             Err(err) => {
-                let _ = remove_dir_if_exists(&staged);
+                remove_staged_index_artifacts(&staged);
                 return Err(err);
             }
         };
@@ -2655,7 +2660,7 @@ where
                 completed_sqlite_resource.clone(),
             );
         }
-        let staged_index_stats = staged_index_artifact_stats(&staged, generation);
+        let staged_index_stats = staged_index_artifact_stats(staged.as_deref(), generation);
         for committed in committed_sources {
             self.record_task_progress(
                 committed.task_id.as_ref(),
@@ -3870,7 +3875,7 @@ where
         };
         let index_publish_permit =
             acquire_ingest_resource("index_publish", "index_publish").await?;
-        let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let staged = self.stage_prepared_index_artifacts_for_residency(&prepared)?;
         drop(index_publish_permit);
         let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let generation = match source_id {
@@ -3952,7 +3957,10 @@ where
         let prepared = self
             .prepare_vectors_for_chunks(profile_id, child_chunks)
             .await?;
-        let hnsw = hnsw_from_vectors(prepared.vectors.clone())?;
+        let hnsw = match self.vector_residency {
+            VectorIndexResidency::LowMemory => HnswIndex::new(),
+            VectorIndexResidency::ResidentHnsw => hnsw_from_vectors(prepared.vectors.clone())?,
+        };
 
         Ok(PreparedIndexes {
             hnsw,
@@ -4201,14 +4209,19 @@ where
         source_vectors: Vec<VectorDocument>,
         cache_stats: EmbeddingCacheStats,
     ) -> Result<PreparedIndexes> {
-        let mut all_vectors = self
-            .store
-            .list_vector_documents_for_profile(profile_id)?
-            .into_iter()
-            .filter(|document| document.source_id != *source_id)
-            .collect::<Vec<_>>();
-        all_vectors.extend(source_vectors.clone());
-        let hnsw = hnsw_from_vectors(all_vectors)?;
+        let hnsw = match self.vector_residency {
+            VectorIndexResidency::LowMemory => HnswIndex::new(),
+            VectorIndexResidency::ResidentHnsw => {
+                let mut all_vectors = self
+                    .store
+                    .list_vector_documents_for_profile(profile_id)?
+                    .into_iter()
+                    .filter(|document| document.source_id != *source_id)
+                    .collect::<Vec<_>>();
+                all_vectors.extend(source_vectors.clone());
+                hnsw_from_vectors(all_vectors)?
+            }
+        };
         Ok(PreparedIndexes {
             hnsw,
             vectors: source_vectors,
@@ -4220,7 +4233,10 @@ where
         &self,
         vectors: Vec<VectorDocument>,
     ) -> Result<PreparedIndexes> {
-        let hnsw = hnsw_from_vectors(vectors.clone())?;
+        let hnsw = match self.vector_residency {
+            VectorIndexResidency::LowMemory => HnswIndex::new(),
+            VectorIndexResidency::ResidentHnsw => hnsw_from_vectors(vectors.clone())?,
+        };
         Ok(PreparedIndexes {
             hnsw,
             vectors,
@@ -4257,18 +4273,36 @@ where
         prepared: PreparedIndexes,
     ) -> Result<()> {
         let generation = self.store.index_generation_for_profile(profile_id)?;
-        let staged = stage_prepared_index_artifacts(&self.data_dir, &prepared)?;
+        let staged = self.stage_prepared_index_artifacts_for_residency(&prepared)?;
         self.publish_committed_indexes(profile_id, generation, staged, prepared)
+    }
+
+    fn stage_prepared_index_artifacts_for_residency(
+        &self,
+        prepared: &PreparedIndexes,
+    ) -> Result<Option<PathBuf>> {
+        match self.vector_residency {
+            VectorIndexResidency::LowMemory => Ok(None),
+            VectorIndexResidency::ResidentHnsw => {
+                stage_prepared_index_artifacts(&self.data_dir, prepared).map(Some)
+            }
+        }
     }
 
     fn publish_committed_indexes(
         &mut self,
         profile_id: &EmbeddingProfileId,
         generation: u64,
-        staged: PathBuf,
+        staged: Option<PathBuf>,
         prepared: PreparedIndexes,
     ) -> Result<()> {
-        match publish_staged_index_artifacts(&self.data_dir, profile_id, generation, &staged) {
+        let publish_result = match staged.as_deref() {
+            Some(staged) => {
+                publish_staged_index_artifacts(&self.data_dir, profile_id, generation, staged)
+            }
+            None => write_index_manifest(&self.data_dir, profile_id, generation),
+        };
+        match publish_result {
             Ok(()) => {}
             Err(err) => {
                 self.invalidate_live_indexes()?;
@@ -4691,11 +4725,13 @@ fn stage_prepared_index_artifacts(data_dir: &Path, prepared: &PreparedIndexes) -
     Ok(staging_dir)
 }
 
-fn staged_index_artifact_stats(staging_dir: &Path, generation: u64) -> StagedIndexArtifactStats {
-    let hnsw_bytes = match fs::metadata(staging_dir.join("vectors.hnsw")) {
-        Ok(metadata) => metadata.len(),
-        Err(_) => 0,
-    };
+fn staged_index_artifact_stats(
+    staging_dir: Option<&Path>,
+    generation: u64,
+) -> StagedIndexArtifactStats {
+    let hnsw_bytes = staging_dir
+        .and_then(|staging_dir| fs::metadata(staging_dir.join("vectors.hnsw")).ok())
+        .map_or(0, |metadata| metadata.len());
     let manifest_bytes = match index_manifest_json_bytes(generation) {
         Ok(bytes) => usize_to_u64(bytes.len()),
         Err(_) => 0,
@@ -4799,6 +4835,12 @@ fn hnsw_from_vectors(vectors: Vec<VectorDocument>) -> Result<HnswIndex> {
     hnsw.replace_all(vectors);
     hnsw.build()?;
     Ok(hnsw)
+}
+
+fn remove_staged_index_artifacts(staged: &Option<PathBuf>) {
+    if let Some(staged) = staged {
+        let _ = remove_dir_if_exists(staged);
+    }
 }
 
 fn remove_dir_if_exists(path: &Path) -> Result<()> {
@@ -10009,6 +10051,63 @@ model = "local-vision"
         assert!(vectors
             .iter()
             .all(|vector| vector.chunk_id.0 != "old-chunk"));
+    }
+
+    #[tokio::test]
+    async fn low_memory_ingest_does_not_publish_hnsw_artifact_but_keeps_sqlite_vectors() {
+        assert_ingest_vector_artifact_residency(VectorIndexResidency::LowMemory, false).await;
+    }
+
+    #[tokio::test]
+    async fn resident_hnsw_ingest_publishes_hnsw_artifact() {
+        assert_ingest_vector_artifact_residency(VectorIndexResidency::ResidentHnsw, true).await;
+    }
+
+    async fn assert_ingest_vector_artifact_residency(
+        residency: VectorIndexResidency,
+        expect_hnsw_artifact: bool,
+    ) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("doc.txt");
+        std::fs::write(&path, "alpha vector artifact regression\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        );
+        pipeline.vector_residency = residency;
+        let source_id = pipeline.add_source(&path).unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+
+        pipeline.ingest_source(&source_id).await.unwrap();
+
+        let generation = pipeline
+            .store()
+            .index_generation_for_profile(&profile)
+            .unwrap();
+        let manifest = read_index_manifest(tempdir.path(), &profile)
+            .unwrap()
+            .expect("published index manifest");
+        assert_eq!(manifest.generation, generation);
+        let hnsw_path =
+            index_generation_dir(tempdir.path(), &profile, generation).join("vectors.hnsw");
+        assert_eq!(hnsw_path.exists(), expect_hnsw_artifact);
+        let vectors = pipeline
+            .store()
+            .list_vector_documents_for_profile(&profile)
+            .unwrap();
+        assert!(!vectors.is_empty());
+        let hits = pipeline
+            .store()
+            .search_vector_documents_for_profile(&profile, &[1.0, 0.0], 5, None)
+            .unwrap();
+        assert!(!hits.is_empty());
+        match residency {
+            VectorIndexResidency::LowMemory => assert!(pipeline.hnsw().is_empty()),
+            VectorIndexResidency::ResidentHnsw => assert_eq!(pipeline.hnsw().len(), vectors.len()),
+        }
     }
 
     #[tokio::test]
