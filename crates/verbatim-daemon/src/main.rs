@@ -1373,11 +1373,42 @@ async fn create_background_ingest_batch(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
-async fn background_ingest_batch_source_ids(
+#[derive(Debug, Clone)]
+struct BackgroundIngestSourceCandidate {
+    source_id: SourceId,
+    source_hash: Option<String>,
+}
+
+async fn source_hash_for_ingest_task_metadata(
+    state: &SharedState,
+    source_id: &str,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    let source_id = SourceId(source_id.to_string());
+    with_query_pipeline(state, move |pipeline| {
+        Ok(pipeline.source_ingest_snapshot(&source_id)?.current_hash)
+    })
+    .await
+    .map_err(pipeline_access_error)
+}
+
+fn ingest_task_request_metadata_with_source_hash(
+    mut request: serde_json::Value,
+    source_hash: Option<&str>,
+) -> serde_json::Value {
+    if let (Some(source_hash), serde_json::Value::Object(map)) = (source_hash, &mut request) {
+        map.insert(
+            "source_hash".into(),
+            serde_json::Value::String(source_hash.to_string()),
+        );
+    }
+    bounded_json(request)
+}
+
+async fn background_ingest_batch_sources(
     state: &SharedState,
     force: bool,
     vectors_only: bool,
-) -> Result<Vec<SourceId>> {
+) -> Result<Vec<BackgroundIngestSourceCandidate>> {
     if !force && !vectors_only {
         let config = runtime_config_snapshot(state)?.config;
         refresh_live_embedding_profile_capabilities(
@@ -1392,13 +1423,17 @@ async fn background_ingest_batch_source_ids(
             pipeline.check_stale()?;
         }
         let sources = pipeline.store().list_sources()?;
-        Ok::<_, anyhow::Error>(
-            sources
-                .into_iter()
-                .filter(|source| vectors_only || force || source.status != SourceStatus::Indexed)
-                .map(|source| source.id)
-                .collect(),
-        )
+        sources
+            .into_iter()
+            .filter(|source| vectors_only || force || source.status != SourceStatus::Indexed)
+            .map(|source| {
+                let source_hash = pipeline.source_ingest_snapshot(&source.id)?.current_hash;
+                Ok(BackgroundIngestSourceCandidate {
+                    source_id: source.id,
+                    source_hash,
+                })
+            })
+            .collect()
     })
     .await
 }
@@ -2259,9 +2294,8 @@ async fn ingest_one(
             anyhow::anyhow!("force is only supported for all-source ingest"),
         ));
     }
-    let task_id = create_persisted_task(
-        &state,
-        TaskKind::Ingest,
+    let source_hash = source_hash_for_ingest_task_metadata(&state, &id).await?;
+    let request = ingest_task_request_metadata_with_source_hash(
         ingest_task_request_metadata_with_queue_claim(
             Some(&id),
             false,
@@ -2269,8 +2303,9 @@ async fn ingest_one(
             query.vectors_only,
             false,
         ),
-    )
-    .await?;
+        source_hash.as_deref(),
+    );
+    let task_id = create_persisted_task(&state, TaskKind::Ingest, request).await?;
     execute_ingest_task(
         state,
         task_id,
@@ -2438,21 +2473,26 @@ async fn submit_ingest_task(
         schedule_ingest_queue(Arc::clone(&state));
         return Ok(Json(TaskCreatedResponse { task_id: task_id.0 }));
     }
+    let Some(source_id) = req.source_id.clone() else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("source_id is required for source-specific ingest"),
+        ));
+    };
+    let source_hash = source_hash_for_ingest_task_metadata(&state, &source_id).await?;
     let task_id = TaskId::new();
-    let task_id = create_persisted_task_with_id(
-        &state,
-        task_id,
-        TaskKind::Ingest,
+    let request = ingest_task_request_metadata_with_source_hash(
         ingest_task_request_metadata_with_queue_claim_and_batch(
-            req.source_id.as_deref(),
+            Some(source_id.as_str()),
             req.force,
             req.embedding_profile_id.as_deref(),
             req.vectors_only,
             true,
             None,
         ),
-    )
-    .await?;
+        source_hash.as_deref(),
+    );
+    let task_id = create_persisted_task_with_id(&state, task_id, TaskKind::Ingest, request).await?;
     schedule_ingest_queue(Arc::clone(&state));
     Ok(Json(TaskCreatedResponse { task_id: task_id.0 }))
 }
@@ -3981,11 +4021,10 @@ async fn expand_next_unexpanded_ingest_batch(state: &SharedState) -> Result<bool
         return Ok(false);
     };
 
-    let source_ids =
-        match background_ingest_batch_source_ids(state, candidate.force, candidate.vectors_only)
-            .await
+    let sources =
+        match background_ingest_batch_sources(state, candidate.force, candidate.vectors_only).await
         {
-            Ok(source_ids) => source_ids,
+            Ok(sources) => sources,
             Err(error) => {
                 finish_task_failed(state, &candidate.task_id, &error.to_string())
                     .await
@@ -3994,7 +4033,7 @@ async fn expand_next_unexpanded_ingest_batch(state: &SharedState) -> Result<bool
             }
         };
 
-    persist_ingest_batch_children(state, candidate, source_ids).await
+    persist_ingest_batch_children(state, candidate, sources).await
 }
 
 async fn next_unexpanded_ingest_batch_parent_async(
@@ -4006,7 +4045,7 @@ async fn next_unexpanded_ingest_batch_parent_async(
 async fn persist_ingest_batch_children(
     state: &SharedState,
     candidate: IngestBatchExpansionCandidate,
-    source_ids: Vec<SourceId>,
+    sources: Vec<BackgroundIngestSourceCandidate>,
 ) -> Result<bool> {
     with_task_store_write(state, move |store| {
         if store.count_running_tasks(TaskKind::Ingest)? > 0 {
@@ -4019,22 +4058,25 @@ async fn persist_ingest_batch_children(
             return Ok(false);
         };
 
-        for source_id in &source_ids {
+        for source in &sources {
             let child_id = TaskId::new();
-            let child_request = ingest_task_request_metadata_with_queue_claim_and_batch(
-                Some(source_id.0.as_str()),
-                false,
-                candidate.embedding_profile_id.as_deref(),
-                candidate.vectors_only,
-                true,
-                Some(&candidate.task_id.0),
+            let child_request = ingest_task_request_metadata_with_source_hash(
+                ingest_task_request_metadata_with_queue_claim_and_batch(
+                    Some(source.source_id.0.as_str()),
+                    false,
+                    candidate.embedding_profile_id.as_deref(),
+                    candidate.vectors_only,
+                    true,
+                    Some(&candidate.task_id.0),
+                ),
+                source.source_hash.as_deref(),
             );
             let child = store.create_task(&child_id, TaskKind::Ingest, &child_request)?;
             let payload = queued_event_payload(store, child)?;
             store.insert_task_event(&child_id, "queued", "task queued", &payload)?;
         }
 
-        if source_ids.is_empty() {
+        if sources.is_empty() {
             let result = ingest_result_metadata(0, &EmbeddingCacheStats::default());
             let terminalize_timing = PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str());
             if store.finish_task_success(&candidate.task_id, &result)? {
@@ -4060,7 +4102,7 @@ async fn persist_ingest_batch_children(
             "ingest batch children queued",
             &serde_json::json!({
                 "ingest_batch_id": candidate.task_id.0,
-                "children": source_ids.len(),
+                "children": sources.len(),
             }),
         )?;
         Ok::<_, anyhow::Error>(true)
@@ -6420,12 +6462,15 @@ fn collection_watcher_ingest_request_metadata(
     collection_name: &str,
     candidate: &CollectionMaintenanceIngestCandidate,
 ) -> serde_json::Value {
-    let mut request = ingest_task_request_metadata_with_queue_claim(
-        Some(&candidate.source_id.0),
-        false,
-        None,
-        false,
-        true,
+    let mut request = ingest_task_request_metadata_with_source_hash(
+        ingest_task_request_metadata_with_queue_claim(
+            Some(&candidate.source_id.0),
+            false,
+            None,
+            false,
+            true,
+        ),
+        candidate.source_hash.as_deref(),
     );
     if let serde_json::Value::Object(map) = &mut request {
         map.insert(
@@ -6436,12 +6481,6 @@ fn collection_watcher_ingest_request_metadata(
             "enqueue_reason".into(),
             serde_json::Value::String(candidate.reason.to_string()),
         );
-        if let Some(source_hash) = &candidate.source_hash {
-            map.insert(
-                "source_hash".into(),
-                serde_json::Value::String(source_hash.clone()),
-            );
-        }
     }
     bounded_json(request)
 }
@@ -6465,18 +6504,30 @@ async fn source_has_active_ingest_task(
                 continue;
             }
 
-            let active_source_hash = request.source_hash.as_deref();
-            let matching_hashes = match (candidate_source_hash.as_deref(), active_source_hash) {
-                (Some(candidate_hash), Some(active_hash)) => candidate_hash == active_hash,
-                _ => false,
-            };
-            if active_source_hash.is_none() || matching_hashes {
+            if request.vectors_only {
+                continue;
+            }
+            if active_ingest_matches_source_hash(
+                candidate_source_hash.as_deref(),
+                request.source_hash.as_deref(),
+            ) {
                 return Ok(true);
             }
         }
         Ok(false)
     })
     .await
+}
+
+fn active_ingest_matches_source_hash(
+    candidate_source_hash: Option<&str>,
+    active_source_hash: Option<&str>,
+) -> bool {
+    match (candidate_source_hash, active_source_hash) {
+        (Some(candidate_hash), Some(active_hash)) => candidate_hash == active_hash,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8133,7 +8184,7 @@ mod tests {
 
         let select_state = Arc::clone(&state);
         let select_task = tokio::spawn(async move {
-            background_ingest_batch_source_ids(&select_state, false, false).await
+            background_ingest_batch_sources(&select_state, false, false).await
         });
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -9522,8 +9573,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collection_watcher_maintenance_skips_hashless_production_ingest_intent() {
-        let test_dir = TestDir::new("collection-watcher-hashless-production-intent");
+    async fn collection_watcher_maintenance_skips_production_ingest_intent_with_source_hash() {
+        let test_dir = TestDir::new("collection-watcher-production-intent-source-hash");
         let root = test_dir.path().join("articles");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("one.md"), "one production source").unwrap();
@@ -9561,6 +9612,7 @@ mod tests {
         .unwrap();
         assert_eq!(sync.report.added, 1);
         let source_id = collection_member_ids_for_test(&state, "articles").0;
+        let source_hash = current_source_hash_for_test(&state, &source_id);
         state.ingest_queue_active.store(true, Ordering::Release);
         let Json(created) = submit_ingest_task(
             State(Arc::clone(&state)),
@@ -9581,7 +9633,7 @@ mod tests {
                 .request
                 .get("source_hash")
                 .and_then(serde_json::Value::as_str),
-            None
+            Some(source_hash.as_str())
         );
         let _ = update_collection_watcher(
             State(Arc::clone(&state)),
@@ -9612,6 +9664,199 @@ mod tests {
             })
             .count();
         assert_eq!(active_for_source, 1);
+    }
+
+    #[tokio::test]
+    async fn collection_watcher_maintenance_queues_changed_source_when_active_task_is_hashless() {
+        let test_dir = TestDir::new("collection-watcher-running-source-hashless");
+        let root = test_dir.path().join("articles");
+        let source_path = root.join("one.md");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source_path, "one original source").unwrap();
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(sync) = sync_collection(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionSyncRequest {
+                paths: Vec::new(),
+                max_depth: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync.report.added, 1);
+        let source_id = collection_member_ids_for_test(&state, "articles").0;
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(
+                Some(&source_id.0),
+                false,
+                None,
+                false,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+        fs::write(&source_path, "one modified source").unwrap();
+        let current_hash = current_source_hash_for_test(&state, &source_id);
+        let _ = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let outcome = maintain_collection_after_watch_event(&state, "articles")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.queued_task_ids.len(), 1);
+        let store = state.task_store.lock().unwrap();
+        let queued = store.queued_tasks(TaskKind::Ingest).unwrap();
+        let queued_for_source = queued
+            .iter()
+            .filter(|task| {
+                task.request
+                    .get("source_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_id.0.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queued_for_source.len(), 1);
+        assert_eq!(
+            queued_for_source[0]
+                .request
+                .get("source_hash")
+                .and_then(serde_json::Value::as_str),
+            Some(current_hash.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_watcher_maintenance_queues_changed_source_when_active_task_is_vectors_only()
+    {
+        let test_dir = TestDir::new("collection-watcher-running-source-vectors-only");
+        let root = test_dir.path().join("articles");
+        let source_path = root.join("one.md");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source_path, "one original source").unwrap();
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let _ = create_collection(
+            State(Arc::clone(&state)),
+            Json(CreateCollectionRequest {
+                name: "articles".into(),
+                ignore_patterns: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = add_collection_root(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(AddCollectionRootRequest {
+                path: root.display().to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(sync) = sync_collection(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionSyncRequest {
+                paths: Vec::new(),
+                max_depth: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sync.report.added, 1);
+        let source_id = collection_member_ids_for_test(&state, "articles").0;
+        fs::write(&source_path, "one modified source").unwrap();
+        let current_hash = current_source_hash_for_test(&state, &source_id);
+        let running_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_request_with_source_hash_and_vectors_only_for_test(
+                &source_id,
+                &current_hash,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        ensure_ingest_task_started(&state, &running_id)
+            .await
+            .unwrap();
+        let _ = update_collection_watcher(
+            State(Arc::clone(&state)),
+            Path("articles".into()),
+            Json(CollectionWatcherUpdateRequest {
+                enabled: true,
+                auto_index_enabled: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let outcome = maintain_collection_after_watch_event(&state, "articles")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.queued_task_ids.len(), 1);
+        let store = state.task_store.lock().unwrap();
+        let queued = store.queued_tasks(TaskKind::Ingest).unwrap();
+        let queued_for_source = queued
+            .iter()
+            .filter(|task| {
+                task.request
+                    .get("source_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_id.0.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queued_for_source.len(), 1);
+        assert_eq!(
+            queued_for_source[0]
+                .request
+                .get("source_hash")
+                .and_then(serde_json::Value::as_str),
+            Some(current_hash.as_str())
+        );
     }
 
     #[tokio::test]
@@ -9973,11 +10218,15 @@ mod tests {
         let (_test_dir, state, source_id, _model_server) =
             reloaded_embedding_endpoint_state("capability-refresh-background-batch", false).await;
 
-        let expanded = background_ingest_batch_source_ids(&state, false, false)
+        let expanded = background_ingest_batch_sources(&state, false, false)
             .await
             .unwrap();
+        let expanded_source_ids = expanded
+            .iter()
+            .map(|candidate| candidate.source_id.clone())
+            .collect::<Vec<_>>();
 
-        assert_eq!(expanded, vec![source_id.clone()]);
+        assert_eq!(expanded_source_ids, vec![source_id.clone()]);
         let source = state
             .pipeline
             .lock()
@@ -11226,6 +11475,8 @@ mod tests {
         let first_id = pipeline.add_source(&first_path).unwrap();
         let second_id = pipeline.add_source(&second_path).unwrap();
         let state = test_state(config, test_dir.path(), pipeline);
+        let first_hash = current_source_hash_for_test(&state, &first_id);
+        let second_hash = current_source_hash_for_test(&state, &second_id);
         state.ingest_queue_active.store(true, Ordering::Release);
 
         let Json(created) = submit_ingest_task(
@@ -11253,6 +11504,27 @@ mod tests {
         assert_eq!(
             child_source_ids,
             BTreeSet::from([first_id.0.clone(), second_id.0.clone()])
+        );
+        let child_source_hashes = children
+            .iter()
+            .map(|task| {
+                (
+                    task.request["source_id"].as_str().unwrap().to_string(),
+                    task.request["source_hash"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            child_source_hashes
+                .get(first_id.0.as_str())
+                .map(String::as_str),
+            Some(first_hash.as_str())
+        );
+        assert_eq!(
+            child_source_hashes
+                .get(second_id.0.as_str())
+                .map(String::as_str),
+            Some(second_hash.as_str())
         );
         assert!(children.iter().all(|task| {
             task.status == TaskStatus::Queued
@@ -11361,6 +11633,48 @@ mod tests {
         assert_eq!(parent.status, TaskStatus::Succeeded);
         assert!(has_task_terminalize_span(&parent_response.spans));
         assert_eq!(parent.result.unwrap()["ingested"], 2);
+    }
+
+    #[tokio::test]
+    async fn foreground_single_source_ingest_request_includes_source_hash() {
+        let test_dir = TestDir::new("foreground-ingest-source-hash");
+        let source_path = test_dir.path().join("doc.txt");
+        fs::write(&source_path, "foreground source hash").unwrap();
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let source_hash = current_source_hash_for_test(&state, &source_id);
+
+        let Json(response) = ingest_one(
+            State(Arc::clone(&state)),
+            Path(source_id.0.clone()),
+            Query(IngestQuery {
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.ingested, 1);
+        let tasks = {
+            let store = state.task_store.lock().unwrap();
+            store
+                .list_tasks_page(TaskListFilter::All, 10)
+                .unwrap()
+                .tasks
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0]
+                .request
+                .get("source_hash")
+                .and_then(serde_json::Value::as_str),
+            Some(source_hash.as_str())
+        );
     }
 
     #[tokio::test]
@@ -12376,11 +12690,19 @@ mod tests {
         source_id: &SourceId,
         source_hash: &str,
     ) -> serde_json::Value {
+        ingest_request_with_source_hash_and_vectors_only_for_test(source_id, source_hash, false)
+    }
+
+    fn ingest_request_with_source_hash_and_vectors_only_for_test(
+        source_id: &SourceId,
+        source_hash: &str,
+        vectors_only: bool,
+    ) -> serde_json::Value {
         let mut request = ingest_task_request_metadata_with_queue_claim(
             Some(&source_id.0),
             false,
             None,
-            false,
+            vectors_only,
             true,
         );
         if let serde_json::Value::Object(map) = &mut request {
