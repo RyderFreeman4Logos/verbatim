@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1570,10 +1571,33 @@ where
     Ok(())
 }
 
-pub fn write_retrieve_response<W>(
+pub fn write_retrieve_response<W>(writer: &mut W, response: &RetrieveResponse) -> io::Result<()>
+where
+    W: Write,
+{
+    if response.results.is_empty() {
+        writeln!(writer, "No retrieval results on this page.")?;
+        return Ok(());
+    }
+
+    for row in retrieve_display_rows(response) {
+        writeln!(
+            writer,
+            "{}. score={} {}",
+            row.rank,
+            format_score(row.score),
+            row.citation
+        )?;
+        write_indented_snippet(writer, row.snippet, "   ")?;
+    }
+
+    Ok(())
+}
+
+pub fn write_retrieve_debug_response<W>(
     writer: &mut W,
     response: &RetrieveResponse,
-) -> std::io::Result<()>
+) -> io::Result<()>
 where
     W: Write,
 {
@@ -1647,12 +1671,274 @@ where
     Ok(())
 }
 
-pub fn write_retrieve_json<W>(writer: &mut W, response: &RetrieveResponse) -> std::io::Result<()>
+pub fn write_retrieve_snippets<W>(writer: &mut W, response: &RetrieveResponse) -> io::Result<()>
+where
+    W: Write,
+{
+    for row in retrieve_display_rows(response) {
+        writeln!(writer, "{} {}", row.citation, row.snippet)?;
+    }
+    Ok(())
+}
+
+pub fn write_retrieve_tsv<W>(writer: &mut W, response: &RetrieveResponse) -> io::Result<()>
+where
+    W: Write,
+{
+    write_retrieve_delimited(writer, response, b'\t')
+}
+
+pub fn write_retrieve_csv<W>(writer: &mut W, response: &RetrieveResponse) -> io::Result<()>
+where
+    W: Write,
+{
+    write_retrieve_delimited(writer, response, b',')
+}
+
+fn write_retrieve_delimited<W>(
+    writer: &mut W,
+    response: &RetrieveResponse,
+    delimiter: u8,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    write_delimited_record(
+        writer,
+        delimiter,
+        [
+            "rank",
+            "score",
+            "citation",
+            "collection",
+            "source",
+            "locator",
+            "snippet",
+        ],
+    )?;
+    for row in retrieve_display_rows(response) {
+        write_delimited_record(
+            writer,
+            delimiter,
+            [
+                row.rank.to_string(),
+                format_score(row.score),
+                row.citation,
+                row.collection,
+                row.source,
+                row.locator,
+                row.snippet.to_string(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn write_retrieve_json<W>(writer: &mut W, response: &RetrieveResponse) -> io::Result<()>
 where
     W: Write,
 {
     serde_json::to_writer_pretty(&mut *writer, response).map_err(io::Error::other)?;
     writeln!(writer)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RetrieveDisplayRow<'a> {
+    rank: usize,
+    score: f32,
+    citation: String,
+    collection: String,
+    source: String,
+    locator: String,
+    snippet: &'a str,
+}
+
+fn retrieve_display_rows(response: &RetrieveResponse) -> Vec<RetrieveDisplayRow<'_>> {
+    response
+        .results
+        .iter()
+        .map(|result| {
+            let locator = compact_locator(result);
+            RetrieveDisplayRow {
+                rank: result.rank,
+                score: result.score,
+                citation: format!("[{locator}]"),
+                collection: display_collection_names(&result.collections),
+                source: display_source(result, &locator),
+                locator,
+                snippet: &result.snippet,
+            }
+        })
+        .collect()
+}
+
+fn write_indented_snippet<W>(writer: &mut W, snippet: &str, indent: &str) -> io::Result<()>
+where
+    W: Write,
+{
+    if snippet.is_empty() {
+        writeln!(writer, "{indent}")?;
+        return Ok(());
+    }
+    for line in snippet.lines() {
+        writeln!(writer, "{indent}{line}")?;
+    }
+    Ok(())
+}
+
+fn compact_locator(result: &verbatim_core::api::RetrieveResultResponse) -> String {
+    if let Some(locator) = &result.structured_locator {
+        return compact_structured_locator(locator);
+    }
+
+    compact_raw_locator(&result.locator, result.source_path.as_deref())
+}
+
+fn compact_structured_locator(locator: &SourceLocator) -> String {
+    match locator {
+        SourceLocator::Document {
+            path_or_url,
+            line_start,
+            line_end: Some(end),
+        } => format!("{} L{line_start}-{end}", compact_path_or_url(path_or_url)),
+        SourceLocator::Document {
+            path_or_url,
+            line_start,
+            line_end: None,
+        } => format!("{} L{line_start}", compact_path_or_url(path_or_url)),
+        SourceLocator::Markdown {
+            path,
+            line_start,
+            line_end,
+            block_kind,
+            heading_slug,
+            ..
+        } => {
+            let path = compact_path_or_url(path);
+            let line = if line_start == line_end {
+                format!("L{line_start}")
+            } else {
+                format!("L{line_start}-{line_end}")
+            };
+            let heading = heading_slug
+                .as_ref()
+                .map(|slug| format!(" #{slug}"))
+                .unwrap_or_default();
+            format!("{path} {line} markdown:{}{heading}", block_kind.as_str())
+        }
+        SourceLocator::Pdf { .. }
+        | SourceLocator::PdfOcr { .. }
+        | SourceLocator::PdfImage { .. } => locator.to_string(),
+    }
+}
+
+fn compact_raw_locator(locator: &str, source_path: Option<&str>) -> String {
+    let mut compact = locator.to_string();
+    if let Some(source_path) = source_path {
+        compact = compact.replace(source_path, &compact_path_or_url(source_path));
+    }
+
+    let Some((first, rest)) = compact.split_once(|character: char| character.is_whitespace())
+    else {
+        return compact_path_or_url(&compact);
+    };
+
+    if first.contains('/') || first.contains('\\') {
+        format!("{} {rest}", compact_path_or_url(first))
+    } else {
+        compact
+    }
+}
+
+fn compact_path_or_url(value: &str) -> String {
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return value.to_string();
+    }
+
+    value
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            Path::new(value)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or(value)
+        .to_string()
+}
+
+fn display_collection_names(collections: &[CollectionResultProvenance]) -> String {
+    let mut names = Vec::new();
+    for collection in collections {
+        if !names.contains(&collection.name.as_str()) {
+            names.push(collection.name.as_str());
+        }
+    }
+    names.join(",")
+}
+
+fn display_source(result: &verbatim_core::api::RetrieveResultResponse, locator: &str) -> String {
+    if let Some(collection) = result.collections.first() {
+        return collection.logical_path.clone();
+    }
+
+    if let Some(source_path) = &result.source_path {
+        return compact_path_or_url(source_path);
+    }
+
+    locator
+        .split_whitespace()
+        .next()
+        .filter(|source| !source.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn format_score(score: f32) -> String {
+    format!("{score:.4}")
+}
+
+fn write_delimited_record<W, I, S>(writer: &mut W, delimiter: u8, fields: I) -> io::Result<()>
+where
+    W: Write,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let delimiter = char::from(delimiter);
+    let mut first = true;
+    for field in fields {
+        if first {
+            first = false;
+        } else {
+            write!(writer, "{delimiter}")?;
+        }
+        write_delimited_field(writer, field.as_ref(), delimiter)?;
+    }
+    writeln!(writer)
+}
+
+fn write_delimited_field<W>(writer: &mut W, field: &str, delimiter: char) -> io::Result<()>
+where
+    W: Write,
+{
+    if field
+        .chars()
+        .any(|character| matches!(character, '"' | '\n' | '\r') || character == delimiter)
+    {
+        write!(writer, "\"")?;
+        for character in field.chars() {
+            if character == '"' {
+                write!(writer, "\"\"")?;
+            } else {
+                write!(writer, "{character}")?;
+            }
+        }
+        write!(writer, "\"")
+    } else {
+        write!(writer, "{field}")
+    }
 }
 
 pub fn write_citations<W>(writer: &mut W, citations: &[CitationResponse]) -> std::io::Result<()>
@@ -2002,7 +2288,8 @@ fn value_string_list(value: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use verbatim_core::api::{
-        EvidenceResponse, RetrieveControlsResponse, RetrieveResponse, RetrieveResultResponse,
+        CollectionResultProvenance, EvidenceResponse, RetrieveControlsResponse, RetrieveResponse,
+        RetrieveResultResponse, RetrieveTimingResponse,
     };
     use verbatim_core::task::{TaskId, TaskKind, TaskStatus};
     use verbatim_core::types::{
@@ -2177,7 +2464,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_output_renders_markdown_structured_locator_when_present() {
+    fn retrieve_debug_output_renders_markdown_structured_locator_when_present() {
         let response = RetrieveResponse {
             task_id: "task-1".into(),
             query: "markdown".into(),
@@ -2237,11 +2524,235 @@ mod tests {
         };
         let mut output = Vec::new();
 
-        write_retrieve_response(&mut output, &response).unwrap();
+        write_retrieve_debug_response(&mut output, &response).unwrap();
         let output = String::from_utf8(output).unwrap();
 
         assert!(output.contains("locator: /tmp/doc.md L3 markdown:paragraph #intro"));
         assert!(output.contains("markdown_locator:"));
         assert!(output.contains("block_hash: block-hash"));
+    }
+
+    #[test]
+    fn retrieve_compact_markdown_omits_debug_metadata_and_paths() {
+        let response = retrieve_display_fixture();
+        let mut output = Vec::new();
+
+        write_retrieve_response(&mut output, &response).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("3. score=0.9876 [doc.md L10 markdown:paragraph #intro]"));
+        assert!(output.contains("   alpha\tbeta"));
+        assert!(output.contains("   gamma, \"delta\" 中文"));
+        assert_low_noise_retrieve_output(&output);
+    }
+
+    #[test]
+    fn retrieve_snippets_omits_headers_scores_and_debug_metadata() {
+        let response = retrieve_display_fixture();
+        let mut output = Vec::new();
+
+        write_retrieve_snippets(&mut output, &response).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert_eq!(
+            output,
+            "[doc.md L10 markdown:paragraph #intro] alpha\tbeta\ngamma, \"delta\" 中文\n"
+        );
+        assert!(!output.contains("score="));
+        assert_low_noise_retrieve_output(&output);
+    }
+
+    #[test]
+    fn retrieve_tsv_round_trips_special_characters_with_fixed_columns() {
+        let response = retrieve_display_fixture();
+        let mut output = Vec::new();
+
+        write_retrieve_tsv(&mut output, &response).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_low_noise_retrieve_output(&output);
+
+        let mut records = parse_delimited_records(&output, '\t');
+        let headers = records.remove(0);
+        assert_eq!(
+            headers,
+            vec![
+                "rank",
+                "score",
+                "citation",
+                "collection",
+                "source",
+                "locator",
+                "snippet"
+            ]
+        );
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.len(), 7);
+        assert_eq!(record[0], "3");
+        assert_eq!(record[1], "0.9876");
+        assert_eq!(record[2], "[doc.md L10 markdown:paragraph #intro]");
+        assert_eq!(record[3], "articles");
+        assert_eq!(record[4], "nested/doc.md");
+        assert_eq!(record[5], "doc.md L10 markdown:paragraph #intro");
+        assert_eq!(record[6], "alpha\tbeta\ngamma, \"delta\" 中文");
+    }
+
+    #[test]
+    fn retrieve_csv_round_trips_special_characters_with_fixed_columns() {
+        let response = retrieve_display_fixture();
+        let mut output = Vec::new();
+
+        write_retrieve_csv(&mut output, &response).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_low_noise_retrieve_output(&output);
+
+        let mut records = parse_delimited_records(&output, ',');
+        let headers = records.remove(0);
+        assert_eq!(
+            headers,
+            vec![
+                "rank",
+                "score",
+                "citation",
+                "collection",
+                "source",
+                "locator",
+                "snippet"
+            ]
+        );
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.len(), 7);
+        assert_eq!(record[0], "3");
+        assert_eq!(record[1], "0.9876");
+        assert_eq!(record[2], "[doc.md L10 markdown:paragraph #intro]");
+        assert_eq!(record[3], "articles");
+        assert_eq!(record[4], "nested/doc.md");
+        assert_eq!(record[5], "doc.md L10 markdown:paragraph #intro");
+        assert_eq!(record[6], "alpha\tbeta\ngamma, \"delta\" 中文");
+    }
+
+    fn retrieve_display_fixture() -> RetrieveResponse {
+        RetrieveResponse {
+            task_id: "task-internal-123".into(),
+            query: "fixture query".into(),
+            source_id: Some("src-internal-123".into()),
+            collection_filter: None,
+            embedding_profile_id: "default".into(),
+            limit: 10,
+            page_size: 10,
+            page: 1,
+            total_results: 1,
+            returned_results: 1,
+            controls: RetrieveControlsResponse {
+                fast: true,
+                rerank_enabled: true,
+                dense_top_k: 80,
+                bm25_top_k: 50,
+                rrf_k: 60,
+                rerank_top_n: 12,
+            },
+            timings: vec![RetrieveTimingResponse {
+                phase: "retrieval".into(),
+                duration_ms: 1234,
+            }],
+            results: vec![RetrieveResultResponse {
+                index: 2,
+                rank: 3,
+                label: "E3".into(),
+                evidence_id: "internal-ev-abc123".into(),
+                source_id: "src-internal-123".into(),
+                source_path: Some("/home/obj/private/docs/doc.md".into()),
+                collections: vec![CollectionResultProvenance {
+                    collection_id: "collection-internal-123".into(),
+                    name: "articles".into(),
+                    logical_path: "nested/doc.md".into(),
+                    source_path: "/home/obj/private/docs/doc.md".into(),
+                    member_updated_at: "1782810157".into(),
+                }],
+                chunk_id: "chunk-internal-123".into(),
+                kind: "text".into(),
+                role: "original_text".into(),
+                score: 0.9876,
+                locator: "/home/obj/private/docs/doc.md L10 markdown:paragraph #intro".into(),
+                structured_locator: None,
+                provenance: None,
+                derived_from: None,
+                snippet: "alpha\tbeta\ngamma, \"delta\" 中文".into(),
+            }],
+            debug: None,
+        }
+    }
+
+    fn assert_low_noise_retrieve_output(output: &str) {
+        for forbidden in [
+            "Context pack:",
+            "controls:",
+            "timing:",
+            "source_path:",
+            "evidence=",
+            "role=",
+            "kind=",
+            "member_updated_at=",
+            "task-internal-123",
+            "internal-ev-abc123",
+            "src-internal-123",
+            "collection-internal-123",
+            "chunk-internal-123",
+            "/home/obj/private",
+        ] {
+            assert!(
+                !output.contains(forbidden),
+                "output unexpectedly contained {forbidden:?}: {output}"
+            );
+        }
+    }
+
+    fn parse_delimited_records(input: &str, delimiter: char) -> Vec<Vec<String>> {
+        let mut records = Vec::new();
+        let mut record = Vec::new();
+        let mut field = String::new();
+        let mut characters = input.chars().peekable();
+        let mut in_quotes = false;
+
+        while let Some(character) = characters.next() {
+            if in_quotes {
+                if character == '"' {
+                    if characters.peek() == Some(&'"') {
+                        field.push('"');
+                        characters.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                } else {
+                    field.push(character);
+                }
+                continue;
+            }
+
+            if character == '"' {
+                in_quotes = true;
+            } else if character == delimiter {
+                record.push(std::mem::take(&mut field));
+            } else if character == '\n' {
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+            } else if character == '\r' {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+            } else {
+                field.push(character);
+            }
+        }
+
+        if !field.is_empty() || !record.is_empty() {
+            record.push(field);
+            records.push(record);
+        }
+
+        records
     }
 }
