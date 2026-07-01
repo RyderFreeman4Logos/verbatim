@@ -136,13 +136,20 @@ fn write_retrieve_with_format<W>(
     stdout: &mut W,
     response: &verbatim_core::api::RetrieveResponse,
     format: RetrieveFormat,
+    show_debug: bool,
 ) -> std::io::Result<()>
 where
     W: Write,
 {
     match format {
+        RetrieveFormat::Markdown if show_debug => {
+            render::write_retrieve_debug_response(stdout, response)
+        }
         RetrieveFormat::Markdown => render::write_retrieve_response(stdout, response),
         RetrieveFormat::Json => render::write_retrieve_json(stdout, response),
+        RetrieveFormat::Snippets => render::write_retrieve_snippets(stdout, response),
+        RetrieveFormat::Tsv => render::write_retrieve_tsv(stdout, response),
+        RetrieveFormat::Csv => render::write_retrieve_csv(stdout, response),
     }
 }
 
@@ -313,7 +320,7 @@ where
                     include_locator: format == RetrieveFormat::Json,
                 };
                 let response = client.retrieve(&request)?;
-                write_retrieve_with_format(stdout, &response, format)?;
+                write_retrieve_with_format(stdout, &response, format, show_retrieval)?;
                 return Ok(0);
             }
 
@@ -368,8 +375,14 @@ where
             show_debug,
             show_locator,
             format,
+            text_only,
         } => {
-            let include_locator = show_locator || format == RetrieveFormat::Json;
+            let format = if text_only {
+                RetrieveFormat::Snippets
+            } else {
+                format.unwrap_or(RetrieveFormat::Markdown)
+            };
+            let include_locator = show_locator || show_debug || format == RetrieveFormat::Json;
             let request = RetrieveRequest {
                 question: question.join(" "),
                 source_id,
@@ -391,7 +404,7 @@ where
                 include_locator,
             };
             let response = client.retrieve(&request)?;
-            write_retrieve_with_format(stdout, &response, format)?;
+            write_retrieve_with_format(stdout, &response, format, show_debug)?;
             Ok(0)
         }
         Commands::Evidence { eid } => {
@@ -988,6 +1001,10 @@ Caveats:
 
 const RETRIEVE_AFTER_HELP: &str = r#"Examples:
   verbatim retrieve "What does the report conclude?"
+  verbatim retrieve --format snippets "What supports it?"
+  verbatim retrieve --text-only "What supports it?"
+  verbatim retrieve --format tsv "What supports it?"
+  verbatim retrieve --format csv "What supports it?"
   verbatim retrieve --source-id <source-id> --page-size 1 "What supports it?"
   verbatim retrieve --collection articles "What evidence is relevant?"
   verbatim retrieve --collection articles --collection areskapitalon "What changed?"
@@ -997,18 +1014,22 @@ const RETRIEVE_AFTER_HELP: &str = r#"Examples:
 Debugging:
   retrieve never invokes chat generation.
   It returns evidence context without invoking chat generation.
+  Default markdown is compact: rank, score, citation, and snippet only.
+  snippets/text-only omit headers and debug metadata; TSV/CSV emit fixed
+  columns: rank, score, citation, collection, source, locator, snippet.
   --collection filters against materialized daemon membership and does not
   rescan collection roots during retrieve.
-  --show-debug includes deterministic dense/BM25/RRF/rerank evidence ranking
-  details for debugging and agent workflows.
-  --show-locator and JSON output include structured locator/provenance fields
-  when available.
+  --show-debug includes task diagnostics, engine controls, timing, locators,
+  internal evidence metadata, and deterministic dense/BM25/RRF/rerank ranking
+  details. JSON output retains structured locator/provenance fields and full
+  evidence identifiers for evidence lookups.
 "#;
 
 const EVIDENCE_AFTER_HELP: &str = r#"Examples:
   verbatim evidence <evidence-id>
 
-Evidence ids come from retrieve output, ask citations, and retrieval debug packs.
+Evidence ids come from retrieve --show-debug, retrieve --format json, ask
+citations, and retrieval debug packs.
 "#;
 
 const CONFIG_AFTER_HELP: &str = r#"Examples:
@@ -1366,8 +1387,11 @@ enum Commands {
         #[arg(long = "show-locator")]
         show_locator: bool,
         /// Output format. JSON includes structured locator/provenance fields.
-        #[arg(long, value_enum, default_value = "markdown")]
-        format: RetrieveFormat,
+        #[arg(long, value_enum)]
+        format: Option<RetrieveFormat>,
+        /// Alias for --format snippets. Omits headers and debug metadata.
+        #[arg(long = "text-only", action = ArgAction::SetTrue, conflicts_with = "format")]
+        text_only: bool,
         /// Question text.
         #[arg(required = true, num_args = 1..)]
         question: Vec<String>,
@@ -1773,6 +1797,9 @@ enum RetrieveFormat {
     #[value(alias = "text")]
     Markdown,
     Json,
+    Snippets,
+    Tsv,
+    Csv,
 }
 
 #[cfg(test)]
@@ -2021,10 +2048,17 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
         assert!(help.contains("retrieve never invokes chat generation"));
-        assert!(help.contains("--show-debug includes deterministic"));
+        assert!(help.contains("Default markdown is compact"));
+        assert!(help.contains("snippets/text-only omit headers"));
+        assert!(help.contains("--show-debug includes task diagnostics"));
         assert!(help.contains("dense/BM25/RRF/rerank"));
         assert!(help.contains("--show-locator"));
         assert!(help.contains("structured locator/provenance"));
+        assert!(help.contains("verbatim retrieve --format snippets"));
+        assert!(help.contains("verbatim retrieve --format tsv"));
+        assert!(help.contains("verbatim retrieve --format csv"));
+        assert!(help.contains("--text-only"));
+        assert!(!help.contains("--quiet"));
         assert!(help.contains("verbatim retrieve --format json --show-debug"));
     }
 
@@ -2049,6 +2083,9 @@ mod tests {
         assert!(retrieve_help.contains("without invoking chat generation"));
         assert!(retrieve_help.contains("markdown"));
         assert!(retrieve_help.contains("json"));
+        assert!(retrieve_help.contains("snippets"));
+        assert!(retrieve_help.contains("tsv"));
+        assert!(retrieve_help.contains("csv"));
     }
 
     #[test]
@@ -3058,9 +3095,17 @@ mod tests {
                 include_locator: false,
             }
         );
-        assert!(stdout.contains("Context pack: task-1"));
-        assert!(stdout.contains("[0] E1 score=0.0310"));
-        assert!(stdout.contains("snippet: compact cited text"));
+        assert!(stdout.contains("1. score=0.0310 [doc.md L1]"));
+        assert!(stdout.contains("   compact cited text"));
+        assert!(!stdout.contains("Context pack:"));
+        assert!(!stdout.contains("task-1"));
+        assert!(!stdout.contains("/tmp/doc.md"));
+        assert!(!stdout.contains("evidence="));
+        assert!(!stdout.contains("role="));
+        assert!(!stdout.contains("kind="));
+        assert!(!stdout.contains("source_path:"));
+        assert!(!stdout.contains("controls:"));
+        assert!(!stdout.contains("timing:"));
     }
 
     #[test]
@@ -3192,9 +3237,42 @@ mod tests {
                 .unwrap()
                 .include_debug
         );
+        assert!(
+            client
+                .last_retrieve
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .include_locator,
+            "show-debug should request structured locator metadata"
+        );
         assert!(stdout.contains("Context pack: task-1"));
         assert!(stdout.contains("Retrieval Debug"));
         assert!(stdout.contains("Final evidence pack:"));
+    }
+
+    #[test]
+    fn retrieve_snippets_and_text_only_render_same_low_noise_output() {
+        let (code, snippets_stdout, snippets_stderr, snippets_client, _) =
+            run_mock(["retrieve", "--format", "snippets", "What", "is", "cited?"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(snippets_stderr.is_empty());
+        assert_eq!(snippets_client.calls.borrow().as_slice(), ["retrieve"]);
+
+        let (code, text_stdout, text_stderr, text_client, _) =
+            run_mock(["retrieve", "--text-only", "What", "is", "cited?"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(text_stderr.is_empty());
+        assert_eq!(text_client.calls.borrow().as_slice(), ["retrieve"]);
+
+        assert_eq!(text_stdout, snippets_stdout);
+        assert_eq!(snippets_stdout, "[doc.md L1] compact cited text\n");
+        assert!(!snippets_stdout.contains("Context pack:"));
+        assert!(!snippets_stdout.contains("score="));
+        assert!(!snippets_stdout.contains("/tmp/doc.md"));
+        assert!(!snippets_stdout.contains("evidence="));
+        assert!(!snippets_stdout.contains("role="));
+        assert!(!snippets_stdout.contains("kind="));
     }
 
     #[test]

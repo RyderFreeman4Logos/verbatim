@@ -176,7 +176,15 @@ verbatim ask --source-id <source-id> "What does the report conclude?"
 Retrieve context without chat generation and inspect one evidence item:
 
 ```sh
-verbatim retrieve --source-id <source-id> --show-debug \
+verbatim retrieve --source-id <source-id> \
+  "What does the report conclude?"
+verbatim retrieve --source-id <source-id> --format snippets \
+  "What does the report conclude?"
+verbatim retrieve --source-id <source-id> --format tsv \
+  "What does the report conclude?"
+verbatim retrieve --source-id <source-id> --format csv \
+  "What does the report conclude?"
+verbatim retrieve --source-id <source-id> --format json --show-debug \
   "What does the report conclude?"
 verbatim evidence <evidence-id>
 ```
@@ -249,10 +257,13 @@ from existing chunks, normally with `--vectors-only`.
 ask. Use `task wait`, `task show`, `task events`, and `task cancel` to follow or
 control queued work.
 
-**Retrieval/debug output**: `retrieve` and `ask --context-only` return evidence
-without invoking chat generation. Add `--show-debug`, `--show-locator`, or JSON
-format when you need deterministic ranking, locator, and provenance details for
-agent workflows or debugging.
+**Retrieval output**: `retrieve` and `ask --context-only` return evidence
+without invoking chat generation. Default Markdown is compact: rank, score,
+citation, and snippet. Use `--format snippets` or `--text-only` for citation
+plus snippet only, and `--format tsv` or `--format csv` for fixed-column output.
+Add `--show-debug`, `--show-locator`, or JSON format when you need deterministic
+ranking, locator, provenance, internal evidence ids, and other debugging
+details.
 
 ## Command Reference
 

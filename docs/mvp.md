@@ -294,6 +294,18 @@ cargo run -p verbatim-cli -- retrieve \
   --source-id <source-id> \
   --page-size 1 \
   "What does Verbatim answer with?"
+cargo run -p verbatim-cli -- retrieve \
+  --source-id <source-id> \
+  --format snippets \
+  "What does Verbatim answer with?"
+cargo run -p verbatim-cli -- retrieve \
+  --source-id <source-id> \
+  --format tsv \
+  "What does Verbatim answer with?"
+cargo run -p verbatim-cli -- retrieve \
+  --source-id <source-id> \
+  --format csv \
+  "What does Verbatim answer with?"
 ```
 
 Generate an answer with the configured chat model when you explicitly want
@@ -306,7 +318,7 @@ cargo run -p verbatim-cli -- ask \
   "What does Verbatim answer with?"
 ```
 
-Inspect one evidence id printed in the citation output:
+Inspect one evidence id from ask citations or retrieve JSON/debug output:
 
 ```sh
 cargo run -p verbatim-cli -- evidence <evidence-id>
@@ -317,11 +329,13 @@ Passing signal:
 - `daemon status` reports `ok`.
 - `source list` shows the added source.
 - `ingest` reports one ingested source.
-- `retrieve` returns a compact context pack with stable result indexes,
-  evidence ids, source identity, display locators, snippets, scores, controls,
-  and retrieval timing without calling the chat model.
+- `retrieve` returns compact Markdown with rank, score, citation, and snippet
+  without calling the chat model.
+- `retrieve --format snippets` returns citation plus snippet only.
+- `retrieve --format tsv` and `retrieve --format csv` return fixed columns:
+  rank, score, citation, collection, source, locator, and snippet.
 - `retrieve --format json --show-locator` returns structured locator and
-  provenance fields for API callers.
+  provenance fields, including evidence ids for API callers.
 - `ask` returns an answer with `[E...]` citations after invoking the configured
   chat model.
 - `--show-retrieval` shows dense/BM25/RRF debug, graph hits when expansion adds
