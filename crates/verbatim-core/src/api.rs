@@ -590,6 +590,8 @@ pub struct RetrieveRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank_top_n: Option<usize>,
     #[serde(default)]
+    pub bypass_cache: bool,
+    #[serde(default)]
     pub include_debug: bool,
     #[serde(default)]
     pub include_locator: bool,
@@ -851,6 +853,7 @@ mod tests {
         assert!(request.page.is_none());
         assert!(!request.fast);
         assert!(request.rerank.is_none());
+        assert!(!request.bypass_cache);
         assert!(!request.include_debug);
         assert!(!request.include_locator);
     }

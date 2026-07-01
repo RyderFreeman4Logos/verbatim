@@ -3391,6 +3391,7 @@ fn context_only_retrieve_request(req: AskRequest) -> RetrieveRequest {
         dense_top_k: None,
         bm25_top_k: None,
         rerank_top_n: None,
+        bypass_cache: false,
         include_debug: req.show_retrieval,
         include_locator: true,
     }
@@ -3422,6 +3423,7 @@ struct EffectiveRetrieveControls {
     page: usize,
     include_debug: bool,
     include_locator: bool,
+    bypass_cache: bool,
     fast: bool,
     config: Config,
     retrieval_config: RetrievalConfig,
@@ -3498,6 +3500,7 @@ fn resolve_retrieve_controls(
         page: nonzero_control("page", req.page.unwrap_or(1))?,
         include_debug: req.include_debug,
         include_locator: req.include_locator,
+        bypass_cache: req.bypass_cache,
         fast: req.fast,
         config: config.clone(),
         retrieval_config,
@@ -5384,6 +5387,7 @@ async fn prepare_retrieve_context(
         .with_embedding_enabled(controls.config.embedding.enabled)
         .with_vector_residency(controls.config.vector_index.residency)
         .require_embedding_profile(&embedding_profile_id)
+        .with_prefix_cache_bypass(controls.bypass_cache)
         .with_read_resource(Arc::clone(&sqlite_reader))
         .with_qdrant_search(&controls.config.qdrant);
         let source_filter_ref = source_filter.as_ref();
@@ -7973,6 +7977,7 @@ mod tests {
             dense_top_k: None,
             bm25_top_k: None,
             rerank_top_n: None,
+            bypass_cache: false,
             include_debug: true,
             include_locator: false,
         };
@@ -8030,6 +8035,7 @@ mod tests {
             dense_top_k: None,
             bm25_top_k: None,
             rerank_top_n: None,
+            bypass_cache: false,
             include_debug: true,
             include_locator: false,
         };
@@ -8126,6 +8132,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: true,
                 include_locator: false,
             },
@@ -9006,6 +9013,7 @@ mod tests {
                 page: 2,
                 include_debug: false,
                 include_locator: false,
+                bypass_cache: false,
                 fast: false,
                 config: Config::default(),
                 retrieval_config: RetrievalConfig::default(),
@@ -10503,6 +10511,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: false,
                 include_locator: false,
             }),
@@ -10541,6 +10550,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: false,
                 include_locator: false,
             }),
@@ -10642,6 +10652,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: false,
                 include_locator: false,
             }),
@@ -10742,6 +10753,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: true,
                 include_locator: false,
             }),
@@ -10793,6 +10805,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: true,
                 include_locator: false,
             }),
@@ -10899,6 +10912,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: false,
                 include_locator: true,
             }),
@@ -10992,6 +11006,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: false,
                 include_locator: false,
             }),
@@ -11266,6 +11281,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: true,
                 include_locator: false,
             }),

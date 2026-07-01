@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -27,6 +28,7 @@ use crate::types::{
 const GRAPH_EXPANSION_SCORE_DECAY: f32 = 0.5;
 const MAX_RERANK_CANDIDATE_CHUNKS: usize = 50;
 const MAX_RERANK_DOCUMENT_CHARS: usize = 8_000;
+static PREFIX_CACHE_BYPASS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
@@ -42,6 +44,7 @@ pub struct RetrievalPipeline<'a> {
     graph_config: Option<&'a GraphConfig>,
     rerank_config: Option<&'a RerankConfig>,
     reranker: Option<&'a dyn Reranker>,
+    bypass_prefix_cache: bool,
     required_profile_id: Option<EmbeddingProfileId>,
     vector_residency: VectorIndexResidency,
     read_resource: Option<Arc<ObservableResource>>,
@@ -102,6 +105,7 @@ impl<'a> RetrievalPipeline<'a> {
             graph_config: None,
             rerank_config: None,
             reranker: None,
+            bypass_prefix_cache: false,
             required_profile_id: None,
             vector_residency: VectorIndexResidency::ResidentHnsw,
             read_resource: None,
@@ -128,6 +132,7 @@ impl<'a> RetrievalPipeline<'a> {
             graph_config: Some(graph_config),
             rerank_config: None,
             reranker: None,
+            bypass_prefix_cache: false,
             required_profile_id: None,
             vector_residency: VectorIndexResidency::ResidentHnsw,
             read_resource: None,
@@ -159,6 +164,11 @@ impl<'a> RetrievalPipeline<'a> {
     pub fn with_reranker(mut self, config: &'a RerankConfig, reranker: &'a dyn Reranker) -> Self {
         self.rerank_config = Some(config);
         self.reranker = Some(reranker);
+        self
+    }
+
+    pub fn with_prefix_cache_bypass(mut self, enabled: bool) -> Self {
+        self.bypass_prefix_cache = enabled;
         self
     }
 
@@ -276,7 +286,7 @@ impl<'a> RetrievalPipeline<'a> {
 
         let (dense_results, query_embedding_latency_ms, dense_vector_path) =
             if self.embedding_enabled {
-                let query_text = self.embed_client.prepare_query(query);
+                let query_text = self.remote_query_text(self.embed_client.prepare_query(query));
                 let embedding_started = Instant::now();
                 let query_vec = self
                     .embed_client
@@ -686,8 +696,9 @@ impl<'a> RetrievalPipeline<'a> {
             .collect::<Vec<_>>();
 
         let rerank_started = Instant::now();
+        let query = self.remote_query_text(query.to_string());
         match reranker
-            .rerank_with_diagnostics(query, &documents, top_n)
+            .rerank_with_diagnostics(&query, &documents, top_n)
             .await
         {
             Ok(response) => {
@@ -1282,6 +1293,38 @@ impl<'a> RetrievalPipeline<'a> {
         };
         Ok(Some(self.result_for_chunk(chunk, score, provenance)?))
     }
+
+    fn remote_query_text(&self, query: String) -> String {
+        if self.bypass_prefix_cache {
+            prefix_cache_bypass_query(query)
+        } else {
+            query
+        }
+    }
+}
+
+fn prefix_cache_bypass_query(query: String) -> String {
+    let nonce = prefix_cache_bypass_nonce();
+    let mut prefixed = String::with_capacity(query.len() + 66);
+    prefixed.push('\n');
+    for bit in 0..64 {
+        if (nonce >> bit) & 1 == 0 {
+            prefixed.push(' ');
+        } else {
+            prefixed.push('\t');
+        }
+    }
+    prefixed.push('\n');
+    prefixed.push_str(&query);
+    prefixed
+}
+
+fn prefix_cache_bypass_nonce() -> u64 {
+    let counter = PREFIX_CACHE_BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    nanos ^ counter.rotate_left(17) ^ u64::from(std::process::id())
 }
 
 struct RetrievalSearchOutput {
@@ -1826,6 +1869,34 @@ mod tests {
         async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(anyhow!("embedding should not be called in BM25-only mode"))
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+    }
+
+    struct RecordingQueryEmbeddingClient {
+        texts: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl RecordingQueryEmbeddingClient {
+        fn new() -> Self {
+            Self {
+                texts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded_texts(&self) -> Vec<Vec<String>> {
+            self.texts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingClient for RecordingQueryEmbeddingClient {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.texts.lock().unwrap().push(texts.to_vec());
+            Ok(texts.iter().map(|text| keyword_vector(text)).collect())
         }
 
         fn dimension(&self) -> usize {
@@ -2601,6 +2672,42 @@ mod tests {
         assert_eq!(debug.query_embedding_latency_ms, None);
         assert!(debug.dense_hits.is_empty());
         assert!(!debug.bm25_hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prefix_cache_bypass_prefixes_query_embedding_text() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-no-cache");
+        let alpha = insert_child(&store, &source, "chunk-alpha", "alpha content");
+        let vector_index = StaticVectorIndex::new(vec![(alpha.id.clone(), 1.0)]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = RecordingQueryEmbeddingClient::new();
+        let config = RetrievalConfig {
+            dense_top_k: 1,
+            bm25_top_k: 1,
+            ..RetrievalConfig::default()
+        };
+        let pipeline = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &config,
+        )
+        .with_prefix_cache_bypass(true);
+
+        let results = pipeline
+            .search_source_set("alpha question", None)
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].chunk_id, alpha.id);
+        let recorded_texts = embed_client.recorded_texts();
+        assert_eq!(recorded_texts.len(), 1);
+        let query_text = &recorded_texts[0][0];
+        assert!(query_text.starts_with('\n'));
+        assert_eq!(query_text.trim_start(), "alpha question");
+        assert_ne!(query_text, "alpha question");
     }
 
     #[tokio::test]

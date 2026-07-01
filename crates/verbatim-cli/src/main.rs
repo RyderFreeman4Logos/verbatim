@@ -316,6 +316,7 @@ where
                     dense_top_k: None,
                     bm25_top_k: None,
                     rerank_top_n: None,
+                    bypass_cache: false,
                     include_debug: show_retrieval,
                     include_locator: format == RetrieveFormat::Json,
                 };
@@ -372,6 +373,7 @@ where
             dense_top_k,
             bm25_top_k,
             rerank_top_n,
+            no_cache,
             show_debug,
             show_locator,
             format,
@@ -400,6 +402,7 @@ where
                 dense_top_k,
                 bm25_top_k,
                 rerank_top_n,
+                bypass_cache: no_cache,
                 include_debug: show_debug,
                 include_locator,
             };
@@ -1378,6 +1381,9 @@ enum Commands {
         /// Override reranker top-n. Use 0 to disable reranking.
         #[arg(long = "rerank-top-n")]
         rerank_top_n: Option<usize>,
+        /// Bypass remote vLLM prefix cache for benchmark-style retrieval requests.
+        #[arg(long = "no-cache", action = ArgAction::SetTrue)]
+        no_cache: bool,
         /// Include deterministic retrieval stage debug metadata in the response.
         ///
         /// Useful for evidence/provenance debugging and agent workflows.
@@ -3091,6 +3097,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: false,
                 include_locator: false,
             }
@@ -3139,6 +3146,19 @@ mod tests {
         assert!(request.include_locator);
         assert!(stdout.contains("\"structured_locator\""));
         assert!(stdout.contains("\"debug\""));
+    }
+
+    #[test]
+    fn retrieve_no_cache_sets_bypass_cache_request_flag() {
+        let (code, _, stderr, client, _) =
+            run_mock(["retrieve", "--no-cache", "What", "is", "cited?"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        let request = client.last_retrieve.borrow();
+        let request = request.as_ref().unwrap();
+        assert_eq!(request.question, "What is cited?");
+        assert!(request.bypass_cache);
     }
 
     #[test]
@@ -3313,6 +3333,7 @@ mod tests {
                 dense_top_k: None,
                 bm25_top_k: None,
                 rerank_top_n: None,
+                bypass_cache: false,
                 include_debug: true,
                 include_locator: false,
             }
