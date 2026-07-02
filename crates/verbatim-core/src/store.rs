@@ -1843,82 +1843,21 @@ impl Store {
         }
 
         let mut hits = Vec::new();
-        match source_filter {
-            Some(source_ids) => {
-                let mut source_ids = source_ids
-                    .iter()
-                    .map(|source_id| source_id.0.as_str())
-                    .collect::<Vec<_>>();
-                source_ids.sort_unstable();
-                let placeholders = vec!["?"; source_ids.len()].join(", ");
-                let sql = format!(
-                    "SELECT chunk_id, vector_blob, vector_json
-                     FROM chunk_vectors
-                     WHERE profile_id = ? AND source_id IN ({placeholders})
-                     ORDER BY source_id, chunk_id"
-                );
-                let mut params = Vec::with_capacity(source_ids.len() + 1);
-                params.push(profile_id.as_str().to_string());
-                params.extend(source_ids.into_iter().map(str::to_string));
-                let mut stmt = self.conn.prepare(&sql)?;
-                let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<Vec<u8>>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (chunk_id, vector_blob, vector_json) = row?;
-                    let vector = if let Some(blob) = vector_blob.as_ref().filter(|b| !b.is_empty())
-                    {
-                        blob_to_vector(blob)?
-                    } else {
-                        let json = vector_json
-                            .ok_or_else(|| anyhow::anyhow!("missing vector for {chunk_id}"))?;
-                        parse_stored_vector(&chunk_id, &json)?
-                    };
-                    push_top_vector_hit(
-                        &mut hits,
-                        top_k,
-                        ChunkId(chunk_id),
-                        vector_search_score(query, &vector),
-                    );
-                }
-            }
-            None => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT chunk_id, vector_blob, vector_json
-                     FROM chunk_vectors
-                     WHERE profile_id = ?1
-                     ORDER BY source_id, chunk_id",
-                )?;
-                let rows = stmt.query_map(params![profile_id.as_str()], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<Vec<u8>>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (chunk_id, vector_blob, vector_json) = row?;
-                    let vector = if let Some(blob) = vector_blob.as_ref().filter(|b| !b.is_empty())
-                    {
-                        blob_to_vector(blob)?
-                    } else {
-                        let json = vector_json
-                            .ok_or_else(|| anyhow::anyhow!("missing vector for {chunk_id}"))?;
-                        parse_stored_vector(&chunk_id, &json)?
-                    };
-                    push_top_vector_hit(
-                        &mut hits,
-                        top_k,
-                        ChunkId(chunk_id),
-                        vector_search_score(query, &vector),
-                    );
-                }
-            }
-        }
+        let sorted_source_ids = source_filter.map(sorted_source_filter_ids);
+        self.search_vector_blob_documents_for_profile(
+            profile_id,
+            query,
+            top_k,
+            sorted_source_ids.as_deref(),
+            &mut hits,
+        )?;
+        self.search_vector_json_documents_for_profile(
+            profile_id,
+            query,
+            top_k,
+            sorted_source_ids.as_deref(),
+            &mut hits,
+        )?;
 
         hits.sort_by(|left, right| {
             right
@@ -1928,6 +1867,73 @@ impl Store {
                 .then_with(|| left.0 .0.cmp(&right.0 .0))
         });
         Ok(hits)
+    }
+
+    fn search_vector_blob_documents_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        query: &[f32],
+        top_k: usize,
+        source_ids: Option<&[String]>,
+        hits: &mut Vec<(ChunkId, f32)>,
+    ) -> Result<()> {
+        let source_clause = vector_scan_source_clause(source_ids);
+        let sql = format!(
+            "SELECT chunk_id, vector_blob
+             FROM chunk_vectors
+             WHERE profile_id = ?
+               AND vector_blob IS NOT NULL
+               AND length(vector_blob) > 0{source_clause}
+             ORDER BY source_id, chunk_id"
+        );
+        let params = vector_scan_params(profile_id, source_ids);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (chunk_id, vector_blob) = row?;
+            let score = vector_blob_search_score(query, &vector_blob)
+                .with_context(|| format!("score vector BLOB for chunk {chunk_id}"))?;
+            push_top_vector_hit(hits, top_k, ChunkId(chunk_id), score);
+        }
+        Ok(())
+    }
+
+    fn search_vector_json_documents_for_profile(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        query: &[f32],
+        top_k: usize,
+        source_ids: Option<&[String]>,
+        hits: &mut Vec<(ChunkId, f32)>,
+    ) -> Result<()> {
+        let source_clause = vector_scan_source_clause(source_ids);
+        let sql = format!(
+            "SELECT chunk_id, vector_json
+             FROM chunk_vectors
+             WHERE profile_id = ?
+               AND (vector_blob IS NULL OR length(vector_blob) = 0){source_clause}
+             ORDER BY source_id, chunk_id"
+        );
+        let params = vector_scan_params(profile_id, source_ids);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (chunk_id, vector_json) = row?;
+            let json =
+                vector_json.ok_or_else(|| anyhow::anyhow!("missing vector for {chunk_id}"))?;
+            let vector = parse_stored_vector(&chunk_id, &json)?;
+            push_top_vector_hit(
+                hits,
+                top_k,
+                ChunkId(chunk_id),
+                vector_search_score(query, &vector),
+            );
+        }
+        Ok(())
     }
 
     pub fn count_vector_documents_for_profile(
@@ -3787,6 +3793,38 @@ fn get_evidence_ids_for_chunk(conn: &Connection, chunk_id: &str) -> Result<Vec<E
     rows.map(|r| Ok(EvidenceId(r?))).collect()
 }
 
+fn sorted_source_filter_ids(source_ids: &HashSet<SourceId>) -> Vec<String> {
+    let mut source_ids = source_ids
+        .iter()
+        .map(|source_id| source_id.0.clone())
+        .collect::<Vec<_>>();
+    source_ids.sort_unstable();
+    source_ids
+}
+
+fn vector_scan_source_clause(source_ids: Option<&[String]>) -> String {
+    source_ids
+        .map(|source_ids| {
+            format!(
+                " AND source_id IN ({})",
+                vec!["?"; source_ids.len()].join(", ")
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn vector_scan_params(
+    profile_id: &EmbeddingProfileId,
+    source_ids: Option<&[String]>,
+) -> Vec<String> {
+    let mut params = Vec::with_capacity(source_ids.map_or(1, |source_ids| source_ids.len() + 1));
+    params.push(profile_id.as_str().to_string());
+    if let Some(source_ids) = source_ids {
+        params.extend(source_ids.iter().cloned());
+    }
+    params
+}
+
 fn parse_stored_vector(chunk_id: &str, vector_json: &str) -> Result<Vec<f32>> {
     serde_json::from_str(vector_json)
         .with_context(|| format!("parse stored vector for chunk {chunk_id}"))
@@ -3820,13 +3858,85 @@ fn blob_to_vector(blob: &[u8]) -> Result<Vec<f32>> {
 }
 
 fn vector_search_score(query: &[f32], vector: &[f32]) -> f32 {
-    let distance = query
+    score_from_squared_l2_distance(
+        query
+            .iter()
+            .zip(vector.iter())
+            .map(|(left, right)| (left - right) * (left - right))
+            .sum::<f32>(),
+    )
+}
+
+fn vector_blob_search_score(query: &[f32], blob: &[u8]) -> Result<f32> {
+    Ok(score_from_squared_l2_distance(
+        vector_blob_squared_l2_distance(query, blob)?,
+    ))
+}
+
+fn score_from_squared_l2_distance(distance_squared: f32) -> f32 {
+    1.0 / (1.0 + distance_squared.sqrt())
+}
+
+fn vector_blob_squared_l2_distance(query: &[f32], blob: &[u8]) -> Result<f32> {
+    if !blob.len().is_multiple_of(4) {
+        anyhow::bail!("vector BLOB length {} is not a multiple of 4", blob.len());
+    }
+    let vector_len = blob.len() / 4;
+    let len = query.len().min(vector_len);
+
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    {
+        Ok(vector_blob_squared_l2_distance_x86_64_sse(query, blob, len))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_endian = "little")))]
+    {
+        Ok(vector_blob_squared_l2_distance_scalar(query, blob, len))
+    }
+}
+
+fn vector_blob_squared_l2_distance_scalar(query: &[f32], blob: &[u8], len: usize) -> f32 {
+    query
         .iter()
-        .zip(vector.iter())
-        .map(|(left, right)| (left - right) * (left - right))
-        .sum::<f32>()
-        .sqrt();
-    1.0 / (1.0 + distance)
+        .take(len)
+        .zip(blob.chunks_exact(4))
+        .map(|(left, bytes)| {
+            let right = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            (left - right) * (left - right)
+        })
+        .sum()
+}
+
+#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+fn vector_blob_squared_l2_distance_x86_64_sse(query: &[f32], blob: &[u8], len: usize) -> f32 {
+    use std::arch::x86_64::{_mm_loadu_ps, _mm_mul_ps, _mm_storeu_ps, _mm_sub_ps};
+
+    let simd_len = len - (len % 4);
+    let mut distance_squared = 0.0f32;
+    let mut lane_squares = [0.0f32; 4];
+    let mut index = 0usize;
+
+    while index < simd_len {
+        // SAFETY: `len` is capped to both `query.len()` and `blob.len() / 4`.
+        // `_mm_loadu_ps` accepts unaligned pointers, every f32 bit pattern is
+        // valid, and this function is only compiled on little-endian x86_64 so
+        // the BLOB's little-endian f32 bytes match native lane layout.
+        unsafe {
+            let query_lanes = _mm_loadu_ps(query.as_ptr().add(index));
+            let vector_lanes = _mm_loadu_ps(blob.as_ptr().add(index * 4).cast::<f32>());
+            let diff = _mm_sub_ps(query_lanes, vector_lanes);
+            let squares = _mm_mul_ps(diff, diff);
+            _mm_storeu_ps(lane_squares.as_mut_ptr(), squares);
+        }
+        distance_squared += lane_squares[0];
+        distance_squared += lane_squares[1];
+        distance_squared += lane_squares[2];
+        distance_squared += lane_squares[3];
+        index += 4;
+    }
+
+    distance_squared
+        + vector_blob_squared_l2_distance_scalar(&query[index..], &blob[index * 4..], len - index)
 }
 
 fn push_top_vector_hit(
@@ -4582,6 +4692,67 @@ mod tests {
         let blob = vector_to_blob(&vector);
         let recovered = blob_to_vector(&blob).unwrap();
         assert_eq!(vector, recovered);
+    }
+
+    #[test]
+    fn vector_blob_search_score_matches_vector_score() {
+        let query = vec![0.5f32, -1.0, 2.0, 8.0, -3.5, 0.25, 7.0, 1.0, 9.0];
+        let vector = vec![1.5f32, -2.3, 0.0, 42.0, -4.0, 0.5, 6.5, 1.25, 10.0];
+        let blob = vector_to_blob(&vector);
+
+        assert_eq!(
+            vector_blob_search_score(&query, &blob).unwrap(),
+            vector_search_score(&query, &vector)
+        );
+
+        let short_query = vec![0.5f32, -1.0, 2.0];
+        assert_eq!(
+            vector_blob_search_score(&short_query, &blob).unwrap(),
+            vector_search_score(&short_query, &vector)
+        );
+        assert!(vector_blob_search_score(&query, &[1, 2, 3])
+            .unwrap_err()
+            .to_string()
+            .contains("multiple of 4"));
+    }
+
+    #[test]
+    fn low_memory_vector_search_uses_blob_without_parsing_json() {
+        let store = Store::in_memory().unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+        store
+            .conn
+            .execute(
+                "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at)
+                 VALUES ('s1', '/tmp/x', 'h', 'Indexed', 'test', NULL)",
+                [],
+            )
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO chunks (id, source_id, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json)
+             VALUES ('c1', 's1', 'text', NULL, 1, 'Leaf', NULL, '[]')",
+            [],
+        ).unwrap();
+        store
+            .replace_all_vector_documents_for_profile(
+                &profile,
+                &[VectorDocument {
+                    chunk_id: ChunkId("c1".into()),
+                    source_id: SourceId("s1".into()),
+                    vector: vec![1.0f32, 0.0, 0.0, 0.0],
+                }],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE chunk_vectors SET vector_json = 'not json'", [])
+            .unwrap();
+
+        let hits = store
+            .search_vector_documents_for_profile(&profile, &[1.0, 0.0, 0.0, 0.0], 1, None)
+            .unwrap();
+
+        assert_eq!(hits, vec![(ChunkId("c1".into()), 1.0)]);
     }
 
     #[test]
