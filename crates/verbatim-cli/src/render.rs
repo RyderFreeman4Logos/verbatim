@@ -13,7 +13,10 @@ use verbatim_core::api::{
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::index_gc::{IndexGcPlanEntry, IndexGcSkippedEntry};
 use verbatim_core::task::{TaskEvent, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary};
-use verbatim_core::types::{BBox, OcrSourceStatus, RetrievalDebug, SourceLocator};
+use verbatim_core::types::{
+    BBox, OcrSourceStatus, RetrievalDebug, RetrievalEvidencePackEntry, RetrievalFusedHit,
+    RetrievalRerankStatus, RetrievalStageHit, SourceLocator,
+};
 
 /// Persisted sample used to estimate aggregate task-list progress across CLI calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1671,6 +1674,18 @@ where
     Ok(())
 }
 
+pub fn write_retrieve_debug_summary<W>(
+    writer: &mut W,
+    response: &RetrieveResponse,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    let summary = RetrieveDebugSummary::from_response(response);
+    serde_json::to_writer(&mut *writer, &summary).map_err(io::Error::other)?;
+    writeln!(writer)
+}
+
 pub fn write_retrieve_snippets<W>(writer: &mut W, response: &RetrieveResponse) -> io::Result<()>
 where
     W: Write,
@@ -1734,12 +1749,254 @@ where
     Ok(())
 }
 
+const RETRIEVE_DEBUG_SUMMARY_LIMIT: usize = 5;
+
+#[derive(Debug, Serialize)]
+struct RetrieveDebugSummary {
+    kind: &'static str,
+    task_id: String,
+    debug_available: bool,
+    timing_ms: RetrieveDebugTimingSummary,
+    counts: RetrieveDebugCountSummary,
+    reranker: RetrieveDebugRerankerSummary,
+    top_candidates: RetrieveDebugTopCandidates,
+}
+
+impl RetrieveDebugSummary {
+    fn from_response(response: &RetrieveResponse) -> Self {
+        let debug = response.debug.as_ref();
+        Self {
+            kind: "retrieval_debug_summary",
+            task_id: response.task_id.clone(),
+            debug_available: debug.is_some(),
+            timing_ms: RetrieveDebugTimingSummary::from_response(response, debug),
+            counts: RetrieveDebugCountSummary::from_debug(debug),
+            reranker: RetrieveDebugRerankerSummary::from_debug(debug),
+            top_candidates: RetrieveDebugTopCandidates::from_debug(debug),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RetrieveDebugTimingSummary {
+    retrieval_ms: Option<u64>,
+    rerank_ms: Option<u64>,
+    total_ms: Option<u64>,
+}
+
+impl RetrieveDebugTimingSummary {
+    fn from_response(response: &RetrieveResponse, debug: Option<&RetrievalDebug>) -> Self {
+        let retrieval_ms = response_timing_ms(response, "retrieval");
+        let rerank_ms = response_timing_ms(response, "rerank")
+            .or_else(|| debug.and_then(|debug| debug.reranker.latency_ms));
+        let total_ms = response_timing_ms(response, "total").or_else(|| {
+            let total = response
+                .timings
+                .iter()
+                .map(|timing| timing.duration_ms)
+                .sum::<u64>();
+            (total > 0).then_some(total)
+        });
+        Self {
+            retrieval_ms,
+            rerank_ms,
+            total_ms,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RetrieveDebugCountSummary {
+    bm25_hits: usize,
+    dense_hits: usize,
+    rrf_fused: usize,
+    rerank_input: usize,
+    final_evidence: usize,
+}
+
+impl RetrieveDebugCountSummary {
+    fn from_debug(debug: Option<&RetrievalDebug>) -> Self {
+        let Some(debug) = debug else {
+            return Self {
+                bm25_hits: 0,
+                dense_hits: 0,
+                rrf_fused: 0,
+                rerank_input: 0,
+                final_evidence: 0,
+            };
+        };
+        Self {
+            bm25_hits: debug.bm25_hits.len(),
+            dense_hits: debug.dense_hits.len(),
+            rrf_fused: debug.rrf_fused_hits.len(),
+            rerank_input: rerank_input_count(debug),
+            final_evidence: debug.final_evidence_pack.len(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RetrieveDebugRerankerSummary {
+    status: Option<&'static str>,
+    reason: Option<String>,
+}
+
+impl RetrieveDebugRerankerSummary {
+    fn from_debug(debug: Option<&RetrievalDebug>) -> Self {
+        let Some(debug) = debug else {
+            return Self {
+                status: None,
+                reason: None,
+            };
+        };
+        Self {
+            status: Some(reranker_status_name(debug.reranker.status)),
+            reason: debug.reranker.reason.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RetrieveDebugTopCandidates {
+    bm25_hits: Vec<RetrieveDebugCandidateSummary>,
+    dense_hits: Vec<RetrieveDebugCandidateSummary>,
+    rrf_fused: Vec<RetrieveDebugCandidateSummary>,
+    rerank_input: Vec<RetrieveDebugCandidateSummary>,
+    final_evidence: Vec<RetrieveDebugCandidateSummary>,
+}
+
+impl RetrieveDebugTopCandidates {
+    fn from_debug(debug: Option<&RetrievalDebug>) -> Self {
+        let Some(debug) = debug else {
+            return Self {
+                bm25_hits: Vec::new(),
+                dense_hits: Vec::new(),
+                rrf_fused: Vec::new(),
+                rerank_input: Vec::new(),
+                final_evidence: Vec::new(),
+            };
+        };
+        Self {
+            bm25_hits: top_stage_candidates(&debug.bm25_hits),
+            dense_hits: top_stage_candidates(&debug.dense_hits),
+            rrf_fused: top_fused_candidates(&debug.rrf_fused_hits),
+            rerank_input: top_rerank_input_candidates(debug),
+            final_evidence: top_final_evidence_candidates(&debug.final_evidence_pack),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RetrieveDebugCandidateSummary {
+    chunk_id: String,
+    source: Option<String>,
+    score: f32,
+}
+
+fn response_timing_ms(response: &RetrieveResponse, phase: &str) -> Option<u64> {
+    response
+        .timings
+        .iter()
+        .find(|timing| timing.phase == phase)
+        .map(|timing| timing.duration_ms)
+}
+
+fn rerank_input_count(debug: &RetrievalDebug) -> usize {
+    debug
+        .reranker
+        .candidate_count
+        .or_else(|| {
+            debug
+                .reranker
+                .request
+                .as_ref()
+                .map(|request| request.candidate_count)
+        })
+        .unwrap_or({
+            if debug.reranker.scores.is_empty() {
+                0
+            } else {
+                debug.reranker.scores.len()
+            }
+        })
+}
+
+fn reranker_status_name(status: RetrievalRerankStatus) -> &'static str {
+    match status {
+        RetrievalRerankStatus::Disabled => "disabled",
+        RetrievalRerankStatus::Skipped => "skipped",
+        RetrievalRerankStatus::Succeeded => "succeeded",
+        RetrievalRerankStatus::Fallback => "fallback",
+    }
+}
+
+fn top_stage_candidates(hits: &[RetrievalStageHit]) -> Vec<RetrieveDebugCandidateSummary> {
+    hits.iter()
+        .take(RETRIEVE_DEBUG_SUMMARY_LIMIT)
+        .map(|hit| RetrieveDebugCandidateSummary {
+            chunk_id: hit.chunk_id.0.clone(),
+            source: hit.source_id.as_ref().map(|source_id| source_id.0.clone()),
+            score: hit.score,
+        })
+        .collect()
+}
+
+fn top_fused_candidates(hits: &[RetrievalFusedHit]) -> Vec<RetrieveDebugCandidateSummary> {
+    hits.iter()
+        .take(RETRIEVE_DEBUG_SUMMARY_LIMIT)
+        .map(|hit| RetrieveDebugCandidateSummary {
+            chunk_id: hit.chunk_id.0.clone(),
+            source: hit.source_id.as_ref().map(|source_id| source_id.0.clone()),
+            score: hit.score,
+        })
+        .collect()
+}
+
+fn top_rerank_input_candidates(debug: &RetrievalDebug) -> Vec<RetrieveDebugCandidateSummary> {
+    debug
+        .rrf_fused_hits
+        .iter()
+        .take(RETRIEVE_DEBUG_SUMMARY_LIMIT.min(rerank_input_count(debug)))
+        .map(|hit| RetrieveDebugCandidateSummary {
+            chunk_id: hit.chunk_id.0.clone(),
+            source: hit.source_id.as_ref().map(|source_id| source_id.0.clone()),
+            score: hit.score,
+        })
+        .collect()
+}
+
+fn top_final_evidence_candidates(
+    items: &[RetrievalEvidencePackEntry],
+) -> Vec<RetrieveDebugCandidateSummary> {
+    items
+        .iter()
+        .take(RETRIEVE_DEBUG_SUMMARY_LIMIT)
+        .map(|item| RetrieveDebugCandidateSummary {
+            chunk_id: item.chunk_id.0.clone(),
+            source: Some(item.source_id.0.clone()),
+            score: item.score,
+        })
+        .collect()
+}
+
 pub fn write_retrieve_json<W>(writer: &mut W, response: &RetrieveResponse) -> io::Result<()>
 where
     W: Write,
 {
     serde_json::to_writer_pretty(&mut *writer, response).map_err(io::Error::other)?;
     writeln!(writer)
+}
+
+pub fn write_retrieve_json_without_debug<W>(
+    writer: &mut W,
+    response: &RetrieveResponse,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    let mut response = response.clone();
+    response.debug = None;
+    write_retrieve_json(writer, &response)
 }
 
 #[derive(Debug, Clone, PartialEq)]

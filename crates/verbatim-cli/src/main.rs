@@ -83,7 +83,7 @@ where
         }
     };
 
-    match dispatch(cli, stdout, client, local) {
+    match dispatch(cli, stdout, stderr, client, local) {
         Ok(code) => Ok(code),
         Err(error) => {
             writeln!(stderr, "{error}").map_err(|_| 1)?;
@@ -136,20 +136,31 @@ fn write_retrieve_with_format<W>(
     stdout: &mut W,
     response: &verbatim_core::api::RetrieveResponse,
     format: RetrieveFormat,
-    show_debug: bool,
 ) -> std::io::Result<()>
 where
     W: Write,
 {
     match format {
-        RetrieveFormat::Markdown if show_debug => {
-            render::write_retrieve_debug_response(stdout, response)
-        }
         RetrieveFormat::Markdown => render::write_retrieve_response(stdout, response),
         RetrieveFormat::Json => render::write_retrieve_json(stdout, response),
         RetrieveFormat::Snippets => render::write_retrieve_snippets(stdout, response),
         RetrieveFormat::Tsv => render::write_retrieve_tsv(stdout, response),
         RetrieveFormat::Csv => render::write_retrieve_csv(stdout, response),
+    }
+}
+
+fn write_retrieve_debug_output<W>(
+    stderr: &mut W,
+    response: &verbatim_core::api::RetrieveResponse,
+    verbose: bool,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if verbose {
+        render::write_retrieve_debug_response(stderr, response)
+    } else {
+        render::write_retrieve_debug_summary(stderr, response)
     }
 }
 
@@ -214,9 +225,16 @@ fn task_wait_timeout_selection(
     }
 }
 
-fn dispatch<W, C, L>(cli: Cli, stdout: &mut W, client: &C, local: &L) -> Result<u8, CliError>
+fn dispatch<W, E, C, L>(
+    cli: Cli,
+    stdout: &mut W,
+    stderr: &mut E,
+    client: &C,
+    local: &L,
+) -> Result<u8, CliError>
 where
     W: Write,
+    E: Write,
     C: DaemonClient,
     L: LocalActions,
 {
@@ -321,7 +339,14 @@ where
                     include_locator: format == RetrieveFormat::Json,
                 };
                 let response = client.retrieve(&request)?;
-                write_retrieve_with_format(stdout, &response, format, show_retrieval)?;
+                if show_retrieval {
+                    write_retrieve_debug_output(stderr, &response, false)?;
+                }
+                if format == RetrieveFormat::Json && show_retrieval {
+                    render::write_retrieve_json_without_debug(stdout, &response)?;
+                } else {
+                    write_retrieve_with_format(stdout, &response, format)?;
+                }
                 return Ok(0);
             }
 
@@ -375,6 +400,7 @@ where
             rerank_top_n,
             no_cache,
             show_debug,
+            verbose,
             show_locator,
             format,
             text_only,
@@ -407,7 +433,14 @@ where
                 include_locator,
             };
             let response = client.retrieve(&request)?;
-            write_retrieve_with_format(stdout, &response, format, show_debug)?;
+            if show_debug {
+                write_retrieve_debug_output(stderr, &response, verbose)?;
+            }
+            if format == RetrieveFormat::Json && show_debug {
+                render::write_retrieve_json_without_debug(stdout, &response)?;
+            } else {
+                write_retrieve_with_format(stdout, &response, format)?;
+            }
             Ok(0)
         }
         Commands::Evidence { eid } => {
@@ -1011,7 +1044,9 @@ const RETRIEVE_AFTER_HELP: &str = r#"Examples:
   verbatim retrieve --source-id <source-id> --page-size 1 "What supports it?"
   verbatim retrieve --collection articles "What evidence is relevant?"
   verbatim retrieve --collection articles --collection areskapitalon "What changed?"
-  verbatim retrieve --show-debug --show-locator "What evidence is relevant?"
+  verbatim retrieve --show-debug "What evidence is relevant?"
+  verbatim retrieve --show-debug --verbose "What evidence is relevant?"
+  verbatim retrieve --show-locator "What evidence is relevant?"
   verbatim retrieve --format json --show-debug "What evidence is relevant?"
 
 Debugging:
@@ -1022,17 +1057,19 @@ Debugging:
   columns: rank, score, citation, collection, source, locator, snippet.
   --collection filters against materialized daemon membership and does not
   rescan collection roots during retrieve.
-  --show-debug includes task diagnostics, engine controls, timing, locators,
-  internal evidence metadata, and deterministic dense/BM25/RRF/rerank ranking
-  details. JSON output retains structured locator/provenance fields and full
-  evidence identifiers for evidence lookups.
+  --show-debug writes a compact JSON retrieval diagnostic summary to stderr.
+  --show-debug --verbose writes the full task diagnostics, engine controls,
+  timing, locators, internal evidence metadata, and deterministic
+  dense/BM25/RRF/rerank ranking details to stderr.
+  JSON output retains structured locator/provenance fields and full evidence
+  identifiers for evidence lookups, but retrieval debug diagnostics stay on stderr.
 "#;
 
 const EVIDENCE_AFTER_HELP: &str = r#"Examples:
   verbatim evidence <evidence-id>
 
-Evidence ids come from retrieve --show-debug, retrieve --format json, ask
-citations, and retrieval debug packs.
+Evidence ids come from retrieve --show-debug --verbose, retrieve --format json,
+ask citations, and retrieval debug packs.
 "#;
 
 const CONFIG_AFTER_HELP: &str = r#"Examples:
@@ -1389,6 +1426,9 @@ enum Commands {
         /// Useful for evidence/provenance debugging and agent workflows.
         #[arg(long = "show-debug")]
         show_debug: bool,
+        /// Emit the full retrieval debug dump instead of the compact summary.
+        #[arg(long, action = ArgAction::SetTrue, requires = "show_debug")]
+        verbose: bool,
         /// Include structured locator/provenance fields in the response.
         #[arg(long = "show-locator")]
         show_locator: bool,
@@ -2056,7 +2096,8 @@ mod tests {
         assert!(help.contains("retrieve never invokes chat generation"));
         assert!(help.contains("Default markdown is compact"));
         assert!(help.contains("snippets/text-only omit headers"));
-        assert!(help.contains("--show-debug includes task diagnostics"));
+        assert!(help.contains("--show-debug writes a compact JSON retrieval diagnostic summary"));
+        assert!(help.contains("--show-debug --verbose writes the full task diagnostics"));
         assert!(help.contains("dense/BM25/RRF/rerank"));
         assert!(help.contains("--show-locator"));
         assert!(help.contains("structured locator/provenance"));
@@ -3116,7 +3157,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_json_requests_structured_locator_and_debug() {
+    fn retrieve_json_requests_structured_locator_and_writes_debug_to_stderr() {
         let (code, stdout, stderr, client, _) = run_mock([
             "retrieve",
             "--format",
@@ -3135,7 +3176,6 @@ mod tests {
         ]);
 
         assert_eq!(code.unwrap(), 0);
-        assert!(stderr.is_empty());
         let request = client.last_retrieve.borrow();
         let request = request.as_ref().unwrap();
         assert_eq!(request.rerank, Some(true));
@@ -3145,7 +3185,11 @@ mod tests {
         assert!(request.include_debug);
         assert!(request.include_locator);
         assert!(stdout.contains("\"structured_locator\""));
-        assert!(stdout.contains("\"debug\""));
+        assert!(!stdout.contains("\"debug\""));
+        let debug: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert_eq!(debug["kind"], "retrieval_debug_summary");
+        assert_eq!(debug["counts"]["bm25_hits"], 1);
+        assert!(stderr.lines().count() < 50);
     }
 
     #[test]
@@ -3235,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_markdown_show_debug_renders_retrieval_debug() {
+    fn retrieve_markdown_show_debug_writes_compact_summary_to_stderr() {
         let (code, stdout, stderr, client, _) = run_mock([
             "retrieve",
             "--show-debug",
@@ -3247,7 +3291,6 @@ mod tests {
         ]);
 
         assert_eq!(code.unwrap(), 0);
-        assert!(stderr.is_empty());
         assert_eq!(client.calls.borrow().as_slice(), ["retrieve"]);
         assert!(
             client
@@ -3266,9 +3309,43 @@ mod tests {
                 .include_locator,
             "show-debug should request structured locator metadata"
         );
-        assert!(stdout.contains("Context pack: task-1"));
-        assert!(stdout.contains("Retrieval Debug"));
-        assert!(stdout.contains("Final evidence pack:"));
+        assert!(stdout.contains("1. score=0.0310 [doc.md L1]"));
+        assert!(!stdout.contains("Context pack: task-1"));
+        assert!(!stdout.contains("Retrieval Debug"));
+        let debug: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert_eq!(debug["kind"], "retrieval_debug_summary");
+        assert_eq!(debug["timing_ms"]["retrieval_ms"], 7);
+        assert_eq!(debug["counts"]["final_evidence"], 1);
+        assert_eq!(debug["reranker"]["status"], "skipped");
+        assert_eq!(
+            debug["top_candidates"]["bm25_hits"][0]["chunk_id"],
+            "chunk-1"
+        );
+        assert!(debug["top_candidates"]["bm25_hits"][0]
+            .get("evidence_ids")
+            .is_none());
+        assert!(stderr.lines().count() < 50);
+    }
+
+    #[test]
+    fn retrieve_markdown_show_debug_verbose_writes_full_debug_to_stderr() {
+        let (code, stdout, stderr, _, _) = run_mock([
+            "retrieve",
+            "--show-debug",
+            "--verbose",
+            "--format",
+            "markdown",
+            "What",
+            "is",
+            "cited?",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stdout.contains("1. score=0.0310 [doc.md L1]"));
+        assert!(!stdout.contains("Retrieval Debug"));
+        assert!(stderr.contains("Context pack: task-1"));
+        assert!(stderr.contains("Retrieval Debug"));
+        assert!(stderr.contains("Final evidence pack:"));
     }
 
     #[test]
@@ -3296,7 +3373,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_context_only_renders_markdown_context_pack_without_generation() {
+    fn ask_context_only_writes_retrieval_debug_summary_to_stderr() {
         let (code, stdout, stderr, client, _) = run_mock([
             "ask",
             "--context-only",
@@ -3315,7 +3392,6 @@ mod tests {
         ]);
 
         assert_eq!(code.unwrap(), 0);
-        assert!(stderr.is_empty());
         assert_eq!(client.calls.borrow().as_slice(), ["retrieve"]);
         assert!(client.last_ask.borrow().is_none());
         assert_eq!(
@@ -3338,11 +3414,12 @@ mod tests {
                 include_locator: false,
             }
         );
-        assert!(stdout.contains("Context pack: task-1"));
-        assert!(stdout.contains("page: 2 page_size=1 limit=3"));
-        assert!(stdout.contains("snippet: compact cited text"));
-        assert!(stdout.contains("Retrieval Debug"));
-        assert!(stdout.contains("Final evidence pack:"));
+        assert!(stdout.contains("1. score=0.0310 [doc.md L1]"));
+        assert!(!stdout.contains("Context pack: task-1"));
+        assert!(!stdout.contains("Retrieval Debug"));
+        let debug: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert_eq!(debug["kind"], "retrieval_debug_summary");
+        assert_eq!(debug["counts"]["rrf_fused"], 1);
     }
 
     #[test]
