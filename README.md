@@ -189,6 +189,9 @@ verbatim retrieve --source-id <source-id> --format json --show-debug \
 verbatim evidence <evidence-id>
 ```
 
+`--show-debug` keeps result stdout pipeable and writes compact retrieval
+diagnostics to stderr; add `--verbose` for the full retrieval debug dump.
+
 Queue long-running work as daemon tasks:
 
 ```sh
@@ -261,9 +264,9 @@ control queued work.
 without invoking chat generation. Default Markdown is compact: rank, score,
 citation, and snippet. Use `--format snippets` or `--text-only` for citation
 plus snippet only, and `--format tsv` or `--format csv` for fixed-column output.
-Add `--show-debug`, `--show-locator`, or JSON format when you need deterministic
-ranking, locator, provenance, internal evidence ids, and other debugging
-details.
+Add `--show-debug` for compact deterministic ranking diagnostics, or use
+`--show-debug --verbose`, `--show-locator`, or JSON format when you need
+locators, provenance, internal evidence ids, and other debugging details.
 
 ## Command Reference
 
