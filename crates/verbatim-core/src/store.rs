@@ -352,6 +352,15 @@ pub struct EmbeddingCacheEntry {
     pub vector: Vec<f32>,
 }
 
+/// Borrowed embedding cache payload for writing vectors already owned elsewhere.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbeddingCacheVector<'a> {
+    /// Stable hash of the prepared embedding input text and profile config.
+    pub embedding_input_hash: &'a str,
+    /// Dense vector payload to persist for cache reuse.
+    pub vector: &'a [f32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingProfileIndexGeneration {
     pub profile_id: EmbeddingProfileId,
@@ -2126,6 +2135,23 @@ impl Store {
         profile_config_hash: &str,
         entries: &[EmbeddingCacheEntry],
     ) -> Result<()> {
+        let vectors = entries
+            .iter()
+            .map(|entry| EmbeddingCacheVector {
+                embedding_input_hash: &entry.embedding_input_hash,
+                vector: &entry.vector,
+            })
+            .collect::<Vec<_>>();
+        self.upsert_embedding_cache_vectors(profile_id, profile_config_hash, &vectors)
+    }
+
+    /// Upsert cache rows from borrowed vectors without taking ownership of the payloads.
+    pub fn upsert_embedding_cache_vectors(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        profile_config_hash: &str,
+        entries: &[EmbeddingCacheVector<'_>],
+    ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -2144,11 +2170,11 @@ impl Store {
                     updated_at = excluded.updated_at",
             )?;
             for entry in entries {
-                let vector_blob = vector_to_blob(&entry.vector);
+                let vector_blob = vector_to_blob(entry.vector);
                 stmt.execute(params![
                     profile_id.as_str(),
                     profile_config_hash,
-                    &entry.embedding_input_hash,
+                    entry.embedding_input_hash,
                     "",
                     vector_blob,
                     sql_usize(entry.vector.len()),

@@ -51,7 +51,7 @@ use crate::resource::{
     TaskResourceProgress,
 };
 use crate::store::{
-    EmbeddingCacheEntry, EmbeddingProfileConfig, SourceContentsReplacement, Store,
+    EmbeddingCacheVector, EmbeddingProfileConfig, SourceContentsReplacement, Store,
     StoredEmbeddingProfileConfig,
 };
 use crate::task::{
@@ -713,6 +713,11 @@ struct EmbeddingInput {
     text: String,
 }
 
+struct PreparedEmbeddingVector {
+    embedding_input_hash: String,
+    document: VectorDocument,
+}
+
 struct PreparedSourceIngest {
     task_id: Option<TaskId>,
     source: Source,
@@ -827,6 +832,15 @@ struct PreparedSourceOutcome {
     source_id: SourceId,
     task_id: Option<TaskId>,
     result: std::result::Result<EmbeddingCacheStats, String>,
+}
+
+fn collect_prepared_source_outcomes(
+    outcome_slots: Vec<Option<PreparedSourceOutcome>>,
+) -> Vec<PreparedSourceOutcome> {
+    outcome_slots
+        .into_iter()
+        .map(|outcome| outcome.expect("prepared source outcome slot populated"))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -2175,6 +2189,36 @@ where
             .source_vectors_stale_for_profile(profile_id, &source.id)?)
     }
 
+    fn prepared_source_has_fresh_committed_vectors(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        source: &Source,
+    ) -> Result<bool> {
+        if !self.embedding_enabled {
+            return Ok(false);
+        }
+        let Some(existing) = self.store.get_source(&source.id)? else {
+            return Ok(false);
+        };
+        if existing.status != SourceStatus::Indexed
+            || existing.hash != source.hash
+            || existing.parser_used != source.parser_used
+        {
+            return Ok(false);
+        }
+        Ok(!self
+            .store
+            .source_vectors_stale_for_profile(profile_id, &source.id)?)
+    }
+
+    fn noop_embedding_cache_stats(child_chunk_count: usize) -> EmbeddingCacheStats {
+        EmbeddingCacheStats {
+            cache_hits: child_chunk_count,
+            reused_chunks: child_chunk_count,
+            ..EmbeddingCacheStats::default()
+        }
+    }
+
     fn record_noop_source_ingest(
         &self,
         task_id: Option<&TaskId>,
@@ -2835,6 +2879,77 @@ where
                 )
                 .await;
         }
+        let total_source_count = prepared_sources.len();
+        let mut outcome_slots = std::iter::repeat_with(|| None)
+            .take(total_source_count)
+            .collect::<Vec<_>>();
+        let mut early_completed_sources = 0;
+        let mut stopped_after_boundary_error: Option<String> = None;
+        let mut sources_to_embed = Vec::with_capacity(total_source_count);
+        for (index, source) in prepared_sources.into_iter().enumerate() {
+            if let Some(error) = &stopped_after_boundary_error {
+                outcome_slots[index] = Some(PreparedSourceOutcome {
+                    source_id: source.source.id,
+                    task_id: source.task_id,
+                    result: Err(format!(
+                        "source ingest not attempted after earlier source boundary failure: {error}"
+                    )),
+                });
+                continue;
+            }
+            match self.prepared_source_has_fresh_committed_vectors(profile_id, &source.source) {
+                Ok(true) => {
+                    let child_chunk_count = source.child_chunks.len();
+                    let cache_stats = Self::noop_embedding_cache_stats(child_chunk_count);
+                    let (completed_sources, total_sources) =
+                        cancellation_scope.progress(early_completed_sources);
+                    match self.ensure_task_not_cancelled(
+                        source.task_id.as_ref(),
+                        completed_sources,
+                        total_sources,
+                        Some(&source.source.id),
+                    ) {
+                        Ok(()) => {
+                            self.record_noop_source_ingest(
+                                source.task_id.as_ref(),
+                                profile_id,
+                                &source.source.id,
+                                child_chunk_count,
+                                &cache_stats,
+                            );
+                            early_completed_sources += 1;
+                            outcome_slots[index] = Some(PreparedSourceOutcome {
+                                source_id: source.source.id,
+                                task_id: source.task_id,
+                                result: Ok(cache_stats),
+                            });
+                        }
+                        Err(error) => {
+                            let error = error.to_string();
+                            stopped_after_boundary_error.get_or_insert_with(|| error.clone());
+                            outcome_slots[index] = Some(PreparedSourceOutcome {
+                                source_id: source.source.id,
+                                task_id: source.task_id,
+                                result: Err(error),
+                            });
+                        }
+                    }
+                }
+                Ok(false) => sources_to_embed.push((index, source)),
+                Err(error) => {
+                    outcome_slots[index] = Some(PreparedSourceOutcome {
+                        source_id: source.source.id,
+                        task_id: source.task_id,
+                        result: Err(error.to_string()),
+                    });
+                }
+            }
+        }
+        if sources_to_embed.is_empty() {
+            return collect_prepared_source_outcomes(outcome_slots);
+        }
+        let (remaining_indices, prepared_sources): (Vec<_>, Vec<_>) =
+            sources_to_embed.into_iter().unzip();
         let source_count = prepared_sources.len();
         let input_count = prepared_sources
             .iter()
@@ -2895,14 +3010,14 @@ where
             Ok(prepared_vectors) => prepared_vectors,
             Err(error) => {
                 let error = error.to_string();
-                return prepared_sources
-                    .into_iter()
-                    .map(|source| PreparedSourceOutcome {
+                for (index, source) in remaining_indices.into_iter().zip(prepared_sources) {
+                    outcome_slots[index] = Some(PreparedSourceOutcome {
                         source_id: source.source.id,
                         task_id: source.task_id,
                         result: Err(error.clone()),
-                    })
-                    .collect();
+                    });
+                }
+                return collect_prepared_source_outcomes(outcome_slots);
             }
         };
         let duration_ms = embedding_started
@@ -2940,7 +3055,7 @@ where
         let mut outcomes = Vec::with_capacity(source_count);
         let mut batched_committed_sources = Vec::new();
         let mut stopped_after_commit_error: Option<String> = None;
-        let mut committed_sources_in_batch = 0;
+        let mut committed_sources_in_batch = early_completed_sources;
         for source in prepared_sources {
             let PreparedSourceIngest {
                 task_id,
@@ -3096,7 +3211,10 @@ where
                 }
             }
         }
-        outcomes
+        for (index, outcome) in remaining_indices.into_iter().zip(outcomes) {
+            outcome_slots[index] = Some(outcome);
+        }
+        collect_prepared_source_outcomes(outcome_slots)
     }
 
     async fn commit_prepared_sources_without_embeddings(
@@ -4246,25 +4364,24 @@ where
                 record_postprocess_started(&request_source_ids, request_count, request_input_count);
                 let postprocess_phase =
                     PhaseTiming::start(IngestTaskStage::EmbeddingPostprocess.as_str());
-                let mut cache_entries = Vec::new();
+                let mut embedded_vectors = Vec::new();
                 for result in batch_results {
                     match result {
                         Ok((_batch_index, batch, embeddings)) => {
-                            cache_entries.reserve(batch.len());
+                            embedded_vectors.reserve(batch.len());
                             for (input, embedding) in batch.into_iter().zip(embeddings) {
                                 cache_stats.embedded_chunks += 1;
                                 cache_stats_by_source
                                     .entry(input.source_id.clone())
                                     .or_default()
                                     .embedded_chunks += 1;
-                                cache_entries.push(EmbeddingCacheEntry {
-                                    embedding_input_hash: input.hash.clone(),
-                                    vector: embedding.clone(),
-                                });
-                                vectors.push(VectorDocument {
-                                    chunk_id: input.chunk_id,
-                                    source_id: input.source_id,
-                                    vector: embedding,
+                                embedded_vectors.push(PreparedEmbeddingVector {
+                                    embedding_input_hash: input.hash,
+                                    document: VectorDocument {
+                                        chunk_id: input.chunk_id,
+                                        source_id: input.source_id,
+                                        vector: embedding,
+                                    },
                                 });
                             }
                         }
@@ -4280,17 +4397,27 @@ where
                 }
                 let sqlite_write_permit =
                     acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
-                self.store.upsert_embedding_cache_entries(
+                let cache_entries = embedded_vectors
+                    .iter()
+                    .map(|entry| EmbeddingCacheVector {
+                        embedding_input_hash: &entry.embedding_input_hash,
+                        vector: &entry.document.vector,
+                    })
+                    .collect::<Vec<_>>();
+                let cache_entry_count = cache_entries.len();
+                self.store.upsert_embedding_cache_vectors(
                     profile_id,
                     &profile_config_hash,
                     &cache_entries,
                 )?;
                 drop(sqlite_write_permit);
+                drop(cache_entries);
+                vectors.extend(embedded_vectors.into_iter().map(|entry| entry.document));
                 postprocess_timing = Some(postprocess_phase.finish(serde_json::json!({
                     "operation": "embedding_response_postprocess",
                     "source_count": request_source_ids.len(),
                     "input_count": request_input_count,
-                    "cache_entries": cache_entries.len(),
+                    "cache_entries": cache_entry_count,
                     "embedded_chunks": cache_stats.embedded_chunks,
                     "error_source_count": errors_by_source.len(),
                 })));
@@ -10546,6 +10673,103 @@ model = "local-vision"
             event.event_type == "noop"
                 && event.payload["operation"] == "source_ingest_noop"
                 && event.payload["vector_index_published"] == false
+        }));
+    }
+
+    #[tokio::test]
+    async fn unchanged_reingest_skips_embedding_cache_vector_payload_read() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("doc.md");
+        std::fs::write(&path, "# Alpha\n\nAlpha body.\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let embedding = RecordingEmbeddingClient::new();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            embedding.clone(),
+            tempdir.path().to_path_buf(),
+        );
+        let source_id = pipeline.add_source(&path).unwrap();
+
+        let first = pipeline.ingest_source(&source_id).await.unwrap();
+        assert_eq!(first.cache_misses, 1);
+        assert_eq!(embedding.calls().len(), 1);
+        let generation_after_first = pipeline.store().index_generation().unwrap();
+        let corrupted_rows = pipeline
+            .store()
+            .connection()
+            .execute(
+                "UPDATE embedding_cache SET vector_blob = X'01', vector_json = ''",
+                [],
+            )
+            .unwrap();
+        assert_eq!(corrupted_rows, 1);
+
+        let second = pipeline.ingest_source(&source_id).await.unwrap();
+
+        assert_eq!(second.cache_hits, 1);
+        assert_eq!(second.cache_misses, 0);
+        assert_eq!(second.reused_chunks, 1);
+        assert_eq!(second.embedded_chunks, 0);
+        assert_eq!(embedding.calls().len(), 1);
+        assert_eq!(
+            pipeline.store().index_generation().unwrap(),
+            generation_after_first
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_unchanged_reingest_observes_cancellation_before_noop() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("doc.md");
+        std::fs::write(&path, "# Alpha\n\nAlpha body.\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let embedding = RecordingEmbeddingClient::new();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            embedding.clone(),
+            tempdir.path().to_path_buf(),
+        );
+        let source_id = pipeline.add_source(&path).unwrap();
+
+        let first = pipeline.ingest_source(&source_id).await.unwrap();
+        assert_eq!(first.cache_misses, 1);
+        assert_eq!(embedding.calls().len(), 1);
+        let generation_after_first = pipeline.store().index_generation().unwrap();
+
+        let second_task = TaskId("task-cancel-unchanged-noop".into());
+        pipeline
+            .store()
+            .create_task(
+                &second_task,
+                TaskKind::Ingest,
+                &serde_json::json!({ "source_id": source_id.0 }),
+            )
+            .unwrap();
+        pipeline.store().start_task(&second_task).unwrap();
+        pipeline.store().cancel_task(&second_task).unwrap();
+
+        let error = pipeline
+            .ingest_source_with_task(&source_id, &second_task)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("ingest task cancelled"));
+        assert_eq!(embedding.calls().len(), 1);
+        assert_eq!(
+            pipeline.store().index_generation().unwrap(),
+            generation_after_first
+        );
+        let second_events = pipeline
+            .store()
+            .list_task_events(&second_task, None, 100)
+            .unwrap();
+        assert!(second_events
+            .iter()
+            .any(|event| event.event_type == "cancelled"));
+        assert!(!second_events.iter().any(|event| {
+            event.event_type == "noop" && event.payload["operation"] == "source_ingest_noop"
         }));
     }
 
