@@ -252,6 +252,31 @@ stores metadata and text in SQLite, builds BM25 search indexes with Tantivy, and
 builds dense vector indexes for retrieval. Retrieval fuses dense and BM25
 results before returning a compact evidence pack.
 
+New dense vector writes store compact little-endian BLOB payloads in SQLite and
+leave the legacy `vector_json` payload empty. Read paths still prefer BLOB and
+fall back to legacy JSON-only rows, so old databases remain readable. To inspect
+old JSON copies without changing SQLite, run:
+
+```sh
+verbatim index vector-json-cleanup --dry-run
+```
+
+Dry-run reports `eligible`, `json_only`, `missing_blob`, and `malformed_blob`
+for both `chunk_vectors` and `embedding_cache`. To clear only JSON payload
+copies that already have a valid BLOB, stop write-heavy ingest/reindex work,
+back up `~/.local/share/verbatim/verbatim.db` plus any `-wal`/`-shm` files, then
+run:
+
+```sh
+verbatim index vector-json-cleanup --execute --confirm
+```
+
+Cleanup is transactional and skips JSON-only or malformed-BLOB rows. It does
+not delete rows, and it does not clear legacy JSON-only payloads because those
+may be the only readable vector copy. SQLite may keep freed pages inside the DB
+file; reclaiming filesystem space requires a separate `VACUUM` or rebuild-table
+maintenance step after an appropriate backup.
+
 **Embedding profile**: A named embedding configuration. Normal parsing ingest
 uses `[embedding].profile_id`; `--embedding-profile` is for rebuilding vectors
 from existing chunks, normally with `--vectors-only`.
@@ -292,6 +317,7 @@ verbatim retrieve [options] "question"
 verbatim ask [options] "question"
 verbatim evidence <eid>
 verbatim task {show|events|wait|watch|cancel}
+verbatim index {status|gc|delete-profile|vector-json-cleanup}
 verbatim config {init|show|validate}
 verbatim daemon {start|status|install}
 ```

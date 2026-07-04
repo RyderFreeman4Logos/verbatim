@@ -3749,6 +3749,7 @@ dependencies = [
  "futures",
  "libc",
  "notify",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

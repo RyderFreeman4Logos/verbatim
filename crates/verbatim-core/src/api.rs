@@ -11,6 +11,7 @@ use crate::index_gc::{IndexGcApplyReport, IndexGcConfig, IndexGcPlan};
 use crate::index_profile_delete::{IndexProfileDeleteApplyReport, IndexProfileDeletePlan};
 use crate::memory_budget::MemoryBudgetSnapshot;
 use crate::resource::ResourceQueueSnapshot;
+use crate::store::VectorJsonCleanupReport;
 use crate::task::{TaskEvent, TaskSpan, TaskSummary};
 use crate::types::{
     BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceIngestDiagnostics,
@@ -429,6 +430,20 @@ pub struct IndexProfileDeleteResponse {
     pub dry_run: bool,
     pub plan: IndexProfileDeletePlan,
     pub apply: IndexProfileDeleteApplyReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorJsonCleanupRequest {
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorJsonCleanupResponse {
+    pub dry_run: bool,
+    pub report: VectorJsonCleanupReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

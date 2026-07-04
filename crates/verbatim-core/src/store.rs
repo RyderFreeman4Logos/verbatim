@@ -368,6 +368,33 @@ pub struct EmbeddingProfileStorageCounts {
     pub embedding_profiles: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VectorJsonCleanupTableStats {
+    pub eligible: u64,
+    pub already_clean: u64,
+    pub json_only: u64,
+    pub missing_blob: u64,
+    pub malformed_blob: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VectorJsonCleanupTables {
+    pub chunk_vectors: VectorJsonCleanupTableStats,
+    pub embedding_cache: VectorJsonCleanupTableStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VectorJsonCleanupCleared {
+    pub chunk_vectors: u64,
+    pub embedding_cache: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VectorJsonCleanupReport {
+    pub tables: VectorJsonCleanupTables,
+    pub cleared: VectorJsonCleanupCleared,
+}
+
 impl Store {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -419,6 +446,49 @@ impl Store {
         self.conn
             .execute_batch("PRAGMA shrink_memory;")
             .context("shrink SQLite connection memory")
+    }
+
+    pub fn vector_json_cleanup_dry_run(&self) -> Result<VectorJsonCleanupReport> {
+        let chunk_vectors =
+            scan_vector_json_cleanup_table(&self.conn, VectorJsonTable::ChunkVectors)?.stats;
+        let embedding_cache =
+            scan_vector_json_cleanup_table(&self.conn, VectorJsonTable::EmbeddingCache)?.stats;
+        Ok(VectorJsonCleanupReport {
+            tables: VectorJsonCleanupTables {
+                chunk_vectors,
+                embedding_cache,
+            },
+            cleared: VectorJsonCleanupCleared::default(),
+        })
+    }
+
+    pub fn cleanup_vector_json_payloads(&self) -> Result<VectorJsonCleanupReport> {
+        let tx = self.conn.unchecked_transaction()?;
+        let chunk_vectors = scan_vector_json_cleanup_table(&tx, VectorJsonTable::ChunkVectors)?;
+        let embedding_cache = scan_vector_json_cleanup_table(&tx, VectorJsonTable::EmbeddingCache)?;
+        clear_vector_json_payloads(
+            &tx,
+            VectorJsonTable::ChunkVectors,
+            &chunk_vectors.eligible_rowids,
+        )?;
+        clear_vector_json_payloads(
+            &tx,
+            VectorJsonTable::EmbeddingCache,
+            &embedding_cache.eligible_rowids,
+        )?;
+        tx.commit()?;
+        Ok(VectorJsonCleanupReport {
+            tables: VectorJsonCleanupTables {
+                chunk_vectors: chunk_vectors.stats,
+                embedding_cache: embedding_cache.stats,
+            },
+            cleared: VectorJsonCleanupCleared {
+                chunk_vectors: u64::try_from(chunk_vectors.eligible_rowids.len())
+                    .unwrap_or(u64::MAX),
+                embedding_cache: u64::try_from(embedding_cache.eligible_rowids.len())
+                    .unwrap_or(u64::MAX),
+            },
+        })
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -1805,13 +1875,11 @@ impl Store {
         let mut result = Vec::new();
         for row in rows {
             let (chunk_id, source_id, vector_blob, vector_json) = row?;
-            let vector = if let Some(blob) = vector_blob.as_ref().filter(|b| !b.is_empty()) {
-                blob_to_vector(blob)?
-            } else if let Some(json) = vector_json {
-                serde_json::from_str(&json).context("parse stored vector")?
-            } else {
-                anyhow::bail!("chunk {chunk_id} has neither vector_blob nor vector_json");
-            };
+            let vector = decode_stored_vector(
+                &format!("chunk {chunk_id}"),
+                vector_blob.as_deref(),
+                vector_json.as_deref(),
+            )?;
             result.push(VectorDocument {
                 chunk_id: ChunkId(chunk_id),
                 source_id: SourceId(source_id),
@@ -1889,7 +1957,7 @@ impl Store {
     ) -> Result<()> {
         let source_clause = vector_scan_source_clause(source_ids);
         let sql = format!(
-            "SELECT chunk_id, vector_blob
+            "SELECT chunk_id, vector_blob, vector_json
              FROM chunk_vectors
              WHERE profile_id = ?
                AND vector_blob IS NOT NULL
@@ -1899,12 +1967,29 @@ impl Store {
         let params = vector_scan_params(profile_id, source_ids);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?;
         for row in rows {
-            let (chunk_id, vector_blob) = row?;
-            let score = vector_blob_search_score(query, &vector_blob)
-                .with_context(|| format!("score vector BLOB for chunk {chunk_id}"))?;
+            let (chunk_id, vector_blob, vector_json) = row?;
+            let score = match vector_blob_search_score(query, &vector_blob) {
+                Ok(score) => score,
+                Err(blob_error) => {
+                    let json = non_empty_vector_json(vector_json.as_deref()).ok_or_else(|| {
+                        blob_error.context(format!(
+                            "score vector BLOB for chunk {chunk_id}; no JSON fallback is present"
+                        ))
+                    })?;
+                    let vector = parse_stored_vector(&format!("chunk {chunk_id}"), json)
+                        .with_context(|| {
+                            format!("parse JSON fallback after malformed BLOB for chunk {chunk_id}")
+                        })?;
+                    vector_search_score(query, &vector)
+                }
+            };
             push_top_vector_hit(hits, top_k, ChunkId(chunk_id), score);
         }
         Ok(())
@@ -1933,9 +2018,9 @@ impl Store {
         })?;
         for row in rows {
             let (chunk_id, vector_json) = row?;
-            let json =
-                vector_json.ok_or_else(|| anyhow::anyhow!("missing vector for {chunk_id}"))?;
-            let vector = parse_stored_vector(&chunk_id, &json)?;
+            let json = non_empty_vector_json(vector_json.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("missing vector for chunk {chunk_id}"))?;
+            let vector = parse_stored_vector(&format!("chunk {chunk_id}"), json)?;
             push_top_vector_hit(
                 hits,
                 top_k,
@@ -2003,13 +2088,11 @@ impl Store {
             )
             .optional()?;
         row.map(|(blob, json)| {
-            if let Some(b) = blob.as_ref().filter(|b| !b.is_empty()) {
-                blob_to_vector(b)
-            } else if let Some(j) = json {
-                serde_json::from_str(&j).context("parse cached embedding vector")
-            } else {
-                anyhow::bail!("embedding cache row has neither blob nor json")
-            }
+            decode_stored_vector(
+                &format!("embedding cache input {embedding_input_hash}"),
+                blob.as_deref(),
+                json.as_deref(),
+            )
         })
         .transpose()
     }
@@ -2061,14 +2144,12 @@ impl Store {
                     updated_at = excluded.updated_at",
             )?;
             for entry in entries {
-                let vector_json =
-                    serde_json::to_string(&entry.vector).context("serialize cached vector")?;
                 let vector_blob = vector_to_blob(&entry.vector);
                 stmt.execute(params![
                     profile_id.as_str(),
                     profile_config_hash,
                     &entry.embedding_input_hash,
-                    vector_json,
+                    "",
                     vector_blob,
                     sql_usize(entry.vector.len()),
                     &now,
@@ -3093,8 +3174,9 @@ fn migrate_embedding_profile_tables(conn: &Connection) -> Result<()> {
     // ── Vector BLOB migration (#171) ───────────────────────────────
     // Add vector_blob BLOB columns alongside the legacy vector_json TEXT
     // columns, then backfill from JSON in Rust (SQL can't parse JSON arrays
-    // to little-endian f32 bytes).  New writes go to vector_blob; reads
-    // prefer vector_blob and fall back to vector_json for compatibility.
+    // to little-endian f32 bytes).  New writes store vector_blob and leave
+    // vector_json empty; reads prefer vector_blob and fall back to vector_json
+    // for compatibility.
     if !table_has_column(conn, "chunk_vectors", "vector_blob")? {
         conn.execute_batch("ALTER TABLE chunk_vectors ADD COLUMN vector_blob BLOB;")?;
     }
@@ -3835,9 +3917,114 @@ fn vector_scan_params(
     params
 }
 
-fn parse_stored_vector(chunk_id: &str, vector_json: &str) -> Result<Vec<f32>> {
-    serde_json::from_str(vector_json)
-        .with_context(|| format!("parse stored vector for chunk {chunk_id}"))
+#[derive(Debug, Clone, Copy)]
+enum VectorJsonTable {
+    ChunkVectors,
+    EmbeddingCache,
+}
+
+impl VectorJsonTable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ChunkVectors => "chunk_vectors",
+            Self::EmbeddingCache => "embedding_cache",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct VectorJsonCleanupScan {
+    stats: VectorJsonCleanupTableStats,
+    eligible_rowids: Vec<i64>,
+}
+
+fn scan_vector_json_cleanup_table(
+    conn: &Connection,
+    table: VectorJsonTable,
+) -> Result<VectorJsonCleanupScan> {
+    let mut scan = VectorJsonCleanupScan::default();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT rowid, length(vector_json), length(vector_blob) FROM {}",
+        table.name()
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+            row.get::<_, Option<i64>>(2)?.unwrap_or_default(),
+        ))
+    })?;
+
+    for row in rows {
+        let (rowid, json_len, blob_len) = row?;
+        if blob_len > 0 && blob_len % 4 == 0 {
+            if json_len > 0 {
+                scan.stats.eligible += 1;
+                scan.eligible_rowids.push(rowid);
+            } else {
+                scan.stats.already_clean += 1;
+            }
+        } else if blob_len > 0 {
+            scan.stats.malformed_blob += 1;
+        } else if json_len > 0 {
+            scan.stats.json_only += 1;
+        } else {
+            scan.stats.missing_blob += 1;
+        }
+    }
+    Ok(scan)
+}
+
+fn clear_vector_json_payloads(
+    tx: &Transaction<'_>,
+    table: VectorJsonTable,
+    rowids: &[i64],
+) -> Result<()> {
+    if rowids.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(&format!(
+        "UPDATE {} SET vector_json = '' WHERE rowid = ?1",
+        table.name()
+    ))?;
+    for rowid in rowids {
+        stmt.execute(params![rowid])?;
+    }
+    Ok(())
+}
+
+fn decode_stored_vector(
+    label: &str,
+    vector_blob: Option<&[u8]>,
+    vector_json: Option<&str>,
+) -> Result<Vec<f32>> {
+    if let Some(blob) = vector_blob.filter(|blob| !blob.is_empty()) {
+        match blob_to_vector(blob) {
+            Ok(vector) => return Ok(vector),
+            Err(blob_error) => {
+                if let Some(json) = non_empty_vector_json(vector_json) {
+                    return parse_stored_vector(label, json).with_context(|| {
+                        format!("parse JSON fallback after malformed BLOB for {label}")
+                    });
+                }
+                return Err(blob_error).with_context(|| {
+                    format!("decode vector BLOB for {label}; no JSON fallback is present")
+                });
+            }
+        }
+    }
+
+    let json = non_empty_vector_json(vector_json)
+        .ok_or_else(|| anyhow::anyhow!("{label} has neither vector_blob nor vector_json"))?;
+    parse_stored_vector(label, json)
+}
+
+fn non_empty_vector_json(vector_json: Option<&str>) -> Option<&str> {
+    vector_json.filter(|json| !json.is_empty())
+}
+
+fn parse_stored_vector(label: &str, vector_json: &str) -> Result<Vec<f32>> {
+    serde_json::from_str(vector_json).with_context(|| format!("parse stored vector for {label}"))
 }
 
 /// Serialize a vector as a compact little-endian f32 BLOB.
@@ -4026,13 +4213,12 @@ fn insert_vector_documents_for_profile_tx(
         )
         .context("prepare vector insert")?;
     for vector in vectors {
-        let vector_json = serde_json::to_string(&vector.vector).context("serialize vector")?;
         let vector_blob = vector_to_blob(&vector.vector);
         stmt.execute(params![
             profile_id.as_str(),
             &vector.chunk_id.0,
             &vector.source_id.0,
-            vector_json,
+            "",
             vector_blob,
         ])
         .with_context(|| format!("insert vector for chunk {}", vector.chunk_id.0))?;
@@ -4769,7 +4955,7 @@ mod tests {
     fn vector_blob_migration_backfills_existing_json_vectors() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_blob_migrate.db");
-        // Create store and insert a vector (writes both json and blob).
+        // Create store and insert a vector.
         {
             let store = Store::new(&db_path).unwrap();
             let profile = EmbeddingProfileId::default_profile();
@@ -4795,6 +4981,13 @@ mod tests {
             store
                 .replace_all_vector_documents_for_profile(&profile, &vectors)
                 .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE chunk_vectors SET vector_json = '[1.0,2.0,3.0]' WHERE chunk_id = 'c1'",
+                    [],
+                )
+                .unwrap();
         }
         // Wipe vector_blob, then re-open (triggers migration backfill).
         {
@@ -4808,6 +5001,404 @@ mod tests {
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].vector, vec![1.0f32, 2.0, 3.0]);
     }
+
+    #[test]
+    fn chunk_vector_writes_are_blob_only_and_readable() {
+        let store = Store::in_memory().unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+        insert_vector_test_source_and_chunks(&store, "s1", &["c1"]);
+
+        store
+            .replace_all_vector_documents_for_profile(
+                &profile,
+                &[VectorDocument {
+                    chunk_id: ChunkId("c1".into()),
+                    source_id: SourceId("s1".into()),
+                    vector: vec![1.0, 2.0],
+                }],
+            )
+            .unwrap();
+
+        let (vector_json, blob_len): (String, i64) = store
+            .conn
+            .query_row(
+                "SELECT vector_json, length(vector_blob) FROM chunk_vectors WHERE chunk_id = 'c1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(vector_json, "");
+        assert_eq!(blob_len, 8);
+        assert_eq!(
+            store.list_vector_documents_for_profile(&profile).unwrap()[0].vector,
+            vec![1.0, 2.0]
+        );
+    }
+
+    #[test]
+    fn legacy_json_only_chunk_vectors_remain_readable_and_searchable() {
+        let store = Store::in_memory().unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+        insert_vector_test_source_and_chunks(&store, "s1", &["c-json"]);
+        insert_chunk_vector_row(&store, "s1", "c-json", &[3.0, 4.0], None);
+
+        assert_eq!(
+            store.list_vector_documents_for_profile(&profile).unwrap()[0].vector,
+            vec![3.0, 4.0]
+        );
+        let hits = store
+            .search_vector_documents_for_profile(&profile, &[3.0, 4.0], 1, None)
+            .unwrap();
+        assert_eq!(hits[0].0, ChunkId("c-json".into()));
+    }
+
+    #[test]
+    fn malformed_chunk_vector_blob_uses_json_fallback() {
+        let store = Store::in_memory().unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+        insert_vector_test_source_and_chunks(&store, "s1", &["c-malformed"]);
+        insert_chunk_vector_row(
+            &store,
+            "s1",
+            "c-malformed",
+            &[5.0, 6.0],
+            Some(vec![1, 2, 3]),
+        );
+
+        assert_eq!(
+            store.list_vector_documents_for_profile(&profile).unwrap()[0].vector,
+            vec![5.0, 6.0]
+        );
+        let hits = store
+            .search_vector_documents_for_profile(&profile, &[5.0, 6.0], 1, None)
+            .unwrap();
+        assert_eq!(hits[0].0, ChunkId("c-malformed".into()));
+    }
+
+    #[test]
+    fn embedding_cache_writes_are_blob_only_and_hits_remain_readable() {
+        let store = Store::in_memory().unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+        store
+            .upsert_embedding_cache_entries(
+                &profile,
+                "config-a",
+                &[EmbeddingCacheEntry {
+                    embedding_input_hash: "input-a".into(),
+                    vector: vec![7.0, 8.0],
+                }],
+            )
+            .unwrap();
+
+        let (vector_json, blob_len): (String, i64) = store
+            .conn
+            .query_row(
+                "SELECT vector_json, length(vector_blob) FROM embedding_cache WHERE embedding_input_hash = 'input-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(vector_json, "");
+        assert_eq!(blob_len, 8);
+        assert_eq!(
+            store
+                .get_embedding_cache_vector(&profile, "config-a", "input-a")
+                .unwrap()
+                .unwrap(),
+            vec![7.0, 8.0]
+        );
+        store
+            .record_embedding_cache_hit(&profile, "config-a", "input-a")
+            .unwrap();
+        let cache_hits: i64 = store
+            .conn
+            .query_row(
+                "SELECT cache_hits FROM embedding_cache WHERE embedding_input_hash = 'input-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_hits, 1);
+    }
+
+    #[test]
+    fn legacy_json_only_embedding_cache_remains_readable() {
+        let store = Store::in_memory().unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+        insert_embedding_cache_row(&store, "config-a", "input-json", &[9.0, 10.0], None);
+
+        assert_eq!(
+            store
+                .get_embedding_cache_vector(&profile, "config-a", "input-json")
+                .unwrap()
+                .unwrap(),
+            vec![9.0, 10.0]
+        );
+    }
+
+    #[test]
+    fn malformed_embedding_cache_blob_uses_json_fallback() {
+        let store = Store::in_memory().unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+        insert_embedding_cache_row(
+            &store,
+            "config-a",
+            "input-malformed",
+            &[11.0, 12.0],
+            Some(vec![1, 2, 3]),
+        );
+
+        assert_eq!(
+            store
+                .get_embedding_cache_vector(&profile, "config-a", "input-malformed")
+                .unwrap()
+                .unwrap(),
+            vec![11.0, 12.0]
+        );
+    }
+
+    #[test]
+    fn vector_json_cleanup_reports_and_clears_only_eligible_rows() {
+        let store = Store::in_memory().unwrap();
+        insert_vector_test_source_and_chunks(
+            &store,
+            "s1",
+            &[
+                "chunk-eligible",
+                "chunk-clean",
+                "chunk-json-only",
+                "chunk-missing",
+                "chunk-malformed",
+            ],
+        );
+        insert_chunk_vector_row(
+            &store,
+            "s1",
+            "chunk-eligible",
+            &[1.0, 0.0],
+            Some(vector_to_blob(&[1.0, 0.0])),
+        );
+        insert_chunk_vector_row(
+            &store,
+            "s1",
+            "chunk-clean",
+            &[],
+            Some(vector_to_blob(&[1.0, 0.0])),
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE chunk_vectors SET vector_json = '' WHERE chunk_id = 'chunk-clean'",
+                [],
+            )
+            .unwrap();
+        insert_chunk_vector_row(&store, "s1", "chunk-json-only", &[2.0, 0.0], None);
+        store
+            .conn
+            .execute(
+                "INSERT INTO chunk_vectors (profile_id, chunk_id, source_id, vector_json, vector_blob)
+                 VALUES ('default', 'chunk-missing', 's1', '', NULL)",
+                [],
+            )
+            .unwrap();
+        insert_chunk_vector_row(
+            &store,
+            "s1",
+            "chunk-malformed",
+            &[3.0, 0.0],
+            Some(vec![1, 2, 3]),
+        );
+
+        insert_embedding_cache_row(
+            &store,
+            "config-a",
+            "cache-eligible",
+            &[1.0, 0.0],
+            Some(vector_to_blob(&[1.0, 0.0])),
+        );
+        insert_embedding_cache_row(
+            &store,
+            "config-a",
+            "cache-clean",
+            &[],
+            Some(vector_to_blob(&[1.0, 0.0])),
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE embedding_cache SET vector_json = '' WHERE embedding_input_hash = 'cache-clean'",
+                [],
+            )
+            .unwrap();
+        insert_embedding_cache_row(&store, "config-a", "cache-json-only", &[2.0, 0.0], None);
+        store
+            .conn
+            .execute(
+                "INSERT INTO embedding_cache
+                    (profile_id, profile_config_hash, embedding_input_hash, vector_json, vector_blob, dimension, cache_hits, created_at, updated_at)
+                 VALUES ('default', 'config-a', 'cache-missing', '', NULL, 2, 0, '1', '1')",
+                [],
+            )
+            .unwrap();
+        insert_embedding_cache_row(
+            &store,
+            "config-a",
+            "cache-malformed",
+            &[3.0, 0.0],
+            Some(vec![1, 2, 3]),
+        );
+
+        let dry_run = store.vector_json_cleanup_dry_run().unwrap();
+        assert_eq!(
+            dry_run.tables.chunk_vectors,
+            VectorJsonCleanupTableStats {
+                eligible: 1,
+                already_clean: 1,
+                json_only: 1,
+                missing_blob: 1,
+                malformed_blob: 1,
+            }
+        );
+        assert_eq!(dry_run.tables.embedding_cache, dry_run.tables.chunk_vectors);
+        assert_eq!(dry_run.cleared, VectorJsonCleanupCleared::default());
+        assert_ne!(chunk_vector_json(&store, "chunk-eligible"), "");
+
+        let applied = store.cleanup_vector_json_payloads().unwrap();
+        assert_eq!(applied.tables, dry_run.tables);
+        assert_eq!(
+            applied.cleared,
+            VectorJsonCleanupCleared {
+                chunk_vectors: 1,
+                embedding_cache: 1,
+            }
+        );
+        assert_eq!(chunk_vector_json(&store, "chunk-eligible"), "");
+        assert_ne!(chunk_vector_json(&store, "chunk-json-only"), "");
+        assert_ne!(chunk_vector_json(&store, "chunk-malformed"), "");
+        assert_eq!(embedding_cache_json(&store, "cache-eligible"), "");
+        assert_ne!(embedding_cache_json(&store, "cache-json-only"), "");
+        assert_ne!(embedding_cache_json(&store, "cache-malformed"), "");
+    }
+
+    #[test]
+    fn vector_json_cleanup_preserves_readable_fallback_rows() {
+        let store = Store::in_memory().unwrap();
+        let profile = EmbeddingProfileId::default_profile();
+        insert_vector_test_source_and_chunks(
+            &store,
+            "s1",
+            &["chunk-eligible", "chunk-json-only", "chunk-malformed"],
+        );
+        insert_chunk_vector_row(
+            &store,
+            "s1",
+            "chunk-eligible",
+            &[1.0, 0.0],
+            Some(vector_to_blob(&[1.0, 0.0])),
+        );
+        insert_chunk_vector_row(&store, "s1", "chunk-json-only", &[2.0, 0.0], None);
+        insert_chunk_vector_row(
+            &store,
+            "s1",
+            "chunk-malformed",
+            &[3.0, 0.0],
+            Some(vec![1, 2, 3]),
+        );
+        insert_embedding_cache_row(
+            &store,
+            "config-a",
+            "cache-eligible",
+            &[1.0, 0.0],
+            Some(vector_to_blob(&[1.0, 0.0])),
+        );
+        insert_embedding_cache_row(&store, "config-a", "cache-json-only", &[2.0, 0.0], None);
+        insert_embedding_cache_row(
+            &store,
+            "config-a",
+            "cache-malformed",
+            &[3.0, 0.0],
+            Some(vec![1, 2, 3]),
+        );
+
+        store.cleanup_vector_json_payloads().unwrap();
+
+        let docs = store.list_vector_documents_for_profile(&profile).unwrap();
+        assert_eq!(docs.len(), 3);
+        let hits = store
+            .search_vector_documents_for_profile(&profile, &[3.0, 0.0], 3, None)
+            .unwrap();
+        assert_eq!(hits[0].0, ChunkId("chunk-malformed".into()));
+        assert_eq!(
+            store
+                .get_embedding_cache_vector(&profile, "config-a", "cache-eligible")
+                .unwrap()
+                .unwrap(),
+            vec![1.0, 0.0]
+        );
+        assert_eq!(
+            store
+                .get_embedding_cache_vector(&profile, "config-a", "cache-json-only")
+                .unwrap()
+                .unwrap(),
+            vec![2.0, 0.0]
+        );
+        assert_eq!(
+            store
+                .get_embedding_cache_vector(&profile, "config-a", "cache-malformed")
+                .unwrap()
+                .unwrap(),
+            vec![3.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn vector_json_cleanup_rolls_back_on_failure() {
+        let store = Store::in_memory().unwrap();
+        insert_vector_test_source_and_chunks(&store, "s1", &["chunk-a", "chunk-b"]);
+        insert_chunk_vector_row(
+            &store,
+            "s1",
+            "chunk-a",
+            &[1.0, 0.0],
+            Some(vector_to_blob(&[1.0, 0.0])),
+        );
+        insert_chunk_vector_row(
+            &store,
+            "s1",
+            "chunk-b",
+            &[2.0, 0.0],
+            Some(vector_to_blob(&[2.0, 0.0])),
+        );
+        insert_embedding_cache_row(
+            &store,
+            "config-a",
+            "cache-a",
+            &[1.0, 0.0],
+            Some(vector_to_blob(&[1.0, 0.0])),
+        );
+        store
+            .conn
+            .execute_batch(
+                "
+                CREATE TRIGGER fail_vector_json_cleanup
+                BEFORE UPDATE OF vector_json ON chunk_vectors
+                WHEN OLD.chunk_id = 'chunk-b'
+                BEGIN
+                    SELECT RAISE(FAIL, 'forced vector JSON cleanup failure');
+                END;
+                ",
+            )
+            .unwrap();
+
+        let error = store.cleanup_vector_json_payloads().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("forced vector JSON cleanup failure"));
+        assert_ne!(chunk_vector_json(&store, "chunk-a"), "");
+        assert_ne!(chunk_vector_json(&store, "chunk-b"), "");
+        assert_ne!(embedding_cache_json(&store, "cache-a"), "");
+    }
+
     #[test]
     fn readonly_open_existing_does_not_run_migrations() {
         let dir = tempdir().unwrap();
@@ -4903,6 +5494,97 @@ mod tests {
                 evidence_unit_ids: vec![],
             },
         ]
+    }
+
+    fn insert_vector_test_source_and_chunks(store: &Store, source_id: &str, chunk_ids: &[&str]) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at)
+                 VALUES (?1, ?2, 'h', 'Indexed', 'test', NULL)",
+                params![source_id, format!("/tmp/{source_id}.md")],
+            )
+            .unwrap();
+        for chunk_id in chunk_ids {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO chunks (id, source_id, chunk_hash, embedding_input_hash, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json)
+                     VALUES (?1, ?2, ?3, ?4, 'text', NULL, 1, 'Leaf', NULL, '[]')",
+                    params![
+                        chunk_id,
+                        source_id,
+                        format!("hash-{chunk_id}"),
+                        format!("embedding-{chunk_id}"),
+                    ],
+                )
+                .unwrap();
+        }
+    }
+
+    fn insert_chunk_vector_row(
+        store: &Store,
+        source_id: &str,
+        chunk_id: &str,
+        vector: &[f32],
+        vector_blob: Option<Vec<u8>>,
+    ) {
+        let vector_json = serde_json::to_string(vector).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO chunk_vectors (profile_id, chunk_id, source_id, vector_json, vector_blob)
+                 VALUES ('default', ?1, ?2, ?3, ?4)",
+                params![chunk_id, source_id, vector_json, vector_blob],
+            )
+            .unwrap();
+    }
+
+    fn insert_embedding_cache_row(
+        store: &Store,
+        profile_config_hash: &str,
+        embedding_input_hash: &str,
+        vector: &[f32],
+        vector_blob: Option<Vec<u8>>,
+    ) {
+        let vector_json = serde_json::to_string(vector).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO embedding_cache
+                    (profile_id, profile_config_hash, embedding_input_hash, vector_json, vector_blob, dimension, cache_hits, created_at, updated_at)
+                 VALUES ('default', ?1, ?2, ?3, ?4, ?5, 0, '1', '1')",
+                params![
+                    profile_config_hash,
+                    embedding_input_hash,
+                    vector_json,
+                    vector_blob,
+                    sql_usize(vector.len()),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn chunk_vector_json(store: &Store, chunk_id: &str) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT vector_json FROM chunk_vectors WHERE chunk_id = ?1",
+                params![chunk_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn embedding_cache_json(store: &Store, embedding_input_hash: &str) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT vector_json FROM embedding_cache WHERE embedding_input_hash = ?1",
+                params![embedding_input_hash],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn sample_image_artifact(source_id: &str, evidence_id: &str) -> ImageArtifact {
