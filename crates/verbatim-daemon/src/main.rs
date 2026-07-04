@@ -56,6 +56,7 @@ use verbatim_core::generate::{
     image_artifact_evidence_id, select_image_attachments, GenerationContext, Generator,
 };
 use verbatim_core::graphrag::GraphRagService;
+use verbatim_core::index::sqlite_fts::FtsMaintenanceOutcome;
 use verbatim_core::index_gc::{apply_index_gc, plan_index_gc, IndexGcApplyReport};
 use verbatim_core::ingest::{
     IndexingOutcome, IngestPipeline, SourceIngestFreshness, SourceIngestOutcome,
@@ -7643,7 +7644,9 @@ async fn run_daemon() -> Result<()> {
     let config_path = config::config_path();
     let config = Config::load_from(&config_path).context("failed to load config")?;
     let data_dir = config::data_dir(&config);
-    let pipeline = IngestPipeline::new(&config, &data_dir)?;
+    let pipeline =
+        IngestPipeline::new(&config, &data_dir).context("failed to initialize ingest pipeline")?;
+    log_fts_startup_maintenance(pipeline.fts_startup_maintenance());
     let memory_budget = pipeline.memory_budget();
     if let Err(error) = apply_index_gc(&data_dir, pipeline.store(), config.index_gc.policy()) {
         tracing::warn!(error = %error, "startup index generation garbage collection failed");
@@ -7781,10 +7784,56 @@ async fn run_daemon() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FtsStartupMaintenanceLogFields {
+    status: &'static str,
+    reason: &'static str,
+    child_rows: u64,
+    fts_rows: u64,
+    missing_rows: u64,
+    orphan_rows: u64,
+    duration_ms: u64,
+}
+
+fn fts_startup_maintenance_log_fields(
+    outcome: FtsMaintenanceOutcome,
+) -> FtsStartupMaintenanceLogFields {
+    FtsStartupMaintenanceLogFields {
+        status: outcome.status.as_str(),
+        reason: outcome.reason.as_str(),
+        child_rows: outcome.counts.child_rows,
+        fts_rows: outcome.counts.fts_rows,
+        missing_rows: outcome.counts.missing_rows,
+        orphan_rows: outcome.counts.orphan_rows,
+        duration_ms: duration_millis_u64(outcome.duration),
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn log_fts_startup_maintenance(outcome: FtsMaintenanceOutcome) {
+    let fields = fts_startup_maintenance_log_fields(outcome);
+    tracing::info!(
+        status = fields.status,
+        reason = fields.reason,
+        child_rows = fields.child_rows,
+        fts_rows = fields.fts_rows,
+        missing_rows = fields.missing_rows,
+        orphan_rows = fields.orphan_rows,
+        duration_ms = fields.duration_ms,
+        "SQLite FTS startup maintenance complete"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use verbatim_core::index::sqlite_fts::{
+        FtsMaintenanceCounts, FtsMaintenanceReason, FtsMaintenanceStatus,
+    };
     use verbatim_core::types::{
         Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind, EvidenceUnit,
         RetrievalDenseVectorPath, RetrievalEvidenceRole, RetrievalProvenance,
@@ -7840,6 +7889,78 @@ mod tests {
 
         assert!(!handled);
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn fts_startup_observability_fields_include_rebuilt_skipped_and_repaired_outcomes() {
+        let cases = [
+            (
+                FtsMaintenanceOutcome {
+                    status: FtsMaintenanceStatus::Rebuilt,
+                    reason: FtsMaintenanceReason::MissingProjectionVersion,
+                    counts: FtsMaintenanceCounts {
+                        child_rows: 3,
+                        fts_rows: 3,
+                        missing_rows: 0,
+                        orphan_rows: 0,
+                    },
+                    duration: Duration::from_millis(17),
+                },
+                ("rebuilt", "missing_projection_version", 3, 3, 0, 0, 17),
+            ),
+            (
+                FtsMaintenanceOutcome {
+                    status: FtsMaintenanceStatus::Skipped,
+                    reason: FtsMaintenanceReason::Current,
+                    counts: FtsMaintenanceCounts {
+                        child_rows: 3,
+                        fts_rows: 3,
+                        missing_rows: 0,
+                        orphan_rows: 0,
+                    },
+                    duration: Duration::from_millis(2),
+                },
+                ("skipped", "current", 3, 3, 0, 0, 2),
+            ),
+            (
+                FtsMaintenanceOutcome {
+                    status: FtsMaintenanceStatus::Repaired,
+                    reason: FtsMaintenanceReason::OrphanRows,
+                    counts: FtsMaintenanceCounts {
+                        child_rows: 3,
+                        fts_rows: 4,
+                        missing_rows: 0,
+                        orphan_rows: 1,
+                    },
+                    duration: Duration::from_millis(23),
+                },
+                ("repaired", "orphan_rows", 3, 4, 0, 1, 23),
+            ),
+        ];
+
+        for (
+            outcome,
+            (
+                expected_status,
+                expected_reason,
+                expected_child_rows,
+                expected_fts_rows,
+                expected_missing_rows,
+                expected_orphan_rows,
+                expected_duration_ms,
+            ),
+        ) in cases
+        {
+            let fields = fts_startup_maintenance_log_fields(outcome);
+
+            assert_eq!(fields.status, expected_status);
+            assert_eq!(fields.reason, expected_reason);
+            assert_eq!(fields.child_rows, expected_child_rows);
+            assert_eq!(fields.fts_rows, expected_fts_rows);
+            assert_eq!(fields.missing_rows, expected_missing_rows);
+            assert_eq!(fields.orphan_rows, expected_orphan_rows);
+            assert_eq!(fields.duration_ms, expected_duration_ms);
+        }
     }
 
     #[test]
@@ -11615,6 +11736,225 @@ mod tests {
             .contains("Alpha retrieval evidence"));
         assert!(model_server.embedding_requests() >= 2);
         assert_eq!(model_server.chat_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn populated_db_retrieve_uses_bm25_after_startup() {
+        let test_dir = TestDir::new("populated-db-retrieve-bm25-startup");
+        let store = Store::new(&test_dir.path().join("verbatim.db")).unwrap();
+        let chunk_ids = insert_populated_bm25_startup_fixture(&store, test_dir.path());
+        let expected_child_rows = u64::try_from(chunk_ids.len()).unwrap();
+        assert_eq!(store.list_sources().unwrap().len(), 2);
+        assert_eq!(store.list_child_chunks().unwrap().len(), chunk_ids.len());
+        drop(store);
+
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.embedding.enabled = false;
+        config.rerank.enabled = false;
+
+        {
+            let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+            let outcome = pipeline.fts_startup_maintenance();
+            assert_eq!(outcome.status, FtsMaintenanceStatus::Rebuilt);
+            assert_eq!(
+                outcome.reason,
+                FtsMaintenanceReason::MissingProjectionVersion
+            );
+            assert_eq!(outcome.counts.child_rows, expected_child_rows);
+            assert_eq!(outcome.counts.fts_rows, expected_child_rows);
+
+            let response =
+                retrieve_populated_bm25_startup_fixture(&config, test_dir.path(), pipeline).await;
+            assert_populated_bm25_startup_response(&response, chunk_ids.len());
+        }
+
+        {
+            let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+            let outcome = pipeline.fts_startup_maintenance();
+            assert_eq!(outcome.status, FtsMaintenanceStatus::Skipped);
+            assert_eq!(outcome.reason, FtsMaintenanceReason::Current);
+            assert_eq!(outcome.counts.child_rows, expected_child_rows);
+            assert_eq!(outcome.counts.fts_rows, expected_child_rows);
+
+            let response =
+                retrieve_populated_bm25_startup_fixture(&config, test_dir.path(), pipeline).await;
+            assert_populated_bm25_startup_response(&response, chunk_ids.len());
+        }
+    }
+
+    fn insert_populated_bm25_startup_fixture(store: &Store, root: &FsPath) -> Vec<ChunkId> {
+        let first_path = root.join("startup-alpha.md");
+        let second_path = root.join("startup-beta.md");
+        fs::write(
+            &first_path,
+            "startupneedle alpha first chunk\nstartupneedle alpha second chunk\n",
+        )
+        .unwrap();
+        fs::write(&second_path, "startupneedle beta third chunk\n").unwrap();
+
+        let first_source = populated_bm25_source("startup-src-alpha", &first_path);
+        let second_source = populated_bm25_source("startup-src-beta", &second_path);
+        store.add_source(&first_source).unwrap();
+        store.add_source(&second_source).unwrap();
+
+        let evidence = vec![
+            populated_bm25_evidence(
+                &first_source.id,
+                "startup-ev-alpha-1",
+                &first_path,
+                "startupneedle alpha first chunk",
+                0,
+            ),
+            populated_bm25_evidence(
+                &first_source.id,
+                "startup-ev-alpha-2",
+                &first_path,
+                "startupneedle alpha second chunk",
+                1,
+            ),
+            populated_bm25_evidence(
+                &second_source.id,
+                "startup-ev-beta-1",
+                &second_path,
+                "startupneedle beta third chunk",
+                0,
+            ),
+        ];
+        store.bulk_insert_evidence(&evidence).unwrap();
+
+        let chunks = vec![
+            populated_bm25_child(
+                &first_source.id,
+                "startup-chunk-alpha-1",
+                &evidence[0].id,
+                "startupneedle alpha first chunk",
+            ),
+            populated_bm25_child(
+                &first_source.id,
+                "startup-chunk-alpha-2",
+                &evidence[1].id,
+                "startupneedle alpha second chunk",
+            ),
+            populated_bm25_child(
+                &second_source.id,
+                "startup-chunk-beta-1",
+                &evidence[2].id,
+                "startupneedle beta third chunk",
+            ),
+        ];
+        let chunk_ids = chunks
+            .iter()
+            .map(|chunk| chunk.id.clone())
+            .collect::<Vec<_>>();
+        let links = chunks
+            .iter()
+            .zip(evidence.iter())
+            .map(|(chunk, evidence)| (chunk.id.clone(), evidence.id.clone()))
+            .collect::<Vec<_>>();
+        store.bulk_insert_chunks(&chunks).unwrap();
+        store.link_chunk_evidence(&links).unwrap();
+
+        chunk_ids
+    }
+
+    fn populated_bm25_source(id: &str, path: &FsPath) -> Source {
+        Source {
+            id: SourceId(id.into()),
+            path: path.to_path_buf(),
+            hash: format!("hash-{id}"),
+            status: SourceStatus::Indexed,
+            parser_used: Some("plaintext".into()),
+            last_ingested_at: None,
+        }
+    }
+
+    fn populated_bm25_evidence(
+        source_id: &SourceId,
+        id: &str,
+        path: &FsPath,
+        text: &str,
+        position: u32,
+    ) -> EvidenceUnit {
+        EvidenceUnit {
+            id: EvidenceId(id.into()),
+            source_id: source_id.clone(),
+            kind: EvidenceKind::Text,
+            derived_from: None,
+            locator: SourceLocator::Document {
+                path_or_url: path.display().to_string(),
+                line_start: position.saturating_add(1),
+                line_end: None,
+            },
+            text: text.into(),
+            text_hash: format!("hash-{id}"),
+            heading_path: vec!["Startup".into()],
+            position,
+        }
+    }
+
+    fn populated_bm25_child(
+        source_id: &SourceId,
+        id: &str,
+        evidence_id: &EvidenceId,
+        text: &str,
+    ) -> Chunk {
+        Chunk {
+            id: ChunkId(id.into()),
+            source_id: source_id.clone(),
+            chunk_hash: format!("hash-{id}"),
+            embedding_input_hash: None,
+            text: text.into(),
+            context_text: None,
+            token_count: 4,
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path: vec!["Startup".into()],
+            evidence_unit_ids: vec![evidence_id.clone()],
+        }
+    }
+
+    async fn retrieve_populated_bm25_startup_fixture(
+        config: &Config,
+        data_dir: &FsPath,
+        pipeline: IngestPipeline,
+    ) -> RetrieveResponse {
+        let state = test_state(config.clone(), data_dir, pipeline);
+        retrieve(
+            State(state),
+            Json(RetrieveRequest {
+                question: "startupneedle".into(),
+                source_id: None,
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                limit: Some(5),
+                page_size: Some(5),
+                page: Some(1),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: Some(5),
+                rerank_top_n: None,
+                bypass_cache: false,
+                include_debug: true,
+                include_locator: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    fn assert_populated_bm25_startup_response(response: &RetrieveResponse, expected_hits: usize) {
+        assert_eq!(response.returned_results, expected_hits);
+        assert!(response
+            .results
+            .iter()
+            .all(|result| result.snippet.contains("startupneedle")));
+        let debug = response.debug.as_ref().expect("retrieval debug");
+        assert_eq!(debug.dense_vector_path, RetrievalDenseVectorPath::Bm25Only);
+        assert_eq!(debug.query_embedding_latency_ms, None);
+        assert!(debug.dense_hits.is_empty());
+        assert_eq!(debug.bm25_hits.len(), expected_hits);
     }
 
     #[tokio::test]
