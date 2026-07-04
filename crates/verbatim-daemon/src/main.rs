@@ -56,6 +56,7 @@ use verbatim_core::generate::{
     image_artifact_evidence_id, select_image_attachments, GenerationContext, Generator,
 };
 use verbatim_core::graphrag::GraphRagService;
+use verbatim_core::index::sqlite_fts::FtsMaintenanceOutcome;
 use verbatim_core::index_gc::{apply_index_gc, plan_index_gc, IndexGcApplyReport};
 use verbatim_core::ingest::{
     IndexingOutcome, IngestPipeline, SourceIngestFreshness, SourceIngestOutcome,
@@ -7643,7 +7644,9 @@ async fn run_daemon() -> Result<()> {
     let config_path = config::config_path();
     let config = Config::load_from(&config_path).context("failed to load config")?;
     let data_dir = config::data_dir(&config);
-    let pipeline = IngestPipeline::new(&config, &data_dir)?;
+    let pipeline =
+        IngestPipeline::new(&config, &data_dir).context("failed to initialize ingest pipeline")?;
+    log_fts_startup_maintenance(pipeline.fts_startup_maintenance());
     let memory_budget = pipeline.memory_budget();
     if let Err(error) = apply_index_gc(&data_dir, pipeline.store(), config.index_gc.policy()) {
         tracing::warn!(error = %error, "startup index generation garbage collection failed");
@@ -7781,10 +7784,56 @@ async fn run_daemon() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FtsStartupMaintenanceLogFields {
+    status: &'static str,
+    reason: &'static str,
+    child_rows: u64,
+    fts_rows: u64,
+    missing_rows: u64,
+    orphan_rows: u64,
+    duration_ms: u64,
+}
+
+fn fts_startup_maintenance_log_fields(
+    outcome: FtsMaintenanceOutcome,
+) -> FtsStartupMaintenanceLogFields {
+    FtsStartupMaintenanceLogFields {
+        status: outcome.status.as_str(),
+        reason: outcome.reason.as_str(),
+        child_rows: outcome.counts.child_rows,
+        fts_rows: outcome.counts.fts_rows,
+        missing_rows: outcome.counts.missing_rows,
+        orphan_rows: outcome.counts.orphan_rows,
+        duration_ms: duration_millis_u64(outcome.duration),
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn log_fts_startup_maintenance(outcome: FtsMaintenanceOutcome) {
+    let fields = fts_startup_maintenance_log_fields(outcome);
+    tracing::info!(
+        status = fields.status,
+        reason = fields.reason,
+        child_rows = fields.child_rows,
+        fts_rows = fields.fts_rows,
+        missing_rows = fields.missing_rows,
+        orphan_rows = fields.orphan_rows,
+        duration_ms = fields.duration_ms,
+        "SQLite FTS startup maintenance complete"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use verbatim_core::index::sqlite_fts::{
+        FtsMaintenanceCounts, FtsMaintenanceReason, FtsMaintenanceStatus,
+    };
     use verbatim_core::types::{
         Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind, EvidenceUnit,
         RetrievalDenseVectorPath, RetrievalEvidenceRole, RetrievalProvenance,
@@ -7840,6 +7889,29 @@ mod tests {
 
         assert!(!handled);
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn fts_startup_observability_fields_include_outcome_reason_counts() {
+        let fields = fts_startup_maintenance_log_fields(FtsMaintenanceOutcome {
+            status: FtsMaintenanceStatus::Repaired,
+            reason: FtsMaintenanceReason::OrphanRows,
+            counts: FtsMaintenanceCounts {
+                child_rows: 3,
+                fts_rows: 4,
+                missing_rows: 0,
+                orphan_rows: 1,
+            },
+            duration: Duration::from_millis(17),
+        });
+
+        assert_eq!(fields.status, "repaired");
+        assert_eq!(fields.reason, "orphan_rows");
+        assert_eq!(fields.child_rows, 3);
+        assert_eq!(fields.fts_rows, 4);
+        assert_eq!(fields.missing_rows, 0);
+        assert_eq!(fields.orphan_rows, 1);
+        assert_eq!(fields.duration_ms, 17);
     }
 
     #[test]

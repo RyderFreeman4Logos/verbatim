@@ -32,7 +32,7 @@ use crate::image_limits::{
 use crate::index::hnsw::HnswIndex;
 #[cfg(feature = "qdrant")]
 use crate::index::qdrant::{records_from_store_for_profile, QdrantClient};
-use crate::index::sqlite_fts::SqliteFtsIndex;
+use crate::index::sqlite_fts::{FtsMaintenanceOutcome, SqliteFtsIndex};
 use crate::index_gc::{apply_index_gc, IndexGcPolicy};
 use crate::index_profile_delete::{
     apply_index_profile_delete_artifacts, apply_index_profile_delete_sqlite,
@@ -99,6 +99,7 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     embedding_batch_size: usize,
     embedding_max_concurrent_requests: usize,
     memory_budget: MemoryBudget,
+    fts_startup_maintenance: FtsMaintenanceOutcome,
     #[cfg(test)]
     source_commit_observer: Option<SourceCommitObserver>,
 }
@@ -873,7 +874,9 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
 
         let db_path = data_dir.join("verbatim.db");
         let store = Store::new(&db_path)?;
-        SqliteFtsIndex::new(&store).rebuild_from_store(&store)?;
+        let fts_startup_maintenance = SqliteFtsIndex::new(&store)
+            .maintain_startup()
+            .context("sqlite FTS startup maintenance")?;
 
         let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
         let active_profile_id = config.embedding.profile_id.clone();
@@ -946,6 +949,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
                 .bounded()
                 .max_concurrent_requests,
             memory_budget: MemoryBudget::from_config(&config.daemon.resources),
+            fts_startup_maintenance,
             #[cfg(test)]
             source_commit_observer: None,
         })
@@ -1017,6 +1021,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
                 .bounded()
                 .max_concurrent_requests,
             memory_budget: MemoryBudget::from_config(&config.daemon.resources),
+            fts_startup_maintenance: FtsMaintenanceOutcome::default(),
             #[cfg(test)]
             source_commit_observer: None,
         })
@@ -1231,6 +1236,10 @@ where
         SqliteFtsIndex::new(&self.store)
     }
 
+    pub fn fts_startup_maintenance(&self) -> FtsMaintenanceOutcome {
+        self.fts_startup_maintenance
+    }
+
     fn ensure_embedding_profile(&self, profile_id: &EmbeddingProfileId) -> Result<bool> {
         self.store
             .ensure_embedding_profile(profile_id, self.embedding_profile_spec.as_store_config())
@@ -1274,6 +1283,7 @@ where
                 std::time::Duration::from_millis(500),
                 25,
             ),
+            fts_startup_maintenance: FtsMaintenanceOutcome::default(),
             #[cfg(test)]
             source_commit_observer: None,
         }
@@ -6273,6 +6283,7 @@ mod tests {
     use crate::image_limits::ImageArtifactLimitError;
     #[cfg(feature = "qdrant")]
     use crate::index::qdrant::QdrantClient;
+    use crate::index::sqlite_fts::FtsMaintenanceStatus;
     use crate::ocr::{
         source_ingest_diagnostics, OcrLine, OcrPageOutput, OcrPageRequest, OcrProvider,
     };
@@ -6882,6 +6893,45 @@ mod tests {
             daemon: Default::default(),
             collection_watcher: Default::default(),
         }
+    }
+
+    #[test]
+    fn fts_startup_maintenance_pipeline_rebuilds_then_skips() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("verbatim.db");
+        {
+            let store = Store::new(&db_path).unwrap();
+            let source = test_source("src-fts-startup", tempdir.path().join("source.txt"));
+            insert_source_with_child_text(&store, &source, "chunk-fts-startup", "alpha startup")
+                .unwrap();
+        }
+        let mut config = test_config();
+        config.embedding.provider = "test".to_string();
+        config.embedding.base_url = String::new();
+        config.embedding.model = "test-embedding".to_string();
+        config.embedding.dimension = 2;
+        config.embedding.query_instruction = String::new();
+
+        let first = IngestPipeline::new(&config, tempdir.path()).unwrap();
+        assert_eq!(
+            first.fts_startup_maintenance().status,
+            FtsMaintenanceStatus::Rebuilt
+        );
+        assert_eq!(
+            first.lexical_index().search("alpha", 5).unwrap()[0].0 .0,
+            "chunk-fts-startup"
+        );
+        drop(first);
+
+        let second = IngestPipeline::new(&config, tempdir.path()).unwrap();
+        assert_eq!(
+            second.fts_startup_maintenance().status,
+            FtsMaintenanceStatus::Skipped
+        );
+        assert_eq!(
+            second.lexical_index().search("alpha", 5).unwrap()[0].0 .0,
+            "chunk-fts-startup"
+        );
     }
 
     fn embedding_context_config(context_window_tokens: usize) -> Config {
