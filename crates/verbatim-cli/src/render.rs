@@ -1649,6 +1649,44 @@ where
             }
         }
     }
+    if let Some(exit) = &health.idle_exit {
+        let skip = exit.skip_reason.as_deref().unwrap_or("none");
+        let next = exit
+            .next_eligible_in_millis
+            .map(|millis| millis.to_string())
+            .unwrap_or_else(|| "now".to_string());
+        writeln!(
+            writer,
+            "Idle exit: enabled={} idle={} eligible={} idle_ms={} timeout_ms={} deadline_unix_ms={} next_eligible_ms={} skip={}",
+            exit.enabled,
+            exit.currently_idle,
+            exit.eligible,
+            exit.idle_for_millis,
+            exit.timeout_millis,
+            exit.deadline_unix_ms,
+            next,
+            skip
+        )?;
+        writeln!(
+            writer,
+            "  active: http={} sse={} tasks={} resources_active={} resources_queued={} ingest_queue={} ingest_worker={} pipeline_busy={} watched_roots={} pending_watcher_events={}",
+            exit.active.http_requests,
+            exit.active.sse_streams,
+            exit.active.active_tasks,
+            exit.active.resource_active,
+            exit.active.resource_queued,
+            exit.active.ingest_queue_active,
+            exit.active.ingest_worker_active,
+            exit.active.pipeline_busy,
+            exit.active.watched_roots,
+            exit.active.pending_watcher_events
+        )?;
+        writeln!(
+            writer,
+            "  config: count_health_requests={} allow_with_collection_watcher={} auto_start_on_cli={}",
+            exit.count_health_requests, exit.allow_with_collection_watcher, exit.auto_start_on_cli
+        )?;
+    }
     Ok(())
 }
 

@@ -21,7 +21,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tower_http::cors::CorsLayer;
 
 use verbatim_core::api::{
@@ -33,23 +33,23 @@ use verbatim_core::api::{
     CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
     CollectionWatcherStatus, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
     ConfigResponse, CreateCollectionRequest, ErrorResponse, EvidenceResponse, HealthResponse,
-    IdleReclaimActivitySnapshot, IdleReclaimBackendResult, IdleReclaimCycleResult,
-    IdleReclaimHealth, ImageArtifactResponse, IndexGcRequest, IndexGcResponse,
-    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
-    ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
-    RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
-    TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskIngestRequest, TaskListAggregate,
-    TaskListResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
-    TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent, VectorJsonCleanupRequest,
-    VectorJsonCleanupResponse,
+    IdleExitActivitySnapshot, IdleExitHealth, IdleReclaimActivitySnapshot,
+    IdleReclaimBackendResult, IdleReclaimCycleResult, IdleReclaimHealth, ImageArtifactResponse,
+    IndexGcRequest, IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse,
+    IndexStatusResponse, IngestResponse, ReindexRequest, ReindexResponse, RetrieveControlsResponse,
+    RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
+    SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate, TaskEventsResponse,
+    TaskIngestRequest, TaskListAggregate, TaskListResponse, TaskQueueTurnover,
+    TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse,
+    TaskWaitEvent, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
     CollectionMemberCandidate, CollectionRecord, CollectionSyncPathInput,
 };
 use verbatim_core::config::{
-    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, DaemonIdleReclaimConfig,
-    DaemonResourceConfig, RerankConfig, RerankStrategy, RetrievalConfig,
+    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, DaemonIdleExitConfig,
+    DaemonIdleReclaimConfig, DaemonResourceConfig, RerankConfig, RerankStrategy, RetrievalConfig,
     SQLITE_WRITER_ACTIVE_CAPACITY,
 };
 use verbatim_core::embed::OpenAiEmbeddingClient;
@@ -115,6 +115,7 @@ struct AppState {
     ingest_worker_active: AtomicBool,
     collection_watcher: CollectionWatcherRuntime,
     idle_reclaim: Arc<IdleReclaimRuntime>,
+    idle_exit: Arc<IdleExitRuntime>,
     #[cfg(test)]
     idle_reclaim_before_backend_hook: std::sync::Mutex<Option<IdleReclaimBeforeBackendHook>>,
     #[cfg(test)]
@@ -161,6 +162,9 @@ const IDLE_RECLAIM_DISABLED_POLL: Duration = Duration::from_secs(60);
 const IDLE_RECLAIM_MAX_POLL: Duration = Duration::from_secs(60);
 const IDLE_RECLAIM_MIN_POLL: Duration = Duration::from_secs(1);
 const IDLE_RECLAIM_ADMISSION_PERMITS: u32 = 1_000_000;
+const IDLE_EXIT_DISABLED_POLL: Duration = Duration::from_secs(60);
+const IDLE_EXIT_MAX_POLL: Duration = Duration::from_secs(60);
+const IDLE_EXIT_MIN_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct CollectionWatcherRuntime {
@@ -297,6 +301,105 @@ impl IdleReclaimRuntime {
     }
 }
 
+struct IdleExitRuntime {
+    active_http_requests: AtomicU64,
+    active_sse_streams: AtomicU64,
+    last_activity_unix_ms: AtomicU64,
+    had_blockers: AtomicBool,
+    shutdown_requested: AtomicBool,
+    watcher_resync_requested: AtomicBool,
+}
+
+impl IdleExitRuntime {
+    fn new(now_unix_ms: u64) -> Self {
+        Self {
+            active_http_requests: AtomicU64::new(0),
+            active_sse_streams: AtomicU64::new(0),
+            last_activity_unix_ms: AtomicU64::new(now_unix_ms),
+            had_blockers: AtomicBool::new(false),
+            shutdown_requested: AtomicBool::new(false),
+            watcher_resync_requested: AtomicBool::new(false),
+        }
+    }
+
+    fn start_http(self: &Arc<Self>) -> IdleExitActivityGuard {
+        self.start_activity(IdleExitActivityKind::Http)
+    }
+
+    fn start_sse(self: &Arc<Self>) -> IdleExitActivityGuard {
+        self.start_activity(IdleExitActivityKind::Sse)
+    }
+
+    fn start_activity(self: &Arc<Self>, kind: IdleExitActivityKind) -> IdleExitActivityGuard {
+        match kind {
+            IdleExitActivityKind::Http => {
+                self.active_http_requests.fetch_add(1, Ordering::AcqRel);
+            }
+            IdleExitActivityKind::Sse => {
+                self.active_sse_streams.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        self.mark_activity();
+        IdleExitActivityGuard {
+            runtime: Arc::clone(self),
+            kind,
+        }
+    }
+
+    fn mark_activity(&self) {
+        self.last_activity_unix_ms
+            .store(now_unix_millis(), Ordering::Release);
+    }
+
+    fn observe_blockers(&self, has_blockers: bool) {
+        let previously_blocked = self.had_blockers.swap(has_blockers, Ordering::AcqRel);
+        if previously_blocked && !has_blockers {
+            self.mark_activity();
+        }
+    }
+
+    fn active_http_requests(&self) -> u64 {
+        self.active_http_requests.load(Ordering::Acquire)
+    }
+
+    fn active_sse_streams(&self) -> u64 {
+        self.active_sse_streams.load(Ordering::Acquire)
+    }
+
+    fn last_activity_unix_ms(&self) -> u64 {
+        self.last_activity_unix_ms.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdleExitActivityKind {
+    Http,
+    Sse,
+}
+
+struct IdleExitActivityGuard {
+    runtime: Arc<IdleExitRuntime>,
+    kind: IdleExitActivityKind,
+}
+
+impl Drop for IdleExitActivityGuard {
+    fn drop(&mut self) {
+        match self.kind {
+            IdleExitActivityKind::Http => {
+                self.runtime
+                    .active_http_requests
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+            IdleExitActivityKind::Sse => {
+                self.runtime
+                    .active_sse_streams
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.runtime.mark_activity();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivityKind {
     Http,
@@ -339,6 +442,11 @@ struct IdleReclaimGate {
     health: IdleReclaimHealth,
 }
 
+#[derive(Debug, Clone)]
+struct IdleExitGate {
+    health: IdleExitHealth,
+}
+
 #[cfg(test)]
 type IdleReclaimBeforeBackendHook = Box<dyn FnMut(&SharedState) + Send + 'static>;
 
@@ -362,6 +470,7 @@ enum CollectionWatcherCommand {
     FilesystemEvent { paths: Vec<PathBuf> },
     NotifyError { error: String },
     Refresh,
+    ResyncActive,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -404,17 +513,38 @@ async fn track_http_activity(
     request: Request,
     next: Next,
 ) -> Response {
-    let _guard = if request.uri().path() == "/api/health" {
+    let is_health_request = request.uri().path() == "/api/health";
+    let should_track_idle_exit =
+        idle_exit_tracks_request_path(&idle_exit_config(&state), request.uri().path());
+    let _idle_exit_guard = if should_track_idle_exit {
+        if !is_health_request {
+            queue_idle_exit_collection_watcher_resync_if_enabled(&state);
+        }
+        Some(state.idle_exit.start_http())
+    } else {
+        None
+    };
+    let _guard = if is_health_request {
         None
     } else {
         Some(state.idle_reclaim.start_http().await)
     };
-    let _health_admission = if request.uri().path() == "/api/health" {
+    let _health_admission = if is_health_request {
         Some(state.idle_reclaim.start_untracked_admission().await)
     } else {
         None
     };
     next.run(request).await
+}
+
+fn idle_exit_tracks_request_path(config: &DaemonIdleExitConfig, path: &str) -> bool {
+    path != "/api/health" || config.count_health_requests
+}
+
+fn idle_exit_config(state: &SharedState) -> DaemonIdleExitConfig {
+    runtime_config_snapshot(state)
+        .map(|runtime| runtime.config.daemon.idle_exit.bounded())
+        .unwrap_or_default()
 }
 
 fn idle_reclaim_config(state: &SharedState) -> DaemonIdleReclaimConfig {
@@ -502,6 +632,155 @@ fn idle_reclaim_gate_with_running(
             last_attempt_result: state.idle_reclaim.last_attempt_result(),
         },
     }
+}
+
+fn idle_exit_gate(state: &SharedState, resources: Vec<ResourceQueueSnapshot>) -> IdleExitGate {
+    let config = idle_exit_config(state);
+    let active_tasks = active_task_count(state).unwrap_or(usize::MAX);
+    let watcher = collection_watcher_idle_exit_snapshot(state);
+    let activity = IdleExitActivitySnapshot {
+        http_requests: state.idle_exit.active_http_requests(),
+        sse_streams: state.idle_exit.active_sse_streams(),
+        active_tasks,
+        resource_active: resources.iter().map(|resource| resource.active).sum(),
+        resource_queued: resources.iter().map(|resource| resource.queued).sum(),
+        ingest_queue_active: state.ingest_queue_active.load(Ordering::Acquire),
+        ingest_worker_active: state.ingest_worker_active.load(Ordering::Acquire),
+        pipeline_busy: pipeline_busy_for_idle_reclaim(state),
+        watched_roots: watcher.watched_roots,
+        pending_watcher_events: watcher.pending_events,
+    };
+    let has_blockers = idle_exit_activity_has_blockers(&config, &activity);
+    state.idle_exit.observe_blockers(has_blockers);
+
+    let now = now_unix_millis();
+    let last_activity = state.idle_exit.last_activity_unix_ms();
+    let idle_for_millis = now.saturating_sub(last_activity);
+    let timeout_millis = millis_from_secs(config.timeout_seconds);
+    let idle_remaining = timeout_millis.saturating_sub(idle_for_millis);
+    let deadline_unix_ms = last_activity.saturating_add(timeout_millis);
+    let shutdown_requested = state.idle_exit.shutdown_requested.load(Ordering::Acquire);
+    let skip_reason = idle_exit_skip_reason(&config, &activity, idle_remaining, shutdown_requested);
+    let currently_idle = !has_blockers;
+    let eligible = config.enabled && currently_idle && skip_reason.is_none();
+    let next_eligible_in_millis = if eligible || !config.enabled {
+        None
+    } else if has_blockers {
+        Some(timeout_millis)
+    } else {
+        Some(idle_remaining)
+    };
+
+    IdleExitGate {
+        health: IdleExitHealth {
+            enabled: config.enabled,
+            count_health_requests: config.count_health_requests,
+            allow_with_collection_watcher: config.allow_with_collection_watcher,
+            auto_start_on_cli: config.auto_start_on_cli,
+            currently_idle,
+            eligible,
+            skip_reason,
+            idle_for_millis,
+            timeout_millis,
+            last_activity_unix_ms: last_activity,
+            deadline_unix_ms,
+            next_eligible_in_millis,
+            active: activity,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CollectionWatcherIdleExitSnapshot {
+    watched_roots: usize,
+    pending_events: usize,
+}
+
+fn collection_watcher_idle_exit_snapshot(state: &SharedState) -> CollectionWatcherIdleExitSnapshot {
+    match state.collection_watcher.statuses.lock() {
+        Ok(statuses) => CollectionWatcherIdleExitSnapshot {
+            watched_roots: statuses
+                .values()
+                .filter(|status| status.active)
+                .map(|status| status.watched_root_count)
+                .sum(),
+            pending_events: statuses
+                .values()
+                .map(|status| status.pending_event_count)
+                .sum(),
+        },
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to inspect collection watcher idle-exit blockers");
+            CollectionWatcherIdleExitSnapshot {
+                watched_roots: usize::MAX,
+                pending_events: usize::MAX,
+            }
+        }
+    }
+}
+
+fn idle_exit_activity_has_blockers(
+    config: &DaemonIdleExitConfig,
+    activity: &IdleExitActivitySnapshot,
+) -> bool {
+    activity.http_requests > 0
+        || activity.sse_streams > 0
+        || activity.active_tasks > 0
+        || activity.resource_active > 0
+        || activity.resource_queued > 0
+        || activity.ingest_queue_active
+        || activity.ingest_worker_active
+        || activity.pipeline_busy
+        || activity.pending_watcher_events > 0
+        || (!config.allow_with_collection_watcher && activity.watched_roots > 0)
+}
+
+fn idle_exit_skip_reason(
+    config: &DaemonIdleExitConfig,
+    activity: &IdleExitActivitySnapshot,
+    idle_remaining: u64,
+    shutdown_requested: bool,
+) -> Option<String> {
+    if !config.enabled {
+        return Some("disabled".into());
+    }
+    if shutdown_requested {
+        return Some("shutdown_requested".into());
+    }
+    if activity.http_requests > 0 {
+        return Some("active_http_requests".into());
+    }
+    if activity.sse_streams > 0 {
+        return Some("active_sse_streams".into());
+    }
+    if activity.active_tasks > 0 {
+        return Some("active_tasks".into());
+    }
+    if activity.resource_active > 0 {
+        return Some("active_resources".into());
+    }
+    if activity.resource_queued > 0 {
+        return Some("queued_resources".into());
+    }
+    if activity.ingest_queue_active {
+        return Some("ingest_queue_active".into());
+    }
+    if activity.ingest_worker_active {
+        return Some("ingest_worker_active".into());
+    }
+    if activity.pipeline_busy {
+        return Some("pipeline_busy".into());
+    }
+    if activity.pending_watcher_events > 0 {
+        return Some("pending_collection_watcher_events".into());
+    }
+    if !config.allow_with_collection_watcher && activity.watched_roots > 0 {
+        return Some("active_collection_watchers".into());
+    }
+    if idle_remaining > 0 {
+        return Some("idle_timeout_not_reached".into());
+    }
+    None
 }
 
 fn millis_from_secs(seconds: u64) -> u64 {
@@ -610,6 +889,54 @@ fn idle_reclaim_poll_delay(state: &SharedState) -> Duration {
     Duration::from_secs(config.idle_timeout_seconds.min(config.min_interval_seconds))
         .max(IDLE_RECLAIM_MIN_POLL)
         .min(IDLE_RECLAIM_MAX_POLL)
+}
+
+fn start_idle_exit_scheduler(
+    state: SharedState,
+    shutdown_tx: watch::Sender<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(idle_exit_poll_delay(&state)).await;
+            if run_idle_exit_cycle_if_due(&state) {
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+        }
+    })
+}
+
+fn idle_exit_poll_delay(state: &SharedState) -> Duration {
+    let config = idle_exit_config(state);
+    if !config.enabled {
+        return IDLE_EXIT_DISABLED_POLL;
+    }
+    Duration::from_secs(config.timeout_seconds)
+        .max(IDLE_EXIT_MIN_POLL)
+        .min(IDLE_EXIT_MAX_POLL)
+}
+
+fn run_idle_exit_cycle_if_due(state: &SharedState) -> bool {
+    let gate = idle_exit_gate(state, daemon_resource_snapshots(state));
+    if !gate.health.eligible {
+        return false;
+    }
+    if state
+        .idle_exit
+        .shutdown_requested
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    tracing::info!(
+        reason = "idle_timeout",
+        timeout_seconds = idle_exit_config(state).timeout_seconds,
+        idle_for_millis = gate.health.idle_for_millis,
+        deadline_unix_ms = gate.health.deadline_unix_ms,
+        "daemon idle exit timeout elapsed; requesting graceful shutdown"
+    );
+    true
 }
 
 async fn run_idle_reclaim_cycle_if_due(state: &SharedState) -> IdleReclaimCycleResult {
@@ -1245,18 +1572,41 @@ fn set_collection_watcher_sender(state: &SharedState, tx: mpsc::Sender<Collectio
     }
 }
 
-fn send_collection_watcher_command(state: &SharedState, command: CollectionWatcherCommand) {
+fn send_collection_watcher_command(state: &SharedState, command: CollectionWatcherCommand) -> bool {
     let tx = match state.collection_watcher.tx.lock() {
         Ok(guard) => guard.clone(),
         Err(error) => {
             tracing::warn!(error = %error, "failed to lock collection watcher command sender");
-            None
+            return false;
         }
     };
     if let Some(tx) = tx {
         if let Err(error) = tx.try_send(command) {
             tracing::warn!(error = %error, "collection watcher command queue is full");
+            return false;
         }
+        return true;
+    }
+    false
+}
+
+fn queue_idle_exit_collection_watcher_resync_if_enabled(state: &SharedState) {
+    if !idle_exit_config(state).allow_with_collection_watcher {
+        return;
+    }
+    if state
+        .idle_exit
+        .watcher_resync_requested
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    if !send_collection_watcher_command(state, CollectionWatcherCommand::ResyncActive) {
+        state
+            .idle_exit
+            .watcher_resync_requested
+            .store(false, Ordering::Release);
     }
 }
 
@@ -1417,11 +1767,13 @@ struct IngestBatchExpansionCandidate {
 async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
     let resources = daemon_resource_snapshots(&state);
     let idle_reclaim = idle_reclaim_gate(&state, resources.clone()).health;
+    let idle_exit = idle_exit_gate(&state, resources.clone()).health;
     Json(HealthResponse {
         status: "ok".into(),
         memory_budget: state.memory_budget.snapshot(),
         resources,
         idle_reclaim: Some(idle_reclaim),
+        idle_exit: Some(idle_exit),
     })
 }
 
@@ -2423,6 +2775,7 @@ struct TaskTerminalizationOutcome {
 fn mark_idle_reclaim_activity_if_changed(state: &SharedState, changed: bool) {
     if changed {
         state.idle_reclaim.mark_activity();
+        state.idle_exit.mark_activity();
     }
 }
 
@@ -3113,6 +3466,7 @@ async fn ask_stream(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(ASK_STREAM_EVENT_BUFFER);
     let sse_guard = state.idle_reclaim.start_sse().await;
+    let idle_exit_sse_guard = state.idle_exit.start_sse();
     if let Err((status, Json(error))) = validate_ask_retrieve_controls(&req) {
         let _ = tx.try_send(sse_error_event(status, error.error));
     } else {
@@ -3145,9 +3499,15 @@ async fn ask_stream(
     }
 
     Sse::new(stream::unfold(
-        (rx, sse_guard),
-        |(mut rx, sse_guard): (mpsc::Receiver<Event>, ActivityGuard)| async move {
-            rx.recv().await.map(|event| (Ok(event), (rx, sse_guard)))
+        (rx, sse_guard, idle_exit_sse_guard),
+        |(mut rx, sse_guard, idle_exit_sse_guard): (
+            mpsc::Receiver<Event>,
+            ActivityGuard,
+            IdleExitActivityGuard,
+        )| async move {
+            rx.recv()
+                .await
+                .map(|event| (Ok(event), (rx, sse_guard, idle_exit_sse_guard)))
         },
     ))
 }
@@ -3398,6 +3758,7 @@ async fn wait_task(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(TASK_WAIT_EVENT_BUFFER);
     let sse_guard = state.idle_reclaim.start_sse().await;
+    let idle_exit_sse_guard = state.idle_exit.start_sse();
     tokio::spawn(async move {
         let task_id = TaskId(id);
         let mut after = query.after;
@@ -3428,9 +3789,15 @@ async fn wait_task(
     });
 
     Sse::new(stream::unfold(
-        (rx, sse_guard),
-        |(mut rx, sse_guard): (mpsc::Receiver<Event>, ActivityGuard)| async move {
-            rx.recv().await.map(|event| (Ok(event), (rx, sse_guard)))
+        (rx, sse_guard, idle_exit_sse_guard),
+        |(mut rx, sse_guard, idle_exit_sse_guard): (
+            mpsc::Receiver<Event>,
+            ActivityGuard,
+            IdleExitActivityGuard,
+        )| async move {
+            rx.recv()
+                .await
+                .map(|event| (Ok(event), (rx, sse_guard, idle_exit_sse_guard)))
         },
     ))
 }
@@ -5186,7 +5553,9 @@ fn validate_ingest_controls(
         bail!("force is not supported for vectors-only embedding profile builds");
     }
     if embedding_profile_id.is_some() && !vectors_only {
-        bail!("embedding_profile_id is supported for vectors-only builds; set [embedding].profile_id for parse ingest");
+        bail!(
+            "embedding_profile_id is supported for vectors-only builds; set [embedding].profile_id for parse ingest"
+        );
     }
     Ok(())
 }
@@ -5206,7 +5575,9 @@ fn resolve_reindex_controls(req: ReindexRequest) -> Result<IndexingTaskControls>
 
     let vectors_only = req.vectors_only || req.embedding_profile_id.is_some();
     if req.stale && vectors_only {
-        bail!("stale vector-only reindex is not supported; rebuild all vectors or run stale reindex without vectors_only");
+        bail!(
+            "stale vector-only reindex is not supported; rebuild all vectors or run stale reindex without vectors_only"
+        );
     }
     if vectors_only && req.force {
         bail!("force is not supported for vectors-only reindex");
@@ -6873,6 +7244,9 @@ async fn handle_collection_watcher_command(
                 mark_active_collection_watchers_error(state, &error.to_string());
             }
         }
+        CollectionWatcherCommand::ResyncActive => {
+            resync_active_collection_watchers(state).await;
+        }
     }
 }
 
@@ -6912,6 +7286,41 @@ async fn flush_collection_watcher_debounce(
             }
             Err(error) => {
                 tracing::warn!(collection = %name, error = %error, "collection watcher maintenance failed");
+                record_collection_watcher_error(state, &name, error);
+            }
+        }
+    }
+}
+
+async fn resync_active_collection_watchers(state: &SharedState) {
+    let names = match state.collection_watcher.statuses.lock() {
+        Ok(statuses) => statuses
+            .iter()
+            .filter(|(_, status)| status.active && status.watched_root_count > 0)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to collect active collection watchers for resync");
+            Vec::new()
+        }
+    };
+    for name in names {
+        match maintain_collection_after_watch_event(state, &name).await {
+            Ok(outcome) => {
+                let last_task_id = outcome.queued_task_ids.last().cloned();
+                update_collection_watcher_status(state, &name, |status| {
+                    status.last_sync_at = Some(unix_timestamp_string());
+                    status.last_error = None;
+                    status.last_added = outcome.added;
+                    status.last_removed = outcome.removed;
+                    status.last_unchanged = outcome.unchanged;
+                    if last_task_id.is_some() {
+                        status.last_task_id = last_task_id;
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::warn!(collection = %name, error = %error, "collection watcher idle-exit resync failed");
                 record_collection_watcher_error(state, &name, error);
             }
         }
@@ -7495,6 +7904,7 @@ async fn reload_config_from_path(state: &SharedState) -> Result<ConfigReloadMeta
     if collection_watcher_plan_changed {
         send_collection_watcher_command(state, CollectionWatcherCommand::Refresh);
     }
+    queue_idle_exit_collection_watcher_resync_if_enabled(state);
     Ok(metadata)
 }
 
@@ -7613,7 +8023,7 @@ fn config_watch_event_matches(
 // Shutdown signal
 // ---------------------------------------------------------------------------
 
-async fn shutdown_signal() {
+async fn shutdown_signal(mut idle_exit: watch::Receiver<bool>) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -7631,12 +8041,28 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    tokio::select! {
-        () = ctrl_c => {},
-        () = terminate => {},
-    }
+    let idle_exit_signal = async move {
+        loop {
+            if *idle_exit.borrow() {
+                break;
+            }
+            if idle_exit.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
 
-    tracing::info!("shutdown signal received");
+    tokio::select! {
+        () = ctrl_c => {
+            tracing::info!("shutdown signal received");
+        },
+        () = terminate => {
+            tracing::info!("shutdown signal received");
+        },
+        () = idle_exit_signal => {
+            tracing::info!("idle exit shutdown signal received");
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7695,6 +8121,7 @@ async fn run_daemon() -> Result<()> {
         ingest_worker_active: AtomicBool::new(false),
         collection_watcher: CollectionWatcherRuntime::default(),
         idle_reclaim: Arc::new(IdleReclaimRuntime::new(now_unix_millis())),
+        idle_exit: Arc::new(IdleExitRuntime::new(now_unix_millis())),
         #[cfg(test)]
         idle_reclaim_before_backend_hook: std::sync::Mutex::new(None),
         #[cfg(test)]
@@ -7726,7 +8153,10 @@ async fn run_daemon() -> Result<()> {
 
     let _config_watcher = start_config_watcher(Arc::clone(&state))?;
     let _collection_watcher = start_collection_watcher(Arc::clone(&state))?;
+    queue_idle_exit_collection_watcher_resync_if_enabled(&state);
     let _idle_reclaim_scheduler = start_idle_reclaim_scheduler(Arc::clone(&state));
+    let (idle_exit_shutdown_tx, idle_exit_shutdown_rx) = watch::channel(false);
+    let _idle_exit_scheduler = start_idle_exit_scheduler(Arc::clone(&state), idle_exit_shutdown_tx);
     schedule_ingest_queue(Arc::clone(&state));
 
     let app = Router::new()
@@ -7807,7 +8237,7 @@ async fn run_daemon() -> Result<()> {
         .with_context(|| format!("failed to bind {bind_addr}"))?;
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(idle_exit_shutdown_rx))
         .await
         .context("server error")?;
 
@@ -8718,6 +9148,203 @@ mod tests {
         assert_eq!(reclaim.skip_reason.as_deref(), Some("disabled"));
         assert_eq!(reclaim.active.http_requests, 0);
         assert_eq!(reclaim.active.active_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_exit_health() {
+        let test_dir = TestDir::new("idle-exit-health");
+        let config = idle_exit_test_config("http://127.0.0.1:9/v1", 1);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_exit_timeout_elapsed(&state, 5);
+
+        let Json(health) = health(State(Arc::clone(&state))).await;
+        let exit = health.idle_exit.expect("idle exit state is reported");
+
+        assert!(exit.enabled);
+        assert!(exit.currently_idle);
+        assert!(exit.eligible);
+        assert_eq!(exit.skip_reason, None);
+        assert_eq!(exit.timeout_millis, 1_000);
+        assert!(exit.deadline_unix_ms >= exit.last_activity_unix_ms);
+        assert_eq!(exit.active.http_requests, 0);
+        assert_eq!(exit.active.watched_roots, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_exit_tracks_http_and_sse_activity() {
+        let test_dir = TestDir::new("idle-exit-http-sse");
+        let mut config = idle_exit_test_config("http://127.0.0.1:9/v1", 60);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config.clone(), test_dir.path(), pipeline);
+
+        assert!(idle_exit_tracks_request_path(
+            &state.runtime_config.read().unwrap().config.daemon.idle_exit,
+            "/api/retrieve"
+        ));
+        assert!(!idle_exit_tracks_request_path(
+            &state.runtime_config.read().unwrap().config.daemon.idle_exit,
+            "/api/health"
+        ));
+
+        let before_health = state.idle_exit.last_activity_unix_ms();
+        let Json(_) = health(State(Arc::clone(&state))).await;
+        assert_eq!(state.idle_exit.last_activity_unix_ms(), before_health);
+
+        let counted_health_dir = TestDir::new("idle-exit-counted-health");
+        config.daemon.idle_exit.count_health_requests = true;
+        let pipeline = IngestPipeline::new(&config, counted_health_dir.path()).unwrap();
+        let state = test_state(config, counted_health_dir.path(), pipeline);
+        assert!(idle_exit_tracks_request_path(
+            &state.runtime_config.read().unwrap().config.daemon.idle_exit,
+            "/api/health"
+        ));
+        force_idle_exit_timeout_elapsed(&state, 120);
+        let before_counted_health = state.idle_exit.last_activity_unix_ms();
+        {
+            let _health_guard = state.idle_exit.start_http();
+            let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+            assert_eq!(exit.active.http_requests, 1);
+            assert_eq!(exit.skip_reason.as_deref(), Some("active_http_requests"));
+        }
+        assert!(state.idle_exit.last_activity_unix_ms() >= before_counted_health);
+
+        force_idle_exit_timeout_elapsed(&state, 120);
+        {
+            let _sse_guard = state.idle_exit.start_sse();
+            let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+            assert_eq!(exit.active.sse_streams, 1);
+            assert_eq!(exit.skip_reason.as_deref(), Some("active_sse_streams"));
+        }
+        let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+        assert_eq!(exit.active.sse_streams, 0);
+        assert_eq!(
+            exit.skip_reason.as_deref(),
+            Some("idle_timeout_not_reached")
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_exit_exits_cleanly_after_timeout() {
+        let test_dir = TestDir::new("idle-exit-clean-timeout");
+        let config = idle_exit_test_config("http://127.0.0.1:9/v1", 1);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        assert!(!run_idle_exit_cycle_if_due(&state));
+        force_idle_exit_timeout_elapsed(&state, 5);
+
+        assert!(run_idle_exit_cycle_if_due(&state));
+        assert!(state.idle_exit.shutdown_requested.load(Ordering::Acquire));
+        assert!(!run_idle_exit_cycle_if_due(&state));
+    }
+
+    #[tokio::test]
+    async fn idle_exit_blocks_on_tasks_resources_ingest_and_pipeline() {
+        let test_dir = TestDir::new("idle-exit-blockers");
+        let config = idle_exit_test_config("http://127.0.0.1:9/v1", 1);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_exit_timeout_elapsed(&state, 5);
+
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("question", None, None, 1, 1, 1),
+        )
+        .await
+        .unwrap();
+        let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+        assert_eq!(exit.skip_reason.as_deref(), Some("active_tasks"));
+        finish_task_success(&state, &task_id, serde_json::json!({"returned_results": 0}))
+            .await
+            .unwrap();
+        let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+        assert_eq!(
+            exit.skip_reason.as_deref(),
+            Some("idle_timeout_not_reached")
+        );
+
+        force_idle_exit_timeout_elapsed(&state, 5);
+        let reader_permit = state
+            .resources
+            .sqlite_reader
+            .acquire()
+            .await
+            .expect("reader permit");
+        let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+        assert_eq!(exit.skip_reason.as_deref(), Some("active_resources"));
+        drop(reader_permit);
+
+        force_idle_exit_timeout_elapsed(&state, 5);
+        let exit = idle_exit_gate(&state, vec![idle_exit_resource_snapshot_for_test(0, 1)]).health;
+        assert_eq!(exit.skip_reason.as_deref(), Some("queued_resources"));
+
+        force_idle_exit_timeout_elapsed(&state, 5);
+        state.ingest_queue_active.store(true, Ordering::Release);
+        let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+        assert_eq!(exit.skip_reason.as_deref(), Some("ingest_queue_active"));
+        state.ingest_queue_active.store(false, Ordering::Release);
+
+        force_idle_exit_timeout_elapsed(&state, 5);
+        state.ingest_worker_active.store(true, Ordering::Release);
+        let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+        assert_eq!(exit.skip_reason.as_deref(), Some("ingest_worker_active"));
+        state.ingest_worker_active.store(false, Ordering::Release);
+
+        force_idle_exit_timeout_elapsed(&state, 5);
+        let pipeline = take_pipeline(&state).expect("take pipeline slot");
+        let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+        assert_eq!(exit.skip_reason.as_deref(), Some("pipeline_busy"));
+        restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    #[tokio::test]
+    async fn idle_exit_collection_watcher_safety() {
+        let test_dir = TestDir::new("idle-exit-watcher-safety");
+        let mut config = idle_exit_test_config("http://127.0.0.1:9/v1", 1);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config.clone(), test_dir.path(), pipeline);
+        force_idle_exit_timeout_elapsed(&state, 5);
+        update_collection_watcher_status(&state, "articles", |status| {
+            status.active = true;
+            status.watched_root_count = 2;
+        });
+        let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+        assert_eq!(
+            exit.skip_reason.as_deref(),
+            Some("active_collection_watchers")
+        );
+        assert_eq!(exit.active.watched_roots, 2);
+
+        config.daemon.idle_exit.allow_with_collection_watcher = true;
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_exit_timeout_elapsed(&state, 5);
+        update_collection_watcher_status(&state, "articles", |status| {
+            status.active = true;
+            status.watched_root_count = 2;
+        });
+        let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+        assert!(exit.eligible);
+        assert_eq!(exit.skip_reason, None);
+
+        update_collection_watcher_status(&state, "articles", |status| {
+            status.pending_event_count = 1;
+        });
+        let exit = idle_exit_gate(&state, daemon_resource_snapshots(&state)).health;
+        assert_eq!(
+            exit.skip_reason.as_deref(),
+            Some("pending_collection_watcher_events")
+        );
+
+        let (tx, mut rx) = mpsc::channel(1);
+        set_collection_watcher_sender(&state, tx);
+        queue_idle_exit_collection_watcher_resync_if_enabled(&state);
+        match rx.try_recv().expect("resync command queued") {
+            CollectionWatcherCommand::ResyncActive => {}
+            other => panic!("unexpected collection watcher command: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -9803,11 +10430,12 @@ mod tests {
             .reason_buckets
             .iter()
             .any(|bucket| bucket.reason == "embedding_throughput" && bucket.count == 1));
-        assert!(response.tasks.iter().all(|task| task
-            .progress
-            .as_ref()
-            .and_then(|progress| progress.wait_reason.as_ref())
-            .is_some()));
+        assert!(response.tasks.iter().all(|task| {
+            task.progress
+                .as_ref()
+                .and_then(|progress| progress.wait_reason.as_ref())
+                .is_some()
+        }));
     }
 
     #[tokio::test]
@@ -14985,6 +15613,7 @@ mod tests {
             ingest_worker_active: AtomicBool::new(false),
             collection_watcher: CollectionWatcherRuntime::default(),
             idle_reclaim: Arc::new(IdleReclaimRuntime::new(now_unix_millis())),
+            idle_exit: Arc::new(IdleExitRuntime::new(now_unix_millis())),
             #[cfg(test)]
             idle_reclaim_before_backend_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -15335,11 +15964,29 @@ mod tests {
         config
     }
 
+    fn idle_exit_test_config(model_base_url: &str, timeout_seconds: u64) -> Config {
+        let mut config = retrieve_test_config(model_base_url);
+        config.daemon.idle_exit.enabled = true;
+        config.daemon.idle_exit.timeout_seconds = timeout_seconds;
+        config
+    }
+
     fn force_idle_reclaim_timeout_elapsed(state: &SharedState, elapsed_seconds: u64) {
         state.idle_reclaim.last_activity_unix_ms.store(
             now_unix_millis().saturating_sub(elapsed_seconds.saturating_mul(1_000)),
             Ordering::Release,
         );
+    }
+
+    fn force_idle_exit_timeout_elapsed(state: &SharedState, elapsed_seconds: u64) {
+        state.idle_exit.last_activity_unix_ms.store(
+            now_unix_millis().saturating_sub(elapsed_seconds.saturating_mul(1_000)),
+            Ordering::Release,
+        );
+    }
+
+    fn idle_exit_resource_snapshot_for_test(active: usize, queued: usize) -> ResourceQueueSnapshot {
+        idle_reclaim_resource_snapshot_for_test(active, queued)
     }
 
     fn assert_idle_reclaim_skipped_without_backends(

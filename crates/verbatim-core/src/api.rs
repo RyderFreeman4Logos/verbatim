@@ -811,6 +811,41 @@ impl IdleReclaimBackendResult {
     }
 }
 
+/// Idle process exit state exposed through daemon health and CLI status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleExitHealth {
+    pub enabled: bool,
+    pub count_health_requests: bool,
+    pub allow_with_collection_watcher: bool,
+    pub auto_start_on_cli: bool,
+    pub currently_idle: bool,
+    pub eligible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    pub idle_for_millis: u64,
+    pub timeout_millis: u64,
+    pub last_activity_unix_ms: u64,
+    pub deadline_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_eligible_in_millis: Option<u64>,
+    pub active: IdleExitActivitySnapshot,
+}
+
+/// Low-cardinality counters used to explain idle exit blockers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleExitActivitySnapshot {
+    pub http_requests: u64,
+    pub sse_streams: u64,
+    pub active_tasks: usize,
+    pub resource_active: usize,
+    pub resource_queued: usize,
+    pub ingest_queue_active: bool,
+    pub ingest_worker_active: bool,
+    pub pipeline_busy: bool,
+    pub watched_roots: usize,
+    pub pending_watcher_events: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
@@ -820,6 +855,8 @@ pub struct HealthResponse {
     pub resources: Vec<ResourceQueueSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_reclaim: Option<IdleReclaimHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_exit: Option<IdleExitHealth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

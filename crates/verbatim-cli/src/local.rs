@@ -15,6 +15,8 @@ pub trait LocalActions {
     fn config_init(&self) -> CliResult<PathBuf>;
     fn config_validate(&self) -> CliResult<PathBuf>;
     fn daemon_start(&self) -> CliResult<u8>;
+    fn daemon_start_user_service(&self) -> CliResult<()>;
+    fn daemon_idle_exit_auto_start_on_cli(&self) -> CliResult<bool>;
     fn daemon_install(&self, force: bool) -> CliResult<PathBuf>;
     fn load_task_list_history(&self) -> CliResult<Option<TaskListAggregateHistory>>;
     fn store_task_list_history(&self, history: &TaskListAggregateHistory) -> CliResult<()>;
@@ -47,6 +49,42 @@ impl LocalActions for RealLocalActions {
         Ok(status.code().unwrap_or(1).try_into().unwrap_or(1))
     }
 
+    fn daemon_start_user_service(&self) -> CliResult<()> {
+        let output = Command::new("systemctl")
+            .args(["--user", "start", "verbatim"])
+            .output()
+            .map_err(|error| {
+                CliError::Api(format!(
+                    "failed to run systemctl --user start verbatim: {error}"
+                ))
+            })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(CliError::Api(format!(
+            "systemctl --user start verbatim failed with status {}: {}{}",
+            output.status,
+            stdout.trim(),
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" {}", stderr.trim())
+            }
+        )))
+    }
+
+    fn daemon_idle_exit_auto_start_on_cli(&self) -> CliResult<bool> {
+        let path = config::config_path();
+        if !path.exists() {
+            return Ok(false);
+        }
+        let config = Config::load_from(&path)
+            .map_err(|error| CliError::Api(format!("config is invalid: {error:#}")))?;
+        Ok(config.daemon.idle_exit.auto_start_on_cli)
+    }
+
     fn daemon_install(&self, force: bool) -> CliResult<PathBuf> {
         let unit_path = user_systemd_unit_path()?;
         if unit_path.exists() && !force {
@@ -77,7 +115,7 @@ impl LocalActions for RealLocalActions {
                 return Err(CliError::Api(format!(
                     "failed to inspect task list history {}: {error}",
                     path.display()
-                )))
+                )));
             }
         };
         if !metadata.file_type().is_file() || metadata.len() > TASK_LIST_HISTORY_MAX_BYTES {
@@ -95,7 +133,7 @@ impl LocalActions for RealLocalActions {
                 return Err(CliError::Api(format!(
                     "failed to read task list history {}: {error}",
                     path.display()
-                )))
+                )));
             }
         };
         match serde_json::from_slice(&contents) {
@@ -167,7 +205,11 @@ where
 {
     writeln!(writer, "Generated {}", path.display())?;
     writeln!(writer, "Run: systemctl --user daemon-reload")?;
-    writeln!(writer, "Run: systemctl --user enable --now verbatim")
+    writeln!(writer, "Run: systemctl --user enable --now verbatim")?;
+    writeln!(
+        writer,
+        "Idle exit recovery: enable daemon.idle_exit.auto_start_on_cli for explicit CLI status auto-start, or run systemctl --user start verbatim manually."
+    )
 }
 
 fn user_systemd_unit_path() -> CliResult<PathBuf> {
