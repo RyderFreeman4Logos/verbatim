@@ -59,6 +59,7 @@ pub const DEFAULT_RESOURCE_QUEUE_TIMEOUT_SECONDS: u64 = 300;
 pub const SQLITE_WRITER_ACTIVE_CAPACITY: usize = 1;
 pub const DEFAULT_IDLE_RECLAIM_IDLE_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_IDLE_RECLAIM_MIN_INTERVAL_SECONDS: u64 = 900;
+pub const DEFAULT_IDLE_EXIT_TIMEOUT_SECONDS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelEndpointRuntimeConfig {
@@ -1052,6 +1053,8 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub idle_reclaim: DaemonIdleReclaimConfig,
     #[serde(default)]
+    pub idle_exit: DaemonIdleExitConfig,
+    #[serde(default)]
     pub resources: DaemonResourceConfig,
 }
 
@@ -1060,6 +1063,7 @@ impl Default for DaemonConfig {
         Self {
             bind: default_daemon_bind(),
             idle_reclaim: DaemonIdleReclaimConfig::default(),
+            idle_exit: DaemonIdleExitConfig::default(),
             resources: DaemonResourceConfig::default(),
         }
     }
@@ -1156,6 +1160,88 @@ pub fn default_idle_reclaim_idle_timeout_seconds() -> u64 {
 
 pub fn default_idle_reclaim_min_interval_seconds() -> u64 {
     DEFAULT_IDLE_RECLAIM_MIN_INTERVAL_SECONDS
+}
+
+/// Configures opt-in daemon process exit after a blocker-free idle timeout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DaemonIdleExitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_idle_exit_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub count_health_requests: bool,
+    #[serde(default)]
+    pub allow_with_collection_watcher: bool,
+    #[serde(default)]
+    pub auto_start_on_cli: bool,
+}
+
+impl Default for DaemonIdleExitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_seconds: default_idle_exit_timeout_seconds(),
+            count_health_requests: false,
+            allow_with_collection_watcher: false,
+            auto_start_on_cli: false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DaemonIdleExitConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawDaemonIdleExitConfig {
+            #[serde(default)]
+            enabled: bool,
+            #[serde(default = "default_idle_exit_timeout_seconds")]
+            timeout_seconds: u64,
+            #[serde(default)]
+            count_health_requests: bool,
+            #[serde(default)]
+            allow_with_collection_watcher: bool,
+            #[serde(default)]
+            auto_start_on_cli: bool,
+        }
+
+        let raw = RawDaemonIdleExitConfig::deserialize(deserializer)?;
+        let config = Self {
+            enabled: raw.enabled,
+            timeout_seconds: raw.timeout_seconds,
+            count_health_requests: raw.count_health_requests,
+            allow_with_collection_watcher: raw.allow_with_collection_watcher,
+            auto_start_on_cli: raw.auto_start_on_cli,
+        };
+        config.validate().map_err(de::Error::custom)?;
+        Ok(config)
+    }
+}
+
+impl DaemonIdleExitConfig {
+    pub fn bounded(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            timeout_seconds: self.timeout_seconds.max(1),
+            count_health_requests: self.count_health_requests,
+            allow_with_collection_watcher: self.allow_with_collection_watcher,
+            auto_start_on_cli: self.auto_start_on_cli,
+        }
+    }
+
+    fn validate(&self) -> std::result::Result<(), &'static str> {
+        if self.timeout_seconds == 0 {
+            return Err("daemon.idle_exit.timeout_seconds must be at least 1");
+        }
+        Ok(())
+    }
+}
+
+pub fn default_idle_exit_timeout_seconds() -> u64 {
+    DEFAULT_IDLE_EXIT_TIMEOUT_SECONDS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1460,6 +1546,7 @@ impl Config {
         let mut next = self.clone();
 
         next.daemon.idle_reclaim = candidate.daemon.idle_reclaim.clone();
+        next.daemon.idle_exit = candidate.daemon.idle_exit.clone();
         next.daemon.resources.memory_budget_mb = candidate.daemon.resources.memory_budget_mb;
         next.daemon.resources.memory_budget_enforcement =
             candidate.daemon.resources.memory_budget_enforcement;
@@ -1598,6 +1685,11 @@ fn is_reload_safe_key(key: &str) -> bool {
     matches!(
         key,
         "daemon.resources.memory_budget_mb"
+            | "daemon.idle_exit.enabled"
+            | "daemon.idle_exit.timeout_seconds"
+            | "daemon.idle_exit.count_health_requests"
+            | "daemon.idle_exit.allow_with_collection_watcher"
+            | "daemon.idle_exit.auto_start_on_cli"
             | "daemon.idle_reclaim.enabled"
             | "daemon.idle_reclaim.idle_timeout_seconds"
             | "daemon.idle_reclaim.min_interval_seconds"
@@ -1939,6 +2031,20 @@ min_interval_seconds = 900
 sqlite_shrink_memory = true
 malloc_trim = true
 
+[daemon.idle_exit]
+# Disabled by default; the daemon remains long-running unless explicitly enabled.
+enabled = false
+timeout_seconds = 300
+# Health checks do not extend the idle deadline unless this is enabled.
+count_health_requests = false
+# Active collection watcher roots block idle exit by default. Enabling this
+# requires startup or first-request watcher maintenance resync to avoid missed
+# filesystem events while the daemon was stopped.
+allow_with_collection_watcher = false
+# Lets explicitly opted-in CLI status calls start verbatim.service and retry once.
+# This is not systemd socket activation.
+auto_start_on_cli = false
+
 [daemon.resources]
 memory_budget_enforcement = "slow_warn"
 memory_budget_poll_millis = 500
@@ -1995,6 +2101,14 @@ mod tests {
         );
         assert!(config.daemon.idle_reclaim.sqlite_shrink_memory);
         assert!(config.daemon.idle_reclaim.malloc_trim);
+        assert!(!config.daemon.idle_exit.enabled);
+        assert_eq!(
+            config.daemon.idle_exit.timeout_seconds,
+            DEFAULT_IDLE_EXIT_TIMEOUT_SECONDS
+        );
+        assert!(!config.daemon.idle_exit.count_health_requests);
+        assert!(!config.daemon.idle_exit.allow_with_collection_watcher);
+        assert!(!config.daemon.idle_exit.auto_start_on_cli);
         assert!(config.embedding.enabled);
         assert_eq!(config.embedding.provider, "openai_compatible");
         assert_eq!(config.embedding.base_url, "http://127.0.0.1:8002/v1");
@@ -2551,6 +2665,109 @@ min_interval_seconds = 0
     }
 
     #[test]
+    fn daemon_idle_exit_config() {
+        let config: Config = toml::from_str(
+            r#"
+[daemon.idle_exit]
+enabled = true
+timeout_seconds = 60
+count_health_requests = true
+allow_with_collection_watcher = true
+auto_start_on_cli = true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.daemon.idle_exit.enabled);
+        assert_eq!(config.daemon.idle_exit.timeout_seconds, 60);
+        assert!(config.daemon.idle_exit.count_health_requests);
+        assert!(config.daemon.idle_exit.allow_with_collection_watcher);
+        assert!(config.daemon.idle_exit.auto_start_on_cli);
+
+        let serialized = config.show().unwrap();
+        assert!(serialized.contains("[daemon.idle_exit]"));
+        assert!(serialized.contains("timeout_seconds = 60"));
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.daemon.idle_exit, config.daemon.idle_exit);
+
+        let timeout_error = toml::from_str::<Config>(
+            r#"
+[daemon.idle_exit]
+timeout_seconds = 0
+"#,
+        )
+        .unwrap_err();
+        assert!(timeout_error
+            .to_string()
+            .contains("daemon.idle_exit.timeout_seconds must be at least 1"));
+
+        let current: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        let mut candidate = current.clone();
+        candidate.daemon.idle_exit.enabled = true;
+        candidate.daemon.idle_exit.timeout_seconds = 30;
+        candidate.daemon.idle_exit.count_health_requests = true;
+        candidate.daemon.idle_exit.allow_with_collection_watcher = true;
+        candidate.daemon.idle_exit.auto_start_on_cli = true;
+        candidate.daemon.bind = "127.0.0.1:9900".into();
+
+        let plan = current.reload_plan(&candidate).unwrap();
+        assert_eq!(
+            plan.reload_safe_keys,
+            vec![
+                "daemon.idle_exit.allow_with_collection_watcher",
+                "daemon.idle_exit.auto_start_on_cli",
+                "daemon.idle_exit.count_health_requests",
+                "daemon.idle_exit.enabled",
+                "daemon.idle_exit.timeout_seconds",
+            ]
+        );
+        assert_eq!(plan.restart_required_keys.len(), 1);
+        assert_eq!(plan.restart_required_keys[0].key, "daemon.bind");
+
+        let applied = current.apply_reload_safe_changes(&candidate);
+        assert!(applied.daemon.idle_exit.enabled);
+        assert_eq!(applied.daemon.idle_exit.timeout_seconds, 30);
+        assert_eq!(applied.daemon.bind, current.daemon.bind);
+    }
+
+    #[test]
+    fn default_config_includes_idle_exit() {
+        let template: toml::Value = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        let idle_exit = template
+            .get("daemon")
+            .and_then(|daemon| daemon.get("idle_exit"))
+            .expect("default template includes daemon.idle_exit");
+        assert_eq!(
+            idle_exit.get("enabled").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            idle_exit
+                .get("timeout_seconds")
+                .and_then(toml::Value::as_integer),
+            Some(i64::try_from(DEFAULT_IDLE_EXIT_TIMEOUT_SECONDS).unwrap())
+        );
+        assert_eq!(
+            idle_exit
+                .get("count_health_requests")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            idle_exit
+                .get("allow_with_collection_watcher")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            idle_exit
+                .get("auto_start_on_cli")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn default_template_places_capability_cache_ttl_under_model_tables() {
         let template: toml::Value = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
 
@@ -2611,6 +2828,11 @@ min_interval_seconds = 0
         candidate.embedding.endpoint_runtime.queue_timeout_seconds = 60;
         candidate.index_gc.retain_previous_generations = 0;
         candidate.index_gc.stale_staging_seconds = 3_600;
+        candidate.daemon.idle_exit.enabled = true;
+        candidate.daemon.idle_exit.timeout_seconds = 30;
+        candidate.daemon.idle_exit.count_health_requests = true;
+        candidate.daemon.idle_exit.allow_with_collection_watcher = true;
+        candidate.daemon.idle_exit.auto_start_on_cli = true;
         candidate.daemon.resources.memory_budget_mb = Some(2048);
         candidate.daemon.resources.memory_budget_enforcement = MemoryBudgetEnforcement::Fail;
 
@@ -2622,6 +2844,11 @@ min_interval_seconds = 0
                 "chat.max_concurrent_requests",
                 "chat.retry.max_retries",
                 "chat.timeout_seconds",
+                "daemon.idle_exit.allow_with_collection_watcher",
+                "daemon.idle_exit.auto_start_on_cli",
+                "daemon.idle_exit.count_health_requests",
+                "daemon.idle_exit.enabled",
+                "daemon.idle_exit.timeout_seconds",
                 "daemon.resources.memory_budget_enforcement",
                 "daemon.resources.memory_budget_mb",
                 "embedding.base_url",
@@ -2644,6 +2871,11 @@ min_interval_seconds = 0
         assert_eq!(applied.embedding.endpoint_runtime.queue_timeout_seconds, 60);
         assert_eq!(applied.index_gc.retain_previous_generations, 0);
         assert_eq!(applied.index_gc.stale_staging_seconds, 3_600);
+        assert!(applied.daemon.idle_exit.enabled);
+        assert_eq!(applied.daemon.idle_exit.timeout_seconds, 30);
+        assert!(applied.daemon.idle_exit.count_health_requests);
+        assert!(applied.daemon.idle_exit.allow_with_collection_watcher);
+        assert!(applied.daemon.idle_exit.auto_start_on_cli);
         assert_eq!(applied.daemon.resources.memory_budget_mb, Some(2048));
         assert_eq!(
             applied.daemon.resources.memory_budget_enforcement,

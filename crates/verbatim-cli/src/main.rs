@@ -735,8 +735,8 @@ where
 {
     match command {
         DaemonCommand::Start => local.daemon_start(),
-        DaemonCommand::Status => {
-            let health = client.health()?;
+        DaemonCommand::Status { auto_start } => {
+            let health = daemon_status_health(client, local, auto_start)?;
             render::write_health(stdout, &health)?;
             Ok(0)
         }
@@ -745,6 +745,48 @@ where
             local::write_daemon_install(stdout, &path)?;
             Ok(0)
         }
+    }
+}
+
+fn daemon_status_health<C, L>(
+    client: &C,
+    local: &L,
+    auto_start: bool,
+) -> Result<verbatim_core::api::HealthResponse, CliError>
+where
+    C: DaemonClient,
+    L: LocalActions,
+{
+    match client.health() {
+        Ok(health) => Ok(health),
+        Err(CliError::DaemonUnreachable(original)) => {
+            let should_auto_start = if auto_start {
+                true
+            } else {
+                local.daemon_idle_exit_auto_start_on_cli()?
+            };
+            if !should_auto_start {
+                return Err(CliError::DaemonUnreachable(original));
+            }
+            if let Err(start_error) = local.daemon_start_user_service() {
+                return Err(CliError::DaemonUnreachable(format!(
+                    "could not reach verbatim daemon; auto-start failed\n\
+                     original failure: {original}\n\
+                     auto-start failure: {start_error}\n\
+                     Start it manually with: systemctl --user start verbatim"
+                )));
+            }
+            client.health().map_err(|retry_error| match retry_error {
+                CliError::DaemonUnreachable(retry) => CliError::DaemonUnreachable(format!(
+                    "started verbatim.service but could not reach verbatim daemon on retry\n\
+                     original failure: {original}\n\
+                     retry failure: {retry}\n\
+                     Start it manually with: systemctl --user start verbatim"
+                )),
+                other => other,
+            })
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1152,9 +1194,11 @@ verbatim daemon install and systemctl --user enable --now verbatim.
 
 const DAEMON_STATUS_AFTER_HELP: &str = r#"Examples:
   verbatim daemon status
+  verbatim daemon status --auto-start
 
 Status checks daemon health through the HTTP API and fails if the daemon cannot
-be reached.
+be reached. With --auto-start, status starts the installed user systemd service
+with `systemctl --user start verbatim` and retries health once. This is not systemd socket activation.
 "#;
 
 const DAEMON_INSTALL_AFTER_HELP: &str = r#"Examples:
@@ -1165,6 +1209,8 @@ const DAEMON_INSTALL_AFTER_HELP: &str = r#"Examples:
 
 Install writes ~/.config/systemd/user/verbatim.service, or the equivalent path
 under XDG_CONFIG_HOME. Use --force only to replace an existing unit file.
+Idle exit can recover with explicit CLI auto-start for status or run
+`systemctl --user start verbatim` manually; no socket unit is installed.
 "#;
 
 const TASK_AFTER_HELP: &str = r#"Examples:
@@ -1781,7 +1827,11 @@ enum DaemonCommand {
         about = "Check daemon health through the HTTP API.",
         after_help = DAEMON_STATUS_AFTER_HELP
     )]
-    Status,
+    Status {
+        /// Start the installed user systemd service and retry health once if unreachable.
+        #[arg(long)]
+        auto_start: bool,
+    },
     /// Install the systemd user service.
     #[command(
         about = "Install the systemd user service unit.",
@@ -1910,13 +1960,14 @@ mod tests {
         CitationResponse, CollectionResponse, CollectionStatusResponse, CollectionSyncRequest,
         CollectionSyncResponse, CollectionWatcherResponse, CollectionWatcherStatus,
         CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
-        CreateCollectionRequest, EvidenceResponse, HealthResponse, IdleReclaimActivitySnapshot,
-        IdleReclaimBackendResult, IdleReclaimCycleResult, IdleReclaimHealth, IngestResponse,
-        ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest,
-        RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
-        TaskCreatedResponse, TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskListAggregate,
-        TaskListResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
-        TaskStaleRunningAggregate, TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
+        CreateCollectionRequest, EvidenceResponse, HealthResponse, IdleExitActivitySnapshot,
+        IdleExitHealth, IdleReclaimActivitySnapshot, IdleReclaimBackendResult,
+        IdleReclaimCycleResult, IdleReclaimHealth, IngestResponse, ReindexRequest, ReindexResponse,
+        RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+        RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
+        TaskEventsResponse, TaskListAggregate, TaskListResponse, TaskQueueTurnover,
+        TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse,
+        COLLECTION_CLI_API_PARITY,
     };
     use verbatim_core::collection::{
         CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
@@ -2056,6 +2107,23 @@ mod tests {
     }
 
     #[test]
+    fn daemon_help_mentions_idle_exit_activation() {
+        let (code, status_help, status_stderr, _, _) = run_mock(["daemon", "status", "--help"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(status_stderr.is_empty());
+        assert!(status_help.contains("--auto-start"));
+        assert!(status_help.contains("systemctl --user start verbatim"));
+        assert!(status_help.contains("not systemd socket activation"));
+
+        let (code, install_help, install_stderr, _, _) = run_mock(["daemon", "install", "--help"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(install_stderr.is_empty());
+        assert!(install_help.contains("Idle exit"));
+        assert!(install_help.contains("systemctl --user start verbatim"));
+        assert!(install_help.contains("no socket unit is installed"));
+    }
+
+    #[test]
     fn collection_cli_api_parity_inventory_matches_clap_commands() {
         let mut actual = collection_leaf_command_paths_from_clap();
         actual.sort();
@@ -2068,10 +2136,12 @@ mod tests {
         expected.sort();
 
         assert_eq!(actual, expected);
-        assert!(COLLECTION_CLI_API_PARITY.iter().all(|entry| entry
-            .endpoint
-            .path_template()
-            .starts_with("/api/collections")));
+        assert!(COLLECTION_CLI_API_PARITY.iter().all(|entry| {
+            entry
+                .endpoint
+                .path_template()
+                .starts_with("/api/collections")
+        }));
     }
 
     #[test]
@@ -2702,6 +2772,7 @@ mod tests {
                 }),
                 last_attempt_result: None,
             }),
+            idle_exit: None,
         }));
         let local = MockLocalActions::default();
 
@@ -2764,6 +2835,7 @@ mod tests {
                     },
                 }),
             }),
+            idle_exit: None,
         }));
         let local = MockLocalActions::default();
 
@@ -2775,6 +2847,126 @@ mod tests {
         assert!(stdout.contains("last attempt: status=succeeded attempted_at_unix_ms=100"));
         assert!(stdout.contains("sqlite: status=succeeded attempted=true success=2 failure=0"));
         assert!(stdout.contains("allocator: status=succeeded_no_release attempted=true success=1"));
+    }
+
+    #[test]
+    fn daemon_status_renders_idle_exit() {
+        let client = MockDaemonClient::default();
+        client.health_response.replace(Some(HealthResponse {
+            status: "ok".into(),
+            memory_budget: Default::default(),
+            resources: Vec::new(),
+            idle_reclaim: None,
+            idle_exit: Some(IdleExitHealth {
+                enabled: true,
+                count_health_requests: false,
+                allow_with_collection_watcher: false,
+                auto_start_on_cli: true,
+                currently_idle: false,
+                eligible: false,
+                skip_reason: Some("active_collection_watchers".into()),
+                idle_for_millis: 12_000,
+                timeout_millis: 10_000,
+                last_activity_unix_ms: 90,
+                deadline_unix_ms: 10_090,
+                next_eligible_in_millis: Some(10_000),
+                active: IdleExitActivitySnapshot {
+                    watched_roots: 2,
+                    pending_watcher_events: 1,
+                    ..IdleExitActivitySnapshot::default()
+                },
+            }),
+        }));
+        let local = MockLocalActions::default();
+
+        let (code, stdout, stderr) = run_mock_with(["daemon", "status"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("Idle exit: enabled=true idle=false eligible=false"));
+        assert!(stdout.contains("deadline_unix_ms=10090"));
+        assert!(stdout.contains("skip=active_collection_watchers"));
+        assert!(stdout.contains("watched_roots=2 pending_watcher_events=1"));
+        assert!(stdout.contains(
+            "config: count_health_requests=false allow_with_collection_watcher=false auto_start_on_cli=true"
+        ));
+    }
+
+    #[test]
+    fn daemon_auto_start_retry() {
+        let client = MockDaemonClient::default();
+        client
+            .health_errors
+            .borrow_mut()
+            .push(CliError::DaemonUnreachable(
+                "original connection refused".into(),
+            ));
+        let local = MockLocalActions::default();
+
+        let (code, stdout, stderr) =
+            run_mock_with(["daemon", "status", "--auto-start"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stdout.contains("Daemon status: ok"));
+        assert!(stderr.is_empty());
+        assert_eq!(client.calls.borrow().as_slice(), ["health"]);
+        assert_eq!(
+            local.calls.borrow().as_slice(),
+            ["daemon_start_user_service"]
+        );
+
+        let client = MockDaemonClient {
+            health_error: Some(CliError::DaemonUnreachable("daemon stopped".into())),
+            ..MockDaemonClient::default()
+        };
+        let local = MockLocalActions::default();
+        let (code, stdout, stderr) = run_mock_with(["daemon", "status"], &client, &local);
+
+        assert_eq!(code.unwrap_err(), 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("daemon stopped"));
+        assert_eq!(
+            local.calls.borrow().as_slice(),
+            ["daemon_idle_exit_auto_start_on_cli"]
+        );
+
+        let client = MockDaemonClient::default();
+        client
+            .health_errors
+            .borrow_mut()
+            .push(CliError::DaemonUnreachable("daemon idle exited".into()));
+        let local = MockLocalActions::default();
+        local.idle_exit_auto_start_on_cli.replace(true);
+        let (code, stdout, stderr) = run_mock_with(["daemon", "status"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stdout.contains("Daemon status: ok"));
+        assert!(stderr.is_empty());
+        assert_eq!(
+            local.calls.borrow().as_slice(),
+            [
+                "daemon_idle_exit_auto_start_on_cli",
+                "daemon_start_user_service"
+            ]
+        );
+
+        let client = MockDaemonClient::default();
+        client
+            .health_errors
+            .borrow_mut()
+            .push(CliError::DaemonUnreachable("connection failed".into()));
+        let local = MockLocalActions::default();
+        local
+            .daemon_user_service_error
+            .replace(Some(CliError::Api("systemd unavailable".into())));
+        let (code, stdout, stderr) =
+            run_mock_with(["daemon", "status", "--auto-start"], &client, &local);
+
+        assert_eq!(code.unwrap_err(), 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("connection failed"));
+        assert!(stderr.contains("systemd unavailable"));
+        assert!(stderr.contains("systemctl --user start verbatim"));
     }
 
     #[test]
@@ -3992,6 +4184,7 @@ mod tests {
         last_watcher_update: RefCell<Option<CollectionWatcherUpdateRequest>>,
         list_error: Option<CliError>,
         health_error: Option<CliError>,
+        health_errors: RefCell<Vec<CliError>>,
         health_response: RefCell<Option<HealthResponse>>,
         task_list_response: RefCell<Option<TaskListResponse>>,
     }
@@ -4332,6 +4525,9 @@ mod tests {
         }
 
         fn health(&self) -> client::CliResult<HealthResponse> {
+            if !self.health_errors.borrow().is_empty() {
+                return Err(self.health_errors.borrow_mut().remove(0));
+            }
             if let Some(error) = &self.health_error {
                 return Err(clone_cli_error(error));
             }
@@ -4345,6 +4541,7 @@ mod tests {
                     memory_budget: Default::default(),
                     resources: Vec::new(),
                     idle_reclaim: None,
+                    idle_exit: None,
                 }))
         }
     }
@@ -4357,6 +4554,8 @@ mod tests {
         task_list_history_store_error: RefCell<bool>,
         task_list_history_clear_error: RefCell<bool>,
         now_millis: RefCell<u64>,
+        daemon_user_service_error: RefCell<Option<CliError>>,
+        idle_exit_auto_start_on_cli: RefCell<bool>,
     }
 
     impl LocalActions for MockLocalActions {
@@ -4373,6 +4572,23 @@ mod tests {
         fn daemon_start(&self) -> client::CliResult<u8> {
             self.calls.borrow_mut().push("daemon_start".into());
             Ok(0)
+        }
+
+        fn daemon_start_user_service(&self) -> client::CliResult<()> {
+            self.calls
+                .borrow_mut()
+                .push("daemon_start_user_service".into());
+            if let Some(error) = self.daemon_user_service_error.borrow().as_ref() {
+                return Err(clone_cli_error(error));
+            }
+            Ok(())
+        }
+
+        fn daemon_idle_exit_auto_start_on_cli(&self) -> client::CliResult<bool> {
+            self.calls
+                .borrow_mut()
+                .push("daemon_idle_exit_auto_start_on_cli".into());
+            Ok(*self.idle_exit_auto_start_on_cli.borrow())
         }
 
         fn daemon_install(&self, force: bool) -> client::CliResult<PathBuf> {
