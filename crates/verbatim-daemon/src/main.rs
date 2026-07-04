@@ -2384,6 +2384,18 @@ fn record_ingest_task_terminalize_span(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TaskTerminalizationOutcome {
+    task_changed: bool,
+    should_wake_ingest_queue: bool,
+}
+
+fn mark_idle_reclaim_activity_if_changed(state: &SharedState, changed: bool) {
+    if changed {
+        state.idle_reclaim.mark_activity();
+    }
+}
+
 async fn finish_task_success(
     state: &SharedState,
     task_id: &TaskId,
@@ -2391,7 +2403,7 @@ async fn finish_task_success(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
-    let should_wake_ingest_queue = with_task_store_write(state, move |store| {
+    let outcome = with_task_store_write(state, move |store| {
         let task = store.get_task(&task_id)?;
         let should_wake_ingest_queue = task
             .as_ref()
@@ -2406,11 +2418,15 @@ async fn finish_task_success(
             }
             finalize_ingest_batch_parent_if_complete(store, task.as_ref())?;
         }
-        Ok(task_changed && should_wake_ingest_queue)
+        Ok(TaskTerminalizationOutcome {
+            task_changed,
+            should_wake_ingest_queue: task_changed && should_wake_ingest_queue,
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    if should_wake_ingest_queue {
+    mark_idle_reclaim_activity_if_changed(state, outcome.task_changed);
+    if outcome.should_wake_ingest_queue {
         schedule_ingest_queue(state_for_queue);
     }
     Ok(())
@@ -2442,7 +2458,7 @@ async fn finish_task_failed_with_upstream(
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
     let error_message = bounded_error(error_message);
-    let should_wake_ingest_queue = with_task_store_write(state, move |store| {
+    let outcome = with_task_store_write(state, move |store| {
         let task = store.get_task(&task_id)?;
         let upstream_failure = upstream_failure
             .map(|failure| upstream_failure_with_task_context(failure, &task_id, task.as_ref()));
@@ -2475,11 +2491,15 @@ async fn finish_task_failed_with_upstream(
             }
             finalize_ingest_batch_parent_if_complete(store, task.as_ref())?;
         }
-        Ok(task_changed && should_wake_ingest_queue)
+        Ok(TaskTerminalizationOutcome {
+            task_changed,
+            should_wake_ingest_queue: task_changed && should_wake_ingest_queue,
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    if should_wake_ingest_queue {
+    mark_idle_reclaim_activity_if_changed(state, outcome.task_changed);
+    if outcome.should_wake_ingest_queue {
         schedule_ingest_queue(state_for_queue);
     }
     Ok(())
@@ -4596,18 +4616,20 @@ async fn recover_abandoned_running_source_batch_children(state: &SharedState) ->
     if state.ingest_worker_active.load(Ordering::Acquire) {
         return Ok(0);
     }
-    with_task_store_write(
+    let recovered = with_task_store_write(
         state,
         recover_abandoned_running_source_batch_children_in_store,
     )
-    .await
+    .await?;
+    mark_idle_reclaim_activity_if_changed(state, recovered > 0);
+    Ok(recovered)
 }
 
 /// Fail all ingest tasks stuck in `running` status from a previous daemon
 /// session.  On startup no worker is active, so any `running` task is an
 /// orphan that will permanently block the ingest queue (#182).
 async fn recover_orphaned_running_tasks(state: &SharedState) -> Result<usize> {
-    with_task_store_write(state, |store| {
+    let recovered = with_task_store_write(state, |store| {
         let mut candidates = Vec::new();
         for task in store.tasks(TaskKind::Ingest)? {
             if task.status == TaskStatus::Running {
@@ -4650,7 +4672,9 @@ async fn recover_orphaned_running_tasks(state: &SharedState) -> Result<usize> {
         }
         Ok(recovered)
     })
-    .await
+    .await?;
+    mark_idle_reclaim_activity_if_changed(state, recovered > 0);
+    Ok(recovered)
 }
 
 fn recover_abandoned_running_source_batch_children_in_store(store: &mut Store) -> Result<usize> {
@@ -4752,7 +4776,7 @@ async fn persist_ingest_batch_children(
     candidate: IngestBatchExpansionCandidate,
     expansion: BackgroundIngestBatchExpansion,
 ) -> Result<bool> {
-    with_task_store_write(state, move |store| {
+    let persisted = with_task_store_write(state, move |store| {
         if store.count_running_tasks(TaskKind::Ingest)? > 0 {
             return Ok(false);
         }
@@ -4832,7 +4856,9 @@ async fn persist_ingest_batch_children(
         }
         Ok::<_, anyhow::Error>(true)
     })
-    .await
+    .await?;
+    mark_idle_reclaim_activity_if_changed(state, persisted);
+    Ok(persisted)
 }
 
 fn persist_skipped_missing_ingest_child(
@@ -5617,7 +5643,7 @@ async fn cancel_task_record(
     task_id: &TaskId,
 ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
     let task_id = task_id.clone();
-    with_task_store_write(state, move |store| {
+    let changed = with_task_store_write(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
@@ -5658,7 +5684,9 @@ async fn cancel_task_record(
         } else {
             err(StatusCode::INTERNAL_SERVER_ERROR, e)
         }
-    })
+    })?;
+    mark_idle_reclaim_activity_if_changed(state, changed);
+    Ok(changed)
 }
 
 fn task_controlled_ingest_batch_id(task: &verbatim_core::task::TaskSummary) -> Option<String> {
@@ -8638,6 +8666,39 @@ mod tests {
         assert_eq!(result.skip_reason.as_deref(), Some("active_tasks"));
         assert!(!result.sqlite.attempted);
         assert!(!result.allocator.attempted);
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_waits_after_background_task_completion() {
+        let test_dir = TestDir::new("idle-reclaim-after-task-completion");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 60, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("question", None, None, 1, 1, 1),
+        )
+        .await
+        .unwrap();
+
+        finish_task_success(&state, &task_id, serde_json::json!({"returned_results": 0}))
+            .await
+            .unwrap();
+        let immediate = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_idle_reclaim_skipped_without_backends(&immediate, "idle_timeout_not_reached");
+
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let after_timeout = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_ne!(after_timeout.status, "skipped");
+        assert!(after_timeout.sqlite.attempted);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        assert!(after_timeout.allocator.attempted);
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        assert!(!after_timeout.allocator.attempted);
     }
 
     #[tokio::test]
