@@ -10425,6 +10425,11 @@ model = "local-vision"
         assert_eq!(first.cache_misses, 2);
         assert_eq!(first.embedded_chunks, 2);
         assert_eq!(embedding.calls().len(), 1);
+        let first_cleanup = pipeline.store().vector_json_cleanup_dry_run().unwrap();
+        assert_eq!(first_cleanup.tables.chunk_vectors.eligible, 0);
+        assert_eq!(first_cleanup.tables.chunk_vectors.already_clean, 2);
+        assert_eq!(first_cleanup.tables.embedding_cache.eligible, 0);
+        assert_eq!(first_cleanup.tables.embedding_cache.already_clean, 2);
 
         std::fs::write(&path, inserted).unwrap();
         let second = pipeline.ingest_source(&source_id).await.unwrap();
@@ -10451,6 +10456,26 @@ model = "local-vision"
         assert_eq!(third.reused_chunks, 2);
         assert_eq!(third.embedded_chunks, 0);
         assert_eq!(embedding.calls().len(), 2);
+        let cleanup = pipeline.store().cleanup_vector_json_payloads().unwrap();
+        assert_eq!(cleanup.cleared.chunk_vectors, 0);
+        assert_eq!(cleanup.cleared.embedding_cache, 0);
+
+        let lexical_index = pipeline.lexical_index();
+        let retrieval_config = RetrievalConfig::default();
+        let retrieval = RetrievalPipeline::new(
+            pipeline.vector_index(),
+            &lexical_index,
+            pipeline.store(),
+            &embedding,
+            &retrieval_config,
+        );
+        let (results, _debug) = retrieval
+            .search_source_set_with_debug("Alpha body", None)
+            .await
+            .unwrap();
+        assert!(results
+            .iter()
+            .any(|result| result.chunk.source_id == source_id));
     }
 
     #[tokio::test]

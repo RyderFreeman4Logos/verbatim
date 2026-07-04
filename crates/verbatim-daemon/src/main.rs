@@ -40,7 +40,8 @@ use verbatim_core::api::{
     RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
     TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskIngestRequest, TaskListAggregate,
     TaskListResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
-    TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent,
+    TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent, VectorJsonCleanupRequest,
+    VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -1557,6 +1558,34 @@ async fn index_delete_profile(
         plan,
         apply,
     }))
+}
+
+async fn vector_json_cleanup(
+    State(state): State<SharedState>,
+    Json(req): Json<VectorJsonCleanupRequest>,
+) -> Result<Json<VectorJsonCleanupResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !req.dry_run && !req.confirm {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("vector JSON cleanup requires confirm=true unless dry_run=true"),
+        ));
+    }
+
+    let state = Arc::clone(&state);
+    let dry_run = req.dry_run;
+    let report = tokio::task::spawn_blocking(move || {
+        run_with_pipeline(state, move |pipeline| {
+            if dry_run {
+                pipeline.store().vector_json_cleanup_dry_run()
+            } else {
+                pipeline.store().cleanup_vector_json_payloads()
+            }
+        })
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
+    .map_err(pipeline_access_error)?;
+    Ok(Json(VectorJsonCleanupResponse { dry_run, report }))
 }
 
 async fn add_source(
@@ -7750,6 +7779,7 @@ async fn run_daemon() -> Result<()> {
         .route("/api/index/status", get(index_status))
         .route("/api/index/gc", post(index_gc))
         .route("/api/index/profiles/delete", post(index_delete_profile))
+        .route("/api/index/vector-json/cleanup", post(vector_json_cleanup))
         .route("/api/ask", post(ask))
         .route("/api/ask/stream", post(ask_stream))
         .route("/api/retrieve", post(retrieve))
@@ -12959,6 +12989,125 @@ mod tests {
         assert_eq!(applied.apply.removed.len(), 1);
         assert!(!old_generation.exists());
         assert!(current_generation.exists());
+    }
+
+    #[tokio::test]
+    async fn vector_json_cleanup_dry_run_and_apply_use_daemon_store() {
+        let test_dir = TestDir::new("vector-json-cleanup");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let db_path = test_dir.path().join("verbatim.db");
+        let state = test_state(config, test_dir.path(), pipeline);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at)
+                 VALUES ('source-1', '/tmp/vector-json-cleanup.md', 'hash', 'Indexed', 'test', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks (id, source_id, chunk_hash, embedding_input_hash, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json)
+                 VALUES ('chunk-eligible', 'source-1', 'hash-eligible', 'input-eligible', 'text', NULL, 1, 'Leaf', NULL, '[]')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks (id, source_id, chunk_hash, embedding_input_hash, text, context_text, token_count, chunk_type, parent_chunk_id, heading_path_json)
+                 VALUES ('chunk-json-only', 'source-1', 'hash-json-only', 'input-json-only', 'text', NULL, 1, 'Leaf', NULL, '[]')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunk_vectors (profile_id, chunk_id, source_id, vector_json, vector_blob)
+                 VALUES ('default', 'chunk-eligible', 'source-1', '[1.0,2.0]', ?1)",
+                [vec![0_u8; 8]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunk_vectors (profile_id, chunk_id, source_id, vector_json, vector_blob)
+                 VALUES ('default', 'chunk-json-only', 'source-1', '[3.0,4.0]', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO embedding_cache
+                    (profile_id, profile_config_hash, embedding_input_hash, vector_json, vector_blob, dimension, cache_hits, created_at, updated_at)
+                 VALUES ('default', 'config-a', 'cache-eligible', '[1.0,2.0]', ?1, 2, 0, '1', '1')",
+                [vec![0_u8; 8]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO embedding_cache
+                    (profile_id, profile_config_hash, embedding_input_hash, vector_json, vector_blob, dimension, cache_hits, created_at, updated_at)
+                 VALUES ('default', 'config-a', 'cache-json-only', '[3.0,4.0]', NULL, 2, 0, '1', '1')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let Json(dry_run) = vector_json_cleanup(
+            State(Arc::clone(&state)),
+            Json(VectorJsonCleanupRequest {
+                dry_run: true,
+                confirm: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dry_run.dry_run);
+        assert_eq!(dry_run.report.tables.chunk_vectors.eligible, 1);
+        assert_eq!(dry_run.report.tables.chunk_vectors.json_only, 1);
+        assert_eq!(dry_run.report.tables.embedding_cache.eligible, 1);
+        assert_eq!(dry_run.report.tables.embedding_cache.json_only, 1);
+        assert_eq!(dry_run.report.cleared.chunk_vectors, 0);
+
+        let Json(applied) = vector_json_cleanup(
+            State(Arc::clone(&state)),
+            Json(VectorJsonCleanupRequest {
+                dry_run: false,
+                confirm: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!applied.dry_run);
+        assert_eq!(applied.report.cleared.chunk_vectors, 1);
+        assert_eq!(applied.report.cleared.embedding_cache, 1);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let chunk_eligible: String = conn
+            .query_row(
+                "SELECT vector_json FROM chunk_vectors WHERE chunk_id = 'chunk-eligible'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let chunk_json_only: String = conn
+            .query_row(
+                "SELECT vector_json FROM chunk_vectors WHERE chunk_id = 'chunk-json-only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cache_eligible: String = conn
+            .query_row(
+                "SELECT vector_json FROM embedding_cache WHERE embedding_input_hash = 'cache-eligible'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cache_json_only: String = conn
+            .query_row(
+                "SELECT vector_json FROM embedding_cache WHERE embedding_input_hash = 'cache-json-only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_eligible, "");
+        assert_eq!(cache_eligible, "");
+        assert_eq!(chunk_json_only, "[3.0,4.0]");
+        assert_eq!(cache_json_only, "[3.0,4.0]");
     }
 
     #[tokio::test]

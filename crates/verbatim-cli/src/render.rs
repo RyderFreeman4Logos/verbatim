@@ -9,9 +9,11 @@ use verbatim_core::api::{
     EvidenceResponse, HealthResponse, IndexGcResponse, IndexProfileDeleteResponse,
     IndexStatusResponse, IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse,
     TaskCreatedResponse, TaskListAggregate, TaskListResponse, TaskReasonBucket, TaskWaitEvent,
+    VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::index_gc::{IndexGcPlanEntry, IndexGcSkippedEntry};
+use verbatim_core::store::VectorJsonCleanupTableStats;
 use verbatim_core::task::{TaskEvent, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary};
 use verbatim_core::types::{
     BBox, OcrSourceStatus, RetrievalDebug, RetrievalEvidencePackEntry, RetrievalFusedHit,
@@ -679,6 +681,66 @@ where
         }
     }
     Ok(())
+}
+
+pub fn write_vector_json_cleanup<W>(
+    writer: &mut W,
+    response: &VectorJsonCleanupResponse,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    let heading = if response.dry_run {
+        "Vector JSON cleanup dry-run"
+    } else {
+        "Vector JSON cleanup complete"
+    };
+    writeln!(writer, "{heading}")?;
+    write_vector_json_cleanup_table(
+        writer,
+        "chunk_vectors",
+        &response.report.tables.chunk_vectors,
+        response.report.cleared.chunk_vectors,
+    )?;
+    write_vector_json_cleanup_table(
+        writer,
+        "embedding_cache",
+        &response.report.tables.embedding_cache,
+        response.report.cleared.embedding_cache,
+    )?;
+    if response.dry_run {
+        writeln!(writer, "No SQLite rows were modified.")?;
+    } else {
+        writeln!(
+            writer,
+            "JSON-only and malformed-BLOB rows were skipped; legacy JSON-only vectors remain readable."
+        )?;
+    }
+    writeln!(
+        writer,
+        "SQLite file size may require VACUUM or rebuild-table maintenance to reclaim disk space."
+    )
+}
+
+fn write_vector_json_cleanup_table<W>(
+    writer: &mut W,
+    name: &str,
+    stats: &VectorJsonCleanupTableStats,
+    cleared: u64,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        writer,
+        "  {name}: eligible={} json_only={} missing_blob={} malformed_blob={} already_clean={} cleared={}",
+        stats.eligible,
+        stats.json_only,
+        stats.missing_blob,
+        stats.malformed_blob,
+        stats.already_clean,
+        cleared,
+    )
 }
 
 fn write_index_gc_entry<W>(writer: &mut W, entry: &IndexGcPlanEntry) -> std::io::Result<()>

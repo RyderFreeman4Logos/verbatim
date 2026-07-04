@@ -17,7 +17,7 @@ use verbatim_core::api::{
     IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse,
     IngestResponse, ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse,
     SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskListResponse,
-    TaskSummaryResponse,
+    TaskSummaryResponse, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
@@ -129,6 +129,10 @@ pub trait DaemonClient {
         &self,
         request: &IndexProfileDeleteRequest,
     ) -> CliResult<IndexProfileDeleteResponse>;
+    fn vector_json_cleanup(
+        &self,
+        request: &VectorJsonCleanupRequest,
+    ) -> CliResult<VectorJsonCleanupResponse>;
     fn list_tasks(&self) -> CliResult<TaskListResponse>;
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
     fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse>;
@@ -523,6 +527,17 @@ impl DaemonClient for HttpDaemonClient {
         self.request_json(Method::POST, "/api/index/profiles/delete", Some(request))
     }
 
+    fn vector_json_cleanup(
+        &self,
+        request: &VectorJsonCleanupRequest,
+    ) -> CliResult<VectorJsonCleanupResponse> {
+        self.request_json(
+            Method::POST,
+            "/api/index/vector-json/cleanup",
+            Some(request),
+        )
+    }
+
     fn list_tasks(&self) -> CliResult<TaskListResponse> {
         self.request_json::<TaskListResponse, ()>(
             Method::GET,
@@ -683,6 +698,7 @@ fn is_long_running_mutation(method: &Method, path: &str) -> bool {
             || path.starts_with("/api/ingest/")
             || path == "/api/reindex"
             || path == "/api/index/gc"
+            || path == "/api/index/vector-json/cleanup"
             || path == "/api/tasks/reindex"
             || (path.starts_with("/api/collections/") && path.ends_with("/sync"));
     }
@@ -1098,6 +1114,10 @@ mod tests {
             RequestTimeoutPolicy::LongRunning
         );
         assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/index/vector-json/cleanup"),
+            RequestTimeoutPolicy::LongRunning
+        );
+        assert_eq!(
             json_timeout_policy(&Method::POST, "/api/tasks/reindex"),
             RequestTimeoutPolicy::LongRunning
         );
@@ -1448,6 +1468,34 @@ mod tests {
         let request = server.request();
         assert!(request.starts_with("POST /api/index/gc HTTP/1.1"));
         assert!(request.contains("\"dry_run\":true"));
+    }
+
+    #[test]
+    fn http_vector_json_cleanup_posts_request() {
+        let body = concat!(
+            "{\"dry_run\":true,\"report\":{",
+            "\"tables\":{",
+            "\"chunk_vectors\":{\"eligible\":1,\"already_clean\":2,\"json_only\":3,\"missing_blob\":4,\"malformed_blob\":5},",
+            "\"embedding_cache\":{\"eligible\":6,\"already_clean\":7,\"json_only\":8,\"missing_blob\":9,\"malformed_blob\":10}",
+            "},\"cleared\":{\"chunk_vectors\":0,\"embedding_cache\":0}}}"
+        );
+        let server = TestServer::respond_many(vec![json_response("200 OK", body)]);
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let response = client
+            .vector_json_cleanup(&VectorJsonCleanupRequest {
+                dry_run: true,
+                confirm: false,
+            })
+            .unwrap();
+
+        assert!(response.dry_run);
+        assert_eq!(response.report.tables.chunk_vectors.eligible, 1);
+        assert_eq!(response.report.tables.embedding_cache.malformed_blob, 10);
+        let request = server.request();
+        assert!(request.starts_with("POST /api/index/vector-json/cleanup HTTP/1.1"));
+        assert!(request.contains("\"dry_run\":true"));
+        assert!(request.contains("\"confirm\":false"));
     }
 
     #[test]

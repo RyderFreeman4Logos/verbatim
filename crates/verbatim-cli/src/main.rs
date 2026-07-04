@@ -8,12 +8,12 @@ use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand, Valu
 use verbatim_core::api::{
     AddCollectionRootRequest, AskRequest, CollectionFilterRequest, CollectionSyncPathRequest,
     CollectionSyncRequest, CollectionWatcherUpdateRequest, CreateCollectionRequest, IndexGcRequest,
-    IndexProfileDeleteRequest, ReindexRequest, RetrieveRequest,
+    IndexProfileDeleteRequest, ReindexRequest, RetrieveRequest, VectorJsonCleanupRequest,
 };
 #[cfg(test)]
 use verbatim_core::api::{
     ChunkingProfileStatusResponse, EmbeddingCapabilityStatusResponse, IndexGcResponse,
-    IndexProfileDeleteResponse, IndexStatusResponse,
+    IndexProfileDeleteResponse, IndexStatusResponse, VectorJsonCleanupResponse,
 };
 
 mod client;
@@ -621,6 +621,17 @@ where
             })?;
             render::write_index_profile_delete(stdout, &response)?;
         }
+        IndexCommand::VectorJsonCleanup {
+            dry_run,
+            execute,
+            confirm,
+        } => {
+            let response = client.vector_json_cleanup(&VectorJsonCleanupRequest {
+                dry_run: dry_run || !execute,
+                confirm,
+            })?;
+            render::write_vector_json_cleanup(stdout, &response)?;
+        }
     }
     Ok(0)
 }
@@ -966,8 +977,11 @@ const INDEX_AFTER_HELP: &str = r#"Examples:
   verbatim index gc
   verbatim index delete-profile old-profile --dry-run
   verbatim index delete-profile old-profile --confirm
+  verbatim index vector-json-cleanup --dry-run
+  verbatim index vector-json-cleanup --execute --confirm
 
-Index maintenance operates on daemon-managed index artifacts only.
+Index maintenance operates through the daemon. Vector JSON cleanup clears only
+legacy JSON payload copies for rows that already have a valid vector BLOB.
 "#;
 
 const INDEX_GC_AFTER_HELP: &str = r#"Examples:
@@ -988,6 +1002,22 @@ Deletes profile-scoped vector/index/cache/status metadata and published HNSW
 artifacts for an obsolete embedding profile. It preserves sources, chunks,
 evidence, collections, and lexical SQLite FTS/BM25 data. Active profile deletion
 is refused unless --allow-active is passed.
+"#;
+
+const INDEX_VECTOR_JSON_CLEANUP_AFTER_HELP: &str = r#"Examples:
+  verbatim index vector-json-cleanup --dry-run
+  verbatim index vector-json-cleanup --execute --confirm
+
+New vector writes store compact BLOB payloads and leave vector_json empty.
+Legacy JSON-only rows remain readable and are never deleted or cleared by this
+cleanup. Dry-run reports eligible, json_only, missing_blob, and malformed_blob
+counts for chunk_vectors and embedding_cache without mutating SQLite.
+
+Before --execute, stop write-heavy ingest/reindex work and back up
+~/.local/share/verbatim/verbatim.db plus its WAL/SHM files. Execute is opt-in
+and transactional: it clears JSON payloads only for rows with a valid BLOB and
+skips JSON-only or malformed-BLOB rows. SQLite may not return disk space to the
+filesystem until a VACUUM or rebuild-table maintenance step is run.
 "#;
 
 const INGEST_AFTER_HELP: &str = r#"Examples:
@@ -1697,6 +1727,23 @@ enum IndexCommand {
         #[arg(long = "allow-active", action = ArgAction::SetTrue)]
         allow_active: bool,
     },
+    /// Clear legacy vector_json payload copies when valid BLOB vectors exist.
+    #[command(
+        name = "vector-json-cleanup",
+        about = "Dry-run or execute cleanup of legacy vector_json payload copies.",
+        after_help = INDEX_VECTOR_JSON_CLEANUP_AFTER_HELP
+    )]
+    VectorJsonCleanup {
+        /// Show counts without modifying SQLite. This is also the default when --execute is omitted.
+        #[arg(long = "dry-run", action = ArgAction::SetTrue, conflicts_with = "execute")]
+        dry_run: bool,
+        /// Clear eligible JSON payloads. Requires --confirm.
+        #[arg(long = "execute", action = ArgAction::SetTrue, requires = "confirm")]
+        execute: bool,
+        /// Required with --execute after taking a backup.
+        #[arg(long = "confirm", action = ArgAction::SetTrue)]
+        confirm: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1918,6 +1965,7 @@ mod tests {
             &["collection", "watch", "status", "--help"],
             &["index", "--help"],
             &["index", "gc", "--help"],
+            &["index", "vector-json-cleanup", "--help"],
             &["ingest", "--help"],
             &["reindex", "--help"],
             &["ask", "--help"],
@@ -1973,6 +2021,7 @@ mod tests {
             &["collection", "watch", "status", "--help"],
             &["index", "--help"],
             &["index", "gc", "--help"],
+            &["index", "vector-json-cleanup", "--help"],
             &["ingest", "--help"],
             &["reindex", "--help"],
             &["ask", "--help"],
@@ -2164,6 +2213,22 @@ mod tests {
     }
 
     #[test]
+    fn vector_json_cleanup_help_documents_safety_contract() {
+        let (code, help, stderr, _, _) = run_mock(["index", "vector-json-cleanup", "--help"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(help.contains("--dry-run"));
+        assert!(help.contains("--execute"));
+        assert!(help.contains("--confirm"));
+        assert!(help.contains("back up"));
+        assert!(help.contains("eligible, json_only, missing_blob, and malformed_blob"));
+        assert!(help.contains("Legacy JSON-only rows remain readable"));
+        assert!(help.contains("never deleted or cleared"));
+        assert!(help.contains("VACUUM or rebuild-table"));
+    }
+
+    #[test]
     fn task_wait_timeout_parser_accepts_seconds_and_duration_suffixes() {
         assert_eq!(
             parse_task_wait_timeout("1500").unwrap().0,
@@ -2257,6 +2322,48 @@ mod tests {
         assert!(stdout.contains("Index GC:"));
         assert!(stdout.contains("removed: 1 artifact(s), 2.0KiB reclaimed"));
         assert!(stdout.contains("Removed artifacts:"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn index_vector_json_cleanup_dry_run_calls_daemon_and_reports_counts() {
+        let (code, stdout, stderr, client, _) =
+            run_mock(["index", "vector-json-cleanup", "--dry-run"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["vector_json_cleanup:true:false"]
+        );
+        assert!(stdout.contains("Vector JSON cleanup dry-run"));
+        assert!(stdout
+            .contains("chunk_vectors: eligible=2 json_only=3 missing_blob=4 malformed_blob=5"));
+        assert!(stdout
+            .contains("embedding_cache: eligible=6 json_only=7 missing_blob=8 malformed_blob=9"));
+        assert!(stdout.contains("No SQLite rows were modified."));
+        assert!(stdout.contains("VACUUM or rebuild-table"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn index_vector_json_cleanup_execute_requires_confirm_and_reports_cleared() {
+        let (code, _, stderr, client, _) = run_mock(["index", "vector-json-cleanup", "--execute"]);
+
+        assert!(code.is_err());
+        assert!(stderr.contains("required"));
+        assert!(client.calls.borrow().is_empty());
+
+        let (code, stdout, stderr, client, _) =
+            run_mock(["index", "vector-json-cleanup", "--execute", "--confirm"]);
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["vector_json_cleanup:false:true"]
+        );
+        assert!(stdout.contains("Vector JSON cleanup complete"));
+        assert!(stdout.contains("cleared=2"));
+        assert!(stdout.contains("cleared=6"));
+        assert!(stdout.contains("JSON-only and malformed-BLOB rows were skipped"));
         assert!(stderr.is_empty());
     }
 
@@ -3877,6 +3984,7 @@ mod tests {
         last_retrieve: RefCell<Option<RetrieveRequest>>,
         last_reindex: RefCell<Option<ReindexRequest>>,
         last_index_profile_delete: RefCell<Option<IndexProfileDeleteRequest>>,
+        last_vector_json_cleanup: RefCell<Option<VectorJsonCleanupRequest>>,
         last_collection_create: RefCell<Option<CreateCollectionRequest>>,
         last_collection_root: RefCell<Option<AddCollectionRootRequest>>,
         collection_root_response: RefCell<Option<AddCollectionRootResponse>>,
@@ -4110,6 +4218,18 @@ mod tests {
             self.last_index_profile_delete
                 .replace(Some(request.clone()));
             Ok(sample_index_profile_delete_response(request.dry_run))
+        }
+
+        fn vector_json_cleanup(
+            &self,
+            request: &VectorJsonCleanupRequest,
+        ) -> client::CliResult<VectorJsonCleanupResponse> {
+            self.calls.borrow_mut().push(format!(
+                "vector_json_cleanup:{}:{}",
+                request.dry_run, request.confirm
+            ));
+            self.last_vector_json_cleanup.replace(Some(request.clone()));
+            Ok(sample_vector_json_cleanup_response(request.dry_run))
         }
 
         fn list_tasks(&self) -> client::CliResult<TaskListResponse> {
@@ -4517,6 +4637,38 @@ mod tests {
                     removed_artifacts: vec![artifact.clone()],
                     reclaimed_bytes: artifact.approximate_bytes,
                 }
+            },
+        }
+    }
+
+    fn sample_vector_json_cleanup_response(dry_run: bool) -> VectorJsonCleanupResponse {
+        VectorJsonCleanupResponse {
+            dry_run,
+            report: verbatim_core::store::VectorJsonCleanupReport {
+                tables: verbatim_core::store::VectorJsonCleanupTables {
+                    chunk_vectors: verbatim_core::store::VectorJsonCleanupTableStats {
+                        eligible: 2,
+                        already_clean: 1,
+                        json_only: 3,
+                        missing_blob: 4,
+                        malformed_blob: 5,
+                    },
+                    embedding_cache: verbatim_core::store::VectorJsonCleanupTableStats {
+                        eligible: 6,
+                        already_clean: 2,
+                        json_only: 7,
+                        missing_blob: 8,
+                        malformed_blob: 9,
+                    },
+                },
+                cleared: if dry_run {
+                    verbatim_core::store::VectorJsonCleanupCleared::default()
+                } else {
+                    verbatim_core::store::VectorJsonCleanupCleared {
+                        chunk_vectors: 2,
+                        embedding_cache: 6,
+                    }
+                },
             },
         }
     }
