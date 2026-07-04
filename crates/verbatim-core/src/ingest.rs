@@ -2883,24 +2883,57 @@ where
         let mut outcome_slots = std::iter::repeat_with(|| None)
             .take(total_source_count)
             .collect::<Vec<_>>();
+        let mut early_completed_sources = 0;
+        let mut stopped_after_boundary_error: Option<String> = None;
         let mut sources_to_embed = Vec::with_capacity(total_source_count);
         for (index, source) in prepared_sources.into_iter().enumerate() {
+            if let Some(error) = &stopped_after_boundary_error {
+                outcome_slots[index] = Some(PreparedSourceOutcome {
+                    source_id: source.source.id,
+                    task_id: source.task_id,
+                    result: Err(format!(
+                        "source ingest not attempted after earlier source boundary failure: {error}"
+                    )),
+                });
+                continue;
+            }
             match self.prepared_source_has_fresh_committed_vectors(profile_id, &source.source) {
                 Ok(true) => {
                     let child_chunk_count = source.child_chunks.len();
                     let cache_stats = Self::noop_embedding_cache_stats(child_chunk_count);
-                    self.record_noop_source_ingest(
+                    let (completed_sources, total_sources) =
+                        cancellation_scope.progress(early_completed_sources);
+                    match self.ensure_task_not_cancelled(
                         source.task_id.as_ref(),
-                        profile_id,
-                        &source.source.id,
-                        child_chunk_count,
-                        &cache_stats,
-                    );
-                    outcome_slots[index] = Some(PreparedSourceOutcome {
-                        source_id: source.source.id,
-                        task_id: source.task_id,
-                        result: Ok(cache_stats),
-                    });
+                        completed_sources,
+                        total_sources,
+                        Some(&source.source.id),
+                    ) {
+                        Ok(()) => {
+                            self.record_noop_source_ingest(
+                                source.task_id.as_ref(),
+                                profile_id,
+                                &source.source.id,
+                                child_chunk_count,
+                                &cache_stats,
+                            );
+                            early_completed_sources += 1;
+                            outcome_slots[index] = Some(PreparedSourceOutcome {
+                                source_id: source.source.id,
+                                task_id: source.task_id,
+                                result: Ok(cache_stats),
+                            });
+                        }
+                        Err(error) => {
+                            let error = error.to_string();
+                            stopped_after_boundary_error.get_or_insert_with(|| error.clone());
+                            outcome_slots[index] = Some(PreparedSourceOutcome {
+                                source_id: source.source.id,
+                                task_id: source.task_id,
+                                result: Err(error),
+                            });
+                        }
+                    }
                 }
                 Ok(false) => sources_to_embed.push((index, source)),
                 Err(error) => {
@@ -2915,14 +2948,6 @@ where
         if sources_to_embed.is_empty() {
             return collect_prepared_source_outcomes(outcome_slots);
         }
-        let early_completed_sources = outcome_slots
-            .iter()
-            .filter(|outcome| {
-                outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.result.is_ok())
-            })
-            .count();
         let (remaining_indices, prepared_sources): (Vec<_>, Vec<_>) =
             sources_to_embed.into_iter().unzip();
         let source_count = prepared_sources.len();
@@ -10691,6 +10716,61 @@ model = "local-vision"
             pipeline.store().index_generation().unwrap(),
             generation_after_first
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_unchanged_reingest_observes_cancellation_before_noop() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("doc.md");
+        std::fs::write(&path, "# Alpha\n\nAlpha body.\n").unwrap();
+        let store = Store::in_memory().unwrap();
+        let embedding = RecordingEmbeddingClient::new();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            embedding.clone(),
+            tempdir.path().to_path_buf(),
+        );
+        let source_id = pipeline.add_source(&path).unwrap();
+
+        let first = pipeline.ingest_source(&source_id).await.unwrap();
+        assert_eq!(first.cache_misses, 1);
+        assert_eq!(embedding.calls().len(), 1);
+        let generation_after_first = pipeline.store().index_generation().unwrap();
+
+        let second_task = TaskId("task-cancel-unchanged-noop".into());
+        pipeline
+            .store()
+            .create_task(
+                &second_task,
+                TaskKind::Ingest,
+                &serde_json::json!({ "source_id": source_id.0 }),
+            )
+            .unwrap();
+        pipeline.store().start_task(&second_task).unwrap();
+        pipeline.store().cancel_task(&second_task).unwrap();
+
+        let error = pipeline
+            .ingest_source_with_task(&source_id, &second_task)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("ingest task cancelled"));
+        assert_eq!(embedding.calls().len(), 1);
+        assert_eq!(
+            pipeline.store().index_generation().unwrap(),
+            generation_after_first
+        );
+        let second_events = pipeline
+            .store()
+            .list_task_events(&second_task, None, 100)
+            .unwrap();
+        assert!(second_events
+            .iter()
+            .any(|event| event.event_type == "cancelled"));
+        assert!(!second_events.iter().any(|event| {
+            event.event_type == "noop" && event.payload["operation"] == "source_ingest_noop"
+        }));
     }
 
     fn child_chunk_for_heading<'a>(chunks: &'a [Chunk], heading: &str) -> &'a Chunk {
