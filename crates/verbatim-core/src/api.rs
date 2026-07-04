@@ -716,6 +716,86 @@ impl From<ImageArtifact> for ImageArtifactResponse {
     }
 }
 
+/// Idle memory reclaim state exposed through daemon health and CLI status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleReclaimHealth {
+    pub enabled: bool,
+    pub sqlite_shrink_memory: bool,
+    pub malloc_trim: bool,
+    pub currently_idle: bool,
+    pub eligible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    pub idle_for_millis: u64,
+    pub idle_timeout_millis: u64,
+    pub min_interval_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_eligible_in_millis: Option<u64>,
+    pub active: IdleReclaimActivitySnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_result: Option<IdleReclaimCycleResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_result: Option<IdleReclaimCycleResult>,
+}
+
+/// Low-cardinality counters used to explain why idle reclaim is or is not eligible.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleReclaimActivitySnapshot {
+    pub http_requests: u64,
+    pub sse_streams: u64,
+    pub active_tasks: usize,
+    pub resource_active: usize,
+    pub resource_queued: usize,
+    pub ingest_queue_active: bool,
+    pub ingest_worker_active: bool,
+    pub pipeline_busy: bool,
+}
+
+/// Last idle reclaim scheduler decision and per-backend outcomes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleReclaimCycleResult {
+    pub attempted_at_unix_ms: u64,
+    pub finished_at_unix_ms: u64,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    pub sqlite: IdleReclaimBackendResult,
+    pub allocator: IdleReclaimBackendResult,
+}
+
+/// Best-effort result for one reclaim backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdleReclaimBackendResult {
+    pub status: String,
+    pub attempted: bool,
+    pub success_count: u64,
+    pub failure_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl IdleReclaimBackendResult {
+    pub fn disabled() -> Self {
+        Self {
+            status: "disabled".into(),
+            attempted: false,
+            success_count: 0,
+            failure_count: 0,
+            last_error: None,
+        }
+    }
+
+    pub fn skipped() -> Self {
+        Self {
+            status: "skipped".into(),
+            attempted: false,
+            success_count: 0,
+            failure_count: 0,
+            last_error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
@@ -723,6 +803,8 @@ pub struct HealthResponse {
     pub memory_budget: MemoryBudgetSnapshot,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<ResourceQueueSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_reclaim: Option<IdleReclaimHealth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

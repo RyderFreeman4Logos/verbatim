@@ -57,6 +57,8 @@ pub const DEFAULT_MODEL_RETRY_MAX_BACKOFF_MILLIS: u64 = 5_000;
 pub const DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS: u64 = 60;
 pub const DEFAULT_RESOURCE_QUEUE_TIMEOUT_SECONDS: u64 = 300;
 pub const SQLITE_WRITER_ACTIVE_CAPACITY: usize = 1;
+pub const DEFAULT_IDLE_RECLAIM_IDLE_TIMEOUT_SECONDS: u64 = 300;
+pub const DEFAULT_IDLE_RECLAIM_MIN_INTERVAL_SECONDS: u64 = 900;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelEndpointRuntimeConfig {
@@ -1045,7 +1047,10 @@ fn default_qdrant_timeout_seconds() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
+    #[serde(default = "default_daemon_bind")]
     pub bind: String,
+    #[serde(default)]
+    pub idle_reclaim: DaemonIdleReclaimConfig,
     #[serde(default)]
     pub resources: DaemonResourceConfig,
 }
@@ -1053,10 +1058,104 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1:7700".into(),
+            bind: default_daemon_bind(),
+            idle_reclaim: DaemonIdleReclaimConfig::default(),
             resources: DaemonResourceConfig::default(),
         }
     }
+}
+
+fn default_daemon_bind() -> String {
+    "127.0.0.1:7700".into()
+}
+
+/// Configures best-effort daemon memory reclaim that only runs after the daemon is idle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DaemonIdleReclaimConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_idle_reclaim_idle_timeout_seconds")]
+    pub idle_timeout_seconds: u64,
+    #[serde(default = "default_idle_reclaim_min_interval_seconds")]
+    pub min_interval_seconds: u64,
+    #[serde(default = "default_enabled")]
+    pub sqlite_shrink_memory: bool,
+    #[serde(default = "default_enabled")]
+    pub malloc_trim: bool,
+}
+
+impl Default for DaemonIdleReclaimConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_timeout_seconds: default_idle_reclaim_idle_timeout_seconds(),
+            min_interval_seconds: default_idle_reclaim_min_interval_seconds(),
+            sqlite_shrink_memory: true,
+            malloc_trim: true,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DaemonIdleReclaimConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawDaemonIdleReclaimConfig {
+            #[serde(default)]
+            enabled: bool,
+            #[serde(default = "default_idle_reclaim_idle_timeout_seconds")]
+            idle_timeout_seconds: u64,
+            #[serde(default = "default_idle_reclaim_min_interval_seconds")]
+            min_interval_seconds: u64,
+            #[serde(default = "default_enabled")]
+            sqlite_shrink_memory: bool,
+            #[serde(default = "default_enabled")]
+            malloc_trim: bool,
+        }
+
+        let raw = RawDaemonIdleReclaimConfig::deserialize(deserializer)?;
+        let config = Self {
+            enabled: raw.enabled,
+            idle_timeout_seconds: raw.idle_timeout_seconds,
+            min_interval_seconds: raw.min_interval_seconds,
+            sqlite_shrink_memory: raw.sqlite_shrink_memory,
+            malloc_trim: raw.malloc_trim,
+        };
+        config.validate().map_err(de::Error::custom)?;
+        Ok(config)
+    }
+}
+
+impl DaemonIdleReclaimConfig {
+    pub fn bounded(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            idle_timeout_seconds: self.idle_timeout_seconds.max(1),
+            min_interval_seconds: self.min_interval_seconds.max(1),
+            sqlite_shrink_memory: self.sqlite_shrink_memory,
+            malloc_trim: self.malloc_trim,
+        }
+    }
+
+    fn validate(&self) -> std::result::Result<(), &'static str> {
+        if self.idle_timeout_seconds == 0 {
+            return Err("daemon.idle_reclaim.idle_timeout_seconds must be at least 1");
+        }
+        if self.min_interval_seconds == 0 {
+            return Err("daemon.idle_reclaim.min_interval_seconds must be at least 1");
+        }
+        Ok(())
+    }
+}
+
+pub fn default_idle_reclaim_idle_timeout_seconds() -> u64 {
+    DEFAULT_IDLE_RECLAIM_IDLE_TIMEOUT_SECONDS
+}
+
+pub fn default_idle_reclaim_min_interval_seconds() -> u64 {
+    DEFAULT_IDLE_RECLAIM_MIN_INTERVAL_SECONDS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1360,6 +1459,7 @@ impl Config {
     pub fn apply_reload_safe_changes(&self, candidate: &Self) -> Self {
         let mut next = self.clone();
 
+        next.daemon.idle_reclaim = candidate.daemon.idle_reclaim.clone();
         next.daemon.resources.memory_budget_mb = candidate.daemon.resources.memory_budget_mb;
         next.daemon.resources.memory_budget_enforcement =
             candidate.daemon.resources.memory_budget_enforcement;
@@ -1498,6 +1598,11 @@ fn is_reload_safe_key(key: &str) -> bool {
     matches!(
         key,
         "daemon.resources.memory_budget_mb"
+            | "daemon.idle_reclaim.enabled"
+            | "daemon.idle_reclaim.idle_timeout_seconds"
+            | "daemon.idle_reclaim.min_interval_seconds"
+            | "daemon.idle_reclaim.sqlite_shrink_memory"
+            | "daemon.idle_reclaim.malloc_trim"
             | "daemon.resources.memory_budget_enforcement"
             | "daemon.resources.memory_budget_poll_millis"
             | "daemon.resources.memory_reservation_margin_percent"
@@ -1826,6 +1931,14 @@ task_wait_timeout_seconds = 1500
 [daemon]
 bind = "127.0.0.1:7700"
 
+[daemon.idle_reclaim]
+# Disabled by default because SQLite shrink and allocator trim can pause briefly.
+enabled = false
+idle_timeout_seconds = 300
+min_interval_seconds = 900
+sqlite_shrink_memory = true
+malloc_trim = true
+
 [daemon.resources]
 memory_budget_enforcement = "slow_warn"
 memory_budget_poll_millis = 500
@@ -1871,6 +1984,17 @@ mod tests {
             config.daemon.resources.memory_reservation_margin_percent,
             25
         );
+        assert!(!config.daemon.idle_reclaim.enabled);
+        assert_eq!(
+            config.daemon.idle_reclaim.idle_timeout_seconds,
+            DEFAULT_IDLE_RECLAIM_IDLE_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            config.daemon.idle_reclaim.min_interval_seconds,
+            DEFAULT_IDLE_RECLAIM_MIN_INTERVAL_SECONDS
+        );
+        assert!(config.daemon.idle_reclaim.sqlite_shrink_memory);
+        assert!(config.daemon.idle_reclaim.malloc_trim);
         assert!(config.embedding.enabled);
         assert_eq!(config.embedding.provider, "openai_compatible");
         assert_eq!(config.embedding.base_url, "http://127.0.0.1:8002/v1");
@@ -2372,6 +2496,58 @@ memory_reservation_margin_percent = 10
         let serialized = config.show().unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.daemon.resources, config.daemon.resources);
+    }
+
+    #[test]
+    fn daemon_idle_reclaim_defaults_disabled_and_roundtrips() {
+        let config: Config = toml::from_str(
+            r#"
+[daemon.idle_reclaim]
+enabled = true
+idle_timeout_seconds = 60
+min_interval_seconds = 600
+sqlite_shrink_memory = false
+malloc_trim = true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.daemon.idle_reclaim.enabled);
+        assert_eq!(config.daemon.idle_reclaim.idle_timeout_seconds, 60);
+        assert_eq!(config.daemon.idle_reclaim.min_interval_seconds, 600);
+        assert!(!config.daemon.idle_reclaim.sqlite_shrink_memory);
+        assert!(config.daemon.idle_reclaim.malloc_trim);
+
+        let serialized = config.show().unwrap();
+        assert!(serialized.contains("[daemon.idle_reclaim]"));
+        assert!(serialized.contains("enabled = true"));
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.daemon.idle_reclaim, config.daemon.idle_reclaim);
+    }
+
+    #[test]
+    fn daemon_idle_reclaim_rejects_zero_intervals() {
+        let idle_error = toml::from_str::<Config>(
+            r#"
+[daemon.idle_reclaim]
+idle_timeout_seconds = 0
+"#,
+        )
+        .unwrap_err();
+        assert!(idle_error
+            .to_string()
+            .contains("idle_timeout_seconds must be at least 1"));
+
+        let interval_error = toml::from_str::<Config>(
+            r#"
+[daemon.idle_reclaim]
+min_interval_seconds = 0
+"#,
+        )
+        .unwrap_err();
+        assert!(interval_error
+            .to_string()
+            .contains("min_interval_seconds must be at least 1"));
     }
 
     #[test]

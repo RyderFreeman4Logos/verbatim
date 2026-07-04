@@ -5,21 +5,23 @@ use std::io::Write;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
+use axum::response::Response;
 use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::{extract::Request, Json, Router};
 use futures::stream;
 use futures::Stream;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tower_http::cors::CorsLayer;
 
 use verbatim_core::api::{
@@ -31,9 +33,10 @@ use verbatim_core::api::{
     CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
     CollectionWatcherStatus, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
     ConfigResponse, CreateCollectionRequest, ErrorResponse, EvidenceResponse, HealthResponse,
-    ImageArtifactResponse, IndexGcRequest, IndexGcResponse, IndexProfileDeleteRequest,
-    IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse, ReindexRequest,
-    ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
+    IdleReclaimActivitySnapshot, IdleReclaimBackendResult, IdleReclaimCycleResult,
+    IdleReclaimHealth, ImageArtifactResponse, IndexGcRequest, IndexGcResponse,
+    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
+    ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
     RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
     TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskIngestRequest, TaskListAggregate,
     TaskListResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
@@ -44,8 +47,9 @@ use verbatim_core::collection::{
     CollectionMemberCandidate, CollectionRecord, CollectionSyncPathInput,
 };
 use verbatim_core::config::{
-    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, DaemonResourceConfig,
-    RerankConfig, RerankStrategy, RetrievalConfig, SQLITE_WRITER_ACTIVE_CAPACITY,
+    self, Config, ConfigReloadMetadata, ConfigRestartRequiredKey, DaemonIdleReclaimConfig,
+    DaemonResourceConfig, RerankConfig, RerankStrategy, RetrievalConfig,
+    SQLITE_WRITER_ACTIVE_CAPACITY,
 };
 use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::{
@@ -108,6 +112,11 @@ struct AppState {
     /// Actual indexing worker occupancy, independent from persisted task status.
     ingest_worker_active: AtomicBool,
     collection_watcher: CollectionWatcherRuntime,
+    idle_reclaim: Arc<IdleReclaimRuntime>,
+    #[cfg(test)]
+    idle_reclaim_before_backend_hook: std::sync::Mutex<Option<IdleReclaimBeforeBackendHook>>,
+    #[cfg(test)]
+    idle_reclaim_before_backend_call_hook: std::sync::Mutex<Option<IdleReclaimBeforeBackendHook>>,
     runtime_config: std::sync::RwLock<RuntimeConfigState>,
     config_path: PathBuf,
     data_dir: PathBuf,
@@ -146,12 +155,190 @@ const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
 const CONFIG_RELOAD_ERROR_MAX_CHARS: usize = 1024;
 const COLLECTION_WATCHER_EVENT_BUFFER: usize = 512;
 const COLLECTION_WATCHER_STATUS_ERROR_MAX_CHARS: usize = 1024;
+const IDLE_RECLAIM_DISABLED_POLL: Duration = Duration::from_secs(60);
+const IDLE_RECLAIM_MAX_POLL: Duration = Duration::from_secs(60);
+const IDLE_RECLAIM_MIN_POLL: Duration = Duration::from_secs(1);
+const IDLE_RECLAIM_ADMISSION_PERMITS: u32 = 1_000_000;
 
 #[derive(Default)]
 struct CollectionWatcherRuntime {
     tx: std::sync::Mutex<Option<mpsc::Sender<CollectionWatcherCommand>>>,
     statuses: std::sync::Mutex<HashMap<String, CollectionWatcherStatusState>>,
 }
+
+struct IdleReclaimRuntime {
+    admission: Arc<Semaphore>,
+    active_http_requests: AtomicU64,
+    active_sse_streams: AtomicU64,
+    last_activity_unix_ms: AtomicU64,
+    running: AtomicBool,
+    last_result: std::sync::Mutex<Option<IdleReclaimCycleResult>>,
+    last_attempt_result: std::sync::Mutex<Option<IdleReclaimCycleResult>>,
+}
+
+impl IdleReclaimRuntime {
+    fn new(now_unix_ms: u64) -> Self {
+        Self {
+            admission: Arc::new(Semaphore::new(IDLE_RECLAIM_ADMISSION_PERMITS as usize)),
+            active_http_requests: AtomicU64::new(0),
+            active_sse_streams: AtomicU64::new(0),
+            last_activity_unix_ms: AtomicU64::new(now_unix_ms),
+            running: AtomicBool::new(false),
+            last_result: std::sync::Mutex::new(None),
+            last_attempt_result: std::sync::Mutex::new(None),
+        }
+    }
+
+    async fn start_http(self: &Arc<Self>) -> ActivityGuard {
+        let permit = Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .expect("idle reclaim admission semaphore is never closed");
+        self.start_activity(ActivityKind::Http, permit)
+    }
+
+    async fn start_sse(self: &Arc<Self>) -> ActivityGuard {
+        let permit = Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .expect("idle reclaim admission semaphore is never closed");
+        self.start_activity(ActivityKind::Sse, permit)
+    }
+
+    async fn start_backend(self: &Arc<Self>) -> IdleReclaimBackendAdmission {
+        let permit = Arc::clone(&self.admission)
+            .acquire_many_owned(IDLE_RECLAIM_ADMISSION_PERMITS)
+            .await
+            .expect("idle reclaim admission semaphore is never closed");
+        IdleReclaimBackendAdmission { _permit: permit }
+    }
+
+    async fn start_untracked_admission(self: &Arc<Self>) -> ActivityGuard {
+        let permit = Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .expect("idle reclaim admission semaphore is never closed");
+        ActivityGuard {
+            runtime: Arc::clone(self),
+            kind: None,
+            _admission_permit: permit,
+        }
+    }
+
+    #[cfg(test)]
+    fn try_start_http_for_test(self: &Arc<Self>) -> Option<ActivityGuard> {
+        let permit = Arc::clone(&self.admission).try_acquire_owned().ok()?;
+        Some(self.start_activity(ActivityKind::Http, permit))
+    }
+
+    fn start_activity(
+        self: &Arc<Self>,
+        kind: ActivityKind,
+        _admission_permit: OwnedSemaphorePermit,
+    ) -> ActivityGuard {
+        match kind {
+            ActivityKind::Http => {
+                self.active_http_requests.fetch_add(1, Ordering::AcqRel);
+            }
+            ActivityKind::Sse => {
+                self.active_sse_streams.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        self.mark_activity();
+        ActivityGuard {
+            runtime: Arc::clone(self),
+            kind: Some(kind),
+            _admission_permit,
+        }
+    }
+
+    fn mark_activity(&self) {
+        self.last_activity_unix_ms
+            .store(now_unix_millis(), Ordering::Release);
+    }
+
+    fn active_http_requests(&self) -> u64 {
+        self.active_http_requests.load(Ordering::Acquire)
+    }
+
+    fn active_sse_streams(&self) -> u64 {
+        self.active_sse_streams.load(Ordering::Acquire)
+    }
+
+    fn last_activity_unix_ms(&self) -> u64 {
+        self.last_activity_unix_ms.load(Ordering::Acquire)
+    }
+
+    fn last_result(&self) -> Option<IdleReclaimCycleResult> {
+        self.last_result
+            .lock()
+            .map(|result| result.clone())
+            .unwrap_or(None)
+    }
+
+    fn last_attempt_result(&self) -> Option<IdleReclaimCycleResult> {
+        self.last_attempt_result
+            .lock()
+            .map(|result| result.clone())
+            .unwrap_or(None)
+    }
+
+    fn record_result(&self, result: IdleReclaimCycleResult) {
+        if idle_reclaim_result_attempted(&result) {
+            if let Ok(mut last_attempt_result) = self.last_attempt_result.lock() {
+                *last_attempt_result = Some(result.clone());
+            }
+        }
+        if let Ok(mut last_result) = self.last_result.lock() {
+            *last_result = Some(result);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityKind {
+    Http,
+    Sse,
+}
+
+struct ActivityGuard {
+    runtime: Arc<IdleReclaimRuntime>,
+    kind: Option<ActivityKind>,
+    _admission_permit: OwnedSemaphorePermit,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        let Some(kind) = self.kind else {
+            return;
+        };
+        match kind {
+            ActivityKind::Http => {
+                self.runtime
+                    .active_http_requests
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+            ActivityKind::Sse => {
+                self.runtime
+                    .active_sse_streams
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.runtime.mark_activity();
+    }
+}
+
+struct IdleReclaimBackendAdmission {
+    _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Debug, Clone)]
+struct IdleReclaimGate {
+    health: IdleReclaimHealth,
+}
+
+#[cfg(test)]
+type IdleReclaimBeforeBackendHook = Box<dyn FnMut(&SharedState) + Send + 'static>;
 
 #[derive(Debug, Clone, Default)]
 struct CollectionWatcherStatusState {
@@ -201,6 +388,477 @@ impl DebouncedCollectionSet {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+async fn track_http_activity(
+    State(state): State<SharedState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let _guard = if request.uri().path() == "/api/health" {
+        None
+    } else {
+        Some(state.idle_reclaim.start_http().await)
+    };
+    let _health_admission = if request.uri().path() == "/api/health" {
+        Some(state.idle_reclaim.start_untracked_admission().await)
+    } else {
+        None
+    };
+    next.run(request).await
+}
+
+fn idle_reclaim_config(state: &SharedState) -> DaemonIdleReclaimConfig {
+    runtime_config_snapshot(state)
+        .map(|runtime| runtime.config.daemon.idle_reclaim.bounded())
+        .unwrap_or_default()
+}
+
+fn idle_reclaim_gate(
+    state: &SharedState,
+    resources: Vec<ResourceQueueSnapshot>,
+) -> IdleReclaimGate {
+    idle_reclaim_gate_with_running(
+        state,
+        resources,
+        state.idle_reclaim.running.load(Ordering::Acquire),
+    )
+}
+
+fn idle_reclaim_gate_with_running(
+    state: &SharedState,
+    resources: Vec<ResourceQueueSnapshot>,
+    running: bool,
+) -> IdleReclaimGate {
+    let config = idle_reclaim_config(state);
+    let now = now_unix_millis();
+    let last_activity = state.idle_reclaim.last_activity_unix_ms();
+    let idle_for_millis = now.saturating_sub(last_activity);
+    let idle_timeout_millis = millis_from_secs(config.idle_timeout_seconds);
+    let min_interval_millis = millis_from_secs(config.min_interval_seconds);
+    let active_tasks = active_task_count(state).unwrap_or(usize::MAX);
+    let activity = IdleReclaimActivitySnapshot {
+        http_requests: state.idle_reclaim.active_http_requests(),
+        sse_streams: state.idle_reclaim.active_sse_streams(),
+        active_tasks,
+        resource_active: resources.iter().map(|resource| resource.active).sum(),
+        resource_queued: resources.iter().map(|resource| resource.queued).sum(),
+        ingest_queue_active: state.ingest_queue_active.load(Ordering::Acquire),
+        ingest_worker_active: state.ingest_worker_active.load(Ordering::Acquire),
+        pipeline_busy: pipeline_busy_for_idle_reclaim(state),
+    };
+    let last_attempt_at = state
+        .idle_reclaim
+        .last_attempt_result()
+        .map(|result| result.attempted_at_unix_ms);
+    let min_interval_remaining = last_attempt_at
+        .map(|attempted_at| {
+            attempted_at
+                .saturating_add(min_interval_millis)
+                .saturating_sub(now)
+        })
+        .unwrap_or(0);
+    let idle_remaining = idle_timeout_millis.saturating_sub(idle_for_millis);
+    let skip_reason = idle_reclaim_skip_reason(
+        &config,
+        &activity,
+        idle_remaining,
+        min_interval_remaining,
+        running,
+    );
+    let currently_idle = idle_reclaim_activity_is_idle(&activity);
+    let eligible = config.enabled && currently_idle && skip_reason.is_none();
+    let next_eligible_in_millis = if eligible {
+        None
+    } else if config.enabled {
+        Some(idle_remaining.max(min_interval_remaining))
+    } else {
+        None
+    };
+
+    IdleReclaimGate {
+        health: IdleReclaimHealth {
+            enabled: config.enabled,
+            sqlite_shrink_memory: config.sqlite_shrink_memory,
+            malloc_trim: config.malloc_trim,
+            currently_idle,
+            eligible,
+            skip_reason,
+            idle_for_millis,
+            idle_timeout_millis,
+            min_interval_millis,
+            next_eligible_in_millis,
+            active: activity,
+            last_result: state.idle_reclaim.last_result(),
+            last_attempt_result: state.idle_reclaim.last_attempt_result(),
+        },
+    }
+}
+
+fn millis_from_secs(seconds: u64) -> u64 {
+    seconds.saturating_mul(1_000)
+}
+
+fn active_task_count(state: &SharedState) -> Result<usize> {
+    let store = state
+        .task_store
+        .lock()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(store
+        .list_tasks_page(TaskListFilter::Active, 1)
+        .context("count active tasks for idle reclaim gate")?
+        .total)
+}
+
+fn pipeline_busy_for_idle_reclaim(state: &SharedState) -> bool {
+    match state.pipeline.try_lock() {
+        Ok(pipeline) => pipeline.is_none(),
+        Err(std::sync::TryLockError::WouldBlock) => true,
+        Err(std::sync::TryLockError::Poisoned(_)) => true,
+    }
+}
+
+fn idle_reclaim_activity_is_idle(activity: &IdleReclaimActivitySnapshot) -> bool {
+    activity.http_requests == 0
+        && activity.sse_streams == 0
+        && activity.active_tasks == 0
+        && activity.resource_active == 0
+        && activity.resource_queued == 0
+        && !activity.ingest_queue_active
+        && !activity.ingest_worker_active
+        && !activity.pipeline_busy
+}
+
+fn idle_reclaim_skip_reason(
+    config: &DaemonIdleReclaimConfig,
+    activity: &IdleReclaimActivitySnapshot,
+    idle_remaining: u64,
+    min_interval_remaining: u64,
+    running: bool,
+) -> Option<String> {
+    if !config.enabled {
+        return Some("disabled".into());
+    }
+    if running {
+        return Some("already_running".into());
+    }
+    if activity.http_requests > 0 {
+        return Some("active_http_requests".into());
+    }
+    if activity.sse_streams > 0 {
+        return Some("active_sse_streams".into());
+    }
+    if activity.active_tasks > 0 {
+        return Some("active_tasks".into());
+    }
+    if activity.resource_active > 0 {
+        return Some("active_resources".into());
+    }
+    if activity.resource_queued > 0 {
+        return Some("queued_resources".into());
+    }
+    if activity.ingest_queue_active {
+        return Some("ingest_queue_active".into());
+    }
+    if activity.ingest_worker_active {
+        return Some("ingest_worker_active".into());
+    }
+    if activity.pipeline_busy {
+        return Some("pipeline_busy".into());
+    }
+    if idle_remaining > 0 {
+        return Some("idle_timeout_not_reached".into());
+    }
+    if min_interval_remaining > 0 {
+        return Some("min_interval_not_reached".into());
+    }
+    None
+}
+
+fn start_idle_reclaim_scheduler(state: SharedState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(idle_reclaim_poll_delay(&state)).await;
+            let result = run_idle_reclaim_cycle_if_due(&state).await;
+            if result.status == "failed" || result.status == "partial_failure" {
+                tracing::warn!(
+                    status = %result.status,
+                    skip_reason = ?result.skip_reason,
+                    sqlite_status = %result.sqlite.status,
+                    allocator_status = %result.allocator.status,
+                    "idle memory reclaim completed with non-fatal errors"
+                );
+            }
+        }
+    })
+}
+
+fn idle_reclaim_poll_delay(state: &SharedState) -> Duration {
+    let config = idle_reclaim_config(state);
+    if !config.enabled {
+        return IDLE_RECLAIM_DISABLED_POLL;
+    }
+    Duration::from_secs(config.idle_timeout_seconds.min(config.min_interval_seconds))
+        .max(IDLE_RECLAIM_MIN_POLL)
+        .min(IDLE_RECLAIM_MAX_POLL)
+}
+
+async fn run_idle_reclaim_cycle_if_due(state: &SharedState) -> IdleReclaimCycleResult {
+    let gate = idle_reclaim_gate_with_running(state, daemon_resource_snapshots(state), false);
+    if let Some(skip_reason) = gate.health.skip_reason.clone() {
+        let result = skipped_idle_reclaim_result(skip_reason);
+        state.idle_reclaim.record_result(result.clone());
+        return result;
+    }
+    if state
+        .idle_reclaim
+        .running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        let result = skipped_idle_reclaim_result("already_running".into());
+        state.idle_reclaim.record_result(result.clone());
+        return result;
+    }
+    let _lease = IdleReclaimRunLease {
+        runtime: Arc::clone(&state.idle_reclaim),
+    };
+
+    let gate = idle_reclaim_gate_with_running(state, daemon_resource_snapshots(state), false);
+    if let Some(skip_reason) = gate.health.skip_reason.clone() {
+        let result = skipped_idle_reclaim_result(skip_reason);
+        state.idle_reclaim.record_result(result.clone());
+        return result;
+    }
+
+    let config = idle_reclaim_config(state);
+    let attempted_at_unix_ms = now_unix_millis();
+    maybe_run_idle_reclaim_before_backend_hook(state);
+    if let Some(skip_reason) = idle_reclaim_backend_skip_reason(state) {
+        let result = skipped_idle_reclaim_result(skip_reason);
+        state.idle_reclaim.record_result(result.clone());
+        return result;
+    }
+    let sqlite = if config.sqlite_shrink_memory {
+        let _admission = state.idle_reclaim.start_backend().await;
+        if let Some(skip_reason) = idle_reclaim_backend_skip_reason(state) {
+            let result = skipped_idle_reclaim_result(skip_reason);
+            state.idle_reclaim.record_result(result.clone());
+            return result;
+        }
+        maybe_run_idle_reclaim_before_backend_call_hook(state);
+        let state = Arc::clone(state);
+        tokio::task::spawn_blocking(move || shrink_sqlite_stores(&state))
+            .await
+            .unwrap_or_else(|error| {
+                failed_backend_result(format!("join SQLite shrink task: {error}"))
+            })
+    } else {
+        IdleReclaimBackendResult::disabled()
+    };
+    let mut allocator_skip_reason = None;
+    if config.malloc_trim {
+        allocator_skip_reason = idle_reclaim_backend_skip_reason(state);
+    }
+    let allocator = if config.malloc_trim {
+        if let Some(_skip_reason) = allocator_skip_reason.as_ref() {
+            IdleReclaimBackendResult::skipped()
+        } else {
+            let _admission = state.idle_reclaim.start_backend().await;
+            allocator_skip_reason = idle_reclaim_backend_skip_reason(state);
+            if allocator_skip_reason.is_some() {
+                IdleReclaimBackendResult::skipped()
+            } else {
+                maybe_run_idle_reclaim_before_backend_call_hook(state);
+                malloc_trim_backend_result()
+            }
+        }
+    } else {
+        IdleReclaimBackendResult::disabled()
+    };
+    let status = reclaim_cycle_status(&sqlite, &allocator);
+    let skip_reason = allocator_skip_reason
+        .or_else(|| (status == "skipped").then(|| "all_backends_disabled".to_string()));
+    let result = IdleReclaimCycleResult {
+        attempted_at_unix_ms,
+        finished_at_unix_ms: now_unix_millis(),
+        status,
+        skip_reason,
+        sqlite,
+        allocator,
+    };
+    state.idle_reclaim.record_result(result.clone());
+    result
+}
+
+fn idle_reclaim_backend_skip_reason(state: &SharedState) -> Option<String> {
+    idle_reclaim_gate_with_running(state, daemon_resource_snapshots(state), false)
+        .health
+        .skip_reason
+}
+
+#[cfg(test)]
+fn maybe_run_idle_reclaim_before_backend_hook(state: &SharedState) {
+    let hook = state
+        .idle_reclaim_before_backend_hook
+        .lock()
+        .ok()
+        .and_then(|mut hook| hook.take());
+    if let Some(mut hook) = hook {
+        hook(state);
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_run_idle_reclaim_before_backend_hook(_state: &SharedState) {}
+
+#[cfg(test)]
+fn maybe_run_idle_reclaim_before_backend_call_hook(state: &SharedState) {
+    let hook = state
+        .idle_reclaim_before_backend_call_hook
+        .lock()
+        .ok()
+        .and_then(|mut hook| hook.take());
+    if let Some(mut hook) = hook {
+        hook(state);
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_run_idle_reclaim_before_backend_call_hook(_state: &SharedState) {}
+
+struct IdleReclaimRunLease {
+    runtime: Arc<IdleReclaimRuntime>,
+}
+
+impl Drop for IdleReclaimRunLease {
+    fn drop(&mut self) {
+        self.runtime.running.store(false, Ordering::Release);
+    }
+}
+
+fn skipped_idle_reclaim_result(skip_reason: String) -> IdleReclaimCycleResult {
+    let now = now_unix_millis();
+    IdleReclaimCycleResult {
+        attempted_at_unix_ms: now,
+        finished_at_unix_ms: now,
+        status: "skipped".into(),
+        skip_reason: Some(skip_reason),
+        sqlite: IdleReclaimBackendResult::skipped(),
+        allocator: IdleReclaimBackendResult::skipped(),
+    }
+}
+
+fn reclaim_cycle_status(
+    sqlite: &IdleReclaimBackendResult,
+    allocator: &IdleReclaimBackendResult,
+) -> String {
+    let attempted = sqlite.attempted || allocator.attempted;
+    let failures = sqlite.failure_count.saturating_add(allocator.failure_count);
+    let successes = sqlite.success_count.saturating_add(allocator.success_count);
+    if !attempted {
+        "skipped".into()
+    } else if failures == 0 {
+        "succeeded".into()
+    } else if successes > 0 {
+        "partial_failure".into()
+    } else {
+        "failed".into()
+    }
+}
+
+fn idle_reclaim_result_attempted(result: &IdleReclaimCycleResult) -> bool {
+    result.sqlite.attempted || result.allocator.attempted
+}
+
+fn shrink_sqlite_stores(state: &SharedState) -> IdleReclaimBackendResult {
+    let mut result = IdleReclaimBackendResult {
+        status: "succeeded".into(),
+        attempted: true,
+        success_count: 0,
+        failure_count: 0,
+        last_error: None,
+    };
+    match state.pipeline.lock() {
+        Ok(pipeline) => match pipeline.as_ref() {
+            Some(pipeline) => {
+                record_sqlite_shrink_result("pipeline", pipeline.store(), &mut result)
+            }
+            None => record_sqlite_shrink_error("pipeline", "pipeline busy", &mut result),
+        },
+        Err(error) => record_sqlite_shrink_error("pipeline", &error.to_string(), &mut result),
+    }
+    match state.task_store.lock() {
+        Ok(store) => record_sqlite_shrink_result("task_store", &store, &mut result),
+        Err(error) => record_sqlite_shrink_error("task_store", &error.to_string(), &mut result),
+    }
+    if result.failure_count > 0 {
+        result.status = if result.success_count > 0 {
+            "partial_failure".into()
+        } else {
+            "failed".into()
+        };
+    }
+    result
+}
+
+fn record_sqlite_shrink_result(name: &str, store: &Store, result: &mut IdleReclaimBackendResult) {
+    match store.shrink_memory() {
+        Ok(()) => result.success_count = result.success_count.saturating_add(1),
+        Err(error) => record_sqlite_shrink_error(name, &error.to_string(), result),
+    }
+}
+
+fn record_sqlite_shrink_error(name: &str, error: &str, result: &mut IdleReclaimBackendResult) {
+    result.failure_count = result.failure_count.saturating_add(1);
+    result.last_error = Some(bounded_error(&format!("{name}: {error}")));
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn malloc_trim_backend_result() -> IdleReclaimBackendResult {
+    // SAFETY: `malloc_trim` is a process-wide glibc allocator maintenance call.
+    // Passing pad=0 provides no pointers or Rust-managed references to C, so the
+    // unsafe boundary is limited to trusting glibc's ABI for this platform cfg.
+    let released = unsafe { libc::malloc_trim(0) };
+    IdleReclaimBackendResult {
+        status: if released == 0 {
+            "succeeded_no_release".into()
+        } else {
+            "succeeded".into()
+        },
+        attempted: true,
+        success_count: 1,
+        failure_count: 0,
+        last_error: None,
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn malloc_trim_backend_result() -> IdleReclaimBackendResult {
+    IdleReclaimBackendResult {
+        status: "unsupported".into(),
+        attempted: false,
+        success_count: 0,
+        failure_count: 0,
+        last_error: None,
+    }
+}
+
+fn failed_backend_result(error: String) -> IdleReclaimBackendResult {
+    IdleReclaimBackendResult {
+        status: "failed".into(),
+        attempted: true,
+        success_count: 0,
+        failure_count: 1,
+        last_error: Some(bounded_error(&error)),
+    }
 }
 
 fn daemon_resources(config: &DaemonResourceConfig) -> DaemonResources {
@@ -755,10 +1413,13 @@ struct IngestBatchExpansionCandidate {
 // ---------------------------------------------------------------------------
 
 async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
+    let resources = daemon_resource_snapshots(&state);
+    let idle_reclaim = idle_reclaim_gate(&state, resources.clone()).health;
     Json(HealthResponse {
         status: "ok".into(),
         memory_budget: state.memory_budget.snapshot(),
-        resources: daemon_resource_snapshots(&state),
+        resources,
+        idle_reclaim: Some(idle_reclaim),
     })
 }
 
@@ -1723,6 +2384,18 @@ fn record_ingest_task_terminalize_span(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TaskTerminalizationOutcome {
+    task_changed: bool,
+    should_wake_ingest_queue: bool,
+}
+
+fn mark_idle_reclaim_activity_if_changed(state: &SharedState, changed: bool) {
+    if changed {
+        state.idle_reclaim.mark_activity();
+    }
+}
+
 async fn finish_task_success(
     state: &SharedState,
     task_id: &TaskId,
@@ -1730,7 +2403,7 @@ async fn finish_task_success(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
-    let should_wake_ingest_queue = with_task_store_write(state, move |store| {
+    let outcome = with_task_store_write(state, move |store| {
         let task = store.get_task(&task_id)?;
         let should_wake_ingest_queue = task
             .as_ref()
@@ -1745,11 +2418,15 @@ async fn finish_task_success(
             }
             finalize_ingest_batch_parent_if_complete(store, task.as_ref())?;
         }
-        Ok(task_changed && should_wake_ingest_queue)
+        Ok(TaskTerminalizationOutcome {
+            task_changed,
+            should_wake_ingest_queue: task_changed && should_wake_ingest_queue,
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    if should_wake_ingest_queue {
+    mark_idle_reclaim_activity_if_changed(state, outcome.task_changed);
+    if outcome.should_wake_ingest_queue {
         schedule_ingest_queue(state_for_queue);
     }
     Ok(())
@@ -1781,7 +2458,7 @@ async fn finish_task_failed_with_upstream(
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
     let error_message = bounded_error(error_message);
-    let should_wake_ingest_queue = with_task_store_write(state, move |store| {
+    let outcome = with_task_store_write(state, move |store| {
         let task = store.get_task(&task_id)?;
         let upstream_failure = upstream_failure
             .map(|failure| upstream_failure_with_task_context(failure, &task_id, task.as_ref()));
@@ -1814,11 +2491,15 @@ async fn finish_task_failed_with_upstream(
             }
             finalize_ingest_batch_parent_if_complete(store, task.as_ref())?;
         }
-        Ok(task_changed && should_wake_ingest_queue)
+        Ok(TaskTerminalizationOutcome {
+            task_changed,
+            should_wake_ingest_queue: task_changed && should_wake_ingest_queue,
+        })
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    if should_wake_ingest_queue {
+    mark_idle_reclaim_activity_if_changed(state, outcome.task_changed);
+    if outcome.should_wake_ingest_queue {
         schedule_ingest_queue(state_for_queue);
     }
     Ok(())
@@ -2401,6 +3082,7 @@ async fn ask_stream(
     Json(req): Json<AskRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(ASK_STREAM_EVENT_BUFFER);
+    let sse_guard = state.idle_reclaim.start_sse().await;
     if let Err((status, Json(error))) = validate_ask_retrieve_controls(&req) {
         let _ = tx.try_send(sse_error_event(status, error.error));
     } else {
@@ -2432,9 +3114,12 @@ async fn ask_stream(
         }
     }
 
-    Sse::new(stream::unfold(rx, |mut rx: mpsc::Receiver<Event>| async {
-        rx.recv().await.map(|event| (Ok(event), rx))
-    }))
+    Sse::new(stream::unfold(
+        (rx, sse_guard),
+        |(mut rx, sse_guard): (mpsc::Receiver<Event>, ActivityGuard)| async move {
+            rx.recv().await.map(|event| (Ok(event), (rx, sse_guard)))
+        },
+    ))
 }
 
 async fn submit_ask_task(
@@ -2682,6 +3367,7 @@ async fn wait_task(
     Query(query): Query<TaskEventsQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(TASK_WAIT_EVENT_BUFFER);
+    let sse_guard = state.idle_reclaim.start_sse().await;
     tokio::spawn(async move {
         let task_id = TaskId(id);
         let mut after = query.after;
@@ -2711,9 +3397,12 @@ async fn wait_task(
         }
     });
 
-    Sse::new(stream::unfold(rx, |mut rx| async {
-        rx.recv().await.map(|event| (Ok(event), rx))
-    }))
+    Sse::new(stream::unfold(
+        (rx, sse_guard),
+        |(mut rx, sse_guard): (mpsc::Receiver<Event>, ActivityGuard)| async move {
+            rx.recv().await.map(|event| (Ok(event), (rx, sse_guard)))
+        },
+    ))
 }
 
 async fn execute_ask_task(
@@ -3927,18 +4616,20 @@ async fn recover_abandoned_running_source_batch_children(state: &SharedState) ->
     if state.ingest_worker_active.load(Ordering::Acquire) {
         return Ok(0);
     }
-    with_task_store_write(
+    let recovered = with_task_store_write(
         state,
         recover_abandoned_running_source_batch_children_in_store,
     )
-    .await
+    .await?;
+    mark_idle_reclaim_activity_if_changed(state, recovered > 0);
+    Ok(recovered)
 }
 
 /// Fail all ingest tasks stuck in `running` status from a previous daemon
 /// session.  On startup no worker is active, so any `running` task is an
 /// orphan that will permanently block the ingest queue (#182).
 async fn recover_orphaned_running_tasks(state: &SharedState) -> Result<usize> {
-    with_task_store_write(state, |store| {
+    let recovered = with_task_store_write(state, |store| {
         let mut candidates = Vec::new();
         for task in store.tasks(TaskKind::Ingest)? {
             if task.status == TaskStatus::Running {
@@ -3981,7 +4672,9 @@ async fn recover_orphaned_running_tasks(state: &SharedState) -> Result<usize> {
         }
         Ok(recovered)
     })
-    .await
+    .await?;
+    mark_idle_reclaim_activity_if_changed(state, recovered > 0);
+    Ok(recovered)
 }
 
 fn recover_abandoned_running_source_batch_children_in_store(store: &mut Store) -> Result<usize> {
@@ -4083,7 +4776,7 @@ async fn persist_ingest_batch_children(
     candidate: IngestBatchExpansionCandidate,
     expansion: BackgroundIngestBatchExpansion,
 ) -> Result<bool> {
-    with_task_store_write(state, move |store| {
+    let persisted = with_task_store_write(state, move |store| {
         if store.count_running_tasks(TaskKind::Ingest)? > 0 {
             return Ok(false);
         }
@@ -4163,7 +4856,9 @@ async fn persist_ingest_batch_children(
         }
         Ok::<_, anyhow::Error>(true)
     })
-    .await
+    .await?;
+    mark_idle_reclaim_activity_if_changed(state, persisted);
+    Ok(persisted)
 }
 
 fn persist_skipped_missing_ingest_child(
@@ -4948,7 +5643,7 @@ async fn cancel_task_record(
     task_id: &TaskId,
 ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
     let task_id = task_id.clone();
-    with_task_store_write(state, move |store| {
+    let changed = with_task_store_write(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
@@ -4989,7 +5684,9 @@ async fn cancel_task_record(
         } else {
             err(StatusCode::INTERNAL_SERVER_ERROR, e)
         }
-    })
+    })?;
+    mark_idle_reclaim_activity_if_changed(state, changed);
+    Ok(changed)
 }
 
 fn task_controlled_ingest_batch_id(task: &verbatim_core::task::TaskSummary) -> Option<String> {
@@ -6965,6 +7662,11 @@ async fn run_daemon() -> Result<()> {
         ingest_queue_active: AtomicBool::new(false),
         ingest_worker_active: AtomicBool::new(false),
         collection_watcher: CollectionWatcherRuntime::default(),
+        idle_reclaim: Arc::new(IdleReclaimRuntime::new(now_unix_millis())),
+        #[cfg(test)]
+        idle_reclaim_before_backend_hook: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        idle_reclaim_before_backend_call_hook: std::sync::Mutex::new(None),
         runtime_config: std::sync::RwLock::new(RuntimeConfigState {
             config,
             reload: initial_reload_metadata(&config_path),
@@ -6992,6 +7694,7 @@ async fn run_daemon() -> Result<()> {
 
     let _config_watcher = start_config_watcher(Arc::clone(&state))?;
     let _collection_watcher = start_collection_watcher(Arc::clone(&state))?;
+    let _idle_reclaim_scheduler = start_idle_reclaim_scheduler(Arc::clone(&state));
     schedule_ingest_queue(Arc::clone(&state));
 
     let app = Router::new()
@@ -7057,6 +7760,10 @@ async fn run_daemon() -> Result<()> {
         .route("/api/tasks/{id}/cancel", post(cancel_task_handler))
         .route("/api/tasks/{id}/resume", post(resume_task_handler))
         .route("/api/evidence/{eid}", get(get_evidence))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            track_http_activity,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -7843,6 +8550,386 @@ mod tests {
             .expect("sqlite reader resource is reported");
         assert!(reader.completed >= 1);
         drop(writer_permit);
+    }
+
+    #[tokio::test]
+    async fn health_reports_idle_reclaim_disabled_by_default() {
+        let test_dir = TestDir::new("idle-reclaim-default-health");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let Json(health) = health(State(Arc::clone(&state))).await;
+        let reclaim = health.idle_reclaim.expect("idle reclaim state is reported");
+
+        assert!(!reclaim.enabled);
+        assert!(!reclaim.eligible);
+        assert_eq!(reclaim.skip_reason.as_deref(), Some("disabled"));
+        assert_eq!(reclaim.active.http_requests, 0);
+        assert_eq!(reclaim.active.active_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_skips_active_http_without_invoking_backends() {
+        let test_dir = TestDir::new("idle-reclaim-active-http");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let _http = state.idle_reclaim.start_http().await;
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_eq!(result.status, "skipped");
+        assert_eq!(result.skip_reason.as_deref(), Some("active_http_requests"));
+        assert!(!result.sqlite.attempted);
+        assert!(!result.allocator.attempted);
+        let Json(health) = health(State(Arc::clone(&state))).await;
+        let reclaim = health.idle_reclaim.unwrap();
+        assert_eq!(reclaim.active.http_requests, 1);
+        assert_eq!(reclaim.skip_reason.as_deref(), Some("active_http_requests"));
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_skips_active_sse_without_invoking_backends() {
+        let test_dir = TestDir::new("idle-reclaim-active-sse");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let _sse = state.idle_reclaim.start_sse().await;
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_eq!(result.status, "skipped");
+        assert_eq!(result.skip_reason.as_deref(), Some("active_sse_streams"));
+        assert!(!result.sqlite.attempted);
+        assert!(!result.allocator.attempted);
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_skips_active_resource_without_invoking_backends() {
+        let test_dir = TestDir::new("idle-reclaim-active-resource");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let _permit = state
+            .resources
+            .sqlite_reader
+            .acquire()
+            .await
+            .expect("reader permit");
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_eq!(result.status, "skipped");
+        assert_eq!(result.skip_reason.as_deref(), Some("active_resources"));
+        assert!(!result.sqlite.attempted);
+        assert!(!result.allocator.attempted);
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_skips_queued_resource_without_invoking_backends() {
+        let test_dir = TestDir::new("idle-reclaim-queued-resource");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+
+        let result = run_idle_reclaim_initial_gate_for_test(
+            &state,
+            vec![idle_reclaim_resource_snapshot_for_test(0, 1)],
+        );
+
+        assert_idle_reclaim_skipped_without_backends(&result, "queued_resources");
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_skips_active_tasks_without_invoking_backends() {
+        let test_dir = TestDir::new("idle-reclaim-active-task");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let _task_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("question", None, None, 1, 1, 1),
+        )
+        .await
+        .unwrap();
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_eq!(result.status, "skipped");
+        assert_eq!(result.skip_reason.as_deref(), Some("active_tasks"));
+        assert!(!result.sqlite.attempted);
+        assert!(!result.allocator.attempted);
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_waits_after_background_task_completion() {
+        let test_dir = TestDir::new("idle-reclaim-after-task-completion");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 60, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("question", None, None, 1, 1, 1),
+        )
+        .await
+        .unwrap();
+
+        finish_task_success(&state, &task_id, serde_json::json!({"returned_results": 0}))
+            .await
+            .unwrap();
+        let immediate = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_idle_reclaim_skipped_without_backends(&immediate, "idle_timeout_not_reached");
+
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let after_timeout = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_ne!(after_timeout.status, "skipped");
+        assert!(after_timeout.sqlite.attempted);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        assert!(after_timeout.allocator.attempted);
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        assert!(!after_timeout.allocator.attempted);
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_skips_active_ingest_queue_without_invoking_backends() {
+        let test_dir = TestDir::new("idle-reclaim-active-ingest-queue");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        state.ingest_queue_active.store(true, Ordering::Release);
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_idle_reclaim_skipped_without_backends(&result, "ingest_queue_active");
+        state.ingest_queue_active.store(false, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_skips_busy_pipeline_without_invoking_backends() {
+        let test_dir = TestDir::new("idle-reclaim-busy-pipeline");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let pipeline = take_pipeline(&state).expect("take pipeline slot");
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_idle_reclaim_skipped_without_backends(&result, "pipeline_busy");
+        restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_skips_before_idle_timeout_without_invoking_backends() {
+        let test_dir = TestDir::new("idle-reclaim-timeout-not-reached");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 60, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_idle_reclaim_skipped_without_backends(&result, "idle_timeout_not_reached");
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_runs_sqlite_shrink_and_allocator_trim_when_idle() {
+        let test_dir = TestDir::new("idle-reclaim-runs");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_ne!(result.status, "skipped");
+        assert!(result.sqlite.attempted);
+        assert_eq!(result.sqlite.success_count, 2);
+        assert_eq!(result.sqlite.failure_count, 0);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            assert!(result.allocator.attempted);
+            assert_eq!(result.allocator.success_count, 1);
+            assert_eq!(result.allocator.failure_count, 0);
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        {
+            assert!(!result.allocator.attempted);
+            assert_eq!(result.allocator.status, "unsupported");
+        }
+        let Json(health) = health(State(Arc::clone(&state))).await;
+        let reclaim = health.idle_reclaim.unwrap();
+        assert_eq!(
+            reclaim
+                .last_result
+                .as_ref()
+                .map(|last| last.status.as_str()),
+            Some(result.status.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_min_interval_blocks_repeat_attempt() {
+        let test_dir = TestDir::new("idle-reclaim-min-interval");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 600, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+
+        let first = run_idle_reclaim_cycle_if_due(&state).await;
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let second = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert!(first.sqlite.attempted);
+        assert_eq!(second.status, "skipped");
+        assert_eq!(
+            second.skip_reason.as_deref(),
+            Some("min_interval_not_reached")
+        );
+        assert!(!second.sqlite.attempted);
+        assert!(!second.allocator.attempted);
+        let Json(health) = health(State(Arc::clone(&state))).await;
+        let reclaim = health.idle_reclaim.unwrap();
+        let last_result = reclaim.last_result.expect("latest scheduler decision");
+        assert_eq!(last_result.status, "skipped");
+        assert_eq!(
+            last_result.skip_reason.as_deref(),
+            Some("min_interval_not_reached")
+        );
+        let last_attempt = reclaim
+            .last_attempt_result
+            .expect("last real reclaim attempt remains visible");
+        assert_eq!(
+            last_attempt.attempted_at_unix_ms,
+            first.attempted_at_unix_ms
+        );
+        assert!(last_attempt.sqlite.attempted);
+        assert_eq!(last_attempt.sqlite.success_count, 2);
+        assert_eq!(last_attempt.sqlite.failure_count, 0);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            assert!(last_attempt.allocator.attempted);
+            assert_eq!(last_attempt.allocator.success_count, 1);
+            assert_eq!(last_attempt.allocator.failure_count, 0);
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        {
+            assert!(!last_attempt.allocator.attempted);
+            assert_eq!(last_attempt.allocator.status, "unsupported");
+        }
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let third = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_eq!(third.status, "skipped");
+        assert_eq!(
+            third.skip_reason.as_deref(),
+            Some("min_interval_not_reached")
+        );
+        assert!(!third.sqlite.attempted);
+        assert!(!third.allocator.attempted);
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_rechecks_activity_before_invoking_backends() {
+        let test_dir = TestDir::new("idle-reclaim-recheck-before-backend");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let active_guard: Arc<std::sync::Mutex<Option<ActivityGuard>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let active_guard_for_hook = Arc::clone(&active_guard);
+        set_idle_reclaim_before_backend_hook(&state, move |state| {
+            *active_guard_for_hook.lock().unwrap() = state.idle_reclaim.try_start_http_for_test();
+        });
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_eq!(result.status, "skipped");
+        assert_eq!(result.skip_reason.as_deref(), Some("active_http_requests"));
+        assert!(!result.sqlite.attempted);
+        assert!(!result.allocator.attempted);
+        drop(active_guard.lock().unwrap().take());
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_admission_blocks_http_during_sqlite_backend_window() {
+        let test_dir = TestDir::new("idle-reclaim-sqlite-admission");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, false);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let admission_blocked = Arc::new(AtomicBool::new(false));
+        let admission_blocked_for_hook = Arc::clone(&admission_blocked);
+        set_idle_reclaim_before_backend_call_hook(&state, move |state| {
+            admission_blocked_for_hook.store(
+                state.idle_reclaim.try_start_http_for_test().is_none(),
+                Ordering::Release,
+            );
+        });
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert!(admission_blocked.load(Ordering::Acquire));
+        assert!(result.sqlite.attempted);
+        assert!(!result.allocator.attempted);
+        assert_eq!(state.idle_reclaim.active_http_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_admission_blocks_http_during_allocator_backend_window() {
+        let test_dir = TestDir::new("idle-reclaim-allocator-admission");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, false, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        let admission_blocked = Arc::new(AtomicBool::new(false));
+        let admission_blocked_for_hook = Arc::clone(&admission_blocked);
+        set_idle_reclaim_before_backend_call_hook(&state, move |state| {
+            admission_blocked_for_hook.store(
+                state.idle_reclaim.try_start_http_for_test().is_none(),
+                Ordering::Release,
+            );
+        });
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert!(admission_blocked.load(Ordering::Acquire));
+        assert!(!result.sqlite.attempted);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        assert!(result.allocator.attempted);
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        assert!(!result.allocator.attempted);
+        assert_eq!(state.idle_reclaim.active_http_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_reclaim_running_cycle_blocks_reentry() {
+        let test_dir = TestDir::new("idle-reclaim-no-reentry");
+        let config = idle_reclaim_test_config("http://127.0.0.1:9/v1", 1, 60, true, true);
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        force_idle_reclaim_timeout_elapsed(&state, 120);
+        state.idle_reclaim.running.store(true, Ordering::Release);
+
+        let result = run_idle_reclaim_cycle_if_due(&state).await;
+
+        assert_eq!(result.status, "skipped");
+        assert_eq!(result.skip_reason.as_deref(), Some("already_running"));
+        assert!(!result.sqlite.attempted);
+        assert!(!result.allocator.attempted);
+        state.idle_reclaim.running.store(false, Ordering::Release);
     }
 
     #[tokio::test]
@@ -13408,6 +14495,11 @@ mod tests {
             ingest_queue_active: AtomicBool::new(false),
             ingest_worker_active: AtomicBool::new(false),
             collection_watcher: CollectionWatcherRuntime::default(),
+            idle_reclaim: Arc::new(IdleReclaimRuntime::new(now_unix_millis())),
+            #[cfg(test)]
+            idle_reclaim_before_backend_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            idle_reclaim_before_backend_call_hook: std::sync::Mutex::new(None),
             runtime_config: std::sync::RwLock::new(RuntimeConfigState {
                 reload: initial_reload_metadata(&config_path),
                 config,
@@ -13736,6 +14828,88 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    fn idle_reclaim_test_config(
+        model_base_url: &str,
+        idle_timeout_seconds: u64,
+        min_interval_seconds: u64,
+        sqlite_shrink_memory: bool,
+        malloc_trim: bool,
+    ) -> Config {
+        let mut config = retrieve_test_config(model_base_url);
+        config.daemon.idle_reclaim.enabled = true;
+        config.daemon.idle_reclaim.idle_timeout_seconds = idle_timeout_seconds;
+        config.daemon.idle_reclaim.min_interval_seconds = min_interval_seconds;
+        config.daemon.idle_reclaim.sqlite_shrink_memory = sqlite_shrink_memory;
+        config.daemon.idle_reclaim.malloc_trim = malloc_trim;
+        config
+    }
+
+    fn force_idle_reclaim_timeout_elapsed(state: &SharedState, elapsed_seconds: u64) {
+        state.idle_reclaim.last_activity_unix_ms.store(
+            now_unix_millis().saturating_sub(elapsed_seconds.saturating_mul(1_000)),
+            Ordering::Release,
+        );
+    }
+
+    fn assert_idle_reclaim_skipped_without_backends(
+        result: &IdleReclaimCycleResult,
+        skip_reason: &str,
+    ) {
+        assert_eq!(result.status, "skipped");
+        assert_eq!(result.skip_reason.as_deref(), Some(skip_reason));
+        assert!(!result.sqlite.attempted);
+        assert!(!result.allocator.attempted);
+    }
+
+    fn run_idle_reclaim_initial_gate_for_test(
+        state: &SharedState,
+        resources: Vec<ResourceQueueSnapshot>,
+    ) -> IdleReclaimCycleResult {
+        let gate = idle_reclaim_gate_with_running(state, resources, false);
+        let skip_reason = gate
+            .health
+            .skip_reason
+            .expect("test resource snapshot should make idle reclaim skip");
+        let result = skipped_idle_reclaim_result(skip_reason);
+        state.idle_reclaim.record_result(result.clone());
+        result
+    }
+
+    fn idle_reclaim_resource_snapshot_for_test(
+        active: usize,
+        queued: usize,
+    ) -> ResourceQueueSnapshot {
+        ResourceQueueSnapshot {
+            name: "test_resource".into(),
+            kind: "test".into(),
+            capacity: 1,
+            queue_capacity: 1,
+            queued,
+            active,
+            completed: 0,
+            errors: 0,
+            queue_wait_ms_total: 0,
+            service_ms_total: 0,
+            last_queue_wait_ms: None,
+            last_service_ms: None,
+            throughput_per_minute: 0.0,
+        }
+    }
+
+    fn set_idle_reclaim_before_backend_hook<F>(state: &SharedState, hook: F)
+    where
+        F: FnMut(&SharedState) + Send + 'static,
+    {
+        *state.idle_reclaim_before_backend_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    fn set_idle_reclaim_before_backend_call_hook<F>(state: &SharedState, hook: F)
+    where
+        F: FnMut(&SharedState) + Send + 'static,
+    {
+        *state.idle_reclaim_before_backend_call_hook.lock().unwrap() = Some(Box::new(hook));
     }
 
     async fn reloaded_embedding_endpoint_state(

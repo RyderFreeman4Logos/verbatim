@@ -411,6 +411,16 @@ impl Store {
         }
     }
 
+    /// Ask SQLite to release connection-local memory it can safely discard.
+    ///
+    /// This is a best-effort maintenance operation; callers decide when the
+    /// connection is idle enough for the brief maintenance pause.
+    pub fn shrink_memory(&self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA shrink_memory;")
+            .context("shrink SQLite connection memory")
+    }
+
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
