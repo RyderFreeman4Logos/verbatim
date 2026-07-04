@@ -1863,12 +1863,13 @@ mod tests {
         CitationResponse, CollectionResponse, CollectionStatusResponse, CollectionSyncRequest,
         CollectionSyncResponse, CollectionWatcherResponse, CollectionWatcherStatus,
         CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
-        CreateCollectionRequest, EvidenceResponse, HealthResponse, IngestResponse, ReindexRequest,
-        ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
-        RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
-        TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskListAggregate, TaskListResponse,
-        TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate,
-        TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
+        CreateCollectionRequest, EvidenceResponse, HealthResponse, IdleReclaimActivitySnapshot,
+        IdleReclaimBackendResult, IdleReclaimCycleResult, IdleReclaimHealth, IngestResponse,
+        ReindexRequest, ReindexResponse, RetrieveControlsResponse, RetrieveRequest,
+        RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
+        TaskCreatedResponse, TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskListAggregate,
+        TaskListResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
+        TaskStaleRunningAggregate, TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
     };
     use verbatim_core::collection::{
         CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
@@ -2550,6 +2551,123 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert_eq!(client.calls.borrow().as_slice(), ["health"]);
         assert!(stdout.contains("Daemon status: ok"));
+        assert!(!stdout.contains("Idle reclaim:"));
+    }
+
+    #[test]
+    fn daemon_status_displays_idle_reclaim_health_when_present() {
+        let client = MockDaemonClient::default();
+        client.health_response.replace(Some(HealthResponse {
+            status: "ok".into(),
+            memory_budget: Default::default(),
+            resources: Vec::new(),
+            idle_reclaim: Some(IdleReclaimHealth {
+                enabled: true,
+                sqlite_shrink_memory: true,
+                malloc_trim: true,
+                currently_idle: true,
+                eligible: false,
+                skip_reason: Some("min_interval_not_reached".into()),
+                idle_for_millis: 12_000,
+                idle_timeout_millis: 10_000,
+                min_interval_millis: 60_000,
+                next_eligible_in_millis: Some(48_000),
+                active: IdleReclaimActivitySnapshot::default(),
+                last_result: Some(IdleReclaimCycleResult {
+                    attempted_at_unix_ms: 100,
+                    finished_at_unix_ms: 110,
+                    status: "succeeded".into(),
+                    skip_reason: None,
+                    sqlite: IdleReclaimBackendResult {
+                        status: "succeeded".into(),
+                        attempted: true,
+                        success_count: 2,
+                        failure_count: 0,
+                        last_error: None,
+                    },
+                    allocator: IdleReclaimBackendResult {
+                        status: "succeeded_no_release".into(),
+                        attempted: true,
+                        success_count: 1,
+                        failure_count: 0,
+                        last_error: None,
+                    },
+                }),
+                last_attempt_result: None,
+            }),
+        }));
+        let local = MockLocalActions::default();
+
+        let (code, stdout, stderr) = run_mock_with(["daemon", "status"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("Idle reclaim: enabled=true idle=true eligible=false"));
+        assert!(stdout.contains("skip=min_interval_not_reached"));
+        assert!(stdout.contains("last: status=succeeded attempted_at_unix_ms=100"));
+        assert!(stdout.contains("sqlite: status=succeeded attempted=true success=2 failure=0"));
+        assert!(stdout.contains("allocator: status=succeeded_no_release attempted=true success=1"));
+    }
+
+    #[test]
+    fn daemon_status_displays_last_reclaim_attempt_after_skipped_decision() {
+        let client = MockDaemonClient::default();
+        client.health_response.replace(Some(HealthResponse {
+            status: "ok".into(),
+            memory_budget: Default::default(),
+            resources: Vec::new(),
+            idle_reclaim: Some(IdleReclaimHealth {
+                enabled: true,
+                sqlite_shrink_memory: true,
+                malloc_trim: true,
+                currently_idle: true,
+                eligible: false,
+                skip_reason: Some("min_interval_not_reached".into()),
+                idle_for_millis: 12_000,
+                idle_timeout_millis: 10_000,
+                min_interval_millis: 60_000,
+                next_eligible_in_millis: Some(48_000),
+                active: IdleReclaimActivitySnapshot::default(),
+                last_result: Some(IdleReclaimCycleResult {
+                    attempted_at_unix_ms: 200,
+                    finished_at_unix_ms: 200,
+                    status: "skipped".into(),
+                    skip_reason: Some("min_interval_not_reached".into()),
+                    sqlite: IdleReclaimBackendResult::skipped(),
+                    allocator: IdleReclaimBackendResult::skipped(),
+                }),
+                last_attempt_result: Some(IdleReclaimCycleResult {
+                    attempted_at_unix_ms: 100,
+                    finished_at_unix_ms: 110,
+                    status: "succeeded".into(),
+                    skip_reason: None,
+                    sqlite: IdleReclaimBackendResult {
+                        status: "succeeded".into(),
+                        attempted: true,
+                        success_count: 2,
+                        failure_count: 0,
+                        last_error: None,
+                    },
+                    allocator: IdleReclaimBackendResult {
+                        status: "succeeded_no_release".into(),
+                        attempted: true,
+                        success_count: 1,
+                        failure_count: 0,
+                        last_error: None,
+                    },
+                }),
+            }),
+        }));
+        let local = MockLocalActions::default();
+
+        let (code, stdout, stderr) = run_mock_with(["daemon", "status"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("last: status=skipped attempted_at_unix_ms=200"));
+        assert!(stdout.contains("last attempt: status=succeeded attempted_at_unix_ms=100"));
+        assert!(stdout.contains("sqlite: status=succeeded attempted=true success=2 failure=0"));
+        assert!(stdout.contains("allocator: status=succeeded_no_release attempted=true success=1"));
     }
 
     #[test]
@@ -3766,6 +3884,7 @@ mod tests {
         last_watcher_update: RefCell<Option<CollectionWatcherUpdateRequest>>,
         list_error: Option<CliError>,
         health_error: Option<CliError>,
+        health_response: RefCell<Option<HealthResponse>>,
         task_list_response: RefCell<Option<TaskListResponse>>,
     }
 
@@ -4097,11 +4216,16 @@ mod tests {
                 return Err(clone_cli_error(error));
             }
             self.calls.borrow_mut().push("health".into());
-            Ok(HealthResponse {
-                status: "ok".into(),
-                memory_budget: Default::default(),
-                resources: Vec::new(),
-            })
+            Ok(self
+                .health_response
+                .borrow()
+                .clone()
+                .unwrap_or(HealthResponse {
+                    status: "ok".into(),
+                    memory_budget: Default::default(),
+                    resources: Vec::new(),
+                    idle_reclaim: None,
+                }))
         }
     }
 

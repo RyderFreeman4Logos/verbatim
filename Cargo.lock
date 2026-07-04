@@ -3747,6 +3747,7 @@ dependencies = [
  "anyhow",
  "axum",
  "futures",
+ "libc",
  "notify",
  "serde",
  "serde_json",

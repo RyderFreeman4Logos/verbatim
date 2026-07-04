@@ -1550,7 +1550,82 @@ where
             )?;
         }
     }
+    if let Some(reclaim) = &health.idle_reclaim {
+        let skip = reclaim.skip_reason.as_deref().unwrap_or("none");
+        let next = reclaim
+            .next_eligible_in_millis
+            .map(|millis| millis.to_string())
+            .unwrap_or_else(|| "now".to_string());
+        writeln!(
+            writer,
+            "Idle reclaim: enabled={} idle={} eligible={} idle_ms={} next_eligible_ms={} skip={}",
+            reclaim.enabled,
+            reclaim.currently_idle,
+            reclaim.eligible,
+            reclaim.idle_for_millis,
+            next,
+            skip
+        )?;
+        writeln!(
+            writer,
+            "  active: http={} sse={} tasks={} resources_active={} resources_queued={} ingest_queue={} ingest_worker={} pipeline_busy={}",
+            reclaim.active.http_requests,
+            reclaim.active.sse_streams,
+            reclaim.active.active_tasks,
+            reclaim.active.resource_active,
+            reclaim.active.resource_queued,
+            reclaim.active.ingest_queue_active,
+            reclaim.active.ingest_worker_active,
+            reclaim.active.pipeline_busy
+        )?;
+        if let Some(result) = &reclaim.last_result {
+            write_idle_reclaim_cycle(writer, "last", result)?;
+        }
+        if let Some(attempt) = &reclaim.last_attempt_result {
+            if reclaim.last_result.as_ref() != Some(attempt) {
+                write_idle_reclaim_cycle(writer, "last attempt", attempt)?;
+            }
+        }
+    }
     Ok(())
+}
+
+fn write_idle_reclaim_cycle<W>(
+    writer: &mut W,
+    label: &str,
+    result: &verbatim_core::api::IdleReclaimCycleResult,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    let skip = result.skip_reason.as_deref().unwrap_or("none");
+    writeln!(
+        writer,
+        "  {label}: status={} attempted_at_unix_ms={} finished_at_unix_ms={} skip={}",
+        result.status, result.attempted_at_unix_ms, result.finished_at_unix_ms, skip
+    )?;
+    write_idle_reclaim_backend(writer, "sqlite", &result.sqlite)?;
+    write_idle_reclaim_backend(writer, "allocator", &result.allocator)?;
+    Ok(())
+}
+
+fn write_idle_reclaim_backend<W>(
+    writer: &mut W,
+    label: &str,
+    result: &verbatim_core::api::IdleReclaimBackendResult,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(
+        writer,
+        "  {label}: status={} attempted={} success={} failure={} error={}",
+        result.status,
+        result.attempted,
+        result.success_count,
+        result.failure_count,
+        result.last_error.as_deref().unwrap_or("none")
+    )
 }
 
 pub fn write_ask_response<W>(writer: &mut W, response: &AskResponse) -> std::io::Result<()>

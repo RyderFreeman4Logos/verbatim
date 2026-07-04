@@ -15,6 +15,11 @@ ignore = [
     # The advisory has no safe upgrade path; keep the parser contract until
     # upstream migrates to a maintained font parser.
     "RUSTSEC-2026-0192",
+    # Transitive from office_oxide 0.1.2 via pdf_oxide. Upstream currently pins
+    # quick-xml ^0.40, so quick-xml >=0.41 cannot fully replace the vulnerable
+    # copy until office_oxide publishes a compatible release.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
     # bincode 1.x is unmaintained upstream but stable and widely used.
     # Upgrading to bincode 2.x changes the serialization format (not backward compatible).
     "RUSTSEC-2025-0141",
