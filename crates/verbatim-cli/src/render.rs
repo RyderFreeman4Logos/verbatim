@@ -52,6 +52,33 @@ pub enum TaskListHistoryUpdate {
     Clear,
 }
 
+pub fn write_source_summary<W>(
+    writer: &mut W,
+    sources: &[SourceResponse],
+    limit: Option<usize>,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if sources.is_empty() {
+        return writeln!(writer, "No sources.");
+    }
+    let total = sources.len();
+    let preview_count = limit.unwrap_or(3).min(total);
+    writeln!(writer, "Sources: {} total", total)?;
+    for source in sources.iter().take(preview_count) {
+        writeln!(writer, "  id={} status={}", source.id, source.status)?;
+    }
+    if total > preview_count {
+        writeln!(
+            writer,
+            "... showing {} of {}. Use --details for all, --limit N for more.",
+            preview_count, total
+        )?;
+    }
+    Ok(())
+}
+
 pub fn write_sources<W>(writer: &mut W, sources: &[SourceResponse]) -> std::io::Result<()>
 where
     W: Write,
@@ -2721,7 +2748,7 @@ mod tests {
     use super::*;
     use verbatim_core::api::{
         CollectionResultProvenance, EvidenceResponse, RetrieveControlsResponse, RetrieveResponse,
-        RetrieveResultResponse, RetrieveTimingResponse,
+        RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
     };
     use verbatim_core::task::{TaskId, TaskKind, TaskStatus};
     use verbatim_core::types::{
@@ -3186,5 +3213,67 @@ mod tests {
         }
 
         records
+    }
+
+    fn source_fixture(id: &str, status: &str, path: &str) -> SourceResponse {
+        SourceResponse {
+            id: id.into(),
+            path: path.into(),
+            status: status.into(),
+            hash: "abc123".into(),
+            parser_used: None,
+            last_ingested_at: None,
+            diagnostics: None,
+        }
+    }
+
+    #[test]
+    fn source_summary_compact_default_shows_total_and_preview() {
+        let sources: Vec<_> = (0..5)
+            .map(|i| source_fixture(&format!("src-{i}"), "Indexed", &format!("/p/{i}")))
+            .collect();
+        let mut output = Vec::new();
+        write_source_summary(&mut output, &sources, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Sources: 5 total"));
+        assert!(out.contains("src-0"));
+        assert!(out.contains("src-2"));
+        assert!(!out.contains("src-3"));
+        assert!(out.contains("showing 3 of 5"));
+        assert!(!out.contains("/p/"));
+    }
+
+    #[test]
+    fn source_summary_compact_respects_limit() {
+        let sources: Vec<_> = (0..5)
+            .map(|i| source_fixture(&format!("src-{i}"), "Indexed", &format!("/p/{i}")))
+            .collect();
+        let mut output = Vec::new();
+        write_source_summary(&mut output, &sources, Some(1)).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Sources: 5 total"));
+        assert!(out.contains("src-0"));
+        assert!(!out.contains("src-1"));
+        assert!(out.contains("showing 1 of 5"));
+    }
+
+    #[test]
+    fn source_summary_compact_no_truncation_hint_when_all_shown() {
+        let sources = vec![source_fixture("only", "Indexed", "/x")];
+        let mut output = Vec::new();
+        write_source_summary(&mut output, &sources, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Sources: 1 total"));
+        assert!(out.contains("only"));
+        assert!(!out.contains("showing"));
+    }
+
+    #[test]
+    fn source_summary_empty_shows_no_sources() {
+        let sources: Vec<SourceResponse> = vec![];
+        let mut output = Vec::new();
+        write_source_summary(&mut output, &sources, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert_eq!(out, "No sources.\n");
     }
 }

@@ -464,9 +464,32 @@ where
             let response = client.add_source(&path)?;
             writeln!(stdout, "Added source: {}", response.id)?;
         }
-        SourceCommand::List => {
+        SourceCommand::List {
+            details,
+            limit,
+            status,
+        } => {
+            if limit == Some(0) {
+                return Err(CliError::Api("--limit must be >= 1".to_string()));
+            }
             let sources = client.list_sources()?;
-            render::write_sources(stdout, &sources)?;
+            let filtered: Vec<_> = match &status {
+                Some(s) => sources
+                    .iter()
+                    .filter(|src| src.status == *s)
+                    .cloned()
+                    .collect(),
+                None => sources,
+            };
+            if details {
+                let limited: Vec<_> = match limit {
+                    Some(n) => filtered.iter().take(n).cloned().collect(),
+                    None => filtered.clone(),
+                };
+                render::write_sources(stdout, &limited)?;
+            } else {
+                render::write_source_summary(stdout, &filtered, limit)?;
+            }
         }
         SourceCommand::Inspect { id } => {
             let source = client.get_source(&id)?;
@@ -893,8 +916,14 @@ retrieve, ask, inspect, or remove commands.
 
 const SOURCE_LIST_AFTER_HELP: &str = r#"Examples:
   verbatim source list
+  verbatim source list --details
+  verbatim source list --limit 10 --details
+  verbatim source list --status Indexed --details
 
-Use the printed source ids with ingest, retrieve, ask, and source inspect.
+Default output is compact (total count + small preview).
+Pass --details for per-source path and full metadata.
+Use --limit N (N >= 1) to control preview/detail count.
+Filter with --status <status> (Pending, Indexed, Stale).
 "#;
 
 const SOURCE_INSPECT_AFTER_HELP: &str = r#"Examples:
@@ -1574,7 +1603,22 @@ enum SourceCommand {
         about = "List daemon-registered sources.",
         after_help = SOURCE_LIST_AFTER_HELP
     )]
-    List,
+    List {
+        /// Show full details (path, status) for every source.
+        ///
+        /// Default output is a compact summary suitable for agent/LLM consumption.
+        /// Pass --details for the full listing humans are used to.
+        #[arg(long)]
+        details: bool,
+
+        /// Maximum number of sources to show (with --details or in default preview).
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+
+        /// Filter sources by status (e.g. Indexed, Pending, Error).
+        #[arg(long, value_name = "STATUS")]
+        status: Option<String>,
+    },
     /// Inspect one source.
     #[command(
         about = "Inspect metadata and diagnostics for one source.",
