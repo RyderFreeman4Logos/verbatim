@@ -1591,6 +1591,64 @@ where
     writeln!(writer)
 }
 
+pub fn write_config_compact<W>(writer: &mut W, config: &ConfigResponse) -> std::io::Result<()>
+where
+    W: Write,
+{
+    let cfg = &config.config;
+    let daemon_bind = cfg
+        .get("daemon")
+        .and_then(|d| d.get("bind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let emb_model = cfg
+        .get("embedding")
+        .and_then(|e| e.get("model"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let emb_upstream = cfg
+        .get("embedding")
+        .and_then(|e| e.get("upstream"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let rerank_model = cfg
+        .get("rerank")
+        .and_then(|r| r.get("model"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("disabled");
+    let idle_reclaim = cfg
+        .get("daemon")
+        .and_then(|d| d.get("idle_reclaim"))
+        .and_then(|r| r.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let idle_exit = cfg
+        .get("daemon")
+        .and_then(|d| d.get("idle_exit"))
+        .and_then(|e| e.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    writeln!(writer, "daemon.bind={daemon_bind}")?;
+    if emb_upstream.is_empty() {
+        writeln!(writer, "embedding.model={emb_model}")?;
+    } else {
+        writeln!(
+            writer,
+            "embedding.model={emb_model} upstream={emb_upstream}"
+        )?;
+    }
+    writeln!(writer, "rerank.model={rerank_model}")?;
+    writeln!(
+        writer,
+        "idle_reclaim={} idle_exit={}",
+        if idle_reclaim { "enabled" } else { "disabled" },
+        if idle_exit { "enabled" } else { "disabled" }
+    )?;
+    writeln!(writer, "Use --full for complete config.")?;
+    Ok(())
+}
+
 pub fn write_health<W>(writer: &mut W, health: &HealthResponse) -> std::io::Result<()>
 where
     W: Write,
@@ -2747,8 +2805,8 @@ fn value_string_list(value: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use verbatim_core::api::{
-        CollectionResultProvenance, EvidenceResponse, RetrieveControlsResponse, RetrieveResponse,
-        RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
+        CollectionResultProvenance, ConfigResponse, EvidenceResponse, RetrieveControlsResponse,
+        RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
     };
     use verbatim_core::task::{TaskId, TaskKind, TaskStatus};
     use verbatim_core::types::{
@@ -3275,5 +3333,66 @@ mod tests {
         write_source_summary(&mut output, &sources, None).unwrap();
         let out = String::from_utf8(output).unwrap();
         assert_eq!(out, "No sources.\n");
+    }
+
+    #[test]
+    fn config_compact_extracts_key_fields() {
+        let config = ConfigResponse {
+            config: serde_json::json!({
+                "daemon": {
+                    "bind": "127.0.0.1:7700",
+                    "idle_reclaim": {"enabled": true},
+                    "idle_exit": {"enabled": true}
+                },
+                "embedding": {
+                    "model": "Qwen3-Embedding-8B",
+                    "upstream": "http://gb10:18002"
+                },
+                "rerank": {
+                    "model": "Qwen3-Reranker-8B"
+                }
+            }),
+            reload: verbatim_core::config::ConfigReloadMetadata {
+                active_config_path: "/tmp/config.toml".into(),
+                loaded_at: "2026-01-01T00:00:00Z".into(),
+                last_reload_at: None,
+                last_reload_error: None,
+                last_applied_reload_safe_keys: vec![],
+                last_restart_required_keys: vec![],
+            },
+        };
+        let mut output = Vec::new();
+        write_config_compact(&mut output, &config).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("daemon.bind=127.0.0.1:7700"));
+        assert!(out.contains("embedding.model=Qwen3-Embedding-8B"));
+        assert!(out.contains("upstream=http://gb10:18002"));
+        assert!(out.contains("rerank.model=Qwen3-Reranker-8B"));
+        assert!(out.contains("idle_reclaim=enabled"));
+        assert!(out.contains("idle_exit=enabled"));
+        assert!(out.contains("--full"));
+    }
+
+    #[test]
+    fn config_compact_handles_missing_fields() {
+        let config = ConfigResponse {
+            config: serde_json::json!({}),
+            reload: verbatim_core::config::ConfigReloadMetadata {
+                active_config_path: "/tmp/config.toml".into(),
+                loaded_at: "2026-01-01T00:00:00Z".into(),
+                last_reload_at: None,
+                last_reload_error: None,
+                last_applied_reload_safe_keys: vec![],
+                last_restart_required_keys: vec![],
+            },
+        };
+        let mut output = Vec::new();
+        write_config_compact(&mut output, &config).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("daemon.bind=?"));
+        assert!(out.contains("embedding.model=?"));
+        assert!(out.contains("rerank.model=disabled"));
+        assert!(out.contains("idle_reclaim=disabled"));
+        assert!(out.contains("idle_exit=disabled"));
     }
 }

@@ -733,9 +733,13 @@ where
             let path = local.config_init()?;
             local::write_config_init(stdout, &path)?;
         }
-        ConfigCommand::Show => {
+        ConfigCommand::Show { full } => {
             let config = client.get_config()?;
-            render::write_config(stdout, &config)?;
+            if full {
+                render::write_config(stdout, &config)?;
+            } else {
+                render::write_config_compact(stdout, &config)?;
+            }
         }
         ConfigCommand::Validate => {
             let path = local.config_validate()?;
@@ -1191,10 +1195,11 @@ Initialize creates the local config file if it does not already exist.
 "#;
 
 const CONFIG_SHOW_AFTER_HELP: &str = r#"Examples:
-  verbatim daemon status
   verbatim config show
+  verbatim config show --full
 
-Show reads the active daemon config view and redacts secret-like values.
+Default output is compact (key daemon/embedding/rerank/idle settings).
+Pass --full for the complete redacted JSON config.
 "#;
 
 const CONFIG_VALIDATE_AFTER_HELP: &str = r#"Examples:
@@ -1849,7 +1854,11 @@ enum ConfigCommand {
         about = "Show the daemon's redacted runtime config.",
         after_help = CONFIG_SHOW_AFTER_HELP
     )]
-    Show,
+    Show {
+        /// Show the full config JSON (default is compact summary).
+        #[arg(long)]
+        full: bool,
+    },
     /// Validate the local config file.
     #[command(
         about = "Validate the local config file before daemon use.",
@@ -2766,7 +2775,7 @@ mod tests {
         let (code, stdout, _, client, _) = run_mock(["config", "show"]);
         assert_eq!(code.unwrap(), 0);
         assert_eq!(client.calls.borrow().as_slice(), ["get_config"]);
-        assert!(stdout.contains("\"daemon\""));
+        assert!(stdout.contains("daemon.bind="));
 
         let (code, stdout, _, client, _) = run_mock(["daemon", "status"]);
         assert_eq!(code.unwrap(), 0);
