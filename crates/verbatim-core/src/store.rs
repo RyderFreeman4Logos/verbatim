@@ -2471,6 +2471,17 @@ impl Store {
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
+    /// Returns all tasks regardless of kind, ordered by creation time.
+    pub fn tasks_all(&self) -> Result<Vec<TaskSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json
+             FROM tasks
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], row_to_task_summary)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
     pub fn active_tasks(&self, kind: TaskKind) -> Result<Vec<TaskSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, status, created_at, updated_at, started_at, finished_at, request_json, result_json, error, progress_json

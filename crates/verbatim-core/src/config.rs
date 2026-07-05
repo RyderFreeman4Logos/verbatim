@@ -1050,6 +1050,11 @@ fn default_qdrant_timeout_seconds() -> u64 {
 pub struct DaemonConfig {
     #[serde(default = "default_daemon_bind")]
     pub bind: String,
+    /// Number of tokio worker threads. Defaults to 4 to limit glibc malloc
+    /// arena proliferation (each thread gets its own arena, each up to 128 MB).
+    /// Set to 0 or omit for num_cpus (tokio default).
+    #[serde(default = "default_worker_threads")]
+    pub worker_threads: usize,
     #[serde(default)]
     pub idle_reclaim: DaemonIdleReclaimConfig,
     #[serde(default)]
@@ -1062,6 +1067,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             bind: default_daemon_bind(),
+            worker_threads: default_worker_threads(),
             idle_reclaim: DaemonIdleReclaimConfig::default(),
             idle_exit: DaemonIdleExitConfig::default(),
             resources: DaemonResourceConfig::default(),
@@ -1071,6 +1077,10 @@ impl Default for DaemonConfig {
 
 fn default_daemon_bind() -> String {
     "127.0.0.1:7700".into()
+}
+
+fn default_worker_threads() -> usize {
+    4
 }
 
 /// Configures best-effort daemon memory reclaim that only runs after the daemon is idle.
@@ -1787,6 +1797,8 @@ fn is_reload_safe_key(key: &str) -> bool {
 fn restart_required_reason(key: &str) -> &'static str {
     if key == "daemon.bind" {
         "daemon bind address is only read when the listener starts; restart verbatim-daemon to bind a new address"
+    } else if key == "daemon.worker_threads" {
+        "tokio worker thread count is fixed when the runtime is created; restart verbatim-daemon to apply a new thread count"
     } else if key.starts_with("store.") {
         "store path selects persisted SQLite, vector, and lexical index data; restart with an explicit data migration or reindex plan"
     } else if key.starts_with("embedding.") {
@@ -2022,6 +2034,11 @@ task_wait_timeout_seconds = 1500
 
 [daemon]
 bind = "127.0.0.1:7700"
+# Number of tokio worker threads. Lower values reduce glibc malloc arena
+# proliferation (each thread gets its own arena, each up to 128 MB virtual).
+# Default 4 is sufficient for typical RAG workloads.
+# Set to 0 for num_cpus (tokio default, can cause 1+ GB RSS on many-core machines).
+worker_threads = 4
 
 [daemon.idle_reclaim]
 # Disabled by default because SQLite shrink and allocator trim can pause briefly.
@@ -2099,6 +2116,7 @@ mod tests {
             config.daemon.idle_reclaim.min_interval_seconds,
             DEFAULT_IDLE_RECLAIM_MIN_INTERVAL_SECONDS
         );
+        assert_eq!(config.daemon.worker_threads, 4);
         assert!(config.daemon.idle_reclaim.sqlite_shrink_memory);
         assert!(config.daemon.idle_reclaim.malloc_trim);
         assert!(!config.daemon.idle_exit.enabled);
