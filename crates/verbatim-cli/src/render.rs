@@ -1649,6 +1649,37 @@ where
     Ok(())
 }
 
+pub fn write_health_compact<W>(writer: &mut W, health: &HealthResponse) -> std::io::Result<()>
+where
+    W: Write,
+{
+    write!(
+        writer,
+        "{} rss={}MB",
+        health.status, health.memory_budget.rss_mb
+    )?;
+    let active_tasks: usize = health.resources.iter().map(|r| r.active).sum();
+    let total_completed: u64 = health.resources.iter().map(|r| r.completed).sum();
+    write!(writer, " tasks={}/{}", active_tasks, total_completed)?;
+    if let Some(reclaim) = &health.idle_reclaim {
+        if reclaim.enabled {
+            write!(writer, " idle_reclaim=enabled")?;
+        }
+    }
+    if let Some(exit) = &health.idle_exit {
+        if exit.enabled {
+            write!(
+                writer,
+                " idle_exit=enabled({}s)",
+                exit.timeout_millis / 1000
+            )?;
+        }
+    }
+    writeln!(writer)?;
+    writeln!(writer, "Use --details for full health output.")?;
+    Ok(())
+}
+
 pub fn write_health<W>(writer: &mut W, health: &HealthResponse) -> std::io::Result<()>
 where
     W: Write,
@@ -3394,5 +3425,77 @@ mod tests {
         assert!(out.contains("rerank.model=disabled"));
         assert!(out.contains("idle_reclaim=disabled"));
         assert!(out.contains("idle_exit=disabled"));
+    }
+
+    #[test]
+    fn health_compact_shows_status_rss_and_idle_flags() {
+        use verbatim_core::api::{IdleExitHealth, IdleReclaimHealth};
+        use verbatim_core::memory_budget::MemoryBudgetSnapshot;
+        let health = HealthResponse {
+            status: "ok".into(),
+            memory_budget: MemoryBudgetSnapshot {
+                rss_mb: 282,
+                ..Default::default()
+            },
+            resources: Vec::new(),
+            idle_reclaim: Some(IdleReclaimHealth {
+                enabled: true,
+                sqlite_shrink_memory: true,
+                malloc_trim: true,
+                currently_idle: true,
+                eligible: false,
+                skip_reason: None,
+                idle_for_millis: 30_000,
+                idle_timeout_millis: 300_000,
+                min_interval_millis: 900_000,
+                next_eligible_in_millis: None,
+                active: Default::default(),
+                last_result: None,
+                last_attempt_result: None,
+            }),
+            idle_exit: Some(IdleExitHealth {
+                enabled: true,
+                count_health_requests: false,
+                allow_with_collection_watcher: true,
+                auto_start_on_cli: true,
+                currently_idle: false,
+                eligible: false,
+                skip_reason: Some("active_tasks".into()),
+                idle_for_millis: 0,
+                timeout_millis: 1_200_000,
+                last_activity_unix_ms: 0,
+                deadline_unix_ms: 0,
+                next_eligible_in_millis: None,
+                active: Default::default(),
+            }),
+        };
+        let mut output = Vec::new();
+        write_health_compact(&mut output, &health).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("ok rss=282MB"));
+        assert!(out.contains("idle_reclaim=enabled"));
+        assert!(out.contains("idle_exit=enabled(1200s)"));
+        assert!(out.contains("--details"));
+    }
+
+    #[test]
+    fn health_compact_minimal_when_no_idle_features() {
+        use verbatim_core::memory_budget::MemoryBudgetSnapshot;
+        let health = HealthResponse {
+            status: "ok".into(),
+            memory_budget: MemoryBudgetSnapshot {
+                rss_mb: 100,
+                ..Default::default()
+            },
+            resources: Vec::new(),
+            idle_reclaim: None,
+            idle_exit: None,
+        };
+        let mut output = Vec::new();
+        write_health_compact(&mut output, &health).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("ok rss=100MB"));
+        assert!(!out.contains("idle_reclaim"));
+        assert!(!out.contains("idle_exit"));
     }
 }

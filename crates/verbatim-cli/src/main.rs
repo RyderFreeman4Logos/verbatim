@@ -762,9 +762,16 @@ where
 {
     match command {
         DaemonCommand::Start => local.daemon_start(),
-        DaemonCommand::Status { auto_start } => {
+        DaemonCommand::Status {
+            auto_start,
+            details,
+        } => {
             let health = daemon_status_health(client, local, auto_start)?;
-            render::write_health(stdout, &health)?;
+            if details {
+                render::write_health(stdout, &health)?;
+            } else {
+                render::write_health_compact(stdout, &health)?;
+            }
             Ok(0)
         }
         DaemonCommand::Install { force } => {
@@ -1229,10 +1236,13 @@ verbatim daemon install and systemctl --user enable --now verbatim.
 const DAEMON_STATUS_AFTER_HELP: &str = r#"Examples:
   verbatim daemon status
   verbatim daemon status --auto-start
+  verbatim daemon status --details
 
-Status checks daemon health through the HTTP API and fails if the daemon cannot
-be reached. With --auto-start, status starts the installed user systemd service
-with `systemctl --user start verbatim` and retries health once. This is not systemd socket activation.
+Default output is compact (status + RSS + tasks + idle flags).
+Pass --details for full multi-line health output (resources, reclaim, exit).
+With --auto-start, status starts the installed user systemd service
+with `systemctl --user start verbatim` and retries health once.
+This is not systemd socket activation.
 "#;
 
 const DAEMON_INSTALL_AFTER_HELP: &str = r#"Examples:
@@ -1884,6 +1894,9 @@ enum DaemonCommand {
         /// Start the installed user systemd service and retry health once if unreachable.
         #[arg(long)]
         auto_start: bool,
+        /// Show full multi-line health output (resources, idle reclaim, idle exit).
+        #[arg(long)]
+        details: bool,
     },
     /// Install the systemd user service.
     #[command(
@@ -2780,7 +2793,7 @@ mod tests {
         let (code, stdout, _, client, _) = run_mock(["daemon", "status"]);
         assert_eq!(code.unwrap(), 0);
         assert_eq!(client.calls.borrow().as_slice(), ["health"]);
-        assert!(stdout.contains("Daemon status: ok"));
+        assert!(stdout.contains("ok"));
         assert!(!stdout.contains("Idle reclaim:"));
     }
 
@@ -2829,7 +2842,8 @@ mod tests {
         }));
         let local = MockLocalActions::default();
 
-        let (code, stdout, stderr) = run_mock_with(["daemon", "status"], &client, &local);
+        let (code, stdout, stderr) =
+            run_mock_with(["daemon", "status", "--details"], &client, &local);
 
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
@@ -2892,7 +2906,8 @@ mod tests {
         }));
         let local = MockLocalActions::default();
 
-        let (code, stdout, stderr) = run_mock_with(["daemon", "status"], &client, &local);
+        let (code, stdout, stderr) =
+            run_mock_with(["daemon", "status", "--details"], &client, &local);
 
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
@@ -2932,7 +2947,8 @@ mod tests {
         }));
         let local = MockLocalActions::default();
 
-        let (code, stdout, stderr) = run_mock_with(["daemon", "status"], &client, &local);
+        let (code, stdout, stderr) =
+            run_mock_with(["daemon", "status", "--details"], &client, &local);
 
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
@@ -2960,7 +2976,7 @@ mod tests {
             run_mock_with(["daemon", "status", "--auto-start"], &client, &local);
 
         assert_eq!(code.unwrap(), 0);
-        assert!(stdout.contains("Daemon status: ok"));
+        assert!(stdout.contains("ok"));
         assert!(stderr.is_empty());
         assert_eq!(client.calls.borrow().as_slice(), ["health"]);
         assert_eq!(
@@ -2993,7 +3009,7 @@ mod tests {
         let (code, stdout, stderr) = run_mock_with(["daemon", "status"], &client, &local);
 
         assert_eq!(code.unwrap(), 0);
-        assert!(stdout.contains("Daemon status: ok"));
+        assert!(stdout.contains("ok"));
         assert!(stderr.is_empty());
         assert_eq!(
             local.calls.borrow().as_slice(),
