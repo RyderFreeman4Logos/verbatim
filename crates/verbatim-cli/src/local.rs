@@ -257,7 +257,8 @@ fn systemd_unit(daemon: &Path) -> String {
          ExecStart={}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
-         Environment=VERBATIM_CONFIG=%h/.config/verbatim/config.toml\n\n\
+         Environment=VERBATIM_CONFIG=%h/.config/verbatim/config.toml\n\
+         Environment=MALLOC_ARENA_MAX=2\n\n\
          [Install]\n\
          WantedBy=default.target\n",
         daemon.display()
@@ -413,7 +414,8 @@ mod tests {
              ExecStart=/bin/verbatim-daemon\n\
              Restart=on-failure\n\
              RestartSec=5\n\
-             Environment=VERBATIM_CONFIG=%h/.config/verbatim/config.toml\n\n\
+             Environment=VERBATIM_CONFIG=%h/.config/verbatim/config.toml\n\
+             Environment=MALLOC_ARENA_MAX=2\n\n\
              [Install]\n\
              WantedBy=default.target\n"
         );
@@ -444,6 +446,7 @@ mod tests {
         assert!(unit.contains("Description=Verbatim RAG daemon"));
         assert!(unit.contains("RestartSec=5"));
         assert!(unit.contains("Environment=VERBATIM_CONFIG=%h/.config/verbatim/config.toml"));
+        assert!(unit.contains("Environment=MALLOC_ARENA_MAX=2"));
         fs::remove_dir_all(tempdir).unwrap();
     }
 

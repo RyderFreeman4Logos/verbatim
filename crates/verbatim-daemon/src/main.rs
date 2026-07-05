@@ -5143,11 +5143,12 @@ async fn recover_abandoned_running_source_batch_children(state: &SharedState) ->
 
 /// Fail all ingest tasks stuck in `running` status from a previous daemon
 /// session.  On startup no worker is active, so any `running` task is an
-/// orphan that will permanently block the ingest queue (#182).
+/// orphan that will permanently block the ingest queue (#182) or prevent
+/// idle exit by keeping `active_tasks > 0`.
 async fn recover_orphaned_running_tasks(state: &SharedState) -> Result<usize> {
     let recovered = with_task_store_write(state, |store| {
         let mut candidates = Vec::new();
-        for task in store.tasks(TaskKind::Ingest)? {
+        for task in store.tasks_all()? {
             if task.status == TaskStatus::Running {
                 candidates.push(task);
             }
@@ -5155,8 +5156,17 @@ async fn recover_orphaned_running_tasks(state: &SharedState) -> Result<usize> {
 
         let mut recovered = 0;
         for task in candidates {
-            let error_message = "orphaned running ingest task from previous daemon session; \
-                 no active worker can resume it — failing to unblock ingest queue";
+            let kind = task.kind;
+            let error_message = match kind {
+                TaskKind::Ingest => {
+                    "orphaned running ingest task from previous daemon session; \
+                 no active worker can resume it — failing to unblock ingest queue"
+                }
+                _ => {
+                    "orphaned running task from previous daemon session; \
+                 no active worker can resume it — failing to unblock idle exit"
+                }
+            };
             let resumability = task_failure_resumability_metadata(&task, Some(error_message))
                 .ok()
                 .flatten();
@@ -8194,13 +8204,29 @@ async fn shutdown_signal(mut idle_exit: watch::Receiver<bool>) {
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     if write_version_if_requested(std::env::args().skip(1), &mut std::io::stdout())? {
         return Ok(());
     }
 
-    run_daemon().await
+    // Read worker_threads from config before creating the runtime.
+    let config_path = config::config_path();
+    let config = Config::load_from(&config_path).context("failed to load config")?;
+    let worker_threads = if config.daemon.worker_threads == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    } else {
+        config.daemon.worker_threads
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .context("failed to create tokio runtime")?;
+
+    runtime.block_on(run_daemon_with_config(config))
 }
 
 fn write_version_if_requested<I, W>(args: I, stdout: &mut W) -> Result<bool>
@@ -8218,11 +8244,10 @@ where
     }
 }
 
-async fn run_daemon() -> Result<()> {
+async fn run_daemon_with_config(config: Config) -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let config_path = config::config_path();
-    let config = Config::load_from(&config_path).context("failed to load config")?;
     let data_dir = config::data_dir(&config);
     let pipeline =
         IngestPipeline::new(&config, &data_dir).context("failed to initialize ingest pipeline")?;
