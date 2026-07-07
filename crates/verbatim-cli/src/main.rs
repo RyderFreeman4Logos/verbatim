@@ -443,6 +443,10 @@ where
             }
             Ok(0)
         }
+        Commands::Resolve { reference, format } => {
+            run_resolve(&reference, format, stdout)?;
+            Ok(0)
+        }
         Commands::Evidence { eid } => {
             let evidence = client.get_evidence(&eid)?;
             render::write_evidence(stdout, &evidence)?;
@@ -452,6 +456,66 @@ where
         Commands::Daemon { command } => run_daemon(command, stdout, client, local),
         Commands::Task { command } => run_task(command, stdout, client, local),
     }
+}
+
+/// Run the `resolve` command: parse a canonical reference and display its
+/// normalized form.
+fn run_resolve<W>(
+    reference: &str,
+    format: Option<ResolveFormat>,
+    stdout: &mut W,
+) -> Result<(), CliError>
+where
+    W: Write,
+{
+    let registry = verbatim_core::profiles::ProfileRegistry::new();
+    let parsed = registry.try_parse(reference).ok_or_else(|| {
+        CliError::Api(format!(
+            "could not parse \"{reference}\" as a canonical reference"
+        ))
+    })?;
+
+    // Build normalized key from start components
+    let normalized: String = parsed
+        .start
+        .iter()
+        .map(|c| c.value.to_lowercase().replace(' ', ""))
+        .collect::<Vec<_>>()
+        .join(":");
+
+    match format {
+        Some(ResolveFormat::Json) => {
+            let end_display = parsed.end.as_ref().map(|end| {
+                end.iter()
+                    .map(|c| c.value.clone())
+                    .collect::<Vec<_>>()
+                    .join(":")
+            });
+            writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({
+                    "profile": parsed.profile_id,
+                    "raw": parsed.raw,
+                    "display": parsed.display,
+                    "normalized": normalized,
+                    "start": parsed.start.iter().map(|c| serde_json::json!({
+                        "level": c.level,
+                        "value": c.value,
+                        "ordinal": c.ordinal,
+                    })).collect::<Vec<_>>(),
+                    "end": end_display,
+                })
+            )?;
+        }
+        Some(ResolveFormat::Text) | None => {
+            writeln!(stdout, "display:   {}", parsed.display)?;
+            writeln!(stdout, "normalized: {}", normalized)?;
+            writeln!(stdout, "profile:   {}", parsed.profile_id)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn run_source<W, C>(command: SourceCommand, stdout: &mut W, client: &C) -> Result<u8, CliError>
@@ -1184,6 +1248,18 @@ Evidence ids come from retrieve --show-debug --verbose, retrieve --format json,
 ask citations, and retrieval debug packs.
 "#;
 
+const RESOLVE_AFTER_HELP: &str = r#"Examples:
+  verbatim resolve "John 3:16"
+  verbatim resolve "1 Cor 13:4-7" --format json
+  verbatim resolve "Gen 1:31-2:3"
+
+Parses and normalizes canonical references using known source profiles
+(Bible, etc.). The output normalized key can be used to look up the same
+passage in any version (ESV, NIV, CUV, etc.) — it is version-independent.
+
+Currently supported: Bible (66-book Protestant canon with abbreviations).
+"#;
+
 const CONFIG_AFTER_HELP: &str = r#"Examples:
   verbatim config init
   verbatim config validate
@@ -1561,6 +1637,19 @@ enum Commands {
         /// Question text.
         #[arg(required = true, num_args = 1..)]
         question: Vec<String>,
+    },
+    /// Resolve a canonical reference (e.g., "John 3:16") to its normalized form.
+    #[command(
+        about = "Parse and normalize a canonical reference (Bible verse, etc.).",
+        after_help = RESOLVE_AFTER_HELP
+    )]
+    Resolve {
+        /// The reference string to resolve (e.g., "John 3:16", "1 Cor 13:4-7").
+        #[arg(value_name = "REFERENCE")]
+        reference: String,
+        /// Output format: text (default) or json.
+        #[arg(long, value_enum)]
+        format: Option<ResolveFormat>,
     },
     /// Inspect one evidence unit through the daemon API.
     #[command(
@@ -2009,6 +2098,13 @@ enum RetrieveFormat {
     Snippets,
     Tsv,
     Csv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ResolveFormat {
+    #[value(alias = "text")]
+    Text,
+    Json,
 }
 
 #[cfg(test)]
@@ -4138,6 +4234,40 @@ mod tests {
         assert!(stdout.contains("--force"));
         assert!(stdout.contains("Overwrite an existing service file"));
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn resolve_outputs_display_and_normalized() {
+        let (code, stdout, stderr, _, _) = run_mock(["resolve", "John 3:16"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stdout.contains("display:   John 3:16"));
+        assert!(stdout.contains("normalized: john:3:16"));
+        assert!(stdout.contains("profile:   bible"));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn resolve_json_output() {
+        let (code, stdout, _, _, _) = run_mock(["resolve", "1 Cor 13:4-7", "--format", "json"]);
+        assert_eq!(code.unwrap(), 0);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(parsed["display"], "1 Corinthians 13:4-7");
+        assert_eq!(parsed["normalized"], "1corinthians:13:4");
+        assert_eq!(parsed["profile"], "bible");
+    }
+
+    #[test]
+    fn resolve_cross_chapter_range() {
+        let (code, stdout, _, _, _) = run_mock(["resolve", "Gen 1:31-2:3"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stdout.contains("display:   Genesis 1:31-2:3"));
+    }
+
+    #[test]
+    fn resolve_rejects_invalid_reference() {
+        let (code, stdout, _, _, _) = run_mock(["resolve", "not a reference"]);
+        assert!(code.is_err());
+        assert!(!stdout.contains("display:"));
     }
 
     fn run_mock<I>(

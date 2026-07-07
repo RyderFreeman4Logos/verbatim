@@ -1,4 +1,5 @@
 pub mod api;
+pub mod canonical_chunker;
 pub mod chunker;
 pub mod collection;
 pub mod config;
@@ -15,6 +16,7 @@ pub mod ingest;
 pub mod memory_budget;
 pub mod ocr;
 pub mod parser;
+pub mod profiles;
 pub mod provider;
 pub mod resource;
 pub mod retrieve;

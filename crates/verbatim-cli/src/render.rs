@@ -2376,7 +2376,8 @@ fn compact_structured_locator(locator: &SourceLocator) -> String {
         }
         SourceLocator::Pdf { .. }
         | SourceLocator::PdfOcr { .. }
-        | SourceLocator::PdfImage { .. } => locator.to_string(),
+        | SourceLocator::PdfImage { .. }
+        | SourceLocator::Canonical { .. } => locator.to_string(),
     }
 }
 
