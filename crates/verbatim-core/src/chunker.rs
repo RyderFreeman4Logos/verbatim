@@ -281,7 +281,7 @@ pub fn deterministic_chunk_hash(
     hex_sha256(input.as_bytes())
 }
 
-fn unique_chunk_id(
+pub fn unique_chunk_id(
     source_id: &SourceId,
     kind: &str,
     chunk_hash: &str,

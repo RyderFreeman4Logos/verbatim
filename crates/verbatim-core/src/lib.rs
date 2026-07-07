@@ -1,4 +1,5 @@
 pub mod api;
+pub mod canonical_chunker;
 pub mod chunker;
 pub mod collection;
 pub mod config;
