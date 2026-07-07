@@ -1232,6 +1232,8 @@ Debugging:
   retrieve never invokes chat generation.
   It returns evidence context without invoking chat generation.
   Default markdown is compact: rank, score, citation, and snippet only.
+  Scores are ranked chunk-level scores; canonical multi-locator compact
+  snippets show a chunk-internal support unit for the query.
   snippets/text-only omit headers and debug metadata; TSV/CSV emit fixed
   columns: rank, score, citation, collection, source, locator, snippet.
   --collection filters against materialized daemon membership and does not
@@ -2383,6 +2385,8 @@ mod tests {
         assert!(stderr.is_empty());
         assert!(help.contains("retrieve never invokes chat generation"));
         assert!(help.contains("Default markdown is compact"));
+        assert!(help.contains("Scores are ranked chunk-level scores"));
+        assert!(help.contains("chunk-internal support unit"));
         assert!(help.contains("snippets/text-only omit headers"));
         assert!(help.contains("--show-debug writes a compact JSON retrieval diagnostic summary"));
         assert!(help.contains("--show-debug --verbose writes the full task diagnostics"));

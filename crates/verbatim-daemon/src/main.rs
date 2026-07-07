@@ -6675,6 +6675,7 @@ fn empty_retrieval_debug() -> RetrievalDebug {
         graph_expanded_hits: Vec::new(),
         reranker: verbatim_core::types::RetrievalRerankDebug::disabled(),
         final_evidence_pack: Vec::new(),
+        display_evidence_pack: Vec::new(),
     }
 }
 
@@ -6949,7 +6950,8 @@ fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
             include_locator: controls.include_locator,
         })
     } else {
-        let total_results = debug.final_evidence_pack.len();
+        let display_pack = retrieve_display_evidence_pack(&debug);
+        let total_results = display_pack.len();
         let results_page = retrieve_result_page(RetrieveResultPageInput {
             results: &results,
             debug: &debug,
@@ -7032,6 +7034,14 @@ fn retrieve_passage_result_page(
         })
         .collect();
     (total_results, page)
+}
+
+fn retrieve_display_evidence_pack(debug: &RetrievalDebug) -> &[RetrievalEvidencePackEntry] {
+    if debug.display_evidence_pack.is_empty() {
+        &debug.final_evidence_pack
+    } else {
+        &debug.display_evidence_pack
+    }
 }
 
 struct PassageGroup<'a> {
@@ -7262,14 +7272,14 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Vec<RetrieveResul
         page,
         include_locator,
     } = input;
+    let display_pack = retrieve_display_evidence_pack(debug);
     let start = page_start(page, page_size);
-    let end = debug.final_evidence_pack.len().min(limit);
+    let end = display_pack.len().min(limit);
     if start >= end {
         return Vec::new();
     }
 
-    debug
-        .final_evidence_pack
+    display_pack
         .iter()
         .enumerate()
         .skip(start)
@@ -8703,8 +8713,9 @@ mod tests {
     };
     use verbatim_core::types::{
         CanonicalLocator, Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind,
-        EvidenceUnit, ReferenceComponent, RetrievalDenseVectorPath, RetrievalEvidenceRole,
-        RetrievalProvenance, RetrievalRerankStatus, Source, SourceLocator, VectorIndexResidency,
+        EvidenceUnit, ReferenceComponent, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
+        RetrievalEvidenceRole, RetrievalProvenance, RetrievalRerankStatus, Source, SourceLocator,
+        VectorIndexResidency,
     };
 
     fn has_task_terminalize_span(spans: &[verbatim_core::task::TaskSpan]) -> bool {
@@ -11409,6 +11420,7 @@ mod tests {
                 graph_expanded_hits: Vec::new(),
                 reranker: verbatim_core::types::RetrievalRerankDebug::disabled(),
                 final_evidence_pack: Vec::new(),
+                display_evidence_pack: Vec::new(),
             }),
             context: None,
             collection_filter: None,
@@ -11443,6 +11455,7 @@ mod tests {
             graph_expanded_hits: Vec::new(),
             reranker: verbatim_core::types::RetrievalRerankDebug::disabled(),
             final_evidence_pack: Vec::new(),
+            display_evidence_pack: Vec::new(),
         });
 
         prepend_global_results(&mut results, vec![global], &mut debug);
@@ -11514,6 +11527,60 @@ mod tests {
     }
 
     #[test]
+    fn retrieve_response_no_passage_uses_canonical_display_support_pack() {
+        let results = vec![test_canonical_retrieval_result(
+            1,
+            "chunk-2tim4",
+            &[("ev-1", 1), ("ev-8", 8), ("ev-9", 9)],
+        )];
+        let mut debug = empty_retrieval_debug();
+        refresh_final_evidence_pack_debug(&mut debug, &results);
+        debug.display_evidence_pack = vec![RetrievalEvidencePackEntry {
+            label: "E1".into(),
+            ..debug.final_evidence_pack[1].clone()
+        }];
+
+        let response = retrieve_response(RetrieveResponseInput {
+            task_id: TaskId("task-1".into()),
+            query: "crown of righteousness".into(),
+            source_filter: Some(SourceId("src".into())),
+            collection_filter: None,
+            collection_provenance: HashMap::new(),
+            embedding_profile_id: EmbeddingProfileId::default_profile(),
+            controls: EffectiveRetrieveControls {
+                limit: 1,
+                page_size: 1,
+                page: 1,
+                include_debug: false,
+                include_locator: true,
+                passage: false,
+                bypass_cache: false,
+                fast: false,
+                config: Config::default(),
+                retrieval_config: RetrievalConfig::default(),
+                rerank_config: RerankConfig::default(),
+            },
+            results,
+            debug,
+            source_paths: HashMap::new(),
+            retrieval_ms: 7,
+        });
+
+        assert_eq!(response.total_results, 1);
+        assert_eq!(response.returned_results, 1);
+        let result = &response.results[0];
+        assert_eq!(result.evidence_id, "ev-8");
+        assert_eq!(result.chunk_id, "chunk-2tim4");
+        assert_eq!(result.score, 1.0);
+        assert_eq!(result.locator, "2 Timothy 4:8");
+        assert_eq!(result.snippet, "verse 8 text.");
+        assert!(matches!(
+            result.structured_locator,
+            Some(SourceLocator::Canonical { .. })
+        ));
+    }
+
+    #[test]
     fn retrieve_response_passage_mode_pages_by_canonical_chunk() {
         let results = vec![test_canonical_retrieval_result(
             1,
@@ -11522,6 +11589,10 @@ mod tests {
         )];
         let mut debug = empty_retrieval_debug();
         refresh_final_evidence_pack_debug(&mut debug, &results);
+        debug.display_evidence_pack = vec![RetrievalEvidencePackEntry {
+            label: "E1".into(),
+            ..debug.final_evidence_pack[1].clone()
+        }];
 
         let response = retrieve_response(RetrieveResponseInput {
             task_id: TaskId("task-1".into()),
