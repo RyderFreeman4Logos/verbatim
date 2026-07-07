@@ -337,6 +337,7 @@ where
                     bypass_cache: false,
                     include_debug: show_retrieval,
                     include_locator: format == RetrieveFormat::Json,
+                    passage: false,
                 };
                 let response = client.retrieve(&request)?;
                 if show_retrieval {
@@ -404,6 +405,7 @@ where
             show_locator,
             format,
             text_only,
+            passage,
         } => {
             let format = if text_only {
                 RetrieveFormat::Snippets
@@ -431,6 +433,7 @@ where
                 bypass_cache: no_cache,
                 include_debug: show_debug,
                 include_locator,
+                passage,
             };
             let response = client.retrieve(&request)?;
             if show_debug {
@@ -1628,6 +1631,9 @@ enum Commands {
         /// Include structured locator/provenance fields in the response.
         #[arg(long = "show-locator")]
         show_locator: bool,
+        /// Group retrieved evidence from the same chunk as passage blocks before pagination.
+        #[arg(long = "passage", action = ArgAction::SetTrue)]
+        passage: bool,
         /// Output format. JSON includes structured locator/provenance fields.
         #[arg(long, value_enum)]
         format: Option<RetrieveFormat>,
@@ -3723,6 +3729,7 @@ mod tests {
                 bypass_cache: false,
                 include_debug: false,
                 include_locator: false,
+                passage: false,
             }
         );
         assert!(stdout.contains("1. score=0.0310 [doc.md L1]"));
@@ -3785,6 +3792,30 @@ mod tests {
         let request = request.as_ref().unwrap();
         assert_eq!(request.question, "What is cited?");
         assert!(request.bypass_cache);
+    }
+
+    #[test]
+    fn retrieve_passage_sets_passage_request_flag() {
+        let (code, _, stderr, client, _) = run_mock([
+            "retrieve",
+            "--passage",
+            "--collection",
+            "csb_bible",
+            "crown",
+            "of",
+            "righteousness",
+        ]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        let request = client.last_retrieve.borrow();
+        let request = request.as_ref().unwrap();
+        assert_eq!(request.question, "crown of righteousness");
+        assert_eq!(
+            request.collection_filter.names,
+            vec!["csb_bible".to_string()]
+        );
+        assert!(request.passage);
     }
 
     #[test]
@@ -3994,6 +4025,7 @@ mod tests {
                 bypass_cache: false,
                 include_debug: true,
                 include_locator: false,
+                passage: false,
             }
         );
         assert!(stdout.contains("1. score=0.0310 [doc.md L1]"));

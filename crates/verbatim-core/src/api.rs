@@ -610,6 +610,12 @@ pub struct RetrieveRequest {
     pub include_debug: bool,
     #[serde(default)]
     pub include_locator: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub passage: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -990,6 +996,7 @@ mod tests {
         assert!(!request.bypass_cache);
         assert!(!request.include_debug);
         assert!(!request.include_locator);
+        assert!(!request.passage);
     }
 
     #[test]
