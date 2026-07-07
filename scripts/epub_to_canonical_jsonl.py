@@ -112,9 +112,30 @@ def extract_body(raw: str) -> str:
 
 
 def strip_reference_sections(body: str) -> str:
-    """Remove footnote and cross-reference sections so their text is ignored."""
+    """Remove footnote, cross-reference, and structural navigation sections so
+    their text is ignored during verse extraction.
+
+    Strips:
+      - <section class="fnSection">…</section>   (footnotes)
+      - <section class="xrfSection">…</section>   (cross-references)
+      - <section epub:type="chapter" id="csb-…">  (empty chapter-boundary markers)
+      - <h1 class="bookname">…</h1>               (book name + nav arrows)
+      - <h4>…</h4>                                (chapter titles like "Psalm 24")
+      - <h2>…</h2>                                (chapter subtitles)
+    """
     body = RE_FN_SECTION.sub("", body)
     body = RE_XRF_SECTION.sub("", body)
+    # Empty chapter-boundary section markers (self-closing or empty)
+    body = re.sub(
+        r'<section\s+epub:type="chapter"[^>]*>\s*</section>', "", body
+    )
+    # Bookname headings (contain nav arrows + book name — not verse text)
+    body = re.sub(
+        r'<h1\s+class="bookname">.*?</h1>', "", body, flags=re.DOTALL
+    )
+    # Chapter titles in <h4> (e.g. "Psalm 24") and subtitles in <h2>
+    body = re.sub(r"<h4\b[^>]*>.*?</h4>", "", body, flags=re.DOTALL)
+    body = re.sub(r"<h2\b[^>]*>.*?</h2>", "", body, flags=re.DOTALL)
     return body
 
 
@@ -132,14 +153,19 @@ def clean_verse_text(raw_html: str) -> str:
     text = html.unescape(text)
     # Collapse whitespace
     text = RE_WS.sub(" ", text).strip()
-    # Remove trailing comma artifact left by stripped footnote markers.
+    # Remove trailing comma/period artifacts left by stripped footnote markers.
     # CSB typography separates adjacent footnote/cross-ref letters with ", "
-    # (e.g. "...earth.<a>A</a>, <a>b</a>" → "...earth., " → "...earth.").
-    # First strip obvious punctuation artifacts, then a lone trailing comma
-    # that is a pure footnote-separator remnant.
-    text = re.sub(r"[.,]{2,}\s*$", "", text)   # "..," ".," ",," etc.
-    text = re.sub(r"(?<=[.;!?])[,，]\s*$", "", text)  # "word.," → "word."
-    text = re.sub(r"\s+,\s*$", "", text)
+    # so removing markers can leave dangling punctuation like:
+    #   "earth., "  → period + comma-separator remnant  (fix → "earth.")
+    #   "place,, ," → multiple comma-separator remnants (fix → "place,")
+    # Rule: only strip when the trailing punctuation run looks like an artifact
+    # (contains 2+ commas, or a period immediately followed by comma+space).
+    # A single trailing comma is preserved (it's a legitimate mid-sentence
+    # comma in the verse, e.g. "...the little owls, cormorants, ...").
+    # 1) "word., " or "word.," → "word."
+    text = re.sub(r"\.\s*,+\s*$", ".", text)
+    # 2) Trailing run with 2+ commas (e.g. ",,", ",,,", ", ,") → strip all
+    text = re.sub(r"(?:,\s*){2,}$", "", text)
     return text.strip()
 
 
@@ -200,11 +226,9 @@ def parse_book_file(raw: str, ordinal: int, title: str, testament: str):
 
     # Walk events, tracking the current section heading, and for each verse
     # extract text from end of its marker span to the start of the next verse
-    # marker (or to the next heading/section boundary, whichever comes first).
+    # marker OR the next heading, whichever comes first.
     current_heading = None
     results = []
-
-    verse_events = [e for e in events if e[0] == "verse"]
 
     for idx, ev in enumerate(events):
         if ev[0] == "heading":
@@ -212,9 +236,11 @@ def parse_book_file(raw: str, ordinal: int, title: str, testament: str):
         elif ev[0] == "verse":
             _, _, (book_key, chapter, verse, marker_end) = ev
             # Determine where this verse's text chunk ends:
-            #   start of the NEXT verse marker, or end-of-body if last.
+            #   the next event (verse marker or heading) after this one,
+            #   whichever comes first. This prevents inter-chapter headings
+            #   and navigation from leaking into the last verse of a chapter.
             text_end = len(body)
-            for nxt in verse_events:
+            for nxt in events[idx + 1:]:
                 if nxt[1] > ev[1]:
                     text_end = nxt[1]
                     break
