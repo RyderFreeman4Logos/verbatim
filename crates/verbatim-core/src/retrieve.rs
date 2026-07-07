@@ -284,7 +284,7 @@ impl<'a> RetrievalPipeline<'a> {
             .map(|_| all_child_count.max(self.config.bm25_top_k))
             .unwrap_or(self.config.bm25_top_k);
 
-        let (dense_results, query_embedding_latency_ms, dense_vector_path) =
+        let (dense_results, query_embedding_latency_ms, dense_vector_path, query_vector) =
             if self.embedding_enabled {
                 let query_text = self.remote_query_text(self.embed_client.prepare_query(query));
                 let embedding_started = Instant::now();
@@ -301,9 +301,10 @@ impl<'a> RetrievalPipeline<'a> {
                         .await?,
                     Some(query_embedding_latency_ms),
                     self.dense_vector_path(),
+                    Some(query_vec),
                 )
             } else {
-                (Vec::new(), None, RetrievalDenseVectorPath::Bm25Only)
+                (Vec::new(), None, RetrievalDenseVectorPath::Bm25Only, None)
             };
 
         let (fused, bm25_hits, dense_hits, rrf_fused_hits) = self.with_read_permit(|| {
@@ -367,6 +368,13 @@ impl<'a> RetrievalPipeline<'a> {
             Ok((results, graph_expanded_hits))
         })?;
 
+        let display_evidence_pack = if include_debug {
+            self.display_evidence_pack_debug(query, query_vector.as_deref(), &results)
+                .await
+        } else {
+            Vec::new()
+        };
+
         let debug = if include_debug {
             Some(RetrievalDebug {
                 dense_vector_path,
@@ -377,6 +385,7 @@ impl<'a> RetrievalPipeline<'a> {
                 graph_expanded_hits,
                 reranker: reranker_debug,
                 final_evidence_pack: final_evidence_pack_debug(&results),
+                display_evidence_pack,
             })
         } else {
             None
@@ -639,6 +648,74 @@ impl<'a> RetrievalPipeline<'a> {
             evidence_units,
             provenance,
         })
+    }
+
+    async fn display_evidence_pack_debug(
+        &self,
+        query: &str,
+        query_vector: Option<&[f32]>,
+        results: &[RetrievalResult],
+    ) -> Vec<RetrievalEvidencePackEntry> {
+        if !results.iter().any(canonical_multi_evidence_result) {
+            return final_evidence_pack_debug(results);
+        }
+
+        let semantic_scores = match query_vector {
+            Some(query_vector) => {
+                self.canonical_support_semantic_scores(query_vector, results)
+                    .await
+            }
+            None => HashMap::new(),
+        };
+        let support_ids = canonical_display_support_ids(query, results, &semantic_scores);
+        evidence_pack_debug_with_display_selection(results, &support_ids)
+    }
+
+    async fn canonical_support_semantic_scores(
+        &self,
+        query_vector: &[f32],
+        results: &[RetrievalResult],
+    ) -> HashMap<String, f32> {
+        let mut candidates = Vec::new();
+        let mut documents = Vec::new();
+
+        for result in results
+            .iter()
+            .filter(|result| canonical_multi_evidence_result(result))
+        {
+            for evidence in &result.evidence_units {
+                candidates.push(evidence.id.0.clone());
+                documents.push(
+                    self.embed_client
+                        .prepare_document(&evidence.text, &evidence.heading_path.join(" / ")),
+                );
+            }
+        }
+
+        if documents.is_empty() {
+            return HashMap::new();
+        }
+
+        let vectors = match self.embed_client.embed(&documents).await {
+            Ok(vectors) => vectors,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "canonical support evidence embedding failed; falling back to lexical display selection"
+                );
+                return HashMap::new();
+            }
+        };
+
+        candidates
+            .into_iter()
+            .zip(vectors)
+            .filter_map(|(evidence_id, vector)| {
+                cosine_similarity(query_vector, &vector)
+                    .filter(|score| score.is_finite())
+                    .map(|score| (evidence_id, score))
+            })
+            .collect()
     }
 
     async fn rerank_fused(&self, query: &str, fused: Vec<(ChunkId, f32)>) -> Result<RerankOutcome> {
@@ -1416,6 +1493,7 @@ fn empty_search_output(include_debug: bool) -> RetrievalSearchOutput {
             graph_expanded_hits: Vec::new(),
             reranker: RetrievalRerankDebug::disabled(),
             final_evidence_pack: Vec::new(),
+            display_evidence_pack: Vec::new(),
         }),
     }
 }
@@ -1640,15 +1718,63 @@ fn bounded_rerank_debug_text(input: &str) -> String {
 
 /// Rebuild the final evidence-pack debug view after callers alter retrieval result order.
 pub fn refresh_final_evidence_pack_debug(debug: &mut RetrievalDebug, results: &[RetrievalResult]) {
+    let selected_canonical_support_ids = selected_display_support_ids(debug);
     debug.final_evidence_pack = final_evidence_pack_debug(results);
+    debug.display_evidence_pack = if selected_canonical_support_ids.is_empty() {
+        debug.final_evidence_pack.clone()
+    } else {
+        evidence_pack_debug_with_display_selection(results, &selected_canonical_support_ids)
+    };
 }
 
 fn final_evidence_pack_debug(results: &[RetrievalResult]) -> Vec<RetrievalEvidencePackEntry> {
+    evidence_pack_debug_with_display_selection(results, &HashMap::new())
+}
+
+fn selected_display_support_ids(debug: &RetrievalDebug) -> HashMap<String, EvidenceId> {
+    if debug.display_evidence_pack.is_empty()
+        || debug.display_evidence_pack.len() >= debug.final_evidence_pack.len()
+    {
+        return HashMap::new();
+    }
+
+    let mut full_counts = HashMap::<String, usize>::new();
+    for entry in &debug.final_evidence_pack {
+        *full_counts.entry(entry.chunk_id.0.clone()).or_default() += 1;
+    }
+
+    let mut display_counts = HashMap::<String, usize>::new();
+    for entry in &debug.display_evidence_pack {
+        *display_counts.entry(entry.chunk_id.0.clone()).or_default() += 1;
+    }
+
+    debug
+        .display_evidence_pack
+        .iter()
+        .filter(|entry| {
+            display_counts
+                .get(&entry.chunk_id.0)
+                .zip(full_counts.get(&entry.chunk_id.0))
+                .is_some_and(|(display_count, full_count)| display_count < full_count)
+        })
+        .map(|entry| (entry.chunk_id.0.clone(), entry.evidence_id.clone()))
+        .collect()
+}
+
+fn evidence_pack_debug_with_display_selection(
+    results: &[RetrievalResult],
+    selected_canonical_support_ids: &HashMap<String, EvidenceId>,
+) -> Vec<RetrievalEvidencePackEntry> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
     for result in results {
         for evidence in &result.evidence_units {
+            if let Some(selected_id) = selected_canonical_support_ids.get(&result.chunk_id.0) {
+                if &evidence.id != selected_id {
+                    continue;
+                }
+            }
             if !seen.insert(evidence.id.0.clone()) {
                 continue;
             }
@@ -1673,6 +1799,132 @@ fn final_evidence_pack_debug(results: &[RetrievalResult]) -> Vec<RetrievalEviden
     }
 
     entries
+}
+
+fn canonical_display_support_ids(
+    query: &str,
+    results: &[RetrievalResult],
+    semantic_scores: &HashMap<String, f32>,
+) -> HashMap<String, EvidenceId> {
+    results
+        .iter()
+        .filter(|result| canonical_multi_evidence_result(result))
+        .filter_map(|result| {
+            let evidence = best_support_evidence(query, &result.evidence_units, semantic_scores)?;
+            Some((result.chunk_id.0.clone(), evidence.id.clone()))
+        })
+        .collect()
+}
+
+fn best_support_evidence<'a>(
+    query: &str,
+    evidence_units: &'a [EvidenceUnit],
+    semantic_scores: &HashMap<String, f32>,
+) -> Option<&'a EvidenceUnit> {
+    evidence_units
+        .iter()
+        .enumerate()
+        .max_by(|(left_index, left), (right_index, right)| {
+            compare_support_candidates(
+                query,
+                left,
+                *left_index,
+                right,
+                *right_index,
+                semantic_scores,
+            )
+        })
+        .map(|(_, evidence)| evidence)
+}
+
+fn compare_support_candidates(
+    query: &str,
+    left: &EvidenceUnit,
+    left_index: usize,
+    right: &EvidenceUnit,
+    right_index: usize,
+    semantic_scores: &HashMap<String, f32>,
+) -> std::cmp::Ordering {
+    let left_semantic = semantic_scores.get(&left.id.0).copied();
+    let right_semantic = semantic_scores.get(&right.id.0).copied();
+    support_score_tuple(query, left, left_semantic, left_index).cmp(&support_score_tuple(
+        query,
+        right,
+        right_semantic,
+        right_index,
+    ))
+}
+
+fn support_score_tuple(
+    query: &str,
+    evidence: &EvidenceUnit,
+    semantic_score: Option<f32>,
+    index: usize,
+) -> (i32, i32, i32, std::cmp::Reverse<usize>) {
+    let finite_semantic = semantic_score.filter(|score| score.is_finite());
+    let semantic = finite_semantic
+        .map(|score| (score * 1_000_000.0).round() as i32)
+        .unwrap_or(0);
+    let has_semantic = i32::from(finite_semantic.is_some());
+    let lexical = (lexical_support_score(query, &evidence.text) * 1_000.0).round() as i32;
+    (has_semantic, semantic, lexical, std::cmp::Reverse(index))
+}
+
+fn canonical_multi_evidence_result(result: &RetrievalResult) -> bool {
+    result.evidence_units.len() > 1
+        && result
+            .evidence_units
+            .iter()
+            .all(|evidence| matches!(evidence.locator, SourceLocator::Canonical { .. }))
+}
+
+fn lexical_support_score(query: &str, text: &str) -> f32 {
+    let query_terms = support_terms(query);
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+
+    let text_terms = support_terms(text);
+    if text_terms.is_empty() {
+        return 0.0;
+    }
+
+    let text_term_set = text_terms.into_iter().collect::<HashSet<_>>();
+    let hits = query_terms
+        .iter()
+        .filter(|term| text_term_set.contains(*term))
+        .count();
+    hits as f32 / query_terms.len() as f32
+}
+
+fn support_terms(input: &str) -> Vec<String> {
+    input
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.len() != right.len() || left.is_empty() {
+        return None;
+    }
+
+    let mut dot = 0.0f32;
+    let mut left_norm = 0.0f32;
+    let mut right_norm = 0.0f32;
+    for (left, right) in left.iter().zip(right) {
+        dot += left * right;
+        left_norm += left * left;
+        right_norm += right * right;
+    }
+
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return None;
+    }
+
+    Some(dot / (left_norm.sqrt() * right_norm.sqrt()))
 }
 
 fn evidence_debug_role(evidence: &EvidenceUnit) -> RetrievalEvidenceRole {
@@ -1788,10 +2040,10 @@ mod tests {
     use crate::store::Store;
     use crate::traits::{LexicalIndex, VectorDocument, VectorIndex};
     use crate::types::{
-        BBox, EdgeType, EvidenceId, EvidenceKind, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
-        GraphNodeKind, GraphTraversalDirection, ImageArtifact, ImageId, RetrievalDenseVectorPath,
-        RetrievalEvidenceRole, RetrievalOrigin, RetrievalRerankStatus, Source, SourceLocator,
-        SourceStatus, VectorIndexResidency,
+        BBox, CanonicalLocator, EdgeType, EvidenceId, EvidenceKind, GraphEdge, GraphEdgeId,
+        GraphNode, GraphNodeId, GraphNodeKind, GraphTraversalDirection, ImageArtifact, ImageId,
+        ReferenceComponent, RetrievalDenseVectorPath, RetrievalEvidenceRole, RetrievalOrigin,
+        RetrievalRerankStatus, Source, SourceLocator, SourceStatus, VectorIndexResidency,
     };
 
     #[test]
@@ -2279,6 +2531,82 @@ mod tests {
             .insert()
     }
 
+    fn insert_canonical_chunk(
+        store: &Store,
+        source: &Source,
+        chunk_id: &str,
+        evidence: &[(&str, u32, &str)],
+    ) -> Chunk {
+        let evidence_units = evidence
+            .iter()
+            .map(|(id, verse, text)| EvidenceUnit {
+                id: EvidenceId((*id).into()),
+                source_id: source.id.clone(),
+                kind: EvidenceKind::Text,
+                derived_from: None,
+                locator: SourceLocator::Canonical {
+                    locator: CanonicalLocator::single_unit(
+                        "bible",
+                        "CSB",
+                        vec![
+                            ReferenceComponent {
+                                level: "book".into(),
+                                value: "2 Timothy".into(),
+                                ordinal: Some(55),
+                            },
+                            ReferenceComponent {
+                                level: "chapter".into(),
+                                value: "4".into(),
+                                ordinal: Some(4),
+                            },
+                            ReferenceComponent {
+                                level: "verse".into(),
+                                value: verse.to_string(),
+                                ordinal: Some(*verse),
+                            },
+                        ],
+                        format!("2 Timothy 4:{verse}"),
+                        format!("2timothy:4:{verse}"),
+                    ),
+                },
+                text: (*text).into(),
+                text_hash: format!("hash-{id}"),
+                heading_path: Vec::new(),
+                position: *verse,
+            })
+            .collect::<Vec<_>>();
+        let chunk = Chunk {
+            id: ChunkId(chunk_id.into()),
+            source_id: source.id.clone(),
+            chunk_hash: format!("hash-{chunk_id}"),
+            embedding_input_hash: None,
+            text: evidence_units
+                .iter()
+                .map(|unit| unit.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            context_text: None,
+            token_count: evidence_units.len() as u32 * 4,
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path: Vec::new(),
+            evidence_unit_ids: evidence_units.iter().map(|unit| unit.id.clone()).collect(),
+        };
+
+        store.bulk_insert_evidence(&evidence_units).unwrap();
+        store
+            .bulk_insert_chunks(std::slice::from_ref(&chunk))
+            .unwrap();
+        let links = chunk
+            .evidence_unit_ids
+            .iter()
+            .cloned()
+            .map(|evidence_id| (chunk.id.clone(), evidence_id))
+            .collect::<Vec<_>>();
+        store.link_chunk_evidence(&links).unwrap();
+        chunk
+    }
+
     struct TextChunkFixture<'a> {
         store: &'a Store,
         source: &'a Source,
@@ -2710,6 +3038,62 @@ mod tests {
         assert!(query_text.starts_with('\n'));
         assert_eq!(query_text.trim_start(), "alpha question");
         assert_ne!(query_text, "alpha question");
+    }
+
+    #[tokio::test]
+    async fn canonical_display_pack_selects_chunk_internal_support_evidence() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-canonical-display");
+        store.add_source(&source).unwrap();
+        let chunk = insert_canonical_chunk(
+            &store,
+            &source,
+            "chunk-2tim4",
+            &[
+                (
+                    "ev-2tim4-1",
+                    1,
+                    "I solemnly charge you before God and Christ Jesus.",
+                ),
+                (
+                    "ev-2tim4-8",
+                    8,
+                    "There is reserved for me the alpha crown of righteousness.",
+                ),
+                ("ev-2tim4-9", 9, "Make every effort to come to me soon."),
+            ],
+        );
+        let vector_index = StaticVectorIndex::new(vec![(chunk.id.clone(), 0.9)]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let embed_client = KeywordEmbeddingClient;
+        let config = RetrievalConfig {
+            dense_top_k: 1,
+            bm25_top_k: 0,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+
+        let (results, debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &config,
+        )
+        .search_source_set_with_debug("alpha righteousness", None)
+        .await
+        .unwrap();
+
+        assert_eq!(chunk_ids(&results), vec!["chunk-2tim4"]);
+        assert_eq!(debug.final_evidence_pack.len(), 3);
+        assert_eq!(debug.final_evidence_pack[0].evidence_id.0, "ev-2tim4-1");
+        assert_eq!(debug.final_evidence_pack[1].evidence_id.0, "ev-2tim4-8");
+        assert_eq!(debug.display_evidence_pack.len(), 1);
+        let display = &debug.display_evidence_pack[0];
+        assert_eq!(display.evidence_id.0, "ev-2tim4-8");
+        assert_eq!(display.chunk_id, chunk.id);
+        assert_eq!(display.score, results[0].score);
+        assert_eq!(display.locator.display, "2 Timothy 4:8");
     }
 
     #[tokio::test]
