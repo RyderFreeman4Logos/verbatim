@@ -5903,7 +5903,9 @@ fn locator_page(locator: &SourceLocator) -> Option<u32> {
         SourceLocator::Pdf { page, .. }
         | SourceLocator::PdfOcr { page, .. }
         | SourceLocator::PdfImage { page, .. } => Some(*page),
-        SourceLocator::Document { .. } | SourceLocator::Markdown { .. } => None,
+        SourceLocator::Document { .. }
+        | SourceLocator::Markdown { .. }
+        | SourceLocator::Canonical { .. } => None,
     }
 }
 

@@ -349,6 +349,117 @@ pub struct MarkdownHeadingLocator {
     pub line: u32,
 }
 
+/// One component of a canonical reference hierarchy.
+///
+/// For a Bible verse like `John 3:16`, the components are:
+///   - `{ level: "book", value: "John", ordinal: Some(43) }`
+///   - `{ level: "chapter", value: "3", ordinal: Some(3) }`
+///   - `{ level: "verse", value: "16", ordinal: Some(16) }`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceComponent {
+    pub level: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<u32>,
+}
+
+/// A low-level file locator linking a canonical unit to its representation in a
+/// concrete file (byte range, line range, EPUB CFI, XML ID, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum BackingSelector {
+    ByteRange {
+        start: u64,
+        end: u64,
+    },
+    LineRange {
+        start: u32,
+        end: u32,
+    },
+    TextQuote {
+        exact: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suffix: Option<String>,
+    },
+    XmlId {
+        id: String,
+    },
+    SourceNative {
+        scheme: String,
+        value: String,
+    },
+}
+
+/// A normalized start/end range in a source profile's reference scheme.
+///
+/// For `John 3:16-18`, `start` and `end` share the book/chapter components but
+/// differ at the verse level (16 vs 18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalLocator {
+    /// Profile ID, e.g. `"bible"`, `"rfc"`, `"legal_code"`.
+    pub profile_id: String,
+    /// Work identifier, e.g. `"CSB"`, `"ESV"`, `"RFC9110"`.
+    pub work_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    /// Reference components for the start of the range.
+    pub start: Vec<ReferenceComponent>,
+    /// Reference components for the end of the range (`None` for a single unit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<Vec<ReferenceComponent>>,
+    /// Human-readable citation, e.g. `"John 3:16-18"`.
+    pub display: String,
+    /// Machine-normalized key for exact lookup, e.g. `"john:3:16-john:3:18"`.
+    pub normalized: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backing_selectors: Vec<BackingSelector>,
+}
+
+impl CanonicalLocator {
+    /// Build a single-unit locator (start == end).
+    pub fn single_unit(
+        profile_id: &str,
+        work_id: &str,
+        components: Vec<ReferenceComponent>,
+        display: String,
+        normalized: String,
+    ) -> Self {
+        Self {
+            profile_id: profile_id.to_string(),
+            work_id: work_id.to_string(),
+            version_id: None,
+            start: components,
+            end: None,
+            display,
+            normalized,
+            backing_selectors: Vec::new(),
+        }
+    }
+
+    /// Build a range locator with distinct start/end.
+    pub fn range(
+        profile_id: &str,
+        work_id: &str,
+        start: Vec<ReferenceComponent>,
+        end: Vec<ReferenceComponent>,
+        display: String,
+        normalized: String,
+    ) -> Self {
+        Self {
+            profile_id: profile_id.to_string(),
+            work_id: work_id.to_string(),
+            version_id: None,
+            start,
+            end: Some(end),
+            display,
+            normalized,
+            backing_selectors: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SourceLocator {
@@ -393,6 +504,12 @@ pub enum SourceLocator {
         heading_slug: Option<String>,
         #[serde(default)]
         heading_path: Vec<MarkdownHeadingLocator>,
+    },
+    /// A canonical-reference locator for sources with traditional citation schemes
+    /// (e.g., Bible book/chapter/verse, RFC section, legal code paragraph).
+    Canonical {
+        #[serde(flatten)]
+        locator: CanonicalLocator,
     },
 }
 
@@ -469,6 +586,7 @@ impl fmt::Display for SourceLocator {
                 }
                 Ok(())
             }
+            Self::Canonical { locator } => write!(f, "{}", locator.display),
         }
     }
 }
@@ -1294,5 +1412,122 @@ mod tests {
         assert!(!encoded.contains("api_key"));
         assert!(!encoded.contains("secret query token=fixture-query"));
         assert!(!encoded.contains("secret document body"));
+    }
+
+    #[test]
+    fn reference_component_serializes_with_optional_ordinal() {
+        let with_ordinal = ReferenceComponent {
+            level: "verse".into(),
+            value: "16".into(),
+            ordinal: Some(16),
+        };
+        let without_ordinal = ReferenceComponent {
+            level: "book".into(),
+            value: "John".into(),
+            ordinal: None,
+        };
+
+        let encoded_with = serde_json::to_string(&with_ordinal).unwrap();
+        assert!(encoded_with.contains("\"ordinal\":16"));
+
+        let encoded_without = serde_json::to_string(&without_ordinal).unwrap();
+        assert!(!encoded_without.contains("ordinal"));
+    }
+
+    #[test]
+    fn canonical_locator_round_trips_through_json() {
+        let locator = CanonicalLocator {
+            profile_id: "bible".into(),
+            work_id: "CSB".into(),
+            version_id: Some("digital-edition-2017".into()),
+            start: vec![
+                ReferenceComponent {
+                    level: "book".into(),
+                    value: "John".into(),
+                    ordinal: Some(43),
+                },
+                ReferenceComponent {
+                    level: "chapter".into(),
+                    value: "3".into(),
+                    ordinal: Some(3),
+                },
+                ReferenceComponent {
+                    level: "verse".into(),
+                    value: "16".into(),
+                    ordinal: Some(16),
+                },
+            ],
+            end: None,
+            display: "John 3:16".into(),
+            normalized: "john:3:16".into(),
+            backing_selectors: vec![BackingSelector::LineRange { start: 1, end: 1 }],
+        };
+
+        let encoded = serde_json::to_string(&locator).unwrap();
+        let decoded: CanonicalLocator = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, locator);
+    }
+
+    #[test]
+    fn canonical_source_locator_round_trips_through_json() {
+        let locator = CanonicalLocator::single_unit(
+            "bible",
+            "CSB",
+            vec![
+                ReferenceComponent {
+                    level: "book".into(),
+                    value: "John".into(),
+                    ordinal: Some(43),
+                },
+                ReferenceComponent {
+                    level: "chapter".into(),
+                    value: "3".into(),
+                    ordinal: Some(3),
+                },
+                ReferenceComponent {
+                    level: "verse".into(),
+                    value: "16".into(),
+                    ordinal: Some(16),
+                },
+            ],
+            "John 3:16".into(),
+            "john:3:16".into(),
+        );
+        let source_locator = SourceLocator::Canonical { locator };
+
+        let encoded = serde_json::to_string(&source_locator).unwrap();
+        assert!(encoded.contains("\"type\":\"Canonical\""));
+
+        let decoded: SourceLocator = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, source_locator);
+    }
+
+    #[test]
+    fn canonical_locator_display_formats_citation() {
+        let locator = CanonicalLocator::single_unit(
+            "bible",
+            "CSB",
+            vec![ReferenceComponent {
+                level: "book".into(),
+                value: "John".into(),
+                ordinal: None,
+            }],
+            "John 3:16".into(),
+            "john:3:16".into(),
+        );
+        let source_locator = SourceLocator::Canonical { locator };
+        assert_eq!(source_locator.to_string(), "John 3:16");
+    }
+
+    #[test]
+    fn backing_selector_line_range_round_trips() {
+        let selector = BackingSelector::LineRange { start: 5, end: 10 };
+        let encoded = serde_json::to_string(&selector).unwrap();
+        assert!(encoded.contains("\"type\":\"LineRange\""));
+        assert!(encoded.contains("\"start\":5"));
+        assert!(encoded.contains("\"end\":10"));
+
+        let decoded: BackingSelector = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, selector);
     }
 }
