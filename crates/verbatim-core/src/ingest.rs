@@ -2021,7 +2021,20 @@ where
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
         let output = {
             let _cpu_permit = cpu_permit;
-            chunk_evidence(source_id, &searchable_evidence, &chunker_config)
+            // Use unit-aligned chunker for canonical sources (Bible verses, etc.)
+            // to avoid splitting individual units and overlap by whole units.
+            let has_canonical = searchable_evidence
+                .iter()
+                .any(|e| matches!(e.locator, SourceLocator::Canonical { .. }));
+            if has_canonical {
+                crate::canonical_chunker::chunk_canonical_units(
+                    source_id,
+                    &searchable_evidence,
+                    &crate::canonical_chunker::CanonicalChunkerConfig::default(),
+                )
+            } else {
+                chunk_evidence(source_id, &searchable_evidence, &chunker_config)
+            }
         };
         tracing::info!(chunk_count = output.chunks.len(), "chunked");
         self.record_task_phase(
