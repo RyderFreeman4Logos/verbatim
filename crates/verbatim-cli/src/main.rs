@@ -1150,6 +1150,13 @@ Index maintenance operates through the daemon. Vector JSON cleanup clears only
 legacy JSON payload copies for rows that already have a valid vector BLOB.
 "#;
 
+const INDEX_STATUS_AFTER_HELP: &str = r#"Examples:
+  verbatim index status
+
+Show the active embedding profile capability and chunking status for the
+current daemon state.
+"#;
+
 const INDEX_GC_AFTER_HELP: &str = r#"Examples:
   verbatim index gc --dry-run
   verbatim index gc
@@ -1934,7 +1941,10 @@ enum CollectionWatchCommand {
 #[derive(Debug, Subcommand)]
 enum IndexCommand {
     /// Show active embedding profile capability and chunking status.
-    #[command(about = "Show active embedding profile capability and chunking status.")]
+    #[command(
+        about = "Show active embedding profile capability and chunking status.",
+        after_help = INDEX_STATUS_AFTER_HELP
+    )]
     Status,
     /// Garbage collect old index generations and stale staging directories.
     #[command(
@@ -2172,13 +2182,91 @@ enum TaskProfileFormat {
 }
 
 #[cfg(test)]
+static CONFIG_INIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+#[test]
+fn index_status_help_includes_examples() {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let code = run(["index", "status", "--help"], &mut stdout, &mut stderr);
+    let help = String::from_utf8(stdout).unwrap();
+
+    assert_eq!(code.unwrap(), 0);
+    assert!(stderr.is_empty());
+    assert!(help.contains("Usage:"));
+    assert!(help.contains("Examples:"));
+    assert!(help.contains("verbatim index status"));
+    assert!(help.contains("-h, --help"));
+}
+
+#[cfg(test)]
+#[test]
+fn config_init_template_documents_store_and_parser() {
+    let template = tests::generated_config_template();
+
+    assert!(template.contains("[store]"));
+    assert!(template.contains("SQLite metadata/text"));
+    assert!(template.contains("vectors"));
+    assert!(template.contains("BM25"));
+    assert!(template.contains("[parser]"));
+    assert!(template.contains("born-digital"));
+    assert!(template.contains("scanned/image-only"));
+    assert!(template.contains("image artifact"));
+}
+
+#[cfg(test)]
+#[test]
+fn config_init_template_documents_model_and_retrieval_knobs() {
+    let _env = tests::EnvGuard::capture(&["OPENAI_API_KEY"]);
+    std::env::set_var("OPENAI_API_KEY", "sentinel-secret-value");
+
+    let template = tests::generated_config_template();
+
+    assert!(template.contains("[embedding]"));
+    assert!(template.contains("[rerank]"));
+    assert!(template.contains("endpoint"));
+    assert!(template.contains("model"));
+    assert!(template.contains("concurrency"));
+    assert!(template.contains("timeout"));
+    assert!(template.contains("[retrieval]"));
+    assert!(template.contains("RRF fusion"));
+    assert!(template.contains("page size"));
+    assert!(template.contains("OCR"));
+    assert!(template.contains("vision"));
+    assert!(template.contains("qdrant"));
+    assert!(template.contains("api_key = \"\""));
+    assert!(!template.contains("sentinel-secret-value"));
+}
+
+#[cfg(test)]
+#[test]
+fn config_init_template_documents_daemon_resources_and_watcher() {
+    let template = tests::generated_config_template();
+
+    assert!(template.contains("[daemon]"));
+    assert!(template.contains("bind"));
+    assert!(template.contains("worker threads"));
+    assert!(template.contains("idle reclaim"));
+    assert!(template.contains("idle exit"));
+    assert!(template.contains("[daemon.resources]"));
+    assert!(template.contains("resources"));
+    assert!(template.contains("collection watcher"));
+}
+
+#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::env;
+    use std::ffi::OsString;
+    use std::fs;
     use std::io::{Read as _, Write as _};
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::Value;
     use verbatim_core::api::{
@@ -2254,6 +2342,7 @@ mod tests {
             &["config", "init", "--help"],
             &["config", "show", "--help"],
             &["config", "validate", "--help"],
+            &["index", "status", "--help"],
             &["daemon", "--help"],
             &["daemon", "start", "--help"],
             &["daemon", "status", "--help"],
@@ -2310,6 +2399,7 @@ mod tests {
             &["config", "init", "--help"],
             &["config", "show", "--help"],
             &["config", "validate", "--help"],
+            &["index", "status", "--help"],
             &["daemon", "--help"],
             &["daemon", "start", "--help"],
             &["daemon", "status", "--help"],
@@ -4649,6 +4739,73 @@ mod tests {
             String::from_utf8(stdout).unwrap(),
             String::from_utf8(stderr).unwrap(),
         )
+    }
+
+    pub(super) fn generated_config_template() -> String {
+        let _env_lock = super::CONFIG_INIT_ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::capture(&["VERBATIM_CONFIG"]);
+        let tempdir = TempDirGuard::new("config-init-template");
+        let config_path = tempdir.path().join("config.toml");
+        env::set_var("VERBATIM_CONFIG", &config_path);
+
+        let written_path = verbatim_core::config::init_default_config().unwrap();
+        assert_eq!(written_path, config_path);
+
+        fs::read_to_string(&written_path).unwrap()
+    }
+
+    pub(super) struct EnvGuard {
+        values: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        pub(super) fn capture(names: &[&'static str]) -> Self {
+            let values = names
+                .iter()
+                .map(|name| (*name, env::var_os(name)))
+                .collect();
+            Self { values }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                match value {
+                    Some(value) => env::set_var(name, value),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(name: &str) -> Self {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = env::temp_dir().join(format!(
+                "verbatim-cli-{name}-{}-{suffix}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 
     struct TaskListHttpServer {
