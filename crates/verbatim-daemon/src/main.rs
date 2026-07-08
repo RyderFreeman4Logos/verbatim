@@ -89,8 +89,11 @@ use verbatim_core::task::{
     AskOutputStageProfile, AskTaskProfile, AskVerificationStageProfile, AskVerificationStatus,
     IngestTaskStage, PhaseTiming, RetrieveDenseStageProfile, RetrieveDisplayStageProfile,
     RetrieveEvidenceStageProfile, RetrieveRerankStageProfile, RetrieveStageProfile,
-    RetrieveTaskProfile, TaskEndpointSummary, TaskEvent, TaskId, TaskKind, TaskProfile,
-    TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
+    RetrieveTaskProfile, TaskCollectionFilterControls, TaskEndpointSummary, TaskEvent,
+    TaskFilterControls, TaskId, TaskKind, TaskOutputControls, TaskProfile, TaskProfileControls,
+    TaskProgressSnapshot, TaskQdrantControls, TaskRerankControls, TaskResourceProfile,
+    TaskRetrievalControls, TaskSourceFilterControls, TaskSpan, TaskStatus, TaskSummary,
+    TaskVectorControls,
 };
 use verbatim_core::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 use verbatim_core::types::{
@@ -166,6 +169,9 @@ const TASK_QUEUE_REASON_BUCKET_LIMIT: usize = 16;
 const TASK_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FAST_RETRIEVAL_TOP_K: usize = 20;
 const DEFAULT_SNIPPET_CHARS: usize = 240;
+const TASK_PROFILE_COLLECTION_SAMPLE_LIMIT: usize = 8;
+const TASK_PROFILE_RESOURCE_QUEUE_LIMIT: usize = 32;
+const TASK_PROFILE_STRING_MAX_CHARS: usize = 256;
 const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
 const CONFIG_RELOAD_ERROR_MAX_CHARS: usize = 1024;
 const COLLECTION_WATCHER_EVENT_BUFFER: usize = 512;
@@ -3061,6 +3067,200 @@ fn retrieve_task_profile_from_debug(
     }
 }
 
+fn retrieve_profile_controls(
+    controls: &EffectiveRetrieveControls,
+    embedding_profile_id: &EmbeddingProfileId,
+    query_scope: &QueryScope,
+    debug: &RetrievalDebug,
+) -> TaskProfileControls {
+    TaskProfileControls {
+        retrieval: TaskRetrievalControls {
+            dense_top_k: Some(controls.retrieval_config.dense_top_k),
+            bm25_top_k: Some(controls.retrieval_config.bm25_top_k),
+            rrf_k: Some(controls.retrieval_config.rrf_k),
+            fast: controls.fast,
+            bypass_cache: controls.bypass_cache,
+        },
+        rerank: rerank_profile_controls(&controls.rerank_config, debug),
+        qdrant: qdrant_profile_controls(&controls.config, debug),
+        vector: vector_profile_controls(&controls.config, embedding_profile_id, debug),
+        filters: task_filter_controls(query_scope),
+        output: TaskOutputControls {
+            limit: Some(controls.limit),
+            page_size: Some(controls.page_size),
+            page: Some(controls.page),
+            passage: controls.passage,
+            include_locator: controls.include_locator,
+            include_debug: controls.include_debug,
+            include_debug_packs: controls.include_debug_packs,
+            show_retrieval: None,
+        },
+    }
+}
+
+fn ask_profile_controls(
+    config: &Config,
+    embedding_profile_id: &EmbeddingProfileId,
+    query_scope: &QueryScope,
+    debug: Option<&RetrievalDebug>,
+    show_retrieval: bool,
+) -> TaskProfileControls {
+    TaskProfileControls {
+        retrieval: TaskRetrievalControls {
+            dense_top_k: Some(config.retrieval.dense_top_k),
+            bm25_top_k: Some(config.retrieval.bm25_top_k),
+            rrf_k: Some(config.retrieval.rrf_k),
+            fast: false,
+            bypass_cache: false,
+        },
+        rerank: debug
+            .map(|debug| rerank_profile_controls(&config.rerank, debug))
+            .unwrap_or_else(|| rerank_config_profile_controls(&config.rerank, None)),
+        qdrant: debug
+            .map(|debug| qdrant_profile_controls(config, debug))
+            .unwrap_or_else(|| TaskQdrantControls {
+                enabled: config.qdrant.enabled,
+                preferred: config.qdrant.prefer_for_search,
+                used: false,
+            }),
+        vector: debug
+            .map(|debug| vector_profile_controls(config, embedding_profile_id, debug))
+            .unwrap_or_else(|| TaskVectorControls {
+                embedding_enabled: config.embedding.enabled,
+                embedding_profile_id: Some(bounded_profile_text(embedding_profile_id.as_str())),
+                residency: Some(config.vector_index.residency),
+                dense_path: None,
+            }),
+        filters: task_filter_controls(query_scope),
+        output: TaskOutputControls {
+            limit: None,
+            page_size: None,
+            page: None,
+            passage: false,
+            include_locator: false,
+            include_debug: show_retrieval,
+            include_debug_packs: show_retrieval,
+            show_retrieval: Some(show_retrieval),
+        },
+    }
+}
+
+fn rerank_profile_controls(
+    rerank_config: &RerankConfig,
+    debug: &RetrievalDebug,
+) -> TaskRerankControls {
+    rerank_config_profile_controls(rerank_config, debug.reranker.top_n)
+}
+
+fn rerank_config_profile_controls(
+    rerank_config: &RerankConfig,
+    effective_top_n: Option<usize>,
+) -> TaskRerankControls {
+    TaskRerankControls {
+        enabled: rerank_config.enabled,
+        configured_top_n: Some(rerank_config.top_n),
+        effective_top_n,
+        strategy: Some(rerank_config.strategy),
+        provider: nonempty_profile_text(&rerank_config.provider),
+        model: nonempty_profile_text(&rerank_config.model),
+    }
+}
+
+fn qdrant_profile_controls(config: &Config, debug: &RetrievalDebug) -> TaskQdrantControls {
+    TaskQdrantControls {
+        enabled: config.qdrant.enabled,
+        preferred: config.qdrant.prefer_for_search,
+        used: debug.dense_vector_path == RetrievalDenseVectorPath::Qdrant,
+    }
+}
+
+fn vector_profile_controls(
+    config: &Config,
+    embedding_profile_id: &EmbeddingProfileId,
+    debug: &RetrievalDebug,
+) -> TaskVectorControls {
+    TaskVectorControls {
+        embedding_enabled: config.embedding.enabled,
+        embedding_profile_id: Some(bounded_profile_text(embedding_profile_id.as_str())),
+        residency: Some(config.vector_index.residency),
+        dense_path: Some(debug.dense_vector_path),
+    }
+}
+
+fn task_filter_controls(query_scope: &QueryScope) -> TaskFilterControls {
+    TaskFilterControls {
+        source: TaskSourceFilterControls {
+            requested_source_id: query_scope
+                .source_id
+                .as_ref()
+                .map(|source_id| bounded_profile_text(&source_id.0)),
+            effective_source_count: query_scope.source_filter.as_ref().map(HashSet::len),
+        },
+        collection: collection_filter_profile_controls(query_scope.collection_filter.as_ref()),
+    }
+}
+
+fn collection_filter_profile_controls(
+    collection_filter: Option<&CollectionFilterResponse>,
+) -> TaskCollectionFilterControls {
+    let Some(collection_filter) = collection_filter else {
+        return TaskCollectionFilterControls::default();
+    };
+    let requested = bounded_collection_filter_names(&collection_filter.requested);
+    TaskCollectionFilterControls {
+        requested_count: requested.0,
+        requested_names: requested.1,
+        requested_truncated: requested.2,
+        require_fresh: collection_filter.requested.require_fresh,
+        applied_count: Some(collection_filter.applied.len()),
+        union_source_count: Some(collection_filter.union_source_count),
+        stale: Some(collection_filter.stale),
+        warning_count: Some(collection_filter.warnings.len()),
+    }
+}
+
+fn bounded_collection_filter_names(filter: &CollectionFilterRequest) -> (usize, Vec<String>, bool) {
+    let names = filter
+        .collection_ids
+        .iter()
+        .chain(&filter.names)
+        .map(|name| bounded_profile_text(name.trim()))
+        .collect::<BTreeSet<_>>();
+    let requested_count = names.len();
+    let requested_names = names
+        .into_iter()
+        .take(TASK_PROFILE_COLLECTION_SAMPLE_LIMIT)
+        .collect::<Vec<_>>();
+    let requested_truncated = requested_count > requested_names.len();
+    (requested_count, requested_names, requested_truncated)
+}
+
+fn task_resource_profile_from_state(state: &SharedState) -> TaskResourceProfile {
+    TaskResourceProfile {
+        queues: daemon_resource_snapshots(state)
+            .iter()
+            .take(TASK_PROFILE_RESOURCE_QUEUE_LIMIT)
+            .map(Into::into)
+            .collect(),
+    }
+}
+
+fn nonempty_profile_text(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| bounded_profile_text(value))
+}
+
+fn bounded_profile_text(value: &str) -> String {
+    let mut output = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index == TASK_PROFILE_STRING_MAX_CHARS {
+            output.push_str("...[truncated]");
+            return output;
+        }
+        output.push(ch);
+    }
+    output
+}
+
 fn ask_task_profile_from_telemetry(
     telemetry: &GenerationTelemetry,
     response_formatting_ms: u64,
@@ -4452,6 +4652,12 @@ async fn execute_retrieve_task_inner(
 
     let configured_rerank_top_n = controls.rerank_config.top_n;
     let mut profile_debug = debug.clone();
+    let profile_controls = retrieve_profile_controls(
+        &controls,
+        &embedding_profile_id,
+        &query_scope,
+        &profile_debug,
+    );
     let mut task_local_spans = debug.local_spans_ms.clone();
     let response_started = Instant::now();
     let mut response = retrieve_response(RetrieveResponseInput {
@@ -4482,6 +4688,8 @@ async fn execute_retrieve_task_inner(
         status: TaskStatus::Succeeded,
         queue_wait_ms,
         total_wall_ms: queue_wait_ms.saturating_add(elapsed_ms(execution_started)),
+        controls: profile_controls,
+        resources: task_resource_profile_from_state(&state),
         endpoints: retrieve_endpoint_summaries(&profile_debug),
         retrieve: Some(retrieve_task_profile_from_debug(
             &profile_debug,
@@ -4684,6 +4892,13 @@ async fn execute_ask_task_inner(
     } else {
         None
     };
+    let profile_controls = ask_profile_controls(
+        &config,
+        &embedding_profile_id,
+        &query_scope,
+        retrieval_debug.as_ref(),
+        show_retrieval,
+    );
     let response_started = Instant::now();
     let response = AskResponse {
         answer: gen_result.answer,
@@ -4715,6 +4930,8 @@ async fn execute_ask_task_inner(
         status: TaskStatus::Succeeded,
         queue_wait_ms,
         total_wall_ms: queue_wait_ms.saturating_add(elapsed_ms(execution_started)),
+        controls: profile_controls,
+        resources: task_resource_profile_from_state(&state),
         endpoints,
         retrieve: retrieve_profile,
         ask: Some(ask_task_profile_from_telemetry(
@@ -14628,7 +14845,10 @@ mod tests {
         config.chat.enabled = true;
         config.chat.base_url = model_server.base_url.clone();
         config.chat.model = "test-chat".into();
+        config.retrieval.dense_top_k = 11;
+        config.retrieval.bm25_top_k = 7;
         config.rerank.enabled = false;
+        config.rerank.top_n = 5;
         config.verifier.enabled = false;
 
         let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
@@ -14660,6 +14880,16 @@ mod tests {
         assert_eq!(model_server.chat_requests(), 1);
         let task_id = latest_task_id(&state, TaskKind::Ask);
 
+        {
+            let mut runtime = state.runtime_config.write().unwrap();
+            runtime.config.retrieval.dense_top_k = 999;
+            runtime.config.retrieval.bm25_top_k = 999;
+            runtime.config.rerank.enabled = true;
+            runtime.config.rerank.top_n = 99;
+            runtime.config.qdrant.enabled = true;
+            runtime.config.qdrant.prefer_for_search = true;
+        }
+
         let before_embedding = model_server.embedding_requests();
         let before_chat = model_server.chat_requests();
         let before_models = model_server.model_requests();
@@ -14671,6 +14901,29 @@ mod tests {
         assert_eq!(profile_response.profile.task_id, task_id);
         assert_eq!(profile_response.profile.task_kind, TaskKind::Ask);
         assert_eq!(profile_response.profile.status, TaskStatus::Succeeded);
+        let value = serde_json::to_value(&profile_response.profile).unwrap();
+        assert_eq!(value["controls"]["retrieval"]["dense_top_k"], 11);
+        assert_eq!(value["controls"]["retrieval"]["bm25_top_k"], 7);
+        assert_eq!(value["controls"]["rerank"]["enabled"], false);
+        assert_eq!(value["controls"]["rerank"]["configured_top_n"], 5);
+        assert_eq!(
+            value["controls"]["rerank"]["effective_top_n"],
+            serde_json::Value::Null
+        );
+        assert_eq!(value["controls"]["qdrant"]["enabled"], false);
+        assert_eq!(value["controls"]["vector"]["embedding_enabled"], false);
+        assert_eq!(value["controls"]["vector"]["dense_path"], "bm25_only");
+        assert_eq!(
+            value["controls"]["filters"]["source"]["effective_source_count"],
+            1
+        );
+        assert_eq!(value["controls"]["output"]["show_retrieval"], false);
+        assert!(value["resources"]["queues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|resource| resource["name"] == "sqlite_reader"
+                && resource.get("latest_queue_wait_ms").is_some()));
         let retrieve_profile = profile_response
             .profile
             .retrieve
@@ -14709,9 +14962,14 @@ mod tests {
             .any(|endpoint| endpoint.name == "chat" && endpoint.calls == 1));
 
         let encoded = serde_json::to_string(&profile_response.profile).unwrap();
+        assert!(encoded.len() <= 16 * 1024);
         assert!(!encoded.contains("BM25 answer"));
+        assert!(!encoded.contains("What should ask profile lookup reuse?"));
+        assert!(!encoded.contains("Ask profile lookup should reuse"));
         assert!(!encoded.contains("SOURCE PACK"));
         assert!(!encoded.contains("USER QUESTION"));
+        assert!(!encoded.contains("bm25_hits"));
+        assert!(!encoded.contains("dense_hits"));
         assert!(!encoded.contains("api_key"));
         assert_eq!(model_server.embedding_requests(), before_embedding);
         assert_eq!(model_server.chat_requests(), before_chat);
@@ -14848,6 +15106,16 @@ mod tests {
         .await
         .unwrap();
 
+        {
+            let mut runtime = state.runtime_config.write().unwrap();
+            runtime.config.retrieval.dense_top_k = 777;
+            runtime.config.retrieval.bm25_top_k = 777;
+            runtime.config.rerank.enabled = true;
+            runtime.config.rerank.top_n = 77;
+            runtime.config.qdrant.enabled = true;
+            runtime.config.qdrant.prefer_for_search = true;
+        }
+
         let before_embedding = model_server.embedding_requests();
         let before_chat = model_server.chat_requests();
         let before_models = model_server.model_requests();
@@ -14868,6 +15136,46 @@ mod tests {
             profile_response.profile.schema_version,
             verbatim_core::task::TASK_PROFILE_SCHEMA_VERSION
         );
+        let value = serde_json::to_value(&profile_response.profile).unwrap();
+        assert_eq!(value["controls"]["retrieval"]["dense_top_k"], 20);
+        assert_eq!(value["controls"]["retrieval"]["bm25_top_k"], 3);
+        assert_eq!(value["controls"]["retrieval"]["fast"], true);
+        assert_eq!(value["controls"]["rerank"]["enabled"], false);
+        assert_eq!(value["controls"]["rerank"]["configured_top_n"], 0);
+        assert_eq!(
+            value["controls"]["rerank"]["effective_top_n"],
+            serde_json::Value::Null
+        );
+        assert_eq!(value["controls"]["qdrant"]["enabled"], false);
+        assert_eq!(value["controls"]["qdrant"]["preferred"], false);
+        assert_eq!(value["controls"]["qdrant"]["used"], false);
+        assert_eq!(value["controls"]["vector"]["embedding_enabled"], false);
+        assert_eq!(value["controls"]["vector"]["dense_path"], "bm25_only");
+        assert_eq!(
+            value["controls"]["filters"]["source"]["effective_source_count"],
+            1
+        );
+        assert_eq!(value["controls"]["output"]["limit"], 3);
+        assert_eq!(value["controls"]["output"]["page_size"], 3);
+        assert_eq!(value["controls"]["output"]["page"], 1);
+        assert_eq!(
+            value["resources"]["queues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|resource| resource["name"] == "sqlite_reader")
+                .count(),
+            1
+        );
+        assert!(
+            value["resources"]["queues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|resource| resource["name"] == "cpu_worker"
+                    && resource.get("latest_service_ms").is_some()),
+            "profile should serialize unavailable resource timings as stable null fields"
+        );
         assert!(profile_response.profile.endpoints.is_empty());
         let retrieve_profile = profile_response
             .profile
@@ -14887,6 +15195,12 @@ mod tests {
             retrieve_response.returned_results
         );
         assert!(profile_response.profile.total_wall_ms >= profile_response.profile.queue_wait_ms);
+        let encoded = serde_json::to_string(&profile_response.profile).unwrap();
+        assert!(encoded.len() <= 16 * 1024);
+        assert!(!encoded.contains("Profile lookup should reuse"));
+        assert!(!encoded.contains("bm25_hits"));
+        assert!(!encoded.contains("dense_hits"));
+        assert!(!encoded.contains("final_evidence_pack"));
         assert_eq!(model_server.embedding_requests(), before_embedding);
         assert_eq!(model_server.chat_requests(), before_chat);
         assert_eq!(model_server.model_requests(), before_models);
@@ -14914,6 +15228,8 @@ mod tests {
             status: TaskStatus::Succeeded,
             queue_wait_ms: 7,
             total_wall_ms: 136_572,
+            controls: Default::default(),
+            resources: Default::default(),
             endpoints: vec![
                 TaskEndpointSummary::single_call("embedding", 761),
                 TaskEndpointSummary::single_call("reranker", 1_357),

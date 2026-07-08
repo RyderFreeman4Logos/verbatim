@@ -5575,6 +5575,8 @@ mod tests {
             status: TaskStatus::Succeeded,
             queue_wait_ms: 0,
             total_wall_ms: 25,
+            controls: Default::default(),
+            resources: Default::default(),
             endpoints: Vec::new(),
             retrieve: Some(verbatim_core::task::RetrieveTaskProfile {
                 dense: verbatim_core::task::RetrieveDenseStageProfile {
