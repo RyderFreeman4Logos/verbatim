@@ -1043,6 +1043,8 @@ pub enum RetrievalDenseVectorPath {
     LowMemorySqliteScan,
     /// Dense retrieval used the resident local HNSW index.
     ResidentHnsw,
+    /// Dense retrieval used preferred Qdrant hits, with local validation/fill.
+    Qdrant,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

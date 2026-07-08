@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::resource::TaskResourceProgress;
-use crate::types::{hex_sha256, EmbeddingCacheStats};
+use crate::types::{
+    hex_sha256, EmbeddingCacheStats, RetrievalDenseVectorPath, RetrievalRerankStatus,
+};
 
 static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -201,6 +203,68 @@ pub struct TaskProfile {
     pub status: TaskStatus,
     pub queue_wait_ms: u64,
     pub total_wall_ms: u64,
+    #[serde(default)]
+    pub endpoints: Vec<TaskEndpointSummary>,
+    #[serde(default)]
+    pub retrieve: Option<RetrieveTaskProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveTaskProfile {
+    pub dense: RetrieveDenseStageProfile,
+    pub bm25: RetrieveStageProfile,
+    pub fusion: RetrieveStageProfile,
+    pub rerank: RetrieveRerankStageProfile,
+    pub evidence: RetrieveEvidenceStageProfile,
+    pub display: RetrieveDisplayStageProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveDenseStageProfile {
+    pub path: RetrievalDenseVectorPath,
+    pub candidate_count: usize,
+    pub local_ms: u64,
+    pub query_embedding_ms: u64,
+    pub endpoint_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveStageProfile {
+    pub candidate_count: usize,
+    pub local_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveRerankStageProfile {
+    pub status: RetrievalRerankStatus,
+    pub reason: Option<String>,
+    pub input_count: Option<usize>,
+    pub configured_top_n: usize,
+    pub effective_top_n: Option<usize>,
+    pub output_count: usize,
+    pub local_ms: u64,
+    pub endpoint_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveEvidenceStageProfile {
+    pub result_count: usize,
+    pub graph_expanded_count: usize,
+    pub final_count: usize,
+    pub display_count: usize,
+    pub result_hydration_ms: u64,
+    pub graph_expansion_ms: u64,
+    pub final_pack_ms: u64,
+    pub display_pack_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveDisplayStageProfile {
+    pub returned_count: usize,
+    pub response_formatting_ms: u64,
+    pub canonical_support_embedding_ms: Option<u64>,
+    pub canonical_display_selection_ms: Option<u64>,
+    pub canonical_selected_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -889,6 +953,110 @@ mod tests {
                 .len(),
             1024
         );
+    }
+
+    #[test]
+    fn retrieve_task_profile_json_is_bounded_and_stage_oriented() {
+        let profile = TaskProfile {
+            schema_version: TASK_PROFILE_SCHEMA_VERSION,
+            task_id: TaskId("task-slow-local".into()),
+            task_kind: TaskKind::Retrieve,
+            status: TaskStatus::Succeeded,
+            queue_wait_ms: 5,
+            total_wall_ms: 136_572,
+            endpoints: vec![
+                TaskEndpointSummary::single_call("embedding", 761),
+                TaskEndpointSummary::single_call("reranker", 1_357),
+            ],
+            retrieve: Some(RetrieveTaskProfile {
+                dense: RetrieveDenseStageProfile {
+                    path: RetrievalDenseVectorPath::LowMemorySqliteScan,
+                    candidate_count: 20_000,
+                    local_ms: 96_000,
+                    query_embedding_ms: 761,
+                    endpoint_latency_ms: Some(761),
+                },
+                bm25: RetrieveStageProfile {
+                    candidate_count: 5_000,
+                    local_ms: 2_000,
+                },
+                fusion: RetrieveStageProfile {
+                    candidate_count: 22_000,
+                    local_ms: 900,
+                },
+                rerank: RetrieveRerankStageProfile {
+                    status: RetrievalRerankStatus::Succeeded,
+                    reason: None,
+                    input_count: Some(100),
+                    configured_top_n: 20,
+                    effective_top_n: Some(20),
+                    output_count: 20,
+                    local_ms: 1_400,
+                    endpoint_latency_ms: Some(1_357),
+                },
+                evidence: RetrieveEvidenceStageProfile {
+                    result_count: 100,
+                    graph_expanded_count: 4,
+                    final_count: 1_500,
+                    display_count: 10,
+                    result_hydration_ms: 21_000,
+                    graph_expansion_ms: 3_000,
+                    final_pack_ms: 0,
+                    display_pack_ms: 9_500,
+                },
+                display: RetrieveDisplayStageProfile {
+                    returned_count: 10,
+                    response_formatting_ms: 315,
+                    canonical_support_embedding_ms: Some(120),
+                    canonical_display_selection_ms: Some(250),
+                    canonical_selected_count: Some(10),
+                },
+            }),
+        };
+
+        let encoded = serde_json::to_string(&profile).unwrap();
+        let value: Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(value["retrieve"]["dense"]["path"], "low_memory_sqlite_scan");
+        assert_eq!(value["retrieve"]["dense"]["local_ms"], 96_000);
+        assert_eq!(
+            value["retrieve"]["dense"]["endpoint_latency_ms"],
+            json!(761)
+        );
+        assert_eq!(value["retrieve"]["bm25"]["candidate_count"], 5_000);
+        assert_eq!(value["retrieve"]["fusion"]["candidate_count"], 22_000);
+        assert_eq!(value["retrieve"]["rerank"]["input_count"], 100);
+        assert_eq!(value["retrieve"]["rerank"]["configured_top_n"], 20);
+        assert_eq!(value["retrieve"]["rerank"]["effective_top_n"], 20);
+        assert_eq!(
+            value["retrieve"]["rerank"]["endpoint_latency_ms"],
+            json!(1_357)
+        );
+        assert_eq!(value["retrieve"]["evidence"]["final_count"], 1_500);
+        assert_eq!(value["retrieve"]["display"]["canonical_selected_count"], 10);
+        assert_eq!(value["endpoints"][0]["name"], "embedding");
+        assert_eq!(value["endpoints"][1]["name"], "reranker");
+        assert!(!encoded.contains("chunk-"));
+        assert!(!encoded.contains("evidence_id"));
+        assert!(!encoded.contains("prompt"));
+        assert!(!encoded.contains("document"));
+        assert!(!encoded.contains("api_key"));
+    }
+
+    #[test]
+    fn legacy_minimal_task_profile_json_defaults_new_fields() {
+        let profile: TaskProfile = serde_json::from_value(json!({
+            "schema_version": TASK_PROFILE_SCHEMA_VERSION,
+            "task_id": "task-legacy",
+            "task_kind": "retrieve",
+            "status": "succeeded",
+            "queue_wait_ms": 0,
+            "total_wall_ms": 17
+        }))
+        .unwrap();
+
+        assert!(profile.endpoints.is_empty());
+        assert!(profile.retrieve.is_none());
     }
 
     #[test]

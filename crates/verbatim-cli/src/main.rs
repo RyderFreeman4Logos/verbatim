@@ -2184,7 +2184,9 @@ mod tests {
         IngestTaskStage, TaskEndpointSummary, TaskEvent, TaskId, TaskKind, TaskProfile,
         TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
     };
-    use verbatim_core::types::{SourceId, SourceLocator};
+    use verbatim_core::types::{
+        RetrievalDenseVectorPath, RetrievalRerankStatus, SourceId, SourceLocator,
+    };
 
     use super::*;
 
@@ -3312,6 +3314,9 @@ mod tests {
         );
         assert!(parsed["queue_wait_ms"].is_u64());
         assert!(parsed["total_wall_ms"].is_u64());
+        assert_eq!(parsed["retrieve"]["dense"]["path"], "bm25_only");
+        assert_eq!(parsed["retrieve"]["bm25"]["candidate_count"], 1);
+        assert!(parsed["retrieve"]["rerank"]["input_count"].is_null());
     }
 
     #[test]
@@ -5570,6 +5575,51 @@ mod tests {
             status: TaskStatus::Succeeded,
             queue_wait_ms: 0,
             total_wall_ms: 25,
+            endpoints: Vec::new(),
+            retrieve: Some(verbatim_core::task::RetrieveTaskProfile {
+                dense: verbatim_core::task::RetrieveDenseStageProfile {
+                    path: RetrievalDenseVectorPath::Bm25Only,
+                    candidate_count: 0,
+                    local_ms: 0,
+                    query_embedding_ms: 0,
+                    endpoint_latency_ms: None,
+                },
+                bm25: verbatim_core::task::RetrieveStageProfile {
+                    candidate_count: 1,
+                    local_ms: 3,
+                },
+                fusion: verbatim_core::task::RetrieveStageProfile {
+                    candidate_count: 1,
+                    local_ms: 1,
+                },
+                rerank: verbatim_core::task::RetrieveRerankStageProfile {
+                    status: RetrievalRerankStatus::Disabled,
+                    reason: None,
+                    input_count: None,
+                    configured_top_n: 0,
+                    effective_top_n: None,
+                    output_count: 0,
+                    local_ms: 0,
+                    endpoint_latency_ms: None,
+                },
+                evidence: verbatim_core::task::RetrieveEvidenceStageProfile {
+                    result_count: 1,
+                    graph_expanded_count: 0,
+                    final_count: 1,
+                    display_count: 1,
+                    result_hydration_ms: 2,
+                    graph_expansion_ms: 0,
+                    final_pack_ms: 0,
+                    display_pack_ms: 1,
+                },
+                display: verbatim_core::task::RetrieveDisplayStageProfile {
+                    returned_count: 1,
+                    response_formatting_ms: 1,
+                    canonical_support_embedding_ms: None,
+                    canonical_display_selection_ms: None,
+                    canonical_selected_count: None,
+                },
+            }),
         }
     }
 

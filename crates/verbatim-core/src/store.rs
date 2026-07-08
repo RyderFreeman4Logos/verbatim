@@ -6552,6 +6552,8 @@ mod tests {
             status: TaskStatus::Succeeded,
             queue_wait_ms: 0,
             total_wall_ms: 17,
+            endpoints: Vec::new(),
+            retrieve: None,
         };
         store
             .finish_task_success_with_profile(

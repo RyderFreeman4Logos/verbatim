@@ -82,16 +82,18 @@ use verbatim_core::task::{
     ingest_task_request_metadata_with_queue_claim_and_batch, reindex_result_metadata,
     reindex_task_request_metadata_with_queue_claim,
     reindex_task_request_metadata_with_queue_claim_and_batch, retrieve_request_metadata,
-    retrieve_result_metadata, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskEvent, TaskId,
-    TaskKind, TaskProfile, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
+    retrieve_result_metadata, IngestTaskStage, PhaseTiming, RetrieveDenseStageProfile,
+    RetrieveDisplayStageProfile, RetrieveEvidenceStageProfile, RetrieveRerankStageProfile,
+    RetrieveStageProfile, RetrieveTaskProfile, TaskEndpointSummary, TaskEvent, TaskId, TaskKind,
+    TaskProfile, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
 };
 use verbatim_core::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 use verbatim_core::types::{
     CanonicalLocator, CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId,
     EvidenceKind, ImageArtifact, ReferenceComponent, RetrievalDebug,
     RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
-    RetrievalEvidenceRole, RetrievalLocalSpansMs, RetrievalResult, SourceId, SourceLocator,
-    SourceStatus,
+    RetrievalEvidenceRole, RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalResult, SourceId,
+    SourceLocator, SourceStatus,
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
@@ -2971,6 +2973,89 @@ fn retrieve_local_span_entries(
     entries
 }
 
+fn retrieve_endpoint_summaries(debug: &RetrievalDebug) -> Vec<TaskEndpointSummary> {
+    let mut endpoints = Vec::new();
+    if let Some(latency_ms) = debug.query_embedding_latency_ms {
+        endpoints.push(TaskEndpointSummary::single_call("embedding", latency_ms));
+    }
+    if let Some(latency_ms) = debug.reranker.latency_ms {
+        let endpoint = match debug.reranker.status {
+            RetrievalRerankStatus::Fallback => TaskEndpointSummary::failed_call(
+                "reranker",
+                Some(latency_ms),
+                debug
+                    .reranker
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "rerank fallback".into()),
+            ),
+            RetrievalRerankStatus::Succeeded
+            | RetrievalRerankStatus::Disabled
+            | RetrievalRerankStatus::Skipped => {
+                TaskEndpointSummary::single_call("reranker", latency_ms)
+            }
+        };
+        endpoints.push(endpoint);
+    }
+    endpoints
+}
+
+fn retrieve_task_profile_from_debug(
+    debug: &RetrievalDebug,
+    configured_rerank_top_n: usize,
+    total_results: usize,
+    returned_results: usize,
+) -> RetrieveTaskProfile {
+    let spans = &debug.local_spans_ms;
+    let canonical_selected_count = spans
+        .canonical_display_selection_ms
+        .map(|_| debug.display_evidence_count);
+    RetrieveTaskProfile {
+        dense: RetrieveDenseStageProfile {
+            path: debug.dense_vector_path,
+            candidate_count: debug.dense_hits.len(),
+            local_ms: spans.dense_vector_search_ms,
+            query_embedding_ms: spans.query_embedding_ms,
+            endpoint_latency_ms: debug.query_embedding_latency_ms,
+        },
+        bm25: RetrieveStageProfile {
+            candidate_count: debug.bm25_hits.len(),
+            local_ms: spans.bm25_search_ms,
+        },
+        fusion: RetrieveStageProfile {
+            candidate_count: debug.rrf_fused_hits.len(),
+            local_ms: spans.rrf_fusion_ms,
+        },
+        rerank: RetrieveRerankStageProfile {
+            status: debug.reranker.status,
+            reason: debug.reranker.reason.clone(),
+            input_count: debug.reranker.candidate_count,
+            configured_top_n: configured_rerank_top_n,
+            effective_top_n: debug.reranker.top_n,
+            output_count: debug.reranker.scores.len(),
+            local_ms: spans.rerank_total_ms,
+            endpoint_latency_ms: debug.reranker.latency_ms,
+        },
+        evidence: RetrieveEvidenceStageProfile {
+            result_count: total_results,
+            graph_expanded_count: debug.graph_expanded_hits.len(),
+            final_count: debug.final_evidence_count,
+            display_count: debug.display_evidence_count,
+            result_hydration_ms: spans.result_hydration_ms,
+            graph_expansion_ms: spans.graph_expansion_ms,
+            final_pack_ms: spans.final_evidence_pack_ms,
+            display_pack_ms: spans.display_evidence_pack_ms,
+        },
+        display: RetrieveDisplayStageProfile {
+            returned_count: returned_results,
+            response_formatting_ms: spans.response_formatting_ms,
+            canonical_support_embedding_ms: spans.canonical_support_embedding_ms,
+            canonical_display_selection_ms: spans.canonical_display_selection_ms,
+            canonical_selected_count,
+        },
+    }
+}
+
 async fn record_task_progress(
     state: &SharedState,
     task_id: &TaskId,
@@ -4271,6 +4356,8 @@ async fn execute_retrieve_task_inner(
     )
     .await?;
 
+    let configured_rerank_top_n = controls.rerank_config.top_n;
+    let mut profile_debug = debug.clone();
     let mut task_local_spans = debug.local_spans_ms.clone();
     let response_started = Instant::now();
     let mut response = retrieve_response(RetrieveResponseInput {
@@ -4288,6 +4375,7 @@ async fn execute_retrieve_task_inner(
     });
     let response_formatting_ms = elapsed_ms(response_started);
     task_local_spans.response_formatting_ms = response_formatting_ms;
+    profile_debug.local_spans_ms.response_formatting_ms = response_formatting_ms;
     if let Some(response_debug) = response.debug.as_mut() {
         response_debug.local_spans_ms.response_formatting_ms = response_formatting_ms;
     }
@@ -4300,6 +4388,13 @@ async fn execute_retrieve_task_inner(
         status: TaskStatus::Succeeded,
         queue_wait_ms,
         total_wall_ms: queue_wait_ms.saturating_add(elapsed_ms(execution_started)),
+        endpoints: retrieve_endpoint_summaries(&profile_debug),
+        retrieve: Some(retrieve_task_profile_from_debug(
+            &profile_debug,
+            configured_rerank_top_n,
+            response.total_results,
+            response.returned_results,
+        )),
     };
     finish_task_success_with_profile(
         &state,
@@ -14444,10 +14539,140 @@ mod tests {
             profile_response.profile.schema_version,
             verbatim_core::task::TASK_PROFILE_SCHEMA_VERSION
         );
+        assert!(profile_response.profile.endpoints.is_empty());
+        let retrieve_profile = profile_response
+            .profile
+            .retrieve
+            .as_ref()
+            .expect("retrieve task profile should include retrieve stages");
+        assert_eq!(
+            retrieve_profile.dense.path,
+            RetrievalDenseVectorPath::Bm25Only
+        );
+        assert_eq!(retrieve_profile.dense.candidate_count, 0);
+        assert!(retrieve_profile.bm25.candidate_count > 0);
+        assert!(retrieve_profile.fusion.candidate_count > 0);
+        assert!(retrieve_profile.evidence.final_count > 0);
+        assert_eq!(
+            retrieve_profile.display.returned_count,
+            retrieve_response.returned_results
+        );
         assert!(profile_response.profile.total_wall_ms >= profile_response.profile.queue_wait_ms);
         assert_eq!(model_server.embedding_requests(), before_embedding);
         assert_eq!(model_server.chat_requests(), before_chat);
         assert_eq!(model_server.model_requests(), before_models);
+    }
+
+    #[tokio::test]
+    async fn retrieve_profile_json_distinguishes_slow_local_work_from_fast_model_endpoints() {
+        let test_dir = TestDir::new("retrieve-profile-slow-local-fast-model");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("Where did retrieve spend time?", None, None, 20, 20, 20),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &task_id).await.unwrap();
+
+        let profile = TaskProfile {
+            schema_version: verbatim_core::task::TASK_PROFILE_SCHEMA_VERSION,
+            task_id: task_id.clone(),
+            task_kind: TaskKind::Retrieve,
+            status: TaskStatus::Succeeded,
+            queue_wait_ms: 7,
+            total_wall_ms: 136_572,
+            endpoints: vec![
+                TaskEndpointSummary::single_call("embedding", 761),
+                TaskEndpointSummary::single_call("reranker", 1_357),
+            ],
+            retrieve: Some(RetrieveTaskProfile {
+                dense: RetrieveDenseStageProfile {
+                    path: RetrievalDenseVectorPath::LowMemorySqliteScan,
+                    candidate_count: 20_000,
+                    local_ms: 96_000,
+                    query_embedding_ms: 761,
+                    endpoint_latency_ms: Some(761),
+                },
+                bm25: RetrieveStageProfile {
+                    candidate_count: 5_000,
+                    local_ms: 2_000,
+                },
+                fusion: RetrieveStageProfile {
+                    candidate_count: 22_000,
+                    local_ms: 900,
+                },
+                rerank: RetrieveRerankStageProfile {
+                    status: RetrievalRerankStatus::Succeeded,
+                    reason: None,
+                    input_count: Some(100),
+                    configured_top_n: 20,
+                    effective_top_n: Some(20),
+                    output_count: 20,
+                    local_ms: 1_400,
+                    endpoint_latency_ms: Some(1_357),
+                },
+                evidence: RetrieveEvidenceStageProfile {
+                    result_count: 100,
+                    graph_expanded_count: 4,
+                    final_count: 1_500,
+                    display_count: 10,
+                    result_hydration_ms: 21_000,
+                    graph_expansion_ms: 3_000,
+                    final_pack_ms: 0,
+                    display_pack_ms: 9_500,
+                },
+                display: RetrieveDisplayStageProfile {
+                    returned_count: 10,
+                    response_formatting_ms: 315,
+                    canonical_support_embedding_ms: Some(120),
+                    canonical_display_selection_ms: Some(250),
+                    canonical_selected_count: Some(10),
+                },
+            }),
+        };
+        finish_task_success_with_profile(
+            &state,
+            &task_id,
+            retrieve_result_metadata(100, 10, true),
+            profile,
+        )
+        .await
+        .unwrap();
+
+        let Json(profile_response) =
+            task_profile_handler(State(Arc::clone(&state)), Path(task_id.0.clone()))
+                .await
+                .unwrap();
+        let value = serde_json::to_value(&profile_response.profile).unwrap();
+
+        assert_eq!(value["endpoints"][0]["latest_latency_ms"], 761);
+        assert_eq!(value["endpoints"][1]["latest_latency_ms"], 1_357);
+        assert_eq!(value["retrieve"]["dense"]["path"], "low_memory_sqlite_scan");
+        assert_eq!(value["retrieve"]["dense"]["local_ms"], 96_000);
+        assert_eq!(value["retrieve"]["evidence"]["result_hydration_ms"], 21_000);
+        assert_eq!(value["retrieve"]["evidence"]["display_pack_ms"], 9_500);
+        assert_eq!(
+            value["retrieve"]["rerank"]["endpoint_latency_ms"],
+            serde_json::json!(1_357)
+        );
+        let local_ms = value["retrieve"]["dense"]["local_ms"].as_u64().unwrap()
+            + value["retrieve"]["evidence"]["result_hydration_ms"]
+                .as_u64()
+                .unwrap()
+            + value["retrieve"]["evidence"]["display_pack_ms"]
+                .as_u64()
+                .unwrap();
+        let model_ms = value["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|endpoint| endpoint["latest_latency_ms"].as_u64().unwrap())
+            .sum::<u64>();
+        assert!(local_ms > model_ms * 30);
     }
 
     #[tokio::test]
