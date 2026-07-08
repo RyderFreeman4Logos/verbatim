@@ -336,6 +336,7 @@ where
                     rerank_top_n: None,
                     bypass_cache: false,
                     include_debug: show_retrieval,
+                    include_debug_packs: false,
                     include_locator: format == RetrieveFormat::Json,
                     passage: false,
                 };
@@ -432,6 +433,7 @@ where
                 rerank_top_n,
                 bypass_cache: no_cache,
                 include_debug: show_debug,
+                include_debug_packs: show_debug && verbose,
                 include_locator,
                 passage,
             };
@@ -1238,10 +1240,11 @@ Debugging:
   columns: rank, score, citation, collection, source, locator, snippet.
   --collection filters against materialized daemon membership and does not
   rescan collection roots during retrieve.
-  --show-debug writes a compact JSON retrieval diagnostic summary to stderr.
+  --show-debug writes a compact JSON retrieval diagnostic summary with local
+  stage spans to stderr.
   --show-debug --verbose writes the full task diagnostics, engine controls,
   timing, locators, internal evidence metadata, and deterministic
-  dense/BM25/RRF/rerank ranking details to stderr.
+  dense/BM25/RRF/rerank ranking details and local stage spans to stderr.
   JSON output retains structured locator/provenance fields and full evidence
   identifiers for evidence lookups, but retrieval debug diagnostics stay on stderr.
 "#;
@@ -2388,8 +2391,9 @@ mod tests {
         assert!(help.contains("Scores are ranked chunk-level scores"));
         assert!(help.contains("chunk-internal support unit"));
         assert!(help.contains("snippets/text-only omit headers"));
-        assert!(help.contains("--show-debug writes a compact JSON retrieval diagnostic summary"));
+        assert!(help.contains("compact JSON retrieval diagnostic summary with local"));
         assert!(help.contains("--show-debug --verbose writes the full task diagnostics"));
+        assert!(help.contains("local stage spans"));
         assert!(help.contains("dense/BM25/RRF/rerank"));
         assert!(help.contains("--show-locator"));
         assert!(help.contains("structured locator/provenance"));
@@ -3732,6 +3736,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: false,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             }
@@ -3918,6 +3923,14 @@ mod tests {
                 .include_debug
         );
         assert!(
+            !client
+                .last_retrieve
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .include_debug_packs
+        );
+        assert!(
             client
                 .last_retrieve
                 .borrow()
@@ -3932,6 +3945,8 @@ mod tests {
         let debug: serde_json::Value = serde_json::from_str(&stderr).unwrap();
         assert_eq!(debug["kind"], "retrieval_debug_summary");
         assert_eq!(debug["timing_ms"]["retrieval_ms"], 7);
+        assert_eq!(debug["local_spans_ms"]["dense_vector_search_ms"], 3);
+        assert_eq!(debug["local_spans_ms"]["response_formatting_ms"], 12);
         assert_eq!(debug["counts"]["final_evidence"], 1);
         assert_eq!(debug["reranker"]["status"], "skipped");
         assert_eq!(
@@ -3946,7 +3961,7 @@ mod tests {
 
     #[test]
     fn retrieve_markdown_show_debug_verbose_writes_full_debug_to_stderr() {
-        let (code, stdout, stderr, _, _) = run_mock([
+        let (code, stdout, stderr, client, _) = run_mock([
             "retrieve",
             "--show-debug",
             "--verbose",
@@ -3958,10 +3973,19 @@ mod tests {
         ]);
 
         assert_eq!(code.unwrap(), 0);
+        assert!(
+            client
+                .last_retrieve
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .include_debug_packs
+        );
         assert!(stdout.contains("1. score=0.0310 [doc.md L1]"));
         assert!(!stdout.contains("Retrieval Debug"));
         assert!(stderr.contains("Context pack: task-1"));
         assert!(stderr.contains("Retrieval Debug"));
+        assert!(stderr.contains("dense_vector_search_ms=3ms"));
         assert!(stderr.contains("Final evidence pack:"));
     }
 
@@ -4028,6 +4052,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: true,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             }
@@ -5459,6 +5484,22 @@ mod tests {
     fn sample_debug_json() -> Value {
         serde_json::json!({
             "dense_vector_path": "resident_hnsw",
+            "local_spans_ms": {
+                "setup_ms": 1,
+                "query_embedding_ms": 2,
+                "dense_vector_search_ms": 3,
+                "bm25_search_ms": 4,
+                "rrf_fusion_ms": 5,
+                "debug_candidate_pack_ms": 6,
+                "rerank_total_ms": 7,
+                "result_hydration_ms": 8,
+                "graph_expansion_ms": 9,
+                "final_evidence_pack_ms": 10,
+                "display_evidence_pack_ms": 11,
+                "response_formatting_ms": 12,
+                "canonical_support_embedding_ms": 13,
+                "canonical_display_selection_ms": 14
+            },
             "bm25_hits": [
                 {
                     "rank": 1,

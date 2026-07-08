@@ -956,12 +956,55 @@ impl Default for RetrievalProvenance {
     }
 }
 
+/// Retrieve diagnostic durations in milliseconds.
+///
+/// `canonical_*` values are nested in `display_evidence_pack_ms` when present;
+/// `response_formatting_ms` is measured by the daemon after core retrieval.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalLocalSpansMs {
+    pub setup_ms: u64,
+    pub query_embedding_ms: u64,
+    pub dense_vector_search_ms: u64,
+    pub bm25_search_ms: u64,
+    pub rrf_fusion_ms: u64,
+    pub debug_candidate_pack_ms: u64,
+    pub rerank_total_ms: u64,
+    pub result_hydration_ms: u64,
+    pub graph_expansion_ms: u64,
+    pub final_evidence_pack_ms: u64,
+    pub display_evidence_pack_ms: u64,
+    pub response_formatting_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_support_embedding_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_display_selection_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalDebugEvidencePackMode {
+    /// Build full diagnostic evidence-pack arrays.
+    #[default]
+    Full,
+    /// Keep compact counts/spans and only build display entries needed by
+    /// normal retrieve response rendering.
+    Compact,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalDebug {
     #[serde(default)]
     pub dense_vector_path: RetrievalDenseVectorPath,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_embedding_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub local_spans_ms: RetrievalLocalSpansMs,
+    #[serde(default)]
+    pub evidence_pack_mode: RetrievalDebugEvidencePackMode,
+    #[serde(default)]
+    pub final_evidence_count: usize,
+    #[serde(default)]
+    pub display_evidence_count: usize,
     pub bm25_hits: Vec<RetrievalStageHit>,
     pub dense_hits: Vec<RetrievalStageHit>,
     pub rrf_fused_hits: Vec<RetrievalFusedHit>,
@@ -1317,6 +1360,22 @@ mod tests {
         let debug = RetrievalDebug {
             dense_vector_path: RetrievalDenseVectorPath::ResidentHnsw,
             query_embedding_latency_ms: None,
+            local_spans_ms: RetrievalLocalSpansMs {
+                setup_ms: 1,
+                query_embedding_ms: 2,
+                dense_vector_search_ms: 3,
+                bm25_search_ms: 4,
+                rrf_fusion_ms: 5,
+                debug_candidate_pack_ms: 6,
+                rerank_total_ms: 7,
+                result_hydration_ms: 8,
+                graph_expansion_ms: 9,
+                final_evidence_pack_ms: 10,
+                display_evidence_pack_ms: 11,
+                response_formatting_ms: 12,
+                canonical_support_embedding_ms: Some(13),
+                canonical_display_selection_ms: Some(14),
+            },
             bm25_hits: vec![RetrievalStageHit {
                 rank: 1,
                 chunk_id: ChunkId("chunk-1".into()),
@@ -1352,6 +1411,9 @@ mod tests {
                 reason: "included_by_configured_graph_expansion".into(),
             }],
             reranker: RetrievalRerankDebug::skipped("disabled"),
+            evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
+            final_evidence_count: 1,
+            display_evidence_count: 1,
             final_evidence_pack: vec![RetrievalEvidencePackEntry {
                 label: "E1".into(),
                 result_rank: 1,
@@ -1380,6 +1442,13 @@ mod tests {
         };
 
         let encoded = serde_json::to_string(&debug).unwrap();
+        assert!(encoded.contains("local_spans_ms"));
+        assert!(encoded.contains("dense_vector_search_ms"));
+        assert!(encoded.contains("response_formatting_ms"));
+        assert!(encoded.contains("canonical_display_selection_ms"));
+        assert!(encoded.contains("evidence_pack_mode"));
+        assert!(encoded.contains("final_evidence_count"));
+        assert!(encoded.contains("display_evidence_count"));
         assert!(encoded.contains("bm25_hits"));
         assert!(encoded.contains("graph_expanded_hits"));
         assert!(encoded.contains("final_evidence_pack"));

@@ -608,6 +608,8 @@ pub struct RetrieveRequest {
     pub bypass_cache: bool,
     #[serde(default)]
     pub include_debug: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_debug_packs: bool,
     #[serde(default)]
     pub include_locator: bool,
     #[serde(default, skip_serializing_if = "is_false")]
