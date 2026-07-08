@@ -71,7 +71,10 @@ use verbatim_core::provider::ProviderError;
 use verbatim_core::resource::{
     global_resource_registry, ObservableResource, ResourceLimitConfig, ResourceQueueSnapshot,
 };
-use verbatim_core::retrieve::{refresh_final_evidence_pack_debug, RetrievalPipeline};
+use verbatim_core::retrieve::{
+    refresh_evidence_pack_debug, RetrievalCanonicalSelectionBudget, RetrievalDebugOptions,
+    RetrievalDisplayScope, RetrievalPipeline,
+};
 use verbatim_core::store::{Store, TaskListFilter};
 use verbatim_core::task::{
     ask_request_metadata, ask_result_metadata, bounded_error, bounded_json, ingest_result_metadata,
@@ -85,8 +88,9 @@ use verbatim_core::task::{
 use verbatim_core::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 use verbatim_core::types::{
     CanonicalLocator, CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId,
-    EvidenceKind, ImageArtifact, ReferenceComponent, RetrievalDebug, RetrievalDenseVectorPath,
-    RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalResult, SourceId, SourceLocator,
+    EvidenceKind, ImageArtifact, ReferenceComponent, RetrievalDebug,
+    RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
+    RetrievalEvidenceRole, RetrievalLocalSpansMs, RetrievalResult, SourceId, SourceLocator,
     SourceStatus,
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
@@ -2843,6 +2847,99 @@ async fn record_task_span(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
+async fn record_retrieve_local_spans(
+    state: &SharedState,
+    task_id: &TaskId,
+    parent_started_at: &str,
+    spans: &RetrievalLocalSpansMs,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    for (phase, debug_field, duration_ms) in retrieve_local_span_entries(spans) {
+        record_task_span(
+            state,
+            task_id,
+            verbatim_core::task::FinishedPhaseTiming {
+                phase: format!("retrieve.local.{phase}"),
+                started_at: parent_started_at.to_string(),
+                duration_ms,
+                metadata: serde_json::json!({
+                    "nested": true,
+                    "parent_phase": "retrieval",
+                    "unit": "ms",
+                    "debug_field": debug_field,
+                }),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn retrieve_local_span_entries(
+    spans: &RetrievalLocalSpansMs,
+) -> Vec<(&'static str, &'static str, u64)> {
+    let mut entries = vec![
+        ("setup", "setup_ms", spans.setup_ms),
+        (
+            "query_embedding",
+            "query_embedding_ms",
+            spans.query_embedding_ms,
+        ),
+        (
+            "dense_vector_search",
+            "dense_vector_search_ms",
+            spans.dense_vector_search_ms,
+        ),
+        ("bm25_search", "bm25_search_ms", spans.bm25_search_ms),
+        ("rrf_fusion", "rrf_fusion_ms", spans.rrf_fusion_ms),
+        (
+            "debug_candidate_pack",
+            "debug_candidate_pack_ms",
+            spans.debug_candidate_pack_ms,
+        ),
+        ("rerank_total", "rerank_total_ms", spans.rerank_total_ms),
+        (
+            "result_hydration",
+            "result_hydration_ms",
+            spans.result_hydration_ms,
+        ),
+        (
+            "graph_expansion",
+            "graph_expansion_ms",
+            spans.graph_expansion_ms,
+        ),
+        (
+            "final_evidence_pack",
+            "final_evidence_pack_ms",
+            spans.final_evidence_pack_ms,
+        ),
+        (
+            "display_evidence_pack",
+            "display_evidence_pack_ms",
+            spans.display_evidence_pack_ms,
+        ),
+        (
+            "response_formatting",
+            "response_formatting_ms",
+            spans.response_formatting_ms,
+        ),
+    ];
+    if let Some(duration_ms) = spans.canonical_support_embedding_ms {
+        entries.push((
+            "canonical_support_embedding",
+            "canonical_support_embedding_ms",
+            duration_ms,
+        ));
+    }
+    if let Some(duration_ms) = spans.canonical_display_selection_ms {
+        entries.push((
+            "canonical_display_selection",
+            "canonical_display_selection_ms",
+            duration_ms,
+        ));
+    }
+    entries
+}
+
 async fn record_task_progress(
     state: &SharedState,
     task_id: &TaskId,
@@ -4009,10 +4106,10 @@ async fn execute_retrieve_task_inner(
             debug.rrf_fused_hits.len() as u64,
             None,
         )
-        .with_counter("evidence", debug.final_evidence_pack.len() as u64, None)
+        .with_counter("evidence", debug.final_evidence_count as u64, None)
         .with_recent_status(format!(
             "retrieved {} evidence entries",
-            debug.final_evidence_pack.len()
+            debug.final_evidence_count
         ))
         .with_active_worker_kind(TaskKind::Retrieve.as_str());
     if let Some(latency_ms) = debug.query_embedding_latency_ms {
@@ -4045,10 +4142,15 @@ async fn execute_retrieve_task_inner(
         };
         retrieval_progress.set_endpoint(endpoint);
     }
+    let retrieval_response_total = if controls.passage {
+        debug.final_evidence_count
+    } else {
+        debug.display_evidence_count
+    };
     let retrieval_timing = timing.finish(serde_json::json!({
         "result_count": results.len(),
         "returned_results": page_len(
-            debug.final_evidence_pack.len(),
+            retrieval_response_total,
             controls.limit,
             controls.page_size,
             controls.page,
@@ -4059,6 +4161,7 @@ async fn execute_retrieve_task_inner(
         "dense_vector_path": debug.dense_vector_path,
     }));
     record_task_progress(&state, task_id, retrieval_progress).await;
+    let retrieval_started_at = retrieval_timing.started_at.clone();
     record_task_span(&state, task_id, retrieval_timing.clone()).await?;
     record_task_event(
         &state,
@@ -4073,7 +4176,9 @@ async fn execute_retrieve_task_inner(
     )
     .await?;
 
-    let response = retrieve_response(RetrieveResponseInput {
+    let mut task_local_spans = debug.local_spans_ms.clone();
+    let response_started = Instant::now();
+    let mut response = retrieve_response(RetrieveResponseInput {
         task_id: task_id.clone(),
         query: question,
         source_filter: query_scope.source_id,
@@ -4086,6 +4191,12 @@ async fn execute_retrieve_task_inner(
         source_paths,
         retrieval_ms: retrieval_timing.duration_ms,
     });
+    let response_formatting_ms = elapsed_ms(response_started);
+    task_local_spans.response_formatting_ms = response_formatting_ms;
+    if let Some(response_debug) = response.debug.as_mut() {
+        response_debug.local_spans_ms.response_formatting_ms = response_formatting_ms;
+    }
+    record_retrieve_local_spans(&state, task_id, &retrieval_started_at, &task_local_spans).await?;
 
     finish_task_success(
         &state,
@@ -4599,6 +4710,7 @@ fn context_only_retrieve_request(req: AskRequest) -> RetrieveRequest {
         rerank_top_n: None,
         bypass_cache: false,
         include_debug: req.show_retrieval,
+        include_debug_packs: false,
         include_locator: true,
         passage: false,
     }
@@ -4629,6 +4741,7 @@ struct EffectiveRetrieveControls {
     page_size: usize,
     page: usize,
     include_debug: bool,
+    include_debug_packs: bool,
     include_locator: bool,
     passage: bool,
     bypass_cache: bool,
@@ -4642,6 +4755,24 @@ struct RetrievedContext {
     results: Vec<RetrievalResult>,
     debug: RetrievalDebug,
     source_paths: HashMap<String, String>,
+}
+
+fn retrieve_debug_display_scope(controls: &EffectiveRetrieveControls) -> RetrievalDisplayScope {
+    if controls.passage {
+        RetrievalDisplayScope::All
+    } else {
+        RetrievalDisplayScope::page(controls.limit, controls.page_size, controls.page)
+    }
+}
+
+fn retrieve_debug_options(controls: &EffectiveRetrieveControls) -> RetrievalDebugOptions {
+    let canonical_budget =
+        RetrievalCanonicalSelectionBudget::scoped(retrieve_debug_display_scope(controls));
+    if controls.passage || (controls.include_debug && controls.include_debug_packs) {
+        RetrievalDebugOptions::full(canonical_budget)
+    } else {
+        RetrievalDebugOptions::compact(canonical_budget)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4707,6 +4838,7 @@ fn resolve_retrieve_controls(
         )?,
         page: nonzero_control("page", req.page.unwrap_or(1))?,
         include_debug: req.include_debug,
+        include_debug_packs: req.include_debug_packs,
         include_locator: req.include_locator,
         passage: req.passage,
         bypass_cache: req.bypass_cache,
@@ -6622,6 +6754,7 @@ async fn prepare_retrieve_context(
         .with_read_resource(Arc::clone(&sqlite_reader))
         .with_qdrant_search(&controls.config.qdrant);
         let source_filter_ref = source_filter.as_ref();
+        let debug_options = retrieve_debug_options(&controls);
         let (mut results, mut debug) = match (
             controls.rerank_config.enabled,
             controls.rerank_config.strategy,
@@ -6629,19 +6762,26 @@ async fn prepare_retrieve_context(
             (true, RerankStrategy::Endpoint) => {
                 let reranker = OpenAiCompatibleReranker::from_config(&controls.rerank_config);
                 let retrieval = retrieval.with_reranker(&controls.rerank_config, &reranker);
-                runtime.block_on(
-                    retrieval.search_source_set_with_debug(&question2, source_filter_ref),
-                )?
+                runtime.block_on(retrieval.search_source_set_with_debug_options(
+                    &question2,
+                    source_filter_ref,
+                    debug_options,
+                ))?
             }
             (true, RerankStrategy::Llm) => {
                 let reranker = OpenAiCompatibleLlmReranker::from_config(&controls.rerank_config);
                 let retrieval = retrieval.with_reranker(&controls.rerank_config, &reranker);
-                runtime.block_on(
-                    retrieval.search_source_set_with_debug(&question2, source_filter_ref),
-                )?
+                runtime.block_on(retrieval.search_source_set_with_debug_options(
+                    &question2,
+                    source_filter_ref,
+                    debug_options,
+                ))?
             }
-            (false, _) => runtime
-                .block_on(retrieval.search_source_set_with_debug(&question2, source_filter_ref))?,
+            (false, _) => runtime.block_on(retrieval.search_source_set_with_debug_options(
+                &question2,
+                source_filter_ref,
+                debug_options,
+            ))?,
         };
         if controls.config.graph.global_search.enabled && source_filter_ref.is_none() {
             let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
@@ -6669,6 +6809,10 @@ fn empty_retrieval_debug() -> RetrievalDebug {
     RetrievalDebug {
         dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
         query_embedding_latency_ms: None,
+        local_spans_ms: RetrievalLocalSpansMs::default(),
+        evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
+        final_evidence_count: 0,
+        display_evidence_count: 0,
         bm25_hits: Vec::new(),
         dense_hits: Vec::new(),
         rrf_fused_hits: Vec::new(),
@@ -6837,7 +6981,7 @@ fn prepend_global_results(
     *results = global_results;
     renumber_result_ranks(results);
     if let Some(debug) = retrieval_debug.as_mut() {
-        refresh_final_evidence_pack_debug(debug, results);
+        refresh_evidence_pack_debug(debug, results);
     }
 }
 
@@ -6951,7 +7095,7 @@ fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
         })
     } else {
         let display_pack = retrieve_display_evidence_pack(&debug);
-        let total_results = display_pack.len();
+        let total_results = retrieve_display_evidence_count(&debug, display_pack);
         let results_page = retrieve_result_page(RetrieveResultPageInput {
             results: &results,
             debug: &debug,
@@ -7041,6 +7185,17 @@ fn retrieve_display_evidence_pack(debug: &RetrievalDebug) -> &[RetrievalEvidence
         &debug.final_evidence_pack
     } else {
         &debug.display_evidence_pack
+    }
+}
+
+fn retrieve_display_evidence_count(
+    debug: &RetrievalDebug,
+    display_pack: &[RetrievalEvidencePackEntry],
+) -> usize {
+    if debug.display_evidence_count > 0 || display_pack.is_empty() {
+        debug.display_evidence_count
+    } else {
+        display_pack.len()
     }
 }
 
@@ -8711,6 +8866,7 @@ mod tests {
     use verbatim_core::index::sqlite_fts::{
         FtsMaintenanceCounts, FtsMaintenanceReason, FtsMaintenanceStatus,
     };
+    use verbatim_core::retrieve::refresh_final_evidence_pack_debug;
     use verbatim_core::types::{
         CanonicalLocator, Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind,
         EvidenceUnit, ReferenceComponent, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
@@ -9256,6 +9412,65 @@ mod tests {
             .spans
             .iter()
             .any(|span| span.phase == IngestTaskStage::TaskTerminalize.as_str()));
+    }
+
+    #[tokio::test]
+    async fn retrieve_local_spans_are_public_task_spans() {
+        let test_dir = TestDir::new("retrieve-local-task-spans");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("What is cited?", None, None, 1, 1, 1),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &task_id).await.unwrap();
+
+        record_retrieve_local_spans(
+            &state,
+            &task_id,
+            "1",
+            &RetrievalLocalSpansMs {
+                setup_ms: 1,
+                query_embedding_ms: 2,
+                dense_vector_search_ms: 3,
+                bm25_search_ms: 4,
+                rrf_fusion_ms: 5,
+                debug_candidate_pack_ms: 6,
+                rerank_total_ms: 7,
+                result_hydration_ms: 8,
+                graph_expansion_ms: 9,
+                final_evidence_pack_ms: 10,
+                display_evidence_pack_ms: 11,
+                response_formatting_ms: 12,
+                canonical_support_embedding_ms: Some(13),
+                canonical_display_selection_ms: Some(14),
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = task_summary_response(&state, task_id).await.unwrap();
+        assert!(response
+            .spans
+            .iter()
+            .any(|span| span.phase == "retrieve.local.dense_vector_search"
+                && span.duration_ms == 3
+                && span.metadata["debug_field"] == serde_json::json!("dense_vector_search_ms")));
+        assert!(response
+            .spans
+            .iter()
+            .any(|span| span.phase == "retrieve.local.response_formatting"
+                && span.duration_ms == 12
+                && span.metadata["debug_field"] == serde_json::json!("response_formatting_ms")));
+        assert!(response.spans.iter().any(|span| {
+            span.phase == "retrieve.local.canonical_display_selection"
+                && span.duration_ms == 14
+                && span.metadata["nested"] == serde_json::json!(true)
+        }));
     }
 
     #[tokio::test]
@@ -10464,6 +10679,7 @@ mod tests {
             rerank_top_n: None,
             bypass_cache: false,
             include_debug: true,
+            include_debug_packs: false,
             include_locator: false,
             passage: false,
         };
@@ -10523,6 +10739,7 @@ mod tests {
             rerank_top_n: None,
             bypass_cache: false,
             include_debug: true,
+            include_debug_packs: false,
             include_locator: false,
             passage: false,
         };
@@ -10621,6 +10838,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: true,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             },
@@ -11414,6 +11632,10 @@ mod tests {
             retrieval: Some(RetrievalDebug {
                 dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
                 query_embedding_latency_ms: None,
+                local_spans_ms: RetrievalLocalSpansMs::default(),
+                evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
+                final_evidence_count: 0,
+                display_evidence_count: 0,
                 bm25_hits: Vec::new(),
                 dense_hits: Vec::new(),
                 rrf_fused_hits: Vec::new(),
@@ -11449,6 +11671,10 @@ mod tests {
         let mut debug = Some(RetrievalDebug {
             dense_vector_path: RetrievalDenseVectorPath::ResidentHnsw,
             query_embedding_latency_ms: None,
+            local_spans_ms: RetrievalLocalSpansMs::default(),
+            evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
+            final_evidence_count: 0,
+            display_evidence_count: 0,
             bm25_hits: Vec::new(),
             dense_hits: Vec::new(),
             rrf_fused_hits: Vec::new(),
@@ -11503,6 +11729,7 @@ mod tests {
                 page_size: 1,
                 page: 2,
                 include_debug: false,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
                 bypass_cache: false,
@@ -11539,6 +11766,7 @@ mod tests {
             label: "E1".into(),
             ..debug.final_evidence_pack[1].clone()
         }];
+        debug.display_evidence_count = debug.display_evidence_pack.len();
 
         let response = retrieve_response(RetrieveResponseInput {
             task_id: TaskId("task-1".into()),
@@ -11552,6 +11780,7 @@ mod tests {
                 page_size: 1,
                 page: 1,
                 include_debug: false,
+                include_debug_packs: false,
                 include_locator: true,
                 passage: false,
                 bypass_cache: false,
@@ -11593,6 +11822,7 @@ mod tests {
             label: "E1".into(),
             ..debug.final_evidence_pack[1].clone()
         }];
+        debug.display_evidence_count = debug.display_evidence_pack.len();
 
         let response = retrieve_response(RetrieveResponseInput {
             task_id: TaskId("task-1".into()),
@@ -11606,6 +11836,7 @@ mod tests {
                 page_size: 1,
                 page: 1,
                 include_debug: false,
+                include_debug_packs: false,
                 include_locator: true,
                 passage: true,
                 bypass_cache: false,
@@ -13113,6 +13344,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: false,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             }),
@@ -13329,6 +13561,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: true,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             }),
@@ -13347,6 +13580,11 @@ mod tests {
         let debug = response.debug.as_ref().expect("retrieval debug");
         assert_eq!(debug.dense_vector_path, RetrievalDenseVectorPath::Bm25Only);
         assert_eq!(debug.query_embedding_latency_ms, None);
+        assert_eq!(debug.local_spans_ms.query_embedding_ms, 0);
+        assert_eq!(debug.local_spans_ms.dense_vector_search_ms, 0);
+        let encoded_debug = serde_json::to_value(debug).unwrap();
+        assert!(encoded_debug["local_spans_ms"]["bm25_search_ms"].is_u64());
+        assert!(encoded_debug["local_spans_ms"]["response_formatting_ms"].is_u64());
         assert!(debug.dense_hits.is_empty());
         assert_eq!(debug.bm25_hits.len(), expected_hits);
     }
@@ -13373,6 +13611,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: false,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             }),
@@ -13476,6 +13715,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: false,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             }),
@@ -13578,6 +13818,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: true,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             }),
@@ -13631,6 +13872,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: true,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             }),
@@ -13739,6 +13981,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: false,
+                include_debug_packs: false,
                 include_locator: true,
                 passage: false,
             }),
@@ -13834,6 +14077,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: false,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             }),
@@ -14110,6 +14354,7 @@ mod tests {
                 rerank_top_n: None,
                 bypass_cache: false,
                 include_debug: true,
+                include_debug_packs: false,
                 include_locator: false,
                 passage: false,
             }),

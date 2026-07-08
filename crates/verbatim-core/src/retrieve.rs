@@ -18,11 +18,12 @@ use crate::traits::{
 use crate::types::{
     Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
     EvidenceUnit, GraphExpansionStep, GraphNodeId, GraphNodeKind, GraphTraversalDirection, ImageId,
-    RetrievalDebug, RetrievalDenseVectorPath, RetrievalEvidencePackEntry, RetrievalEvidenceRole,
-    RetrievalFusedHit, RetrievalGraphExpansionDebug, RetrievalLocatorDebug, RetrievalProvenance,
-    RetrievalRerankCapabilityDebug, RetrievalRerankCapabilityState, RetrievalRerankDebug,
-    RetrievalRerankRequestDebug, RetrievalRerankScore, RetrievalResult, RetrievalStageHit,
-    SourceId, SourceLocator, VectorIndexResidency,
+    RetrievalDebug, RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath,
+    RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalFusedHit,
+    RetrievalGraphExpansionDebug, RetrievalLocalSpansMs, RetrievalLocatorDebug,
+    RetrievalProvenance, RetrievalRerankCapabilityDebug, RetrievalRerankCapabilityState,
+    RetrievalRerankDebug, RetrievalRerankRequestDebug, RetrievalRerankScore, RetrievalResult,
+    RetrievalStageHit, SourceId, SourceLocator, VectorIndexResidency,
 };
 
 const GRAPH_EXPANSION_SCORE_DECAY: f32 = 0.5;
@@ -50,6 +51,126 @@ pub struct RetrievalPipeline<'a> {
     read_resource: Option<Arc<ObservableResource>>,
     #[cfg(feature = "qdrant")]
     qdrant: Option<QdrantClient>,
+}
+
+/// Visible display entries that should receive display-only support selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RetrievalDisplayScope {
+    /// Run display-only support selection for every display entry.
+    #[default]
+    All,
+    /// Run display-only support selection only for a zero-based display-entry range.
+    Window { start: usize, len: usize },
+}
+
+impl RetrievalDisplayScope {
+    /// Build a scope matching retrieve response pagination controls.
+    pub fn page(limit: usize, page_size: usize, page: usize) -> Self {
+        let start = page.saturating_sub(1).saturating_mul(page_size);
+        let len = limit.saturating_sub(start).min(page_size);
+        Self::Window { start, len }
+    }
+
+    fn contains(self, display_index: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Window { start, len } => {
+                display_index >= start && display_index < start.saturating_add(len)
+            }
+        }
+    }
+}
+
+/// Canonical debug selection budgets split by expensive support scoring and
+/// compact display replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrievalCanonicalSelectionBudget {
+    /// Canonical display entries whose support candidates may be embedded and scored.
+    pub support: RetrievalDisplayScope,
+    /// Canonical display entries allowed to replace first-evidence placeholders
+    /// with the selected support evidence in compact display output.
+    pub display: RetrievalDisplayScope,
+}
+
+impl RetrievalCanonicalSelectionBudget {
+    /// Run canonical support and display selection for every display entry.
+    pub fn all() -> Self {
+        Self {
+            support: RetrievalDisplayScope::All,
+            display: RetrievalDisplayScope::All,
+        }
+    }
+
+    /// Run both budgets over the same display-entry scope.
+    pub fn scoped(scope: RetrievalDisplayScope) -> Self {
+        Self {
+            support: scope,
+            display: scope,
+        }
+    }
+
+    /// Build matching budgets from retrieve response pagination controls.
+    pub fn page(limit: usize, page_size: usize, page: usize) -> Self {
+        Self::scoped(RetrievalDisplayScope::page(limit, page_size, page))
+    }
+
+    /// Build independent support and display budgets.
+    pub fn new(support: RetrievalDisplayScope, display: RetrievalDisplayScope) -> Self {
+        Self { support, display }
+    }
+}
+
+impl Default for RetrievalCanonicalSelectionBudget {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+/// Controls how much diagnostic evidence-pack data a debug search builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetrievalDebugOptions {
+    pub canonical_budget: RetrievalCanonicalSelectionBudget,
+    pub evidence_pack_mode: RetrievalDebugEvidencePackMode,
+}
+
+impl RetrievalDebugOptions {
+    pub fn full(canonical_budget: RetrievalCanonicalSelectionBudget) -> Self {
+        Self {
+            canonical_budget,
+            evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
+        }
+    }
+
+    pub fn compact(canonical_budget: RetrievalCanonicalSelectionBudget) -> Self {
+        Self {
+            canonical_budget,
+            evidence_pack_mode: RetrievalDebugEvidencePackMode::Compact,
+        }
+    }
+}
+
+impl Default for RetrievalDebugOptions {
+    fn default() -> Self {
+        Self::full(RetrievalCanonicalSelectionBudget::default())
+    }
+}
+
+/// Target used to derive detailed canonical support after ranking.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RetrievalCanonicalDetailTarget<'a> {
+    /// Select the canonical result containing this evidence id.
+    EvidenceId(&'a EvidenceId),
+    /// Select the canonical result containing this exact structured locator.
+    Locator(&'a SourceLocator),
+}
+
+/// Detail payload for one canonical result without rerunning ranking.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievalCanonicalDetailDebug {
+    /// Compact display entry selected for the target canonical result.
+    pub display_entry: RetrievalEvidencePackEntry,
+    /// Full support evidence entries for the target canonical result.
+    pub support_evidence_pack: Vec<RetrievalEvidencePackEntry>,
 }
 
 #[cfg(feature = "qdrant")]
@@ -218,7 +339,7 @@ impl<'a> RetrievalPipeline<'a> {
         source_filter: Option<&HashSet<SourceId>>,
     ) -> Result<Vec<RetrievalResult>> {
         Ok(self
-            .search_filtered_internal(query, source_filter, false)
+            .search_filtered_internal(query, source_filter, None)
             .await?
             .results)
     }
@@ -242,7 +363,49 @@ impl<'a> RetrievalPipeline<'a> {
         query: &str,
         source_filter: Option<&HashSet<SourceId>>,
     ) -> Result<(Vec<RetrievalResult>, RetrievalDebug)> {
-        self.search_filtered_internal(query, source_filter, true)
+        self.search_source_set_with_debug_canonical_budget(
+            query,
+            source_filter,
+            RetrievalCanonicalSelectionBudget::all(),
+        )
+        .await
+    }
+
+    pub async fn search_source_set_with_debug_display_scope(
+        &self,
+        query: &str,
+        source_filter: Option<&HashSet<SourceId>>,
+        display_scope: RetrievalDisplayScope,
+    ) -> Result<(Vec<RetrievalResult>, RetrievalDebug)> {
+        self.search_source_set_with_debug_canonical_budget(
+            query,
+            source_filter,
+            RetrievalCanonicalSelectionBudget::scoped(display_scope),
+        )
+        .await
+    }
+
+    pub async fn search_source_set_with_debug_canonical_budget(
+        &self,
+        query: &str,
+        source_filter: Option<&HashSet<SourceId>>,
+        canonical_budget: RetrievalCanonicalSelectionBudget,
+    ) -> Result<(Vec<RetrievalResult>, RetrievalDebug)> {
+        self.search_source_set_with_debug_options(
+            query,
+            source_filter,
+            RetrievalDebugOptions::full(canonical_budget),
+        )
+        .await
+    }
+
+    pub async fn search_source_set_with_debug_options(
+        &self,
+        query: &str,
+        source_filter: Option<&HashSet<SourceId>>,
+        debug_options: RetrievalDebugOptions,
+    ) -> Result<(Vec<RetrievalResult>, RetrievalDebug)> {
+        self.search_filtered_internal(query, source_filter, Some(debug_options))
             .await?
             .into_results_with_debug()
     }
@@ -251,11 +414,15 @@ impl<'a> RetrievalPipeline<'a> {
         &self,
         query: &str,
         source_filter: Option<&HashSet<SourceId>>,
-        include_debug: bool,
+        debug_options: Option<RetrievalDebugOptions>,
     ) -> Result<RetrievalSearchOutput> {
+        let include_debug = debug_options.is_some();
+        let debug_options = debug_options.unwrap_or_default();
+        let mut local_spans_ms = RetrievalLocalSpansMs::default();
         if source_filter.is_some_and(HashSet::is_empty) {
             return Ok(empty_search_output(include_debug));
         }
+        let setup_started = Instant::now();
         let all_child_count = self.with_read_permit(|| {
             if self.embedding_enabled {
                 self.ensure_required_profile_vectors(source_filter)?;
@@ -266,6 +433,7 @@ impl<'a> RetrievalPipeline<'a> {
                 Ok(0)
             }
         })?;
+        local_spans_ms.setup_ms = elapsed_ms(setup_started);
         #[cfg(feature = "qdrant")]
         let qdrant_can_filter = self.qdrant.is_some();
         #[cfg(not(feature = "qdrant"))]
@@ -296,9 +464,14 @@ impl<'a> RetrievalPipeline<'a> {
                     .next()
                     .unwrap_or_default();
                 let query_embedding_latency_ms = elapsed_ms(embedding_started);
+                local_spans_ms.query_embedding_ms = query_embedding_latency_ms;
+                let dense_started = Instant::now();
+                let dense_results = self
+                    .dense_search(&query_vec, dense_top_k, source_filter)
+                    .await?;
+                local_spans_ms.dense_vector_search_ms = elapsed_ms(dense_started);
                 (
-                    self.dense_search(&query_vec, dense_top_k, source_filter)
-                        .await?,
+                    dense_results,
                     Some(query_embedding_latency_ms),
                     self.dense_vector_path(),
                     Some(query_vec),
@@ -307,8 +480,20 @@ impl<'a> RetrievalPipeline<'a> {
                 (Vec::new(), None, RetrievalDenseVectorPath::Bm25Only, None)
             };
 
-        let (fused, bm25_hits, dense_hits, rrf_fused_hits) = self.with_read_permit(|| {
+        let (
+            fused,
+            bm25_hits,
+            dense_hits,
+            rrf_fused_hits,
+            bm25_search_ms,
+            rrf_fusion_ms,
+            debug_candidate_pack_ms,
+        ) = self.with_read_permit(|| {
+            let bm25_started = Instant::now();
             let bm25_results = self.lexical_index.search(query, bm25_top_k)?;
+            let bm25_search_ms = elapsed_ms(bm25_started);
+
+            let rrf_started = Instant::now();
             let mut fused = rrf_fusion(&dense_results, &bm25_results, self.config.rrf_k);
             if let Some(source_ids) = source_filter {
                 fused.retain(|(chunk_id, _)| {
@@ -319,7 +504,9 @@ impl<'a> RetrievalPipeline<'a> {
                         .is_some_and(|chunk| source_ids.contains(&chunk.source_id))
                 });
             }
+            let rrf_fusion_ms = elapsed_ms(rrf_started);
 
+            let debug_pack_started = Instant::now();
             let bm25_hits = if include_debug {
                 self.stage_debug_hits(&bm25_results, source_filter)?
             } else {
@@ -335,56 +522,118 @@ impl<'a> RetrievalPipeline<'a> {
             } else {
                 Vec::new()
             };
-            Ok((fused, bm25_hits, dense_hits, rrf_fused_hits))
+            let debug_candidate_pack_ms = elapsed_ms(debug_pack_started);
+            Ok((
+                fused,
+                bm25_hits,
+                dense_hits,
+                rrf_fused_hits,
+                bm25_search_ms,
+                rrf_fusion_ms,
+                debug_candidate_pack_ms,
+            ))
         })?;
+        local_spans_ms.bm25_search_ms = bm25_search_ms;
+        local_spans_ms.rrf_fusion_ms = rrf_fusion_ms;
+        local_spans_ms.debug_candidate_pack_ms = debug_candidate_pack_ms;
 
+        let rerank_started = Instant::now();
         let RerankOutcome {
             fused,
             debug: reranker_debug,
         } = self.rerank_fused(query, fused).await?;
+        local_spans_ms.rerank_total_ms = elapsed_ms(rerank_started);
 
-        let (results, graph_expanded_hits) = self.with_read_permit(|| {
-            let mut results = Vec::new();
-            for (rank, (chunk_id, score)) in fused.into_iter().enumerate() {
-                let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
-                    continue;
+        let (results, graph_expanded_hits, result_hydration_ms, graph_expansion_ms) = self
+            .with_read_permit(|| {
+                let result_hydration_started = Instant::now();
+                let mut results = Vec::new();
+                for (rank, (chunk_id, score)) in fused.into_iter().enumerate() {
+                    let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
+                        continue;
+                    };
+                    let result_rank = rank + 1;
+                    let provenance = RetrievalProvenance::seed(
+                        result_rank,
+                        chunk.id.clone(),
+                        chunk.source_id.clone(),
+                    );
+
+                    results.push(self.result_for_chunk(chunk, score, provenance)?);
+                }
+                let result_hydration_ms = elapsed_ms(result_hydration_started);
+
+                let graph_expansion_started = Instant::now();
+                self.expand_graph_results(&mut results, source_filter)?;
+                let graph_expansion_ms = elapsed_ms(graph_expansion_started);
+                let graph_expanded_hits = if include_debug {
+                    graph_expansion_debug_hits(&results)
+                } else {
+                    Vec::new()
                 };
-                let result_rank = rank + 1;
-                let provenance = RetrievalProvenance::seed(
-                    result_rank,
-                    chunk.id.clone(),
-                    chunk.source_id.clone(),
-                );
+                Ok((
+                    results,
+                    graph_expanded_hits,
+                    result_hydration_ms,
+                    graph_expansion_ms,
+                ))
+            })?;
+        local_spans_ms.result_hydration_ms = result_hydration_ms;
+        local_spans_ms.graph_expansion_ms = graph_expansion_ms;
 
-                results.push(self.result_for_chunk(chunk, score, provenance)?);
+        let mut final_evidence_count = 0usize;
+        let final_evidence_pack = if include_debug
+            && debug_options.evidence_pack_mode == RetrievalDebugEvidencePackMode::Full
+        {
+            let final_pack_started = Instant::now();
+            let final_evidence_pack = final_evidence_pack_debug(&results);
+            local_spans_ms.final_evidence_pack_ms = elapsed_ms(final_pack_started);
+            final_evidence_count = final_evidence_pack.len();
+            final_evidence_pack
+        } else {
+            if include_debug {
+                final_evidence_count = final_evidence_debug_count(&results);
             }
-
-            self.expand_graph_results(&mut results, source_filter)?;
-            let graph_expanded_hits = if include_debug {
-                graph_expansion_debug_hits(&results)
-            } else {
-                Vec::new()
-            };
-            Ok((results, graph_expanded_hits))
-        })?;
+            Vec::new()
+        };
 
         let display_evidence_pack = if include_debug {
-            self.display_evidence_pack_debug(query, query_vector.as_deref(), &results)
-                .await
+            let display_pack_started = Instant::now();
+            let (
+                display_evidence_pack,
+                canonical_support_embedding_ms,
+                canonical_display_selection_ms,
+            ) = self
+                .display_evidence_pack_debug(
+                    query,
+                    query_vector.as_deref(),
+                    &results,
+                    debug_options.canonical_budget,
+                )
+                .await;
+            local_spans_ms.display_evidence_pack_ms = elapsed_ms(display_pack_started);
+            local_spans_ms.canonical_support_embedding_ms = canonical_support_embedding_ms;
+            local_spans_ms.canonical_display_selection_ms = canonical_display_selection_ms;
+            display_evidence_pack
         } else {
             Vec::new()
         };
 
         let debug = if include_debug {
+            let display_evidence_count = display_evidence_pack.len();
             Some(RetrievalDebug {
                 dense_vector_path,
                 query_embedding_latency_ms,
+                local_spans_ms,
+                evidence_pack_mode: debug_options.evidence_pack_mode,
+                final_evidence_count,
+                display_evidence_count,
                 bm25_hits,
                 dense_hits,
                 rrf_fused_hits,
                 graph_expanded_hits,
                 reranker: reranker_debug,
-                final_evidence_pack: final_evidence_pack_debug(&results),
+                final_evidence_pack,
                 display_evidence_pack,
             })
         } else {
@@ -655,32 +904,103 @@ impl<'a> RetrievalPipeline<'a> {
         query: &str,
         query_vector: Option<&[f32]>,
         results: &[RetrievalResult],
-    ) -> Vec<RetrievalEvidencePackEntry> {
+        canonical_budget: RetrievalCanonicalSelectionBudget,
+    ) -> (Vec<RetrievalEvidencePackEntry>, Option<u64>, Option<u64>) {
         if !results.iter().any(canonical_multi_evidence_result) {
-            return final_evidence_pack_debug(results);
+            return (final_evidence_pack_debug(results), None, None);
         }
 
-        let semantic_scores = match query_vector {
+        let support_results = canonical_scope_results(results, canonical_budget.support);
+        let mut canonical_support_embedding_ms = None;
+        let semantic_scores = match (query_vector, support_results.is_empty()) {
+            (_, true) => HashMap::new(),
+            (Some(query_vector), false) => {
+                let semantic_started = Instant::now();
+                let semantic_scores = self
+                    .canonical_support_semantic_scores(query_vector, &support_results)
+                    .await;
+                canonical_support_embedding_ms = Some(elapsed_ms(semantic_started));
+                semantic_scores
+            }
+            (None, false) => HashMap::new(),
+        };
+        let selection_started = Instant::now();
+        let support_ids = canonical_display_support_ids(query, &support_results, &semantic_scores);
+        let display_pack = display_evidence_pack_debug_with_canonical_selection(
+            results,
+            &support_ids,
+            canonical_budget.display,
+        );
+        (
+            display_pack,
+            canonical_support_embedding_ms,
+            Some(elapsed_ms(selection_started)),
+        )
+    }
+
+    /// Build detailed canonical support/display debug data for one target
+    /// evidence id or locator from already ranked retrieval results.
+    pub async fn canonical_detail_evidence_pack_debug(
+        &self,
+        query: &str,
+        results: &[RetrievalResult],
+        target: RetrievalCanonicalDetailTarget<'_>,
+    ) -> Option<RetrievalCanonicalDetailDebug> {
+        let result = canonical_detail_result(results, target)?;
+        let query_vector = self.canonical_detail_query_vector(query).await;
+        let detail_results = [result];
+        let semantic_scores = match query_vector.as_deref() {
             Some(query_vector) => {
-                self.canonical_support_semantic_scores(query_vector, results)
+                self.canonical_support_semantic_scores(query_vector, &detail_results)
                     .await
             }
             None => HashMap::new(),
         };
-        let support_ids = canonical_display_support_ids(query, results, &semantic_scores);
-        evidence_pack_debug_with_display_selection(results, &support_ids)
+        let support_ids = canonical_display_support_ids(query, &detail_results, &semantic_scores);
+        let display_entry = display_evidence_pack_debug_with_canonical_selection(
+            std::slice::from_ref(result),
+            &support_ids,
+            RetrievalDisplayScope::All,
+        )
+        .into_iter()
+        .next()?;
+        let support_evidence_pack = final_evidence_pack_debug(std::slice::from_ref(result));
+
+        Some(RetrievalCanonicalDetailDebug {
+            display_entry,
+            support_evidence_pack,
+        })
+    }
+
+    async fn canonical_detail_query_vector(&self, query: &str) -> Option<Vec<f32>> {
+        if !self.embedding_enabled {
+            return None;
+        }
+
+        let query_text = self.remote_query_text(self.embed_client.prepare_query(query));
+        match self.embed_client.embed(&[query_text]).await {
+            Ok(vectors) => vectors.into_iter().next(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "canonical detail query embedding failed; falling back to lexical support selection"
+                );
+                None
+            }
+        }
     }
 
     async fn canonical_support_semantic_scores(
         &self,
         query_vector: &[f32],
-        results: &[RetrievalResult],
+        results: &[&RetrievalResult],
     ) -> HashMap<String, f32> {
         let mut candidates = Vec::new();
         let mut documents = Vec::new();
 
         for result in results
             .iter()
+            .copied()
             .filter(|result| canonical_multi_evidence_result(result))
         {
             for evidence in &result.evidence_units {
@@ -1487,6 +1807,10 @@ fn empty_search_output(include_debug: bool) -> RetrievalSearchOutput {
         debug: include_debug.then(|| RetrievalDebug {
             dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
             query_embedding_latency_ms: None,
+            local_spans_ms: RetrievalLocalSpansMs::default(),
+            evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
+            final_evidence_count: 0,
+            display_evidence_count: 0,
             bm25_hits: Vec::new(),
             dense_hits: Vec::new(),
             rrf_fused_hits: Vec::new(),
@@ -1718,20 +2042,98 @@ fn bounded_rerank_debug_text(input: &str) -> String {
 
 /// Rebuild the final evidence-pack debug view after callers alter retrieval result order.
 pub fn refresh_final_evidence_pack_debug(debug: &mut RetrievalDebug, results: &[RetrievalResult]) {
+    debug.evidence_pack_mode = RetrievalDebugEvidencePackMode::Full;
+    refresh_evidence_pack_debug(debug, results);
+}
+
+/// Rebuild evidence-pack debug data according to the debug payload mode.
+pub fn refresh_evidence_pack_debug(debug: &mut RetrievalDebug, results: &[RetrievalResult]) {
     let selected_canonical_support_ids = selected_display_support_ids(debug);
-    debug.final_evidence_pack = final_evidence_pack_debug(results);
-    debug.display_evidence_pack = if selected_canonical_support_ids.is_empty() {
-        debug.final_evidence_pack.clone()
-    } else {
-        evidence_pack_debug_with_display_selection(results, &selected_canonical_support_ids)
-    };
+    match debug.evidence_pack_mode {
+        RetrievalDebugEvidencePackMode::Full => {
+            debug.final_evidence_pack = final_evidence_pack_debug(results);
+            debug.final_evidence_count = debug.final_evidence_pack.len();
+            debug.display_evidence_pack = if selected_canonical_support_ids.is_empty() {
+                debug.final_evidence_pack.clone()
+            } else {
+                display_evidence_pack_debug_with_canonical_selection(
+                    results,
+                    &selected_canonical_support_ids,
+                    RetrievalDisplayScope::All,
+                )
+            };
+        }
+        RetrievalDebugEvidencePackMode::Compact => {
+            debug.final_evidence_pack.clear();
+            debug.final_evidence_count = final_evidence_debug_count(results);
+            debug.display_evidence_pack = display_evidence_pack_debug_with_canonical_selection(
+                results,
+                &selected_canonical_support_ids,
+                RetrievalDisplayScope::All,
+            );
+        }
+    }
+    debug.display_evidence_count = debug.display_evidence_pack.len();
 }
 
 fn final_evidence_pack_debug(results: &[RetrievalResult]) -> Vec<RetrievalEvidencePackEntry> {
     evidence_pack_debug_with_display_selection(results, &HashMap::new())
 }
 
+fn final_evidence_debug_count(results: &[RetrievalResult]) -> usize {
+    let mut seen = HashSet::new();
+    let mut count = 0usize;
+    for result in results {
+        for evidence in &result.evidence_units {
+            if seen.insert(evidence.id.0.clone()) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn canonical_scope_results(
+    results: &[RetrievalResult],
+    scope: RetrievalDisplayScope,
+) -> Vec<&RetrievalResult> {
+    let mut display_results = Vec::new();
+    let mut seen = HashSet::new();
+    let mut display_index = 0usize;
+
+    for result in results {
+        if canonical_multi_evidence_result(result) {
+            if let Some(evidence) = result.evidence_units.first() {
+                if seen.insert(evidence.id.0.clone()) {
+                    if scope.contains(display_index) {
+                        display_results.push(result);
+                    }
+                    display_index += 1;
+                }
+            }
+            continue;
+        }
+
+        for evidence in &result.evidence_units {
+            if !seen.insert(evidence.id.0.clone()) {
+                continue;
+            }
+            display_index += 1;
+        }
+    }
+
+    display_results
+}
+
 fn selected_display_support_ids(debug: &RetrievalDebug) -> HashMap<String, EvidenceId> {
+    if debug.final_evidence_pack.is_empty() && !debug.display_evidence_pack.is_empty() {
+        return debug
+            .display_evidence_pack
+            .iter()
+            .map(|entry| (entry.chunk_id.0.clone(), entry.evidence_id.clone()))
+            .collect();
+    }
+
     if debug.display_evidence_pack.is_empty()
         || debug.display_evidence_pack.len() >= debug.final_evidence_pack.len()
     {
@@ -1801,13 +2203,116 @@ fn evidence_pack_debug_with_display_selection(
     entries
 }
 
+fn display_evidence_pack_debug_with_canonical_selection(
+    results: &[RetrievalResult],
+    selected_canonical_support_ids: &HashMap<String, EvidenceId>,
+    display_scope: RetrievalDisplayScope,
+) -> Vec<RetrievalEvidencePackEntry> {
+    let mut entries = Vec::new();
+    let mut entry_seen = HashSet::new();
+    let mut display_seen = HashSet::new();
+    let mut display_index = 0usize;
+
+    for result in results {
+        if canonical_multi_evidence_result(result) {
+            let Some(first_evidence) = result.evidence_units.first() else {
+                continue;
+            };
+            if !display_seen.insert(first_evidence.id.0.clone()) {
+                continue;
+            }
+            let evidence = if display_scope.contains(display_index) {
+                canonical_display_evidence(result, selected_canonical_support_ids)
+            } else {
+                Some(first_evidence)
+            };
+            display_index += 1;
+            if let Some(evidence) = evidence {
+                push_evidence_pack_debug_entry(result, evidence, &mut entries, &mut entry_seen);
+            }
+            continue;
+        }
+
+        for evidence in &result.evidence_units {
+            if !display_seen.insert(evidence.id.0.clone()) {
+                continue;
+            }
+            display_index += 1;
+            push_evidence_pack_debug_entry(result, evidence, &mut entries, &mut entry_seen);
+        }
+    }
+
+    entries
+}
+
+fn canonical_detail_result<'a>(
+    results: &'a [RetrievalResult],
+    target: RetrievalCanonicalDetailTarget<'_>,
+) -> Option<&'a RetrievalResult> {
+    results
+        .iter()
+        .filter(|result| canonical_multi_evidence_result(result))
+        .find(|result| {
+            result.evidence_units.iter().any(|evidence| match target {
+                RetrievalCanonicalDetailTarget::EvidenceId(evidence_id) => {
+                    &evidence.id == evidence_id
+                }
+                RetrievalCanonicalDetailTarget::Locator(locator) => &evidence.locator == locator,
+            })
+        })
+}
+
+fn canonical_display_evidence<'a>(
+    result: &'a RetrievalResult,
+    selected_canonical_support_ids: &HashMap<String, EvidenceId>,
+) -> Option<&'a EvidenceUnit> {
+    selected_canonical_support_ids
+        .get(&result.chunk_id.0)
+        .and_then(|selected_id| {
+            result
+                .evidence_units
+                .iter()
+                .find(|evidence| &evidence.id == selected_id)
+        })
+        .or_else(|| result.evidence_units.first())
+}
+
+fn push_evidence_pack_debug_entry(
+    result: &RetrievalResult,
+    evidence: &EvidenceUnit,
+    entries: &mut Vec<RetrievalEvidencePackEntry>,
+    seen: &mut HashSet<String>,
+) {
+    if !seen.insert(evidence.id.0.clone()) {
+        return;
+    }
+
+    entries.push(RetrievalEvidencePackEntry {
+        label: format!("E{}", entries.len() + 1),
+        result_rank: result.provenance.result_rank,
+        chunk_id: result.chunk_id.clone(),
+        score: result.score,
+        evidence_id: evidence.id.clone(),
+        source_id: evidence.source_id.clone(),
+        role: evidence_debug_role(evidence),
+        kind: evidence.kind,
+        derived_from: evidence.derived_from.clone(),
+        locator: RetrievalLocatorDebug {
+            display: evidence.locator.to_string(),
+            structured: evidence.locator.clone(),
+        },
+        provenance: result.provenance.clone(),
+    });
+}
+
 fn canonical_display_support_ids(
     query: &str,
-    results: &[RetrievalResult],
+    results: &[&RetrievalResult],
     semantic_scores: &HashMap<String, f32>,
 ) -> HashMap<String, EvidenceId> {
     results
         .iter()
+        .copied()
         .filter(|result| canonical_multi_evidence_result(result))
         .filter_map(|result| {
             let evidence = best_support_evidence(query, &result.evidence_units, semantic_scores)?;
@@ -2607,6 +3112,101 @@ mod tests {
         chunk
     }
 
+    fn insert_numbered_canonical_chunk(
+        store: &Store,
+        source: &Source,
+        chunk_id: &str,
+        evidence_id_prefix: &str,
+        start_verse: u32,
+        evidence_count: usize,
+        support_offset: usize,
+        marker: &str,
+    ) -> Chunk {
+        assert!(support_offset < evidence_count);
+        let evidence_units = (0..evidence_count)
+            .map(|index| {
+                let verse = start_verse + u32::try_from(index).expect("evidence index fits in u32");
+                let id = numbered_canonical_evidence_id(evidence_id_prefix, start_verse, index);
+                let text = if index == support_offset {
+                    format!("{marker} alpha crown support verse {verse}.")
+                } else {
+                    format!("{marker} background verse {verse}.")
+                };
+
+                EvidenceUnit {
+                    id: EvidenceId(id.clone()),
+                    source_id: source.id.clone(),
+                    kind: EvidenceKind::Text,
+                    derived_from: None,
+                    locator: SourceLocator::Canonical {
+                        locator: CanonicalLocator::single_unit(
+                            "bible",
+                            "CSB",
+                            vec![
+                                ReferenceComponent {
+                                    level: "book".into(),
+                                    value: "2 Timothy".into(),
+                                    ordinal: Some(55),
+                                },
+                                ReferenceComponent {
+                                    level: "chapter".into(),
+                                    value: "4".into(),
+                                    ordinal: Some(4),
+                                },
+                                ReferenceComponent {
+                                    level: "verse".into(),
+                                    value: verse.to_string(),
+                                    ordinal: Some(verse),
+                                },
+                            ],
+                            format!("2 Timothy 4:{verse}"),
+                            format!("2timothy:4:{verse}"),
+                        ),
+                    },
+                    text,
+                    text_hash: format!("hash-{id}"),
+                    heading_path: Vec::new(),
+                    position: verse,
+                }
+            })
+            .collect::<Vec<_>>();
+        let chunk = Chunk {
+            id: ChunkId(chunk_id.into()),
+            source_id: source.id.clone(),
+            chunk_hash: format!("hash-{chunk_id}"),
+            embedding_input_hash: None,
+            text: evidence_units
+                .iter()
+                .map(|unit| unit.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            context_text: None,
+            token_count: evidence_units.len() as u32 * 4,
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path: Vec::new(),
+            evidence_unit_ids: evidence_units.iter().map(|unit| unit.id.clone()).collect(),
+        };
+
+        store.bulk_insert_evidence(&evidence_units).unwrap();
+        store
+            .bulk_insert_chunks(std::slice::from_ref(&chunk))
+            .unwrap();
+        let links = chunk
+            .evidence_unit_ids
+            .iter()
+            .cloned()
+            .map(|evidence_id| (chunk.id.clone(), evidence_id))
+            .collect::<Vec<_>>();
+        store.link_chunk_evidence(&links).unwrap();
+        chunk
+    }
+
+    fn numbered_canonical_evidence_id(prefix: &str, start_verse: u32, index: usize) -> String {
+        let verse = start_verse + u32::try_from(index).expect("evidence index fits in u32");
+        format!("{prefix}-{verse:03}")
+    }
+
     struct TextChunkFixture<'a> {
         store: &'a Store,
         source: &'a Source,
@@ -3000,8 +3600,15 @@ mod tests {
         assert_eq!(results[0].chunk_id, alpha.id);
         assert_eq!(debug.dense_vector_path, RetrievalDenseVectorPath::Bm25Only);
         assert_eq!(debug.query_embedding_latency_ms, None);
+        assert_eq!(debug.local_spans_ms.query_embedding_ms, 0);
+        assert_eq!(debug.local_spans_ms.dense_vector_search_ms, 0);
+        assert_eq!(debug.local_spans_ms.response_formatting_ms, 0);
         assert!(debug.dense_hits.is_empty());
         assert!(!debug.bm25_hits.is_empty());
+        let encoded = serde_json::to_value(&debug).unwrap();
+        assert!(encoded["local_spans_ms"]["bm25_search_ms"].is_u64());
+        assert!(encoded["local_spans_ms"]["rrf_fusion_ms"].is_u64());
+        assert!(encoded["local_spans_ms"]["final_evidence_pack_ms"].is_u64());
     }
 
     #[tokio::test]
@@ -3094,6 +3701,774 @@ mod tests {
         assert_eq!(display.chunk_id, chunk.id);
         assert_eq!(display.score, results[0].score);
         assert_eq!(display.locator.display, "2 Timothy 4:8");
+    }
+
+    #[tokio::test]
+    async fn scoped_display_pack_limits_canonical_support_embedding_to_visible_page() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-canonical-display-scope");
+        store.add_source(&source).unwrap();
+        let first = insert_canonical_chunk(
+            &store,
+            &source,
+            "chunk-first",
+            &[
+                ("ev-first-11", 11, "Opening charge before God."),
+                (
+                    "ev-first-12",
+                    12,
+                    "Alpha crown of righteousness is reserved.",
+                ),
+                ("ev-first-13", 13, "Come to me soon."),
+            ],
+        );
+        let second = insert_canonical_chunk(
+            &store,
+            &source,
+            "chunk-second",
+            &[
+                ("ev-second-1", 1, "Second opening charge."),
+                (
+                    "ev-second-8",
+                    8,
+                    "Second alpha crown is the visible support.",
+                ),
+                ("ev-second-9", 9, "Second closing request."),
+            ],
+        );
+        let vector_index =
+            StaticVectorIndex::new(vec![(first.id.clone(), 0.9), (second.id.clone(), 0.8)]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 0,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            strategy: RerankStrategy::Endpoint,
+            provider: "vllm".into(),
+            model: "test-reranker".into(),
+            top_n: 2,
+            ..Default::default()
+        };
+        let full_client = RecordingQueryEmbeddingClient::new();
+        let full_reranker = RecordingReranker::hits(vec![(1, 0.99), (0, 0.7)]);
+        let (full_results, full_debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &full_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &full_reranker)
+        .search_source_set_with_debug("alpha crown", None)
+        .await
+        .unwrap();
+
+        let scoped_client = RecordingQueryEmbeddingClient::new();
+        let scoped_reranker = RecordingReranker::hits(vec![(1, 0.99), (0, 0.7)]);
+        let (scoped_results, scoped_debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &scoped_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &scoped_reranker)
+        .search_source_set_with_debug_display_scope(
+            "alpha crown",
+            None,
+            RetrievalDisplayScope::page(1, 1, 1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            chunk_ids(&full_results),
+            vec!["chunk-second", "chunk-first"]
+        );
+        assert_eq!(chunk_ids(&scoped_results), chunk_ids(&full_results));
+        assert_eq!(full_reranker.recorded_docs()[0].len(), 2);
+        assert_eq!(scoped_reranker.recorded_docs()[0].len(), 2);
+        assert_eq!(full_reranker.recorded_top_ns(), vec![2]);
+        assert_eq!(scoped_reranker.recorded_top_ns(), vec![2]);
+        assert_eq!(
+            scoped_debug.final_evidence_pack.len(),
+            full_debug.final_evidence_pack.len()
+        );
+        assert_eq!(scoped_debug.final_evidence_pack.len(), 6);
+        assert_eq!(full_debug.display_evidence_pack.len(), 2);
+        assert_eq!(scoped_debug.display_evidence_pack.len(), 2);
+        assert_eq!(
+            scoped_debug.display_evidence_pack[0].evidence_id,
+            full_debug.display_evidence_pack[0].evidence_id
+        );
+        assert_eq!(
+            scoped_debug.display_evidence_pack[0].evidence_id.0,
+            "ev-second-8"
+        );
+
+        let full_embedding_batches = full_client.recorded_texts();
+        let scoped_embedding_batches = scoped_client.recorded_texts();
+        assert_eq!(full_embedding_batches.len(), 2);
+        assert_eq!(scoped_embedding_batches.len(), 2);
+        assert_eq!(full_embedding_batches[0].len(), 1);
+        assert_eq!(scoped_embedding_batches[0].len(), 1);
+        assert_eq!(full_embedding_batches[1].len(), 6);
+        assert_eq!(scoped_embedding_batches[1].len(), 3);
+        assert!(scoped_embedding_batches[1]
+            .iter()
+            .all(|text| text.contains("Second")));
+    }
+
+    #[tokio::test]
+    async fn compact_debug_skips_full_evidence_pack_without_changing_ranking() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-compact-debug");
+        store.add_source(&source).unwrap();
+        let first = insert_canonical_chunk(
+            &store,
+            &source,
+            "chunk-first",
+            &[
+                ("ev-first-11", 11, "Opening charge before God."),
+                (
+                    "ev-first-12",
+                    12,
+                    "Alpha crown of righteousness is reserved.",
+                ),
+                ("ev-first-13", 13, "Come to me soon."),
+            ],
+        );
+        let second = insert_canonical_chunk(
+            &store,
+            &source,
+            "chunk-second",
+            &[
+                ("ev-second-1", 1, "Second opening charge."),
+                (
+                    "ev-second-8",
+                    8,
+                    "Second alpha crown is the visible support.",
+                ),
+                ("ev-second-9", 9, "Second closing request."),
+            ],
+        );
+        let vector_index =
+            StaticVectorIndex::new(vec![(first.id.clone(), 0.9), (second.id.clone(), 0.8)]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 0,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            strategy: RerankStrategy::Endpoint,
+            provider: "vllm".into(),
+            model: "test-reranker".into(),
+            top_n: 2,
+            ..Default::default()
+        };
+        let visible_budget = RetrievalCanonicalSelectionBudget::page(1, 1, 1);
+
+        let compact_client = RecordingQueryEmbeddingClient::new();
+        let compact_reranker = RecordingReranker::hits(vec![(1, 0.99), (0, 0.7)]);
+        let (compact_results, compact_debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &compact_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &compact_reranker)
+        .search_source_set_with_debug_options(
+            "alpha crown",
+            None,
+            RetrievalDebugOptions::compact(visible_budget),
+        )
+        .await
+        .unwrap();
+
+        let full_client = RecordingQueryEmbeddingClient::new();
+        let full_reranker = RecordingReranker::hits(vec![(1, 0.99), (0, 0.7)]);
+        let (full_results, full_debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &full_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &full_reranker)
+        .search_source_set_with_debug_options(
+            "alpha crown",
+            None,
+            RetrievalDebugOptions::full(visible_budget),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            chunk_ids(&compact_results),
+            vec!["chunk-second", "chunk-first"]
+        );
+        assert_eq!(chunk_ids(&compact_results), chunk_ids(&full_results));
+        assert_eq!(compact_reranker.recorded_docs()[0].len(), 2);
+        assert_eq!(
+            compact_reranker.recorded_docs()[0],
+            full_reranker.recorded_docs()[0]
+        );
+        assert_eq!(compact_reranker.recorded_top_ns(), vec![2]);
+        assert_eq!(
+            compact_reranker.recorded_top_ns(),
+            full_reranker.recorded_top_ns()
+        );
+
+        assert_eq!(
+            compact_debug.evidence_pack_mode,
+            RetrievalDebugEvidencePackMode::Compact
+        );
+        assert!(compact_debug.final_evidence_pack.is_empty());
+        assert_eq!(compact_debug.final_evidence_count, 6);
+        assert_eq!(compact_debug.display_evidence_pack.len(), 2);
+        assert_eq!(compact_debug.display_evidence_count, 2);
+        assert_eq!(
+            compact_debug.display_evidence_pack[0].evidence_id.0,
+            "ev-second-8"
+        );
+        assert_eq!(
+            compact_debug.display_evidence_pack[1].evidence_id.0,
+            "ev-first-11"
+        );
+        assert_eq!(compact_debug.local_spans_ms.final_evidence_pack_ms, 0);
+
+        assert_eq!(
+            full_debug.evidence_pack_mode,
+            RetrievalDebugEvidencePackMode::Full
+        );
+        assert_eq!(full_debug.final_evidence_pack.len(), 6);
+        assert_eq!(full_debug.final_evidence_count, 6);
+        assert_eq!(full_debug.display_evidence_pack.len(), 2);
+        assert_eq!(
+            full_debug.display_evidence_pack[0].evidence_id.0,
+            "ev-second-8"
+        );
+
+        let compact_embedding_batches = compact_client.recorded_texts();
+        assert_eq!(compact_embedding_batches.len(), 2);
+        assert_eq!(compact_embedding_batches[0].len(), 1);
+        assert_eq!(compact_embedding_batches[1].len(), 3);
+        assert!(compact_embedding_batches[1]
+            .iter()
+            .all(|text| text.contains("Second")));
+    }
+
+    #[tokio::test]
+    async fn canonical_support_and_display_budgets_are_independent() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-canonical-independent-budgets");
+        store.add_source(&source).unwrap();
+        let first = insert_canonical_chunk(
+            &store,
+            &source,
+            "chunk-first",
+            &[
+                ("ev-first-11", 11, "Opening charge before God."),
+                (
+                    "ev-first-12",
+                    12,
+                    "Alpha crown of righteousness is reserved.",
+                ),
+                ("ev-first-13", 13, "Come to me soon."),
+            ],
+        );
+        let second = insert_canonical_chunk(
+            &store,
+            &source,
+            "chunk-second",
+            &[
+                ("ev-second-1", 1, "Second opening charge."),
+                (
+                    "ev-second-8",
+                    8,
+                    "Second alpha crown is the visible support.",
+                ),
+                ("ev-second-9", 9, "Second closing request."),
+            ],
+        );
+        let vector_index =
+            StaticVectorIndex::new(vec![(first.id.clone(), 0.9), (second.id.clone(), 0.8)]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 0,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            strategy: RerankStrategy::Endpoint,
+            provider: "vllm".into(),
+            model: "test-reranker".into(),
+            top_n: 2,
+            ..Default::default()
+        };
+        let visible_scope = RetrievalDisplayScope::page(1, 1, 1);
+
+        let support_limited_client = RecordingQueryEmbeddingClient::new();
+        let support_limited_reranker = RecordingReranker::hits(vec![(1, 0.99), (0, 0.7)]);
+        let (support_limited_results, support_limited_debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &support_limited_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &support_limited_reranker)
+        .search_source_set_with_debug_canonical_budget(
+            "alpha crown",
+            None,
+            RetrievalCanonicalSelectionBudget::new(visible_scope, RetrievalDisplayScope::All),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            chunk_ids(&support_limited_results),
+            vec!["chunk-second", "chunk-first"]
+        );
+        assert_eq!(support_limited_reranker.recorded_docs()[0].len(), 2);
+        assert_eq!(support_limited_reranker.recorded_top_ns(), vec![2]);
+        assert_eq!(support_limited_debug.final_evidence_pack.len(), 6);
+        assert_eq!(support_limited_debug.display_evidence_pack.len(), 2);
+        assert_eq!(
+            support_limited_debug.display_evidence_pack[0].evidence_id.0,
+            "ev-second-8"
+        );
+        assert_eq!(
+            support_limited_debug.display_evidence_pack[1].evidence_id.0,
+            "ev-first-11"
+        );
+        let support_limited_batches = support_limited_client.recorded_texts();
+        assert_eq!(support_limited_batches.len(), 2);
+        assert_eq!(support_limited_batches[0].len(), 1);
+        assert_eq!(support_limited_batches[1].len(), 3);
+        assert!(support_limited_batches[1]
+            .iter()
+            .all(|text| text.contains("Second")));
+
+        let display_limited_client = RecordingQueryEmbeddingClient::new();
+        let display_limited_reranker = RecordingReranker::hits(vec![(1, 0.99), (0, 0.7)]);
+        let (display_limited_results, display_limited_debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &display_limited_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &display_limited_reranker)
+        .search_source_set_with_debug_canonical_budget(
+            "alpha crown",
+            None,
+            RetrievalCanonicalSelectionBudget::new(RetrievalDisplayScope::All, visible_scope),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            chunk_ids(&display_limited_results),
+            chunk_ids(&support_limited_results)
+        );
+        assert_eq!(display_limited_reranker.recorded_docs()[0].len(), 2);
+        assert_eq!(display_limited_reranker.recorded_top_ns(), vec![2]);
+        assert_eq!(display_limited_debug.final_evidence_pack.len(), 6);
+        assert_eq!(display_limited_debug.display_evidence_pack.len(), 2);
+        assert_eq!(
+            display_limited_debug.display_evidence_pack[0].evidence_id.0,
+            "ev-second-8"
+        );
+        assert_eq!(
+            display_limited_debug.display_evidence_pack[1].evidence_id.0,
+            "ev-first-11"
+        );
+        let display_limited_batches = display_limited_client.recorded_texts();
+        assert_eq!(display_limited_batches.len(), 2);
+        assert_eq!(display_limited_batches[0].len(), 1);
+        assert_eq!(display_limited_batches[1].len(), 6);
+    }
+
+    #[tokio::test]
+    async fn canonical_detail_by_evidence_id_or_locator_scores_only_target_result() {
+        let store = Store::in_memory().unwrap();
+        let source = source("src-canonical-detail");
+        store.add_source(&source).unwrap();
+        let first = insert_canonical_chunk(
+            &store,
+            &source,
+            "chunk-first",
+            &[
+                ("ev-first-11", 11, "Opening charge before God."),
+                (
+                    "ev-first-12",
+                    12,
+                    "Alpha crown of righteousness is reserved.",
+                ),
+                ("ev-first-13", 13, "Come to me soon."),
+            ],
+        );
+        let second = insert_canonical_chunk(
+            &store,
+            &source,
+            "chunk-second",
+            &[
+                ("ev-second-1", 1, "Second opening charge."),
+                (
+                    "ev-second-8",
+                    8,
+                    "Second alpha crown is the visible support.",
+                ),
+                ("ev-second-9", 9, "Second closing request."),
+            ],
+        );
+        let vector_index =
+            StaticVectorIndex::new(vec![(first.id.clone(), 0.9), (second.id.clone(), 0.8)]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: 2,
+            bm25_top_k: 0,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            strategy: RerankStrategy::Endpoint,
+            provider: "vllm".into(),
+            model: "test-reranker".into(),
+            top_n: 2,
+            ..Default::default()
+        };
+        let client = RecordingQueryEmbeddingClient::new();
+        let reranker = RecordingReranker::hits(vec![(1, 0.99), (0, 0.7)]);
+        let pipeline = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &reranker);
+        let (results, debug) = pipeline
+            .search_source_set_with_debug_canonical_budget(
+                "alpha crown",
+                None,
+                RetrievalCanonicalSelectionBudget::page(1, 1, 1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(chunk_ids(&results), vec!["chunk-second", "chunk-first"]);
+        assert_eq!(debug.final_evidence_pack.len(), 6);
+        assert_eq!(debug.display_evidence_pack.len(), 2);
+        assert_eq!(debug.display_evidence_pack[0].evidence_id.0, "ev-second-8");
+        assert_eq!(debug.display_evidence_pack[1].evidence_id.0, "ev-first-11");
+        assert_eq!(reranker.recorded_docs()[0].len(), 2);
+        assert_eq!(reranker.recorded_top_ns(), vec![2]);
+        let initial_batches = client.recorded_texts();
+        assert_eq!(initial_batches.len(), 2);
+        assert_eq!(initial_batches[1].len(), 3);
+        assert!(initial_batches[1]
+            .iter()
+            .all(|text| text.contains("Second")));
+
+        let target_id = EvidenceId("ev-first-13".into());
+        let detail_by_id = pipeline
+            .canonical_detail_evidence_pack_debug(
+                "alpha crown",
+                &results,
+                RetrievalCanonicalDetailTarget::EvidenceId(&target_id),
+            )
+            .await
+            .expect("target evidence id should resolve to canonical detail");
+
+        assert_eq!(detail_by_id.display_entry.evidence_id.0, "ev-first-12");
+        assert_eq!(detail_by_id.support_evidence_pack.len(), 3);
+        assert!(detail_by_id
+            .support_evidence_pack
+            .iter()
+            .any(|entry| entry.evidence_id.0 == "ev-first-13"));
+        let detail_batches = client.recorded_texts();
+        assert_eq!(detail_batches.len(), 4);
+        assert_eq!(detail_batches[2].len(), 1);
+        assert_eq!(detail_batches[3].len(), 3);
+        assert!(detail_batches[3]
+            .iter()
+            .all(|text| !text.contains("Second")));
+        assert!(detail_batches[3]
+            .iter()
+            .any(|text| text.contains("Alpha crown")));
+
+        let target_locator = results[1]
+            .evidence_units
+            .iter()
+            .find(|evidence| evidence.id.0 == "ev-first-13")
+            .expect("target locator")
+            .locator
+            .clone();
+        let detail_by_locator = pipeline
+            .canonical_detail_evidence_pack_debug(
+                "alpha crown",
+                &results,
+                RetrievalCanonicalDetailTarget::Locator(&target_locator),
+            )
+            .await
+            .expect("target locator should resolve to canonical detail");
+
+        assert_eq!(detail_by_locator.display_entry.evidence_id.0, "ev-first-12");
+        assert_eq!(
+            detail_by_locator.support_evidence_pack,
+            detail_by_id.support_evidence_pack
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_canonical_regression_bounds_many_expanded_evidence_units() {
+        const RANKED_CHUNK_COUNT: usize = 4;
+        const EVIDENCE_PER_CHUNK: usize = 40;
+        const EXPANDED_EVIDENCE_COUNT: usize = RANKED_CHUNK_COUNT * EVIDENCE_PER_CHUNK;
+        const VISIBLE_SUPPORT_OFFSET: usize = 16;
+        const DETAIL_SUPPORT_OFFSET: usize = 18;
+        const DETAIL_TARGET_OFFSET: usize = 31;
+
+        let store = Store::in_memory().unwrap();
+        let source = source("src-canonical-many-expanded");
+        store.add_source(&source).unwrap();
+        let anchor = insert_numbered_canonical_chunk(
+            &store,
+            &source,
+            "chunk-anchor",
+            "ev-anchor",
+            1,
+            EVIDENCE_PER_CHUNK,
+            7,
+            "anchor",
+        );
+        let visible = insert_numbered_canonical_chunk(
+            &store,
+            &source,
+            "chunk-visible",
+            "ev-visible",
+            101,
+            EVIDENCE_PER_CHUNK,
+            VISIBLE_SUPPORT_OFFSET,
+            "visible",
+        );
+        let detail = insert_numbered_canonical_chunk(
+            &store,
+            &source,
+            "chunk-detail",
+            "ev-detail",
+            201,
+            EVIDENCE_PER_CHUNK,
+            DETAIL_SUPPORT_OFFSET,
+            "detail",
+        );
+        let tail = insert_numbered_canonical_chunk(
+            &store,
+            &source,
+            "chunk-tail",
+            "ev-tail",
+            301,
+            EVIDENCE_PER_CHUNK,
+            23,
+            "tail",
+        );
+        let vector_index = StaticVectorIndex::new(vec![
+            (anchor.id.clone(), 0.95),
+            (visible.id.clone(), 0.9),
+            (detail.id.clone(), 0.85),
+            (tail.id.clone(), 0.8),
+        ]);
+        let lexical_index = StaticLexicalIndex::new(Vec::new());
+        let retrieval_config = RetrievalConfig {
+            dense_top_k: RANKED_CHUNK_COUNT,
+            bm25_top_k: 0,
+            rrf_k: 60,
+            ..RetrievalConfig::default()
+        };
+        let rerank_config = RerankConfig {
+            enabled: true,
+            strategy: RerankStrategy::Endpoint,
+            provider: "vllm".into(),
+            model: "test-reranker".into(),
+            top_n: RANKED_CHUNK_COUNT,
+            ..Default::default()
+        };
+        let visible_budget = RetrievalCanonicalSelectionBudget::page(1, 1, 1);
+        let expected_order = vec![
+            "chunk-visible",
+            "chunk-detail",
+            "chunk-anchor",
+            "chunk-tail",
+        ];
+        let visible_support_id =
+            numbered_canonical_evidence_id("ev-visible", 101, VISIBLE_SUPPORT_OFFSET);
+        let detail_support_id =
+            numbered_canonical_evidence_id("ev-detail", 201, DETAIL_SUPPORT_OFFSET);
+        let detail_target_id = EvidenceId(numbered_canonical_evidence_id(
+            "ev-detail",
+            201,
+            DETAIL_TARGET_OFFSET,
+        ));
+
+        let compact_client = RecordingQueryEmbeddingClient::new();
+        let compact_reranker =
+            RecordingReranker::hits(vec![(1, 0.99), (2, 0.95), (0, 0.8), (3, 0.7)]);
+        let compact_pipeline = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &compact_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &compact_reranker);
+        let (compact_results, compact_debug) = compact_pipeline
+            .search_source_set_with_debug_options(
+                "alpha crown",
+                None,
+                RetrievalDebugOptions::compact(visible_budget),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(chunk_ids(&compact_results), expected_order);
+        assert_eq!(compact_reranker.call_count(), 1);
+        assert_eq!(
+            compact_reranker.recorded_docs()[0].len(),
+            RANKED_CHUNK_COUNT
+        );
+        assert_eq!(compact_reranker.recorded_top_ns(), vec![RANKED_CHUNK_COUNT]);
+        assert_eq!(
+            compact_debug.evidence_pack_mode,
+            RetrievalDebugEvidencePackMode::Compact
+        );
+        assert!(compact_debug.final_evidence_pack.is_empty());
+        assert_eq!(compact_debug.final_evidence_count, EXPANDED_EVIDENCE_COUNT);
+        assert_eq!(compact_debug.display_evidence_count, RANKED_CHUNK_COUNT);
+        assert_eq!(
+            compact_debug.display_evidence_pack.len(),
+            RANKED_CHUNK_COUNT
+        );
+        assert_eq!(
+            compact_debug.display_evidence_pack[0].evidence_id.0,
+            visible_support_id
+        );
+        assert_eq!(
+            compact_debug.display_evidence_pack[1].evidence_id.0,
+            "ev-detail-201"
+        );
+        assert_eq!(compact_debug.local_spans_ms.final_evidence_pack_ms, 0);
+
+        let compact_embedding_batches = compact_client.recorded_texts();
+        assert_eq!(compact_embedding_batches.len(), 2);
+        assert_eq!(compact_embedding_batches[0].len(), 1);
+        assert_eq!(compact_embedding_batches[1].len(), EVIDENCE_PER_CHUNK);
+        assert!(compact_embedding_batches[1]
+            .iter()
+            .all(|text| text.contains("visible")));
+        assert!(compact_embedding_batches
+            .iter()
+            .all(|batch| batch.len() < EXPANDED_EVIDENCE_COUNT));
+
+        let full_client = RecordingQueryEmbeddingClient::new();
+        let full_reranker = RecordingReranker::hits(vec![(1, 0.99), (2, 0.95), (0, 0.8), (3, 0.7)]);
+        let (full_results, full_debug) = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &full_client,
+            &retrieval_config,
+        )
+        .with_reranker(&rerank_config, &full_reranker)
+        .search_source_set_with_debug_options(
+            "alpha crown",
+            None,
+            RetrievalDebugOptions::full(visible_budget),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(chunk_ids(&full_results), chunk_ids(&compact_results));
+        assert_eq!(
+            full_debug.evidence_pack_mode,
+            RetrievalDebugEvidencePackMode::Full
+        );
+        assert_eq!(
+            full_debug.final_evidence_pack.len(),
+            EXPANDED_EVIDENCE_COUNT
+        );
+        assert_eq!(full_debug.final_evidence_count, EXPANDED_EVIDENCE_COUNT);
+        assert_eq!(full_debug.display_evidence_count, RANKED_CHUNK_COUNT);
+        assert_eq!(
+            full_debug.display_evidence_pack[0].evidence_id.0,
+            visible_support_id
+        );
+        assert!(full_debug
+            .final_evidence_pack
+            .iter()
+            .any(|entry| entry.evidence_id == detail_target_id));
+
+        let target_locator = compact_results[1]
+            .evidence_units
+            .iter()
+            .find(|evidence| evidence.id == detail_target_id)
+            .expect("detail target evidence")
+            .locator
+            .clone();
+        let detail_by_id = compact_pipeline
+            .canonical_detail_evidence_pack_debug(
+                "alpha crown",
+                &compact_results,
+                RetrievalCanonicalDetailTarget::EvidenceId(&detail_target_id),
+            )
+            .await
+            .expect("non-visible target evidence id should resolve");
+
+        assert_eq!(compact_reranker.call_count(), 1);
+        assert_eq!(detail_by_id.display_entry.evidence_id.0, detail_support_id);
+        assert_eq!(detail_by_id.support_evidence_pack.len(), EVIDENCE_PER_CHUNK);
+        assert!(detail_by_id
+            .support_evidence_pack
+            .iter()
+            .any(|entry| entry.evidence_id == detail_target_id));
+        let detail_embedding_batches = compact_client.recorded_texts();
+        assert_eq!(detail_embedding_batches.len(), 4);
+        assert_eq!(detail_embedding_batches[2].len(), 1);
+        assert_eq!(detail_embedding_batches[3].len(), EVIDENCE_PER_CHUNK);
+        assert!(detail_embedding_batches[3]
+            .iter()
+            .all(|text| text.contains("detail")));
+
+        let detail_by_locator = compact_pipeline
+            .canonical_detail_evidence_pack_debug(
+                "alpha crown",
+                &compact_results,
+                RetrievalCanonicalDetailTarget::Locator(&target_locator),
+            )
+            .await
+            .expect("non-visible target locator should resolve");
+
+        assert_eq!(compact_reranker.call_count(), 1);
+        assert_eq!(
+            detail_by_locator.support_evidence_pack,
+            detail_by_id.support_evidence_pack
+        );
+        assert_eq!(
+            detail_by_locator.display_entry.evidence_id,
+            detail_by_id.display_entry.evidence_id
+        );
     }
 
     #[tokio::test]

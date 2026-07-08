@@ -17,7 +17,7 @@ use verbatim_core::store::VectorJsonCleanupTableStats;
 use verbatim_core::task::{TaskEvent, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary};
 use verbatim_core::types::{
     BBox, OcrSourceStatus, RetrievalDebug, RetrievalEvidencePackEntry, RetrievalFusedHit,
-    RetrievalRerankStatus, RetrievalStageHit, SourceLocator,
+    RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalStageHit, SourceLocator,
 };
 
 /// Persisted sample used to estimate aggregate task-list progress across CLI calls.
@@ -2048,6 +2048,7 @@ struct RetrieveDebugSummary {
     task_id: String,
     debug_available: bool,
     timing_ms: RetrieveDebugTimingSummary,
+    local_spans_ms: RetrievalLocalSpansMs,
     counts: RetrieveDebugCountSummary,
     reranker: RetrieveDebugRerankerSummary,
     top_candidates: RetrieveDebugTopCandidates,
@@ -2061,6 +2062,9 @@ impl RetrieveDebugSummary {
             task_id: response.task_id.clone(),
             debug_available: debug.is_some(),
             timing_ms: RetrieveDebugTimingSummary::from_response(response, debug),
+            local_spans_ms: debug
+                .map(|debug| debug.local_spans_ms.clone())
+                .unwrap_or_default(),
             counts: RetrieveDebugCountSummary::from_debug(debug),
             reranker: RetrieveDebugRerankerSummary::from_debug(debug),
             top_candidates: RetrieveDebugTopCandidates::from_debug(debug),
@@ -2121,7 +2125,7 @@ impl RetrieveDebugCountSummary {
             dense_hits: debug.dense_hits.len(),
             rrf_fused: debug.rrf_fused_hits.len(),
             rerank_input: rerank_input_count(debug),
-            final_evidence: debug.final_evidence_pack.len(),
+            final_evidence: debug_final_evidence_count(debug),
         }
     }
 }
@@ -2218,6 +2222,14 @@ fn reranker_status_name(status: RetrievalRerankStatus) -> &'static str {
         RetrievalRerankStatus::Skipped => "skipped",
         RetrievalRerankStatus::Succeeded => "succeeded",
         RetrievalRerankStatus::Fallback => "fallback",
+    }
+}
+
+fn debug_final_evidence_count(debug: &RetrievalDebug) -> usize {
+    if debug.final_evidence_count > 0 || debug.final_evidence_pack.is_empty() {
+        debug.final_evidence_count
+    } else {
+        debug.final_evidence_pack.len()
     }
 }
 
@@ -2580,12 +2592,33 @@ where
     if let Some(path) = debug.get("dense_vector_path").and_then(Value::as_str) {
         writeln!(writer, "Dense vector path: {path}")?;
     }
+    write_local_spans(writer, debug.get("local_spans_ms"))?;
     write_stage_hits(writer, "BM25 hits", debug.get("bm25_hits"))?;
     write_stage_hits(writer, "Dense hits", debug.get("dense_hits"))?;
     write_fused_hits(writer, debug.get("rrf_fused_hits"))?;
     write_graph_hits(writer, debug.get("graph_expanded_hits"))?;
     write_reranker(writer, debug.get("reranker"))?;
     write_final_pack(writer, debug.get("final_evidence_pack"))?;
+    Ok(())
+}
+
+fn write_local_spans<W>(writer: &mut W, spans: Option<&Value>) -> std::io::Result<()>
+where
+    W: Write,
+{
+    writeln!(writer)?;
+    writeln!(writer, "Local spans (ms):")?;
+    let Some(spans) = spans.and_then(Value::as_object) else {
+        return writeln!(writer, "  (none)");
+    };
+    if spans.is_empty() {
+        return writeln!(writer, "  (none)");
+    }
+    for (field, value) in spans {
+        if let Some(duration_ms) = value.as_u64() {
+            writeln!(writer, "  {field}={duration_ms}ms")?;
+        }
+    }
     Ok(())
 }
 
