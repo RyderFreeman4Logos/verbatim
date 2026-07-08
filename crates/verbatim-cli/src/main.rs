@@ -841,13 +841,21 @@ where
             } else {
                 render::write_health_compact(stdout, &health)?;
             }
-            Ok(0)
+            Ok(daemon_status_exit_code(&health))
         }
         DaemonCommand::Install { force } => {
             let path = local.daemon_install(force)?;
             local::write_daemon_install(stdout, &path)?;
             Ok(0)
         }
+    }
+}
+
+fn daemon_status_exit_code(health: &verbatim_core::api::HealthResponse) -> u8 {
+    if health.readiness.retrieval_ready {
+        0
+    } else {
+        1
     }
 }
 
@@ -2180,12 +2188,12 @@ mod tests {
         CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
         CreateCollectionRequest, EvidenceResponse, HealthResponse, IdleExitActivitySnapshot,
         IdleExitHealth, IdleReclaimActivitySnapshot, IdleReclaimBackendResult,
-        IdleReclaimCycleResult, IdleReclaimHealth, IngestResponse, ReindexRequest, ReindexResponse,
-        RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
-        RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
-        TaskEventsResponse, TaskListAggregate, TaskListResponse, TaskProfileResponse,
-        TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate,
-        TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
+        IdleReclaimCycleResult, IdleReclaimHealth, IngestResponse, ReadinessHealth, ReindexRequest,
+        ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
+        RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
+        TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskListAggregate, TaskListResponse,
+        TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
+        TaskStaleRunningAggregate, TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
     };
     use verbatim_core::collection::{
         CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
@@ -2994,6 +3002,7 @@ mod tests {
         let client = MockDaemonClient::default();
         client.health_response.replace(Some(HealthResponse {
             status: "ok".into(),
+            readiness: ReadinessHealth::ready(),
             memory_budget: Default::default(),
             resources: Vec::new(),
             idle_reclaim: Some(IdleReclaimHealth {
@@ -3047,10 +3056,61 @@ mod tests {
     }
 
     #[test]
+    fn daemon_status_returns_nonzero_while_retrieval_is_starting() {
+        let client = MockDaemonClient::default();
+        client.health_response.replace(Some(HealthResponse {
+            status: "ok".into(),
+            readiness: ReadinessHealth::starting(
+                "orphan_recovery",
+                Some("recovering previous running ingest tasks".into()),
+            ),
+            memory_budget: Default::default(),
+            resources: Vec::new(),
+            idle_reclaim: None,
+            idle_exit: None,
+        }));
+        let local = MockLocalActions::default();
+
+        let (code, stdout, stderr) =
+            run_mock_with(["daemon", "status", "--details"], &client, &local);
+
+        assert_eq!(code.unwrap(), 1);
+        assert!(stderr.is_empty());
+        assert!(stdout.contains("Readiness: starting"));
+        assert!(stdout.contains("process_alive=true"));
+        assert!(stdout.contains("retrieval_ready=false"));
+        assert!(stdout.contains("startup_phase=orphan_recovery"));
+        assert!(stdout.contains("degraded_reason=recovering previous running ingest tasks"));
+    }
+
+    #[test]
+    fn retrieve_starting_error_is_clear_and_not_unreachable() {
+        let client = MockDaemonClient {
+            retrieve_error: Some(CliError::Api(
+                "verbatim daemon is starting; retrieval is not ready \
+                 (startup_phase=orphan_recovery; degraded_reason=recovering previous running ingest tasks)"
+                    .into(),
+            )),
+            ..MockDaemonClient::default()
+        };
+        let local = MockLocalActions::default();
+
+        let (code, stdout, stderr) = run_mock_with(["retrieve", "question"], &client, &local);
+
+        assert_eq!(code.unwrap_err(), 1);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("verbatim daemon is starting"));
+        assert!(stderr.contains("retrieval is not ready"));
+        assert!(stderr.contains("startup_phase=orphan_recovery"));
+        assert!(!stderr.contains("could not reach"));
+    }
+
+    #[test]
     fn daemon_status_displays_last_reclaim_attempt_after_skipped_decision() {
         let client = MockDaemonClient::default();
         client.health_response.replace(Some(HealthResponse {
             status: "ok".into(),
+            readiness: ReadinessHealth::ready(),
             memory_budget: Default::default(),
             resources: Vec::new(),
             idle_reclaim: Some(IdleReclaimHealth {
@@ -3114,6 +3174,7 @@ mod tests {
         let client = MockDaemonClient::default();
         client.health_response.replace(Some(HealthResponse {
             status: "ok".into(),
+            readiness: ReadinessHealth::ready(),
             memory_budget: Default::default(),
             resources: Vec::new(),
             idle_reclaim: None,
@@ -4656,6 +4717,7 @@ mod tests {
         last_collection_sync: RefCell<Option<CollectionSyncRequest>>,
         last_watcher_update: RefCell<Option<CollectionWatcherUpdateRequest>>,
         list_error: Option<CliError>,
+        retrieve_error: Option<CliError>,
         health_error: Option<CliError>,
         health_errors: RefCell<Vec<CliError>>,
         health_response: RefCell<Option<HealthResponse>>,
@@ -4988,6 +5050,9 @@ mod tests {
         }
 
         fn retrieve(&self, request: &RetrieveRequest) -> client::CliResult<RetrieveResponse> {
+            if let Some(error) = &self.retrieve_error {
+                return Err(clone_cli_error(error));
+            }
             self.calls.borrow_mut().push("retrieve".into());
             self.last_retrieve.replace(Some(request.clone()));
             Ok(sample_retrieve_response(request))
@@ -5029,6 +5094,7 @@ mod tests {
                 .clone()
                 .unwrap_or(HealthResponse {
                     status: "ok".into(),
+                    readiness: ReadinessHealth::ready(),
                     memory_budget: Default::default(),
                     resources: Vec::new(),
                     idle_reclaim: None,
