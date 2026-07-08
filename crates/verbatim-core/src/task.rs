@@ -19,6 +19,7 @@ pub const TASK_METADATA_MAX_BYTES: usize = 8192;
 pub const TASK_EVENT_MESSAGE_MAX_CHARS: usize = 512;
 pub const TASK_ERROR_MAX_CHARS: usize = 2048;
 pub const TASK_SPAN_MAX_PER_TASK: usize = 256;
+pub const TASK_PROFILE_SCHEMA_VERSION: u32 = 1;
 const TASK_STRING_MAX_CHARS: usize = 256;
 const TASK_UPSTREAM_BODY_PREFIX_MAX_CHARS: usize = 4096;
 const TASK_ARRAY_MAX_ITEMS: usize = 32;
@@ -190,6 +191,16 @@ pub struct TaskSummary {
     pub blocking_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<TaskProgressSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProfile {
+    pub schema_version: u32,
+    pub task_id: TaskId,
+    pub task_kind: TaskKind,
+    pub status: TaskStatus,
+    pub queue_wait_ms: u64,
+    pub total_wall_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

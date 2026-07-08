@@ -39,7 +39,7 @@ use verbatim_core::api::{
     IndexStatusResponse, IngestResponse, ReindexRequest, ReindexResponse, RetrieveControlsResponse,
     RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
     SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate, TaskEventsResponse,
-    TaskIngestRequest, TaskListAggregate, TaskListResponse, TaskQueueTurnover,
+    TaskIngestRequest, TaskListAggregate, TaskListResponse, TaskProfileResponse, TaskQueueTurnover,
     TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse,
     TaskWaitEvent, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
 };
@@ -83,7 +83,7 @@ use verbatim_core::task::{
     reindex_task_request_metadata_with_queue_claim,
     reindex_task_request_metadata_with_queue_claim_and_batch, retrieve_request_metadata,
     retrieve_result_metadata, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskEvent, TaskId,
-    TaskKind, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
+    TaskKind, TaskProfile, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
 };
 use verbatim_core::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 use verbatim_core::types::{
@@ -504,6 +504,12 @@ impl DebouncedCollectionSet {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn unix_seconds_delta_ms(start: &str, end: &str) -> Option<u64> {
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    Some(end.saturating_sub(start).saturating_mul(1_000))
 }
 
 fn now_unix_millis() -> u64 {
@@ -2724,6 +2730,31 @@ async fn ensure_task_started(
     ))
 }
 
+async fn task_queue_wait_ms(
+    state: &SharedState,
+    task_id: &TaskId,
+) -> Result<u64, (StatusCode, Json<ErrorResponse>)> {
+    let task_id = task_id.clone();
+    with_task_store_read(state, move |store| {
+        let task = store
+            .get_task(&task_id)?
+            .with_context(|| format!("task not found: {}", task_id.0))?;
+        Ok(task
+            .started_at
+            .as_deref()
+            .and_then(|started_at| unix_seconds_delta_ms(&task.created_at, started_at))
+            .unwrap_or(0))
+    })
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("task not found") {
+            err(StatusCode::NOT_FOUND, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })
+}
+
 async fn try_mark_ingest_task_started(
     state: &SharedState,
     task_id: &TaskId,
@@ -3001,6 +3032,24 @@ async fn finish_task_success(
     task_id: &TaskId,
     result: serde_json::Value,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    finish_task_success_with_optional_profile(state, task_id, result, None).await
+}
+
+async fn finish_task_success_with_profile(
+    state: &SharedState,
+    task_id: &TaskId,
+    result: serde_json::Value,
+    profile: TaskProfile,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    finish_task_success_with_optional_profile(state, task_id, result, Some(profile)).await
+}
+
+async fn finish_task_success_with_optional_profile(
+    state: &SharedState,
+    task_id: &TaskId,
+    result: serde_json::Value,
+    profile: Option<TaskProfile>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
     let outcome = with_task_store_write(state, move |store| {
@@ -3010,7 +3059,10 @@ async fn finish_task_success(
             .is_some_and(|task| task.kind == TaskKind::Ingest);
         let terminalize_timing = should_wake_ingest_queue
             .then(|| PhaseTiming::start(IngestTaskStage::TaskTerminalize.as_str()));
-        let task_changed = store.finish_task_success(&task_id, &result)?;
+        let task_changed = match profile.as_ref() {
+            Some(profile) => store.finish_task_success_with_profile(&task_id, &result, profile)?,
+            None => store.finish_task_success(&task_id, &result)?,
+        };
         if task_changed {
             store.insert_task_event(&task_id, "succeeded", "task succeeded", &result)?;
             if let Some(timing) = terminalize_timing {
@@ -3420,6 +3472,40 @@ async fn task_summary_response(
     .await
     .map_err(|e| {
         if e.to_string().contains("task not found") {
+            err(StatusCode::NOT_FOUND, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })
+}
+
+async fn task_profile_response(
+    state: &SharedState,
+    task_id: TaskId,
+) -> Result<TaskProfileResponse, (StatusCode, Json<ErrorResponse>)> {
+    with_task_store_read(state, move |store| {
+        let task = store
+            .get_task(&task_id)?
+            .with_context(|| format!("task not found: {}", task_id.0))?;
+        if !task.status.is_terminal() {
+            bail!(
+                "task profile unavailable for incomplete task: {}",
+                task_id.0
+            );
+        }
+        let profile = store
+            .get_task_profile(&task_id)?
+            .with_context(|| format!("task profile unavailable: {}", task_id.0))?;
+        Ok(TaskProfileResponse { profile })
+    })
+    .await
+    .map_err(|e| {
+        let message = e.to_string();
+        if message.contains("task not found") {
+            err(StatusCode::NOT_FOUND, e)
+        } else if message.contains("incomplete task") {
+            err(StatusCode::CONFLICT, e)
+        } else if message.contains("task profile unavailable") {
             err(StatusCode::NOT_FOUND, e)
         } else {
             err(StatusCode::INTERNAL_SERVER_ERROR, e)
@@ -3855,6 +3941,13 @@ async fn show_task(
     task_summary_response(&state, TaskId(id)).await.map(Json)
 }
 
+async fn task_profile_handler(
+    State(state): State<SharedState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskProfileResponse>, (StatusCode, Json<ErrorResponse>)> {
+    task_profile_response(&state, TaskId(id)).await.map(Json)
+}
+
 async fn list_task_events_handler(
     State(state): State<SharedState>,
     Path(id): Path<String>,
@@ -4050,7 +4143,9 @@ async fn execute_retrieve_task_inner(
     req: RetrieveRequest,
     controls: EffectiveRetrieveControls,
 ) -> Result<RetrieveResponse, (StatusCode, Json<ErrorResponse>)> {
+    let execution_started = Instant::now();
     ensure_task_started(&state, task_id).await?;
+    let queue_wait_ms = task_queue_wait_ms(&state, task_id).await?;
     let question = req.question;
     let source_id = req.source_id.map(SourceId);
     let collection_filter = req.collection_filter;
@@ -4198,7 +4293,15 @@ async fn execute_retrieve_task_inner(
     }
     record_retrieve_local_spans(&state, task_id, &retrieval_started_at, &task_local_spans).await?;
 
-    finish_task_success(
+    let profile = TaskProfile {
+        schema_version: verbatim_core::task::TASK_PROFILE_SCHEMA_VERSION,
+        task_id: task_id.clone(),
+        task_kind: TaskKind::Retrieve,
+        status: TaskStatus::Succeeded,
+        queue_wait_ms,
+        total_wall_ms: queue_wait_ms.saturating_add(elapsed_ms(execution_started)),
+    };
+    finish_task_success_with_profile(
         &state,
         task_id,
         retrieve_result_metadata(
@@ -4206,6 +4309,7 @@ async fn execute_retrieve_task_inner(
             response.returned_results,
             response.controls.rerank_enabled,
         ),
+        profile,
     )
     .await?;
     Ok(response)
@@ -8790,6 +8894,7 @@ async fn run_daemon_with_config(config: Config) -> Result<()> {
         .route("/api/tasks/reindex", post(submit_reindex_task))
         .route("/api/tasks", get(list_tasks_handler))
         .route("/api/tasks/{id}", get(show_task))
+        .route("/api/tasks/{id}/profile", get(task_profile_handler))
         .route("/api/tasks/{id}/events", get(list_task_events_handler))
         .route("/api/tasks/{id}/wait", get(wait_task))
         .route("/api/tasks/{id}/cancel", post(cancel_task_handler))
@@ -14274,6 +14379,75 @@ mod tests {
         assert!(!debug.bm25_hits.is_empty());
         assert_eq!(model_server.embedding_requests(), 0);
         assert_eq!(model_server.chat_requests(), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_retrieve_profile_query_uses_persisted_state_without_model_calls() {
+        let model_server = MockModelServer::start(3).await;
+        let test_dir = TestDir::new("completed-retrieve-profile-no-rerun");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Profile lookup should reuse the completed retrieve task state.",
+        )
+        .unwrap();
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.embedding.enabled = false;
+        config.rerank.enabled = false;
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let Json(retrieve_response) = retrieve(
+            State(Arc::clone(&state)),
+            Json(RetrieveRequest {
+                question: "Profile lookup retrieve task state?".into(),
+                source_id: Some(source_id.0),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                limit: Some(3),
+                page_size: Some(3),
+                page: Some(1),
+                fast: true,
+                rerank: Some(false),
+                dense_top_k: None,
+                bm25_top_k: Some(3),
+                rerank_top_n: None,
+                bypass_cache: false,
+                include_debug: true,
+                include_debug_packs: false,
+                include_locator: false,
+                passage: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let before_embedding = model_server.embedding_requests();
+        let before_chat = model_server.chat_requests();
+        let before_models = model_server.model_requests();
+        let Json(profile_response) = task_profile_handler(
+            State(Arc::clone(&state)),
+            Path(retrieve_response.task_id.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            profile_response.profile.task_id.0,
+            retrieve_response.task_id
+        );
+        assert_eq!(profile_response.profile.task_kind, TaskKind::Retrieve);
+        assert_eq!(profile_response.profile.status, TaskStatus::Succeeded);
+        assert_eq!(
+            profile_response.profile.schema_version,
+            verbatim_core::task::TASK_PROFILE_SCHEMA_VERSION
+        );
+        assert!(profile_response.profile.total_wall_ms >= profile_response.profile.queue_wait_ms);
+        assert_eq!(model_server.embedding_requests(), before_embedding);
+        assert_eq!(model_server.chat_requests(), before_chat);
+        assert_eq!(model_server.model_requests(), before_models);
     }
 
     #[tokio::test]

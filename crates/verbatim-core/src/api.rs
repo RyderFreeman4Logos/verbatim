@@ -12,7 +12,7 @@ use crate::index_profile_delete::{IndexProfileDeleteApplyReport, IndexProfileDel
 use crate::memory_budget::MemoryBudgetSnapshot;
 use crate::resource::ResourceQueueSnapshot;
 use crate::store::VectorJsonCleanupReport;
-use crate::task::{TaskEvent, TaskSpan, TaskSummary};
+use crate::task::{TaskEvent, TaskProfile, TaskSpan, TaskSummary};
 use crate::types::{
     BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceIngestDiagnostics,
     SourceLocator,
@@ -468,6 +468,11 @@ pub struct TaskSummaryResponse {
     pub task: TaskSummary,
     #[serde(default)]
     pub spans: Vec<TaskSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProfileResponse {
+    pub profile: TaskProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

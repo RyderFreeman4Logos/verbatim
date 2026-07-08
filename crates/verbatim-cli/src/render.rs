@@ -8,8 +8,8 @@ use verbatim_core::api::{
     CollectionFilterResponse, CollectionResultProvenance, CollectionWatcherStatus, ConfigResponse,
     EvidenceResponse, HealthResponse, IndexGcResponse, IndexProfileDeleteResponse,
     IndexStatusResponse, IngestResponse, ReindexResponse, RetrieveResponse, SourceResponse,
-    TaskCreatedResponse, TaskListAggregate, TaskListResponse, TaskReasonBucket, TaskWaitEvent,
-    VectorJsonCleanupResponse,
+    TaskCreatedResponse, TaskListAggregate, TaskListResponse, TaskProfileResponse,
+    TaskReasonBucket, TaskWaitEvent, VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::{CollectionRecord, CollectionStatus, CollectionSyncReport};
 use verbatim_core::index_gc::{IndexGcPlanEntry, IndexGcSkippedEntry};
@@ -563,6 +563,17 @@ where
     W: Write,
 {
     writeln!(writer, "Reindexed {} source(s).", response.reindexed)
+}
+
+pub fn write_task_profile_json<W>(
+    writer: &mut W,
+    response: &TaskProfileResponse,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    serde_json::to_writer_pretty(&mut *writer, &response.profile).map_err(io::Error::other)?;
+    writeln!(writer)
 }
 
 pub fn write_index_gc<W>(writer: &mut W, response: &IndexGcResponse) -> std::io::Result<()>

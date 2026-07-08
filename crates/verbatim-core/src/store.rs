@@ -17,7 +17,7 @@ use crate::collection::{
 };
 use crate::task::{
     bounded_error, bounded_json, bounded_message, IngestTaskStage, TaskEvent, TaskId, TaskKind,
-    TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary, TASK_SPAN_MAX_PER_TASK,
+    TaskProfile, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary, TASK_SPAN_MAX_PER_TASK,
 };
 use crate::traits::VectorDocument;
 use crate::types::{
@@ -554,6 +554,12 @@ impl Store {
             "tasks",
             "progress_phase_started_at",
             "ALTER TABLE tasks ADD COLUMN progress_phase_started_at TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
+            "tasks",
+            "profile_json",
+            "ALTER TABLE tasks ADD COLUMN profile_json TEXT",
         )?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS tasks_active_progress_metadata_idx
@@ -2282,6 +2288,18 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn get_task_profile(&self, task_id: &TaskId) -> Result<Option<TaskProfile>> {
+        let profile_json = self
+            .conn
+            .prepare("SELECT profile_json FROM tasks WHERE id = ?1")?
+            .query_row(params![&task_id.0], |row| row.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten();
+        profile_json
+            .map(|json| serde_json::from_str(&json).context("deserialize task profile"))
+            .transpose()
+    }
+
     pub fn task_status(&self, task_id: &TaskId) -> Result<Option<TaskStatus>> {
         self.conn
             .prepare("SELECT status FROM tasks WHERE id = ?1")?
@@ -2727,18 +2745,41 @@ impl Store {
         task_id: &TaskId,
         result: &serde_json::Value,
     ) -> Result<bool> {
+        self.finish_task_success_with_optional_profile(task_id, result, None)
+    }
+
+    pub fn finish_task_success_with_profile(
+        &self,
+        task_id: &TaskId,
+        result: &serde_json::Value,
+        profile: &TaskProfile,
+    ) -> Result<bool> {
+        self.finish_task_success_with_optional_profile(task_id, result, Some(profile))
+    }
+
+    fn finish_task_success_with_optional_profile(
+        &self,
+        task_id: &TaskId,
+        result: &serde_json::Value,
+        profile: Option<&TaskProfile>,
+    ) -> Result<bool> {
         let now = unix_timestamp_string();
         let result = serde_json::to_string(&bounded_json(result.clone()))
             .context("serialize task success result")?;
+        let profile = profile
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize task profile")?;
         let changed = self.conn.execute(
-            "UPDATE tasks
-             SET status = ?2, updated_at = ?3, finished_at = COALESCE(finished_at, ?3), result_json = ?4, error = NULL
-             WHERE id = ?1 AND status IN (?5, ?6)",
+             "UPDATE tasks
+             SET status = ?2, updated_at = ?3, finished_at = COALESCE(finished_at, ?3), result_json = ?4, profile_json = ?5, error = NULL
+             WHERE id = ?1 AND status IN (?6, ?7)",
             params![
                 &task_id.0,
                 TaskStatus::Succeeded.as_str(),
                 now,
                 result,
+                profile,
                 TaskStatus::Queued.as_str(),
                 TaskStatus::Running.as_str(),
             ],
@@ -2794,7 +2835,8 @@ impl Store {
                  progress_phase = NULL,
                  progress_wait_reason = NULL,
                  progress_recent_status = NULL,
-                 progress_phase_started_at = NULL
+                 progress_phase_started_at = NULL,
+                 profile_json = NULL
              WHERE id = ?1 AND status = ?4",
             params![
                 &task_id.0,
@@ -4754,7 +4796,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     progress_phase TEXT,
     progress_wait_reason TEXT,
     progress_recent_status TEXT,
-    progress_phase_started_at TEXT
+    progress_phase_started_at TEXT,
+    profile_json TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_status_updated_idx
     ON tasks(status, updated_at);
@@ -5465,6 +5508,7 @@ mod tests {
 
         let migrated = Store::new(&db_path).unwrap();
         assert!(table_has_column(migrated.connection(), "tasks", "progress_json").unwrap());
+        assert!(table_has_column(migrated.connection(), "tasks", "profile_json").unwrap());
     }
 
     fn sample_evidence(source_id: &str) -> Vec<EvidenceUnit> {
@@ -6479,6 +6523,49 @@ mod tests {
         let spans = store.list_task_spans(&task_id).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].metadata["model"], "qwen");
+    }
+
+    #[test]
+    fn completed_retrieve_task_profile_is_persisted_and_queryable() {
+        let store = Store::in_memory().unwrap();
+        let task_id = TaskId("task-profile".into());
+        store
+            .create_task(
+                &task_id,
+                TaskKind::Retrieve,
+                &crate::task::retrieve_request_metadata(
+                    "What supports profile lookup?",
+                    None,
+                    None,
+                    3,
+                    3,
+                    1,
+                ),
+            )
+            .unwrap();
+        assert!(store.start_task(&task_id).unwrap());
+
+        let profile = crate::task::TaskProfile {
+            schema_version: crate::task::TASK_PROFILE_SCHEMA_VERSION,
+            task_id: task_id.clone(),
+            task_kind: TaskKind::Retrieve,
+            status: TaskStatus::Succeeded,
+            queue_wait_ms: 0,
+            total_wall_ms: 17,
+        };
+        store
+            .finish_task_success_with_profile(
+                &task_id,
+                &crate::task::retrieve_result_metadata(2, 1, false),
+                &profile,
+            )
+            .unwrap();
+
+        let stored = store
+            .get_task_profile(&task_id)
+            .unwrap()
+            .expect("retrieve task profile should be stored");
+        assert_eq!(stored, profile);
     }
 
     #[test]

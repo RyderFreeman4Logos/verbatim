@@ -17,7 +17,7 @@ use verbatim_core::api::{
     IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse,
     IngestResponse, ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse,
     SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskListResponse,
-    TaskSummaryResponse, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
+    TaskProfileResponse, TaskSummaryResponse, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
@@ -135,6 +135,7 @@ pub trait DaemonClient {
     ) -> CliResult<VectorJsonCleanupResponse>;
     fn list_tasks(&self) -> CliResult<TaskListResponse>;
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
+    fn get_task_profile(&self, task_id: &str) -> CliResult<TaskProfileResponse>;
     fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse>;
     fn wait_task<W>(
         &self,
@@ -550,6 +551,14 @@ impl DaemonClient for HttpDaemonClient {
         self.request_json::<TaskSummaryResponse, ()>(
             Method::GET,
             &format!("/api/tasks/{task_id}"),
+            None,
+        )
+    }
+
+    fn get_task_profile(&self, task_id: &str) -> CliResult<TaskProfileResponse> {
+        self.request_json::<TaskProfileResponse, ()>(
+            Method::GET,
+            &format!("/api/tasks/{task_id}/profile"),
             None,
         )
     }
@@ -1572,6 +1581,27 @@ mod tests {
         assert!(requests[4].starts_with("GET /api/tasks/task-1/wait?after=2 HTTP/1.1"));
         assert!(requests[5].starts_with("POST /api/tasks/task-1/cancel HTTP/1.1"));
         assert!(requests[6].starts_with("POST /api/tasks/task-1/resume HTTP/1.1"));
+    }
+
+    #[test]
+    fn http_task_profile_route_is_plumbed() {
+        let server = TestServer::respond_many(vec![concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+            "{\"profile\":{\"schema_version\":1,\"task_id\":\"task-1\",",
+            "\"task_kind\":\"retrieve\",\"status\":\"succeeded\",",
+            "\"queue_wait_ms\":0,\"total_wall_ms\":12}}"
+        )
+        .to_string()]);
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let profile = client.get_task_profile("task-1").unwrap().profile;
+
+        assert_eq!(profile.task_id.0, "task-1");
+        assert_eq!(profile.task_kind.as_str(), "retrieve");
+        assert_eq!(profile.status.as_str(), "succeeded");
+        assert_eq!(profile.total_wall_ms, 12);
+        let requests = server.requests();
+        assert!(requests[0].starts_with("GET /api/tasks/task-1/profile HTTP/1.1"));
     }
 
     #[test]

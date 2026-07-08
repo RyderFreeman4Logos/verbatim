@@ -928,6 +928,12 @@ where
             let response = client.get_task(&task_id)?;
             render::write_task_summary(stdout, &response.task, &response.spans)?;
         }
+        TaskCommand::Profile { task_id, format } => {
+            let response = client.get_task_profile(&task_id)?;
+            match format {
+                TaskProfileFormat::Json => render::write_task_profile_json(stdout, &response)?,
+            }
+        }
         TaskCommand::Events { task_id, after } => {
             let response = client.get_task_events(&task_id, after)?;
             render::write_task_events(stdout, &response.events)?;
@@ -1344,6 +1350,7 @@ Idle exit can recover with explicit CLI auto-start for status or run
 const TASK_AFTER_HELP: &str = r#"Examples:
   verbatim task list
   verbatim task show <task-id>
+  verbatim task profile <task-id> --format json
   verbatim task events <task-id>
   verbatim task wait --timeout 25m <task-id>
   verbatim task cancel <task-id>
@@ -1368,6 +1375,14 @@ const TASK_SHOW_AFTER_HELP: &str = r#"Examples:
 
 Show prints the current task status, request/result summary, progress snapshot,
 and bounded phase spans such as ingest stage timings.
+"#;
+
+const TASK_PROFILE_AFTER_HELP: &str = r#"Examples:
+  verbatim task profile <task-id> --format json
+
+Profile reads persisted completed-task diagnostics by task id. It does not rerun
+retrieval, embedding, rerank, BM25, dense search, chat, verifier, or evidence
+expansion work.
 "#;
 
 const TASK_EVENTS_AFTER_HELP: &str = r#"Examples:
@@ -2032,6 +2047,19 @@ enum TaskCommand {
         #[arg(value_name = "TASK_ID")]
         task_id: String,
     },
+    /// Show a persisted completed-task performance profile.
+    #[command(
+        about = "Show persisted completed-task performance diagnostics.",
+        after_help = TASK_PROFILE_AFTER_HELP
+    )]
+    Profile {
+        /// Completed task id.
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = TaskProfileFormat::Json)]
+        format: TaskProfileFormat,
+    },
     /// List bounded task events.
     #[command(
         about = "List task events with optional sequence resume.",
@@ -2118,6 +2146,11 @@ enum ResolveFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TaskProfileFormat {
+    Json,
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -2138,9 +2171,9 @@ mod tests {
         IdleReclaimCycleResult, IdleReclaimHealth, IngestResponse, ReindexRequest, ReindexResponse,
         RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
         RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
-        TaskEventsResponse, TaskListAggregate, TaskListResponse, TaskQueueTurnover,
-        TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse,
-        COLLECTION_CLI_API_PARITY,
+        TaskEventsResponse, TaskListAggregate, TaskListResponse, TaskProfileResponse,
+        TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate,
+        TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
     };
     use verbatim_core::collection::{
         CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
@@ -2148,8 +2181,8 @@ mod tests {
     };
     use verbatim_core::config::ConfigReloadMetadata;
     use verbatim_core::task::{
-        IngestTaskStage, TaskEndpointSummary, TaskEvent, TaskId, TaskKind, TaskProgressSnapshot,
-        TaskSpan, TaskStatus, TaskSummary,
+        IngestTaskStage, TaskEndpointSummary, TaskEvent, TaskId, TaskKind, TaskProfile,
+        TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
     };
     use verbatim_core::types::{SourceId, SourceLocator};
 
@@ -2362,7 +2395,23 @@ mod tests {
         assert!(stderr.is_empty());
         assert!(task_help.contains("Task ids are returned by --background"));
         assert!(task_help.contains("verbatim task wait --timeout 25m"));
+        assert!(task_help.contains("verbatim task profile"));
         assert!(task_help.contains("verbatim task resume"));
+    }
+
+    #[test]
+    fn task_profile_help_documents_json_and_no_rerun_contract() {
+        let (code, help, stderr, _, _) = run_mock(["task", "profile", "--help"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(help.contains("verbatim task profile <task-id> --format json"));
+        assert!(help.contains("--format"));
+        assert!(help.contains("completed-task diagnostics"));
+        assert!(help.contains("does not rerun"));
+        assert!(help.contains("retrieval"));
+        assert!(help.contains("embedding"));
+        assert!(help.contains("chat"));
     }
 
     #[test]
@@ -3240,6 +3289,29 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert_eq!(client.calls.borrow().as_slice(), ["resume_task:task-1"]);
         assert!(stdout.contains("Task: task-1"));
+    }
+
+    #[test]
+    fn task_profile_json_calls_daemon_and_writes_machine_readable_profile() {
+        let (code, stdout, stderr, client, _) =
+            run_mock(["task", "profile", "task-1", "--format", "json"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["get_task_profile:task-1"]
+        );
+        let parsed: Value = serde_json::from_str(&stdout).expect("profile stdout is JSON");
+        assert_eq!(parsed["task_id"], "task-1");
+        assert_eq!(parsed["task_kind"], "retrieve");
+        assert_eq!(parsed["status"], "succeeded");
+        assert_eq!(
+            parsed["schema_version"],
+            verbatim_core::task::TASK_PROFILE_SCHEMA_VERSION
+        );
+        assert!(parsed["queue_wait_ms"].is_u64());
+        assert!(parsed["total_wall_ms"].is_u64());
     }
 
     #[test]
@@ -4699,6 +4771,15 @@ mod tests {
             Ok(sample_task_response(TaskStatus::Succeeded))
         }
 
+        fn get_task_profile(&self, task_id: &str) -> client::CliResult<TaskProfileResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("get_task_profile:{task_id}"));
+            Ok(TaskProfileResponse {
+                profile: sample_task_profile(task_id),
+            })
+        }
+
         fn get_task_events(
             &self,
             task_id: &str,
@@ -5478,6 +5559,17 @@ mod tests {
             message: "retrieval complete".into(),
             payload: serde_json::json!({"result_count": 1}),
             created_at: "2".into(),
+        }
+    }
+
+    fn sample_task_profile(task_id: &str) -> TaskProfile {
+        TaskProfile {
+            schema_version: verbatim_core::task::TASK_PROFILE_SCHEMA_VERSION,
+            task_id: TaskId(task_id.into()),
+            task_kind: TaskKind::Retrieve,
+            status: TaskStatus::Succeeded,
+            queue_wait_ms: 0,
+            total_wall_ms: 25,
         }
     }
 
