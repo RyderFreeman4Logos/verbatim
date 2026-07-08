@@ -2770,6 +2770,7 @@ impl Store {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize task profile")?;
+        // Keep terminal status, result metadata, and profile JSON in one SQLite statement.
         let changed = self.conn.execute(
              "UPDATE tasks
              SET status = ?2, updated_at = ?3, finished_at = COALESCE(finished_at, ?3), result_json = ?4, profile_json = ?5, error = NULL
@@ -5511,6 +5512,87 @@ mod tests {
         assert!(table_has_column(migrated.connection(), "tasks", "profile_json").unwrap());
     }
 
+    #[test]
+    fn legacy_task_profile_migration_is_idempotent_and_preserves_rows() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy-profile.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    request_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT
+                );
+                INSERT INTO tasks (
+                    id, kind, status, created_at, updated_at, started_at, finished_at,
+                    request_json, result_json, error
+                ) VALUES (
+                    'task-legacy', 'retrieve', 'succeeded', '1', '2', '1', '2',
+                    '{\"question\":\"old\"}', '{\"returned_results\":0}', NULL
+                );
+                INSERT INTO tasks (
+                    id, kind, status, created_at, updated_at, started_at, finished_at,
+                    request_json, result_json, error
+                ) VALUES (
+                    'task-running', 'retrieve', 'running', '3', '4', '4', NULL,
+                    '{\"question\":\"new\"}', NULL, NULL
+                );",
+            )
+            .unwrap();
+        }
+
+        let running_id = TaskId("task-running".into());
+        let profile = crate::task::TaskProfile {
+            schema_version: crate::task::TASK_PROFILE_SCHEMA_VERSION,
+            task_id: running_id.clone(),
+            task_kind: TaskKind::Retrieve,
+            status: TaskStatus::Succeeded,
+            queue_wait_ms: 1,
+            total_wall_ms: 9,
+            controls: Default::default(),
+            resources: Default::default(),
+            endpoints: Vec::new(),
+            retrieve: None,
+            ask: None,
+        };
+        {
+            let migrated = Store::new(&db_path).unwrap();
+            assert!(table_has_column(migrated.connection(), "tasks", "profile_json").unwrap());
+            assert!(migrated
+                .get_task_profile(&TaskId("task-legacy".into()))
+                .unwrap()
+                .is_none());
+            assert!(migrated
+                .finish_task_success_with_profile(
+                    &running_id,
+                    &crate::task::retrieve_result_metadata(0, 0, false),
+                    &profile,
+                )
+                .unwrap());
+        }
+
+        let reopened = Store::new(&db_path).unwrap();
+        let legacy = reopened
+            .get_task(&TaskId("task-legacy".into()))
+            .unwrap()
+            .expect("legacy row should survive migrations");
+        assert_eq!(legacy.status, TaskStatus::Succeeded);
+        assert!(reopened.get_task_profile(&legacy.id).unwrap().is_none());
+        let stored_profile = reopened
+            .get_task_profile(&running_id)
+            .unwrap()
+            .expect("profile data should survive repeated migration");
+        assert_eq!(stored_profile, profile);
+    }
+
     fn sample_evidence(source_id: &str) -> Vec<EvidenceUnit> {
         vec![
             EvidenceUnit {
@@ -6571,6 +6653,91 @@ mod tests {
             .unwrap()
             .expect("retrieve task profile should be stored");
         assert_eq!(stored, profile);
+        let summary = store
+            .get_task(&task_id)
+            .unwrap()
+            .expect("task summary should be stored");
+        assert_eq!(summary.status, TaskStatus::Succeeded);
+        assert!(summary.result.is_some());
+        assert!(summary.error.is_none());
+    }
+
+    #[test]
+    fn malformed_stored_task_profile_returns_error_without_panicking() {
+        let store = Store::in_memory().unwrap();
+        let task_id = TaskId("task-malformed-profile".into());
+        store
+            .create_task(
+                &task_id,
+                TaskKind::Retrieve,
+                &crate::task::retrieve_request_metadata(
+                    "What happens to malformed profiles?",
+                    None,
+                    None,
+                    3,
+                    3,
+                    1,
+                ),
+            )
+            .unwrap();
+        assert!(store.start_task(&task_id).unwrap());
+        assert!(store
+            .finish_task_success(
+                &task_id,
+                &crate::task::retrieve_result_metadata(0, 0, false)
+            )
+            .unwrap());
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET profile_json = ?2 WHERE id = ?1",
+                params![&task_id.0, "{not valid json"],
+            )
+            .unwrap();
+
+        let error = store.get_task_profile(&task_id).unwrap_err();
+        assert!(error.to_string().contains("deserialize task profile"));
+    }
+
+    #[test]
+    fn cancelled_task_is_not_overwritten_by_late_profile_success() {
+        let store = Store::in_memory().unwrap();
+        let task_id = TaskId("task-cancel-profile".into());
+        store
+            .create_task(
+                &task_id,
+                TaskKind::Retrieve,
+                &crate::task::retrieve_request_metadata("cancelled", None, None, 3, 3, 1),
+            )
+            .unwrap();
+        assert!(store.start_task(&task_id).unwrap());
+        assert!(store.cancel_task(&task_id).unwrap());
+
+        let profile = crate::task::TaskProfile {
+            schema_version: crate::task::TASK_PROFILE_SCHEMA_VERSION,
+            task_id: task_id.clone(),
+            task_kind: TaskKind::Retrieve,
+            status: TaskStatus::Succeeded,
+            queue_wait_ms: 0,
+            total_wall_ms: 1,
+            controls: Default::default(),
+            resources: Default::default(),
+            endpoints: Vec::new(),
+            retrieve: None,
+            ask: None,
+        };
+        assert!(!store
+            .finish_task_success_with_profile(
+                &task_id,
+                &crate::task::retrieve_result_metadata(1, 1, false),
+                &profile,
+            )
+            .unwrap());
+
+        let summary = store.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(summary.status, TaskStatus::Cancelled);
+        assert!(summary.result.is_none());
+        assert!(store.get_task_profile(&task_id).unwrap().is_none());
     }
 
     #[test]

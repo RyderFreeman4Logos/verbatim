@@ -3864,30 +3864,32 @@ async fn task_profile_response(
 ) -> Result<TaskProfileResponse, (StatusCode, Json<ErrorResponse>)> {
     let task_id_for_error = task_id.clone();
     with_task_store_read(state, move |store| {
-        let task = store
-            .get_task(&task_id)?
-            .with_context(|| format!("task not found: {}", task_id.0))?;
-        if !task.status.is_terminal() {
-            bail!(
-                "task profile unavailable for incomplete task {} (status {})",
-                task_id.0,
-                task.status.as_str()
-            );
-        }
-        if !matches!(task.kind, TaskKind::Ask | TaskKind::Retrieve) {
-            bail!(
-                "task profile unsupported for {} task: {}",
-                task.kind.as_str(),
-                task_id.0
-            );
-        }
-        let profile = store.get_task_profile(&task_id)?.with_context(|| {
-            format!(
-                "task profile unavailable for legacy/no-profile task: {}",
-                task_id.0
-            )
-        })?;
-        Ok(TaskProfileResponse { profile })
+        store.with_read_snapshot(|store| {
+            let task = store
+                .get_task(&task_id)?
+                .with_context(|| format!("task not found: {}", task_id.0))?;
+            if !task.status.is_terminal() {
+                bail!(
+                    "task profile unavailable for incomplete task {} (status {})",
+                    task_id.0,
+                    task.status.as_str()
+                );
+            }
+            if !matches!(task.kind, TaskKind::Ask | TaskKind::Retrieve) {
+                bail!(
+                    "task profile unsupported for {} task: {}",
+                    task.kind.as_str(),
+                    task_id.0
+                );
+            }
+            let profile = store.get_task_profile(&task_id)?.with_context(|| {
+                format!(
+                    "task profile unavailable for legacy/no-profile task: {}",
+                    task_id.0
+                )
+            })?;
+            Ok(TaskProfileResponse { profile })
+        })
     })
     .await
     .map_err(|e| {
@@ -9453,6 +9455,22 @@ mod tests {
         spans
             .iter()
             .any(|span| span.phase == IngestTaskStage::TaskTerminalize.as_str())
+    }
+
+    fn minimal_task_profile(task_id: &TaskId, kind: TaskKind, status: TaskStatus) -> TaskProfile {
+        TaskProfile {
+            schema_version: verbatim_core::task::TASK_PROFILE_SCHEMA_VERSION,
+            task_id: task_id.clone(),
+            task_kind: kind,
+            status,
+            queue_wait_ms: 0,
+            total_wall_ms: 1,
+            controls: Default::default(),
+            resources: Default::default(),
+            endpoints: Vec::new(),
+            retrieve: None,
+            ask: None,
+        }
     }
 
     #[test]
@@ -15448,6 +15466,179 @@ mod tests {
             "stored task profile JSON is malformed for task: {}",
             corrupt_id.0
         )));
+    }
+
+    #[tokio::test]
+    async fn task_profile_api_hides_partial_profile_for_running_task() {
+        let test_dir = TestDir::new("task-profile-running-partial");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("running task", None, None, 3, 3, 1),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &task_id).await.unwrap();
+
+        let profile = minimal_task_profile(&task_id, TaskKind::Retrieve, TaskStatus::Succeeded);
+        let conn = rusqlite::Connection::open(test_dir.path().join("verbatim.db")).unwrap();
+        conn.execute(
+            "UPDATE tasks SET profile_json = ?2 WHERE id = ?1",
+            rusqlite::params![&task_id.0, serde_json::to_string(&profile).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = task_profile_handler(State(Arc::clone(&state)), Path(task_id.0.clone()))
+            .await
+            .unwrap_err();
+        let (status, Json(body)) = error;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            format!(
+                "task profile unavailable for incomplete task {} (status running)",
+                task_id.0
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_and_cancelled_profile_tasks_without_profile_are_unavailable() {
+        let test_dir = TestDir::new("task-profile-terminal-unavailable");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let failed_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("failed task", None, None, 3, 3, 1),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &failed_id).await.unwrap();
+        with_task_store_write(&state, {
+            let failed_id = failed_id.clone();
+            move |store| store.finish_task_failed(&failed_id, "retrieval failed")
+        })
+        .await
+        .unwrap();
+
+        let cancelled_id = create_persisted_task(
+            &state,
+            TaskKind::Ask,
+            ask_request_metadata("cancelled task", None, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &cancelled_id).await.unwrap();
+        cancel_task_record(&state, &cancelled_id).await.unwrap();
+
+        for task_id in [&failed_id, &cancelled_id] {
+            let error = task_profile_handler(State(Arc::clone(&state)), Path(task_id.0.clone()))
+                .await
+                .unwrap_err();
+            let (status, Json(body)) = error;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(
+                body.error,
+                format!(
+                    "task profile unavailable for legacy/no-profile task: {}",
+                    task_id.0
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_task_profile_is_returned_when_persisted() {
+        let test_dir = TestDir::new("task-profile-failed-persisted");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("failed with profile", None, None, 3, 3, 1),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &task_id).await.unwrap();
+
+        let profile = minimal_task_profile(&task_id, TaskKind::Retrieve, TaskStatus::Failed);
+        with_task_store_write(&state, {
+            let task_id = task_id.clone();
+            move |store| store.finish_task_failed(&task_id, "retrieval failed")
+        })
+        .await
+        .unwrap();
+        let conn = rusqlite::Connection::open(test_dir.path().join("verbatim.db")).unwrap();
+        conn.execute(
+            "UPDATE tasks SET profile_json = ?2 WHERE id = ?1",
+            rusqlite::params![&task_id.0, serde_json::to_string(&profile).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let Json(response) = task_profile_handler(State(Arc::clone(&state)), Path(task_id.0))
+            .await
+            .unwrap();
+        assert_eq!(response.profile, profile);
+        assert_eq!(response.profile.status, TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn running_profile_query_is_bounded_and_completion_later_returns_persisted_profile() {
+        let test_dir = TestDir::new("task-profile-running-then-complete");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        let task_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("interleaved task", None, None, 3, 3, 1),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &task_id).await.unwrap();
+
+        let writer_permit = state
+            .resources
+            .sqlite_writer
+            .acquire()
+            .await
+            .expect("writer permit");
+        let running = tokio::time::timeout(
+            Duration::from_millis(250),
+            task_profile_handler(State(Arc::clone(&state)), Path(task_id.0.clone())),
+        )
+        .await
+        .expect("running profile query should not wait behind writer resource")
+        .unwrap_err();
+        let (status, Json(body)) = running;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.error.contains("status running"));
+        drop(writer_permit);
+
+        let profile = minimal_task_profile(&task_id, TaskKind::Retrieve, TaskStatus::Succeeded);
+        finish_task_success_with_profile(
+            &state,
+            &task_id,
+            retrieve_result_metadata(0, 0, false),
+            profile.clone(),
+        )
+        .await
+        .unwrap();
+
+        let Json(completed) =
+            task_profile_handler(State(Arc::clone(&state)), Path(task_id.0.clone()))
+                .await
+                .unwrap();
+        assert_eq!(completed.profile, profile);
     }
 
     #[tokio::test]
