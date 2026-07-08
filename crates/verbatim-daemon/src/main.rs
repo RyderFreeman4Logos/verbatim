@@ -4325,6 +4325,7 @@ async fn submit_ingest_task(
     State(state): State<SharedState>,
     Json(req): Json<TaskIngestRequest>,
 ) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    retrieval_readiness_gate(&state)?;
     if req.source_id.is_some() && req.force {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -4370,6 +4371,7 @@ async fn submit_reindex_task(
     State(state): State<SharedState>,
     Json(req): Json<ReindexRequest>,
 ) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    retrieval_readiness_gate(&state)?;
     let controls = resolve_reindex_controls(req).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     validate_requested_source_exists(&state, controls.source_id.as_deref()).await?;
     let task_id = TaskId::new();
@@ -10767,6 +10769,70 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_ingest_starting_rejects_without_persisting_task() {
+        let test_dir = TestDir::new("background-ingest-starting");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        set_readiness(
+            &state,
+            ReadinessHealth::starting(
+                "initializing_pipeline",
+                Some("initializing indexes and startup maintenance".into()),
+            ),
+        );
+
+        let (status, Json(error)) = submit_ingest_task(
+            State(Arc::clone(&state)),
+            Json(TaskIngestRequest {
+                source_id: None,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_starting_readiness_error(&error, "initializing_pipeline");
+        assert_eq!(task_count_for_test(&state), 0);
+    }
+
+    #[tokio::test]
+    async fn background_reindex_starting_rejects_without_persisting_task() {
+        let test_dir = TestDir::new("background-reindex-starting");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        set_readiness(
+            &state,
+            ReadinessHealth::starting(
+                "initializing_pipeline",
+                Some("initializing indexes and startup maintenance".into()),
+            ),
+        );
+
+        let (status, Json(error)) = submit_reindex_task(
+            State(Arc::clone(&state)),
+            Json(ReindexRequest {
+                source_id: None,
+                all: true,
+                stale: false,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_starting_readiness_error(&error, "initializing_pipeline");
+        assert_eq!(task_count_for_test(&state), 0);
     }
 
     #[tokio::test]
@@ -18565,6 +18631,20 @@ mod tests {
     ) -> Vec<verbatim_core::task::TaskSummary> {
         let store = state.task_store.lock().unwrap();
         ingest_batch_children(&store, &parent_id.0).unwrap()
+    }
+
+    fn task_count_for_test(state: &SharedState) -> usize {
+        let store = state.task_store.lock().unwrap();
+        store.tasks_all().unwrap().len()
+    }
+
+    fn assert_starting_readiness_error(error: &ErrorResponse, startup_phase: &str) {
+        assert_eq!(error.code.as_deref(), Some("retrieval_not_ready"));
+        assert_eq!(error.readiness.as_deref(), Some("starting"));
+        assert_eq!(error.retrieval_ready, Some(false));
+        assert_eq!(error.startup_phase.as_deref(), Some(startup_phase));
+        assert!(error.error.contains("verbatim daemon is starting"));
+        assert!(error.error.contains("retrieval is not ready"));
     }
 
     async fn assert_queued_ingest_waits_for_running(state: &SharedState, queued_id: &TaskId) {
