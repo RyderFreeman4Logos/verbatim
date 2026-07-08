@@ -9419,6 +9419,29 @@ struct StartupPipelineInit {
     index_gc_error: Option<String>,
 }
 
+enum DaemonStartupRace<T> {
+    StartupFinished(T),
+    ServerExited,
+}
+
+async fn await_startup_or_server_exit<T, F>(
+    startup: F,
+    server_task: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Result<DaemonStartupRace<T>>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(startup);
+    tokio::select! {
+        startup_result = &mut startup => Ok(DaemonStartupRace::StartupFinished(startup_result)),
+        server_result = server_task => {
+            server_result
+                .context("join daemon HTTP server task")??;
+            Ok(DaemonStartupRace::ServerExited)
+        }
+    }
+}
+
 async fn run_daemon_with_config(config: Config) -> Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -9467,28 +9490,28 @@ async fn run_daemon_with_config(config: Config) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {bind_addr}"))?;
 
-    let server_task = tokio::spawn(async move {
+    let mut server_task = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal(idle_exit_shutdown_rx))
             .await
             .context("server error")
     });
 
-    let _startup_handles =
-        match finish_daemon_startup(Arc::clone(&state), config, data_dir, idle_exit_shutdown_tx)
-            .await
-        {
-            Ok(handles) => Some(handles),
-            Err(error) => {
-                let reason = error.to_string();
-                tracing::error!(error = %reason, "daemon startup maintenance failed");
-                set_readiness(
-                    &state,
-                    ReadinessHealth::degraded("startup_failed", Some(reason)),
-                );
-                None
-            }
-        };
+    let startup =
+        finish_daemon_startup(Arc::clone(&state), config, data_dir, idle_exit_shutdown_tx);
+    let _startup_handles = match await_startup_or_server_exit(startup, &mut server_task).await? {
+        DaemonStartupRace::ServerExited => return Ok(()),
+        DaemonStartupRace::StartupFinished(Ok(handles)) => Some(handles),
+        DaemonStartupRace::StartupFinished(Err(error)) => {
+            let reason = error.to_string();
+            tracing::error!(error = %reason, "daemon startup maintenance failed");
+            set_readiness(
+                &state,
+                ReadinessHealth::degraded("startup_failed", Some(reason)),
+            );
+            None
+        }
+    };
 
     server_task
         .await
@@ -9510,13 +9533,9 @@ async fn finish_daemon_startup(
             Some("initializing indexes and startup maintenance".into()),
         ),
     );
-    let startup = tokio::task::spawn_blocking({
-        let config = config.clone();
-        let data_dir = data_dir.clone();
-        move || startup_pipeline_init(config, data_dir)
-    })
-    .await
-    .context("join startup pipeline initialization")??;
+    let startup = start_startup_pipeline_init(config.clone(), data_dir.clone())
+        .await
+        .context("join startup pipeline initialization")??;
     log_fts_startup_maintenance(startup.fts_startup_maintenance);
     if let Some(error) = startup.index_gc_error {
         tracing::warn!(error = %error, "startup index generation garbage collection failed");
@@ -9575,6 +9594,21 @@ async fn finish_daemon_startup(
         _idle_reclaim_scheduler: idle_reclaim_scheduler,
         _idle_exit_scheduler: idle_exit_scheduler,
     })
+}
+
+async fn start_startup_pipeline_init(
+    config: Config,
+    data_dir: PathBuf,
+) -> Result<Result<StartupPipelineInit>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("verbatim-startup-init".into())
+        .spawn(move || {
+            let _ = tx.send(startup_pipeline_init(config, data_dir));
+        })
+        .context("spawn startup pipeline initialization thread")?;
+    rx.await
+        .context("startup pipeline initialization thread exited before reporting")
 }
 
 fn startup_pipeline_init(config: Config, data_dir: PathBuf) -> Result<StartupPipelineInit> {
@@ -10660,6 +10694,27 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_race_returns_when_server_exits_before_startup_finishes() {
+        let (server_exit_tx, server_exit_rx) = tokio::sync::oneshot::channel();
+        let mut server_task = tokio::spawn(async move {
+            server_exit_rx.await.unwrap();
+            Ok(())
+        });
+        let startup = std::future::pending::<()>();
+
+        server_exit_tx.send(()).unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(250),
+            await_startup_or_server_exit(startup, &mut server_task),
+        )
+        .await
+        .expect("server exit should win without waiting for startup")
+        .expect("server task should exit cleanly");
+
+        assert!(matches!(outcome, DaemonStartupRace::ServerExited));
     }
 
     #[tokio::test]
