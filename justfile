@@ -269,14 +269,22 @@ install-local-daemon:
 
     "${cli_bin}" --version
     "${daemon_bin}" --version
+    last_status=""
     for ((attempt = 1; attempt <= readiness_timeout; attempt++)); do
-        if PATH="${bin_dir}:${PATH}" "${cli_bin}" daemon status; then
+        if last_status="$(PATH="${bin_dir}:${PATH}" "${cli_bin}" daemon status --details 2>&1)"; then
+            printf '%s\n' "${last_status}"
             echo "Local ${service_unit} daemon deployed from ${daemon_bin}"
             exit 0
         fi
         sleep 1
     done
     echo "${service_unit} restarted but did not pass daemon status within ${readiness_timeout} seconds" >&2
+    echo "last verbatim daemon status --details:" >&2
+    if [[ -n "${last_status}" ]]; then
+        printf '%s\n' "${last_status}" >&2
+    else
+        echo "<no status output captured>" >&2
+    fi
     echo "systemctl --user status ${service_unit} --no-pager -l:" >&2
     systemctl --user status "${service_unit}" --no-pager -l >&2 || true
     echo "journalctl --user -u ${service_unit} --no-pager -n 80:" >&2

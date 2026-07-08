@@ -38,12 +38,13 @@ use verbatim_core::api::{
     IdleExitActivitySnapshot, IdleExitHealth, IdleReclaimActivitySnapshot,
     IdleReclaimBackendResult, IdleReclaimCycleResult, IdleReclaimHealth, ImageArtifactResponse,
     IndexGcRequest, IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse,
-    IndexStatusResponse, IngestResponse, ReindexRequest, ReindexResponse, RetrieveControlsResponse,
-    RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
-    SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate, TaskEventsResponse,
-    TaskIngestRequest, TaskListAggregate, TaskListResponse, TaskProfileResponse, TaskQueueTurnover,
-    TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse,
-    TaskWaitEvent, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
+    IndexStatusResponse, IngestResponse, ReadinessHealth, ReindexRequest, ReindexResponse,
+    RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+    RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
+    TaskEventsResponse, TaskIngestRequest, TaskListAggregate, TaskListResponse,
+    TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
+    TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent, VectorJsonCleanupRequest,
+    VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -123,6 +124,7 @@ struct AppState {
     /// Independent task metadata connection for serialized writes.
     task_store: std::sync::Mutex<Store>,
     index_status_cache: std::sync::RwLock<Option<IndexStatusResponse>>,
+    readiness: std::sync::RwLock<ReadinessHealth>,
     resources: DaemonResources,
     memory_budget: MemoryBudget,
     ingest_queue_active: AtomicBool,
@@ -542,12 +544,9 @@ async fn track_http_activity(
     if let Some(status) = idle_exit_shutdown_rejection_status(&state, &request_path) {
         return (
             status,
-            Json(ErrorResponse {
-                error:
-                    "daemon is shutting down after idle timeout; retry after the service restarts"
-                        .into(),
-                upstream_failure: None,
-            }),
+            Json(ErrorResponse::new(
+                "daemon is shutting down after idle timeout; retry after the service restarts",
+            )),
         )
             .into_response();
     }
@@ -561,12 +560,9 @@ async fn track_http_activity(
     if let Some(status) = idle_exit_shutdown_rejection_status(&state, &request_path) {
         return (
             status,
-            Json(ErrorResponse {
-                error:
-                    "daemon is shutting down after idle timeout; retry after the service restarts"
-                        .into(),
-                upstream_failure: None,
-            }),
+            Json(ErrorResponse::new(
+                "daemon is shutting down after idle timeout; retry after the service restarts",
+            )),
         )
             .into_response();
     }
@@ -1448,6 +1444,55 @@ fn daemon_resource_snapshots(state: &SharedState) -> Vec<ResourceQueueSnapshot> 
     snapshots
 }
 
+fn readiness_snapshot(state: &SharedState) -> ReadinessHealth {
+    state
+        .readiness
+        .read()
+        .map(|readiness| readiness.clone())
+        .unwrap_or_else(|error| {
+            ReadinessHealth::degraded(
+                "readiness_lock",
+                Some(format!("readiness lock poisoned: {error}")),
+            )
+        })
+}
+
+fn set_readiness(state: &SharedState, readiness: ReadinessHealth) {
+    match state.readiness.write() {
+        Ok(mut current) => {
+            *current = readiness;
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to update daemon readiness");
+        }
+    }
+}
+
+fn retrieval_readiness_gate(state: &SharedState) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let readiness = readiness_snapshot(state);
+    if readiness.retrieval_ready {
+        return Ok(());
+    }
+    let message = retrieval_not_ready_message(&readiness);
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse::retrieval_not_ready(message, readiness)),
+    ))
+}
+
+fn retrieval_not_ready_message(readiness: &ReadinessHealth) -> String {
+    let mut message = format!(
+        "verbatim daemon is {}; retrieval is not ready (startup_phase={}",
+        readiness.state, readiness.startup_phase
+    );
+    if let Some(reason) = &readiness.degraded_reason {
+        message.push_str("; degraded_reason=");
+        message.push_str(reason);
+    }
+    message.push(')');
+    message
+}
+
 const PIPELINE_BUSY_ERROR: &str = "ingest pipeline is busy with a long-running indexing operation";
 
 fn pipeline_busy_error() -> anyhow::Error {
@@ -1913,6 +1958,7 @@ async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
     let idle_exit = idle_exit_health_gate(&state, resources.clone()).health;
     Json(HealthResponse {
         status: "ok".into(),
+        readiness: readiness_snapshot(&state),
         memory_budget: state.memory_budget.snapshot(),
         resources,
         idle_reclaim: Some(idle_reclaim),
@@ -3476,8 +3522,13 @@ async fn finish_task_failed_from_response(
     task_id: &TaskId,
     error: &ErrorResponse,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    finish_task_failed_with_upstream(state, task_id, &error.error, error.upstream_failure.clone())
-        .await
+    finish_task_failed_with_upstream(
+        state,
+        task_id,
+        &error.error,
+        error.upstream_failure.clone().map(|failure| *failure),
+    )
+    .await
 }
 
 async fn finish_task_failed_with_upstream(
@@ -4150,6 +4201,7 @@ async fn ask(
     State(state): State<SharedState>,
     Json(req): Json<AskRequest>,
 ) -> Result<Json<AskResponse>, (StatusCode, Json<ErrorResponse>)> {
+    retrieval_readiness_gate(&state)?;
     validate_ask_retrieve_controls(&req)?;
     let task_id = create_persisted_task(
         &state,
@@ -4169,7 +4221,8 @@ async fn ask(
 async fn ask_stream(
     State(state): State<SharedState>,
     Json(req): Json<AskRequest>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
+    retrieval_readiness_gate(&state)?;
     let (tx, rx) = mpsc::channel::<Event>(ASK_STREAM_EVENT_BUFFER);
     let sse_guard = state.idle_reclaim.start_sse().await;
     let idle_exit_sse_guard = state.idle_exit.start_sse();
@@ -4204,7 +4257,7 @@ async fn ask_stream(
         }
     }
 
-    Sse::new(stream::unfold(
+    Ok(Sse::new(stream::unfold(
         (rx, sse_guard, idle_exit_sse_guard),
         |(mut rx, sse_guard, idle_exit_sse_guard): (
             mpsc::Receiver<Event>,
@@ -4215,13 +4268,14 @@ async fn ask_stream(
                 .await
                 .map(|event| (Ok(event), (rx, sse_guard, idle_exit_sse_guard)))
         },
-    ))
+    )))
 }
 
 async fn submit_ask_task(
     State(state): State<SharedState>,
     Json(req): Json<AskRequest>,
 ) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    retrieval_readiness_gate(&state)?;
     validate_ask_retrieve_controls(&req)?;
     let task_id = create_persisted_task(
         &state,
@@ -4243,6 +4297,7 @@ async fn retrieve(
     State(state): State<SharedState>,
     Json(req): Json<RetrieveRequest>,
 ) -> Result<Json<RetrieveResponse>, (StatusCode, Json<ErrorResponse>)> {
+    retrieval_readiness_gate(&state)?;
     let config = runtime_config_snapshot(&state)
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .config;
@@ -4270,6 +4325,7 @@ async fn submit_ingest_task(
     State(state): State<SharedState>,
     Json(req): Json<TaskIngestRequest>,
 ) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    retrieval_readiness_gate(&state)?;
     if req.source_id.is_some() && req.force {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -4315,6 +4371,7 @@ async fn submit_reindex_task(
     State(state): State<SharedState>,
     Json(req): Json<ReindexRequest>,
 ) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    retrieval_readiness_gate(&state)?;
     let controls = resolve_reindex_controls(req).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     validate_requested_source_exists(&state, controls.source_id.as_deref()).await?;
     let task_id = TaskId::new();
@@ -8236,12 +8293,12 @@ where
         })
 }
 
-fn sse_error_event(status: StatusCode, error: String) -> Event {
+fn sse_error_event(status: StatusCode, error: impl Into<String>) -> Event {
     sse_json_event(
         "error",
         &AskErrorEvent {
             status: Some(status.as_u16()),
-            error,
+            error: error.into(),
         },
     )
 }
@@ -8965,9 +9022,10 @@ fn err(status: StatusCode, e: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
     }
     (
         status,
-        Json(ErrorResponse {
-            error: format!("{e:#}"),
-            upstream_failure,
+        Json({
+            let mut response = ErrorResponse::new(format!("{e:#}"));
+            response.upstream_failure = upstream_failure.map(Box::new);
+            response
         }),
     )
 }
@@ -9273,72 +9331,8 @@ where
     }
 }
 
-async fn run_daemon_with_config(config: Config) -> Result<()> {
-    tracing_subscriber::fmt::init();
-
-    let config_path = config::config_path();
-    let data_dir = config::data_dir(&config);
-    let pipeline =
-        IngestPipeline::new(&config, &data_dir).context("failed to initialize ingest pipeline")?;
-    log_fts_startup_maintenance(pipeline.fts_startup_maintenance());
-    let memory_budget = pipeline.memory_budget();
-    if let Err(error) = apply_index_gc(&data_dir, pipeline.store(), config.index_gc.policy()) {
-        tracing::warn!(error = %error, "startup index generation garbage collection failed");
-    }
-    let index_status_cache = initial_index_status_cache(&pipeline);
-    let task_store = Store::new(&data_dir.join("verbatim.db"))?;
-
-    let bind_addr = config.daemon.bind.clone();
-
-    let state: SharedState = Arc::new(AppState {
-        pipeline: std::sync::Mutex::new(Some(pipeline)),
-        task_store: std::sync::Mutex::new(task_store),
-        index_status_cache: std::sync::RwLock::new(index_status_cache),
-        resources: daemon_resources(&config.daemon.resources),
-        memory_budget,
-        ingest_queue_active: AtomicBool::new(false),
-        ingest_worker_active: AtomicBool::new(false),
-        collection_watcher: CollectionWatcherRuntime::default(),
-        idle_reclaim: Arc::new(IdleReclaimRuntime::new(now_unix_millis())),
-        idle_exit: Arc::new(IdleExitRuntime::new(now_unix_millis())),
-        #[cfg(test)]
-        idle_reclaim_before_backend_hook: std::sync::Mutex::new(None),
-        #[cfg(test)]
-        idle_reclaim_before_backend_call_hook: std::sync::Mutex::new(None),
-        runtime_config: std::sync::RwLock::new(RuntimeConfigState {
-            config,
-            reload: initial_reload_metadata(&config_path),
-        }),
-        config_path,
-        data_dir,
-    });
-    let _memory_budget_sampler = state.memory_budget.start_rss_sampler();
-    // Fail orphaned ingest tasks left in `running` status by a previous daemon
-    // session that was killed before completing them.  Without this, the stale
-    // running task blocks the entire ingest queue because every queue-drain path
-    // refuses to start new work while a running task exists (#182).
-    match recover_orphaned_running_tasks(&state).await {
-        Ok(0) => {}
-        Ok(recovered) => {
-            tracing::warn!(
-                recovered,
-                "failed orphaned running ingest tasks from previous daemon session"
-            );
-        }
-        Err(error) => {
-            tracing::error!(error = %error, "failed to recover orphaned running ingest tasks");
-        }
-    }
-
-    let _config_watcher = start_config_watcher(Arc::clone(&state))?;
-    let _collection_watcher = start_collection_watcher(Arc::clone(&state))?;
-    queue_idle_exit_collection_watcher_resync_if_enabled(&state);
-    let _idle_reclaim_scheduler = start_idle_reclaim_scheduler(Arc::clone(&state));
-    let (idle_exit_shutdown_tx, idle_exit_shutdown_rx) = watch::channel(false);
-    let _idle_exit_scheduler = start_idle_exit_scheduler(Arc::clone(&state), idle_exit_shutdown_tx);
-    schedule_ingest_queue(Arc::clone(&state));
-
-    let app = Router::new()
+fn daemon_router(state: SharedState) -> Router {
+    Router::new()
         .route("/api/health", get(health))
         .route("/api/config", get(get_config))
         .route("/api/sources", post(add_source))
@@ -9408,7 +9402,64 @@ async fn run_daemon_with_config(config: Config) -> Result<()> {
             track_http_activity,
         ))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state)
+}
+
+struct StartupRuntimeHandles {
+    _config_watcher: RecommendedWatcher,
+    _collection_watcher: tokio::task::JoinHandle<()>,
+    _idle_reclaim_scheduler: tokio::task::JoinHandle<()>,
+    _idle_exit_scheduler: tokio::task::JoinHandle<()>,
+}
+
+struct StartupPipelineInit {
+    pipeline: IngestPipeline,
+    fts_startup_maintenance: FtsMaintenanceOutcome,
+    index_status_cache: Option<IndexStatusResponse>,
+    index_gc_error: Option<String>,
+}
+
+async fn run_daemon_with_config(config: Config) -> Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let config_path = config::config_path();
+    let data_dir = config::data_dir(&config);
+    fs::create_dir_all(&data_dir)
+        .with_context(|| format!("create data dir: {}", data_dir.display()))?;
+    let memory_budget = MemoryBudget::from_config(&config.daemon.resources);
+    let task_store = Store::new(&data_dir.join("verbatim.db"))?;
+
+    let bind_addr = config.daemon.bind.clone();
+
+    let state: SharedState = Arc::new(AppState {
+        pipeline: std::sync::Mutex::new(None),
+        task_store: std::sync::Mutex::new(task_store),
+        index_status_cache: std::sync::RwLock::new(None),
+        readiness: std::sync::RwLock::new(ReadinessHealth::starting(
+            "initializing_pipeline",
+            Some("initializing indexes and startup maintenance".into()),
+        )),
+        resources: daemon_resources(&config.daemon.resources),
+        memory_budget,
+        ingest_queue_active: AtomicBool::new(false),
+        ingest_worker_active: AtomicBool::new(false),
+        collection_watcher: CollectionWatcherRuntime::default(),
+        idle_reclaim: Arc::new(IdleReclaimRuntime::new(now_unix_millis())),
+        idle_exit: Arc::new(IdleExitRuntime::new(now_unix_millis())),
+        #[cfg(test)]
+        idle_reclaim_before_backend_hook: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        idle_reclaim_before_backend_call_hook: std::sync::Mutex::new(None),
+        runtime_config: std::sync::RwLock::new(RuntimeConfigState {
+            config: config.clone(),
+            reload: initial_reload_metadata(&config_path),
+        }),
+        config_path,
+        data_dir: data_dir.clone(),
+    });
+    let _memory_budget_sampler = state.memory_budget.start_rss_sampler();
+    let (idle_exit_shutdown_tx, idle_exit_shutdown_rx) = watch::channel(false);
+    let app = daemon_router(Arc::clone(&state));
 
     tracing::info!(bind = %bind_addr, "starting verbatim daemon");
 
@@ -9416,12 +9467,131 @@ async fn run_daemon_with_config(config: Config) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {bind_addr}"))?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(idle_exit_shutdown_rx))
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal(idle_exit_shutdown_rx))
+            .await
+            .context("server error")
+    });
+
+    let _startup_handles =
+        match finish_daemon_startup(Arc::clone(&state), config, data_dir, idle_exit_shutdown_tx)
+            .await
+        {
+            Ok(handles) => Some(handles),
+            Err(error) => {
+                let reason = error.to_string();
+                tracing::error!(error = %reason, "daemon startup maintenance failed");
+                set_readiness(
+                    &state,
+                    ReadinessHealth::degraded("startup_failed", Some(reason)),
+                );
+                None
+            }
+        };
+
+    server_task
         .await
-        .context("server error")?;
+        .context("join daemon HTTP server task")??;
 
     Ok(())
+}
+
+async fn finish_daemon_startup(
+    state: SharedState,
+    config: Config,
+    data_dir: PathBuf,
+    idle_exit_shutdown_tx: watch::Sender<bool>,
+) -> Result<StartupRuntimeHandles> {
+    set_readiness(
+        &state,
+        ReadinessHealth::starting(
+            "initializing_pipeline",
+            Some("initializing indexes and startup maintenance".into()),
+        ),
+    );
+    let startup = tokio::task::spawn_blocking({
+        let config = config.clone();
+        let data_dir = data_dir.clone();
+        move || startup_pipeline_init(config, data_dir)
+    })
+    .await
+    .context("join startup pipeline initialization")??;
+    log_fts_startup_maintenance(startup.fts_startup_maintenance);
+    if let Some(error) = startup.index_gc_error {
+        tracing::warn!(error = %error, "startup index generation garbage collection failed");
+    }
+    {
+        let mut cache = state
+            .index_status_cache
+            .write()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        *cache = startup.index_status_cache;
+    }
+    restore_pipeline(&state, startup.pipeline)?;
+
+    set_readiness(
+        &state,
+        ReadinessHealth::starting(
+            "orphan_recovery",
+            Some("recovering previous running ingest tasks".into()),
+        ),
+    );
+    // Fail orphaned ingest tasks left in `running` status by a previous daemon
+    // session that was killed before completing them.  Without this, the stale
+    // running task blocks the entire ingest queue because every queue-drain path
+    // refuses to start new work while a running task exists (#182).
+    match recover_orphaned_running_tasks(&state).await {
+        Ok(0) => {}
+        Ok(recovered) => {
+            tracing::warn!(
+                recovered,
+                "failed orphaned running ingest tasks from previous daemon session"
+            );
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "failed to recover orphaned running ingest tasks");
+        }
+    }
+
+    set_readiness(
+        &state,
+        ReadinessHealth::starting(
+            "watcher_startup",
+            Some("starting config, collection, and background schedulers".into()),
+        ),
+    );
+    let config_watcher = start_config_watcher(Arc::clone(&state))?;
+    let collection_watcher = start_collection_watcher(Arc::clone(&state))?;
+    queue_idle_exit_collection_watcher_resync_if_enabled(&state);
+    let idle_reclaim_scheduler = start_idle_reclaim_scheduler(Arc::clone(&state));
+    let idle_exit_scheduler = start_idle_exit_scheduler(Arc::clone(&state), idle_exit_shutdown_tx);
+    schedule_ingest_queue(Arc::clone(&state));
+    set_readiness(&state, ReadinessHealth::ready());
+
+    Ok(StartupRuntimeHandles {
+        _config_watcher: config_watcher,
+        _collection_watcher: collection_watcher,
+        _idle_reclaim_scheduler: idle_reclaim_scheduler,
+        _idle_exit_scheduler: idle_exit_scheduler,
+    })
+}
+
+fn startup_pipeline_init(config: Config, data_dir: PathBuf) -> Result<StartupPipelineInit> {
+    let pipeline =
+        IngestPipeline::new(&config, &data_dir).context("failed to initialize ingest pipeline")?;
+    let fts_startup_maintenance = pipeline.fts_startup_maintenance();
+    let index_gc_error = apply_index_gc(&data_dir, pipeline.store(), config.index_gc.policy())
+        .err()
+        .map(|error| error.to_string());
+    let index_status_cache = initial_index_status_cache(&pipeline);
+
+    Ok(StartupPipelineInit {
+        pipeline,
+        fts_startup_maintenance,
+        index_status_cache,
+        index_gc_error,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10405,6 +10575,264 @@ mod tests {
         assert_eq!(reclaim.skip_reason.as_deref(), Some("disabled"));
         assert_eq!(reclaim.active.http_requests, 0);
         assert_eq!(reclaim.active.active_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn health_reports_starting_then_ready_readiness() {
+        let test_dir = TestDir::new("health-readiness");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        set_readiness(
+            &state,
+            ReadinessHealth::starting(
+                "orphan_recovery",
+                Some("recovering previous running ingest tasks".into()),
+            ),
+        );
+        let Json(starting) = health(State(Arc::clone(&state))).await;
+        assert_eq!(starting.status, "ok");
+        assert!(starting.readiness.process_alive);
+        assert_eq!(starting.readiness.state, "starting");
+        assert!(!starting.readiness.retrieval_ready);
+        assert_eq!(starting.readiness.startup_phase, "orphan_recovery");
+        assert_eq!(
+            starting.readiness.degraded_reason.as_deref(),
+            Some("recovering previous running ingest tasks")
+        );
+
+        set_readiness(&state, ReadinessHealth::ready());
+        let Json(ready) = health(State(Arc::clone(&state))).await;
+        assert_eq!(ready.readiness.state, "ready");
+        assert!(ready.readiness.retrieval_ready);
+        assert_eq!(ready.readiness.startup_phase, "ready");
+        assert!(ready.readiness.degraded_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn health_http_is_available_while_startup_job_is_blocked() {
+        let test_dir = TestDir::new("health-startup-blocked");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        set_readiness(
+            &state,
+            ReadinessHealth::starting(
+                "startup_maintenance",
+                Some("startup maintenance is still running".into()),
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let app = Router::new()
+            .route("/api/health", get(health))
+            .with_state(Arc::clone(&state));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    while !*shutdown_rx.borrow() {
+                        if shutdown_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await;
+        });
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let startup_state = Arc::clone(&state);
+        let startup_job = tokio::spawn(async move {
+            release_rx.await.unwrap();
+            set_readiness(&startup_state, ReadinessHealth::ready());
+        });
+
+        let starting = http_get_health_for_test(addr).await;
+        assert_eq!(starting.readiness.state, "starting");
+        assert!(!starting.readiness.retrieval_ready);
+
+        release_tx.send(()).unwrap();
+        startup_job.await.unwrap();
+        let ready = http_get_health_for_test(addr).await;
+        assert_eq!(ready.readiness.state, "ready");
+        assert!(ready.readiness.retrieval_ready);
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retrieve_starting_returns_typed_startup_error() {
+        let test_dir = TestDir::new("retrieve-starting");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        set_readiness(
+            &state,
+            ReadinessHealth::starting(
+                "orphan_recovery",
+                Some("recovering previous running ingest tasks".into()),
+            ),
+        );
+
+        let (status, Json(error)) = retrieve(
+            State(Arc::clone(&state)),
+            Json(RetrieveRequest {
+                question: "question".into(),
+                source_id: None,
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                limit: None,
+                page_size: None,
+                page: None,
+                fast: false,
+                rerank: None,
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                bypass_cache: false,
+                include_debug: false,
+                include_debug_packs: false,
+                include_locator: false,
+                passage: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code.as_deref(), Some("retrieval_not_ready"));
+        assert_eq!(error.readiness.as_deref(), Some("starting"));
+        assert_eq!(error.retrieval_ready, Some(false));
+        assert_eq!(error.startup_phase.as_deref(), Some("orphan_recovery"));
+        assert_eq!(
+            error.degraded_reason.as_deref(),
+            Some("recovering previous running ingest tasks")
+        );
+        assert!(error.error.contains("verbatim daemon is starting"));
+        assert!(error.error.contains("retrieval is not ready"));
+    }
+
+    #[tokio::test]
+    async fn ask_stream_starting_returns_json_service_unavailable() {
+        let test_dir = TestDir::new("ask-stream-starting");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        set_readiness(
+            &state,
+            ReadinessHealth::starting(
+                "orphan_recovery",
+                Some("recovering previous running ingest tasks".into()),
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let app = Router::new()
+            .route("/api/ask/stream", post(ask_stream))
+            .with_state(Arc::clone(&state));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    while !*shutdown_rx.borrow() {
+                        if shutdown_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await;
+        });
+
+        let (status_line, headers, body) = http_post_ask_stream_for_test(addr).await;
+        assert!(
+            status_line.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "unexpected response status: {status_line}"
+        );
+        let lower_headers = headers.to_ascii_lowercase();
+        assert!(lower_headers.contains("content-type: application/json"));
+        assert!(!lower_headers.contains("text/event-stream"));
+
+        let error: ErrorResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(error.code.as_deref(), Some("retrieval_not_ready"));
+        assert_eq!(error.readiness.as_deref(), Some("starting"));
+        assert_eq!(error.retrieval_ready, Some(false));
+        assert_eq!(error.startup_phase.as_deref(), Some("orphan_recovery"));
+        assert_eq!(
+            error.degraded_reason.as_deref(),
+            Some("recovering previous running ingest tasks")
+        );
+        assert!(error.error.contains("verbatim daemon is starting"));
+        assert!(error.error.contains("retrieval is not ready"));
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_ingest_starting_rejects_without_persisting_task() {
+        let test_dir = TestDir::new("background-ingest-starting");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        set_readiness(
+            &state,
+            ReadinessHealth::starting(
+                "initializing_pipeline",
+                Some("initializing indexes and startup maintenance".into()),
+            ),
+        );
+
+        let (status, Json(error)) = submit_ingest_task(
+            State(Arc::clone(&state)),
+            Json(TaskIngestRequest {
+                source_id: None,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_starting_readiness_error(&error, "initializing_pipeline");
+        assert_eq!(task_count_for_test(&state), 0);
+    }
+
+    #[tokio::test]
+    async fn background_reindex_starting_rejects_without_persisting_task() {
+        let test_dir = TestDir::new("background-reindex-starting");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        set_readiness(
+            &state,
+            ReadinessHealth::starting(
+                "initializing_pipeline",
+                Some("initializing indexes and startup maintenance".into()),
+            ),
+        );
+
+        let (status, Json(error)) = submit_reindex_task(
+            State(Arc::clone(&state)),
+            Json(ReindexRequest {
+                source_id: None,
+                all: true,
+                stale: false,
+                force: false,
+                embedding_profile_id: None,
+                vectors_only: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_starting_readiness_error(&error, "initializing_pipeline");
+        assert_eq!(task_count_for_test(&state), 0);
     }
 
     #[tokio::test]
@@ -12597,7 +13025,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(
-            body.error,
+            body.error.as_ref(),
             "source not found: __missing_source_smoke_retest__"
         );
     }
@@ -12740,7 +13168,7 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body.error, "collection not found: missing");
+        assert_eq!(body.error.as_ref(), "collection not found: missing");
         drop(writer_permit);
     }
 
@@ -15496,7 +15924,7 @@ mod tests {
             .unwrap_err();
         let (status, Json(body)) = missing;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body.error, "task not found: missing");
+        assert_eq!(body.error.as_ref(), "task not found: missing");
 
         let queued_id = create_persisted_task(
             &state,
@@ -15533,7 +15961,7 @@ mod tests {
         let (status, Json(body)) = unsupported;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
-            body.error,
+            body.error.as_ref(),
             format!("task profile unsupported for ingest task: {}", ingest_id.0)
         );
 
@@ -15554,7 +15982,7 @@ mod tests {
         let (status, Json(body)) = legacy;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(
-            body.error,
+            body.error.as_ref(),
             format!(
                 "task profile unavailable for legacy/no-profile task: {}",
                 legacy_id.0
@@ -15621,7 +16049,7 @@ mod tests {
         let (status, Json(body)) = error;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
-            body.error,
+            body.error.as_ref(),
             format!(
                 "task profile unavailable for incomplete task {} (status running)",
                 task_id.0
@@ -15668,7 +16096,7 @@ mod tests {
             let (status, Json(body)) = error;
             assert_eq!(status, StatusCode::NOT_FOUND);
             assert_eq!(
-                body.error,
+                body.error.as_ref(),
                 format!(
                     "task profile unavailable for legacy/no-profile task: {}",
                     task_id.0
@@ -16029,7 +16457,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(
-            body.error,
+            body.error.as_ref(),
             "source not found: __missing_source_smoke_retest__"
         );
     }
@@ -18155,6 +18583,7 @@ mod tests {
             pipeline: std::sync::Mutex::new(Some(pipeline)),
             task_store: std::sync::Mutex::new(Store::new(&data_dir.join("verbatim.db")).unwrap()),
             index_status_cache: std::sync::RwLock::new(index_status_cache),
+            readiness: std::sync::RwLock::new(ReadinessHealth::ready()),
             resources: daemon_resources(&config.daemon.resources),
             memory_budget,
             ingest_queue_active: AtomicBool::new(false),
@@ -18202,6 +18631,20 @@ mod tests {
     ) -> Vec<verbatim_core::task::TaskSummary> {
         let store = state.task_store.lock().unwrap();
         ingest_batch_children(&store, &parent_id.0).unwrap()
+    }
+
+    fn task_count_for_test(state: &SharedState) -> usize {
+        let store = state.task_store.lock().unwrap();
+        store.tasks_all().unwrap().len()
+    }
+
+    fn assert_starting_readiness_error(error: &ErrorResponse, startup_phase: &str) {
+        assert_eq!(error.code.as_deref(), Some("retrieval_not_ready"));
+        assert_eq!(error.readiness.as_deref(), Some("starting"));
+        assert_eq!(error.retrieval_ready, Some(false));
+        assert_eq!(error.startup_phase.as_deref(), Some(startup_phase));
+        assert!(error.error.contains("verbatim daemon is starting"));
+        assert!(error.error.contains("retrieval is not ready"));
     }
 
     async fn assert_queued_ingest_waits_for_running(state: &SharedState, queued_id: &TaskId) {
@@ -18299,6 +18742,57 @@ mod tests {
             .last()
             .expect("expected at least one task")
             .id
+    }
+
+    async fn http_get_health_for_test(addr: std::net::SocketAddr) -> HealthResponse {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response: {response}"
+        );
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("HTTP response includes a body separator");
+        serde_json::from_str(body).unwrap()
+    }
+
+    async fn http_post_ask_stream_for_test(addr: std::net::SocketAddr) -> (String, String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = r#"{"question":"question","context_only":true}"#;
+        let request = format!(
+            "POST /api/ask/stream HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n\
+             {}",
+            body.len(),
+            body
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response includes a body separator");
+        let (status_line, headers) = head
+            .split_once("\r\n")
+            .expect("HTTP response includes a status line");
+
+        (status_line.into(), headers.into(), body.into())
     }
 
     struct MockModelServer {

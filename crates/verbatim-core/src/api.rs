@@ -859,9 +859,84 @@ pub struct IdleExitActivitySnapshot {
     pub pending_watcher_events: usize,
 }
 
+/// Process and retrieval readiness exposed through daemon health.
+///
+/// These fields are flattened into `HealthResponse` so scripts can read them
+/// without knowing a nested object shape. Defaults intentionally treat older
+/// daemon payloads as ready because they did not expose startup readiness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessHealth {
+    #[serde(default = "default_process_alive")]
+    pub process_alive: bool,
+    #[serde(default = "default_readiness_state", rename = "readiness")]
+    pub state: String,
+    #[serde(default = "default_retrieval_ready")]
+    pub retrieval_ready: bool,
+    #[serde(default = "default_startup_phase")]
+    pub startup_phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+}
+
+impl Default for ReadinessHealth {
+    fn default() -> Self {
+        Self::ready()
+    }
+}
+
+impl ReadinessHealth {
+    pub fn ready() -> Self {
+        Self {
+            process_alive: true,
+            state: "ready".into(),
+            retrieval_ready: true,
+            startup_phase: "ready".into(),
+            degraded_reason: None,
+        }
+    }
+
+    pub fn starting(phase: impl Into<String>, degraded_reason: Option<String>) -> Self {
+        Self {
+            process_alive: true,
+            state: "starting".into(),
+            retrieval_ready: false,
+            startup_phase: phase.into(),
+            degraded_reason,
+        }
+    }
+
+    pub fn degraded(phase: impl Into<String>, degraded_reason: Option<String>) -> Self {
+        Self {
+            process_alive: true,
+            state: "degraded".into(),
+            retrieval_ready: false,
+            startup_phase: phase.into(),
+            degraded_reason,
+        }
+    }
+}
+
+fn default_process_alive() -> bool {
+    true
+}
+
+fn default_readiness_state() -> String {
+    "ready".into()
+}
+
+fn default_retrieval_ready() -> bool {
+    true
+}
+
+fn default_startup_phase() -> String {
+    "ready".into()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
+    #[serde(default, flatten)]
+    pub readiness: ReadinessHealth,
     #[serde(default)]
     pub memory_budget: MemoryBudgetSnapshot,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -874,9 +949,45 @@ pub struct HealthResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorResponse {
-    pub error: String,
+    pub error: Box<str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_failure: Option<serde_json::Value>,
+    pub code: Option<Box<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<Box<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_phase: Option<Box<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<Box<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_failure: Option<Box<serde_json::Value>>,
+}
+
+impl ErrorResponse {
+    pub fn new(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into().into_boxed_str(),
+            code: None,
+            readiness: None,
+            retrieval_ready: None,
+            startup_phase: None,
+            degraded_reason: None,
+            upstream_failure: None,
+        }
+    }
+
+    pub fn retrieval_not_ready(error: impl Into<String>, readiness: ReadinessHealth) -> Self {
+        Self {
+            error: error.into().into_boxed_str(),
+            code: Some("retrieval_not_ready".into()),
+            readiness: Some(readiness.state.into_boxed_str()),
+            retrieval_ready: Some(readiness.retrieval_ready),
+            startup_phase: Some(readiness.startup_phase.into_boxed_str()),
+            degraded_reason: readiness.degraded_reason.map(String::into_boxed_str),
+            upstream_failure: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1004,6 +1115,45 @@ mod tests {
         assert!(!request.include_debug);
         assert!(!request.include_locator);
         assert!(!request.passage);
+    }
+
+    #[test]
+    fn health_response_defaults_missing_readiness_to_ready() {
+        let response: HealthResponse =
+            serde_json::from_value(serde_json::json!({"status": "ok"})).unwrap();
+
+        assert!(response.readiness.process_alive);
+        assert_eq!(response.readiness.state, "ready");
+        assert!(response.readiness.retrieval_ready);
+        assert_eq!(response.readiness.startup_phase, "ready");
+        assert!(response.readiness.degraded_reason.is_none());
+    }
+
+    #[test]
+    fn health_response_serializes_starting_readiness_fields() {
+        let response = HealthResponse {
+            status: "ok".into(),
+            readiness: ReadinessHealth::starting(
+                "orphan_recovery",
+                Some("recovering previous running ingest tasks".into()),
+            ),
+            memory_budget: Default::default(),
+            resources: Vec::new(),
+            idle_reclaim: None,
+            idle_exit: None,
+        };
+
+        let wire = serde_json::to_value(response).unwrap();
+
+        assert_eq!(wire["status"], "ok");
+        assert_eq!(wire["process_alive"], true);
+        assert_eq!(wire["readiness"], "starting");
+        assert_eq!(wire["retrieval_ready"], false);
+        assert_eq!(wire["startup_phase"], "orphan_recovery");
+        assert_eq!(
+            wire["degraded_reason"],
+            "recovering previous running ingest tasks"
+        );
     }
 
     #[test]

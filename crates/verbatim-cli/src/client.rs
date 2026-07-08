@@ -1743,6 +1743,44 @@ mod tests {
     }
 
     #[test]
+    fn http_retrieve_starting_error_uses_daemon_json_message() {
+        let server = TestServer::respond_once(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"verbatim daemon is starting; retrieval is not ready (startup_phase=orphan_recovery; degraded_reason=recovering previous running ingest tasks)\",\"code\":\"retrieval_not_ready\",\"readiness\":\"starting\",\"retrieval_ready\":false,\"startup_phase\":\"orphan_recovery\",\"degraded_reason\":\"recovering previous running ingest tasks\"}",
+        );
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let error = client
+            .retrieve(&RetrieveRequest {
+                question: "question".into(),
+                source_id: None,
+                collection_filter: Default::default(),
+                embedding_profile_id: None,
+                limit: None,
+                page_size: None,
+                page: None,
+                fast: false,
+                rerank: None,
+                dense_top_k: None,
+                bm25_top_k: None,
+                rerank_top_n: None,
+                bypass_cache: false,
+                include_debug: false,
+                include_debug_packs: false,
+                include_locator: false,
+                passage: false,
+            })
+            .unwrap_err();
+
+        assert_eq!(error.exit_code(), 1);
+        let message = error.to_string();
+        assert!(message.contains("verbatim daemon is starting"));
+        assert!(message.contains("retrieval is not ready"));
+        assert!(message.contains("startup_phase=orphan_recovery"));
+        assert!(!message.contains("could not reach"));
+        assert!(server.request().starts_with("POST /api/retrieve HTTP/1.1"));
+    }
+
+    #[test]
     fn long_error_body_redacts_secret_before_truncation_boundary() {
         let body = format!(
             "{{\"api_key\":\"should-not-print\",\"padding\":\"{}\"",

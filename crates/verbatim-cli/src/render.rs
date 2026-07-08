@@ -1947,6 +1947,17 @@ where
         "{} rss={}MB",
         health.status, health.memory_budget.rss_mb
     )?;
+    write!(
+        writer,
+        " readiness={} retrieval_ready={}",
+        health.readiness.state, health.readiness.retrieval_ready
+    )?;
+    if !health.readiness.retrieval_ready {
+        write!(writer, " startup_phase={}", health.readiness.startup_phase)?;
+        if let Some(reason) = &health.readiness.degraded_reason {
+            write!(writer, " degraded_reason={reason}")?;
+        }
+    }
     let active_tasks: usize = health.resources.iter().map(|r| r.active).sum();
     let total_completed: u64 = health.resources.iter().map(|r| r.completed).sum();
     write!(writer, " tasks={}/{}", active_tasks, total_completed)?;
@@ -1974,6 +1985,17 @@ where
     W: Write,
 {
     writeln!(writer, "Daemon status: {}", health.status)?;
+    writeln!(
+        writer,
+        "Readiness: {} process_alive={} retrieval_ready={} startup_phase={}",
+        health.readiness.state,
+        health.readiness.process_alive,
+        health.readiness.retrieval_ready,
+        health.readiness.startup_phase
+    )?;
+    if let Some(reason) = &health.readiness.degraded_reason {
+        writeln!(writer, "Readiness degraded_reason={reason}")?;
+    }
     let budget = &health.memory_budget;
     let limit = budget
         .limit_mb
@@ -3159,8 +3181,9 @@ fn value_string_list(value: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use verbatim_core::api::{
-        CollectionResultProvenance, ConfigResponse, EvidenceResponse, RetrieveControlsResponse,
-        RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
+        CollectionResultProvenance, ConfigResponse, EvidenceResponse, ReadinessHealth,
+        RetrieveControlsResponse, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
+        SourceResponse,
     };
     use verbatim_core::task::{TaskId, TaskKind, TaskStatus};
     use verbatim_core::types::{
@@ -3756,6 +3779,7 @@ mod tests {
         use verbatim_core::memory_budget::MemoryBudgetSnapshot;
         let health = HealthResponse {
             status: "ok".into(),
+            readiness: ReadinessHealth::ready(),
             memory_budget: MemoryBudgetSnapshot {
                 rss_mb: 282,
                 ..Default::default()
@@ -3806,6 +3830,7 @@ mod tests {
         use verbatim_core::memory_budget::MemoryBudgetSnapshot;
         let health = HealthResponse {
             status: "ok".into(),
+            readiness: ReadinessHealth::ready(),
             memory_budget: MemoryBudgetSnapshot {
                 rss_mb: 100,
                 ..Default::default()
