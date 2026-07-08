@@ -466,14 +466,14 @@ impl<'a> RetrievalPipeline<'a> {
                 let query_embedding_latency_ms = elapsed_ms(embedding_started);
                 local_spans_ms.query_embedding_ms = query_embedding_latency_ms;
                 let dense_started = Instant::now();
-                let dense_results = self
+                let (dense_results, dense_vector_path) = self
                     .dense_search(&query_vec, dense_top_k, source_filter)
                     .await?;
                 local_spans_ms.dense_vector_search_ms = elapsed_ms(dense_started);
                 (
                     dense_results,
                     Some(query_embedding_latency_ms),
-                    self.dense_vector_path(),
+                    dense_vector_path,
                     Some(query_vec),
                 )
             } else {
@@ -677,13 +677,13 @@ impl<'a> RetrievalPipeline<'a> {
         query_vec: &[f32],
         top_k: usize,
         source_filter: Option<&HashSet<SourceId>>,
-    ) -> Result<Vec<(ChunkId, f32)>> {
+    ) -> Result<(Vec<(ChunkId, f32)>, RetrievalDenseVectorPath)> {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &self.qdrant {
             let local_results =
                 self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))?;
             if local_results.is_empty() {
-                return Ok(local_results);
+                return Ok((local_results, self.dense_vector_path()));
             }
             let default_profile_id;
             let profile_id = match &self.required_profile_id {
@@ -700,16 +700,18 @@ impl<'a> RetrievalPipeline<'a> {
                 .search(profile_id, query_vec, top_k, qdrant_source_filter)
                 .await
             {
-                Ok(results) => self.with_read_permit(|| {
-                    self.merge_preferred_dense_hits(
-                        profile_id,
-                        profile_generation,
-                        results,
-                        local_results,
-                        top_k,
-                        source_filter,
-                    )
-                }),
+                Ok(results) => self
+                    .with_read_permit(|| {
+                        self.merge_preferred_dense_hits(
+                            profile_id,
+                            profile_generation,
+                            results,
+                            local_results,
+                            top_k,
+                            source_filter,
+                        )
+                    })
+                    .map(|hits| (hits, RetrievalDenseVectorPath::Qdrant)),
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
@@ -718,12 +720,13 @@ impl<'a> RetrievalPipeline<'a> {
                     self.with_read_permit(|| {
                         self.valid_dense_hits(local_results, top_k, source_filter)
                     })
+                    .map(|hits| (hits, self.dense_vector_path()))
                 }
             };
         }
         self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))
+            .map(|hits| (hits, self.dense_vector_path()))
     }
-
     fn local_dense_search(
         &self,
         query_vec: &[f32],
@@ -4785,14 +4788,17 @@ mod tests {
         )
         .with_qdrant_search(&qdrant);
 
-        let results = pipeline
-            .search_filtered("alpha", Some(&source.id))
+        let mut source_filter = HashSet::new();
+        source_filter.insert(source.id.clone());
+        let (results, debug) = pipeline
+            .search_source_set_with_debug("alpha", Some(&source_filter))
             .await
             .unwrap();
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].chunk_id, remote_preferred.id);
         assert_eq!(results[1].chunk_id, local_fallback.id);
+        assert_eq!(debug.dense_vector_path, RetrievalDenseVectorPath::Qdrant);
         assert_eq!(
             handle.join().unwrap(),
             "POST /collections/verbatim/points/search HTTP/1.1"

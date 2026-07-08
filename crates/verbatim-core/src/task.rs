@@ -10,8 +10,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-use crate::resource::TaskResourceProgress;
-use crate::types::{hex_sha256, EmbeddingCacheStats};
+use crate::config::RerankStrategy;
+use crate::resource::{ResourceQueueSnapshot, TaskResourceProgress};
+use crate::types::{
+    hex_sha256, EmbeddingCacheStats, RetrievalDenseVectorPath, RetrievalRerankStatus,
+    VectorIndexResidency,
+};
 
 static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -19,6 +23,7 @@ pub const TASK_METADATA_MAX_BYTES: usize = 8192;
 pub const TASK_EVENT_MESSAGE_MAX_CHARS: usize = 512;
 pub const TASK_ERROR_MAX_CHARS: usize = 2048;
 pub const TASK_SPAN_MAX_PER_TASK: usize = 256;
+pub const TASK_PROFILE_SCHEMA_VERSION: u32 = 1;
 const TASK_STRING_MAX_CHARS: usize = 256;
 const TASK_UPSTREAM_BODY_PREFIX_MAX_CHARS: usize = 4096;
 const TASK_ARRAY_MAX_ITEMS: usize = 32;
@@ -190,6 +195,271 @@ pub struct TaskSummary {
     pub blocking_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<TaskProgressSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProfile {
+    pub schema_version: u32,
+    pub task_id: TaskId,
+    pub task_kind: TaskKind,
+    pub status: TaskStatus,
+    pub queue_wait_ms: u64,
+    pub total_wall_ms: u64,
+    #[serde(default)]
+    pub controls: TaskProfileControls,
+    #[serde(default)]
+    pub resources: TaskResourceProfile,
+    #[serde(default)]
+    pub endpoints: Vec<TaskEndpointSummary>,
+    #[serde(default)]
+    pub retrieve: Option<RetrieveTaskProfile>,
+    #[serde(default)]
+    pub ask: Option<AskTaskProfile>,
+}
+
+/// Bounded execution controls captured when the task ran.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProfileControls {
+    pub retrieval: TaskRetrievalControls,
+    pub rerank: TaskRerankControls,
+    pub qdrant: TaskQdrantControls,
+    pub vector: TaskVectorControls,
+    pub filters: TaskFilterControls,
+    pub output: TaskOutputControls,
+}
+
+/// Effective dense and lexical retrieval controls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRetrievalControls {
+    pub dense_top_k: Option<usize>,
+    pub bm25_top_k: Option<usize>,
+    pub rrf_k: Option<usize>,
+    pub fast: bool,
+    pub bypass_cache: bool,
+}
+
+/// Effective reranker controls and model role summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRerankControls {
+    pub enabled: bool,
+    pub configured_top_n: Option<usize>,
+    pub effective_top_n: Option<usize>,
+    pub strategy: Option<RerankStrategy>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Effective Qdrant search controls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskQdrantControls {
+    pub enabled: bool,
+    pub preferred: bool,
+    pub used: bool,
+}
+
+/// Effective embedding profile and dense vector path context.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskVectorControls {
+    pub embedding_enabled: bool,
+    pub embedding_profile_id: Option<String>,
+    pub residency: Option<VectorIndexResidency>,
+    pub dense_path: Option<RetrievalDenseVectorPath>,
+}
+
+/// Bounded source and collection filter summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskFilterControls {
+    pub source: TaskSourceFilterControls,
+    pub collection: TaskCollectionFilterControls,
+}
+
+/// Bounded source filter summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSourceFilterControls {
+    pub requested_source_id: Option<String>,
+    pub effective_source_count: Option<usize>,
+}
+
+/// Bounded collection filter summary; never includes member lists or paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCollectionFilterControls {
+    pub requested_count: usize,
+    pub requested_names: Vec<String>,
+    pub requested_truncated: bool,
+    pub require_fresh: bool,
+    pub applied_count: Option<usize>,
+    pub union_source_count: Option<usize>,
+    pub stale: Option<bool>,
+    pub warning_count: Option<usize>,
+}
+
+/// Effective output and pagination controls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskOutputControls {
+    pub limit: Option<usize>,
+    pub page_size: Option<usize>,
+    pub page: Option<usize>,
+    pub passage: bool,
+    pub include_locator: bool,
+    pub include_debug: bool,
+    pub include_debug_packs: bool,
+    pub show_retrieval: Option<bool>,
+}
+
+/// Bounded resource queue summary captured when the task completed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskResourceProfile {
+    pub queues: Vec<TaskResourceQueueSummary>,
+}
+
+/// Low-cardinality wait and service timing for one resource queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskResourceQueueSummary {
+    pub name: String,
+    pub kind: String,
+    pub capacity: usize,
+    pub queue_capacity: usize,
+    pub queued: usize,
+    pub active: usize,
+    pub completed: u64,
+    pub errors: u64,
+    pub queue_wait_ms_total: u64,
+    pub service_ms_total: u64,
+    pub latest_queue_wait_ms: Option<u64>,
+    pub latest_service_ms: Option<u64>,
+}
+
+impl From<&ResourceQueueSnapshot> for TaskResourceQueueSummary {
+    fn from(snapshot: &ResourceQueueSnapshot) -> Self {
+        Self {
+            name: snapshot.name.clone(),
+            kind: snapshot.kind.clone(),
+            capacity: snapshot.capacity,
+            queue_capacity: snapshot.queue_capacity,
+            queued: snapshot.queued,
+            active: snapshot.active,
+            completed: snapshot.completed,
+            errors: snapshot.errors,
+            queue_wait_ms_total: snapshot.queue_wait_ms_total,
+            service_ms_total: snapshot.service_ms_total,
+            latest_queue_wait_ms: snapshot.last_queue_wait_ms,
+            latest_service_ms: snapshot.last_service_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveTaskProfile {
+    pub dense: RetrieveDenseStageProfile,
+    pub bm25: RetrieveStageProfile,
+    pub fusion: RetrieveStageProfile,
+    pub rerank: RetrieveRerankStageProfile,
+    pub evidence: RetrieveEvidenceStageProfile,
+    pub display: RetrieveDisplayStageProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveDenseStageProfile {
+    pub path: RetrievalDenseVectorPath,
+    pub candidate_count: usize,
+    pub local_ms: u64,
+    pub query_embedding_ms: u64,
+    pub endpoint_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveStageProfile {
+    pub candidate_count: usize,
+    pub local_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveRerankStageProfile {
+    pub status: RetrievalRerankStatus,
+    pub reason: Option<String>,
+    pub input_count: Option<usize>,
+    pub configured_top_n: usize,
+    pub effective_top_n: Option<usize>,
+    pub output_count: usize,
+    pub local_ms: u64,
+    pub endpoint_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveEvidenceStageProfile {
+    pub result_count: usize,
+    pub graph_expanded_count: usize,
+    pub final_count: usize,
+    pub display_count: usize,
+    pub result_hydration_ms: u64,
+    pub graph_expansion_ms: u64,
+    pub final_pack_ms: u64,
+    pub display_pack_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrieveDisplayStageProfile {
+    pub returned_count: usize,
+    pub response_formatting_ms: u64,
+    pub canonical_support_embedding_ms: Option<u64>,
+    pub canonical_display_selection_ms: Option<u64>,
+    pub canonical_selected_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskTaskProfile {
+    pub generation: AskGenerationStageProfile,
+    pub verification: AskVerificationStageProfile,
+    pub output: AskOutputStageProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskGenerationStatus {
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskGenerationStageProfile {
+    pub status: AskGenerationStatus,
+    pub call_count: u64,
+    pub total_latency_ms: u64,
+    pub latest_latency_ms: Option<u64>,
+    pub retry_count: u64,
+    pub error_count: u64,
+    pub latest_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskVerificationStatus {
+    Disabled,
+    Passed,
+    Revised,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskVerificationStageProfile {
+    pub enabled: bool,
+    pub status: AskVerificationStatus,
+    pub call_count: u64,
+    pub total_latency_ms: u64,
+    pub latest_latency_ms: Option<u64>,
+    pub retry_count: u64,
+    pub error_count: u64,
+    pub latest_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskOutputStageProfile {
+    pub response_formatting_ms: u64,
+    pub answer_chars: usize,
+    pub citation_count: usize,
+    pub retrieval_included: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -878,6 +1148,395 @@ mod tests {
                 .len(),
             1024
         );
+    }
+
+    #[test]
+    fn retrieve_task_profile_json_is_bounded_and_stage_oriented() {
+        let profile = TaskProfile {
+            schema_version: TASK_PROFILE_SCHEMA_VERSION,
+            task_id: TaskId("task-slow-local".into()),
+            task_kind: TaskKind::Retrieve,
+            status: TaskStatus::Succeeded,
+            queue_wait_ms: 5,
+            total_wall_ms: 136_572,
+            controls: TaskProfileControls {
+                retrieval: TaskRetrievalControls {
+                    dense_top_k: Some(80),
+                    bm25_top_k: Some(50),
+                    rrf_k: Some(60),
+                    fast: false,
+                    bypass_cache: false,
+                },
+                rerank: TaskRerankControls {
+                    enabled: true,
+                    configured_top_n: Some(20),
+                    effective_top_n: Some(20),
+                    strategy: Some(RerankStrategy::Endpoint),
+                    provider: Some("vllm".into()),
+                    model: Some("Qwen/Qwen3-Reranker-4B".into()),
+                },
+                qdrant: TaskQdrantControls {
+                    enabled: true,
+                    preferred: true,
+                    used: false,
+                },
+                vector: TaskVectorControls {
+                    embedding_enabled: true,
+                    embedding_profile_id: Some("default".into()),
+                    residency: Some(VectorIndexResidency::LowMemory),
+                    dense_path: Some(RetrievalDenseVectorPath::LowMemorySqliteScan),
+                },
+                filters: TaskFilterControls {
+                    source: TaskSourceFilterControls {
+                        requested_source_id: Some("src-1".into()),
+                        effective_source_count: Some(1),
+                    },
+                    collection: TaskCollectionFilterControls {
+                        requested_count: 2,
+                        requested_names: vec!["papers".into(), "notes".into()],
+                        requested_truncated: false,
+                        require_fresh: true,
+                        applied_count: Some(2),
+                        union_source_count: Some(30),
+                        stale: Some(false),
+                        warning_count: Some(0),
+                    },
+                },
+                output: TaskOutputControls {
+                    limit: Some(100),
+                    page_size: Some(10),
+                    page: Some(1),
+                    passage: false,
+                    include_locator: false,
+                    include_debug: false,
+                    include_debug_packs: false,
+                    show_retrieval: None,
+                },
+            },
+            resources: TaskResourceProfile {
+                queues: vec![
+                    TaskResourceQueueSummary {
+                        name: "sqlite_reader".into(),
+                        kind: "sqlite_read".into(),
+                        capacity: 4,
+                        queue_capacity: 16,
+                        queued: 0,
+                        active: 0,
+                        completed: 1,
+                        errors: 0,
+                        queue_wait_ms_total: 2,
+                        service_ms_total: 95,
+                        latest_queue_wait_ms: Some(2),
+                        latest_service_ms: Some(95),
+                    },
+                    TaskResourceQueueSummary {
+                        name: "cpu_worker".into(),
+                        kind: "cpu".into(),
+                        capacity: 2,
+                        queue_capacity: 16,
+                        queued: 0,
+                        active: 0,
+                        completed: 0,
+                        errors: 0,
+                        queue_wait_ms_total: 0,
+                        service_ms_total: 0,
+                        latest_queue_wait_ms: None,
+                        latest_service_ms: None,
+                    },
+                ],
+            },
+            endpoints: vec![
+                TaskEndpointSummary::single_call("embedding", 761),
+                TaskEndpointSummary::single_call("reranker", 1_357),
+            ],
+            retrieve: Some(RetrieveTaskProfile {
+                dense: RetrieveDenseStageProfile {
+                    path: RetrievalDenseVectorPath::LowMemorySqliteScan,
+                    candidate_count: 20_000,
+                    local_ms: 96_000,
+                    query_embedding_ms: 761,
+                    endpoint_latency_ms: Some(761),
+                },
+                bm25: RetrieveStageProfile {
+                    candidate_count: 5_000,
+                    local_ms: 2_000,
+                },
+                fusion: RetrieveStageProfile {
+                    candidate_count: 22_000,
+                    local_ms: 900,
+                },
+                rerank: RetrieveRerankStageProfile {
+                    status: RetrievalRerankStatus::Succeeded,
+                    reason: None,
+                    input_count: Some(100),
+                    configured_top_n: 20,
+                    effective_top_n: Some(20),
+                    output_count: 20,
+                    local_ms: 1_400,
+                    endpoint_latency_ms: Some(1_357),
+                },
+                evidence: RetrieveEvidenceStageProfile {
+                    result_count: 100,
+                    graph_expanded_count: 4,
+                    final_count: 1_500,
+                    display_count: 10,
+                    result_hydration_ms: 21_000,
+                    graph_expansion_ms: 3_000,
+                    final_pack_ms: 0,
+                    display_pack_ms: 9_500,
+                },
+                display: RetrieveDisplayStageProfile {
+                    returned_count: 10,
+                    response_formatting_ms: 315,
+                    canonical_support_embedding_ms: Some(120),
+                    canonical_display_selection_ms: Some(250),
+                    canonical_selected_count: Some(10),
+                },
+            }),
+            ask: None,
+        };
+
+        let encoded = serde_json::to_string(&profile).unwrap();
+        let value: Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(value["retrieve"]["dense"]["path"], "low_memory_sqlite_scan");
+        assert_eq!(value["controls"]["retrieval"]["dense_top_k"], 80);
+        assert_eq!(value["controls"]["retrieval"]["bm25_top_k"], 50);
+        assert_eq!(value["controls"]["rerank"]["enabled"], true);
+        assert_eq!(value["controls"]["rerank"]["configured_top_n"], 20);
+        assert_eq!(value["controls"]["rerank"]["effective_top_n"], 20);
+        assert_eq!(value["controls"]["rerank"]["strategy"], "endpoint");
+        assert_eq!(value["controls"]["qdrant"]["enabled"], true);
+        assert_eq!(value["controls"]["qdrant"]["preferred"], true);
+        assert_eq!(value["controls"]["qdrant"]["used"], false);
+        assert_eq!(value["controls"]["vector"]["residency"], "low_memory");
+        assert_eq!(
+            value["controls"]["vector"]["dense_path"],
+            "low_memory_sqlite_scan"
+        );
+        assert_eq!(
+            value["controls"]["filters"]["source"]["effective_source_count"],
+            1
+        );
+        assert_eq!(
+            value["controls"]["filters"]["collection"]["requested_names"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(value["controls"]["output"]["page_size"], 10);
+        assert_eq!(value["resources"]["queues"][0]["name"], "sqlite_reader");
+        assert_eq!(
+            value["resources"]["queues"][0]["latest_service_ms"],
+            json!(95)
+        );
+        assert_eq!(
+            value["resources"]["queues"][1]["latest_service_ms"],
+            Value::Null
+        );
+        assert_eq!(value["retrieve"]["dense"]["local_ms"], 96_000);
+        assert_eq!(
+            value["retrieve"]["dense"]["endpoint_latency_ms"],
+            json!(761)
+        );
+        assert_eq!(value["retrieve"]["bm25"]["candidate_count"], 5_000);
+        assert_eq!(value["retrieve"]["fusion"]["candidate_count"], 22_000);
+        assert_eq!(value["retrieve"]["rerank"]["input_count"], 100);
+        assert_eq!(value["retrieve"]["rerank"]["configured_top_n"], 20);
+        assert_eq!(value["retrieve"]["rerank"]["effective_top_n"], 20);
+        assert_eq!(
+            value["retrieve"]["rerank"]["endpoint_latency_ms"],
+            json!(1_357)
+        );
+        assert_eq!(value["retrieve"]["evidence"]["final_count"], 1_500);
+        assert_eq!(value["retrieve"]["display"]["canonical_selected_count"], 10);
+        assert_eq!(value["endpoints"][0]["name"], "embedding");
+        assert_eq!(value["endpoints"][1]["name"], "reranker");
+        assert!(encoded.len() <= TASK_METADATA_MAX_BYTES);
+        assert!(!encoded.contains("chunk-"));
+        assert!(!encoded.contains("bm25_hits"));
+        assert!(!encoded.contains("dense_hits"));
+        assert!(!encoded.contains("final_evidence_pack"));
+        assert!(!encoded.contains("evidence_id"));
+        assert!(!encoded.contains("prompt"));
+        assert!(!encoded.contains("document"));
+        assert!(!encoded.contains("api_key"));
+    }
+
+    #[test]
+    fn legacy_minimal_task_profile_json_defaults_new_fields() {
+        let profile: TaskProfile = serde_json::from_value(json!({
+            "schema_version": TASK_PROFILE_SCHEMA_VERSION,
+            "task_id": "task-legacy",
+            "task_kind": "retrieve",
+            "status": "succeeded",
+            "queue_wait_ms": 0,
+            "total_wall_ms": 17
+        }))
+        .unwrap();
+
+        assert!(profile.endpoints.is_empty());
+        assert_eq!(profile.controls, TaskProfileControls::default());
+        assert_eq!(profile.resources, TaskResourceProfile::default());
+        assert!(profile.retrieve.is_none());
+        assert!(profile.ask.is_none());
+    }
+
+    #[test]
+    fn ask_task_profile_json_is_bounded_and_stage_oriented() {
+        let profile = TaskProfile {
+            schema_version: TASK_PROFILE_SCHEMA_VERSION,
+            task_id: TaskId("task-ask".into()),
+            task_kind: TaskKind::Ask,
+            status: TaskStatus::Succeeded,
+            queue_wait_ms: 3,
+            total_wall_ms: 2_050,
+            controls: TaskProfileControls {
+                retrieval: TaskRetrievalControls {
+                    dense_top_k: Some(0),
+                    bm25_top_k: Some(4),
+                    rrf_k: Some(60),
+                    fast: false,
+                    bypass_cache: false,
+                },
+                rerank: TaskRerankControls {
+                    enabled: false,
+                    configured_top_n: Some(0),
+                    effective_top_n: None,
+                    strategy: Some(RerankStrategy::Endpoint),
+                    provider: Some("vllm".into()),
+                    model: Some("Qwen/Qwen3-Reranker-4B".into()),
+                },
+                qdrant: TaskQdrantControls::default(),
+                vector: TaskVectorControls {
+                    embedding_enabled: false,
+                    embedding_profile_id: Some("default".into()),
+                    residency: Some(VectorIndexResidency::LowMemory),
+                    dense_path: Some(RetrievalDenseVectorPath::Bm25Only),
+                },
+                filters: TaskFilterControls::default(),
+                output: TaskOutputControls {
+                    limit: None,
+                    page_size: None,
+                    page: None,
+                    passage: false,
+                    include_locator: false,
+                    include_debug: false,
+                    include_debug_packs: false,
+                    show_retrieval: Some(false),
+                },
+            },
+            resources: TaskResourceProfile::default(),
+            endpoints: vec![
+                TaskEndpointSummary::single_call("chat", 800),
+                TaskEndpointSummary {
+                    name: "verifier".into(),
+                    calls: 2,
+                    latest_latency_ms: Some(300),
+                    first_token_latency_ms: None,
+                    p50_latency_ms: Some(250),
+                    p95_latency_ms: Some(300),
+                    latest_error: None,
+                },
+            ],
+            retrieve: Some(RetrieveTaskProfile {
+                dense: RetrieveDenseStageProfile {
+                    path: RetrievalDenseVectorPath::Bm25Only,
+                    candidate_count: 0,
+                    local_ms: 0,
+                    query_embedding_ms: 0,
+                    endpoint_latency_ms: None,
+                },
+                bm25: RetrieveStageProfile {
+                    candidate_count: 4,
+                    local_ms: 12,
+                },
+                fusion: RetrieveStageProfile {
+                    candidate_count: 4,
+                    local_ms: 1,
+                },
+                rerank: RetrieveRerankStageProfile {
+                    status: RetrievalRerankStatus::Disabled,
+                    reason: None,
+                    input_count: None,
+                    configured_top_n: 0,
+                    effective_top_n: None,
+                    output_count: 0,
+                    local_ms: 0,
+                    endpoint_latency_ms: None,
+                },
+                evidence: RetrieveEvidenceStageProfile {
+                    result_count: 3,
+                    graph_expanded_count: 0,
+                    final_count: 3,
+                    display_count: 3,
+                    result_hydration_ms: 2,
+                    graph_expansion_ms: 0,
+                    final_pack_ms: 1,
+                    display_pack_ms: 1,
+                },
+                display: RetrieveDisplayStageProfile {
+                    returned_count: 3,
+                    response_formatting_ms: 0,
+                    canonical_support_embedding_ms: None,
+                    canonical_display_selection_ms: None,
+                    canonical_selected_count: None,
+                },
+            }),
+            ask: Some(AskTaskProfile {
+                generation: AskGenerationStageProfile {
+                    status: AskGenerationStatus::Succeeded,
+                    call_count: 1,
+                    total_latency_ms: 800,
+                    latest_latency_ms: Some(800),
+                    retry_count: 0,
+                    error_count: 0,
+                    latest_error: None,
+                },
+                verification: AskVerificationStageProfile {
+                    enabled: true,
+                    status: AskVerificationStatus::Revised,
+                    call_count: 2,
+                    total_latency_ms: 550,
+                    latest_latency_ms: Some(300),
+                    retry_count: 0,
+                    error_count: 0,
+                    latest_error: None,
+                },
+                output: AskOutputStageProfile {
+                    response_formatting_ms: 7,
+                    answer_chars: 42,
+                    citation_count: 1,
+                    retrieval_included: false,
+                },
+            }),
+        };
+
+        let encoded = serde_json::to_string(&profile).unwrap();
+        let value: Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(value["task_kind"], "ask");
+        assert_eq!(value["controls"]["retrieval"]["bm25_top_k"], 4);
+        assert_eq!(value["controls"]["rerank"]["enabled"], false);
+        assert_eq!(value["controls"]["rerank"]["effective_top_n"], Value::Null);
+        assert_eq!(value["controls"]["qdrant"]["enabled"], false);
+        assert_eq!(value["controls"]["output"]["show_retrieval"], false);
+        assert_eq!(value["resources"]["queues"].as_array().unwrap().len(), 0);
+        assert_eq!(value["retrieve"]["bm25"]["candidate_count"], 4);
+        assert_eq!(value["ask"]["generation"]["call_count"], 1);
+        assert_eq!(value["ask"]["generation"]["latest_latency_ms"], 800);
+        assert_eq!(value["ask"]["generation"]["retry_count"], 0);
+        assert_eq!(value["ask"]["verification"]["enabled"], true);
+        assert_eq!(value["ask"]["verification"]["status"], "revised");
+        assert_eq!(value["ask"]["verification"]["call_count"], 2);
+        assert_eq!(value["ask"]["output"]["response_formatting_ms"], 7);
+        assert_eq!(value["ask"]["output"]["citation_count"], 1);
+        assert!(encoded.len() <= TASK_METADATA_MAX_BYTES);
+        assert!(!encoded.contains("SOURCE PACK"));
+        assert!(!encoded.contains("USER QUESTION"));
+        assert!(!encoded.contains("document body"));
+        assert!(!encoded.contains("api_key"));
     }
 
     #[test]

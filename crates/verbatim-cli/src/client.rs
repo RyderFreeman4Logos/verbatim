@@ -17,7 +17,7 @@ use verbatim_core::api::{
     IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse,
     IngestResponse, ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse,
     SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskListResponse,
-    TaskSummaryResponse, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
+    TaskProfileResponse, TaskSummaryResponse, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
@@ -135,6 +135,7 @@ pub trait DaemonClient {
     ) -> CliResult<VectorJsonCleanupResponse>;
     fn list_tasks(&self) -> CliResult<TaskListResponse>;
     fn get_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
+    fn get_task_profile(&self, task_id: &str) -> CliResult<TaskProfileResponse>;
     fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse>;
     fn wait_task<W>(
         &self,
@@ -554,6 +555,14 @@ impl DaemonClient for HttpDaemonClient {
         )
     }
 
+    fn get_task_profile(&self, task_id: &str) -> CliResult<TaskProfileResponse> {
+        self.request_json::<TaskProfileResponse, ()>(
+            Method::GET,
+            &format!("/api/tasks/{task_id}/profile"),
+            None,
+        )
+    }
+
     fn get_task_events(&self, task_id: &str, after: Option<i64>) -> CliResult<TaskEventsResponse> {
         let path = match after {
             Some(after) => format!("/api/tasks/{task_id}/events?after={after}"),
@@ -812,7 +821,7 @@ where
 fn http_error(status: StatusCode, mut response: reqwest::blocking::Response) -> CliError {
     let (body, truncated) = read_bounded_error_body(&mut response)
         .unwrap_or_else(|error| (format!("<failed to read response body: {error}>"), false));
-    if status == StatusCode::NOT_FOUND {
+    if status.is_client_error() {
         if let Some(message) = daemon_error_message(&body) {
             return CliError::Api(message);
         }
@@ -826,7 +835,7 @@ fn http_error(status: StatusCode, mut response: reqwest::blocking::Response) -> 
 fn daemon_error_message(body: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(body).ok()?;
     let message = value.get("error")?.as_str()?.trim();
-    (!message.is_empty()).then(|| message.to_string())
+    (!message.is_empty()).then(|| redact_json_like_text(message))
 }
 
 fn request_error(url: &str, error: reqwest::Error) -> CliError {
@@ -1575,6 +1584,27 @@ mod tests {
     }
 
     #[test]
+    fn http_task_profile_route_is_plumbed() {
+        let server = TestServer::respond_many(vec![concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+            "{\"profile\":{\"schema_version\":1,\"task_id\":\"task-1\",",
+            "\"task_kind\":\"retrieve\",\"status\":\"succeeded\",",
+            "\"queue_wait_ms\":0,\"total_wall_ms\":12}}"
+        )
+        .to_string()]);
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let profile = client.get_task_profile("task-1").unwrap().profile;
+
+        assert_eq!(profile.task_id.0, "task-1");
+        assert_eq!(profile.task_kind.as_str(), "retrieve");
+        assert_eq!(profile.status.as_str(), "succeeded");
+        assert_eq!(profile.total_wall_ms, 12);
+        let requests = server.requests();
+        assert!(requests[0].starts_with("GET /api/tasks/task-1/profile HTTP/1.1"));
+    }
+
+    #[test]
     fn http_task_wait_send_timeout_returns_distinct_error_and_no_event_summary() {
         let server = TestServer::respond_delayed_response(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
@@ -1691,6 +1721,25 @@ mod tests {
         assert!(server
             .request()
             .starts_with("DELETE /api/sources/__missing_source_smoke_retest__ HTTP/1.1"));
+    }
+
+    #[test]
+    fn http_client_error_reports_daemon_error_without_json_wrapper() {
+        let server = TestServer::respond_once(
+            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"task profile unavailable for incomplete task task-1 (status queued)\"}",
+        );
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let error = client.get_task_profile("task-1").unwrap_err();
+
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(
+            error.to_string(),
+            "task profile unavailable for incomplete task task-1 (status queued)"
+        );
+        assert!(server
+            .request()
+            .starts_with("GET /api/tasks/task-1/profile HTTP/1.1"));
     }
 
     #[test]
