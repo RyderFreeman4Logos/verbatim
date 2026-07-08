@@ -931,6 +931,7 @@ where
         TaskCommand::Profile { task_id, format } => {
             let response = client.get_task_profile(&task_id)?;
             match format {
+                TaskProfileFormat::Human => render::write_task_profile(stdout, &response)?,
                 TaskProfileFormat::Json => render::write_task_profile_json(stdout, &response)?,
             }
         }
@@ -1378,11 +1379,13 @@ and bounded phase spans such as ingest stage timings.
 "#;
 
 const TASK_PROFILE_AFTER_HELP: &str = r#"Examples:
+  verbatim task profile <task-id>
   verbatim task profile <task-id> --format json
 
-Profile reads persisted completed-task diagnostics by task id. It does not rerun
-retrieval, embedding, rerank, BM25, dense search, chat, verifier, or evidence
-expansion work.
+Profile reads persisted completed-task diagnostics by task id. The default
+output is compact human-readable text; use --format json for machine-readable
+output. It does not rerun retrieval, embedding, rerank, BM25, dense search,
+chat, verifier, or evidence expansion work.
 "#;
 
 const TASK_EVENTS_AFTER_HELP: &str = r#"Examples:
@@ -2057,7 +2060,7 @@ enum TaskCommand {
         #[arg(value_name = "TASK_ID")]
         task_id: String,
         /// Output format.
-        #[arg(long, value_enum, default_value_t = TaskProfileFormat::Json)]
+        #[arg(long, value_enum, default_value_t = TaskProfileFormat::Human)]
         format: TaskProfileFormat,
     },
     /// List bounded task events.
@@ -2148,6 +2151,7 @@ enum ResolveFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum TaskProfileFormat {
+    Human,
     Json,
 }
 
@@ -3317,6 +3321,111 @@ mod tests {
         assert_eq!(parsed["retrieve"]["dense"]["path"], "bm25_only");
         assert_eq!(parsed["retrieve"]["bm25"]["candidate_count"], 1);
         assert!(parsed["retrieve"]["rerank"]["input_count"].is_null());
+    }
+
+    #[test]
+    fn task_profile_human_retrieve_output_is_compact_and_grouped() {
+        let (code, stdout, stderr, client, _) = run_mock(["task", "profile", "task-1"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["get_task_profile:task-1"]
+        );
+        assert!(serde_json::from_str::<Value>(&stdout).is_err());
+        assert!(stdout.contains("Task profile: task-1"));
+        assert!(stdout.contains("Timing:"));
+        assert!(stdout.contains("Controls:"));
+        assert!(stdout.contains("Model endpoints:"));
+        assert!(stdout.contains("Retrieval:"));
+        assert!(stdout.contains("Rerank:"));
+        assert!(stdout.contains("Evidence:"));
+        assert!(stdout.contains("Display/output:"));
+        assert!(stdout.contains("Resource queues:"));
+        assert!(stdout.contains("kind: retrieve"));
+        assert!(stdout.contains("dense: path=bm25_only"));
+        assert!(stdout.contains("bm25: candidates=1 local=3ms"));
+        assert!(stdout.contains("final=1"));
+        assert!(!stdout.contains("question"));
+        assert!(!stdout.contains("bm25_hits"));
+        assert!(!stdout.contains("final_evidence_pack"));
+    }
+
+    #[test]
+    fn task_profile_human_ask_output_includes_ask_sections_and_retrieval_summary() {
+        let client = MockDaemonClient::default();
+        client
+            .task_profile_response
+            .replace(Some(TaskProfileResponse {
+                profile: sample_ask_task_profile("task-ask"),
+            }));
+        let local = MockLocalActions::default();
+
+        let (code, stdout, stderr) =
+            run_mock_with(["task", "profile", "task-ask"], &client, &local);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert_eq!(
+            client.calls.borrow().as_slice(),
+            ["get_task_profile:task-ask"]
+        );
+        assert!(stdout.contains("Task profile: task-ask"));
+        assert!(stdout.contains("kind: ask"));
+        assert!(stdout.contains("Retrieval:"));
+        assert!(stdout.contains("Ask generation:"));
+        assert!(stdout.contains("Ask verification:"));
+        assert!(stdout.contains("Ask output:"));
+        assert!(stdout.contains("status=succeeded"));
+        assert!(stdout.contains("status=passed"));
+        assert!(stdout.contains("retrieval_included=true"));
+        assert!(!stdout.contains("prompt"));
+        assert!(!stdout.contains("raw"));
+    }
+
+    #[test]
+    fn task_profile_errors_go_to_stderr_with_nonzero_exit_and_empty_stdout() {
+        for (task_id, message) in [
+            ("missing", "task not found: missing"),
+            (
+                "queued",
+                "task profile unavailable for incomplete task queued (status queued)",
+            ),
+            ("ingest", "task profile unsupported for ingest task: ingest"),
+            (
+                "legacy",
+                "task profile unavailable for legacy/no-profile task: legacy",
+            ),
+            (
+                "corrupt",
+                "stored task profile JSON is malformed for task: corrupt",
+            ),
+        ] {
+            let client = MockDaemonClient {
+                task_profile_error: Some(CliError::Api(message.into())),
+                ..MockDaemonClient::default()
+            };
+            let local = MockLocalActions::default();
+
+            let (code, stdout, stderr) =
+                run_mock_with(["task", "profile", task_id], &client, &local);
+
+            assert_eq!(code.unwrap_err(), 1, "{task_id}");
+            assert!(stdout.is_empty(), "{task_id}");
+            assert!(stderr.contains(message), "{task_id}: {stderr}");
+        }
+    }
+
+    #[test]
+    fn task_profile_missing_task_id_is_clap_error_to_stderr() {
+        let (code, stdout, stderr, client, _) = run_mock(["task", "profile"]);
+
+        assert_eq!(code.unwrap_err(), 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("required"));
+        assert!(stderr.contains("TASK_ID"));
+        assert!(client.calls.borrow().is_empty());
     }
 
     #[test]
@@ -4524,6 +4633,8 @@ mod tests {
         health_errors: RefCell<Vec<CliError>>,
         health_response: RefCell<Option<HealthResponse>>,
         task_list_response: RefCell<Option<TaskListResponse>>,
+        task_profile_response: RefCell<Option<TaskProfileResponse>>,
+        task_profile_error: Option<CliError>,
     }
 
     impl DaemonClient for MockDaemonClient {
@@ -4777,12 +4888,19 @@ mod tests {
         }
 
         fn get_task_profile(&self, task_id: &str) -> client::CliResult<TaskProfileResponse> {
+            if let Some(error) = &self.task_profile_error {
+                return Err(clone_cli_error(error));
+            }
             self.calls
                 .borrow_mut()
                 .push(format!("get_task_profile:{task_id}"));
-            Ok(TaskProfileResponse {
-                profile: sample_task_profile(task_id),
-            })
+            Ok(self
+                .task_profile_response
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| TaskProfileResponse {
+                    profile: sample_task_profile(task_id),
+                }))
         }
 
         fn get_task_events(
@@ -5624,6 +5742,43 @@ mod tests {
             }),
             ask: None,
         }
+    }
+
+    fn sample_ask_task_profile(task_id: &str) -> TaskProfile {
+        let mut profile = sample_task_profile(task_id);
+        profile.task_kind = TaskKind::Ask;
+        profile.endpoints = vec![
+            verbatim_core::task::TaskEndpointSummary::single_call("chat", 42),
+            verbatim_core::task::TaskEndpointSummary::single_call("verifier", 7),
+        ];
+        profile.ask = Some(verbatim_core::task::AskTaskProfile {
+            generation: verbatim_core::task::AskGenerationStageProfile {
+                status: verbatim_core::task::AskGenerationStatus::Succeeded,
+                call_count: 1,
+                total_latency_ms: 42,
+                latest_latency_ms: Some(42),
+                retry_count: 0,
+                error_count: 0,
+                latest_error: None,
+            },
+            verification: verbatim_core::task::AskVerificationStageProfile {
+                enabled: true,
+                status: verbatim_core::task::AskVerificationStatus::Passed,
+                call_count: 1,
+                total_latency_ms: 7,
+                latest_latency_ms: Some(7),
+                retry_count: 0,
+                error_count: 0,
+                latest_error: None,
+            },
+            output: verbatim_core::task::AskOutputStageProfile {
+                response_formatting_ms: 2,
+                answer_chars: 120,
+                citation_count: 1,
+                retrieval_included: true,
+            },
+        });
+        profile
     }
 
     fn sample_debug_json() -> Value {

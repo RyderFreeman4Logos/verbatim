@@ -821,7 +821,7 @@ where
 fn http_error(status: StatusCode, mut response: reqwest::blocking::Response) -> CliError {
     let (body, truncated) = read_bounded_error_body(&mut response)
         .unwrap_or_else(|error| (format!("<failed to read response body: {error}>"), false));
-    if status == StatusCode::NOT_FOUND {
+    if status.is_client_error() {
         if let Some(message) = daemon_error_message(&body) {
             return CliError::Api(message);
         }
@@ -835,7 +835,7 @@ fn http_error(status: StatusCode, mut response: reqwest::blocking::Response) -> 
 fn daemon_error_message(body: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(body).ok()?;
     let message = value.get("error")?.as_str()?.trim();
-    (!message.is_empty()).then(|| message.to_string())
+    (!message.is_empty()).then(|| redact_json_like_text(message))
 }
 
 fn request_error(url: &str, error: reqwest::Error) -> CliError {
@@ -1721,6 +1721,25 @@ mod tests {
         assert!(server
             .request()
             .starts_with("DELETE /api/sources/__missing_source_smoke_retest__ HTTP/1.1"));
+    }
+
+    #[test]
+    fn http_client_error_reports_daemon_error_without_json_wrapper() {
+        let server = TestServer::respond_once(
+            "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"task profile unavailable for incomplete task task-1 (status queued)\"}",
+        );
+        let client = HttpDaemonClient::with_base_url(server.base_url());
+
+        let error = client.get_task_profile("task-1").unwrap_err();
+
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(
+            error.to_string(),
+            "task profile unavailable for incomplete task task-1 (status queued)"
+        );
+        assert!(server
+            .request()
+            .starts_with("GET /api/tasks/task-1/profile HTTP/1.1"));
     }
 
     #[test]

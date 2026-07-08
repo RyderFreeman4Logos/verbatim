@@ -3862,19 +3862,31 @@ async fn task_profile_response(
     state: &SharedState,
     task_id: TaskId,
 ) -> Result<TaskProfileResponse, (StatusCode, Json<ErrorResponse>)> {
+    let task_id_for_error = task_id.clone();
     with_task_store_read(state, move |store| {
         let task = store
             .get_task(&task_id)?
             .with_context(|| format!("task not found: {}", task_id.0))?;
         if !task.status.is_terminal() {
             bail!(
-                "task profile unavailable for incomplete task: {}",
+                "task profile unavailable for incomplete task {} (status {})",
+                task_id.0,
+                task.status.as_str()
+            );
+        }
+        if !matches!(task.kind, TaskKind::Ask | TaskKind::Retrieve) {
+            bail!(
+                "task profile unsupported for {} task: {}",
+                task.kind.as_str(),
                 task_id.0
             );
         }
-        let profile = store
-            .get_task_profile(&task_id)?
-            .with_context(|| format!("task profile unavailable: {}", task_id.0))?;
+        let profile = store.get_task_profile(&task_id)?.with_context(|| {
+            format!(
+                "task profile unavailable for legacy/no-profile task: {}",
+                task_id.0
+            )
+        })?;
         Ok(TaskProfileResponse { profile })
     })
     .await
@@ -3884,8 +3896,18 @@ async fn task_profile_response(
             err(StatusCode::NOT_FOUND, e)
         } else if message.contains("incomplete task") {
             err(StatusCode::CONFLICT, e)
-        } else if message.contains("task profile unavailable") {
+        } else if message.contains("unsupported") {
+            err(StatusCode::UNPROCESSABLE_ENTITY, e)
+        } else if message.contains("legacy/no-profile") {
             err(StatusCode::NOT_FOUND, e)
+        } else if message.contains("deserialize task profile") {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.context(format!(
+                    "stored task profile JSON is malformed for task: {}",
+                    task_id_for_error.0
+                )),
+            )
         } else {
             err(StatusCode::INTERNAL_SERVER_ERROR, e)
         }
@@ -15319,6 +15341,113 @@ mod tests {
             .map(|endpoint| endpoint["latest_latency_ms"].as_u64().unwrap())
             .sum::<u64>();
         assert!(local_ms > model_ms * 30);
+    }
+
+    #[tokio::test]
+    async fn task_profile_api_reports_clear_unavailable_error_cases() {
+        let test_dir = TestDir::new("task-profile-unavailable-errors");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+
+        let missing = task_profile_handler(State(Arc::clone(&state)), Path("missing".into()))
+            .await
+            .unwrap_err();
+        let (status, Json(body)) = missing;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.error, "task not found: missing");
+
+        let queued_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("queued task", None, None, 3, 3, 1),
+        )
+        .await
+        .unwrap();
+        let queued = task_profile_handler(State(Arc::clone(&state)), Path(queued_id.0.clone()))
+            .await
+            .unwrap_err();
+        let (status, Json(body)) = queued;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body
+            .error
+            .contains("task profile unavailable for incomplete task"));
+        assert!(body.error.contains("status queued"));
+
+        let ingest_id = create_persisted_task(
+            &state,
+            TaskKind::Ingest,
+            ingest_task_request_metadata_with_queue_claim(None, false, None, false, false),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &ingest_id).await.unwrap();
+        finish_task_success(&state, &ingest_id, serde_json::json!({"ingested": 0}))
+            .await
+            .unwrap();
+        let unsupported =
+            task_profile_handler(State(Arc::clone(&state)), Path(ingest_id.0.clone()))
+                .await
+                .unwrap_err();
+        let (status, Json(body)) = unsupported;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body.error,
+            format!("task profile unsupported for ingest task: {}", ingest_id.0)
+        );
+
+        let legacy_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("legacy task", None, None, 3, 3, 1),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &legacy_id).await.unwrap();
+        finish_task_success(&state, &legacy_id, retrieve_result_metadata(0, 0, false))
+            .await
+            .unwrap();
+        let legacy = task_profile_handler(State(Arc::clone(&state)), Path(legacy_id.0.clone()))
+            .await
+            .unwrap_err();
+        let (status, Json(body)) = legacy;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body.error,
+            format!(
+                "task profile unavailable for legacy/no-profile task: {}",
+                legacy_id.0
+            )
+        );
+
+        let corrupt_id = create_persisted_task(
+            &state,
+            TaskKind::Retrieve,
+            retrieve_request_metadata("corrupt task", None, None, 3, 3, 1),
+        )
+        .await
+        .unwrap();
+        ensure_task_started(&state, &corrupt_id).await.unwrap();
+        finish_task_success(&state, &corrupt_id, retrieve_result_metadata(0, 0, false))
+            .await
+            .unwrap();
+        let conn = rusqlite::Connection::open(test_dir.path().join("verbatim.db")).unwrap();
+        conn.execute(
+            "UPDATE tasks SET profile_json = ?2 WHERE id = ?1",
+            rusqlite::params![&corrupt_id.0, "{not valid json"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let corrupt = task_profile_handler(State(Arc::clone(&state)), Path(corrupt_id.0.clone()))
+            .await
+            .unwrap_err();
+        let (status, Json(body)) = corrupt;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.error.contains(&format!(
+            "stored task profile JSON is malformed for task: {}",
+            corrupt_id.0
+        )));
     }
 
     #[tokio::test]

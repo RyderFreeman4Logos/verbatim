@@ -576,6 +576,284 @@ where
     writeln!(writer)
 }
 
+pub fn write_task_profile<W>(writer: &mut W, response: &TaskProfileResponse) -> std::io::Result<()>
+where
+    W: Write,
+{
+    let profile = &response.profile;
+    writeln!(writer, "Task profile: {}", profile.task_id.0)?;
+    writeln!(writer, "  kind: {}", profile.task_kind.as_str())?;
+    writeln!(writer, "  status: {}", profile.status.as_str())?;
+    writeln!(writer, "  schema_version: {}", profile.schema_version)?;
+    writeln!(writer)?;
+
+    writeln!(writer, "Timing:")?;
+    writeln!(writer, "  queue_wait: {}ms", profile.queue_wait_ms)?;
+    writeln!(writer, "  total_wall: {}ms", profile.total_wall_ms)?;
+    writeln!(writer)?;
+
+    let controls = &profile.controls;
+    writeln!(writer, "Controls:")?;
+    writeln!(
+        writer,
+        "  retrieval: dense_top_k={} bm25_top_k={} rrf_k={} fast={} bypass_cache={}",
+        opt_usize(controls.retrieval.dense_top_k),
+        opt_usize(controls.retrieval.bm25_top_k),
+        opt_usize(controls.retrieval.rrf_k),
+        controls.retrieval.fast,
+        controls.retrieval.bypass_cache
+    )?;
+    writeln!(
+        writer,
+        "  rerank: enabled={} configured_top_n={} effective_top_n={} strategy={} provider={} model={}",
+        controls.rerank.enabled,
+        opt_usize(controls.rerank.configured_top_n),
+        opt_usize(controls.rerank.effective_top_n),
+        opt_enum(controls.rerank.strategy.as_ref()),
+        opt_str(controls.rerank.provider.as_deref()),
+        opt_str(controls.rerank.model.as_deref())
+    )?;
+    writeln!(
+        writer,
+        "  qdrant: enabled={} preferred={} used={}",
+        controls.qdrant.enabled, controls.qdrant.preferred, controls.qdrant.used
+    )?;
+    writeln!(
+        writer,
+        "  vector: embedding={} profile={} residency={} dense_path={}",
+        controls.vector.embedding_enabled,
+        opt_str(controls.vector.embedding_profile_id.as_deref()),
+        opt_enum(controls.vector.residency.as_ref()),
+        opt_enum(controls.vector.dense_path.as_ref())
+    )?;
+    writeln!(
+        writer,
+        "  filters: source={} effective_sources={} collections={} applied_collections={} union_sources={} require_fresh={} stale={}",
+        opt_str(
+            controls
+                .filters
+                .source
+                .requested_source_id
+                .as_deref()
+        ),
+        opt_usize(controls.filters.source.effective_source_count),
+        controls.filters.collection.requested_count,
+        opt_usize(controls.filters.collection.applied_count),
+        opt_usize(controls.filters.collection.union_source_count),
+        controls.filters.collection.require_fresh,
+        opt_bool(controls.filters.collection.stale)
+    )?;
+    writeln!(
+        writer,
+        "  output: limit={} page_size={} page={} passage={} locator={} debug={} debug_packs={} show_retrieval={}",
+        opt_usize(controls.output.limit),
+        opt_usize(controls.output.page_size),
+        opt_usize(controls.output.page),
+        controls.output.passage,
+        controls.output.include_locator,
+        controls.output.include_debug,
+        controls.output.include_debug_packs,
+        opt_bool(controls.output.show_retrieval)
+    )?;
+    writeln!(writer)?;
+
+    writeln!(writer, "Model endpoints:")?;
+    if profile.endpoints.is_empty() {
+        writeln!(writer, "  none")?;
+    } else {
+        for endpoint in &profile.endpoints {
+            writeln!(
+                writer,
+                "  {}: calls={} latest={} first_token={} p50={} p95={} error={}",
+                endpoint.name,
+                endpoint.calls,
+                opt_ms(endpoint.latest_latency_ms),
+                opt_ms(endpoint.first_token_latency_ms),
+                opt_ms(endpoint.p50_latency_ms),
+                opt_ms(endpoint.p95_latency_ms),
+                opt_str(endpoint.latest_error.as_deref())
+            )?;
+        }
+    }
+    writeln!(writer)?;
+
+    if let Some(retrieve) = &profile.retrieve {
+        writeln!(writer, "Retrieval:")?;
+        writeln!(
+            writer,
+            "  dense: path={} candidates={} local={}ms query_embedding={}ms endpoint={}",
+            enum_name(&retrieve.dense.path),
+            retrieve.dense.candidate_count,
+            retrieve.dense.local_ms,
+            retrieve.dense.query_embedding_ms,
+            opt_ms(retrieve.dense.endpoint_latency_ms)
+        )?;
+        writeln!(
+            writer,
+            "  bm25: candidates={} local={}ms",
+            retrieve.bm25.candidate_count, retrieve.bm25.local_ms
+        )?;
+        writeln!(
+            writer,
+            "  fusion: candidates={} local={}ms",
+            retrieve.fusion.candidate_count, retrieve.fusion.local_ms
+        )?;
+        writeln!(writer)?;
+
+        writeln!(writer, "Rerank:")?;
+        writeln!(
+            writer,
+            "  status={} reason={} input={} configured_top_n={} effective_top_n={} output={} local={}ms endpoint={}",
+            enum_name(&retrieve.rerank.status),
+            opt_str(retrieve.rerank.reason.as_deref()),
+            opt_usize(retrieve.rerank.input_count),
+            retrieve.rerank.configured_top_n,
+            opt_usize(retrieve.rerank.effective_top_n),
+            retrieve.rerank.output_count,
+            retrieve.rerank.local_ms,
+            opt_ms(retrieve.rerank.endpoint_latency_ms)
+        )?;
+        writeln!(writer)?;
+
+        writeln!(writer, "Evidence:")?;
+        writeln!(
+            writer,
+            "  results={} graph_expanded={} final={} display={}",
+            retrieve.evidence.result_count,
+            retrieve.evidence.graph_expanded_count,
+            retrieve.evidence.final_count,
+            retrieve.evidence.display_count
+        )?;
+        writeln!(
+            writer,
+            "  hydration={}ms graph={}ms final_pack={}ms display_pack={}ms",
+            retrieve.evidence.result_hydration_ms,
+            retrieve.evidence.graph_expansion_ms,
+            retrieve.evidence.final_pack_ms,
+            retrieve.evidence.display_pack_ms
+        )?;
+        writeln!(writer)?;
+
+        writeln!(writer, "Display/output:")?;
+        writeln!(
+            writer,
+            "  returned={} formatting={}ms canonical_support_embedding={} canonical_display_selection={} canonical_selected={}",
+            retrieve.display.returned_count,
+            retrieve.display.response_formatting_ms,
+            opt_ms(retrieve.display.canonical_support_embedding_ms),
+            opt_ms(retrieve.display.canonical_display_selection_ms),
+            opt_usize(retrieve.display.canonical_selected_count)
+        )?;
+        writeln!(writer)?;
+    }
+
+    if let Some(ask) = &profile.ask {
+        writeln!(writer, "Ask generation:")?;
+        writeln!(
+            writer,
+            "  status={} calls={} total={}ms latest={} retries={} errors={} latest_error={}",
+            enum_name(&ask.generation.status),
+            ask.generation.call_count,
+            ask.generation.total_latency_ms,
+            opt_ms(ask.generation.latest_latency_ms),
+            ask.generation.retry_count,
+            ask.generation.error_count,
+            opt_str(ask.generation.latest_error.as_deref())
+        )?;
+        writeln!(writer)?;
+
+        writeln!(writer, "Ask verification:")?;
+        writeln!(
+            writer,
+            "  enabled={} status={} calls={} total={}ms latest={} retries={} errors={} latest_error={}",
+            ask.verification.enabled,
+            enum_name(&ask.verification.status),
+            ask.verification.call_count,
+            ask.verification.total_latency_ms,
+            opt_ms(ask.verification.latest_latency_ms),
+            ask.verification.retry_count,
+            ask.verification.error_count,
+            opt_str(ask.verification.latest_error.as_deref())
+        )?;
+        writeln!(writer)?;
+
+        writeln!(writer, "Ask output:")?;
+        writeln!(
+            writer,
+            "  formatting={}ms answer_chars={} citations={} retrieval_included={}",
+            ask.output.response_formatting_ms,
+            ask.output.answer_chars,
+            ask.output.citation_count,
+            ask.output.retrieval_included
+        )?;
+        writeln!(writer)?;
+    }
+
+    writeln!(writer, "Resource queues:")?;
+    if profile.resources.queues.is_empty() {
+        writeln!(writer, "  none")?;
+    } else {
+        for queue in &profile.resources.queues {
+            writeln!(
+                writer,
+                "  {}({}): capacity={}/{} queued={} active={} completed={} errors={} wait_total={}ms service_total={}ms latest_wait={} latest_service={}",
+                queue.name,
+                queue.kind,
+                queue.capacity,
+                queue.queue_capacity,
+                queue.queued,
+                queue.active,
+                queue.completed,
+                queue.errors,
+                queue.queue_wait_ms_total,
+                queue.service_ms_total,
+                opt_ms(queue.latest_queue_wait_ms),
+                opt_ms(queue.latest_service_ms)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn opt_str(value: Option<&str>) -> &str {
+    value.filter(|value| !value.is_empty()).unwrap_or("-")
+}
+
+fn opt_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn opt_bool(value: Option<bool>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn opt_ms(value: Option<u64>) -> String {
+    value
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn opt_enum<T>(value: Option<&T>) -> String
+where
+    T: Serialize + std::fmt::Debug,
+{
+    value.map(enum_name).unwrap_or_else(|| "-".to_string())
+}
+
+fn enum_name<T>(value: &T) -> String
+where
+    T: Serialize + std::fmt::Debug,
+{
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{value:?}"))
+}
+
 pub fn write_index_gc<W>(writer: &mut W, response: &IndexGcResponse) -> std::io::Result<()>
 where
     W: Write,
