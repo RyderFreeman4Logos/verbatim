@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
@@ -54,7 +56,8 @@ use verbatim_core::config::{
 };
 use verbatim_core::embed::OpenAiEmbeddingClient;
 use verbatim_core::generate::{
-    image_artifact_evidence_id, select_image_attachments, GenerationContext, Generator,
+    image_artifact_evidence_id, select_image_attachments, GenerationCallTelemetry,
+    GenerationContext, GenerationTelemetry, GenerationVerificationStatus, Generator,
 };
 use verbatim_core::graphrag::GraphRagService;
 use verbatim_core::index::sqlite_fts::FtsMaintenanceOutcome;
@@ -82,10 +85,12 @@ use verbatim_core::task::{
     ingest_task_request_metadata_with_queue_claim_and_batch, reindex_result_metadata,
     reindex_task_request_metadata_with_queue_claim,
     reindex_task_request_metadata_with_queue_claim_and_batch, retrieve_request_metadata,
-    retrieve_result_metadata, IngestTaskStage, PhaseTiming, RetrieveDenseStageProfile,
-    RetrieveDisplayStageProfile, RetrieveEvidenceStageProfile, RetrieveRerankStageProfile,
-    RetrieveStageProfile, RetrieveTaskProfile, TaskEndpointSummary, TaskEvent, TaskId, TaskKind,
-    TaskProfile, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
+    retrieve_result_metadata, AskGenerationStageProfile, AskGenerationStatus,
+    AskOutputStageProfile, AskTaskProfile, AskVerificationStageProfile, AskVerificationStatus,
+    IngestTaskStage, PhaseTiming, RetrieveDenseStageProfile, RetrieveDisplayStageProfile,
+    RetrieveEvidenceStageProfile, RetrieveRerankStageProfile, RetrieveStageProfile,
+    RetrieveTaskProfile, TaskEndpointSummary, TaskEvent, TaskId, TaskKind, TaskProfile,
+    TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary,
 };
 use verbatim_core::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 use verbatim_core::types::{
@@ -3056,6 +3061,95 @@ fn retrieve_task_profile_from_debug(
     }
 }
 
+fn ask_task_profile_from_telemetry(
+    telemetry: &GenerationTelemetry,
+    response_formatting_ms: u64,
+    answer: &str,
+    citation_count: usize,
+    retrieval_included: bool,
+) -> AskTaskProfile {
+    AskTaskProfile {
+        generation: ask_generation_stage_profile(&telemetry.generation),
+        verification: ask_verification_stage_profile(&telemetry.verification),
+        output: AskOutputStageProfile {
+            response_formatting_ms,
+            answer_chars: answer.chars().count(),
+            citation_count,
+            retrieval_included,
+        },
+    }
+}
+
+fn ask_generation_stage_profile(telemetry: &GenerationCallTelemetry) -> AskGenerationStageProfile {
+    AskGenerationStageProfile {
+        status: if telemetry.call_count == 0 {
+            AskGenerationStatus::Skipped
+        } else if telemetry.error_count > 0 {
+            AskGenerationStatus::Failed
+        } else {
+            AskGenerationStatus::Succeeded
+        },
+        call_count: telemetry.call_count,
+        total_latency_ms: telemetry.total_latency_ms,
+        latest_latency_ms: telemetry.latest_latency_ms,
+        retry_count: telemetry.retry_count,
+        error_count: telemetry.error_count,
+        latest_error: telemetry.latest_error.as_deref().map(bounded_error),
+    }
+}
+
+fn ask_verification_stage_profile(
+    telemetry: &verbatim_core::generate::GenerationVerificationTelemetry,
+) -> AskVerificationStageProfile {
+    AskVerificationStageProfile {
+        enabled: telemetry.enabled,
+        status: match telemetry.status {
+            GenerationVerificationStatus::Disabled => AskVerificationStatus::Disabled,
+            GenerationVerificationStatus::Passed => AskVerificationStatus::Passed,
+            GenerationVerificationStatus::Revised => AskVerificationStatus::Revised,
+            GenerationVerificationStatus::Failed => AskVerificationStatus::Failed,
+            GenerationVerificationStatus::Skipped => AskVerificationStatus::Skipped,
+        },
+        call_count: telemetry.calls.call_count,
+        total_latency_ms: telemetry.calls.total_latency_ms,
+        latest_latency_ms: telemetry.calls.latest_latency_ms,
+        retry_count: telemetry.calls.retry_count,
+        error_count: telemetry.calls.error_count,
+        latest_error: telemetry.calls.latest_error.as_deref().map(bounded_error),
+    }
+}
+
+fn ask_endpoint_summaries(telemetry: &GenerationTelemetry) -> Vec<TaskEndpointSummary> {
+    let mut endpoints = Vec::new();
+    if let Some(endpoint) = call_telemetry_endpoint_summary("chat", &telemetry.generation) {
+        endpoints.push(endpoint);
+    }
+    if let Some(endpoint) =
+        call_telemetry_endpoint_summary("verifier", &telemetry.verification.calls)
+    {
+        endpoints.push(endpoint);
+    }
+    endpoints
+}
+
+fn call_telemetry_endpoint_summary(
+    name: &'static str,
+    telemetry: &GenerationCallTelemetry,
+) -> Option<TaskEndpointSummary> {
+    if telemetry.call_count == 0 {
+        return None;
+    }
+    Some(TaskEndpointSummary {
+        name: name.into(),
+        calls: telemetry.call_count,
+        latest_latency_ms: telemetry.latest_latency_ms,
+        first_token_latency_ms: None,
+        p50_latency_ms: telemetry.latest_latency_ms,
+        p95_latency_ms: telemetry.latest_latency_ms,
+        latest_error: telemetry.latest_error.as_deref().map(bounded_error),
+    })
+}
+
 async fn record_task_progress(
     state: &SharedState,
     task_id: &TaskId,
@@ -4395,6 +4489,7 @@ async fn execute_retrieve_task_inner(
             response.total_results,
             response.returned_results,
         )),
+        ask: None,
     };
     finish_task_success_with_profile(
         &state,
@@ -4419,7 +4514,9 @@ async fn execute_ask_task_inner(
         return execute_context_only_ask_task_inner(state, task_id, req).await;
     }
 
+    let execution_started = Instant::now();
     ensure_task_started(&state, task_id).await?;
+    let queue_wait_ms = task_queue_wait_ms(&state, task_id).await?;
     let question = req.question;
     let source_id = req.source_id.map(SourceId);
     let collection_filter = req.collection_filter;
@@ -4581,6 +4678,13 @@ async fn execute_ask_task_inner(
     )
     .await?;
 
+    let generation_telemetry = gen_result.telemetry.clone();
+    let retrieval_for_response = if show_retrieval {
+        retrieval_debug.clone()
+    } else {
+        None
+    };
+    let response_started = Instant::now();
     let response = AskResponse {
         answer: gen_result.answer,
         citations: gen_result
@@ -4591,11 +4695,37 @@ async fn execute_ask_task_inner(
             })
             .collect(),
         verified: gen_result.verified,
-        retrieval: retrieval_debug,
+        retrieval: retrieval_for_response,
         context: None,
         collection_filter: query_scope.collection_filter,
     };
-    finish_task_success(
+    let response_formatting_ms = elapsed_ms(response_started);
+    let mut endpoints = retrieval_debug
+        .as_ref()
+        .map(retrieve_endpoint_summaries)
+        .unwrap_or_default();
+    endpoints.extend(ask_endpoint_summaries(&generation_telemetry));
+    let retrieve_profile = retrieval_debug.as_ref().map(|debug| {
+        retrieve_task_profile_from_debug(debug, config.rerank.top_n, results.len(), results.len())
+    });
+    let profile = TaskProfile {
+        schema_version: verbatim_core::task::TASK_PROFILE_SCHEMA_VERSION,
+        task_id: task_id.clone(),
+        task_kind: TaskKind::Ask,
+        status: TaskStatus::Succeeded,
+        queue_wait_ms,
+        total_wall_ms: queue_wait_ms.saturating_add(elapsed_ms(execution_started)),
+        endpoints,
+        retrieve: retrieve_profile,
+        ask: Some(ask_task_profile_from_telemetry(
+            &generation_telemetry,
+            response_formatting_ms,
+            &response.answer,
+            response.citations.len(),
+            response.retrieval.is_some(),
+        )),
+    };
+    finish_task_success_with_profile(
         &state,
         task_id,
         ask_result_metadata(
@@ -4604,6 +4734,7 @@ async fn execute_ask_task_inner(
             response.verified,
             response.retrieval.is_some(),
         ),
+        profile,
     )
     .await?;
     Ok(response)
@@ -4849,8 +4980,10 @@ async fn execute_ask_stream_task_inner(
     )
     .await?;
 
-    if let Some(debug) = retrieval_debug {
-        send_stream_event(&tx, sse_json_event("retrieval", &debug)).await?;
+    if show_retrieval {
+        if let Some(debug) = retrieval_debug {
+            send_stream_event(&tx, sse_json_event("retrieval", &debug)).await?;
+        }
     }
     if let Some(collection_filter) = &query_scope.collection_filter {
         send_stream_event(&tx, sse_json_event("collection_filter", collection_filter)).await?;
@@ -7157,14 +7290,17 @@ fn run_generation_retrieval_once(
     source_filter: Option<&HashSet<SourceId>>,
     show_retrieval: bool,
 ) -> Result<(Vec<RetrievalResult>, Option<RetrievalDebug>)> {
-    if show_retrieval {
-        let (results, debug) =
-            runtime.block_on(retrieval.search_source_set_with_debug(question, source_filter))?;
-        Ok((results, Some(debug)))
+    let debug_options = if show_retrieval {
+        RetrievalDebugOptions::full(RetrievalCanonicalSelectionBudget::all())
     } else {
-        let results = runtime.block_on(retrieval.search_source_set(question, source_filter))?;
-        Ok((results, None))
-    }
+        RetrievalDebugOptions::compact(RetrievalCanonicalSelectionBudget::all())
+    };
+    let (results, debug) = runtime.block_on(retrieval.search_source_set_with_debug_options(
+        question,
+        source_filter,
+        debug_options,
+    ))?;
+    Ok((results, Some(debug)))
 }
 
 fn prepend_global_results(
@@ -14477,6 +14613,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_ask_profile_query_uses_persisted_state_without_chat_or_verifier_rerun() {
+        let model_server =
+            MockModelServer::start_with_chat(3, "BM25 answer from evidence [E1]").await;
+        let test_dir = TestDir::new("completed-ask-profile-no-rerun");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Ask profile lookup should reuse completed retrieval and generation state.",
+        )
+        .unwrap();
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.embedding.enabled = false;
+        config.chat.enabled = true;
+        config.chat.base_url = model_server.base_url.clone();
+        config.chat.model = "test-chat".into();
+        config.rerank.enabled = false;
+        config.verifier.enabled = false;
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+
+        let state = test_state(config, test_dir.path(), pipeline);
+        let response = ask(
+            State(Arc::clone(&state)),
+            Json(AskRequest {
+                question: "What should ask profile lookup reuse?".into(),
+                source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                show_retrieval: false,
+                context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response.answer.contains("BM25 answer"));
+        assert!(response.retrieval.is_none());
+        assert_eq!(model_server.embedding_requests(), 0);
+        assert_eq!(model_server.chat_requests(), 1);
+        let task_id = latest_task_id(&state, TaskKind::Ask);
+
+        let before_embedding = model_server.embedding_requests();
+        let before_chat = model_server.chat_requests();
+        let before_models = model_server.model_requests();
+        let Json(profile_response) =
+            task_profile_handler(State(Arc::clone(&state)), Path(task_id.0.clone()))
+                .await
+                .unwrap();
+
+        assert_eq!(profile_response.profile.task_id, task_id);
+        assert_eq!(profile_response.profile.task_kind, TaskKind::Ask);
+        assert_eq!(profile_response.profile.status, TaskStatus::Succeeded);
+        let retrieve_profile = profile_response
+            .profile
+            .retrieve
+            .as_ref()
+            .expect("ask profile should include retrieval stages");
+        assert_eq!(
+            retrieve_profile.dense.path,
+            RetrievalDenseVectorPath::Bm25Only
+        );
+        assert!(retrieve_profile.bm25.candidate_count > 0);
+        assert!(retrieve_profile.fusion.candidate_count > 0);
+        let ask_profile = profile_response
+            .profile
+            .ask
+            .as_ref()
+            .expect("ask profile should include generation stages");
+        assert_eq!(
+            ask_profile.generation.status,
+            AskGenerationStatus::Succeeded
+        );
+        assert_eq!(ask_profile.generation.call_count, 1);
+        assert_eq!(ask_profile.generation.error_count, 0);
+        assert!(!ask_profile.verification.enabled);
+        assert_eq!(
+            ask_profile.verification.status,
+            AskVerificationStatus::Disabled
+        );
+        assert_eq!(ask_profile.verification.call_count, 0);
+        assert_eq!(ask_profile.verification.latest_latency_ms, None);
+        assert_eq!(ask_profile.output.citation_count, response.citations.len());
+        assert!(!ask_profile.output.retrieval_included);
+        assert!(profile_response
+            .profile
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.name == "chat" && endpoint.calls == 1));
+
+        let encoded = serde_json::to_string(&profile_response.profile).unwrap();
+        assert!(!encoded.contains("BM25 answer"));
+        assert!(!encoded.contains("SOURCE PACK"));
+        assert!(!encoded.contains("USER QUESTION"));
+        assert!(!encoded.contains("api_key"));
+        assert_eq!(model_server.embedding_requests(), before_embedding);
+        assert_eq!(model_server.chat_requests(), before_chat);
+        assert_eq!(model_server.model_requests(), before_models);
+    }
+
+    #[tokio::test]
+    async fn completed_ask_profile_records_enabled_verifier_calls_without_rerun() {
+        let model_server = MockModelServer::start_with_chat_responses(
+            3,
+            [
+                "Verified answer from evidence [E1]",
+                r#"{"verdict":"pass","unsupported_claims":[]}"#,
+            ],
+        )
+        .await;
+        let test_dir = TestDir::new("completed-ask-profile-verifier");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Verifier profile lookup should separate retrieval, generation, and verifier work.",
+        )
+        .unwrap();
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.embedding.enabled = false;
+        config.chat.enabled = true;
+        config.chat.base_url = model_server.base_url.clone();
+        config.chat.model = "test-chat".into();
+        config.rerank.enabled = false;
+        config.verifier.enabled = true;
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+
+        let state = test_state(config, test_dir.path(), pipeline);
+        let response = ask(
+            State(Arc::clone(&state)),
+            Json(AskRequest {
+                question: "What should verifier profile lookup separate?".into(),
+                source_id: Some(source_id.0.clone()),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                show_retrieval: true,
+                context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response.verified);
+        assert!(response.retrieval.is_some());
+        assert_eq!(model_server.embedding_requests(), 0);
+        assert_eq!(model_server.chat_requests(), 2);
+        let task_id = latest_task_id(&state, TaskKind::Ask);
+
+        let before_embedding = model_server.embedding_requests();
+        let before_chat = model_server.chat_requests();
+        let before_models = model_server.model_requests();
+        let Json(profile_response) =
+            task_profile_handler(State(Arc::clone(&state)), Path(task_id.0.clone()))
+                .await
+                .unwrap();
+
+        let value = serde_json::to_value(&profile_response.profile).unwrap();
+        assert_eq!(value["task_kind"], "ask");
+        assert_eq!(value["retrieve"]["dense"]["path"], "bm25_only");
+        assert_eq!(value["ask"]["generation"]["call_count"], 1);
+        assert_eq!(value["ask"]["generation"]["status"], "succeeded");
+        assert_eq!(value["ask"]["verification"]["enabled"], true);
+        assert_eq!(value["ask"]["verification"]["status"], "passed");
+        assert_eq!(value["ask"]["verification"]["call_count"], 1);
+        assert_eq!(value["ask"]["verification"]["error_count"], 0);
+        assert_eq!(value["ask"]["output"]["retrieval_included"], true);
+        assert!(profile_response
+            .profile
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.name == "chat" && endpoint.calls == 1));
+        assert!(profile_response
+            .profile
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.name == "verifier" && endpoint.calls == 1));
+        assert_eq!(model_server.embedding_requests(), before_embedding);
+        assert_eq!(model_server.chat_requests(), before_chat);
+        assert_eq!(model_server.model_requests(), before_models);
+    }
+
+    #[tokio::test]
     async fn completed_retrieve_profile_query_uses_persisted_state_without_model_calls() {
         let model_server = MockModelServer::start(3).await;
         let test_dir = TestDir::new("completed-retrieve-profile-no-rerun");
@@ -14633,6 +14962,7 @@ mod tests {
                     canonical_selected_count: Some(10),
                 },
             }),
+            ask: None,
         };
         finish_task_success_with_profile(
             &state,
@@ -17201,6 +17531,17 @@ mod tests {
         .unwrap()
     }
 
+    fn latest_task_id(state: &SharedState, kind: TaskKind) -> TaskId {
+        let store = state.task_store.lock().unwrap();
+        store
+            .tasks(kind)
+            .unwrap()
+            .into_iter()
+            .last()
+            .expect("expected at least one task")
+            .id
+    }
+
     struct MockModelServer {
         base_url: String,
         model_requests: Arc<AtomicUsize>,
@@ -17222,7 +17563,32 @@ mod tests {
             Self::start_with_chat_response(dimension, Some(chat_response.into())).await
         }
 
+        async fn start_with_chat_responses(
+            dimension: usize,
+            chat_responses: impl IntoIterator<Item = impl Into<String>>,
+        ) -> Self {
+            Self::start_with_chat_response_queue(
+                dimension,
+                chat_responses
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<VecDeque<_>>(),
+            )
+            .await
+        }
+
         async fn start_with_chat_response(dimension: usize, chat_response: Option<String>) -> Self {
+            Self::start_with_chat_response_queue(
+                dimension,
+                chat_response.into_iter().collect::<VecDeque<_>>(),
+            )
+            .await
+        }
+
+        async fn start_with_chat_response_queue(
+            dimension: usize,
+            chat_responses: VecDeque<String>,
+        ) -> Self {
             let state = MockModelState {
                 dimension,
                 model_requests: Arc::new(AtomicUsize::new(0)),
@@ -17232,7 +17598,8 @@ mod tests {
                 embedding_blocked: Arc::new(AtomicBool::new(false)),
                 embedding_release: Arc::new(tokio::sync::Notify::new()),
                 chat_requests: Arc::new(AtomicUsize::new(0)),
-                chat_response,
+                chat_responses: Arc::new(std::sync::Mutex::new(chat_responses)),
+                last_chat_response: Arc::new(std::sync::Mutex::new(None)),
             };
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -17306,7 +17673,8 @@ mod tests {
         embedding_blocked: Arc<AtomicBool>,
         embedding_release: Arc<tokio::sync::Notify>,
         chat_requests: Arc<AtomicUsize>,
-        chat_response: Option<String>,
+        chat_responses: Arc<std::sync::Mutex<VecDeque<String>>>,
+        last_chat_response: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     async fn mock_models(State(state): State<MockModelState>) -> Json<serde_json::Value> {
@@ -17353,7 +17721,13 @@ mod tests {
         State(state): State<MockModelState>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         state.chat_requests.fetch_add(1, Ordering::SeqCst);
-        if let Some(content) = state.chat_response {
+        let content = {
+            let mut responses = state.chat_responses.lock().unwrap();
+            responses.pop_front()
+        }
+        .or_else(|| state.last_chat_response.lock().unwrap().clone());
+        if let Some(content) = content {
+            *state.last_chat_response.lock().unwrap() = Some(content.clone());
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({

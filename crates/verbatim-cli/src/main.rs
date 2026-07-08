@@ -5620,6 +5620,7 @@ mod tests {
                     canonical_selected_count: None,
                 },
             }),
+            ask: None,
         }
     }
 

@@ -207,6 +207,8 @@ pub struct TaskProfile {
     pub endpoints: Vec<TaskEndpointSummary>,
     #[serde(default)]
     pub retrieve: Option<RetrieveTaskProfile>,
+    #[serde(default)]
+    pub ask: Option<AskTaskProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +267,62 @@ pub struct RetrieveDisplayStageProfile {
     pub canonical_support_embedding_ms: Option<u64>,
     pub canonical_display_selection_ms: Option<u64>,
     pub canonical_selected_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskTaskProfile {
+    pub generation: AskGenerationStageProfile,
+    pub verification: AskVerificationStageProfile,
+    pub output: AskOutputStageProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskGenerationStatus {
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskGenerationStageProfile {
+    pub status: AskGenerationStatus,
+    pub call_count: u64,
+    pub total_latency_ms: u64,
+    pub latest_latency_ms: Option<u64>,
+    pub retry_count: u64,
+    pub error_count: u64,
+    pub latest_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskVerificationStatus {
+    Disabled,
+    Passed,
+    Revised,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskVerificationStageProfile {
+    pub enabled: bool,
+    pub status: AskVerificationStatus,
+    pub call_count: u64,
+    pub total_latency_ms: u64,
+    pub latest_latency_ms: Option<u64>,
+    pub retry_count: u64,
+    pub error_count: u64,
+    pub latest_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskOutputStageProfile {
+    pub response_formatting_ms: u64,
+    pub answer_chars: usize,
+    pub citation_count: usize,
+    pub retrieval_included: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1012,6 +1070,7 @@ mod tests {
                     canonical_selected_count: Some(10),
                 },
             }),
+            ask: None,
         };
 
         let encoded = serde_json::to_string(&profile).unwrap();
@@ -1057,6 +1116,120 @@ mod tests {
 
         assert!(profile.endpoints.is_empty());
         assert!(profile.retrieve.is_none());
+        assert!(profile.ask.is_none());
+    }
+
+    #[test]
+    fn ask_task_profile_json_is_bounded_and_stage_oriented() {
+        let profile = TaskProfile {
+            schema_version: TASK_PROFILE_SCHEMA_VERSION,
+            task_id: TaskId("task-ask".into()),
+            task_kind: TaskKind::Ask,
+            status: TaskStatus::Succeeded,
+            queue_wait_ms: 3,
+            total_wall_ms: 2_050,
+            endpoints: vec![
+                TaskEndpointSummary::single_call("chat", 800),
+                TaskEndpointSummary {
+                    name: "verifier".into(),
+                    calls: 2,
+                    latest_latency_ms: Some(300),
+                    first_token_latency_ms: None,
+                    p50_latency_ms: Some(250),
+                    p95_latency_ms: Some(300),
+                    latest_error: None,
+                },
+            ],
+            retrieve: Some(RetrieveTaskProfile {
+                dense: RetrieveDenseStageProfile {
+                    path: RetrievalDenseVectorPath::Bm25Only,
+                    candidate_count: 0,
+                    local_ms: 0,
+                    query_embedding_ms: 0,
+                    endpoint_latency_ms: None,
+                },
+                bm25: RetrieveStageProfile {
+                    candidate_count: 4,
+                    local_ms: 12,
+                },
+                fusion: RetrieveStageProfile {
+                    candidate_count: 4,
+                    local_ms: 1,
+                },
+                rerank: RetrieveRerankStageProfile {
+                    status: RetrievalRerankStatus::Disabled,
+                    reason: None,
+                    input_count: None,
+                    configured_top_n: 0,
+                    effective_top_n: None,
+                    output_count: 0,
+                    local_ms: 0,
+                    endpoint_latency_ms: None,
+                },
+                evidence: RetrieveEvidenceStageProfile {
+                    result_count: 3,
+                    graph_expanded_count: 0,
+                    final_count: 3,
+                    display_count: 3,
+                    result_hydration_ms: 2,
+                    graph_expansion_ms: 0,
+                    final_pack_ms: 1,
+                    display_pack_ms: 1,
+                },
+                display: RetrieveDisplayStageProfile {
+                    returned_count: 3,
+                    response_formatting_ms: 0,
+                    canonical_support_embedding_ms: None,
+                    canonical_display_selection_ms: None,
+                    canonical_selected_count: None,
+                },
+            }),
+            ask: Some(AskTaskProfile {
+                generation: AskGenerationStageProfile {
+                    status: AskGenerationStatus::Succeeded,
+                    call_count: 1,
+                    total_latency_ms: 800,
+                    latest_latency_ms: Some(800),
+                    retry_count: 0,
+                    error_count: 0,
+                    latest_error: None,
+                },
+                verification: AskVerificationStageProfile {
+                    enabled: true,
+                    status: AskVerificationStatus::Revised,
+                    call_count: 2,
+                    total_latency_ms: 550,
+                    latest_latency_ms: Some(300),
+                    retry_count: 0,
+                    error_count: 0,
+                    latest_error: None,
+                },
+                output: AskOutputStageProfile {
+                    response_formatting_ms: 7,
+                    answer_chars: 42,
+                    citation_count: 1,
+                    retrieval_included: false,
+                },
+            }),
+        };
+
+        let encoded = serde_json::to_string(&profile).unwrap();
+        let value: Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(value["task_kind"], "ask");
+        assert_eq!(value["retrieve"]["bm25"]["candidate_count"], 4);
+        assert_eq!(value["ask"]["generation"]["call_count"], 1);
+        assert_eq!(value["ask"]["generation"]["latest_latency_ms"], 800);
+        assert_eq!(value["ask"]["generation"]["retry_count"], 0);
+        assert_eq!(value["ask"]["verification"]["enabled"], true);
+        assert_eq!(value["ask"]["verification"]["status"], "revised");
+        assert_eq!(value["ask"]["verification"]["call_count"], 2);
+        assert_eq!(value["ask"]["output"]["response_formatting_ms"], 7);
+        assert_eq!(value["ask"]["output"]["citation_count"], 1);
+        assert!(!encoded.contains("SOURCE PACK"));
+        assert!(!encoded.contains("USER QUESTION"));
+        assert!(!encoded.contains("document body"));
+        assert!(!encoded.contains("api_key"));
     }
 
     #[test]

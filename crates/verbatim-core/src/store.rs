@@ -6554,6 +6554,7 @@ mod tests {
             total_wall_ms: 17,
             endpoints: Vec::new(),
             retrieve: None,
+            ask: None,
         };
         store
             .finish_task_success_with_profile(

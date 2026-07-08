@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -8,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ChatConfig, ChatVisionAttachmentConfig, VerifierConfig};
 use crate::provider::openai_compatible::OpenAiCompatibleChatModel;
-use crate::provider::{ChatContentPart, ChatMessage, ChatModel, ChatRequest, ImageUrl};
+use crate::provider::{
+    ChatContentPart, ChatMessage, ChatModel, ChatRequest, ImageUrl, ProviderError,
+};
 use crate::types::{
     CitationRef, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, RetrievalResult,
     SourceLocator,
@@ -24,6 +27,77 @@ pub struct GenerationResult {
     pub answer: String,
     pub citations: Vec<CitationRef>,
     pub verified: bool,
+    pub telemetry: GenerationTelemetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationTelemetry {
+    pub generation: GenerationCallTelemetry,
+    pub verification: GenerationVerificationTelemetry,
+}
+
+impl GenerationTelemetry {
+    pub fn new(verifier_enabled: bool) -> Self {
+        Self {
+            generation: GenerationCallTelemetry::default(),
+            verification: GenerationVerificationTelemetry {
+                enabled: verifier_enabled,
+                status: if verifier_enabled {
+                    GenerationVerificationStatus::Skipped
+                } else {
+                    GenerationVerificationStatus::Disabled
+                },
+                calls: GenerationCallTelemetry::default(),
+            },
+        }
+    }
+}
+
+impl Default for GenerationTelemetry {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GenerationCallTelemetry {
+    pub call_count: u64,
+    pub total_latency_ms: u64,
+    pub latest_latency_ms: Option<u64>,
+    pub retry_count: u64,
+    pub error_count: u64,
+    pub latest_error: Option<String>,
+}
+
+impl GenerationCallTelemetry {
+    fn record_success(&mut self, latency_ms: u64) {
+        self.call_count = self.call_count.saturating_add(1);
+        self.total_latency_ms = self.total_latency_ms.saturating_add(latency_ms);
+        self.latest_latency_ms = Some(latency_ms);
+    }
+
+    fn record_error(&mut self, latency_ms: u64, error: &ProviderError) {
+        self.record_success(latency_ms);
+        self.error_count = self.error_count.saturating_add(1);
+        self.retry_count = self.retry_count.saturating_add(provider_retry_count(error));
+        self.latest_error = Some(provider_error_summary(error));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationVerificationStatus {
+    Disabled,
+    Passed,
+    Revised,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationVerificationTelemetry {
+    pub enabled: bool,
+    pub status: GenerationVerificationStatus,
+    pub calls: GenerationCallTelemetry,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,8 +173,15 @@ impl Generator {
             source_pack.text
         );
 
+        let mut telemetry = GenerationTelemetry::new(self.verifier_enabled);
         let raw_answer = self
-            .chat(system_prompt, &user_prompt, &source_pack.attachments)
+            .chat(
+                system_prompt,
+                &user_prompt,
+                &source_pack.attachments,
+                GenerationChatPurpose::Generation,
+                &mut telemetry,
+            )
             .await?;
 
         let citations = extract_citations(&raw_answer, &source_pack.evidence_refs);
@@ -108,7 +189,13 @@ impl Generator {
             relevant_attachments_for_citations(&citations, &source_pack.attachments);
         if self.verifier_enabled {
             let verification = self
-                .verify_with_attachments(question, &raw_answer, &citations, &citation_attachments)
+                .verify_with_attachments(
+                    question,
+                    &raw_answer,
+                    &citations,
+                    &citation_attachments,
+                    &mut telemetry,
+                )
                 .await?;
             return self
                 .apply_verification(
@@ -117,6 +204,7 @@ impl Generator {
                     citations,
                     &citation_attachments,
                     verification,
+                    telemetry,
                 )
                 .await;
         }
@@ -127,6 +215,7 @@ impl Generator {
             answer,
             citations,
             verified: false,
+            telemetry,
         })
     }
 
@@ -155,12 +244,14 @@ impl Generator {
             "SOURCE PACK:\n{}\n\nUSER QUESTION:\n{question}",
             source_pack.text
         );
+        let mut telemetry = GenerationTelemetry::new(false);
         let raw_answer = self
             .stream_chat(
                 SYSTEM_PROMPT,
                 &user_prompt,
                 &source_pack.attachments,
                 |delta| on_delta(delta),
+                &mut telemetry,
             )
             .await?;
 
@@ -171,6 +262,7 @@ impl Generator {
             answer,
             citations,
             verified: false,
+            telemetry,
         })
     }
 
@@ -180,7 +272,8 @@ impl Generator {
         answer: &str,
         citations: &[CitationRef],
     ) -> Result<VerificationResult> {
-        self.verify_with_attachments(question, answer, citations, &[])
+        let mut telemetry = GenerationTelemetry::new(true);
+        self.verify_with_attachments(question, answer, citations, &[], &mut telemetry)
             .await
     }
 
@@ -190,6 +283,7 @@ impl Generator {
         answer: &str,
         citations: &[CitationRef],
         attachments: &[SourcePackAttachment],
+        telemetry: &mut GenerationTelemetry,
     ) -> Result<VerificationResult> {
         let sources_json = verifier_source_inputs(citations, attachments);
 
@@ -216,6 +310,8 @@ impl Generator {
                 "You are a citation verification system. Output only valid JSON.",
                 &prompt,
                 attachments,
+                GenerationChatPurpose::Verification,
+                telemetry,
             )
             .await?;
 
@@ -237,13 +333,18 @@ impl Generator {
         citations: Vec<CitationRef>,
         attachments: &[SourcePackAttachment],
         verification: VerificationResult,
+        mut telemetry: GenerationTelemetry,
     ) -> Result<GenerationResult> {
         match verification.verdict {
-            VerificationVerdict::Pass => Ok(GenerationResult {
-                answer: render_answer(raw_answer, &citations),
-                citations,
-                verified: true,
-            }),
+            VerificationVerdict::Pass => {
+                telemetry.verification.status = GenerationVerificationStatus::Passed;
+                Ok(GenerationResult {
+                    answer: render_answer(raw_answer, &citations),
+                    citations,
+                    verified: true,
+                    telemetry,
+                })
+            }
             VerificationVerdict::Revise => {
                 let revised = self
                     .revise_answer(
@@ -252,10 +353,12 @@ impl Generator {
                         &citations,
                         attachments,
                         &verification.unsupported_claims,
+                        &mut telemetry,
                     )
                     .await?;
                 if is_insufficient_answer(&revised) {
-                    return Ok(insufficient_generation());
+                    telemetry.verification.status = GenerationVerificationStatus::Failed;
+                    return Ok(insufficient_generation_with_telemetry(telemetry));
                 }
                 let revised_citations = filter_citations_for_answer(&revised, &citations);
                 let revised_attachments =
@@ -266,19 +369,26 @@ impl Generator {
                         &revised,
                         &revised_citations,
                         &revised_attachments,
+                        &mut telemetry,
                     )
                     .await?;
                 if second_pass.verdict == VerificationVerdict::Pass {
+                    telemetry.verification.status = GenerationVerificationStatus::Revised;
                     Ok(GenerationResult {
                         answer: render_answer(&revised, &revised_citations),
                         citations: revised_citations,
                         verified: true,
+                        telemetry,
                     })
                 } else {
-                    Ok(insufficient_generation())
+                    telemetry.verification.status = GenerationVerificationStatus::Failed;
+                    Ok(insufficient_generation_with_telemetry(telemetry))
                 }
             }
-            _ => Ok(insufficient_generation()),
+            _ => {
+                telemetry.verification.status = GenerationVerificationStatus::Failed;
+                Ok(insufficient_generation_with_telemetry(telemetry))
+            }
         }
     }
 
@@ -289,6 +399,7 @@ impl Generator {
         citations: &[CitationRef],
         attachments: &[SourcePackAttachment],
         unsupported_claims: &[String],
+        telemetry: &mut GenerationTelemetry,
     ) -> Result<String> {
         let sources_json = verifier_source_inputs(citations, attachments);
         let prompt = format!(
@@ -309,6 +420,8 @@ impl Generator {
             "You revise answers to remove unsupported claims. Output only the revised answer.",
             &prompt,
             attachments,
+            GenerationChatPurpose::Generation,
+            telemetry,
         )
         .await
     }
@@ -318,6 +431,8 @@ impl Generator {
         system: &str,
         user: &str,
         attachments: &[SourcePackAttachment],
+        purpose: GenerationChatPurpose,
+        telemetry: &mut GenerationTelemetry,
     ) -> Result<String> {
         let user_message = if attachments.is_empty() {
             ChatMessage::user(user)
@@ -329,14 +444,24 @@ impl Generator {
             ))
         };
 
-        let response = self
+        let started = Instant::now();
+        let response = match self
             .chat_model
             .chat(ChatRequest::new(vec![
                 ChatMessage::system(system),
                 user_message,
             ]))
             .await
-            .context("chat completion failed")?;
+        {
+            Ok(response) => {
+                record_chat_success(telemetry, purpose, elapsed_ms(started));
+                response
+            }
+            Err(error) => {
+                record_chat_error(telemetry, purpose, elapsed_ms(started), &error);
+                return Err(error).context("chat completion failed");
+            }
+        };
         Ok(response.content)
     }
 
@@ -346,6 +471,7 @@ impl Generator {
         user: &str,
         attachments: &[SourcePackAttachment],
         mut on_delta: F,
+        telemetry: &mut GenerationTelemetry,
     ) -> Result<String>
     where
         F: FnMut(&str) -> Result<()> + Send,
@@ -360,14 +486,26 @@ impl Generator {
             ))
         };
 
-        let mut stream = self
+        let started = Instant::now();
+        let mut stream = match self
             .chat_model
             .stream_chat(ChatRequest::new(vec![
                 ChatMessage::system(system),
                 user_message,
             ]))
             .await
-            .context("streaming chat completion failed")?;
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                record_chat_error(
+                    telemetry,
+                    GenerationChatPurpose::Generation,
+                    elapsed_ms(started),
+                    &error,
+                );
+                return Err(error).context("streaming chat completion failed");
+            }
+        };
 
         let mut answer = String::new();
         while let Some(event) = stream.next().await {
@@ -378,17 +516,88 @@ impl Generator {
             on_delta(&event.delta)?;
             answer.push_str(&event.delta);
         }
+        record_chat_success(
+            telemetry,
+            GenerationChatPurpose::Generation,
+            elapsed_ms(started),
+        );
 
         Ok(answer)
     }
 }
 
+#[cfg(test)]
 fn insufficient_generation() -> GenerationResult {
+    insufficient_generation_with_telemetry(GenerationTelemetry::default())
+}
+
+fn insufficient_generation_with_telemetry(telemetry: GenerationTelemetry) -> GenerationResult {
     GenerationResult {
         answer: "Evidence insufficient to answer this question.".into(),
         citations: Vec::new(),
         verified: false,
+        telemetry,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GenerationChatPurpose {
+    Generation,
+    Verification,
+}
+
+fn record_chat_success(
+    telemetry: &mut GenerationTelemetry,
+    purpose: GenerationChatPurpose,
+    latency_ms: u64,
+) {
+    match purpose {
+        GenerationChatPurpose::Generation => telemetry.generation.record_success(latency_ms),
+        GenerationChatPurpose::Verification => {
+            telemetry.verification.calls.record_success(latency_ms)
+        }
+    }
+}
+
+fn record_chat_error(
+    telemetry: &mut GenerationTelemetry,
+    purpose: GenerationChatPurpose,
+    latency_ms: u64,
+    error: &ProviderError,
+) {
+    match purpose {
+        GenerationChatPurpose::Generation => telemetry.generation.record_error(latency_ms, error),
+        GenerationChatPurpose::Verification => {
+            telemetry.verification.calls.record_error(latency_ms, error)
+        }
+    }
+}
+
+fn provider_retry_count(error: &ProviderError) -> u64 {
+    error
+        .diagnostic()
+        .and_then(|diagnostic| diagnostic.retry_count)
+        .unwrap_or(0)
+        .into()
+}
+
+fn provider_error_summary(error: &ProviderError) -> String {
+    match error {
+        ProviderError::Configuration { operation, .. }
+        | ProviderError::Transport { operation, .. }
+        | ProviderError::HttpStatus { operation, .. }
+        | ProviderError::ResponseDecode { operation, .. }
+        | ProviderError::QueueTimeout { operation, .. }
+        | ProviderError::QueueFull { operation }
+        | ProviderError::StreamDecode { operation, .. }
+        | ProviderError::MalformedResponse { operation, .. } => {
+            format!("{operation}: {error}")
+        }
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 fn is_insufficient_answer(answer: &str) -> bool {
