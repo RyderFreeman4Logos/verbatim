@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -185,6 +186,7 @@ const IDLE_RECLAIM_ADMISSION_PERMITS: u32 = 1_000_000;
 const IDLE_EXIT_DISABLED_POLL: Duration = Duration::from_secs(60);
 const IDLE_EXIT_MAX_POLL: Duration = Duration::from_secs(60);
 const IDLE_EXIT_MIN_POLL: Duration = Duration::from_secs(1);
+const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct CollectionWatcherRuntime {
@@ -9313,7 +9315,24 @@ fn main() -> Result<()> {
         .build()
         .context("failed to create tokio runtime")?;
 
-    runtime.block_on(run_daemon_with_config(config))
+    block_on_daemon_with_shutdown_timeout(
+        runtime,
+        run_daemon_with_config(config),
+        DAEMON_RUNTIME_SHUTDOWN_TIMEOUT,
+    )
+}
+
+fn block_on_daemon_with_shutdown_timeout<F, T>(
+    runtime: tokio::runtime::Runtime,
+    future: F,
+    shutdown_timeout: Duration,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    let result = runtime.block_on(future);
+    runtime.shutdown_timeout(shutdown_timeout);
+    result
 }
 
 fn write_version_if_requested<I, W>(args: I, stdout: &mut W) -> Result<bool>
@@ -9751,6 +9770,49 @@ mod tests {
 
         assert!(!handled);
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn runtime_shutdown_timeout_returns_while_blocking_task_is_still_running() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_for_task = Arc::clone(&finished);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let start = Instant::now();
+        let result = block_on_daemon_with_shutdown_timeout(
+            runtime,
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    finished_for_task.store(true, Ordering::Release);
+                });
+                started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                Ok::<_, anyhow::Error>(())
+            },
+            Duration::from_millis(25),
+        );
+
+        assert!(result.is_ok());
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "runtime shutdown waited for a blocking task instead of honoring shutdown_timeout"
+        );
+        assert!(!finished.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        for _ in 0..50 {
+            if finished.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("blocking task did not finish after test released it");
     }
 
     #[test]
