@@ -1358,6 +1358,8 @@ const TASK_AFTER_HELP: &str = r#"Examples:
   verbatim task resume <task-id>
 
 Task ids are returned by --background ingest/reindex/ask commands.
+Use task profile to read stored completed-task diagnostics by id without
+rerunning the original task work.
 "#;
 
 const TASK_LIST_AFTER_HELP: &str = r#"Examples:
@@ -1382,10 +1384,16 @@ const TASK_PROFILE_AFTER_HELP: &str = r#"Examples:
   verbatim task profile <task-id>
   verbatim task profile <task-id> --format json
 
-Profile reads persisted completed-task diagnostics by task id. The default
-output is compact human-readable text; use --format json for machine-readable
-output. It does not rerun retrieval, embedding, rerank, BM25, dense search,
-chat, verifier, or evidence expansion work.
+Profile reads a persisted task profile by task id. It is a side-effect-free
+diagnostic query for completed tasks with stored profiles; legacy/no-profile
+tasks and incomplete tasks return unavailable errors.
+
+It does not rerun the original task or redo retrieval, embedding, BM25/dense
+search, rerank, chat/generation, citation verifier, or evidence expansion
+work.
+
+The default output is compact human-readable text; use --format json for
+machine-readable tooling output.
 "#;
 
 const TASK_EVENTS_AFTER_HELP: &str = r#"Examples:
@@ -2050,9 +2058,9 @@ enum TaskCommand {
         #[arg(value_name = "TASK_ID")]
         task_id: String,
     },
-    /// Show a persisted completed-task performance profile.
+    /// Read a persisted task profile without rerunning task work.
     #[command(
-        about = "Show persisted completed-task performance diagnostics.",
+        about = "Read persisted task profile diagnostics without rerunning work.",
         after_help = TASK_PROFILE_AFTER_HELP
     )]
     Profile {
@@ -2397,9 +2405,15 @@ mod tests {
         assert!(daemon_help.contains("Start the daemon before source"));
 
         let (code, task_help, stderr, _, _) = run_mock(["task", "--help"]);
+        let normalized_task_help = task_help.replace('\n', " ");
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
         assert!(task_help.contains("Task ids are returned by --background"));
+        assert!(task_help.contains("read stored completed-task diagnostics by id"));
+        assert!(
+            task_help.contains("Read persisted task profile diagnostics without rerunning work")
+        );
+        assert!(normalized_task_help.contains("without rerunning the original task work"));
         assert!(task_help.contains("verbatim task wait --timeout 25m"));
         assert!(task_help.contains("verbatim task profile"));
         assert!(task_help.contains("verbatim task resume"));
@@ -2408,16 +2422,29 @@ mod tests {
     #[test]
     fn task_profile_help_documents_json_and_no_rerun_contract() {
         let (code, help, stderr, _, _) = run_mock(["task", "profile", "--help"]);
+        let normalized_help = help.replace('\n', " ");
 
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
         assert!(help.contains("verbatim task profile <task-id> --format json"));
         assert!(help.contains("--format"));
-        assert!(help.contains("completed-task diagnostics"));
+        assert!(help.contains("reads a persisted task profile by task id"));
+        assert!(help.contains("side-effect-free"));
+        assert!(help.contains("completed tasks with stored profiles"));
+        assert!(help.contains("legacy/no-profile"));
+        assert!(help.contains("incomplete tasks return unavailable errors"));
+        assert!(help.contains("does not rerun the original task"));
         assert!(help.contains("does not rerun"));
         assert!(help.contains("retrieval"));
         assert!(help.contains("embedding"));
-        assert!(help.contains("chat"));
+        assert!(normalized_help.contains("BM25/dense search"));
+        assert!(help.contains("rerank"));
+        assert!(help.contains("chat/generation"));
+        assert!(help.contains("citation verifier"));
+        assert!(help.contains("evidence expansion"));
+        assert!(help.contains("compact human-readable text"));
+        assert!(help.contains("--format json"));
+        assert!(normalized_help.contains("machine-readable tooling output"));
     }
 
     #[test]

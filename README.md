@@ -198,6 +198,7 @@ Queue long-running work as daemon tasks:
 verbatim ingest --background <source-id>
 verbatim task wait --timeout 25m <task-id>
 verbatim task show <task-id>
+verbatim task profile <task-id> --format json
 verbatim task events <task-id>
 verbatim task cancel <task-id>
 ```
@@ -205,6 +206,12 @@ verbatim task cancel <task-id>
 `task wait` uses the CLI/config/default wait timeout. That timeout is separate
 from model `timeout_seconds` settings used by embedding, rerank, chat, vision,
 or OCR providers.
+
+`task profile` reads persisted diagnostics for completed tasks with stored
+profiles. It does not rerun retrieval, embedding, BM25/dense search, rerank,
+chat/generation, citation verification, or evidence expansion; legacy/no-profile
+and incomplete tasks report unavailable errors. The default output is
+human-readable, and `--format json` is for tooling.
 
 ## Local PDF Example
 
@@ -316,7 +323,7 @@ verbatim reindex {--source-id <id>|--all|--stale|--force|--vectors-only}
 verbatim retrieve [options] "question"
 verbatim ask [options] "question"
 verbatim evidence <eid>
-verbatim task {show|events|wait|watch|cancel}
+verbatim task {show|profile|events|wait|watch|cancel}
 verbatim index {status|gc|delete-profile|vector-json-cleanup}
 verbatim config {init|show|validate}
 verbatim daemon {start|status|install}
