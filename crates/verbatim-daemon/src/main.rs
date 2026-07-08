@@ -4221,13 +4221,12 @@ async fn ask(
 async fn ask_stream(
     State(state): State<SharedState>,
     Json(req): Json<AskRequest>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
+    retrieval_readiness_gate(&state)?;
     let (tx, rx) = mpsc::channel::<Event>(ASK_STREAM_EVENT_BUFFER);
     let sse_guard = state.idle_reclaim.start_sse().await;
     let idle_exit_sse_guard = state.idle_exit.start_sse();
-    if let Err((status, Json(error))) = retrieval_readiness_gate(&state) {
-        let _ = tx.try_send(sse_error_event(status, error.error));
-    } else if let Err((status, Json(error))) = validate_ask_retrieve_controls(&req) {
+    if let Err((status, Json(error))) = validate_ask_retrieve_controls(&req) {
         let _ = tx.try_send(sse_error_event(status, error.error));
     } else {
         match create_persisted_task(
@@ -4258,7 +4257,7 @@ async fn ask_stream(
         }
     }
 
-    Sse::new(stream::unfold(
+    Ok(Sse::new(stream::unfold(
         (rx, sse_guard, idle_exit_sse_guard),
         |(mut rx, sse_guard, idle_exit_sse_guard): (
             mpsc::Receiver<Event>,
@@ -4269,7 +4268,7 @@ async fn ask_stream(
                 .await
                 .map(|event| (Ok(event), (rx, sse_guard, idle_exit_sse_guard)))
         },
-    ))
+    )))
 }
 
 async fn submit_ask_task(
@@ -10711,6 +10710,63 @@ mod tests {
         );
         assert!(error.error.contains("verbatim daemon is starting"));
         assert!(error.error.contains("retrieval is not ready"));
+    }
+
+    #[tokio::test]
+    async fn ask_stream_starting_returns_json_service_unavailable() {
+        let test_dir = TestDir::new("ask-stream-starting");
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let state = test_state(config, test_dir.path(), pipeline);
+        set_readiness(
+            &state,
+            ReadinessHealth::starting(
+                "orphan_recovery",
+                Some("recovering previous running ingest tasks".into()),
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let app = Router::new()
+            .route("/api/ask/stream", post(ask_stream))
+            .with_state(Arc::clone(&state));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    while !*shutdown_rx.borrow() {
+                        if shutdown_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await;
+        });
+
+        let (status_line, headers, body) = http_post_ask_stream_for_test(addr).await;
+        assert!(
+            status_line.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "unexpected response status: {status_line}"
+        );
+        let lower_headers = headers.to_ascii_lowercase();
+        assert!(lower_headers.contains("content-type: application/json"));
+        assert!(!lower_headers.contains("text/event-stream"));
+
+        let error: ErrorResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(error.code.as_deref(), Some("retrieval_not_ready"));
+        assert_eq!(error.readiness.as_deref(), Some("starting"));
+        assert_eq!(error.retrieval_ready, Some(false));
+        assert_eq!(error.startup_phase.as_deref(), Some("orphan_recovery"));
+        assert_eq!(
+            error.degraded_reason.as_deref(),
+            Some("recovering previous running ingest tasks")
+        );
+        assert!(error.error.contains("verbatim daemon is starting"));
+        assert!(error.error.contains("retrieval is not ready"));
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -18628,6 +18684,35 @@ mod tests {
             .map(|(_, body)| body)
             .expect("HTTP response includes a body separator");
         serde_json::from_str(body).unwrap()
+    }
+
+    async fn http_post_ask_stream_for_test(addr: std::net::SocketAddr) -> (String, String, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = r#"{"question":"question","context_only":true}"#;
+        let request = format!(
+            "POST /api/ask/stream HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n\
+             {}",
+            body.len(),
+            body
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response includes a body separator");
+        let (status_line, headers) = head
+            .split_once("\r\n")
+            .expect("HTTP response includes a status line");
+
+        (status_line.into(), headers.into(), body.into())
     }
 
     struct MockModelServer {
