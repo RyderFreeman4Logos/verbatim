@@ -98,7 +98,7 @@ use verbatim_core::task::{
 use verbatim_core::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 use verbatim_core::types::{
     CanonicalLocator, CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId,
-    EvidenceKind, ImageArtifact, ReferenceComponent, RetrievalDebug,
+    EvidenceKind, EvidenceUnit, ImageArtifact, ReferenceComponent, RetrievalDebug,
     RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
     RetrievalEvidenceRole, RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalResult, SourceId,
     SourceLocator, SourceStatus,
@@ -4641,7 +4641,7 @@ async fn execute_retrieve_task_inner(
         retrieval_progress.set_endpoint(endpoint);
     }
     let retrieval_response_total = if controls.passage {
-        debug.final_evidence_count
+        retrieve_passage_group_count(&results)
     } else {
         debug.display_evidence_count
     };
@@ -5331,17 +5331,27 @@ struct RetrievedContext {
 }
 
 fn retrieve_debug_display_scope(controls: &EffectiveRetrieveControls) -> RetrievalDisplayScope {
-    if controls.passage {
-        RetrievalDisplayScope::All
-    } else {
-        RetrievalDisplayScope::page(controls.limit, controls.page_size, controls.page)
-    }
+    RetrievalDisplayScope::page(controls.limit, controls.page_size, controls.page)
+}
+
+fn empty_retrieval_display_scope() -> RetrievalDisplayScope {
+    RetrievalDisplayScope::Window { start: 0, len: 0 }
 }
 
 fn retrieve_debug_options(controls: &EffectiveRetrieveControls) -> RetrievalDebugOptions {
+    if controls.passage {
+        let empty_scope = empty_retrieval_display_scope();
+        let canonical_budget = RetrievalCanonicalSelectionBudget::new(empty_scope, empty_scope);
+        return if controls.include_debug && controls.include_debug_packs {
+            RetrievalDebugOptions::full(canonical_budget)
+        } else {
+            RetrievalDebugOptions::compact(canonical_budget)
+        };
+    }
+
     let canonical_budget =
         RetrievalCanonicalSelectionBudget::scoped(retrieve_debug_display_scope(controls));
-    if controls.passage || (controls.include_debug && controls.include_debug_packs) {
+    if controls.include_debug && controls.include_debug_packs {
         RetrievalDebugOptions::full(canonical_budget)
     } else {
         RetrievalDebugOptions::compact(canonical_budget)
@@ -7720,7 +7730,7 @@ fn retrieve_passage_result_page(
 ) -> (usize, Vec<RetrieveResultResponse>) {
     let RetrieveResultPageInput {
         results,
-        debug,
+        debug: _,
         source_paths,
         collection_provenance,
         limit,
@@ -7728,7 +7738,7 @@ fn retrieve_passage_result_page(
         page,
         include_locator,
     } = input;
-    let groups = retrieve_passage_groups(debug);
+    let groups = retrieve_passage_groups(results);
     let total_results = groups.len();
     let end = total_results.min(limit);
     let start = page_start(page, page_size);
@@ -7746,7 +7756,6 @@ fn retrieve_passage_result_page(
             passage_group_response(PassageGroupResponseInput {
                 group_index: page_index,
                 group,
-                results,
                 source_paths,
                 collection_provenance,
                 include_locator,
@@ -7776,25 +7785,34 @@ fn retrieve_display_evidence_count(
 }
 
 struct PassageGroup<'a> {
-    entries: Vec<(usize, &'a RetrievalEvidencePackEntry)>,
+    result: &'a RetrievalResult,
+    first_evidence_ordinal: usize,
 }
 
-fn retrieve_passage_groups(debug: &RetrievalDebug) -> Vec<PassageGroup<'_>> {
-    let mut groups: Vec<PassageGroup<'_>> = Vec::new();
-    let mut by_chunk: HashMap<String, usize> = HashMap::new();
+fn retrieve_passage_group_count(results: &[RetrievalResult]) -> usize {
+    let mut seen_chunks = HashSet::new();
+    results
+        .iter()
+        .filter(|result| {
+            !result.evidence_units.is_empty() && seen_chunks.insert(result.chunk_id.0.clone())
+        })
+        .count()
+}
 
-    for (entry_index, entry) in debug.final_evidence_pack.iter().enumerate() {
-        let group_index = if let Some(group_index) = by_chunk.get(&entry.chunk_id.0) {
-            *group_index
-        } else {
-            let group_index = groups.len();
-            by_chunk.insert(entry.chunk_id.0.clone(), group_index);
-            groups.push(PassageGroup {
-                entries: Vec::new(),
-            });
-            group_index
-        };
-        groups[group_index].entries.push((entry_index, entry));
+fn retrieve_passage_groups(results: &[RetrievalResult]) -> Vec<PassageGroup<'_>> {
+    let mut groups: Vec<PassageGroup<'_>> = Vec::new();
+    let mut seen_chunks = HashSet::new();
+    let mut evidence_ordinal = 1usize;
+
+    for result in results {
+        if result.evidence_units.is_empty() || !seen_chunks.insert(result.chunk_id.0.clone()) {
+            continue;
+        }
+        groups.push(PassageGroup {
+            result,
+            first_evidence_ordinal: evidence_ordinal,
+        });
+        evidence_ordinal = evidence_ordinal.saturating_add(result.evidence_units.len());
     }
 
     groups
@@ -7803,7 +7821,6 @@ fn retrieve_passage_groups(debug: &RetrievalDebug) -> Vec<PassageGroup<'_>> {
 struct PassageGroupResponseInput<'a> {
     group_index: usize,
     group: &'a PassageGroup<'a>,
-    results: &'a [RetrievalResult],
     source_paths: &'a HashMap<String, String>,
     collection_provenance: &'a HashMap<String, Vec<CollectionResultProvenance>>,
     include_locator: bool,
@@ -7813,17 +7830,18 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> RetrieveResul
     let PassageGroupResponseInput {
         group_index,
         group,
-        results,
         source_paths,
         collection_provenance,
         include_locator,
     } = input;
-    let (_, first) = group
-        .entries
+    let first = group
+        .result
+        .evidence_units
         .first()
         .expect("passage groups are never empty");
-    let (_, last) = group
-        .entries
+    let last = group
+        .result
+        .evidence_units
         .last()
         .expect("passage groups are never empty");
     let (locator, structured_locator) = passage_locator(first, last, include_locator);
@@ -7831,32 +7849,32 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> RetrieveResul
     RetrieveResultResponse {
         index: group_index,
         rank: group_index + 1,
-        label: first.label.clone(),
-        evidence_id: first.evidence_id.0.clone(),
+        label: format!("E{}", group.first_evidence_ordinal),
+        evidence_id: first.id.0.clone(),
         source_id: first.source_id.0.clone(),
         source_path: source_paths.get(&first.source_id.0).cloned(),
         collections: collection_provenance
             .get(&first.source_id.0)
             .cloned()
             .unwrap_or_default(),
-        chunk_id: first.chunk_id.0.clone(),
+        chunk_id: group.result.chunk_id.0.clone(),
         kind: evidence_kind_name(first.kind).to_string(),
-        role: retrieval_role_name(first.role).to_string(),
-        score: first.score,
+        role: retrieval_role_name(retrieval_evidence_role(first)).to_string(),
+        score: group.result.score,
         locator,
         structured_locator,
-        provenance: include_locator.then(|| first.provenance.clone()),
+        provenance: include_locator.then(|| group.result.provenance.clone()),
         derived_from: first.derived_from.as_ref().map(|id| id.0.clone()),
-        snippet: passage_snippet(results, group),
+        snippet: passage_snippet(group),
     }
 }
 
 fn passage_locator(
-    first: &RetrievalEvidencePackEntry,
-    last: &RetrievalEvidencePackEntry,
+    first: &EvidenceUnit,
+    last: &EvidenceUnit,
     include_locator: bool,
 ) -> (String, Option<SourceLocator>) {
-    let range = match (&first.locator.structured, &last.locator.structured) {
+    let range = match (&first.locator, &last.locator) {
         (
             SourceLocator::Canonical { locator: first },
             SourceLocator::Canonical { locator: last },
@@ -7870,8 +7888,8 @@ fn passage_locator(
         (display, structured)
     } else {
         (
-            first.locator.display.clone(),
-            include_locator.then(|| first.locator.structured.clone()),
+            first.locator.to_string(),
+            include_locator.then(|| first.locator.clone()),
         )
     }
 }
@@ -7960,11 +7978,12 @@ fn reference_component_value<'a>(
         .map(|component| component.value.as_str())
 }
 
-fn passage_snippet(results: &[RetrievalResult], group: &PassageGroup<'_>) -> String {
+fn passage_snippet(group: &PassageGroup<'_>) -> String {
     group
-        .entries
+        .result
+        .evidence_units
         .iter()
-        .filter_map(|(_, entry)| evidence_text(results, &entry.evidence_id.0))
+        .map(|evidence| evidence.text.as_str())
         .map(normalize_inline_text)
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
@@ -8168,6 +8187,18 @@ fn retrieval_role_name(role: RetrievalEvidenceRole) -> &'static str {
         RetrievalEvidenceRole::ImageArtifact => "image_artifact",
         RetrievalEvidenceRole::ImageCaptionGenerated => "image_caption_generated",
         RetrievalEvidenceRole::Generated => "generated",
+    }
+}
+
+fn retrieval_evidence_role(evidence: &EvidenceUnit) -> RetrievalEvidenceRole {
+    match evidence.kind {
+        EvidenceKind::Text => RetrievalEvidenceRole::OriginalText,
+        EvidenceKind::Ocr => RetrievalEvidenceRole::OcrText,
+        EvidenceKind::Image => RetrievalEvidenceRole::ImageArtifact,
+        EvidenceKind::Generated if evidence.derived_from.is_some() => {
+            RetrievalEvidenceRole::ImageCaptionGenerated
+        }
+        EvidenceKind::Generated => RetrievalEvidenceRole::Generated,
     }
 }
 
@@ -12456,6 +12487,98 @@ mod tests {
             passage.structured_locator,
             Some(SourceLocator::Canonical { .. })
         ));
+    }
+
+    #[test]
+    fn retrieve_response_passage_mode_uses_ranked_chunk_membership_without_debug_pack() {
+        let results = vec![
+            test_canonical_retrieval_result(
+                1,
+                "chunk-2tim4",
+                &[("ev-1", 1), ("ev-2", 2), ("ev-3", 3)],
+            ),
+            test_canonical_retrieval_result(
+                2,
+                "chunk-ps23",
+                &[("ev-ps23-1", 1), ("ev-ps23-2", 2), ("ev-ps23-3", 3)],
+            ),
+        ];
+        let mut debug = empty_retrieval_debug();
+        debug.evidence_pack_mode = RetrievalDebugEvidencePackMode::Compact;
+        debug.final_evidence_pack.clear();
+        debug.display_evidence_pack.clear();
+
+        let response = retrieve_response(RetrieveResponseInput {
+            task_id: TaskId("task-1".into()),
+            query: "crown of righteousness".into(),
+            source_filter: Some(SourceId("src".into())),
+            collection_filter: None,
+            collection_provenance: HashMap::new(),
+            embedding_profile_id: EmbeddingProfileId::default_profile(),
+            controls: EffectiveRetrieveControls {
+                limit: 1,
+                page_size: 1,
+                page: 1,
+                include_debug: false,
+                include_debug_packs: false,
+                include_locator: true,
+                passage: true,
+                bypass_cache: false,
+                fast: false,
+                config: Config::default(),
+                retrieval_config: RetrievalConfig::default(),
+                rerank_config: RerankConfig::default(),
+            },
+            results,
+            debug,
+            source_paths: HashMap::new(),
+            retrieval_ms: 7,
+        });
+
+        assert_eq!(response.total_results, 2);
+        assert_eq!(response.returned_results, 1);
+        let passage = &response.results[0];
+        assert_eq!(passage.evidence_id, "ev-1");
+        assert_eq!(passage.chunk_id, "chunk-2tim4");
+        assert_eq!(passage.locator, "2 Timothy 4:1-3");
+        assert_eq!(passage.snippet, "verse 1 text. verse 2 text. verse 3 text.");
+        assert!(matches!(
+            passage.structured_locator,
+            Some(SourceLocator::Canonical { .. })
+        ));
+    }
+
+    #[test]
+    fn retrieve_debug_options_passage_default_skips_full_pack_and_support_selection() {
+        let controls = EffectiveRetrieveControls {
+            limit: 1,
+            page_size: 10,
+            page: 1,
+            include_debug: false,
+            include_debug_packs: false,
+            include_locator: false,
+            passage: true,
+            bypass_cache: false,
+            fast: false,
+            config: Config::default(),
+            retrieval_config: RetrievalConfig::default(),
+            rerank_config: RerankConfig::default(),
+        };
+
+        let options = retrieve_debug_options(&controls);
+
+        assert_eq!(
+            options.evidence_pack_mode,
+            RetrievalDebugEvidencePackMode::Compact
+        );
+        assert_eq!(
+            options.canonical_budget.support,
+            RetrievalDisplayScope::Window { start: 0, len: 0 }
+        );
+        assert_eq!(
+            options.canonical_budget.display,
+            RetrievalDisplayScope::Window { start: 0, len: 0 }
+        );
     }
 
     #[tokio::test]

@@ -1015,8 +1015,8 @@ pub struct RetrievalDebug {
     ///
     /// For canonical multi-locator chunks this may contain a chunk-internal
     /// support unit instead of the chunk's first unit. The score remains the
-    /// ranked chunk score; passage rendering continues to use
-    /// `final_evidence_pack`.
+    /// ranked chunk score; passage rendering uses ranked chunk membership and
+    /// structured locators directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub display_evidence_pack: Vec<RetrievalEvidencePackEntry>,
 }
