@@ -15,5 +15,6 @@ pre-push:
       run: scripts/hooks/branch-protection.sh
     review-check:
       run: scripts/hooks/review-check.sh
-    full-check:
-      run: just pre-commit
+    version-bump:
+      run: scripts/hooks/check-pre-push-version-bumps.sh
+      use_stdin: true
