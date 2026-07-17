@@ -56,7 +56,7 @@ cd verbatim
 just build
 ```
 
-Run the fast deterministic release gate:
+After bumping the workspace version above `origin/main` on your branch, run the fast deterministic release gate:
 
 ```sh
 just pre-commit-fast

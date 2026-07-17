@@ -15,43 +15,30 @@ default: pre-commit
 # Core Workflow
 # ==============================================================================
 
-# Fast pre-commit: formatting, linting, static analysis only (no tests).
-pre-commit-fast:
+# Fast pre-commit: version validation and focused version tests plus formatting and linting.
+pre-commit-fast scope="staged":
+    just check-version-bumped {{quote(scope)}}
+    just version-check-test
     just fmt
     just clippy
     just deny
 
-# Full pre-commit: formatting, linting, and tests.
-pre-commit:
-    just pre-commit-fast
+# Full pre-commit: version validation in the selected snapshot plus formatting, linting, and tests.
+pre-commit scope="staged":
+    just pre-commit-fast {{quote(scope)}}
     just test
 
 # ==============================================================================
 # Versioning
 # ==============================================================================
 
-# Exit 0 when the workspace version differs from the default branch.
-check-version-bumped:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    default_branch="${DEFAULT_BRANCH:-main}"
-    base_ref="${default_branch}"
-    if ! git rev-parse --verify "${base_ref}:Cargo.toml" >/dev/null 2>&1; then
-        base_ref="origin/${default_branch}"
-    fi
-    current_version="$(python3 - <<'PY'
-    import tomllib
-    from pathlib import Path
+# Exit 0 when a workspace-version snapshot has strictly greater SemVer precedence than the base.
+check-version-bumped scope="staged":
+    scripts/hooks/check-version-bumped.sh --scope {{quote(scope)}}
 
-    print(tomllib.loads(Path("Cargo.toml").read_text())["workspace"]["package"]["version"])
-    PY
-    )"
-    base_version="$(git show "${base_ref}:Cargo.toml" | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])')"
-    if [[ "${current_version}" == "${base_version}" ]]; then
-        echo "Workspace version unchanged from ${base_ref}: ${current_version}" >&2
-        exit 1
-    fi
-    echo "Workspace version bumped: ${base_version} -> ${current_version}"
+# Test staged and HEAD workspace-version snapshot semantics.
+version-check-test:
+    bash scripts/tests/version-check-tests.sh
 
 # Bump the workspace patch version and refresh Cargo.lock.
 bump-patch:
