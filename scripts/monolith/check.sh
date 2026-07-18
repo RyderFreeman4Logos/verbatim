@@ -96,7 +96,11 @@ esac
 base_commit="$(git rev-parse --verify --quiet "${base_ref}^{commit}")" \
     || die "cannot resolve trusted base ref: $base_ref"
 candidate_commit=""
-if [ "$scope" = "head" ]; then
+candidate_tree=""
+if [ "$scope" = "staged" ]; then
+    candidate_tree="$(git write-tree 2>/dev/null)" \
+        || die "cannot capture staged index tree"
+elif [ "$scope" = "head" ]; then
     candidate_commit="$(git rev-parse --verify --quiet 'HEAD^{commit}')" \
         || die "cannot resolve HEAD as a commit"
 elif [ "$scope" = "object" ]; then
@@ -113,6 +117,10 @@ elif [ "$scope" = "object" ]; then
     [ "${#object_id}" -eq "$object_id_length" ] || die "invalid object ID length"
     candidate_commit="$(git rev-parse --verify --quiet "${object_id}^{commit}")" \
         || die "cannot resolve object ID as a commit"
+fi
+if [ -z "$candidate_tree" ]; then
+    candidate_tree="$(git rev-parse --verify --quiet "${candidate_commit}^{tree}")" \
+        || die "cannot resolve candidate tree"
 fi
 tmp_root="$(mktemp -d)"
 cleanup() {
@@ -154,63 +162,64 @@ fi
 if [ "$tokenizer_version_output" != "tokuin $tokenizer_version" ]; then
     die "tokenizer version mismatch: required tokuin $tokenizer_version, got $tokenizer_version_output"
 fi
-snapshot_mode() {
+snapshot_entry() {
     local snapshot="$1"
     local path="$2"
-    local output_name="$3"
-    local entries_file entry entry_mode="" count=0
-    entries_file="$(mktemp "$tmp_root/modes.XXXXXX")" \
-        || die "cannot create mode list for $path"
+    local mode_name="$3"
+    local object_name="$4"
+    local entries_file entry="" matched_entry="" metadata entry_path
+    local entry_mode entry_type entry_id trailing treeish count=0
+    entries_file="$(mktemp "$tmp_root/entries.XXXXXX")" \
+        || die "cannot create snapshot entry list for $path"
     case "$snapshot" in
-        candidate)
-            case "$scope" in
-                staged) git ls-files --stage -z -- "$path" >"$entries_file" ;;
-                head|object) git ls-tree -z "$candidate_commit" -- "$path" >"$entries_file" ;;
-            esac
-            ;;
-        base) git ls-tree -z "$base_commit" -- "$path" >"$entries_file" ;;
+        candidate) treeish="$candidate_tree" ;;
+        base) treeish="$base_commit" ;;
         *) die "internal error: unknown snapshot $snapshot" ;;
     esac
+    git ls-tree -z "$treeish" -- ":(top,literal)$path" >"$entries_file"
     while IFS= read -r -d '' entry; do
         count=$((count + 1))
-        entry_mode="${entry%% *}"
+        matched_entry="$entry"
     done <"$entries_file"
     [ "$count" -gt 0 ] || return 1
-    [ "$count" -eq 1 ] || die "snapshot has multiple index entries for $path"
-    case "$entry_mode" in
-        100644|100755|120000|160000) ;;
-        *) die "unsupported Git mode for $path: $entry_mode" ;;
+    [ "$count" -eq 1 ] || die "snapshot has multiple entries for $path"
+    entry="$matched_entry"
+    case "$entry" in
+        *$'\t'*) ;;
+        *) die "malformed Git tree entry for $path" ;;
     esac
-    printf -v "$output_name" '%s' "$entry_mode"
+    metadata="${entry%%$'\t'*}"
+    entry_path="${entry#*$'\t'}"
+    [ "$entry_path" = "$path" ] \
+        || die "Git tree entry path mismatch for $path"
+    read -r entry_mode entry_type entry_id trailing <<<"$metadata"
+    [ -n "$entry_mode" ] && [ -n "$entry_type" ] \
+        && [ -n "$entry_id" ] && [ -z "$trailing" ] \
+        || die "malformed Git tree metadata for $path"
+    case "$entry_id" in
+        *[!0-9A-Fa-f]*|'') die "invalid Git object ID for $path" ;;
+    esac
+    case "$entry_mode:$entry_type" in
+        100644:blob|100755:blob|120000:blob|160000:commit) ;;
+        *) die "unsupported Git mode/type for $path: $entry_mode/$entry_type" ;;
+    esac
+    printf -v "$mode_name" '%s' "$entry_mode"
+    printf -v "$object_name" '%s' "$entry_id"
 }
 materialize_snapshot() {
     local snapshot="$1"
     local path="$2"
     local output_name="$3"
-    local object_spec object_type snapshot_file mode
-    snapshot_mode "$snapshot" "$path" mode || return 1
+    local snapshot_file mode blob_id
+    snapshot_entry "$snapshot" "$path" mode blob_id || return 1
     case "$mode" in
         100644|100755) ;;
         *) return 1 ;;
     esac
-    case "$snapshot" in
-        candidate)
-            case "$scope" in
-                staged) object_spec=":$path" ;;
-                head|object) object_spec="${candidate_commit}:$path" ;;
-            esac
-            ;;
-        base) object_spec="${base_commit}:$path" ;;
-        *) die "internal error: unknown snapshot $snapshot" ;;
-    esac
-    if ! object_type="$(git cat-file -t "$object_spec" 2>/dev/null)"; then
-        return 1
-    fi
-    [ "$object_type" = "blob" ] || return 1
     snapshot_file="$(mktemp "$tmp_root/blob.XXXXXX")" \
         || die "cannot create snapshot file for $path"
-    if ! git cat-file blob "$object_spec" >"$snapshot_file"; then
-        die "cannot materialize $snapshot snapshot blob for $path ($object_spec)"
+    if ! git cat-file blob "$blob_id" >"$snapshot_file"; then
+        die "cannot materialize $snapshot snapshot blob for $path ($blob_id)"
     fi
     printf -v "$output_name" '%s' "$snapshot_file"
 }
@@ -516,14 +525,9 @@ is_trusted_over_limit() {
             || [ "${trusted_tokens[$path]}" -gt "$token_threshold" ]; }
 }
 candidate_paths_file="$tmp_root/candidate-paths.zlist"
-case "$scope" in
-    staged)
-        git diff --cached --name-only -z --diff-filter=ACMRT "$base_commit" >"$candidate_paths_file"
-        ;;
-    head|object)
-        git diff --name-only -z --diff-filter=ACMRT "$base_commit" "$candidate_commit" >"$candidate_paths_file"
-        ;;
-esac
+git diff --name-only -z --diff-filter=ACMRT \
+    "$base_commit" "$candidate_tree" -- >"$candidate_paths_file" \
+    || die "cannot enumerate candidate snapshot paths"
 declare -A paths_to_check=()
 while IFS= read -r -d '' path; do
     if is_generated_artifact "$path"; then
@@ -632,6 +636,12 @@ for path in "${!paths_to_check[@]}"; do
         failures+=("BLOCK new monolith: $path (${actual_kind[$path]}) exceeds ${line_threshold} lines/${token_threshold} tokens at ${actual_tokens[$path]} tokens/${actual_lines[$path]} lines")
     fi
 done
+if [ "$scope" = "staged" ]; then
+    final_index_tree="$(git write-tree 2>/dev/null)" \
+        || die "cannot capture final staged index tree"
+    [ "$final_index_tree" = "$candidate_tree" ] \
+        || die "Git index changed while monolith gate was running"
+fi
 printf '=== Monolith No-Growth Gate ===\n'
 printf 'Scope: %s\n' "$scope"
 printf 'Trusted base: %s\n' "$base_ref"

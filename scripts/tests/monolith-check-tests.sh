@@ -360,7 +360,12 @@ run_registered_case 'F4 invalid zero' test_invalid_tokenizer_timeout 0
 run_registered_case 'F4 invalid text' test_invalid_tokenizer_timeout invalid
 run_registered_case 'F4 invalid excessive' test_invalid_tokenizer_timeout 301
 run_registered_case 'F4 timeout cleanup' test_tokenizer_timeout_cleans_process_tree
-[ "$registered_case_count" -eq 16 ] || die "registered: $registered_case_count/16"
+run_registered_case 'R2-A literal paths staged' test_literal_pathname_matrix staged
+run_registered_case 'R2-A literal paths head' test_literal_pathname_matrix head
+run_registered_case 'R2-A literal paths object' test_literal_pathname_matrix object
+run_registered_case 'R2-A annotated tag object' test_annotated_tag_object
+run_registered_case 'R2-B staged index mutation' test_staged_index_mutation_fails_closed
+[ "$registered_case_count" -eq 21 ] || die "registered: $registered_case_count/21"
 if [ -n "$case_filter" ]; then
     [ "$executed_case_count" -eq 1 ] || die "selected: $executed_case_count"
 else

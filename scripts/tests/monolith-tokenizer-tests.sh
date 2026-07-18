@@ -29,6 +29,16 @@ case "${TOKUIN_FAKE_MODE:-normal}" in
         ) &
         wait "$!"
         ;;
+    index-mutate)
+        repo="${TOKUIN_FAKE_REPO:?}"
+        marker="${TOKUIN_FAKE_MUTATION_MARKER:?}"
+        if [ ! -e "$marker" ]; then
+            awk 'BEGIN { for (line = 1; line <= 801; line++) print "late" }' \
+                >"$repo/src/index-late.rs"
+            git -C "$repo" add -- src/index-late.rs
+            : >"$marker"
+        fi
+        ;;
     normal) ;;
     *)
         printf 'bad fake mode\n' >&2

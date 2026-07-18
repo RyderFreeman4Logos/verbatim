@@ -86,18 +86,100 @@ test_git_type_change_to_monolith() {
     repo="$(init_repo "type-change-$scope")"
     bin_dir="$test_root/type-change-$scope-bin"
     write_fake_tokenizer "$bin_dir"
-    printf 'target\n' >"$repo/src/target.txt"
-    ln -s target.txt "$repo/src/type-change.rs"
+    printf 'target\n' >"$repo/target.txt"
+    ln -s target.txt "$repo/:type-change.rs"
     write_policy "$repo" 'files = []'
-    run_without_git_env git -C "$repo" add \
-        src/target.txt src/type-change.rs scripts/monolith/baseline.toml
+    run_without_git_env git -C "$repo" add -- \
+        target.txt ':(top,literal):type-change.rs' scripts/monolith/baseline.toml
     run_without_git_env git -C "$repo" commit -q -m base
     run_without_git_env git -C "$repo" branch base
-    rm -- "$repo/src/type-change.rs"
-    write_lines "$repo/src/type-change.rs" 801 candidate
-    run_without_git_env git -C "$repo" add src/type-change.rs
+    rm -- "$repo/:type-change.rs"
+    write_lines "$repo/:type-change.rs" 801 candidate
+    run_without_git_env git -C "$repo" add -- ':(top,literal):type-change.rs'
     assert_scope_failure "type change/$scope" \
-        'BLOCK new monolith: src/type-change.rs' "$repo" "$bin_dir" "$scope"
+        'BLOCK new monolith: :type-change.rs' "$repo" "$bin_dir" "$scope"
+}
+
+test_literal_pathname_matrix() {
+    local scope="$1"
+    local repo bin_dir path candidate_object output status
+    local -a paths=(':colon.rs' '-option.rs' $'src/line\nbreak.rs' $'src/tab\tbreak.rs')
+    local -a pathspecs=()
+    repo="$(init_repo "literal-paths-$scope")"
+    bin_dir="$test_root/literal-paths-$scope-bin"
+    write_fake_tokenizer "$bin_dir"
+    write_policy "$repo" 'files = []'
+    commit_base "$repo"
+    for path in "${paths[@]}"; do
+        write_lines "$repo/$path" 801 candidate
+        pathspecs+=(":(top,literal)$path")
+    done
+    run_without_git_env git -C "$repo" add -- "${pathspecs[@]}"
+    if [ "$scope" != staged ]; then
+        run_without_git_env git -C "$repo" commit -q -m candidate
+        candidate_object="$(run_without_git_env git -C "$repo" rev-parse HEAD)"
+    fi
+    set +e
+    case "$scope" in
+        staged) output="$(run_checker "$repo" "$bin_dir" staged 2>&1)" ;;
+        head) output="$(run_checker "$repo" "$bin_dir" head 2>&1)" ;;
+        object)
+            output="$(run_checker "$repo" "$bin_dir" object \
+                --object "$candidate_object" 2>&1)"
+            ;;
+        *) die "unsupported literal-path scope: $scope" ;;
+    esac
+    status=$?
+    set -e
+    [ "$status" -ne 0 ] || die "literal pathname matrix unexpectedly passed: $scope"
+    assert_output_count "literal pathname hard failures/$scope" \
+        '^BLOCK new monolith:' 4 "$output"
+}
+
+test_annotated_tag_object() {
+    local repo bin_dir tag_object
+    repo="$(init_repo annotated-tag-object)"
+    bin_dir="$test_root/annotated-tag-object-bin"
+    write_fake_tokenizer "$bin_dir"
+    write_policy "$repo" 'files = []'
+    commit_base "$repo"
+    write_lines "$repo/src/tagged.rs" 801 candidate
+    run_without_git_env git -C "$repo" add -- src/tagged.rs
+    run_without_git_env git -C "$repo" commit -q -m candidate
+    run_without_git_env git -C "$repo" tag -a candidate-tag -m candidate-tag
+    tag_object="$(run_without_git_env git -C "$repo" rev-parse candidate-tag)"
+    assert_failure_matching 'annotated tag object is checked literally' \
+        'BLOCK new monolith: src/tagged.rs' \
+        run_checker "$repo" "$bin_dir" object --object "$tag_object"
+}
+
+test_staged_index_mutation_fails_closed() {
+    local repo bin_dir marker output status
+    repo="$(init_repo staged-index-mutation)"
+    bin_dir="$test_root/staged-index-mutation-bin"
+    marker="$test_root/staged-index-mutation.marker"
+    write_fake_tokenizer "$bin_dir"
+    write_policy "$repo" 'files = []'
+    commit_base "$repo"
+    write_token_fixture "$repo/src/trigger.rs" TOKEN_STABLE
+    run_without_git_env git -C "$repo" add -- src/trigger.rs
+    set +e
+    output="$(
+        TOKUIN_FAKE_MODE=index-mutate \
+            TOKUIN_FAKE_REPO="$repo" \
+            TOKUIN_FAKE_MUTATION_MARKER="$marker" \
+            run_checker "$repo" "$bin_dir" staged 2>&1
+    )"
+    status=$?
+    set -e
+    [ "$status" -ne 0 ] || die 'staged index mutation unexpectedly passed'
+    grep -Fq 'Git index changed while monolith gate was running' <<<"$output" || {
+        printf '%s\n' "$output" >&2
+        die 'staged index mutation lacked the fail-closed diagnostic'
+    }
+    run_without_git_env git -C "$repo" diff --cached --name-only -- \
+        src/index-late.rs | grep -Fxq 'src/index-late.rs' \
+        || die 'mutation fixture did not add the late index path'
 }
 
 prepare_pre_push_fixture() {
