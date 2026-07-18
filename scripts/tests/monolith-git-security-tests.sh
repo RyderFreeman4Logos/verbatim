@@ -189,6 +189,8 @@ prepare_pre_push_fixture() {
     cp "$checker" "$repo/scripts/monolith/check.sh"
     cp "$root/scripts/monolith/tokenizer_runner.py" \
         "$repo/scripts/monolith/tokenizer_runner.py"
+    cp "$root/scripts/monolith/tokenizer_contract.py" \
+        "$repo/scripts/monolith/tokenizer_contract.py"
     cp "$pre_push_checker" "$repo/scripts/hooks/check-pre-push-version-bumps.sh"
     cat >"$repo/scripts/hooks/check-version-bumped.sh" <<'SH'
 #!/usr/bin/env bash
@@ -260,6 +262,8 @@ refs/heads/bad $bad_object refs/heads/bad $zero"
     [ "$(wc -l <"$version_log" | tr -d '[:space:]')" -eq 2 ] \
         || die 'shared parser did not visit both non-deletion refs'
     [ ! -s "$full_gate_log" ] || die 'full gate ran after an object validation failure'
+    [ ! -e "$repo/scripts/monolith/__pycache__" ] \
+        || die 'pre-push monolith gate created Python bytecode artifacts'
     : >"$version_log"
     : >"$full_gate_log"
     assert_success 'deletion ref is ignored' \

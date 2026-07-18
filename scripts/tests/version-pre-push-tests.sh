@@ -88,6 +88,8 @@ prepare_pre_push_fixture() {
     cp "$monolith_checker" "$repo/scripts/monolith/check.sh"
     cp "$root/scripts/monolith/tokenizer_runner.py" \
         "$repo/scripts/monolith/tokenizer_runner.py"
+    cp "$root/scripts/monolith/tokenizer_contract.py" \
+        "$repo/scripts/monolith/tokenizer_contract.py"
     cp "$monolith_baseline" "$repo/scripts/monolith/baseline.toml"
     cp "$root/scripts/tests/version-check-tests.sh" "$repo/scripts/tests/version-check-tests.sh"
     python3 - "$monolith_baseline" "$repo" <<'PY'

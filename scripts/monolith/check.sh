@@ -7,8 +7,14 @@ readonly tokenizer_command="tokuin"
 readonly tokenizer_version="0.3.0"
 readonly tokenizer_revision="c68d1f804a4c172846716b7be99e9378e16512b7"
 readonly tokenizer_model="gpt-4o"
+readonly tokenizer_format="json"
 readonly tokenizer_timeout_default=30
 readonly tokenizer_timeout_max=300
+readonly tokenizer_output_default=1048576
+readonly tokenizer_output_max=1048576
+readonly token_count_max=9223372036854775807
+readonly tokenizer_known_answer_input="Verbatim tokenizer attestation v1"
+readonly tokenizer_known_answer_tokens=7
 usage() {
     cat >&2 <<'EOF'
 Usage: scripts/monolith/check.sh --scope staged|head|object [--object <object-id>] [--base-ref <ref>] [--report-all]
@@ -79,6 +85,8 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
     || die "cannot determine the repository root"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 tokenizer_runner="$script_dir/tokenizer_runner.py"
+tokenizer_contract="$script_dir/tokenizer_contract.py"
+[ -r "$tokenizer_contract" ] || die "tokenizer contract helper is unavailable"
 cd "$repo_root"
 if [ -z "$base_ref" ]; then
     default_branch="${DEFAULT_BRANCH:-main}"
@@ -133,35 +141,119 @@ case "$tokenizer_timeout_seconds" in
         die "invalid MONOLITH_TOKENIZER_TIMEOUT_SECONDS: expected an integer from 1 through $tokenizer_timeout_max"
         ;;
 esac
-if [ "$tokenizer_timeout_seconds" -lt 1 ] \
+if [ "${#tokenizer_timeout_seconds}" -gt 3 ] \
+    || [ "$tokenizer_timeout_seconds" -lt 1 ] \
     || [ "$tokenizer_timeout_seconds" -gt "$tokenizer_timeout_max" ]; then
     die "invalid MONOLITH_TOKENIZER_TIMEOUT_SECONDS: expected an integer from 1 through $tokenizer_timeout_max"
+fi
+tokenizer_output_max_bytes="${MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES:-$tokenizer_output_default}"
+case "$tokenizer_output_max_bytes" in
+    ''|*[!0-9]*)
+        die "invalid MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES: expected an integer from 1 through $tokenizer_output_max"
+        ;;
+esac
+if [ "${#tokenizer_output_max_bytes}" -gt 7 ] \
+    || [ "$tokenizer_output_max_bytes" -lt 1 ] \
+    || [ "$tokenizer_output_max_bytes" -gt "$tokenizer_output_max" ]; then
+    die "invalid MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES: expected an integer from 1 through $tokenizer_output_max"
 fi
 if ! tokenizer_bin="$(command -v "$tokenizer_command" 2>/dev/null)"; then
     die "tokenizer unavailable: required tokuin $tokenizer_version in PATH"
 fi
+tokenizer_bin="$(realpath -- "$tokenizer_bin" 2>/dev/null)" \
+    || die "cannot resolve tokenizer executable identity"
+[ -x "$tokenizer_bin" ] || die "resolved tokenizer is not executable: $tokenizer_bin"
 run_bounded() {
-    local stdout_file="$1"
-    local stderr_file="$2"
-    shift 2
-    python3 "$tokenizer_runner" \
-        "$tokenizer_timeout_seconds" "$stdout_file" "$stderr_file" "$@"
+    local action="$1"
+    local stdout_file="$2"
+    local stderr_file="$3"
+    local receipt_file receipt_fields
+    shift 3
+    receipt_file="$(mktemp "$tmp_root/tokenizer-receipt.XXXXXX.json")" \
+        || die "cannot create tokenizer receipt file"
+    bounded_outcome=runner_error
+    bounded_status=2
+    bounded_output_stream=""
+    bounded_value=""
+    bounded_protocol_error=""
+    if ! python3 -B "$tokenizer_runner" "$action" \
+        --timeout-seconds "$tokenizer_timeout_seconds" \
+        --max-output-bytes "$tokenizer_output_max_bytes" \
+        --stdout "$stdout_file" \
+        --stderr "$stderr_file" \
+        --receipt "$receipt_file" "$@"; then
+        return 2
+    fi
+    if ! receipt_fields="$(python3 -B "$tokenizer_runner" decode \
+        --receipt "$receipt_file")"; then
+        return 2
+    fi
+    IFS=$'\t' read -r bounded_outcome bounded_status bounded_output_stream \
+        bounded_value bounded_protocol_error <<<"$receipt_fields"
+    [ "$bounded_status" != - ] || bounded_status=""
+    [ "$bounded_output_stream" != - ] || bounded_output_stream=""
+    [ "$bounded_value" != - ] || bounded_value=""
+    [ "$bounded_protocol_error" != - ] || bounded_protocol_error=""
+    case "$bounded_outcome" in
+        exited) return "${bounded_status:-2}" ;;
+        interrupted) return "${bounded_status:-130}" ;;
+        timed_out|output_limit|orphaned_descendants|spawn_failed|protocol_failed|cleanup_failed)
+            return 125
+            ;;
+        *)
+            bounded_outcome=runner_error
+            bounded_status=2
+            return 2
+            ;;
+    esac
+}
+report_bounded_failure() {
+    local context="$1" stderr_file="$2"
+    case "$bounded_outcome" in
+        timed_out) die "tokenizer $context timed out after ${tokenizer_timeout_seconds}s" ;;
+        output_limit)
+            die "tokenizer $context output exceeded ${tokenizer_output_max_bytes}-byte limit on $bounded_output_stream"
+            ;;
+        interrupted)
+            printf 'ERROR: tokenizer %s interrupted\n' "$context" >&2
+            exit "${bounded_status:-130}"
+            ;;
+        orphaned_descendants) die "tokenizer $context left descendant processes" ;;
+        spawn_failed) die "tokenizer $context could not be spawned" ;;
+        protocol_failed)
+            die "tokenizer $context protocol failure: ${bounded_protocol_error:-unknown}"
+            ;;
+        cleanup_failed) die "tokenizer $context process cleanup failed" ;;
+        runner_error) die "tokenizer $context runner failed" ;;
+    esac
+    [ ! -s "$stderr_file" ] || sed 's/^/  /' "$stderr_file" >&2
 }
 version_stdout="$tmp_root/tokenizer-version.stdout"
 version_stderr="$tmp_root/tokenizer-version.stderr"
-if run_bounded "$version_stdout" "$version_stderr" "$tokenizer_bin" --version; then
-    tokenizer_version_output="$(<"$version_stdout")"
+if run_bounded version "$version_stdout" "$version_stderr" \
+    --executable "$tokenizer_bin" --expected-version "$tokenizer_version"; then
+    :
 else
     tokenizer_status=$?
-    if [ "$tokenizer_status" -eq 124 ]; then
-        die "tokenizer version check timed out after ${tokenizer_timeout_seconds}s"
-    fi
-    [ ! -s "$version_stderr" ] || sed 's/^/  /' "$version_stderr" >&2
+    report_bounded_failure version "$version_stderr"
     die "tokenizer version check failed with status $tokenizer_status"
 fi
-if [ "$tokenizer_version_output" != "tokuin $tokenizer_version" ]; then
-    die "tokenizer version mismatch: required tokuin $tokenizer_version, got $tokenizer_version_output"
+known_answer_file="$tmp_root/tokenizer-known-answer.txt"
+printf '%s' "$tokenizer_known_answer_input" >"$known_answer_file"
+known_answer_stdout="$tmp_root/tokenizer-known-answer.stdout"
+known_answer_stderr="$tmp_root/tokenizer-known-answer.stderr"
+if run_bounded estimate "$known_answer_stdout" "$known_answer_stderr" \
+    --executable "$tokenizer_bin" --model "$tokenizer_model" \
+    --input "$known_answer_file" --maximum-count "$token_count_max" \
+    --expected-tokens "$tokenizer_known_answer_tokens"; then
+    :
+else
+    tokenizer_status=$?
+    report_bounded_failure known-answer "$known_answer_stderr"
+    die "tokenizer known-answer attestation failed with status $tokenizer_status"
 fi
+printf 'Tokenizer attestation passed: tokuin %s model=%s tokens=%s\n' \
+    "$tokenizer_version" "$tokenizer_model" "$bounded_value"
 snapshot_entry() {
     local snapshot="$1"
     local path="$2"
@@ -226,92 +318,16 @@ materialize_snapshot() {
 parse_policy() {
     local label="$1"
     local file="$2"
-    python3 - "$label" "$file" \
-        "$tokenizer_command" "$tokenizer_version" "$tokenizer_revision" \
-        "$tokenizer_model" "$tokenizer_timeout_default" <<'PY'
-import sys
-import tomllib
-from pathlib import PurePosixPath
-label, policy_path, command, version, revision, model, timeout = sys.argv[1:]
-required = {"path", "kind", "baseline_tokens", "baseline_lines", "issue", "rationale"}
-allowed_kinds = {"source", "test", "doc", "config", "other"}
-expected_tokenizer = {
-    "command": command,
-    "version": version,
-    "revision": revision,
-    "model": model,
-    "timeout_seconds": int(timeout),
-}
-
-def fail(message: str) -> None:
-    print(f"ERROR: {label} baseline policy: {message}", file=sys.stderr)
-    raise SystemExit(2)
-
-try:
-    with open(policy_path, "rb") as fh:
-        data = tomllib.load(fh)
-except Exception as exc:
-    fail(f"cannot parse TOML: {exc}")
-if not isinstance(data, dict):
-    fail("top level must be a table")
-unknown_top_level = set(data) - {"files", "tokenizer"}
-if unknown_top_level:
-    fail(f"unknown top-level key(s): {', '.join(sorted(unknown_top_level))}")
-tokenizer = data.get("tokenizer")
-if not isinstance(tokenizer, dict):
-    fail("tokenizer must be a table")
-unknown_tokenizer = set(tokenizer) - set(expected_tokenizer)
-missing_tokenizer = set(expected_tokenizer) - set(tokenizer)
-if unknown_tokenizer:
-    fail(f"tokenizer has unknown key(s): {', '.join(sorted(unknown_tokenizer))}")
-if missing_tokenizer:
-    fail(f"tokenizer is missing key(s): {', '.join(sorted(missing_tokenizer))}")
-for key, expected in expected_tokenizer.items():
-    if tokenizer[key] != expected:
-        fail(f"tokenizer.{key} must be {expected!r}, got {tokenizer[key]!r}")
-entries = data.get("files")
-if not isinstance(entries, list):
-    fail("files must be an array of tables")
-seen: set[str] = set()
-for number, entry in enumerate(entries, start=1):
-    if not isinstance(entry, dict):
-        fail(f"entry #{number} must be a table")
-    unknown = set(entry) - required
-    missing = required - set(entry)
-    if unknown:
-        fail(f"entry #{number} has unknown key(s): {', '.join(sorted(unknown))}")
-    if missing:
-        fail(f"entry #{number} is missing key(s): {', '.join(sorted(missing))}")
-    path = entry["path"]
-    kind = entry["kind"]
-    tokens = entry["baseline_tokens"]
-    lines = entry["baseline_lines"]
-    issue = entry["issue"]
-    rationale = entry["rationale"]
-    if not isinstance(path, str) or not path:
-        fail(f"entry #{number} has missing or invalid path")
-    if any(character in path for character in ("\0", "\n", "\r", "\t")):
-        fail(f"entry #{number} path contains control whitespace")
-    path_object = PurePosixPath(path)
-    if path_object.is_absolute() or ".." in path_object.parts or path.startswith("./") or "//" in path:
-        fail(f"entry #{number} has non-canonical path: {path!r}")
-    if path in seen:
-        fail(f"duplicate path: {path}")
-    seen.add(path)
-    if kind not in allowed_kinds:
-        fail(f"entry for {path} has invalid kind: {kind!r}")
-    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
-        fail(f"entry for {path} has invalid baseline_tokens")
-    if not isinstance(lines, int) or isinstance(lines, bool) or lines < 0:
-        fail(f"entry for {path} has invalid baseline_lines")
-    if issue != "368":
-        fail(f"entry for {path} must use canonical issue = \"368\"")
-    if not isinstance(rationale, str) or not rationale.strip():
-        fail(f"entry for {path} has missing rationale")
-    if "\t" in rationale or "\n" in rationale or "\r" in rationale:
-        fail(f"entry for {path} rationale contains unsupported control whitespace")
-    print(f"{path}\t{kind}\t{tokens}\t{lines}\t{issue}\t{rationale}")
-PY
+    python3 "$tokenizer_contract" policy \
+        --label "$label" --policy "$file" \
+        --command "$tokenizer_command" --version "$tokenizer_version" \
+        --revision "$tokenizer_revision" --model "$tokenizer_model" \
+        --output-format "$tokenizer_format" \
+        --timeout "$tokenizer_timeout_default" \
+        --max-output-bytes "$tokenizer_output_default" \
+        --known-answer-input "$tokenizer_known_answer_input" \
+        --known-answer-tokens "$tokenizer_known_answer_tokens" \
+        --maximum-count "$token_count_max"
 }
 classify_kind() {
     local path="$1"
@@ -340,6 +356,17 @@ is_generated_artifact() {
         *) return 1 ;;
     esac
 }
+validate_count_domain() {
+    local value="$1" label="$2"
+    # Equal-width ASCII decimal strings are compared lexically to avoid signed
+    # shell-arithmetic overflow at 9223372036854775808.
+    # shellcheck disable=SC2071
+    if [ "${#value}" -gt 19 ] \
+        || { [ "${#value}" -eq 19 ] \
+            && (LC_ALL=C; [[ "$value" > "$token_count_max" ]]); }; then
+        die "$label exceeds the signed 64-bit domain: $value"
+    fi
+}
 line_count() {
     local file="$1"
     local path="$2"
@@ -351,6 +378,7 @@ line_count() {
     case "$lines" in
         ''|*[!0-9]*) die "unparsable line count for $path: $lines" ;;
     esac
+    validate_count_domain "$lines" "line count for $path"
     printf '%s\n' "$lines"
 }
 byte_count() {
@@ -364,53 +392,49 @@ byte_count() {
     case "$bytes" in
         ''|*[!0-9]*) die "unparsable byte count for $path: $bytes" ;;
     esac
+    validate_count_domain "$bytes" "byte count for $path"
     printf '%s\n' "$bytes"
 }
 token_count() {
     local file="$1"
     local path="$2"
-    local output stdout_file stderr_file tokenizer_status
+    local stdout_file stderr_file tokenizer_status
     stdout_file="$(mktemp "$tmp_root/tokenizer.stdout.XXXXXX")" \
         || die "cannot create tokenizer stdout file for $path"
     stderr_file="$(mktemp "$tmp_root/tokenizer.stderr.XXXXXX")" \
         || die "cannot create tokenizer stderr file for $path"
-    if run_bounded "$stdout_file" "$stderr_file" \
-        "$tokenizer_bin" estimate --model "$tokenizer_model" --format json "$file"; then
-        output="$(<"$stdout_file")"
+    if run_bounded estimate "$stdout_file" "$stderr_file" \
+        --executable "$tokenizer_bin" --model "$tokenizer_model" \
+        --input "$file" --maximum-count "$token_count_max"; then
+        printf '%s\n' "$bounded_value"
+        return 0
     else
         tokenizer_status=$?
-        if [ "$tokenizer_status" -eq 124 ]; then
-            printf 'ERROR: tokenizer timed out after %ss for %s\n' \
-                "$tokenizer_timeout_seconds" "$path" >&2
-            exit 2
-        fi
-        printf 'ERROR: tokenizer failed for %s using %s estimate --model %s --format json (status %s)\n' \
-            "$path" "$tokenizer_bin" "$tokenizer_model" "$tokenizer_status" >&2
-        if [ -s "$stderr_file" ]; then
-            sed 's/^/  /' "$stderr_file" >&2
-        fi
-        exit 2
     fi
-    if ! TOKEN_OUTPUT="$output" python3 - <<'PY'
-import json
-import os
-import sys
-try:
-    value = json.loads(os.environ["TOKEN_OUTPUT"])
-except Exception as exc:
-    print(f"unparsable tokenizer JSON: {exc}", file=sys.stderr)
-    raise SystemExit(2)
-tokens = value.get("tokens", value.get("total")) if isinstance(value, dict) else None
-if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
-    print("tokenizer JSON did not contain a non-negative integer tokens/total field", file=sys.stderr)
-    raise SystemExit(2)
-print(tokens)
-PY
-    then
-        printf 'ERROR: tokenizer output was unparsable for %s\n' "$path" >&2
-        printf '%s\n' "$output" >&2
-        exit 2
-    fi
+    case "$bounded_outcome" in
+        timed_out)
+            die "tokenizer timed out after ${tokenizer_timeout_seconds}s for $path"
+            ;;
+        output_limit)
+            die "tokenizer output exceeded ${tokenizer_output_max_bytes}-byte limit for $path ($bounded_output_stream)"
+            ;;
+        interrupted)
+            printf 'ERROR: tokenizer interrupted for %s\n' "$path" >&2
+            exit "${bounded_status:-130}"
+            ;;
+        orphaned_descendants) die "tokenizer left descendant processes for $path" ;;
+        spawn_failed) die "tokenizer could not be spawned for $path" ;;
+        protocol_failed)
+            die "tokenizer protocol failure for $path: ${bounded_protocol_error:-unknown}"
+            ;;
+        cleanup_failed) die "tokenizer process cleanup failed for $path" ;;
+        runner_error) die "tokenizer runner failed for $path" ;;
+    esac
+    printf 'ERROR: tokenizer failed for %s using %s estimate --model %s --format %s (status %s)\n' \
+        "$path" "$tokenizer_bin" "$tokenizer_model" "$tokenizer_format" \
+        "$tokenizer_status" >&2
+    [ ! -s "$stderr_file" ] || sed 's/^/  /' "$stderr_file" >&2
+    exit 2
 }
 declare -A candidate_kind=()
 declare -A candidate_tokens=()

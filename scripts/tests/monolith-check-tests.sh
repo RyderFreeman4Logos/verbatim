@@ -2,12 +2,14 @@
 set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 checker="$root/scripts/monolith/check.sh"
+tokenizer_runner="$root/scripts/monolith/tokenizer_runner.py"
 pre_push_checker="$root/scripts/hooks/check-pre-push-version-bumps.sh"
 test_root="$(mktemp -d)"
 case_filter="${MONOLITH_TEST_CASE:-}"
 registered_case_count=0
 executed_case_count=0
 readonly tokenizer_revision="c68d1f804a4c172846716b7be99e9378e16512b7"
+readonly checker_outer_timeout_seconds=15
 cleanup() {
     rm -rf -- "$test_root"
 }
@@ -69,7 +71,11 @@ command = "tokuin"
 version = "0.3.0"
 revision = "$tokenizer_revision"
 model = "gpt-4o"
+format = "json"
 timeout_seconds = 30
+max_output_bytes = 1048576
+known_answer_input = "Verbatim tokenizer attestation v1"
+known_answer_tokens = 7
 EOF
     } >"$repo/scripts/monolith/baseline.toml"
 }
@@ -97,7 +103,18 @@ run_checker() {
             TOKUIN_FAKE_MODE="${TOKUIN_FAKE_MODE:-normal}" \
             TOKUIN_FAKE_VERSION="${TOKUIN_FAKE_VERSION:-0.3.0}" \
             TOKUIN_FAKE_CHILD_PID_FILE="${TOKUIN_FAKE_CHILD_PID_FILE:-}" \
+            TOKUIN_FAKE_OUTPUT="${TOKUIN_FAKE_OUTPUT:-}" \
+            TOKUIN_FAKE_OUTPUT_HEX="${TOKUIN_FAKE_OUTPUT_HEX:-}" \
+            TOKUIN_FAKE_STDERR_HEX="${TOKUIN_FAKE_STDERR_HEX:-}" \
+            TOKUIN_FAKE_TARGET="${TOKUIN_FAKE_TARGET:-}" \
+            TOKUIN_FAKE_LIFECYCLE_MODE="${TOKUIN_FAKE_LIFECYCLE_MODE:-}" \
+            TOKUIN_FAKE_EXIT_STATUS="${TOKUIN_FAKE_EXIT_STATUS:-}" \
+            TOKUIN_FAKE_STREAM="${TOKUIN_FAKE_STREAM:-}" \
+            TOKUIN_FAKE_PID_FILE="${TOKUIN_FAKE_PID_FILE:-}" \
+            TOKUIN_FAKE_REPO="${TOKUIN_FAKE_REPO:-}" \
+            TOKUIN_FAKE_MUTATION_MARKER="${TOKUIN_FAKE_MUTATION_MARKER:-}" \
             MONOLITH_TOKENIZER_TIMEOUT_SECONDS="${MONOLITH_TOKENIZER_TIMEOUT_SECONDS:-}" \
+            MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES="${MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES:-}" \
             run_without_git_env "$checker" --scope "$scope" "$@"
     )
 }
@@ -128,8 +145,17 @@ run_checker_bounded() {
             BASE_REF=base \
             TOKUIN_FAKE_MODE="${TOKUIN_FAKE_MODE:-normal}" \
             TOKUIN_FAKE_CHILD_PID_FILE="${TOKUIN_FAKE_CHILD_PID_FILE:-}" \
+            TOKUIN_FAKE_OUTPUT_HEX="${TOKUIN_FAKE_OUTPUT_HEX:-}" \
+            TOKUIN_FAKE_STDERR_HEX="${TOKUIN_FAKE_STDERR_HEX:-}" \
+            TOKUIN_FAKE_TARGET="${TOKUIN_FAKE_TARGET:-}" \
+            TOKUIN_FAKE_LIFECYCLE_MODE="${TOKUIN_FAKE_LIFECYCLE_MODE:-}" \
+            TOKUIN_FAKE_EXIT_STATUS="${TOKUIN_FAKE_EXIT_STATUS:-}" \
+            TOKUIN_FAKE_STREAM="${TOKUIN_FAKE_STREAM:-}" \
+            TOKUIN_FAKE_PID_FILE="${TOKUIN_FAKE_PID_FILE:-}" \
             MONOLITH_TOKENIZER_TIMEOUT_SECONDS="${MONOLITH_TOKENIZER_TIMEOUT_SECONDS:-}" \
-            run_without_git_env timeout --kill-after=1s 5s \
+            MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES="${MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES:-}" \
+            run_without_git_env timeout --kill-after=1s \
+            "${checker_outer_timeout_seconds}s" \
             "$checker" --scope "$scope" "$@"
     )
 }
@@ -196,13 +222,16 @@ if any(not isinstance(row.get("rationale"), str) or not row["rationale"].strip()
     raise SystemExit("every canonical baseline row needs a rationale")
 rev = sys.argv[3]
 expected = {"command": "tokuin", "version": "0.3.0", "revision": rev,
-            "model": "gpt-4o", "timeout_seconds": 30}
+            "model": "gpt-4o", "format": "json", "timeout_seconds": 30,
+            "max_output_bytes": 1048576,
+            "known_answer_input": "Verbatim tokenizer attestation v1",
+            "known_answer_tokens": 7}
 if data.get("tokenizer") != expected:
     raise SystemExit("canonical tokenizer metadata mismatch")
 with open(sys.argv[2], encoding="utf-8") as fh:
     docs = fh.read()
-required = (f"--rev {rev} --locked tokuin", "tokuin 0.3.0", "30 seconds",
-            "MONOLITH_TOKENIZER_TIMEOUT_SECONDS")
+required = (f"--rev {rev} --locked tokuin", "tokuin 0.3.0", "30-second",
+            "MONOLITH_TOKENIZER_TIMEOUT_SECONDS", "known answer")
 if missing := [text for text in required if text not in docs]:
     raise SystemExit(f"docs missing: {missing!r}")
 PY
@@ -280,7 +309,7 @@ test_issue_rationale_duplicate_and_invalid_rows_fail() {
     commit_base "$repo"
     write_policy "$repo" "$(policy_row src/base.rs 20 801 0)"
     run_without_git_env git -C "$repo" add scripts/monolith/baseline.toml
-    assert_failure_matching 'placeholder issue blocks' 'canonical issue' \
+    assert_failure_matching 'placeholder issue blocks' 'must use issue' \
         run_checker "$repo" "$bin_dir" staged
     write_policy "$repo" '[[files]]
 path = "src/base.rs"
@@ -365,7 +394,12 @@ run_registered_case 'R2-A literal paths head' test_literal_pathname_matrix head
 run_registered_case 'R2-A literal paths object' test_literal_pathname_matrix object
 run_registered_case 'R2-A annotated tag object' test_annotated_tag_object
 run_registered_case 'R2-B staged index mutation' test_staged_index_mutation_fails_closed
-[ "$registered_case_count" -eq 21 ] || die "registered: $registered_case_count/21"
+run_registered_case 'R2-C process lifecycle' test_runner_process_lifecycle_matrix
+run_registered_case 'R2-C runner output caps' test_runner_output_caps
+run_registered_case 'R2-D numeric domain' test_tokenizer_numeric_domain
+run_registered_case 'R2-D natural exit 124' test_natural_exit_124_is_not_timeout
+run_registered_case 'R2-D checker output cap' test_checker_output_cap
+[ "$registered_case_count" -eq 26 ] || die "registered: $registered_case_count/26"
 if [ -n "$case_filter" ]; then
     [ "$executed_case_count" -eq 1 ] || die "selected: $executed_case_count"
 else

@@ -57,9 +57,23 @@ Install:
   tokuin --version  # must print: tokuin 0.3.0
   ```
 
-The monolith gate bounds every Tokuin process to 30 seconds. On slower
-machines, `MONOLITH_TOKENIZER_TIMEOUT_SECONDS` may be set to an integer from 1
-through 300; invalid values and tokenizer timeouts fail the gate closed.
+The monolith gate captures one resolved Tokuin executable and attests the pinned
+command, exact version and revision, `gpt-4o` model, JSON format, and deterministic
+known answer recorded in `baseline.toml` (`Verbatim tokenizer attestation v1` =
+7 tokens). Version stdout must be exactly `tokuin 0.3.0` plus one LF, and a
+successful invocation may not write stderr. Estimate output is strict UTF-8 JSON
+with exactly the `model`, `tokens`, `input_cost`, `output_cost`, and `breakdown`
+keys; the cost/breakdown fields are null, and `tokens` is a signed-64-bit-domain
+integer consistent with the input byte count.
+
+Every spawn, output drain, leader exit, descendant cleanup, escalation, and reap
+shares one 30-second wall-clock budget. Each stdout and stderr capture is capped
+at 1,048,576 bytes. On slower machines, `MONOLITH_TOKENIZER_TIMEOUT_SECONDS` may
+be set to an integer from 1 through 300. `MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES`
+may lower the per-stream cap to an integer from 1 through 1,048,576. Invalid
+values, protocol or provenance mismatches, natural nonzero exits (including
+124), timeouts, output overruns, escaped descendants, spawn failures, and cleanup
+failures all fail the gate closed.
 
 Clone and build:
 
