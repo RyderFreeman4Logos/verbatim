@@ -15,10 +15,12 @@ default: pre-commit
 # Core Workflow
 # ==============================================================================
 
-# Fast pre-commit: version validation and focused version tests plus formatting and linting.
+# Fast pre-commit: staged snapshot policy gates, focused fixtures, formatting, and linting.
 pre-commit-fast scope="staged":
     just check-version-bumped {{quote(scope)}}
+    just check-monolith {{quote(scope)}}
     just version-check-test
+    just monolith-check-test
     just fmt
     just clippy
     just deny
@@ -36,9 +38,17 @@ pre-commit scope="staged":
 check-version-bumped scope="staged":
     scripts/hooks/check-version-bumped.sh --scope {{quote(scope)}}
 
+# Enforce the immutable monolith no-growth policy for a Git snapshot.
+check-monolith scope="staged":
+    scripts/monolith/check.sh --scope {{quote(scope)}}
+
 # Test staged and HEAD workspace-version snapshot semantics.
 version-check-test:
     bash scripts/tests/version-check-tests.sh
+
+# Test staged/object monolith snapshot and fail-closed policy semantics.
+monolith-check-test:
+    bash scripts/tests/monolith-check-tests.sh
 
 # Bump the workspace patch version and refresh Cargo.lock.
 bump-patch:

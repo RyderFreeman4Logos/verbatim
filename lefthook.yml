@@ -6,6 +6,7 @@ no_tty: true
 
 pre-commit:
   commands:
+    # This recipe validates the staged version and immutable monolith snapshots.
     quality-gates:
       run: just pre-commit-fast
 

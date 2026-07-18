@@ -4,6 +4,8 @@ set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 checker="$root/scripts/hooks/check-version-bumped.sh"
 pre_push_checker="$root/scripts/hooks/check-pre-push-version-bumps.sh"
+monolith_checker="$root/scripts/monolith/check.sh"
+monolith_baseline="$root/scripts/monolith/baseline.toml"
 test_tmp_root="$(mktemp -d)"
 
 cleanup() {
@@ -94,6 +96,18 @@ assert_success() {
     fi
 }
 
+assert_success_output() {
+    local name="$1"
+    local output
+    shift
+
+    if ! output="$("$@" 2>&1)"; then
+        printf 'FAIL: expected success: %s\n%s\n' "$name" "$output" >&2
+        exit 1
+    fi
+    printf '%s' "$output"
+}
+
 assert_failure_status_matching() {
     local name="$1"
     local expected_status="$2"
@@ -140,6 +154,21 @@ assert_file_content() {
     if [ "$actual" != "$expected" ]; then
         printf 'FAIL: unexpected content for %s\nexpected:\n%s\nactual:\n%s\n' \
             "$name" "$expected" "$actual" >&2
+        exit 1
+    fi
+}
+
+assert_output_count() {
+    local name="$1"
+    local pattern="$2"
+    local expected="$3"
+    local output="$4"
+    local actual
+
+    actual="$(grep -Ec -- "$pattern" <<<"$output")"
+    if [ "$actual" -ne "$expected" ]; then
+        printf 'FAIL: %s expected %s matches for %s, got %s\n%s\n' \
+            "$name" "$expected" "$pattern" "$actual" "$output" >&2
         exit 1
     fi
 }
@@ -265,28 +294,65 @@ assert_invalid_scope_rejected() {
 
 prepare_pre_push_fixture() {
     local repo="$1"
+    # The assertion must match variables in the fixture verbatim.
+    # shellcheck disable=SC2016
+    local expected_monolith_object_call='    "$monolith_checker" --scope object --object "$local_object"'
 
     assert_file_contains \
         'pre-push object validator command' \
         '      run: scripts/hooks/check-pre-push-version-bumps.sh' \
         "$root/lefthook.yml"
     assert_file_contains 'pre-push object validator stdin' '      use_stdin: true' "$root/lefthook.yml"
-    mkdir -p "$repo/scripts/hooks" "$repo/scripts/tests" "$repo/test-bin"
+    assert_file_contains \
+        'pre-push monolith object validator command' \
+        "$expected_monolith_object_call" \
+        "$pre_push_checker"
+    mkdir -p "$repo/scripts/hooks" "$repo/scripts/monolith" "$repo/scripts/tests" "$repo/test-bin"
     cp "$root/justfile" "$repo/justfile"
     cp "$checker" "$repo/scripts/hooks/check-version-bumped.sh"
     cp "$pre_push_checker" "$repo/scripts/hooks/check-pre-push-version-bumps.sh"
+    cp "$monolith_checker" "$repo/scripts/monolith/check.sh"
+    cp "$monolith_baseline" "$repo/scripts/monolith/baseline.toml"
     cp "$root/scripts/tests/version-check-tests.sh" "$repo/scripts/tests/version-check-tests.sh"
+    python3 - "$monolith_baseline" "$repo" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+
+baseline_path = Path(sys.argv[1])
+repo = Path(sys.argv[2])
+with baseline_path.open("rb") as baseline_file:
+    rows = tomllib.load(baseline_file)["files"]
+for row in rows:
+    fixture_path = repo / row["path"]
+    fixture_path.parent.mkdir(parents=True, exist_ok=True)
+    fixture_path.write_text("fixture source\n", encoding="utf-8")
+PY
     chmod +x \
         "$repo/scripts/hooks/check-pre-push-version-bumps.sh" \
         "$repo/scripts/hooks/check-version-bumped.sh" \
+        "$repo/scripts/monolith/check.sh" \
         "$repo/scripts/tests/version-check-tests.sh"
     printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/test-bin/cargo"
-    chmod +x "$repo/test-bin/cargo"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'printf '\''{"tokens":20}\n'\''' \
+        >"$repo/test-bin/csa"
+    chmod +x "$repo/test-bin/cargo" "$repo/test-bin/csa"
+}
+
+commit_pre_push_fixture_artifacts() {
+    local repo="$1"
+
+    run_without_local_git_env git -C "$repo" add crates justfile scripts
+    run_without_local_git_env git -C "$repo" commit -q -m 'install unified hook fixture artifacts'
 }
 
 install_pre_push_recorders() {
     local repo="$1"
 
+    # The generated fixture expands these variables when it runs.
+    # shellcheck disable=SC2016
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         'set -euo pipefail' \
@@ -301,6 +367,8 @@ install_pre_push_recorders() {
         '    exit 1' \
         'fi' \
         >"$repo/scripts/hooks/check-version-bumped.sh"
+    # The generated fixture expands these variables when it runs.
+    # shellcheck disable=SC2016
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         'set -euo pipefail' \
@@ -353,6 +421,8 @@ touch "$repo/unrelated-worktree-file"
 
 if [ "${VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH:-}" != "1" ]; then
     repo="$(init_repo pre-push-objects)"
+    prepare_pre_push_fixture "$repo"
+    commit_pre_push_fixture_artifacts "$repo"
     commit_manifest "$repo" "0.1.0" base
     run_without_local_git_env git -C "$repo" branch base
     commit_manifest "$repo" "0.1.1" bumped
@@ -365,7 +435,6 @@ if [ "${VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH:-}" != "1" ]; then
     run_without_local_git_env git -C "$repo" commit -q -m unchanged
     unchanged_object="$(run_without_local_git_env git -C "$repo" rev-parse HEAD)"
     run_without_local_git_env git -C "$repo" switch -q main
-    prepare_pre_push_fixture "$repo"
 
     sentinel="$repo/invalid-scope-sentinel"
     scope_payload="staged; touch $sentinel"
@@ -398,14 +467,19 @@ if [ "${VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH:-}" != "1" ]; then
     zero_object='0000000000000000000000000000000000000000'
     multi_ref_input="refs/heads/main $good_object refs/heads/main $zero_object
 refs/tags/v0.1.1 $tag_object refs/tags/v0.1.1 $zero_object"
-    assert_success \
+    pre_push_output="$(assert_success_output \
         'pre-push validates every pushed non-deletion object before the full HEAD gate' \
-        run_pre_push_path "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log"
+        run_pre_push_path "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log")"
     assert_file_content \
         'pre-push validator calls for multiple refs' \
         "validator|--scope|object|--object|$good_object
 validator|--scope|object|--object|$tag_object" \
         "$validator_log"
+    assert_output_count \
+        'pre-push monolith validator calls for multiple refs' \
+        '^Scope: object$' \
+        2 \
+        "$pre_push_output"
     assert_file_content 'pre-push full gate call' 'pre-commit head' "$full_gate_log"
 
     : >"$validator_log"

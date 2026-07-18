@@ -4,6 +4,9 @@ This guide is the release checklist for the Verbatim MVP. It is written for a
 fresh clone and keeps model-backed steps manual so CI does not require local
 Qwen/vLLM endpoints.
 
+The current MVP workspace version is `0.1.90`; `Cargo.toml` and every
+workspace package entry in `Cargo.lock` must match this exact version.
+
 ## MVP Boundary
 
 Verbatim MVP includes:
