@@ -1,36 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 readonly baseline_path="scripts/monolith/baseline.toml"
 readonly line_threshold=800
 readonly token_threshold=8000
-
+readonly tokenizer_command="tokuin"
+readonly tokenizer_version="0.3.0"
+readonly tokenizer_revision="c68d1f804a4c172846716b7be99e9378e16512b7"
+readonly tokenizer_model="gpt-4o"
+readonly tokenizer_timeout_default=30
+readonly tokenizer_timeout_max=300
 usage() {
     cat >&2 <<'EOF'
 Usage: scripts/monolith/check.sh --scope staged|head|object [--object <object-id>] [--base-ref <ref>] [--report-all]
-
 Scopes:
   staged  evaluate the Git index against the trusted base tree
   head    evaluate the committed HEAD tree against the trusted base tree
   object  evaluate a committed object tree against the trusted base tree
-
 The candidate baseline is always read from its selected Git snapshot. Its
 policy is compared to the immutable trusted base before source bytes are
 checked. The first baseline is accepted only when it exactly describes every
 over-limit text file inherited unchanged from that trusted base.
+Requires tokuin 0.3.0. MONOLITH_TOKENIZER_TIMEOUT_SECONDS may override the
+30-second per-process timeout with an integer from 1 through 300. Tokenizer
+timeouts, failures, and malformed output fail closed.
 EOF
 }
-
 die() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 2
 }
-
 scope=""
 base_ref="${BASE_REF:-}"
 object_id=""
 report_all=false
-
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --scope)
@@ -62,24 +64,20 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
-
 case "$scope" in
     staged|head|object) ;;
     "") usage; die "--scope is required" ;;
     *) usage; die "--scope must be one of: staged, head, object" ;;
 esac
-
 if [ "$scope" = "object" ] && [ -z "$object_id" ]; then
     die "--scope object requires --object <object-id>"
 fi
 if [ "$scope" != "object" ] && [ -n "$object_id" ]; then
     die "--object is only valid with --scope object"
 fi
-
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
     || die "cannot determine the repository root"
 cd "$repo_root"
-
 if [ -z "$base_ref" ]; then
     default_branch="${DEFAULT_BRANCH:-main}"
     if git rev-parse --verify --quiet "origin/${default_branch}^{commit}" >/dev/null; then
@@ -90,14 +88,11 @@ if [ -z "$base_ref" ]; then
         die "cannot resolve trusted base: origin/${default_branch} or ${default_branch}"
     fi
 fi
-
 case "$base_ref" in
     -*|*:*|*$'\n'*|*$'\r'*) die "invalid base ref: $base_ref" ;;
 esac
-
 base_commit="$(git rev-parse --verify --quiet "${base_ref}^{commit}")" \
     || die "cannot resolve trusted base ref: $base_ref"
-
 candidate_commit=""
 if [ "$scope" = "head" ]; then
     candidate_commit="$(git rev-parse --verify --quiet 'HEAD^{commit}')" \
@@ -117,28 +112,160 @@ elif [ "$scope" = "object" ]; then
     candidate_commit="$(git rev-parse --verify --quiet "${object_id}^{commit}")" \
         || die "cannot resolve object ID as a commit"
 fi
-
-if [ -x "$repo_root/target/debug/csa" ]; then
-    tokenizer_bin="$repo_root/target/debug/csa"
-elif command -v csa >/dev/null 2>&1; then
-    tokenizer_bin="$(command -v csa)"
-else
-    die "tokenizer unavailable: expected target/debug/csa or csa in PATH"
-fi
-tokenizer_model="${TOKUIN_MODEL:-gpt-4o}"
-
 tmp_root="$(mktemp -d)"
 cleanup() {
     rm -rf -- "$tmp_root"
 }
 trap cleanup EXIT
+tokenizer_timeout_seconds="${MONOLITH_TOKENIZER_TIMEOUT_SECONDS:-$tokenizer_timeout_default}"
+case "$tokenizer_timeout_seconds" in
+    ''|*[!0-9]*)
+        die "invalid MONOLITH_TOKENIZER_TIMEOUT_SECONDS: expected an integer from 1 through $tokenizer_timeout_max"
+        ;;
+esac
+if [ "$tokenizer_timeout_seconds" -lt 1 ] \
+    || [ "$tokenizer_timeout_seconds" -gt "$tokenizer_timeout_max" ]; then
+    die "invalid MONOLITH_TOKENIZER_TIMEOUT_SECONDS: expected an integer from 1 through $tokenizer_timeout_max"
+fi
+if ! tokenizer_bin="$(command -v "$tokenizer_command" 2>/dev/null)"; then
+    die "tokenizer unavailable: required tokuin $tokenizer_version in PATH"
+fi
+run_bounded() {
+    local stdout_file="$1"
+    local stderr_file="$2"
+    shift 2
+    python3 - "$tokenizer_timeout_seconds" "$stdout_file" "$stderr_file" "$@" <<'PY'
+import ctypes
+import os
+import signal
+import subprocess
+import sys
+import time
+timeout = int(sys.argv[1])
+stdout_path, stderr_path = sys.argv[2:4]
+command = sys.argv[4:]
+try:
+    ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
+except Exception:
+    pass
 
+def group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+def reap_children() -> None:
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid <= 0:
+            return
+
+with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        stderr.write(f"cannot execute tokenizer: {exc}\n".encode())
+        raise SystemExit(126)
+    try:
+        status = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            pass
+        if group_alive(process.pid):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        deadline = time.monotonic() + 1
+        while True:
+            reap_children()
+            if not group_alive(process.pid) or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        raise SystemExit(124)
+if status < 0:
+    raise SystemExit(min(255, 128 - status))
+raise SystemExit(min(255, status))
+PY
+}
+version_stdout="$tmp_root/tokenizer-version.stdout"
+version_stderr="$tmp_root/tokenizer-version.stderr"
+if run_bounded "$version_stdout" "$version_stderr" "$tokenizer_bin" --version; then
+    tokenizer_version_output="$(<"$version_stdout")"
+else
+    tokenizer_status=$?
+    if [ "$tokenizer_status" -eq 124 ]; then
+        die "tokenizer version check timed out after ${tokenizer_timeout_seconds}s"
+    fi
+    [ ! -s "$version_stderr" ] || sed 's/^/  /' "$version_stderr" >&2
+    die "tokenizer version check failed with status $tokenizer_status"
+fi
+if [ "$tokenizer_version_output" != "tokuin $tokenizer_version" ]; then
+    die "tokenizer version mismatch: required tokuin $tokenizer_version, got $tokenizer_version_output"
+fi
+snapshot_mode() {
+    local snapshot="$1"
+    local path="$2"
+    local output_name="$3"
+    local entries_file entry entry_mode="" count=0
+    entries_file="$(mktemp "$tmp_root/modes.XXXXXX")" \
+        || die "cannot create mode list for $path"
+    case "$snapshot" in
+        candidate)
+            case "$scope" in
+                staged) git ls-files --stage -z -- "$path" >"$entries_file" ;;
+                head|object) git ls-tree -z "$candidate_commit" -- "$path" >"$entries_file" ;;
+            esac
+            ;;
+        base) git ls-tree -z "$base_commit" -- "$path" >"$entries_file" ;;
+        *) die "internal error: unknown snapshot $snapshot" ;;
+    esac
+    while IFS= read -r -d '' entry; do
+        count=$((count + 1))
+        entry_mode="${entry%% *}"
+    done <"$entries_file"
+    [ "$count" -gt 0 ] || return 1
+    [ "$count" -eq 1 ] || die "snapshot has multiple index entries for $path"
+    case "$entry_mode" in
+        100644|100755|120000|160000) ;;
+        *) die "unsupported Git mode for $path: $entry_mode" ;;
+    esac
+    printf -v "$output_name" '%s' "$entry_mode"
+}
 materialize_snapshot() {
     local snapshot="$1"
     local path="$2"
     local output_name="$3"
-    local object_spec object_type snapshot_file
-
+    local object_spec object_type snapshot_file mode
+    snapshot_mode "$snapshot" "$path" mode || return 1
+    case "$mode" in
+        100644|100755) ;;
+        *) return 1 ;;
+    esac
     case "$snapshot" in
         candidate)
             case "$scope" in
@@ -149,7 +276,6 @@ materialize_snapshot() {
         base) object_spec="${base_commit}:$path" ;;
         *) die "internal error: unknown snapshot $snapshot" ;;
     esac
-
     if ! object_type="$(git cat-file -t "$object_spec" 2>/dev/null)"; then
         return 1
     fi
@@ -161,41 +287,55 @@ materialize_snapshot() {
     fi
     printf -v "$output_name" '%s' "$snapshot_file"
 }
-
 parse_policy() {
     local label="$1"
     local file="$2"
-
-    python3 - "$label" "$file" <<'PY'
+    python3 - "$label" "$file" \
+        "$tokenizer_command" "$tokenizer_version" "$tokenizer_revision" \
+        "$tokenizer_model" "$tokenizer_timeout_default" <<'PY'
 import sys
 import tomllib
 from pathlib import PurePosixPath
-
-label, policy_path = sys.argv[1:]
+label, policy_path, command, version, revision, model, timeout = sys.argv[1:]
 required = {"path", "kind", "baseline_tokens", "baseline_lines", "issue", "rationale"}
 allowed_kinds = {"source", "test", "doc", "config", "other"}
-
+expected_tokenizer = {
+    "command": command,
+    "version": version,
+    "revision": revision,
+    "model": model,
+    "timeout_seconds": int(timeout),
+}
 
 def fail(message: str) -> None:
     print(f"ERROR: {label} baseline policy: {message}", file=sys.stderr)
     raise SystemExit(2)
-
 
 try:
     with open(policy_path, "rb") as fh:
         data = tomllib.load(fh)
 except Exception as exc:
     fail(f"cannot parse TOML: {exc}")
-
 if not isinstance(data, dict):
     fail("top level must be a table")
-unknown_top_level = set(data) - {"files"}
+unknown_top_level = set(data) - {"files", "tokenizer"}
 if unknown_top_level:
     fail(f"unknown top-level key(s): {', '.join(sorted(unknown_top_level))}")
+tokenizer = data.get("tokenizer")
+if not isinstance(tokenizer, dict):
+    fail("tokenizer must be a table")
+unknown_tokenizer = set(tokenizer) - set(expected_tokenizer)
+missing_tokenizer = set(expected_tokenizer) - set(tokenizer)
+if unknown_tokenizer:
+    fail(f"tokenizer has unknown key(s): {', '.join(sorted(unknown_tokenizer))}")
+if missing_tokenizer:
+    fail(f"tokenizer is missing key(s): {', '.join(sorted(missing_tokenizer))}")
+for key, expected in expected_tokenizer.items():
+    if tokenizer[key] != expected:
+        fail(f"tokenizer.{key} must be {expected!r}, got {tokenizer[key]!r}")
 entries = data.get("files")
 if not isinstance(entries, list):
     fail("files must be an array of tables")
-
 seen: set[str] = set()
 for number, entry in enumerate(entries, start=1):
     if not isinstance(entry, dict):
@@ -206,7 +346,6 @@ for number, entry in enumerate(entries, start=1):
         fail(f"entry #{number} has unknown key(s): {', '.join(sorted(unknown))}")
     if missing:
         fail(f"entry #{number} is missing key(s): {', '.join(sorted(missing))}")
-
     path = entry["path"]
     kind = entry["kind"]
     tokens = entry["baseline_tokens"]
@@ -238,7 +377,6 @@ for number, entry in enumerate(entries, start=1):
     print(f"{path}\t{kind}\t{tokens}\t{lines}\t{issue}\t{rationale}")
 PY
 }
-
 classify_kind() {
     local path="$1"
     case "$path" in
@@ -259,21 +397,17 @@ classify_kind() {
             ;;
     esac
 }
-
 is_generated_artifact() {
     local path="$1"
-
     case "$path" in
         Cargo.lock) return 0 ;;
         *) return 1 ;;
     esac
 }
-
 line_count() {
     local file="$1"
     local path="$2"
     local lines
-
     if ! lines="$(awk 'END { print NR + 0 }' "$file" 2>/dev/null)"; then
         die "failed to count lines for $path"
     fi
@@ -283,12 +417,10 @@ line_count() {
     esac
     printf '%s\n' "$lines"
 }
-
 byte_count() {
     local file="$1"
     local path="$2"
     local bytes
-
     if ! bytes="$(wc -c <"$file" 2>/dev/null)"; then
         die "failed to count bytes for $path"
     fi
@@ -298,17 +430,26 @@ byte_count() {
     esac
     printf '%s\n' "$bytes"
 }
-
 token_count() {
     local file="$1"
     local path="$2"
-    local output stderr_file
-
+    local output stdout_file stderr_file tokenizer_status
+    stdout_file="$(mktemp "$tmp_root/tokenizer.stdout.XXXXXX")" \
+        || die "cannot create tokenizer stdout file for $path"
     stderr_file="$(mktemp "$tmp_root/tokenizer.stderr.XXXXXX")" \
         || die "cannot create tokenizer stderr file for $path"
-    if ! output="$("$tokenizer_bin" tokuin estimate --model "$tokenizer_model" --json "$file" 2>"$stderr_file")"; then
-        printf 'ERROR: tokenizer failed for %s using %s tokuin estimate --model %s --json\n' \
-            "$path" "$tokenizer_bin" "$tokenizer_model" >&2
+    if run_bounded "$stdout_file" "$stderr_file" \
+        "$tokenizer_bin" estimate --model "$tokenizer_model" --format json "$file"; then
+        output="$(<"$stdout_file")"
+    else
+        tokenizer_status=$?
+        if [ "$tokenizer_status" -eq 124 ]; then
+            printf 'ERROR: tokenizer timed out after %ss for %s\n' \
+                "$tokenizer_timeout_seconds" "$path" >&2
+            exit 2
+        fi
+        printf 'ERROR: tokenizer failed for %s using %s estimate --model %s --format json (status %s)\n' \
+            "$path" "$tokenizer_bin" "$tokenizer_model" "$tokenizer_status" >&2
         if [ -s "$stderr_file" ]; then
             sed 's/^/  /' "$stderr_file" >&2
         fi
@@ -318,13 +459,11 @@ token_count() {
 import json
 import os
 import sys
-
 try:
     value = json.loads(os.environ["TOKEN_OUTPUT"])
 except Exception as exc:
     print(f"unparsable tokenizer JSON: {exc}", file=sys.stderr)
     raise SystemExit(2)
-
 tokens = value.get("tokens", value.get("total")) if isinstance(value, dict) else None
 if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
     print("tokenizer JSON did not contain a non-negative integer tokens/total field", file=sys.stderr)
@@ -337,7 +476,6 @@ PY
         exit 2
     fi
 }
-
 declare -A candidate_kind=()
 declare -A candidate_tokens=()
 declare -A candidate_lines=()
@@ -351,13 +489,15 @@ declare -A actual_text=()
 declare -A actual_kind=()
 declare -A actual_tokens=()
 declare -A actual_lines=()
-
+declare -A trusted_text=()
+declare -A trusted_kind=()
+declare -A trusted_tokens=()
+declare -A trusted_lines=()
 candidate_manifest=""
 materialize_snapshot candidate "$baseline_path" candidate_manifest \
     || die "candidate snapshot is missing required baseline: $baseline_path"
 candidate_tsv="$tmp_root/candidate-baseline.tsv"
 parse_policy candidate "$candidate_manifest" >"$candidate_tsv"
-
 while IFS=$'\t' read -r path kind tokens lines issue rationale; do
     [ -n "$path" ] || continue
     candidate_kind["$path"]="$kind"
@@ -366,7 +506,6 @@ while IFS=$'\t' read -r path kind tokens lines issue rationale; do
     candidate_issue["$path"]="$issue"
     candidate_rationale["$path"]="$rationale"
 done <"$candidate_tsv"
-
 base_manifest=""
 bootstrap=false
 if materialize_snapshot base "$baseline_path" base_manifest; then
@@ -382,11 +521,9 @@ if materialize_snapshot base "$baseline_path" base_manifest; then
 else
     bootstrap=true
 fi
-
 measure_candidate() {
     local path="$1"
     local file lines bytes tokens kind
-
     if [ -n "${actual_text[$path]+set}" ]; then
         return 0
     fi
@@ -412,32 +549,54 @@ measure_candidate() {
     actual_lines["$path"]="$lines"
     actual_tokens["$path"]="$tokens"
 }
-
+measure_trusted_base() {
+    local path="$1"
+    local file lines bytes tokens kind
+    if [ -n "${trusted_text[$path]+set}" ]; then
+        return 0
+    fi
+    if ! materialize_snapshot base "$path" file; then
+        trusted_text["$path"]="0"
+        return 0
+    fi
+    if ! grep -Iq '' "$file" 2>/dev/null; then
+        trusted_text["$path"]="0"
+        return 0
+    fi
+    trusted_text["$path"]="1"
+    lines="$(line_count "$file" "$path")"
+    bytes="$(byte_count "$file" "$path")"
+    tokens=0
+    if [ "$bytes" -gt "$token_threshold" ] \
+        || [ "$lines" -gt "$line_threshold" ]; then
+        tokens="$(token_count "$file" "$path")"
+    fi
+    kind="$(classify_kind "$path")"
+    trusted_kind["$path"]="$kind"
+    trusted_lines["$path"]="$lines"
+    trusted_tokens["$path"]="$tokens"
+}
 is_over_limit() {
     local path="$1"
-
     [ "${actual_text[$path]:-0}" = "1" ] \
         && { [ "${actual_lines[$path]}" -gt "$line_threshold" ] \
             || [ "${actual_tokens[$path]}" -gt "$token_threshold" ]; }
 }
-
+is_trusted_over_limit() {
+    local path="$1"
+    [ "${trusted_text[$path]:-0}" = "1" ] \
+        && { [ "${trusted_lines[$path]}" -gt "$line_threshold" ] \
+            || [ "${trusted_tokens[$path]}" -gt "$token_threshold" ]; }
+}
 candidate_paths_file="$tmp_root/candidate-paths.zlist"
-if [ "$bootstrap" = true ]; then
-    case "$scope" in
-        staged) git ls-files -z --recurse-submodules >"$candidate_paths_file" ;;
-        head|object) git ls-tree -r -z --name-only "$candidate_commit" >"$candidate_paths_file" ;;
-    esac
-else
-    case "$scope" in
-        staged)
-            git diff --cached --name-only -z --diff-filter=ACMR "$base_commit" >"$candidate_paths_file"
-            ;;
-        head|object)
-            git diff --name-only -z --diff-filter=ACMR "$base_commit" "$candidate_commit" >"$candidate_paths_file"
-            ;;
-    esac
-fi
-
+case "$scope" in
+    staged)
+        git diff --cached --name-only -z --diff-filter=ACMRT "$base_commit" >"$candidate_paths_file"
+        ;;
+    head|object)
+        git diff --name-only -z --diff-filter=ACMRT "$base_commit" "$candidate_commit" >"$candidate_paths_file"
+        ;;
+esac
 declare -A paths_to_check=()
 while IFS= read -r -d '' path; do
     if is_generated_artifact "$path"; then
@@ -448,7 +607,6 @@ done <"$candidate_paths_file"
 for path in "${!candidate_tokens[@]}"; do
     paths_to_check["$path"]=1
 done
-
 declare -a policy_failures=()
 for path in "${!candidate_tokens[@]}"; do
     measure_candidate "$path"
@@ -460,29 +618,40 @@ for path in "${!candidate_tokens[@]}"; do
         policy_failures+=("BLOCK baseline policy: $path kind ${candidate_kind[$path]} does not match ${actual_kind[$path]}")
     fi
 done
-
 if [ "$bootstrap" = true ]; then
     declare -A expected_bootstrap_paths=()
+    base_paths_file="$tmp_root/base-paths.zlist"
+    git ls-tree -r -z --name-only "$base_commit" >"$base_paths_file"
     while IFS= read -r -d '' path; do
         if is_generated_artifact "$path"; then
             continue
         fi
-        measure_candidate "$path"
-        if is_over_limit "$path"; then
+        measure_trusted_base "$path"
+        if is_trusted_over_limit "$path"; then
             expected_bootstrap_paths["$path"]=1
             if [ -z "${candidate_tokens[$path]+set}" ]; then
                 policy_failures+=("BLOCK baseline bootstrap: missing required row for $path")
                 continue
             fi
-            if [ "${candidate_tokens[$path]}" -ne "${actual_tokens[$path]}" ] \
-                || [ "${candidate_lines[$path]}" -ne "${actual_lines[$path]}" ]; then
-                policy_failures+=("BLOCK baseline bootstrap: $path bounds must exactly match ${actual_tokens[$path]} tokens/${actual_lines[$path]} lines")
+            if [ "${candidate_kind[$path]}" != "${trusted_kind[$path]}" ]; then
+                policy_failures+=("BLOCK baseline bootstrap: $path kind must match trusted-base ${trusted_kind[$path]}")
+            fi
+            if [ "${candidate_tokens[$path]}" -ne "${trusted_tokens[$path]}" ] \
+                || [ "${candidate_lines[$path]}" -ne "${trusted_lines[$path]}" ]; then
+                policy_failures+=("BLOCK baseline bootstrap: $path bounds must exactly match trusted-base ${trusted_tokens[$path]} tokens/${trusted_lines[$path]} lines")
             fi
         fi
-    done <"$candidate_paths_file"
+    done <"$base_paths_file"
     for path in "${!candidate_tokens[@]}"; do
         if [ -z "${expected_bootstrap_paths[$path]+set}" ]; then
-            policy_failures+=("BLOCK baseline bootstrap: new exemption for non-oversized path $path")
+            measure_trusted_base "$path"
+            measure_candidate "$path"
+            if is_over_limit "$path" \
+                && [ "${trusted_text[$path]:-0}" != "1" ]; then
+                policy_failures+=("BLOCK baseline bootstrap: candidate-only oversized file $path")
+            else
+                policy_failures+=("BLOCK baseline bootstrap: new exemption for non-oversized trusted-base path $path")
+            fi
         fi
     done
 else
@@ -518,7 +687,6 @@ else
         fi
     done
 fi
-
 declare -a failures=()
 declare -a warnings=()
 checked=0
@@ -537,7 +705,6 @@ for path in "${!paths_to_check[@]}"; do
         failures+=("BLOCK new monolith: $path (${actual_kind[$path]}) exceeds ${line_threshold} lines/${token_threshold} tokens at ${actual_tokens[$path]} tokens/${actual_lines[$path]} lines")
     fi
 done
-
 printf '=== Monolith No-Growth Gate ===\n'
 printf 'Scope: %s\n' "$scope"
 printf 'Trusted base: %s\n' "$base_ref"
@@ -545,7 +712,6 @@ printf 'Thresholds: %s lines, %s tokens (model: %s)\n' \
     "$line_threshold" "$token_threshold" "$tokenizer_model"
 printf 'Candidate baseline rows: %s\n' "${#candidate_tokens[@]}"
 printf 'Checked text files: %s\n' "$checked"
-
 if [ "${#policy_failures[@]}" -gt 0 ]; then
     printf '\nPolicy failures:\n'
     printf '%s\n' "${policy_failures[@]}"
@@ -558,10 +724,8 @@ if [ "${#warnings[@]}" -gt 0 ]; then
     printf '\nWarnings:\n'
     printf '%s\n' "${warnings[@]}"
 fi
-
 printf '\nSummary: %s policy failure(s), %s hard failure(s), %s warning(s)\n' \
     "${#policy_failures[@]}" "${#failures[@]}" "${#warnings[@]}"
-
 if [ "${#policy_failures[@]}" -gt 0 ] || [ "${#failures[@]}" -gt 0 ]; then
     exit 1
 fi

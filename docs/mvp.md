@@ -50,6 +50,16 @@ Install:
 - `cargo-nextest` for `just test`.
 - `cargo-deny` for `just deny` and `just pre-commit-fast`.
 - `lefthook` if you want local git hooks installed.
+- Tokuin pinned to the gate's audited revision:
+
+  ```sh
+  cargo install --git https://github.com/RyderFreeman4Logos/tokuin.git --rev c68d1f804a4c172846716b7be99e9378e16512b7 --locked tokuin
+  tokuin --version  # must print: tokuin 0.3.0
+  ```
+
+The monolith gate bounds every Tokuin process to 30 seconds. On slower
+machines, `MONOLITH_TOKENIZER_TIMEOUT_SECONDS` may be set to an integer from 1
+through 300; invalid values and tokenizer timeouts fail the gate closed.
 
 Clone and build:
 
