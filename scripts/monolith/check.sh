@@ -77,6 +77,8 @@ if [ "$scope" != "object" ] && [ -n "$object_id" ]; then
 fi
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
     || die "cannot determine the repository root"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+tokenizer_runner="$script_dir/tokenizer_runner.py"
 cd "$repo_root"
 if [ -z "$base_ref" ]; then
     default_branch="${DEFAULT_BRANCH:-main}"
@@ -134,83 +136,8 @@ run_bounded() {
     local stdout_file="$1"
     local stderr_file="$2"
     shift 2
-    python3 - "$tokenizer_timeout_seconds" "$stdout_file" "$stderr_file" "$@" <<'PY'
-import ctypes
-import os
-import signal
-import subprocess
-import sys
-import time
-timeout = int(sys.argv[1])
-stdout_path, stderr_path = sys.argv[2:4]
-command = sys.argv[4:]
-try:
-    ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
-except Exception:
-    pass
-
-def group_alive(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-def reap_children() -> None:
-    while True:
-        try:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            return
-        if pid <= 0:
-            return
-
-with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        stderr.write(f"cannot execute tokenizer: {exc}\n".encode())
-        raise SystemExit(126)
-    try:
-        status = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=0.25)
-        except subprocess.TimeoutExpired:
-            pass
-        if group_alive(process.pid):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-        deadline = time.monotonic() + 1
-        while True:
-            reap_children()
-            if not group_alive(process.pid) or time.monotonic() >= deadline:
-                break
-            time.sleep(0.01)
-        raise SystemExit(124)
-if status < 0:
-    raise SystemExit(min(255, 128 - status))
-raise SystemExit(min(255, status))
-PY
+    python3 "$tokenizer_runner" \
+        "$tokenizer_timeout_seconds" "$stdout_file" "$stderr_file" "$@"
 }
 version_stdout="$tmp_root/tokenizer-version.stdout"
 version_stderr="$tmp_root/tokenizer-version.stderr"
