@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export GIT_NO_REPLACE_OBJECTS=1
 readonly baseline_path="scripts/monolith/baseline.toml"
 readonly line_threshold=800
 readonly token_threshold=8000
@@ -38,6 +39,7 @@ die() {
 scope=""
 base_ref="${BASE_REF:-}"
 object_id=""
+expected_tree=""
 report_all=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -54,6 +56,11 @@ while [ "$#" -gt 0 ]; do
         --object)
             [ "$#" -ge 2 ] || die "--object requires a value"
             object_id="$2"
+            shift 2
+            ;;
+        --expected-tree)
+            [ "$#" -ge 2 ] || die "--expected-tree requires a value"
+            expected_tree="$2"
             shift 2
             ;;
         --report-all)
@@ -80,6 +87,9 @@ if [ "$scope" = "object" ] && [ -z "$object_id" ]; then
 fi
 if [ "$scope" != "object" ] && [ -n "$object_id" ]; then
     die "--object is only valid with --scope object"
+fi
+if [ "$scope" != "staged" ] && [ -n "$expected_tree" ]; then
+    die "--expected-tree is only valid with --scope staged"
 fi
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
     || die "cannot determine the repository root"
@@ -108,6 +118,9 @@ candidate_tree=""
 if [ "$scope" = "staged" ]; then
     candidate_tree="$(git write-tree 2>/dev/null)" \
         || die "cannot capture staged index tree"
+    if [ -n "$expected_tree" ] && [ "$candidate_tree" != "$expected_tree" ]; then
+        die "staged index tree does not match aggregate receipt"
+    fi
 elif [ "$scope" = "head" ]; then
     candidate_commit="$(git rev-parse --verify --quiet 'HEAD^{commit}')" \
         || die "cannot resolve HEAD as a commit"
@@ -268,7 +281,9 @@ snapshot_entry() {
         base) treeish="$base_commit" ;;
         *) die "internal error: unknown snapshot $snapshot" ;;
     esac
-    git ls-tree -z "$treeish" -- ":(top,literal)$path" >"$entries_file"
+    if ! git ls-tree -z "$treeish" -- ":(top,literal)$path" >"$entries_file"; then
+        die "cannot enumerate $snapshot snapshot entry for $path"
+    fi
     while IFS= read -r -d '' entry; do
         count=$((count + 1))
         matched_entry="$entry"
@@ -668,6 +683,9 @@ if [ "$scope" = "staged" ]; then
 fi
 printf '=== Monolith No-Growth Gate ===\n'
 printf 'Scope: %s\n' "$scope"
+if [ "$scope" = "staged" ] && [ -n "$expected_tree" ]; then
+    printf 'Validated staged tree: %s\n' "$candidate_tree"
+fi
 printf 'Trusted base: %s\n' "$base_ref"
 printf 'Thresholds: %s lines, %s tokens (model: %s)\n' \
     "$line_threshold" "$token_threshold" "$tokenizer_model"

@@ -4,7 +4,7 @@ root="$(git rev-parse --show-toplevel)"
 checker="$root/scripts/monolith/check.sh"
 tokenizer_runner="$root/scripts/monolith/tokenizer_runner.py"
 pre_push_checker="$root/scripts/hooks/check-pre-push-version-bumps.sh"
-test_root="$(mktemp -d)"
+test_root="$(realpath -e "$(mktemp -d)")"
 case_filter="${MONOLITH_TEST_CASE:-}"
 registered_case_count=0
 executed_case_count=0
@@ -202,6 +202,63 @@ assert_output_count() {
     [ "$actual" -eq "$expected" ] \
         || die "$name expected $expected matches for '$pattern', got $actual"
 }
+run_aggregate() {
+    local repo="$1" bin_dir="$2"
+    (
+        cd "$repo"
+        PATH="$bin_dir:$PATH" BASE_REF=base JUST_NO_DOTENV=true \
+            REQUIRE_NO_REPLACE_OBJECTS="${REQUIRE_NO_REPLACE_OBJECTS:-0}" \
+            run_without_git_env just pre-commit-fast staged
+    )
+}
+run_fmt_fixture() {
+    local repo="$1" bin_dir="$2"
+    (cd "$repo" && PATH="$bin_dir:$PATH" run_without_git_env just fmt)
+}
+run_pre_push() {
+    local repo="$1" bin_dir="$2" input="$3" version_log="$4" full_gate_log="$5"
+    (
+        cd "$repo"
+        if [ -n "$input" ]; then
+            printf '%s\n' "$input"
+        fi | PATH="$repo/test-bin:$bin_dir:$PATH" BASE_REF=base \
+            VERSION_CHECK_LOG="$version_log" FULL_GATE_LOG="$full_gate_log" \
+            run_without_git_env "$repo/scripts/hooks/check-pre-push-version-bumps.sh"
+    )
+}
+push_fixture() {
+    local repo="$1" source_ref="$3" destination_ref="$4" remote
+    remote="$(realpath -e -- "$2")" || die 'cannot canonicalize bare fixture'
+    case "$remote" in
+        "$test_root"/*) ;;
+        *) die 'fixture push escaped its temporary root' ;;
+    esac
+    [ "$(run_without_git_env git --git-dir="$remote" \
+        rev-parse --is-bare-repository)" = true ] || die 'push target is not bare'
+    run_without_git_env env -u GIT_NO_REPLACE_OBJECTS \
+        GIT_ALLOW_PROTOCOL=file GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        git -C "$repo" push --quiet "$remote" "$source_ref:$destination_ref"
+}
+install_push_hook() {
+    local repo="$1" hooks
+    hooks="$(run_without_git_env git -C "$repo" \
+        rev-parse --path-format=absolute --git-path hooks)"
+    case "$hooks" in
+        "$test_root"/*) ;;
+        *) die 'fixture hooks escaped their temporary root' ;;
+    esac
+    cp "$repo/scripts/hooks/check-pre-push-version-bumps.sh" "$hooks/pre-push"
+    chmod +x "$hooks/pre-push"
+}
+gated_push_fixture() {
+    local repo="$1" bin_dir="$2" remote="$3" source_ref="$4" destination_ref="$5"
+    local version_log="$6" full_gate_log="$7"
+    (
+        export PATH="$repo/test-bin:$bin_dir:$PATH" BASE_REF=base
+        export VERSION_CHECK_LOG="$version_log" FULL_GATE_LOG="$full_gate_log"
+        push_fixture "$repo" "$remote" "$source_ref" "$destination_ref"
+    )
+}
 # shellcheck source=scripts/tests/monolith-tokenizer-tests.sh
 source "$root/scripts/tests/monolith-tokenizer-tests.sh"
 # shellcheck source=scripts/tests/monolith-git-security-tests.sh
@@ -392,14 +449,24 @@ run_registered_case 'F4 timeout cleanup' test_tokenizer_timeout_cleans_process_t
 run_registered_case 'R2-A literal paths staged' test_literal_pathname_matrix staged
 run_registered_case 'R2-A literal paths head' test_literal_pathname_matrix head
 run_registered_case 'R2-A literal paths object' test_literal_pathname_matrix object
+run_registered_case 'R2-B literal trusted base staged' test_literal_trusted_base_matrix staged
+run_registered_case 'R2-B literal trusted base head' test_literal_trusted_base_matrix head
+run_registered_case 'R2-B literal trusted base object' test_literal_trusted_base_matrix object
+run_registered_case 'R2-B rename staged' test_git_rename_to_monolith staged
+run_registered_case 'R2-B rename head' test_git_rename_to_monolith head
+run_registered_case 'R2-B rename object' test_git_rename_to_monolith object
 run_registered_case 'R2-A annotated tag object' test_annotated_tag_object
 run_registered_case 'R2-B staged index mutation' test_staged_index_mutation_fails_closed
+run_registered_case 'R2-A aggregate final index' test_aggregate_validates_final_index
+run_registered_case 'R2-A literal restage matrix' test_fmt_restages_literal_paths
+run_registered_case 'R2-B replacement refs bare push' test_replacement_refs_are_ignored
+run_registered_case 'R2-B missing regular object pre-push' test_missing_regular_object_blocks_before_transport
 run_registered_case 'R2-C process lifecycle' test_runner_process_lifecycle_matrix
 run_registered_case 'R2-C runner output caps' test_runner_output_caps
 run_registered_case 'R2-D numeric domain' test_tokenizer_numeric_domain
 run_registered_case 'R2-D natural exit 124' test_natural_exit_124_is_not_timeout
 run_registered_case 'R2-D checker output cap' test_checker_output_cap
-[ "$registered_case_count" -eq 26 ] || die "registered: $registered_case_count/26"
+[ "$registered_case_count" -eq 36 ] || die "registered: $registered_case_count/36"
 if [ -n "$case_filter" ]; then
     [ "$executed_case_count" -eq 1 ] || die "selected: $executed_case_count"
 else

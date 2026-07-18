@@ -100,16 +100,44 @@ test_git_type_change_to_monolith() {
         'BLOCK new monolith: :type-change.rs' "$repo" "$bin_dir" "$scope"
 }
 
+test_git_rename_to_monolith() {
+    local scope="$1"
+    local repo bin_dir
+
+    repo="$(init_repo "rename-$scope")"
+    bin_dir="$test_root/rename-$scope-bin"
+    write_fake_tokenizer "$bin_dir"
+    printf 'base\n' >"$repo/src/original.rs"
+    write_policy "$repo" 'files = []'
+    commit_base "$repo"
+    run_without_git_env git -C "$repo" mv src/original.rs src/renamed.rs
+    write_lines "$repo/src/renamed.rs" 801 renamed
+    run_without_git_env git -C "$repo" add -- src/renamed.rs
+    assert_scope_failure "rename/$scope" \
+        'BLOCK new monolith: src/renamed.rs' "$repo" "$bin_dir" "$scope"
+}
+
 test_literal_pathname_matrix() {
     local scope="$1"
     local repo bin_dir path candidate_object output status
-    local -a paths=(':colon.rs' '-option.rs' $'src/line\nbreak.rs' $'src/tab\tbreak.rs')
+    local -a paths=(
+        '0:large.rs'
+        ':leading-colon.rs'
+        ':(glob)evil*.rs'
+        ':(exclude)*.rs'
+        'src/[bracket].rs'
+        'src/star*.rs'
+        'src/question?.rs'
+        $'src/line\nbreak.rs'
+    )
     local -a pathspecs=()
     repo="$(init_repo "literal-paths-$scope")"
     bin_dir="$test_root/literal-paths-$scope-bin"
     write_fake_tokenizer "$bin_dir"
     write_policy "$repo" 'files = []'
     commit_base "$repo"
+    printf 'decoy\n' >"$repo/large.rs"
+    pathspecs+=(':(top,literal)large.rs')
     for path in "${paths[@]}"; do
         write_lines "$repo/$path" 801 candidate
         pathspecs+=(":(top,literal)$path")
@@ -133,7 +161,53 @@ test_literal_pathname_matrix() {
     set -e
     [ "$status" -ne 0 ] || die "literal pathname matrix unexpectedly passed: $scope"
     assert_output_count "literal pathname hard failures/$scope" \
-        '^BLOCK new monolith:' 4 "$output"
+        '^BLOCK new monolith:' "${#paths[@]}" "$output"
+}
+
+test_literal_trusted_base_matrix() {
+    local scope="$1"
+    local repo bin_dir path candidate_object policy=''
+    local -a paths=(
+        '0:large.rs'
+        ':leading-colon.rs'
+        ':(glob)evil*.rs'
+        ':(exclude)*.rs'
+        'src/[bracket].rs'
+        'src/star*.rs'
+        'src/question?.rs'
+    )
+    local -a pathspecs=()
+
+    repo="$(init_repo "literal-trusted-base-$scope")"
+    bin_dir="$test_root/literal-trusted-base-$scope-bin"
+    write_fake_tokenizer "$bin_dir"
+    for path in "${paths[@]}"; do
+        write_lines "$repo/$path" 801 trusted
+        policy+="$(policy_row "$path" 20 801)"
+        policy+=$'\n'
+        pathspecs+=(":(top,literal)$path")
+    done
+    write_policy "$repo" "$policy"
+    run_without_git_env git -C "$repo" add scripts/monolith/baseline.toml
+    run_without_git_env git -C "$repo" add -- "${pathspecs[@]}"
+    run_without_git_env git -C "$repo" commit -q -m base
+    run_without_git_env git -C "$repo" branch base
+    candidate_object="$(run_without_git_env git -C "$repo" rev-parse HEAD)"
+    case "$scope" in
+        staged)
+            assert_success 'literal trusted-base staged paths remain readable' \
+                run_checker "$repo" "$bin_dir" staged
+            ;;
+        head)
+            assert_success 'literal trusted-base HEAD paths remain readable' \
+                run_checker "$repo" "$bin_dir" head
+            ;;
+        object)
+            assert_success 'literal trusted-base object paths remain readable' \
+                run_checker "$repo" "$bin_dir" object --object "$candidate_object"
+            ;;
+        *) die "unsupported literal trusted-base scope: $scope" ;;
+    esac
 }
 
 test_annotated_tag_object() {
@@ -210,24 +284,6 @@ SH
     write_fake_tokenizer "$bin_dir"
 }
 
-run_pre_push() {
-    local repo="$1"
-    local bin_dir="$2"
-    local input="$3"
-    local version_log="$4"
-    local full_gate_log="$5"
-    (
-        cd "$repo"
-        if [ -n "$input" ]; then
-            printf '%s\n' "$input"
-        fi | PATH="$repo/test-bin:$bin_dir:$PATH" \
-            BASE_REF=base \
-            VERSION_CHECK_LOG="$version_log" \
-            FULL_GATE_LOG="$full_gate_log" \
-            run_without_git_env "$repo/scripts/hooks/check-pre-push-version-bumps.sh"
-    )
-}
-
 test_pre_push_object_parser() {
     local repo bin_dir good_object bad_object zero input output version_log full_gate_log
     repo="$(init_repo pre-push-object-parser)"
@@ -280,4 +336,320 @@ refs/heads/bad $bad_object refs/heads/bad $zero"
         run_pre_push "$repo" "$bin_dir" 'malformed input' "$version_log" "$full_gate_log"
     [ ! -s "$version_log" ] || die 'malformed stdin invoked an object validator'
     [ ! -s "$full_gate_log" ] || die 'malformed stdin ran the full head gate'
+}
+
+prepare_aggregate_fixture() {
+    local repo="$1"
+    local bin_dir="$2"
+
+    mkdir -p "$repo/scripts/hooks" "$repo/scripts/monolith" "$repo/scripts/tests" "$bin_dir"
+    cp "$root/justfile" "$repo/justfile"
+    cp "$checker" "$repo/scripts/monolith/check.sh"
+    cp "$root/scripts/hooks/check-version-bumped.sh" \
+        "$repo/scripts/hooks/check-version-bumped.sh"
+    cp "$root/scripts/monolith/tokenizer_runner.py" \
+        "$repo/scripts/monolith/tokenizer_runner.py"
+    cp "$root/scripts/monolith/tokenizer_contract.py" \
+        "$repo/scripts/monolith/tokenizer_contract.py"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/scripts/tests/version-check-tests.sh"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/scripts/tests/monolith-check-tests.sh"
+    cat >"$bin_dir/cargo" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${REQUIRE_NO_REPLACE_OBJECTS:-0}" = 1 ] \
+    && [ "${GIT_NO_REPLACE_OBJECTS:-}" != 1 ]; then
+    printf 'aggregate did not propagate GIT_NO_REPLACE_OBJECTS=1\n' >&2
+    exit 65
+fi
+case "$1" in
+    fmt)
+        if [ "${FMT_EXPAND:-0}" = 1 ]; then
+            awk 'BEGIN { for (line = 1; line <= 801; line++) print "formatted" }' \
+                >src/format.rs
+        fi
+        ;;
+    clippy|deny) ;;
+    *)
+        printf 'unexpected cargo invocation: %s\n' "$*" >&2
+        exit 64
+        ;;
+esac
+SH
+    chmod +x \
+        "$repo/scripts/hooks/check-version-bumped.sh" \
+        "$repo/scripts/monolith/check.sh" \
+        "$repo/scripts/tests/version-check-tests.sh" \
+        "$repo/scripts/tests/monolith-check-tests.sh" \
+        "$bin_dir/cargo"
+    write_fake_tokenizer "$bin_dir"
+}
+
+commit_aggregate_base() {
+    local repo="$1"
+
+    run_without_git_env git -C "$repo" add Cargo.toml src scripts
+    run_without_git_env git -C "$repo" commit -q -m base
+    run_without_git_env git -C "$repo" branch base
+}
+
+test_aggregate_validates_final_index() {
+    local repo safe_repo bin_dir safe_bin_dir final_tree validated_tree output
+
+    repo="$(init_repo aggregate-final-index)"
+    bin_dir="$test_root/aggregate-final-index-bin"
+    prepare_aggregate_fixture "$repo" "$bin_dir"
+    printf '[workspace]\nmembers = []\n\n[workspace.package]\nversion = "0.1.0"\n' >"$repo/Cargo.toml"
+    printf 'base\n' >"$repo/src/format.rs"
+    write_policy "$repo" 'files = []'
+    commit_aggregate_base "$repo"
+    printf '[workspace]\nmembers = []\n\n[workspace.package]\nversion = "0.1.1"\n' >"$repo/Cargo.toml"
+    printf 'candidate\n' >"$repo/src/format.rs"
+    run_without_git_env git -C "$repo" add Cargo.toml src/format.rs
+
+    if output="$(FMT_EXPAND=1 run_aggregate "$repo" "$bin_dir" 2>&1)"; then
+        printf '%s\n' "$output" >&2
+        die 'aggregate accepted rustfmt-expanded final index'
+    fi
+    grep -Fq 'BLOCK new monolith: src/format.rs' <<<"$output" \
+        || die 'aggregate did not validate the rustfmt-expanded final index'
+
+    safe_repo="$(init_repo aggregate-safe-index)"
+    safe_bin_dir="$test_root/aggregate-safe-index-bin"
+    prepare_aggregate_fixture "$safe_repo" "$safe_bin_dir"
+    printf '[workspace]\nmembers = []\n\n[workspace.package]\nversion = "0.1.0"\n' >"$safe_repo/Cargo.toml"
+    printf 'base\n' >"$safe_repo/src/format.rs"
+    write_policy "$safe_repo" 'files = []'
+    commit_aggregate_base "$safe_repo"
+    printf '[workspace]\nmembers = []\n\n[workspace.package]\nversion = "0.1.1"\n' >"$safe_repo/Cargo.toml"
+    printf 'candidate\n' >"$safe_repo/src/format.rs"
+    run_without_git_env git -C "$safe_repo" add Cargo.toml src/format.rs
+    if output="$(
+        REQUIRE_NO_REPLACE_OBJECTS=1 FMT_EXPAND=0 \
+            run_aggregate "$safe_repo" "$safe_bin_dir" 2>&1
+    )"; then
+        :
+    else
+        printf '%s\n' "$output" >&2
+        die 'aggregate rejected a safe final index or lost replacement-object isolation'
+    fi
+    validated_tree="$(sed -n 's/^Final staged tree receipt: //p' <<<"$output")"
+    final_tree="$(run_without_git_env git -C "$safe_repo" write-tree)"
+    [ "$validated_tree" = "$final_tree" ] \
+        || die 'aggregate receipt did not identify the final staged tree'
+    assert_output_count 'both staged validators use the final tree' \
+        "^Validated staged tree: $final_tree$" 2 "$output"
+}
+
+test_fmt_restages_literal_paths() {
+    local repo bin_dir
+    local -a staged_paths=()
+
+    repo="$(init_repo fmt-literal-brackets)"
+    bin_dir="$test_root/fmt-literal-brackets-bin"
+    prepare_aggregate_fixture "$repo" "$bin_dir"
+    printf 'staged\n' >"$repo/[a].rs"
+    printf 'unstaged\n' >"$repo/a.rs"
+    run_without_git_env git -C "$repo" add -- ':(top,literal)[a].rs'
+    run_fmt_fixture "$repo" "$bin_dir"
+    mapfile -d '' -t staged_paths < <(
+        run_without_git_env git -C "$repo" diff --cached --name-only -z
+    )
+    [ "${#staged_paths[@]}" -eq 1 ] && [ "${staged_paths[0]}" = '[a].rs' ] \
+        || die 'fmt re-staged a path matched by bracket pathspec magic'
+
+    repo="$(init_repo fmt-literal-exclude)"
+    bin_dir="$test_root/fmt-literal-exclude-bin"
+    prepare_aggregate_fixture "$repo" "$bin_dir"
+    printf 'staged\n' >"$repo/:(exclude)*.rs"
+    printf 'unstaged\n' >"$repo/unvalidated.md"
+    run_without_git_env git -C "$repo" add -- ':(top,literal):(exclude)*.rs'
+    run_fmt_fixture "$repo" "$bin_dir"
+    mapfile -d '' -t staged_paths < <(
+        run_without_git_env git -C "$repo" diff --cached --name-only -z
+    )
+    [ "${#staged_paths[@]}" -eq 1 ] \
+        && [ "${staged_paths[0]}" = ':(exclude)*.rs' ] \
+        || die 'fmt re-staged an unrelated path through exclude pathspec magic'
+
+    repo="$(init_repo fmt-partial-stage-refusal)"
+    bin_dir="$test_root/fmt-partial-stage-refusal-bin"
+    prepare_aggregate_fixture "$repo" "$bin_dir"
+    printf 'base one\nbase two\n' >"$repo/partial.rs"
+    run_without_git_env git -C "$repo" add partial.rs
+    run_without_git_env git -C "$repo" commit -q -m base
+    printf 'staged one\nbase two\n' >"$repo/partial.rs"
+    run_without_git_env git -C "$repo" add partial.rs
+    printf 'staged one\nunstaged two\n' >"$repo/partial.rs"
+    assert_failure_matching 'fmt preserves partial-stage refusal' \
+        'refusing -- these files are partially staged' \
+        run_fmt_fixture "$repo" "$bin_dir"
+}
+
+test_replacement_refs_are_ignored() {
+    local repo bin_dir pre_push_bin bad_object good_object transport_remote gated_remote
+    local base_repo base_bin base_object replacement_object
+    local source_tree received_object received_tree
+    local version_log full_gate_log output
+
+    repo="$(init_repo replacement-candidate)"
+    bin_dir="$test_root/replacement-candidate-bin"
+    write_fake_tokenizer "$bin_dir"
+    write_policy "$repo" 'files = []'
+    commit_base "$repo"
+    write_lines "$repo/src/evil.rs" 801 evil
+    run_without_git_env git -C "$repo" add src/evil.rs
+    run_without_git_env git -C "$repo" commit -q -m bad
+    bad_object="$(run_without_git_env git -C "$repo" rev-parse HEAD)"
+    run_without_git_env git -C "$repo" branch bad "$bad_object"
+    run_without_git_env git -C "$repo" switch -q -c good base
+    mkdir -p "$repo/src"
+    printf 'safe\n' >"$repo/src/evil.rs"
+    run_without_git_env git -C "$repo" add src/evil.rs
+    run_without_git_env git -C "$repo" commit -q -m good
+    good_object="$(run_without_git_env git -C "$repo" rev-parse HEAD)"
+    run_without_git_env git -C "$repo" replace "$bad_object" "$good_object"
+    assert_failure_matching 'replacement candidate cannot hide a monolith' \
+        'BLOCK new monolith: src/evil.rs' \
+        run_checker "$repo" "$bin_dir" object --object "$bad_object"
+
+    base_repo="$(init_repo replacement-trusted-base)"
+    base_bin="$test_root/replacement-trusted-base-bin"
+    write_fake_tokenizer "$base_bin"
+    write_lines "$base_repo/src/large.rs" 801 trusted
+    write_policy "$base_repo" "$(policy_row src/large.rs 20 801)"
+    commit_base "$base_repo"
+    base_object="$(run_without_git_env git -C "$base_repo" rev-parse base)"
+    printf 'candidate\n' >"$base_repo/src/candidate.rs"
+    run_without_git_env git -C "$base_repo" add src/candidate.rs
+    run_without_git_env git -C "$base_repo" commit -q -m candidate
+    run_without_git_env git -C "$base_repo" branch candidate
+    run_without_git_env git -C "$base_repo" switch -q -c replacement-base base
+    write_policy "$base_repo" "$(policy_row src/large.rs 20 802)"
+    run_without_git_env git -C "$base_repo" add scripts/monolith/baseline.toml
+    run_without_git_env git -C "$base_repo" commit -q -m replacement-base
+    replacement_object="$(run_without_git_env git -C "$base_repo" rev-parse HEAD)"
+    run_without_git_env git -C "$base_repo" replace "$base_object" "$replacement_object"
+    run_without_git_env git -C "$base_repo" switch -q candidate
+    assert_success 'replacement trusted base cannot change monolith authority' \
+        run_checker "$base_repo" "$base_bin" head
+
+    pre_push_bin="$test_root/replacement-pre-push-bin"
+    prepare_pre_push_fixture "$repo" "$pre_push_bin"
+    transport_remote="$test_root/replacement-transport.git"
+    run_without_git_env git init -q --bare "$transport_remote"
+    push_fixture "$repo" "$transport_remote" refs/heads/bad refs/heads/probe
+    source_tree="$(run_without_git_env env GIT_NO_REPLACE_OBJECTS=1 \
+        git -C "$repo" rev-parse "${bad_object}^{tree}")"
+    received_object="$(run_without_git_env git --git-dir="$transport_remote" \
+        rev-parse refs/heads/probe)"
+    received_tree="$(run_without_git_env git --git-dir="$transport_remote" \
+        rev-parse "${received_object}^{tree}")"
+    [ "$received_object" = "$bad_object" ] \
+        || die 'ungated local push did not preserve the original malicious object'
+    [ "$received_tree" = "$source_tree" ] \
+        || die 'ungated local push did not preserve the original malicious tree'
+
+    gated_remote="$test_root/replacement-gated.git"
+    run_without_git_env git init -q --bare "$gated_remote"
+    install_push_hook "$repo"
+    version_log="$repo/version.log"
+    full_gate_log="$repo/full-gate.log"
+    : >"$version_log"
+    : >"$full_gate_log"
+    if output="$(gated_push_fixture "$repo" "$pre_push_bin" "$gated_remote" \
+        refs/heads/bad refs/heads/main "$version_log" "$full_gate_log" 2>&1)"; then
+        printf '%s\n' "$output" >&2
+        die 'replacement-ref pre-push accepted the original malicious tree'
+    fi
+    grep -Fq 'BLOCK new monolith: src/evil.rs' <<<"$output" \
+        || die 'replacement-ref pre-push did not inspect the original malicious tree'
+    [ "$(wc -l <"$version_log" | tr -d '[:space:]')" -eq 1 ] \
+        || die 'replacement-ref pre-push did not parse the complete object stream'
+    [ ! -s "$full_gate_log" ] || die 'replacement-ref pre-push ran the full gate'
+    if run_without_git_env git --git-dir="$gated_remote" show-ref --verify --quiet \
+        refs/heads/main; then
+        die 'replacement-ref pre-push failure occurred after transport'
+    fi
+    if run_without_git_env git --git-dir="$gated_remote" cat-file -e \
+        "${bad_object}^{commit}" 2>/dev/null; then
+        die 'replacement-ref pre-push failure transported an object before validation'
+    fi
+}
+
+test_missing_regular_object_blocks_before_transport() {
+    local repo bin_dir pre_push_bin control_remote gated_remote source_ref blob_id
+    local object_path tree_id candidate remote_main receiver_candidate
+    local version_log full_gate_log output
+
+    repo="$(init_repo missing-regular-object)"
+    bin_dir="$test_root/missing-regular-object-bin"
+    write_fake_tokenizer "$bin_dir"
+    write_lines "$repo/src/remote-owned.rs" 801 remote
+    write_policy "$repo" 'files = []'
+    commit_base "$repo"
+    control_remote="$test_root/missing-object-control.git"
+    gated_remote="$test_root/missing-object-gated.git"
+    run_without_git_env git init -q --bare "$control_remote"
+    run_without_git_env git init -q --bare "$gated_remote"
+    blob_id="$(run_without_git_env git -C "$repo" rev-parse HEAD:src/remote-owned.rs)"
+    source_ref="refs/heads/$(run_without_git_env git -C "$repo" \
+        symbolic-ref --short HEAD)"
+    push_fixture "$repo" "$control_remote" "$source_ref" refs/heads/main
+    push_fixture "$repo" "$gated_remote" "$source_ref" refs/heads/main
+    remote_main="$(run_without_git_env git --git-dir="$gated_remote" \
+        rev-parse refs/heads/main)"
+    [ "$remote_main" = "$(run_without_git_env git -C "$repo" rev-parse HEAD)" ] \
+        || die 'local base push did not transfer the remote-owned base object'
+    run_without_git_env git --git-dir="$control_remote" cat-file -e "${blob_id}^{blob}" \
+        || die 'control receiver does not own the prerequisite blob'
+    run_without_git_env git --git-dir="$gated_remote" cat-file -e "${blob_id}^{blob}" \
+        || die 'gated receiver does not own the prerequisite blob'
+    run_without_git_env git -C "$repo" update-index --add \
+        --cacheinfo "100644,$blob_id,src/ghost.rs"
+    tree_id="$(run_without_git_env git -C "$repo" write-tree)"
+    candidate="$(printf 'missing regular blob\n' \
+        | run_without_git_env git -C "$repo" commit-tree "$tree_id" -p HEAD)"
+    run_without_git_env git -C "$repo" update-ref refs/heads/bad "$candidate"
+    object_path="$(run_without_git_env git -C "$repo" rev-parse --git-path \
+        "objects/${blob_id:0:2}/${blob_id:2}")"
+    if [[ "$object_path" != /* ]]; then
+        object_path="$repo/$object_path"
+    fi
+    [ -f "$object_path" ] || die 'fixture expected a loose remote-owned blob'
+    rm -f -- "$object_path"
+
+    push_fixture "$repo" "$control_remote" refs/heads/bad refs/heads/bad
+    receiver_candidate="$(run_without_git_env git --git-dir="$control_remote" \
+        rev-parse refs/heads/bad)"
+    [ "$receiver_candidate" = "$candidate" ] \
+        || die 'ungated receiver did not accept the candidate with its owned blob'
+
+    pre_push_bin="$test_root/missing-regular-object-pre-push-bin"
+    prepare_pre_push_fixture "$repo" "$pre_push_bin"
+    install_push_hook "$repo"
+    version_log="$repo/version.log"
+    full_gate_log="$repo/full-gate.log"
+    : >"$version_log"
+    : >"$full_gate_log"
+    if output="$(gated_push_fixture "$repo" "$pre_push_bin" "$gated_remote" \
+        refs/heads/bad refs/heads/bad "$version_log" "$full_gate_log" 2>&1)"; then
+        printf '%s\n' "$output" >&2
+        die 'pre-push accepted a missing regular blob that the receiver already owns'
+    fi
+    grep -Fq 'cannot materialize candidate snapshot blob for src/ghost.rs' <<<"$output" \
+        || die 'missing regular blob did not produce the exact-object failure'
+    [ "$(wc -l <"$version_log" | tr -d '[:space:]')" -eq 1 ] \
+        || die 'missing regular blob pre-push did not parse the complete object stream'
+    [ ! -s "$full_gate_log" ] || die 'missing regular blob pre-push ran the full gate'
+    [ "$(run_without_git_env git --git-dir="$gated_remote" \
+        rev-parse refs/heads/main)" = "$remote_main" ] \
+        || die 'gated receiver main changed after pre-push rejection'
+    if run_without_git_env git --git-dir="$gated_remote" show-ref --verify --quiet \
+        refs/heads/bad; then
+        die 'missing regular blob was transported before pre-push rejection'
+    fi
+    if run_without_git_env git --git-dir="$gated_remote" cat-file -e \
+        "${candidate}^{commit}" 2>/dev/null; then
+        die 'missing regular blob pre-push transported an object before validation'
+    fi
 }

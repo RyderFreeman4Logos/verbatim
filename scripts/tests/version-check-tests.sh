@@ -267,6 +267,66 @@ touch "$repo/unrelated-worktree-file"
         run_without_local_git_env "$checker" --scope head --base-ref base
 )
 
+test_version_snapshot_object_authority() {
+    local replacement_repo base_repo missing_repo bad_object good_object base_object benign_object
+    local missing_object missing_tree
+
+    replacement_repo="$(init_repo version-replacement-candidate)"
+    commit_manifest "$replacement_repo" "0.1.0" base
+    run_without_local_git_env git -C "$replacement_repo" branch base
+    printf 'unchanged version candidate\n' >"$replacement_repo/marker"
+    run_without_local_git_env git -C "$replacement_repo" add marker
+    run_without_local_git_env git -C "$replacement_repo" commit -q -m bad
+    bad_object="$(run_without_local_git_env git -C "$replacement_repo" rev-parse HEAD)"
+    run_without_local_git_env git -C "$replacement_repo" switch -q -c good base
+    commit_manifest "$replacement_repo" "0.1.1" good
+    good_object="$(run_without_local_git_env git -C "$replacement_repo" rev-parse HEAD)"
+    run_without_local_git_env git -C "$replacement_repo" replace "$bad_object" "$good_object"
+    (
+        cd "$replacement_repo"
+        assert_failure_matching \
+            'replacement candidate cannot hide an unchanged workspace version' \
+            'equal SemVer precedence' \
+            run_without_local_git_env "$checker" --scope object --object "$bad_object" --base-ref base
+    )
+
+    base_repo="$(init_repo version-replacement-base)"
+    commit_manifest "$base_repo" "0.1.0" base
+    base_object="$(run_without_local_git_env git -C "$base_repo" rev-parse HEAD)"
+    run_without_local_git_env git -C "$base_repo" branch base
+    run_without_local_git_env git -C "$base_repo" switch -q -c candidate base
+    commit_manifest "$base_repo" "0.1.1" candidate
+    run_without_local_git_env git -C "$base_repo" switch -q -c benign-base base
+    commit_manifest "$base_repo" "9.0.0" benign-base
+    benign_object="$(run_without_local_git_env git -C "$base_repo" rev-parse HEAD)"
+    run_without_local_git_env git -C "$base_repo" replace "$base_object" "$benign_object"
+    run_without_local_git_env git -C "$base_repo" switch -q candidate
+    (
+        cd "$base_repo"
+        assert_success \
+            'replacement trusted base cannot change version authority' \
+            run_without_local_git_env "$checker" --scope head --base-ref base
+    )
+
+    missing_repo="$(init_repo version-missing-cargo-blob)"
+    commit_manifest "$missing_repo" "0.1.0" base
+    run_without_local_git_env git -C "$missing_repo" branch base
+    missing_object="1111111111111111111111111111111111111111"
+    missing_tree="$(printf '100644 blob %s\tCargo.toml\0' "$missing_object" \
+        | run_without_local_git_env git -C "$missing_repo" mktree -z --missing)"
+    bad_object="$(printf 'missing cargo blob\n' \
+        | run_without_local_git_env git -C "$missing_repo" commit-tree "$missing_tree" -p base)"
+    (
+        cd "$missing_repo"
+        assert_failure_matching \
+            'missing regular Cargo.toml blob has a named object failure' \
+            'cannot materialize object snapshot Cargo.toml blob' \
+            run_without_local_git_env "$checker" --scope object --object "$bad_object" --base-ref base
+    )
+}
+
+test_version_snapshot_object_authority
+
 if [ "${VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH:-}" != "1" ]; then
     run_version_pre_push_tests
 fi

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export GIT_NO_REPLACE_OBJECTS=1
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2

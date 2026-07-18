@@ -15,15 +15,41 @@ default: pre-commit
 # Core Workflow
 # ==============================================================================
 
-# Fast pre-commit: staged snapshot policy gates, focused fixtures, formatting, and linting.
+# Fast pre-commit: formatting completes before the immutable staged snapshot gates.
 pre-commit-fast scope="staged":
-    just check-version-bumped {{quote(scope)}}
-    just check-monolith {{quote(scope)}}
-    just version-check-test
-    just monolith-check-test
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export GIT_NO_REPLACE_OBJECTS=1
+    scope={{quote(scope)}}
     just fmt
+    if [ "$scope" = staged ]; then
+        validated_tree="$(git write-tree)"
+        assert_staged_tree() {
+            local step="$1"
+            local actual_tree
+            actual_tree="$(git write-tree)"
+            [ "$actual_tree" = "$validated_tree" ] \
+                || { printf 'ERROR: staged index changed after %s\n' "$step" >&2; exit 2; }
+        }
+        scripts/hooks/check-version-bumped.sh --scope staged --expected-tree "$validated_tree"
+        assert_staged_tree version-check
+        scripts/monolith/check.sh --scope staged --expected-tree "$validated_tree"
+        assert_staged_tree monolith-check
+    else
+        just check-version-bumped "$scope"
+        just check-monolith "$scope"
+    fi
+    just version-check-test
+    if [ "$scope" = staged ]; then assert_staged_tree version-fixtures; fi
+    just monolith-check-test
+    if [ "$scope" = staged ]; then assert_staged_tree monolith-fixtures; fi
     just clippy
+    if [ "$scope" = staged ]; then assert_staged_tree clippy; fi
     just deny
+    if [ "$scope" = staged ]; then
+        assert_staged_tree deny
+        printf 'Final staged tree receipt: %s\n' "$validated_tree"
+    fi
 
 # Full pre-commit: version validation in the selected snapshot plus formatting, linting, and tests.
 pre-commit scope="staged":
@@ -112,7 +138,8 @@ fmt:
         exit 0
     fi
     cargo fmt --all
-    printf '%s\0' "${staged_rs[@]}" | xargs -0 git add --
+    printf '%s\0' "${staged_rs[@]}" \
+        | GIT_LITERAL_PATHSPECS=1 git add --pathspec-from-file=- --pathspec-file-nul
 
 # Clippy for entire workspace (strict).
 clippy:
