@@ -56,6 +56,17 @@ pre-commit scope="staged":
     just pre-commit-fast {{quote(scope)}}
     just test
 
+# Internal pre-push aggregate. It intentionally omits hook fixture suites to avoid recursion.
+pre-push-gate scope="head":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just check-version-bumped {{quote(scope)}}
+    just check-monolith {{quote(scope)}}
+    just clippy
+    just deny
+    just test
+    printf 'pre-push-gate: PARTIAL PASS (%s)\n' {{quote(scope)}}
+
 # ==============================================================================
 # Versioning
 # ==============================================================================
@@ -70,11 +81,20 @@ check-monolith scope="staged":
 
 # Test staged and HEAD workspace-version snapshot semantics.
 version-check-test:
-    bash scripts/tests/version-check-tests.sh
+    env -u VERSION_CHECK_TEST_CASE -u VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH \
+        bash scripts/tests/version-check-tests.sh
+
+# Run exactly one version-fixture case; this is not a canonical full-suite receipt.
+version-check-test-focused test_case:
+    VERSION_CHECK_TEST_CASE={{quote(test_case)}} bash scripts/tests/version-check-tests.sh
 
 # Test staged/object monolith snapshot and fail-closed policy semantics.
 monolith-check-test:
-    bash scripts/tests/monolith-check-tests.sh
+    env -u MONOLITH_TEST_CASE bash scripts/tests/monolith-check-tests.sh
+
+# Run exactly one monolith-fixture case; this is not a canonical full-suite receipt.
+monolith-check-test-focused test_case:
+    MONOLITH_TEST_CASE={{quote(test_case)}} bash scripts/tests/monolith-check-tests.sh
 
 # Bump the workspace patch version and refresh Cargo.lock.
 bump-patch:

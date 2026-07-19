@@ -2,82 +2,7 @@
 # Tokenizer-specific fixtures sourced by monolith-check-tests.sh.
 
 write_fake_tokenizer() {
-    local bin_dir="$1"
-    mkdir -p "$bin_dir"
-    cat >"$bin_dir/tokuin" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-if [ "${1:-}" = "--version" ]; then
-    printf 'tokuin %s\n' "${TOKUIN_FAKE_VERSION:-0.3.0}"
-    exit 0
-fi
-file="${@: -1}"
-if [[ -f "$file" ]] && [[ "$(wc -c < "$file")" == "33" ]] \
-    && grep -Fxq 'Verbatim tokenizer attestation v1' "$file"; then
-    printf '{"model":"gpt-4o","tokens":7,"input_cost":null,"output_cost":null,"breakdown":null}\n'
-    exit 0
-fi
-case "${TOKUIN_FAKE_MODE:-normal}" in
-    failure)
-        printf 'fixture failure\n' >&2
-        exit 127
-        ;;
-    malformed)
-        printf 'not-json\n'
-        exit 0
-        ;;
-    timeout)
-        child_pid_file="${TOKUIN_FAKE_CHILD_PID_FILE:?}"
-        (
-            trap '' TERM
-            printf '%s\n' "$BASHPID" >"$child_pid_file"
-            exec sleep 600
-        ) &
-        wait "$!"
-        ;;
-    index-mutate)
-        repo="${TOKUIN_FAKE_REPO:?}"
-        marker="${TOKUIN_FAKE_MUTATION_MARKER:?}"
-        if [ ! -e "$marker" ]; then
-            awk 'BEGIN { for (line = 1; line <= 801; line++) print "late" }' \
-                >"$repo/src/index-late.rs"
-            git -C "$repo" add -- src/index-late.rs
-            : >"$marker"
-        fi
-        ;;
-    natural-124)
-        printf 'natural exit 124\n' >&2
-        exit 124
-        ;;
-    payload)
-        printf '%s' "${TOKUIN_FAKE_OUTPUT:?}"
-        exit 0
-        ;;
-    output-bomb)
-        python3 - <<'PY'
-import sys
-sys.stdout.write("o" * 4096)
-sys.stderr.write("e" * 4096)
-PY
-        exit 0
-        ;;
-    normal) ;;
-    *)
-        printf 'bad fake mode\n' >&2
-        exit 64
-        ;;
-esac
-if grep -q 'TOKEN_8002' "$file"; then
-    tokens=8002
-elif grep -q 'TOKEN_8001' "$file"; then
-    tokens=8001
-else
-    tokens=20
-fi
-printf '{"model":"gpt-4o","tokens":%s,"input_cost":null,"output_cost":null,"breakdown":null}\n' "$tokens"
-SH
-    chmod +x "$bin_dir/tokuin"
-    ln -s tokuin "$bin_dir/csa"
+    write_strict_tokuin_fake "$1"
 }
 
 write_token_fixture() {
@@ -156,23 +81,23 @@ test_object_snapshot_and_tokenizer_failures() {
 prepare_tokenizer_dependency_fixture() {
     local name="$1"
     local repo
-    repo="$(init_repo "$name")"
-    printf 'base\n' >"$repo/src/tokenizer.rs"
-    write_policy "$repo" 'files = []'
-    commit_base "$repo"
-    write_lines "$repo/src/tokenizer.rs" 801 candidate
-    run_without_git_env git -C "$repo" add src/tokenizer.rs
+    repo="$(init_repo "$name")" || return
+    printf 'base\n' >"$repo/src/tokenizer.rs" || return
+    write_policy "$repo" 'files = []' || return
+    commit_base "$repo" || return
+    write_lines "$repo/src/tokenizer.rs" 801 candidate || return
+    run_without_git_env git -C "$repo" add src/tokenizer.rs || return
     printf '%s\n' "$repo"
 }
 
 prepare_tokenizer_ratchet_fixture() {
     local name="$1" repo
-    repo="$(init_repo "$name")"
-    write_lines "$repo/src/tokenizer.rs" 801 base
-    write_policy "$repo" "$(policy_row src/tokenizer.rs 20 801)"
-    commit_base "$repo"
-    write_lines "$repo/src/tokenizer.rs" 801 candidate
-    run_without_git_env git -C "$repo" add src/tokenizer.rs
+    repo="$(init_repo "$name")" || return
+    write_lines "$repo/src/tokenizer.rs" 801 base || return
+    write_policy "$repo" "$(policy_row src/tokenizer.rs 20 801)" || return
+    commit_base "$repo" || return
+    write_lines "$repo/src/tokenizer.rs" 801 candidate || return
+    run_without_git_env git -C "$repo" add src/tokenizer.rs || return
     printf '%s\n' "$repo"
 }
 
@@ -188,7 +113,6 @@ test_tokenizer_dependency() {
         return
     fi
     write_fake_tokenizer "$bin_dir"
-    rm -- "$bin_dir/csa"
     if [ "$mode" = wrong-version ]; then
         TOKUIN_FAKE_VERSION=9.9.9
         export TOKUIN_FAKE_VERSION
@@ -455,14 +379,67 @@ PY
 
 run_cd_checker() {
     local repo="$1" bin_dir="$2" target="$3" mode="$4" pid_file="$5" stream="${6:-}"
+    local timeout_seconds="${MONOLITH_FIXTURE_TIMEOUT_SECONDS:-1}"
     TOKUIN_FAKE_TARGET="$target" TOKUIN_FAKE_LIFECYCLE_MODE="$mode" \
         TOKUIN_FAKE_PID_FILE="$pid_file" TOKUIN_FAKE_STREAM="$stream" \
-        MONOLITH_TOKENIZER_TIMEOUT_SECONDS=1 MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES=1024 \
+        MONOLITH_TOKENIZER_TIMEOUT_SECONDS="$timeout_seconds" \
+        MONOLITH_TOKENIZER_MAX_OUTPUT_BYTES=1024 \
         run_checker_bounded "$repo" "$bin_dir" staged
+}
+
+assert_procfs_process_disappearance_is_ignored() {
+    python3 -B - "$tokenizer_runner" <<'PY'
+import errno
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+runner_path = Path(sys.argv[1])
+sys.path.insert(0, str(runner_path.parent))
+spec = importlib.util.spec_from_file_location("verbatim_tokenizer_runner_probe", runner_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load tokenizer runner probe")
+runner = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = runner
+spec.loader.exec_module(runner)
+
+probe_entry = Path("/proc/424242")
+real_iterdir = Path.iterdir
+real_read_text = Path.read_text
+hits = []
+
+
+def fake_iterdir(path):
+    if path == Path("/proc"):
+        return iter((probe_entry,))
+    return real_iterdir(path)
+
+
+def fake_read_text(path, *args, **kwargs):
+    if path == probe_entry / "stat":
+        hits.append(path)
+        raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
+    return real_read_text(path, *args, **kwargs)
+
+
+Path.iterdir = fake_iterdir
+Path.read_text = fake_read_text
+try:
+    table = runner.read_process_table()
+finally:
+    Path.iterdir = real_iterdir
+    Path.read_text = real_read_text
+if hits != [probe_entry / "stat"] or table:
+    raise SystemExit(f"procfs disappearance probe failed: hits={hits!r} table={table!r}")
+PY
+    printf 'PROCFS-CHURN: esrch=ignored\n'
 }
 
 test_runner_process_lifecycle_matrix() {
     local repo bin_dir fake prefix pid_file runner_pid output status phase mode stream cases=0
+    local MONOLITH_FIXTURE_TIMEOUT_SECONDS=3
+    assert_procfs_process_disappearance_is_ignored
     repo="$(prepare_tokenizer_ratchet_fixture tokenizer-cd-process)"
     bin_dir="$test_root/tokenizer-cd-process-bin"
     fake="$bin_dir/tokuin"
@@ -667,7 +644,7 @@ test_natural_exit_124_is_not_timeout() {
 }
 
 test_checker_output_cap() {
-    local repo bin_dir output status real_repo real_bin real_tokuin
+    local repo bin_dir output status fixture_repo fixture_bin
     repo="$(prepare_tokenizer_ratchet_fixture tokenizer-known-answer-substitute)"
     bin_dir="$test_root/tokenizer-known-answer-substitute-bin"
     write_cd_tokenizer "$bin_dir/tokuin"
@@ -681,22 +658,19 @@ test_checker_output_cap() {
         printf '%s\n' "$output" >&2
         die 'behavior substitute lacked attestation diagnostic'
     }
-    real_repo="$(init_repo real-tokenizer-attestation)"
-    write_policy "$real_repo" 'files = []'
-    printf 'base\n' >"$real_repo/src/real.rs"
-    commit_base "$real_repo"
-    printf 'candidate\n' >"$real_repo/src/real.rs"
-    run_without_git_env git -C "$real_repo" add src/real.rs
-    real_bin="$test_root/real-tokenizer-bin"
-    mkdir -p "$real_bin"
-    real_tokuin="$(command -v tokuin)"
-    [ -n "$real_tokuin" ] || die 'pinned real tokuin is unavailable for attestation'
-    ln -s "$real_tokuin" "$real_bin/tokuin"
-    output="$(run_checker_clean "$real_repo" "$real_bin" staged 2>&1)" || {
+    fixture_repo="$(init_repo fixture-tokenizer-attestation)"
+    write_policy "$fixture_repo" 'files = []'
+    printf 'base\n' >"$fixture_repo/src/real.rs"
+    commit_base "$fixture_repo"
+    printf 'candidate\n' >"$fixture_repo/src/real.rs"
+    run_without_git_env git -C "$fixture_repo" add src/real.rs
+    fixture_bin="$test_root/fixture-tokenizer-bin"
+    write_fake_tokenizer "$fixture_bin"
+    output="$(run_checker_clean "$fixture_repo" "$fixture_bin" staged 2>&1)" || {
         printf '%s\n' "$output" >&2
-        die 'pinned real tokenizer attestation failed'
+        die 'fixture tokenizer attestation failed'
     }
     grep -Fq 'Tokenizer attestation passed: tokuin 0.3.0 model=gpt-4o tokens=7' \
         <<<"$output" || die 'real tokenizer run lacked deterministic attestation receipt'
-    printf 'PROVENANCE-ATTESTATION: tokuin=0.3.0 model=gpt-4o tokens=7\n'
+    printf 'FIXTURE-ATTESTATION: tokuin=0.3.0 model=gpt-4o tokens=7\n'
 }

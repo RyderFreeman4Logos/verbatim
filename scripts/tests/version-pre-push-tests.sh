@@ -9,7 +9,7 @@ run_pre_push_path() {
     local failing_object="${5:-}"
 
     (
-        cd "$repo"
+        cd "$repo" || exit
         if [ -n "$refs" ]; then
             printf '%s\n' "$refs"
         fi | run_without_local_git_env env \
@@ -28,8 +28,8 @@ run_just_recipe() {
     local scope="$3"
 
     (
-        cd "$repo"
-        BASE_REF=base VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH=1 PATH="$repo/test-bin:$PATH" \
+        cd "$repo" || exit
+        BASE_REF=base PATH="$repo/test-bin:$PATH" \
             just "$recipe" "$scope"
     )
 }
@@ -112,11 +112,8 @@ PY
         "$repo/scripts/monolith/check.sh" \
         "$repo/scripts/tests/version-check-tests.sh"
     printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/test-bin/cargo"
-    printf '%s\n' \
-        '#!/usr/bin/env bash' \
-        'printf '\''{"tokens":20}\n'\''' \
-        >"$repo/test-bin/csa"
-    chmod +x "$repo/test-bin/cargo" "$repo/test-bin/csa"
+    chmod +x "$repo/test-bin/cargo"
+    write_strict_tokuin_fake "$repo/test-bin"
 }
 
 commit_pre_push_fixture_artifacts() {
@@ -151,7 +148,7 @@ install_pre_push_recorders() {
         '#!/usr/bin/env bash' \
         'set -euo pipefail' \
         ': "${VERSION_CHECK_FULL_GATE_LOG:?}"' \
-        'if [ "$#" -ne 2 ] || [ "$1" != "pre-commit" ] || [ "$2" != "head" ]; then' \
+        'if [ "$#" -ne 2 ] || [ "$1" != "pre-push-gate" ] || [ "$2" != "head" ]; then' \
         '    printf "unexpected full gate invocation: %s\\n" "$*" >&2' \
         '    exit 64' \
         'fi' \
@@ -179,7 +176,7 @@ run_version_pre_push_tests() {
 
     sentinel="$repo/invalid-scope-sentinel"
     scope_payload="staged; touch $sentinel"
-    for recipe in check-version-bumped pre-commit-fast pre-commit; do
+    for recipe in check-version-bumped pre-commit-fast pre-commit pre-push-gate; do
         assert_invalid_scope_rejected \
             "$repo" "$recipe" \
             'command separator' \
@@ -188,7 +185,7 @@ run_version_pre_push_tests() {
     done
 
     (
-        cd "$repo"
+        cd "$repo" || exit
         assert_success \
             'object check validates an annotated tag object rather than ambient HEAD' \
             run_without_local_git_env "$checker" --scope object --object "$tag_object" --base-ref base
@@ -197,6 +194,15 @@ run_version_pre_push_tests() {
             'equal SemVer precedence' \
             run_without_local_git_env "$checker" --scope object --object "$unchanged_object" --base-ref base
     )
+
+    internal_gate_output="$(assert_success_output \
+        'internal pre-push aggregate runs the bounded production gate' \
+        run_just_recipe "$repo" pre-push-gate head)"
+    assert_output_count \
+        'internal pre-push aggregate partial receipt' \
+        '^pre-push-gate: PARTIAL PASS \(head\)$' \
+        1 \
+        "$internal_gate_output"
 
     write_manifest "$repo/Cargo.toml" "0.1.0"
     run_without_local_git_env git -C "$repo" add Cargo.toml
@@ -221,7 +227,7 @@ validator|--scope|object|--object|$tag_object" \
         '^Scope: object$' \
         2 \
         "$pre_push_output"
-    assert_file_content 'pre-push full gate call' 'pre-commit head' "$full_gate_log"
+    assert_file_content 'pre-push internal gate call' 'pre-push-gate head' "$full_gate_log"
 
     : >"$validator_log"
     : >"$full_gate_log"
@@ -272,5 +278,5 @@ validator|--scope|object|--object|$tag_object" \
         "$validator_log" \
         "$full_gate_log"
     assert_file_content 'deletion does not invoke the object validator' '' "$validator_log"
-    assert_file_content 'deletion full gate call' 'pre-commit head' "$full_gate_log"
+    assert_file_content 'deletion internal gate call' 'pre-push-gate head' "$full_gate_log"
 }

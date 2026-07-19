@@ -63,4 +63,4 @@ done
 
 [ "$input_seen" -eq 1 ] || die "missing pre-push reference input"
 
-VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH=1 just pre-commit head
+just pre-push-gate head

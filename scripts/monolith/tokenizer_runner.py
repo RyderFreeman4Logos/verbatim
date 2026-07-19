@@ -139,7 +139,13 @@ def read_process_table() -> dict[int, tuple[int, int]]:
             parent_pid = int(fields[1])
             start_time = int(fields[19])
             table[int(entry.name)] = (parent_pid, start_time)
-        except (FileNotFoundError, PermissionError, IndexError, ValueError):
+        except (
+            FileNotFoundError,
+            PermissionError,
+            ProcessLookupError,
+            IndexError,
+            ValueError,
+        ):
             continue
     return table
 
