@@ -43,6 +43,8 @@ pre-commit-fast scope="staged":
     if [ "$scope" = staged ]; then assert_staged_tree version-fixtures; fi
     just monolith-check-test
     if [ "$scope" = staged ]; then assert_staged_tree monolith-fixtures; fi
+    just gate-fixture-contract-test
+    if [ "$scope" = staged ]; then assert_staged_tree gate-fixtures; fi
     just clippy
     if [ "$scope" = staged ]; then assert_staged_tree clippy; fi
     just deny
@@ -95,6 +97,15 @@ monolith-check-test:
 # Run exactly one monolith-fixture case; this is not a canonical full-suite receipt.
 monolith-check-test-focused test_case:
     MONOLITH_TEST_CASE={{quote(test_case)}} bash scripts/tests/monolith-check-tests.sh
+
+# Test canonical local-gate fixture wiring with external selectors removed.
+gate-fixture-contract-test:
+    env -u GATE_FIXTURE_ORACLE -u GATE_FIXTURE_TEST_CASE \
+        bash scripts/tests/gate-fixture-contract-tests.sh
+
+# Exercise the canonical pre-commit wiring without becoming part of its six-case suite.
+gate-fixture-contract-wiring-test:
+    GATE_FIXTURE_ORACLE=canonical-wiring bash scripts/tests/gate-fixture-contract-tests.sh
 
 # Bump the workspace patch version and refresh Cargo.lock.
 bump-patch:

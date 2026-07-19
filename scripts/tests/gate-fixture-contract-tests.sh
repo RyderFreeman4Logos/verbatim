@@ -190,6 +190,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         executed_case_count=$((executed_case_count + 1))
         printf 'CASE: %s\n' "$name"
         "$@"
+        printf 'CASE-PASS: %s\n' "$name"
     }
 
     run_isolated_git() {
@@ -211,7 +212,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             die 'monolith suite depended on host tokuin'
         }
         grep -Fq 'monolith-check-tests: PASS (50 Tier-4 cases)' <<<"$output" \
-            || die 'monolith suite did not produce its complete manifest receipt'
+            || { printf '%s\n' "$output" >&2; die 'monolith suite did not produce its complete manifest receipt'; }
         output="$(PATH="$hostile_bin:$PATH" JUST_NO_DOTENV=true \
             env -u VERSION_CHECK_TEST_CASE -u VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH \
             just version-check-test 2>&1)" || {
@@ -253,6 +254,63 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             || die 'canonical monolith receipt changed under external selector'
         [ "$(receipt_lines <<<"$clean_version")" = "$(receipt_lines <<<"$hostile_version")" ] \
             || die 'canonical version receipt changed under external skip variable'
+    }
+
+    test_canonical_pre_commit_fast_executes_gate_fixture_contracts() {
+        local just_binary canonical_bin log output case_count case_unique_count
+        local case_pass_count case_pass_unique_count
+
+        just_binary="$(command -v just)"
+        [ -x "$just_binary" ] || die "just binary is not executable: $just_binary"
+        canonical_bin="$test_root/canonical-pre-commit-bin"
+        log="$test_root/canonical-pre-commit.log"
+        mkdir -p "$canonical_bin"
+        cat >"$canonical_bin/just" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${GATE_FIXTURE_JUST_BINARY:?}"
+: "${GATE_FIXTURE_LOG:?}"
+: "${GATE_FIXTURE_ROOT:?}"
+printf 'just|%s\n' "$*" >>"$GATE_FIXTURE_LOG"
+case "$*" in
+    fmt|"check-version-bumped head"|"check-monolith head"|clippy|deny) exit 0 ;;
+    version-check-test) printf 'version-check-tests: PASS (12 Tier-4 cases)\n' ;;
+    monolith-check-test) printf 'monolith-check-tests: PASS (50 Tier-4 cases)\n' ;;
+    gate-fixture-contract-test)
+        cd "$GATE_FIXTURE_ROOT"
+        exec "$GATE_FIXTURE_JUST_BINARY" gate-fixture-contract-test
+        ;;
+    *) printf 'unexpected canonical inner just invocation: %s\n' "$*" >&2; exit 64 ;;
+esac
+SH
+        chmod +x "$canonical_bin/just"
+
+        output="$(
+            cd "$root"
+            PATH="$canonical_bin:$PATH" JUST_NO_DOTENV=true \
+                GATE_FIXTURE_JUST_BINARY="$just_binary" \
+                GATE_FIXTURE_LOG="$log" GATE_FIXTURE_ROOT="$root" \
+                GATE_FIXTURE_ORACLE=poisoned \
+                GATE_FIXTURE_TEST_CASE='R2-E host Tokuin independence' \
+                "$just_binary" pre-commit-fast head 2>&1
+        )" || {
+            printf '%s\n' "$output" >&2
+            die 'canonical pre-commit-fast gate-fixture execution failed'
+        }
+
+        [ "$(grep -Fc 'just|gate-fixture-contract-test' "$log")" -eq 1 ] \
+            || die 'canonical gate-fixture helper recipe was not dispatched exactly once'
+        case_count="$(sed -n '/^CASE: R2-[EFG] /p' <<<"$output" | wc -l | tr -d '[:space:]')"
+        case_unique_count="$(sed -n '/^CASE: R2-[EFG] /p' <<<"$output" | sort -u | wc -l | tr -d '[:space:]')"
+        case_pass_count="$(sed -n '/^CASE-PASS: R2-[EFG] /p' <<<"$output" | wc -l | tr -d '[:space:]')"
+        case_pass_unique_count="$(sed -n '/^CASE-PASS: R2-[EFG] /p' <<<"$output" | sort -u | wc -l | tr -d '[:space:]')"
+        [ "$case_count" -eq 6 ] && [ "$case_unique_count" -eq 6 ] \
+            || die 'canonical gate-fixture receipt did not execute six unique cases'
+        [ "$case_pass_count" -eq 6 ] && [ "$case_pass_unique_count" -eq 6 ] \
+            || die 'canonical gate-fixture receipt lacks six positive case completions'
+        grep -Fq 'gate-fixture-contract-tests: PASS (6 Tier-4 cases)' <<<"$output" \
+            || die 'canonical gate-fixture recipe did not produce its complete receipt'
     }
 
     write_harness_mutation() {
@@ -495,6 +553,16 @@ PY
         grep -Fq 'pre-commit-fast: fixture PASS' <<<"$output" \
             || die 'pre-commit boundary did not produce its bounded receipt'
     }
+
+    case "${GATE_FIXTURE_ORACLE:-}" in
+        canonical-wiring)
+            test_canonical_pre_commit_fast_executes_gate_fixture_contracts
+            printf 'gate-fixture-contract-wiring-test: PASS\n'
+            exit 0
+            ;;
+        '') ;;
+        *) die 'unsupported gate-fixture oracle' ;;
+    esac
 
     run_gate_case 'R2-E host Tokuin independence' test_host_tokuin_independence
     run_gate_case 'R2-F canonical entrypoint sanitization' test_canonical_entrypoint_sanitization

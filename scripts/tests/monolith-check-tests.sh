@@ -306,6 +306,18 @@ source "$root/scripts/tests/gate-fixture-contract-tests.sh"
 source "$root/scripts/tests/monolith-tokenizer-tests.sh"
 # shellcheck source=scripts/tests/monolith-git-security-tests.sh
 source "$root/scripts/tests/monolith-git-security-tests.sh"
+
+aggregate_fixture_definition="$(declare -f prepare_aggregate_fixture)"
+[ -n "$aggregate_fixture_definition" ] || die 'aggregate fixture helper is unavailable'
+eval "${aggregate_fixture_definition/prepare_aggregate_fixture/prepare_aggregate_fixture_without_gate_fixture}"
+prepare_aggregate_fixture() {
+    local repo="$1"
+
+    prepare_aggregate_fixture_without_gate_fixture "$@"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/scripts/tests/gate-fixture-contract-tests.sh"
+    chmod +x "$repo/scripts/tests/gate-fixture-contract-tests.sh"
+}
+
 test_hostile_global_system_git_config_is_ignored() {
     local hooks template global_config system_config repo local_hooks bin_dir output fixture_status
     hooks="$test_root/hostile-hooks"
