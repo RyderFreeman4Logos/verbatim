@@ -31,7 +31,7 @@ test_staged_baseline_is_authoritative() {
     run_without_git_env git -C "$repo" add scripts/monolith/baseline.toml
     write_policy "$repo" "$policy"
     assert_failure_matching 'staged baseline ignores worktree restoration' \
-        'cap changed while src/base.rs remains oversized' \
+        'cap increased for src/base.rs' \
         run_checker "$repo" "$bin_dir" staged
 }
 

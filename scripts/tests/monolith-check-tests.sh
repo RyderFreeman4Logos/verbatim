@@ -13,7 +13,7 @@ declare -A registered_case_names=()
 declare -a registered_case_manifest=()
 readonly tokenizer_revision="c68d1f804a4c172846716b7be99e9378e16512b7"
 readonly checker_outer_timeout_seconds=15
-readonly expected_case_manifest_sha256="6b92a78284a49ce0e5e9adb4384321e21c68e113a7134212aa6c55dfc3718f17"
+readonly expected_case_manifest_sha256="57f521818311eafba23c4f107fa2d64ef5fa6ab18f8f64abeaaa05b91af6e9e2"
 cleanup() {
     rm -rf -- "$test_root"
 }
@@ -467,8 +467,8 @@ import tomllib
 with open(sys.argv[1], "rb") as fh:
     data = tomllib.load(fh)
 rows = data["files"]
-if len(rows) != 21:
-    raise SystemExit(f"expected 21 baseline rows, got {len(rows)}")
+if len(rows) != 24:
+    raise SystemExit(f"expected 24 baseline rows, got {len(rows)}")
 if any(row.get("issue") != "368" for row in rows):
     raise SystemExit("every canonical baseline row must use issue 368")
 if any(not isinstance(row.get("rationale"), str) or not row["rationale"].strip() for row in rows):
@@ -505,7 +505,7 @@ test_equal_and_decreased_bounds_pass() {
     run_without_git_env git -C "$repo" add src/large.rs
     assert_success 'decreased source bounds pass' run_checker "$repo" "$bin_dir" staged
 }
-test_baseline_row_removal_after_refactor_passes() {
+test_baseline_row_removal_fails_closed() {
     local repo bin_dir
     repo="$(init_repo baseline-row-removal)"
     bin_dir="$test_root/baseline-row-removal-bin"
@@ -516,7 +516,20 @@ test_baseline_row_removal_after_refactor_passes() {
     write_lines "$repo/src/refactored.rs" 800 refactored
     write_policy "$repo" 'files = []'
     run_without_git_env git -C "$repo" add src/refactored.rs scripts/monolith/baseline.toml
-    assert_success 'baseline row removal after shrinking below the global limit passes' \
+    assert_failure_matching 'immutable row removal blocks' 'required row removed for src/refactored.rs' \
+        run_checker "$repo" "$bin_dir" staged
+}
+test_recalibration_cannot_remove_row() {
+    local repo bin_dir
+    repo="$(init_repo recalibration-removal)"
+    bin_dir="$test_root/recalibration-removal-bin"
+    write_fake_tokenizer "$bin_dir"
+    write_lines "$repo/src/calibrated.rs" 801 base
+    write_policy "$repo" "$(policy_row src/calibrated.rs 20 801)"
+    commit_base "$repo"
+    write_policy "$repo" 'files = []'
+    run_without_git_env git -C "$repo" add scripts/monolith/baseline.toml
+    assert_failure_matching 'recalibration row removal blocks' 'required row removed for src/calibrated.rs' \
         run_checker "$repo" "$bin_dir" staged
 }
 test_generated_lockfile_is_not_a_monolith() {
@@ -542,7 +555,7 @@ test_policy_mutation_fails_closed() {
     commit_base "$repo"
     write_policy "$repo" "$(policy_row src/base.rs 20 802)"
     run_without_git_env git -C "$repo" add scripts/monolith/baseline.toml
-    assert_failure_matching 'cap raise blocks' 'cap changed while src/base.rs remains oversized' \
+    assert_failure_matching 'cap raise blocks' 'cap increased for src/base.rs' \
         run_checker "$repo" "$bin_dir" staged
     write_policy "$repo" "$(policy_row src/base.rs 20 801)
 $(policy_row src/new.rs 20 801)"
@@ -615,7 +628,8 @@ unexpected = "blocked"'
 
 run_registered_case 'R0 canonical baseline rows' test_canonical_baseline_rows
 run_registered_case 'R0 equal and decreased bounds' test_equal_and_decreased_bounds_pass
-run_registered_case 'R0 baseline row removal' test_baseline_row_removal_after_refactor_passes
+run_registered_case 'R0 baseline row removal' test_baseline_row_removal_fails_closed
+run_registered_case 'R0 recalibration cannot remove row' test_recalibration_cannot_remove_row
 run_registered_case 'R0 line and token growth' test_line_and_token_growth_fail
 run_registered_case 'R0 new monolith isolation' test_new_monolith_and_staged_target_isolation
 run_registered_case 'R0 generated lockfile exclusion' test_generated_lockfile_is_not_a_monolith
@@ -663,7 +677,7 @@ run_registered_case 'R2-D checker output cap' test_checker_output_cap
 run_registered_case 'R2-E hostile global-system Git config' test_hostile_global_system_git_config_is_ignored
 run_registered_case 'R2-E constructor failure propagation' test_constructor_failure_propagates
 run_registered_case 'R2-E strict tokenizer argv and call log' test_strict_tokenizer_argv_and_call_log
-[ "$registered_case_count" -eq 50 ] || die "registered: $registered_case_count/50"
+[ "$registered_case_count" -eq 51 ] || die "registered: $registered_case_count/51"
 actual_case_manifest_sha256="$(
     printf '%s\n' "${registered_case_manifest[@]}" | case_manifest_sha256
 )"

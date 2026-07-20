@@ -170,6 +170,30 @@ baseline_lines = 1496
 issue = "368"
 rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
 
+[[files]]
+path = "crates/verbatim-cli/src/local.rs"
+kind = "source"
+baseline_tokens = 6065
+baseline_lines = 718
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet; pinned-tokenizer recalibration lowered token counts below the global threshold but the row is retained as an immutable no-growth cap."
+
+[[files]]
+path = "crates/verbatim-core/src/index/sqlite_fts.rs"
+kind = "source"
+baseline_tokens = 6221
+baseline_lines = 769
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet; pinned-tokenizer recalibration lowered token counts below the global threshold but the row is retained as an immutable no-growth cap."
+
+[[files]]
+path = "crates/verbatim-core/src/provider/endpoint_capability.rs"
+kind = "source"
+baseline_tokens = 5764
+baseline_lines = 800
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet; pinned-tokenizer recalibration lowered token counts below the global threshold but the row is retained as an immutable no-growth cap."
+
 [tokenizer]
 command = "tokuin"
 version = "0.3.0"

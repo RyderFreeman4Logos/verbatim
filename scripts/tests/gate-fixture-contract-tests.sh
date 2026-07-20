@@ -211,7 +211,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             printf '%s\n' "$output" >&2
             die 'monolith suite depended on host tokuin'
         }
-        grep -Fq 'monolith-check-tests: PASS (50 Tier-4 cases)' <<<"$output" \
+        grep -Fq 'monolith-check-tests: PASS (51 Tier-4 cases)' <<<"$output" \
             || { printf '%s\n' "$output" >&2; die 'monolith suite did not produce its complete manifest receipt'; }
         output="$(PATH="$hostile_bin:$PATH" JUST_NO_DOTENV=true \
             env -u VERSION_CHECK_TEST_CASE -u VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH \
@@ -221,7 +221,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         }
         grep -Fq 'version-check-tests: PASS (12 Tier-4 cases)' <<<"$output" \
             || die 'version suite did not produce its complete manifest receipt'
-        printf 'HOST-TOKUIN-INDEPENDENCE: monolith=50 version=12\n'
+        printf 'HOST-TOKUIN-INDEPENDENCE: monolith=51 version=12\n'
     }
 
     receipt_lines() {
@@ -276,7 +276,7 @@ printf 'just|%s\n' "$*" >>"$GATE_FIXTURE_LOG"
 case "$*" in
     fmt|"check-version-bumped head"|"check-monolith head"|clippy|deny) exit 0 ;;
     version-check-test) printf 'version-check-tests: PASS (12 Tier-4 cases)\n' ;;
-    monolith-check-test) printf 'monolith-check-tests: PASS (50 Tier-4 cases)\n' ;;
+    monolith-check-test) printf 'monolith-check-tests: PASS (51 Tier-4 cases)\n' ;;
     gate-fixture-contract-test)
         cd "$GATE_FIXTURE_ROOT"
         exec "$GATE_FIXTURE_JUST_BINARY" gate-fixture-contract-test

@@ -619,8 +619,8 @@ if [ "$bootstrap" = true ]; then
             if is_over_limit "$path" \
                 && [ "${trusted_text[$path]:-0}" != "1" ]; then
                 policy_failures+=("BLOCK baseline bootstrap: candidate-only oversized file $path")
-            else
-                policy_failures+=("BLOCK baseline bootstrap: new exemption for non-oversized trusted-base path $path")
+            elif [ "${trusted_text[$path]:-0}" != "1" ]; then
+                policy_failures+=("BLOCK baseline bootstrap: candidate-only exemption for absent trusted-base path $path")
             fi
         fi
     done
@@ -632,26 +632,15 @@ else
     done
     for path in "${!base_tokens[@]}"; do
         measure_candidate "$path"
-        over_limit=false
-        if is_over_limit "$path"; then
-            over_limit=true
-        fi
         if [ -z "${candidate_tokens[$path]+set}" ]; then
-            if [ "$over_limit" = true ]; then
-                policy_failures+=("BLOCK baseline policy: required row removed while $path remains oversized")
-            fi
+            policy_failures+=("BLOCK baseline policy: required row removed for $path; immutable no-growth ratchet rows cannot be deleted regardless of current threshold status")
             continue
         fi
         if [ "${candidate_issue[$path]}" != "${base_issue[$path]}" ] \
             || [ "${candidate_rationale[$path]}" != "${base_rationale[$path]}" ]; then
             policy_failures+=("BLOCK baseline policy: required issue/rationale changed for $path")
         fi
-        if [ "$over_limit" = true ]; then
-            if [ "${candidate_tokens[$path]}" -ne "${base_tokens[$path]}" ] \
-                || [ "${candidate_lines[$path]}" -ne "${base_lines[$path]}" ]; then
-                policy_failures+=("BLOCK baseline policy: cap changed while $path remains oversized")
-            fi
-        elif [ "${candidate_tokens[$path]}" -gt "${base_tokens[$path]}" ] \
+        if [ "${candidate_tokens[$path]}" -gt "${base_tokens[$path]}" ] \
             || [ "${candidate_lines[$path]}" -gt "${base_lines[$path]}" ]; then
             policy_failures+=("BLOCK baseline policy: cap increased for $path")
         fi
