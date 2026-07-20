@@ -13,7 +13,7 @@ declare -A registered_case_names=()
 declare -a registered_case_manifest=()
 readonly tokenizer_revision="c68d1f804a4c172846716b7be99e9378e16512b7"
 readonly checker_outer_timeout_seconds=15
-readonly expected_case_manifest_sha256="57f521818311eafba23c4f107fa2d64ef5fa6ab18f8f64abeaaa05b91af6e9e2"
+readonly expected_case_manifest_sha256="c42c3a9185d98945b19af7b04f082a5d3a55b76771a8ea1e010666df36c8a622"
 cleanup() {
     rm -rf -- "$test_root"
 }
@@ -626,6 +626,14 @@ unexpected = "blocked"'
         run_checker "$repo" "$bin_dir" staged
 }
 
+register_modes() {
+    local prefix="$1" test_fn="$2" mode
+    shift 2
+    for mode in staged head object; do
+        run_registered_case "$prefix $mode" "$test_fn" "$@" "$mode"
+    done
+}
+
 run_registered_case 'R0 canonical baseline rows' test_canonical_baseline_rows
 run_registered_case 'R0 equal and decreased bounds' test_equal_and_decreased_bounds_pass
 run_registered_case 'R0 baseline row removal' test_baseline_row_removal_fails_closed
@@ -641,28 +649,20 @@ run_registered_case 'R0 pre-push object parser' test_pre_push_object_parser
 run_registered_case 'F1 candidate-only staged' test_bootstrap_attack candidate-only staged
 run_registered_case 'F1 candidate-only head' test_bootstrap_attack candidate-only head
 run_registered_case 'F1 candidate-only object' test_bootstrap_attack candidate-only object
-run_registered_case 'F1 inherited-growth staged' test_bootstrap_attack inherited-growth staged
-run_registered_case 'F1 inherited-growth head' test_bootstrap_attack inherited-growth head
-run_registered_case 'F1 inherited-growth object' test_bootstrap_attack inherited-growth object
+register_modes 'F1 inherited-growth' test_bootstrap_attack inherited-growth
+run_registered_case 'R4-F1 below-threshold exact cap' test_ratchet exact
+run_registered_case 'R4-F1 below-threshold cap inflation' test_ratchet inflated
 run_registered_case 'F2 missing' test_tokenizer_dependency missing
 run_registered_case 'F2 wrong version' test_tokenizer_dependency wrong-version
 run_registered_case 'F2 clean success' test_tokenizer_dependency documented-success
-run_registered_case 'F3 type-change staged' test_git_type_change_to_monolith staged
-run_registered_case 'F3 type-change head' test_git_type_change_to_monolith head
-run_registered_case 'F3 type-change object' test_git_type_change_to_monolith object
+register_modes 'F3 type-change' test_git_type_change_to_monolith
 run_registered_case 'F4 invalid zero' test_invalid_tokenizer_timeout 0
 run_registered_case 'F4 invalid text' test_invalid_tokenizer_timeout invalid
 run_registered_case 'F4 invalid excessive' test_invalid_tokenizer_timeout 301
 run_registered_case 'F4 timeout cleanup' test_tokenizer_timeout_cleans_process_tree
-run_registered_case 'R2-A literal paths staged' test_literal_pathname_matrix staged
-run_registered_case 'R2-A literal paths head' test_literal_pathname_matrix head
-run_registered_case 'R2-A literal paths object' test_literal_pathname_matrix object
-run_registered_case 'R2-B literal trusted base staged' test_literal_trusted_base_matrix staged
-run_registered_case 'R2-B literal trusted base head' test_literal_trusted_base_matrix head
-run_registered_case 'R2-B literal trusted base object' test_literal_trusted_base_matrix object
-run_registered_case 'R2-B rename staged' test_git_rename_to_monolith staged
-run_registered_case 'R2-B rename head' test_git_rename_to_monolith head
-run_registered_case 'R2-B rename object' test_git_rename_to_monolith object
+register_modes 'R2-A literal paths' test_literal_pathname_matrix
+register_modes 'R2-B literal trusted base' test_literal_trusted_base_matrix
+register_modes 'R2-B rename' test_git_rename_to_monolith
 run_registered_case 'R2-A annotated tag object' test_annotated_tag_object
 run_registered_case 'R2-B staged index mutation' test_staged_index_mutation_fails_closed
 run_registered_case 'R2-A aggregate final index' test_aggregate_validates_final_index
@@ -677,7 +677,7 @@ run_registered_case 'R2-D checker output cap' test_checker_output_cap
 run_registered_case 'R2-E hostile global-system Git config' test_hostile_global_system_git_config_is_ignored
 run_registered_case 'R2-E constructor failure propagation' test_constructor_failure_propagates
 run_registered_case 'R2-E strict tokenizer argv and call log' test_strict_tokenizer_argv_and_call_log
-[ "$registered_case_count" -eq 51 ] || die "registered: $registered_case_count/51"
+[ "$registered_case_count" -eq 53 ] || die "registered: $registered_case_count/53"
 actual_case_manifest_sha256="$(
     printf '%s\n' "${registered_case_manifest[@]}" | case_manifest_sha256
 )"

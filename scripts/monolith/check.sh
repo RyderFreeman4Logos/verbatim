@@ -616,11 +616,20 @@ if [ "$bootstrap" = true ]; then
         if [ -z "${expected_bootstrap_paths[$path]+set}" ]; then
             measure_trusted_base "$path"
             measure_candidate "$path"
-            if is_over_limit "$path" \
-                && [ "${trusted_text[$path]:-0}" != "1" ]; then
-                policy_failures+=("BLOCK baseline bootstrap: candidate-only oversized file $path")
-            elif [ "${trusted_text[$path]:-0}" != "1" ]; then
-                policy_failures+=("BLOCK baseline bootstrap: candidate-only exemption for absent trusted-base path $path")
+            if [ "${trusted_text[$path]:-0}" != "1" ]; then
+                if is_over_limit "$path"; then
+                    policy_failures+=("BLOCK baseline bootstrap: candidate-only oversized file $path")
+                else
+                    policy_failures+=("BLOCK baseline bootstrap: candidate-only exemption for absent trusted-base path $path")
+                fi
+            else
+                if [ "${candidate_kind[$path]}" != "${trusted_kind[$path]}" ]; then
+                    policy_failures+=("BLOCK baseline bootstrap: $path kind must match trusted-base ${trusted_kind[$path]}")
+                fi
+                if [ "${candidate_tokens[$path]}" -ne "${trusted_tokens[$path]}" ] \
+                    || [ "${candidate_lines[$path]}" -ne "${trusted_lines[$path]}" ]; then
+                    policy_failures+=("BLOCK baseline bootstrap: $path bounds must exactly match trusted-base ${trusted_tokens[$path]} tokens/${trusted_lines[$path]} lines")
+                fi
             fi
         fi
     done

@@ -80,6 +80,30 @@ test_bootstrap_attack() {
         "$pattern" "$repo" "$bin_dir" "$scope"
 }
 
+test_ratchet() {
+    local mode="$1" repo bin lines=10 cap=10
+    repo="$(init_repo "r-$mode")"
+    bin="$test_root/r-bin"
+    write_fake_tokenizer "$bin"
+    write_lines "$repo/src/x.rs" 10 "$(printf '%01200d' 0)"
+    commit_base_without_policy "$repo"
+    if [ "$mode" != exact ]; then
+        lines=801
+        cap=900
+    fi
+    write_lines "$repo/src/x.rs" "$lines" candidate
+    write_policy "$repo" "$(policy_row src/x.rs 20 "$cap")"
+    run_without_git_env git -C "$repo" add \
+        src/x.rs scripts/monolith/baseline.toml
+    if [ "$mode" = exact ]; then
+        assert_success 'exact cap' run_checker "$repo" "$bin" staged
+    else
+        assert_failure_matching 'inflated cap' \
+            'BLOCK baseline bootstrap: src/x.rs bounds must exactly match trusted-base' \
+            run_checker "$repo" "$bin" staged
+    fi
+}
+
 test_git_type_change_to_monolith() {
     local scope="$1"
     local repo bin_dir
