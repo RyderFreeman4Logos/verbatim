@@ -6829,7 +6829,8 @@ async fn run_indexing_operation(
         &config.embedding.profile_id,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let write_operation = sqlite_durability_ops::preflight_indexing_capacity(&state, controls)?;
+    let write_operation =
+        sqlite_durability_ops::preflight_indexing_capacity(&state, controls).await?;
     let _worker = acquire_ingest_worker(&state)?;
     let task_id2 = task_id.clone();
     let profile_id_for_task = profile_id.clone();
@@ -18523,8 +18524,8 @@ mod tests {
         }
     }
 
-    fn test_state(config: Config, data_dir: &FsPath, pipeline: IngestPipeline) -> SharedState {
-        test_state_with_config_path(config, data_dir, pipeline, data_dir.join("config.toml"))
+    pub(super) fn test_state(c: Config, dir: &FsPath, p: IngestPipeline) -> SharedState {
+        test_state_with_config_path(c, dir, p, dir.join("config.toml"))
     }
 
     async fn ingest_source_for_test(state: &SharedState, source_id: &SourceId) {
@@ -19100,7 +19101,7 @@ mod tests {
         )
     }
 
-    fn retrieve_test_config(model_base_url: &str) -> Config {
+    pub(super) fn retrieve_test_config(model_base_url: &str) -> Config {
         serde_json::from_value(serde_json::json!({
             "embedding": {
                 "base_url": model_base_url,

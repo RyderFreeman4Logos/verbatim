@@ -20,19 +20,27 @@ pub(super) fn health_durability_status(
 ) -> Option<verbatim_core::store::SqliteDurabilityStatus> {
     state
         .task_store
-        .lock()
+        .try_lock()
         .ok()
         .and_then(|store| store.durability_status().ok())
 }
 
 /// Classify the write-heavy operation and fail before it can consume the
 /// SQLite filesystem reserve. Returns the operation for later error mapping.
-pub(super) fn preflight_indexing_capacity(
+pub(super) async fn preflight_indexing_capacity(
     state: &SharedState,
     controls: &IndexingTaskControls,
 ) -> Result<SqliteWriteOperation, (StatusCode, Json<ErrorResponse>)> {
     let write_operation = indexing_write_operation(controls);
-    ensure_indexing_write_capacity(state, write_operation)?;
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || ensure_indexing_write_capacity(&state, write_operation))
+        .await
+        .map_err(|error| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                anyhow::anyhow!("join SQLite task-store capacity preflight: {error}"),
+            )
+        })??;
     Ok(write_operation)
 }
 
@@ -173,5 +181,104 @@ pub(super) fn shutdown_checkpoint(state: &SharedState) {
         Err(error) => {
             tracing::warn!(%error, "SQLite shutdown checkpoint skipped because task store lock is poisoned")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::retrieve_test_config;
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_state(name: &str) -> (TestDir, SharedState) {
+        let unique = format!(
+            "verbatim-daemon-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let data_dir = TestDir(std::env::temp_dir().join(unique));
+        std::fs::create_dir_all(&data_dir.0).unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, &data_dir.0).unwrap();
+        let state = crate::tests::test_state(config, &data_dir.0, pipeline);
+        (data_dir, state)
+    }
+
+    #[test]
+    fn health_durability_status_returns_none_without_waiting_for_task_store_lock() {
+        let (_test_dir, state) = test_state("health-durability-try-lock");
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder_state = Arc::clone(&state);
+        let holder = std::thread::spawn(move || {
+            let _store = holder_state.task_store.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_millis(250));
+        });
+        locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let started = Instant::now();
+        let status = health_durability_status(&state);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "health durability status waited for a held task-store lock"
+        );
+        assert!(status.is_none());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn indexing_capacity_preflight_does_not_block_the_runtime_worker() {
+        let (_test_dir, state) = test_state("indexing-capacity-blocking-worker");
+        let controls = IndexingTaskControls {
+            source_id: None,
+            force: false,
+            embedding_profile_id: None,
+            vectors_only: false,
+            ingest_batch_id: None,
+        };
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder_state = Arc::clone(&state);
+        let holder = std::thread::spawn(move || {
+            let _store = holder_state.task_store.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_millis(500));
+        });
+        locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let started = Instant::now();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let preflight_state = Arc::clone(&state);
+        let preflight = tokio::spawn(async move {
+            entered_tx.send(()).unwrap();
+            preflight_indexing_capacity(&preflight_state, &controls).await
+        });
+        entered_rx.await.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "capacity preflight blocked the current-thread Tokio runtime"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            preflight.await.unwrap().unwrap(),
+            SqliteWriteOperation::Ingest
+        );
+        holder.join().unwrap();
     }
 }
