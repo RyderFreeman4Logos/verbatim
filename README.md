@@ -39,6 +39,10 @@ want generated answers, chat. Keep credentials in the config or your own secret
 management; do not paste secrets into commands or logs. Runtime data lives under
 `~/.local/share/verbatim/` by default.
 
+For the SQLite durability profile, WAL checkpoint policy, disk-full behavior,
+RPO contract, and backup/restore drill, see
+[SQLite durability and recovery](docs/sqlite-durability.md).
+
 Minimal model role configurations:
 
 ```toml

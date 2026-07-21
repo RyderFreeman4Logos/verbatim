@@ -107,6 +107,9 @@ use verbatim_core::types::{
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
+#[path = "sqlite_durability_ops.rs"]
+mod sqlite_durability_ops;
+
 // ---------------------------------------------------------------------------
 // Shared state
 //
@@ -1640,9 +1643,11 @@ where
 {
     let permit = state.resources.sqlite_reader.acquire().await?;
     let db_path = state.data_dir.join("verbatim.db");
+    let durability_profile = runtime_config_snapshot(state)?.config.store.durability;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let store = Store::open_existing_readonly(&db_path)?;
+        let store =
+            Store::open_existing_readonly_with_durability_profile(&db_path, durability_profile)?;
         operation(&store)
     })
     .await
@@ -1958,6 +1963,7 @@ async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
     let resources = daemon_resource_snapshots(&state);
     let idle_reclaim = idle_reclaim_gate(&state, resources.clone()).health;
     let idle_exit = idle_exit_health_gate(&state, resources.clone()).health;
+    let sqlite_durability = sqlite_durability_ops::health_durability_status(&state);
     Json(HealthResponse {
         status: "ok".into(),
         readiness: readiness_snapshot(&state),
@@ -1965,6 +1971,7 @@ async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
         resources,
         idle_reclaim: Some(idle_reclaim),
         idle_exit: Some(idle_exit),
+        sqlite_durability,
     })
 }
 
@@ -6822,6 +6829,8 @@ async fn run_indexing_operation(
         &config.embedding.profile_id,
     )
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let write_operation =
+        sqlite_durability_ops::preflight_indexing_capacity(&state, controls).await?;
     let _worker = acquire_ingest_worker(&state)?;
     let task_id2 = task_id.clone();
     let profile_id_for_task = profile_id.clone();
@@ -6829,7 +6838,6 @@ async fn run_indexing_operation(
     let source_id_for_error = controls.source_id.clone();
     let force = controls.force;
     let vectors_only = controls.vectors_only;
-    let runtime = tokio::runtime::Handle::current();
     let timing = PhaseTiming::start(phase_name);
     record_task_progress(
         &state,
@@ -6841,46 +6849,27 @@ async fn run_indexing_operation(
             .with_active_worker_kind(TaskKind::Ingest.as_str()),
     )
     .await;
-    let state_for_pipeline = Arc::clone(&state);
-    let (outcome, index_status) = tokio::task::spawn_blocking(move || {
-        run_with_pipeline(state_for_pipeline, move |pipeline| {
-            if vectors_only {
-                let source_filter = source_id.as_ref().map(|id| SourceId(id.clone()));
-                let result = runtime.block_on(
-                    pipeline.build_embedding_profile(&profile_id_for_task, source_filter.as_ref()),
-                );
-                let index_status = initial_index_status_cache(pipeline);
-                return Ok((result, index_status));
-            }
-            let result = match source_id {
-                Some(id) => {
-                    match runtime
-                        .block_on(pipeline.ingest_source_with_task(&SourceId(id), &task_id2))
-                    {
-                        Ok(embedding_cache) => Ok(IndexingOutcome {
-                            source_count: 1,
-                            skipped_missing_sources: 0,
-                            embedding_cache,
-                        }),
-                        Err(error) => Err(error),
-                    }
-                }
-                None => runtime.block_on(pipeline.ingest_all_with_task(force, &task_id2)),
-            };
-            let index_status = initial_index_status_cache(pipeline);
-            Ok((result, index_status))
-        })
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(pipeline_access_error)?;
+    let (outcome, index_status) = sqlite_durability_ops::run_indexing_with_pipeline(
+        Arc::clone(&state),
+        vectors_only,
+        source_id,
+        profile_id_for_task,
+        task_id2,
+        force,
+    )
+    .await?;
     if let Some(index_status) = index_status {
         if let Err(error) = update_index_status_cache(&state, &index_status) {
             tracing::warn!(error = %error, "failed to update index status cache after indexing operation");
         }
     }
-    let outcome =
-        outcome.map_err(|e| indexing_operation_error(source_id_for_error.as_deref(), e))?;
+    let outcome = outcome.map_err(|error| {
+        sqlite_durability_ops::indexing_operation_error(
+            source_id_for_error.as_deref(),
+            write_operation,
+            error,
+        )
+    })?;
     let mut progress = timing
         .progress_snapshot()
         .with_counter(
@@ -6933,17 +6922,6 @@ async fn run_indexing_operation(
     record_task_progress(&state, task_id, progress).await;
     record_task_span(&state, task_id, finished).await?;
     Ok((outcome, profile_id))
-}
-
-fn indexing_operation_error(
-    source_id: Option<&str>,
-    error: anyhow::Error,
-) -> (StatusCode, Json<ErrorResponse>) {
-    let status = match source_id {
-        Some(source_id) if is_source_not_found_error(source_id, &error) => StatusCode::NOT_FOUND,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    err(status, error)
 }
 
 async fn cancel_task_record(
@@ -9469,7 +9447,7 @@ async fn run_daemon_with_config(config: Config) -> Result<()> {
     fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir: {}", data_dir.display()))?;
     let memory_budget = MemoryBudget::from_config(&config.daemon.resources);
-    let task_store = Store::new(&data_dir.join("verbatim.db"))?;
+    let task_store = sqlite_durability_ops::open_task_store(&config, &data_dir)?;
 
     let bind_addr = config.daemon.bind.clone();
 
@@ -9535,6 +9513,8 @@ async fn run_daemon_with_config(config: Config) -> Result<()> {
     server_task
         .await
         .context("join daemon HTTP server task")??;
+
+    sqlite_durability_ops::shutdown_checkpoint(&state);
 
     Ok(())
 }
@@ -9704,6 +9684,9 @@ mod tests {
         RetrievalEvidenceRole, RetrievalProvenance, RetrievalRerankStatus, Source, SourceLocator,
         VectorIndexResidency,
     };
+
+    #[path = "sqlite_durability_tests.rs"]
+    mod sqlite_durability_tests;
 
     fn has_task_terminalize_span(spans: &[verbatim_core::task::TaskSpan]) -> bool {
         spans
@@ -18541,8 +18524,8 @@ mod tests {
         }
     }
 
-    fn test_state(config: Config, data_dir: &FsPath, pipeline: IngestPipeline) -> SharedState {
-        test_state_with_config_path(config, data_dir, pipeline, data_dir.join("config.toml"))
+    pub(super) fn test_state(c: Config, dir: &FsPath, p: IngestPipeline) -> SharedState {
+        test_state_with_config_path(c, dir, p, dir.join("config.toml"))
     }
 
     async fn ingest_source_for_test(state: &SharedState, source_id: &SourceId) {
@@ -18698,7 +18681,9 @@ mod tests {
         let memory_budget = pipeline.memory_budget();
         Arc::new(AppState {
             pipeline: std::sync::Mutex::new(Some(pipeline)),
-            task_store: std::sync::Mutex::new(Store::new(&data_dir.join("verbatim.db")).unwrap()),
+            task_store: std::sync::Mutex::new(
+                sqlite_durability_ops::open_task_store(&config, data_dir).unwrap(),
+            ),
             index_status_cache: std::sync::RwLock::new(index_status_cache),
             readiness: std::sync::RwLock::new(ReadinessHealth::ready()),
             resources: daemon_resources(&config.daemon.resources),
@@ -19116,7 +19101,7 @@ mod tests {
         )
     }
 
-    fn retrieve_test_config(model_base_url: &str) -> Config {
+    pub(super) fn retrieve_test_config(model_base_url: &str) -> Config {
         serde_json::from_value(serde_json::json!({
             "embedding": {
                 "base_url": model_base_url,

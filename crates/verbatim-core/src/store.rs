@@ -40,8 +40,6 @@ pub use source_contents_replacement::{
 mod evidence_spans_tests;
 
 const LEGACY_EMBEDDING_PROFILE_CONFIG_HASH: &str = "legacy";
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// SQLite page cache in KB (negative value tells SQLite the number is in KB).
 /// 64 MB = -65536 KB. Reduces disk I/O for the large `list_vector_documents_for_profile` scans.
 const SQLITE_CACHE_SIZE_KB: i64 = -65_536;
@@ -50,36 +48,20 @@ const SQLITE_CACHE_SIZE_KB: i64 = -65_536;
 /// multi-GB database, reducing user-space RSS pressure.
 const SQLITE_MMAP_SIZE: i64 = 268_435_456;
 
-/// WAL autocheckpoint threshold in pages (default 1000).
-const SQLITE_WAL_AUTOCHECKPOINT: i64 = 1_000;
+#[path = "sqlite_durability.rs"]
+mod sqlite_durability;
+#[path = "store_durability.rs"]
+mod store_durability;
+pub use sqlite_durability::{
+    map_storage_error, SqliteCheckpointMode, SqliteCheckpointStatus, SqliteDiskSpaceStatus,
+    SqliteDurabilityError, SqliteDurabilityProfile, SqliteDurabilityStatus,
+    SqliteEffectiveDurability, SqliteWriteOperation,
+};
 
 pub struct Store {
     conn: Connection,
-}
-
-impl Store {
-    /// Apply performance-related SQLite PRAGMAs.
-    ///
-    /// - `journal_mode = WAL`: enables concurrent readers during writes.
-    /// - `synchronous = NORMAL`: used only when WAL was actually enabled.
-    /// - `mmap_size`: memory-mapped I/O for large databases, reducing RSS pressure.
-    /// - `cache_size`: larger page cache reduces disk reads for scan-heavy operations.
-    /// - `wal_autocheckpoint`: controls WAL file growth with periodic checkpointing.
-    fn apply_performance_pragmas(conn: &Connection) -> Result<()> {
-        let journal_mode: String =
-            conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
-        if journal_mode.eq_ignore_ascii_case("wal") {
-            conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
-        } else {
-            conn.execute_batch("PRAGMA synchronous = FULL;")?;
-        }
-        conn.execute_batch(&format!("PRAGMA mmap_size = {SQLITE_MMAP_SIZE};"))?;
-        conn.execute_batch(&format!("PRAGMA cache_size = {SQLITE_CACHE_SIZE_KB};"))?;
-        conn.execute_batch(&format!(
-            "PRAGMA wal_autocheckpoint = {SQLITE_WAL_AUTOCHECKPOINT};"
-        ))?;
-        Ok(())
-    }
+    durability_profile: SqliteDurabilityProfile,
+    database_path: Option<PathBuf>,
 }
 
 /// Task list status filter used by bounded task overview queries.
@@ -373,22 +355,6 @@ pub struct VectorJsonCleanupReport {
 }
 
 impl Store {
-    pub fn new(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        Self::apply_performance_pragmas(&conn)?;
-        let store = Self { conn };
-        store.migrate()?;
-        Ok(store)
-    }
-
-    pub fn open_existing_readonly(path: &Path) -> Result<Self> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA query_only = ON;")?;
-        Ok(Self { conn })
-    }
-
     /// Run related read queries against one SQLite snapshot.
     pub fn with_read_snapshot<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
         self.conn
@@ -466,15 +432,6 @@ impl Store {
                     .unwrap_or(u64::MAX),
             },
         })
-    }
-
-    pub fn in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        Self::apply_performance_pragmas(&conn)?;
-        let store = Self { conn };
-        store.migrate()?;
-        Ok(store)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -859,47 +816,56 @@ impl Store {
         id: &SourceId,
         vectors: &[VectorDocument],
     ) -> Result<u64> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-        replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
-        let generation = bump_all_profile_index_generations(&tx)?;
-        tx.commit()?;
-        Ok(generation)
+        self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
+        (|| {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
+            replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
+            let generation = bump_all_profile_index_generations(&tx)?;
+            tx.commit()?;
+            Ok(generation)
+        })()
+        .map_err(|error| map_storage_error(SqliteWriteOperation::Ingest, error))
     }
 
     pub fn replace_source_contents(
         &self,
         replacement: SourceContentsReplacement<'_>,
     ) -> Result<SourceContentsReplacementReport> {
-        let deleted_child_chunks =
-            self.count_lexical_documents_for_source(&replacement.source.id)?;
-        let tx = self.conn.unchecked_transaction()?;
-        let lexical_update = replace_source_contents_tx(&tx, replacement, deleted_child_chunks)?;
-        let generation = bump_all_profile_index_generations(&tx)?;
-        tx.commit()?;
-        Ok(SourceContentsReplacementReport {
-            generation,
-            lexical_update,
-        })
+        self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
+        (|| {
+            let profile_id = replacement.embedding_profile_id;
+            let deleted_child_chunks =
+                self.count_lexical_documents_for_source(&replacement.source.id)?;
+            let tx = self.conn.unchecked_transaction()?;
+            let lexical_update =
+                replace_source_contents_tx(&tx, replacement, deleted_child_chunks)?;
+            let _ = bump_all_profile_index_generations(&tx)?;
+            let generation = profile_index_generation(&tx, profile_id)?;
+            tx.commit()?;
+            Ok(SourceContentsReplacementReport {
+                generation,
+                lexical_update,
+            })
+        })()
+        .map_err(|error| map_storage_error(SqliteWriteOperation::Ingest, error))
     }
 
     pub fn replace_source_contents_without_generation(
         &self,
         replacement: SourceContentsReplacement<'_>,
     ) -> Result<SourceLexicalIndexUpdate> {
-        let deleted_child_chunks =
-            self.count_lexical_documents_for_source(&replacement.source.id)?;
-        let tx = self.conn.unchecked_transaction()?;
-        let lexical_update = replace_source_contents_tx(&tx, replacement, deleted_child_chunks)?;
-        tx.commit()?;
-        Ok(lexical_update)
-    }
-
-    pub fn bump_all_profile_index_generations(&self) -> Result<u64> {
-        let tx = self.conn.unchecked_transaction()?;
-        let generation = bump_all_profile_index_generations(&tx)?;
-        tx.commit()?;
-        Ok(generation)
+        self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
+        (|| {
+            let deleted_child_chunks =
+                self.count_lexical_documents_for_source(&replacement.source.id)?;
+            let tx = self.conn.unchecked_transaction()?;
+            let lexical_update =
+                replace_source_contents_tx(&tx, replacement, deleted_child_chunks)?;
+            tx.commit()?;
+            Ok(lexical_update)
+        })()
+        .map_err(|error| map_storage_error(SqliteWriteOperation::Ingest, error))
     }
 
     pub fn index_generation(&self) -> Result<u64> {
@@ -907,19 +873,7 @@ impl Store {
     }
 
     pub fn index_generation_for_profile(&self, profile_id: &EmbeddingProfileId) -> Result<u64> {
-        let value: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT generation FROM embedding_profile_index_meta WHERE profile_id = ?1",
-                params![profile_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        value
-            .as_deref()
-            .unwrap_or("0")
-            .parse::<u64>()
-            .context("parse profile index generation")
+        profile_index_generation(&self.conn, profile_id)
     }
 
     pub fn profile_index_generations(&self) -> Result<Vec<EmbeddingProfileIndexGeneration>> {
@@ -2191,19 +2145,6 @@ impl Store {
         set_source_embedding_failures_tx(&tx, profile_id, source_vector_counts, error_message)?;
         tx.commit()?;
         Ok(())
-    }
-
-    pub(crate) fn set_source_embedding_failures_and_bump_all_profile_index_generations(
-        &self,
-        profile_id: &EmbeddingProfileId,
-        source_vector_counts: &[(SourceId, usize)],
-        error_message: &str,
-    ) -> Result<u64> {
-        let tx = self.conn.unchecked_transaction()?;
-        set_source_embedding_failures_tx(&tx, profile_id, source_vector_counts, error_message)?;
-        let generation = bump_all_profile_index_generations(&tx)?;
-        tx.commit()?;
-        Ok(generation)
     }
 
     // --- Task ---
@@ -4324,6 +4265,21 @@ fn set_source_embedding_failures_tx(
         )?;
     }
     Ok(())
+}
+
+fn profile_index_generation(conn: &Connection, profile_id: &EmbeddingProfileId) -> Result<u64> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT generation FROM embedding_profile_index_meta WHERE profile_id = ?1",
+            params![profile_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<u64>()
+        .context("parse profile index generation")
 }
 
 fn bump_profile_index_generation(
