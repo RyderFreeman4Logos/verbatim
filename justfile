@@ -3,6 +3,8 @@
 # AI AGENT: Do NOT modify this file or use `git commit -n`/`--no-verify`.
 
 set shell := ["bash", "-c"]
+# IO scheduling: run cargo at idle priority to avoid starving interactive processes
+_cargo_io_prefix := "ionice -c 3 nice -n 19"
 set tempdir := "."
 set dotenv-load := true
 
@@ -132,7 +134,7 @@ bump-patch:
     path.write_text(text[:match.start()] + match.group(1) + new_version + match.group(5) + text[match.end():])
     print(f"Workspace version bumped: {old_version} -> {new_version}")
     PY
-    cargo metadata --format-version 1 >/dev/null
+    {{_cargo_io_prefix}} cargo metadata --format-version 1 >/dev/null
 
 # ==============================================================================
 # Quality Gates
@@ -168,22 +170,22 @@ fmt:
     if (( ${#staged_rs[@]} == 0 )); then
         exit 0
     fi
-    cargo fmt --all
+    {{_cargo_io_prefix}} cargo fmt --all
     printf '%s\0' "${staged_rs[@]}" \
         | GIT_LITERAL_PATHSPECS=1 git add --pathspec-from-file=- --pathspec-file-nul
 
 # Clippy for entire workspace (strict).
 clippy:
-    cargo clippy --workspace --all-features -- -D warnings
+    {{_cargo_io_prefix}} cargo clippy --workspace --all-features -- -D warnings
 
 # Clippy for a specific crate.
 # Usage: just clippy-p verbatim-core
 clippy-p package:
-    cargo clippy -p {{package}} --all-features -- -D warnings
+    {{_cargo_io_prefix}} cargo clippy -p {{package}} --all-features -- -D warnings
 
 # Security audit (requires cargo-deny).
 deny:
-    cargo deny check --hide-inclusion-graph
+    {{_cargo_io_prefix}} cargo deny check --hide-inclusion-graph
 
 # ==============================================================================
 # Testing
@@ -195,18 +197,18 @@ bench-qdrant-spike *args:
 
 # Run all workspace tests.
 test:
-    cargo nextest run --workspace --no-tests=warn
-    cargo nextest run --workspace --all-features --no-tests=warn
+    {{_cargo_io_prefix}} cargo nextest run --workspace --no-tests=warn
+    {{_cargo_io_prefix}} cargo nextest run --workspace --all-features --no-tests=warn
 
 # Test a specific crate.
 # Usage: just test-p verbatim-core
 test-p package:
-    cargo nextest run -p {{package}} --all-features --no-tests=warn
+    {{_cargo_io_prefix}} cargo nextest run -p {{package}} --all-features --no-tests=warn
 
 # Test by name pattern.
 # Usage: just test-f chunk_overlap
 test-f pattern:
-    cargo nextest run --workspace --all-features -E 'test({{pattern}})' --no-tests=warn
+    {{_cargo_io_prefix}} cargo nextest run --workspace --all-features -E 'test({{pattern}})' --no-tests=warn
 
 # ==============================================================================
 # Build & Install
@@ -214,13 +216,13 @@ test-f pattern:
 
 # Build all workspace members.
 build:
-    cargo build --workspace --all-features
+    {{_cargo_io_prefix}} cargo build --workspace --all-features
 
 # Install release binaries to /usr/local/bin.
 install:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release --all-features -p verbatim-daemon -p verbatim-cli
+    {{_cargo_io_prefix}} cargo build --release --all-features -p verbatim-daemon -p verbatim-cli
     target_dir="${CARGO_TARGET_DIR:-{{_repo_root}}/target}"
     install -m 755 "${target_dir}/release/verbatim-daemon" /usr/local/bin/verbatim-daemon
     install -m 755 "${target_dir}/release/verbatim" /usr/local/bin/verbatim
@@ -285,7 +287,7 @@ install-local-daemon:
         exit 1
     fi
 
-    cargo build --release --all-features -p verbatim-daemon -p verbatim-cli
+    {{_cargo_io_prefix}} cargo build --release --all-features -p verbatim-daemon -p verbatim-cli
     target_dir="${CARGO_TARGET_DIR:-{{_repo_root}}/target}"
     install -m 755 "${target_dir}/release/verbatim-daemon" "${daemon_bin}"
     install -m 755 "${target_dir}/release/verbatim" "${cli_bin}"
