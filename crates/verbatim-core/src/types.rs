@@ -191,10 +191,10 @@ pub struct GraphNodeId(pub String);
 impl GraphNodeId {
     pub fn new(source_id: &SourceId, kind: GraphNodeKind, external_id: &str) -> Self {
         let digest =
-            hex_sha256(format!("{}:{}:{external_id}", &source_id.0, kind.as_str()).as_bytes());
+            hex_sha256(format!("{}:{}:{external_id}", source_id.0, kind.as_str()).as_bytes());
         Self(format!(
             "{}:graph:{}:{}",
-            &source_id.0,
+            source_id.0,
             kind.as_str(),
             &digest[..16]
         ))
@@ -216,16 +216,16 @@ impl GraphEdgeId {
         let digest = hex_sha256(
             format!(
                 "{}:{}:{}:{}:{ordinal_key}",
-                &source_id.0,
+                source_id.0,
                 edge_type.as_str(),
-                &from_node_id.0,
-                &to_node_id.0
+                from_node_id.0,
+                to_node_id.0
             )
             .as_bytes(),
         );
         Self(format!(
             "{}:graph-edge:{}:{}",
-            &source_id.0,
+            source_id.0,
             edge_type.as_str(),
             &digest[..16]
         ))
