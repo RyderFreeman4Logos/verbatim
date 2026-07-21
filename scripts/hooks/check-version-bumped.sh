@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export GIT_NO_REPLACE_OBJECTS=1
 
 usage() {
     cat >&2 <<'EOF'
@@ -24,6 +25,7 @@ die() {
 scope=""
 base_ref="${BASE_REF:-}"
 object_id=""
+expected_tree=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -40,6 +42,11 @@ while [ "$#" -gt 0 ]; do
         --object)
             [ "$#" -ge 2 ] || die "--object requires a value"
             object_id="$2"
+            shift 2
+            ;;
+        --expected-tree)
+            [ "$#" -ge 2 ] || die "--expected-tree requires a value"
+            expected_tree="$2"
             shift 2
             ;;
         -h|--help)
@@ -64,6 +71,10 @@ case "$scope" in
     *) usage; die "--scope must be one of: staged, head, object" ;;
 esac
 
+if [ "$scope" != "staged" ] && [ -n "$expected_tree" ]; then
+    die "--expected-tree is only valid with --scope staged"
+fi
+
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
     || die "cannot determine the repository root"
 cd "$repo_root"
@@ -76,24 +87,80 @@ case "$base_ref" in
     -*|*:*|*$'\n'*|*$'\r'*) die "invalid base ref: $base_ref" ;;
 esac
 
-if ! git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null; then
-    die "cannot resolve base ref: $base_ref"
-fi
+base_commit="$(git rev-parse --verify --quiet "${base_ref}^{commit}")" \
+    || die "cannot resolve base ref: $base_ref"
+base_tree="$(git rev-parse --verify --quiet "${base_commit}^{tree}")" \
+    || die "cannot resolve base tree"
+tmp_root="$(mktemp -d)" || die "cannot create version snapshot directory"
+cleanup() {
+    rm -rf -- "$tmp_root"
+}
+trap cleanup EXIT
+
+snapshot_blob() {
+    local label="$1" tree="$2" output_name="$3"
+    local entries_file entry matched_entry metadata entry_path
+    local entry_mode entry_type entry_id trailing count=0
+
+    entries_file="$(mktemp "$tmp_root/entries.XXXXXX")" \
+        || die "cannot create $label Cargo.toml entry list"
+    if ! git ls-tree -z "$tree" -- ':(top,literal)Cargo.toml' >"$entries_file"; then
+        die "cannot enumerate $label Cargo.toml tree entry"
+    fi
+    while IFS= read -r -d '' entry; do
+        count=$((count + 1))
+        matched_entry="$entry"
+    done <"$entries_file"
+    [ "$count" -gt 0 ] || die "$label Cargo.toml is missing"
+    [ "$count" -eq 1 ] || die "$label Cargo.toml has multiple tree entries"
+    case "$matched_entry" in
+        *$'\t'*) ;;
+        *) die "malformed $label Cargo.toml tree entry" ;;
+    esac
+    metadata="${matched_entry%%$'\t'*}"
+    entry_path="${matched_entry#*$'\t'}"
+    [ "$entry_path" = Cargo.toml ] \
+        || die "$label Cargo.toml tree entry path mismatch"
+    read -r entry_mode entry_type entry_id trailing <<<"$metadata"
+    [ -n "$entry_mode" ] && [ -n "$entry_type" ] \
+        && [ -n "$entry_id" ] && [ -z "$trailing" ] \
+        || die "malformed $label Cargo.toml tree metadata"
+    case "$entry_id" in
+        ''|*[!0-9A-Fa-f]*) die "invalid $label Cargo.toml blob ID" ;;
+    esac
+    case "$entry_mode:$entry_type" in
+        100644:blob|100755:blob) ;;
+        *) die "$label Cargo.toml is not a regular blob" ;;
+    esac
+    printf -v "$output_name" '%s' "$entry_id"
+}
 
 version_from_blob() {
-    local label="$1"
-    local object_spec="$2"
-    local manifest
-    local version
+    local label="$1" blob_id="$2" manifest_file version
 
-    if ! manifest="$(git cat-file blob "$object_spec" 2>/dev/null)"; then
-        die "cannot read $label Cargo.toml blob: $object_spec"
+    manifest_file="$(mktemp "$tmp_root/manifest.XXXXXX")" \
+        || die "cannot create $label Cargo.toml snapshot file"
+    if ! git cat-file blob "$blob_id" >"$manifest_file"; then
+        die "cannot materialize $label Cargo.toml blob: $blob_id"
     fi
-    if ! version="$(
-        printf '%s' "$manifest" \
-            | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])'
+    if ! version="$(python3 - "$manifest_file" <<'PY'
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as manifest:
+        data = tomllib.load(manifest)
+    version = data["workspace"]["package"]["version"]
+except (KeyError, OSError, TypeError, tomllib.TOMLDecodeError) as error:
+    print(f"cannot read workspace.package.version: {error}", file=sys.stderr)
+    raise SystemExit(2)
+if not isinstance(version, str):
+    print("workspace.package.version must be a string", file=sys.stderr)
+    raise SystemExit(2)
+print(version)
+PY
     )"; then
-        die "cannot read workspace.package.version from $label Cargo.toml blob: $object_spec"
+        die "cannot read workspace.package.version from $label Cargo.toml blob"
     fi
     printf '%s\n' "$version"
 }
@@ -154,8 +221,19 @@ PY
 }
 
 case "$scope" in
-    staged) current_spec=":Cargo.toml" ;;
-    head) current_spec="HEAD:Cargo.toml" ;;
+    staged)
+        current_tree="$(git write-tree 2>/dev/null)" \
+            || die "cannot capture staged index tree"
+        if [ -n "$expected_tree" ] && [ "$current_tree" != "$expected_tree" ]; then
+            die "staged index tree does not match aggregate receipt"
+        fi
+        ;;
+    head)
+        current_commit="$(git rev-parse --verify --quiet 'HEAD^{commit}')" \
+            || die "cannot resolve HEAD as a commit"
+        current_tree="$(git rev-parse --verify --quiet "${current_commit}^{tree}")" \
+            || die "cannot resolve HEAD tree"
+        ;;
     object)
         object_format="$(git rev-parse --show-object-format 2>/dev/null)" \
             || die "cannot determine Git object format"
@@ -170,15 +248,19 @@ case "$scope" in
         if [ "${#object_id}" -ne "$object_id_length" ]; then
             die "invalid object ID length"
         fi
-        if ! object_commit="$(git rev-parse --verify --quiet "${object_id}^{commit}")"; then
-            die "cannot resolve object ID as a commit"
-        fi
-        current_spec="${object_commit}:Cargo.toml"
+        current_commit="$(git rev-parse --verify --quiet "${object_id}^{commit}")" \
+            || die "cannot resolve object ID as a commit"
+        current_tree="$(git rev-parse --verify --quiet "${current_commit}^{tree}")" \
+            || die "cannot resolve object snapshot tree"
         ;;
 esac
 
-base_version="$(version_from_blob base "${base_ref}:Cargo.toml")"
-current_version="$(version_from_blob "$scope snapshot" "$current_spec")"
+base_blob=""
+current_blob=""
+snapshot_blob base "$base_tree" base_blob
+snapshot_blob "$scope snapshot" "$current_tree" current_blob
+base_version="$(version_from_blob base "$base_blob")"
+current_version="$(version_from_blob "$scope snapshot" "$current_blob")"
 
 if ! version_precedence="$(semver_precedence "$base_version" "$scope snapshot" "$current_version")"; then
     exit 2
@@ -186,6 +268,9 @@ fi
 
 case "$version_precedence" in
     1)
+        if [ "$scope" = "staged" ] && [ -n "$expected_tree" ]; then
+            printf 'Validated staged tree: %s\n' "$current_tree"
+        fi
         printf 'Workspace version bumped in %s snapshot: %s -> %s\n' \
             "$scope" "$base_version" "$current_version"
         ;;

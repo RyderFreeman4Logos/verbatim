@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export GIT_NO_REPLACE_OBJECTS=1
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -10,8 +11,10 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
     || die "cannot determine the repository root"
 cd "$repo_root"
 
-checker="scripts/hooks/check-version-bumped.sh"
-[ -x "$checker" ] || die "missing executable version checker: $checker"
+version_checker="scripts/hooks/check-version-bumped.sh"
+monolith_checker="scripts/monolith/check.sh"
+[ -x "$version_checker" ] || die "missing executable version checker: $version_checker"
+[ -x "$monolith_checker" ] || die "missing executable monolith checker: $monolith_checker"
 
 object_format="$(git rev-parse --show-object-format 2>/dev/null)" \
     || die "cannot determine Git object format"
@@ -54,9 +57,10 @@ while IFS= read -r line || [ -n "$line" ]; do
     if ! is_object_id "$local_object"; then
         die "invalid pre-push local object ID at line $line_number"
     fi
-    "$checker" --scope object --object "$local_object"
+    "$version_checker" --scope object --object "$local_object"
+    "$monolith_checker" --scope object --object "$local_object"
 done
 
 [ "$input_seen" -eq 1 ] || die "missing pre-push reference input"
 
-VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH=1 just pre-commit head
+just pre-push-gate head

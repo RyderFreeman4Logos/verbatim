@@ -1,0 +1,206 @@
+# Immutable no-growth baseline for tracked text files already over the global
+# 800-line or 8,000-token limits. Bounds may not grow; every row belongs to
+# issue #368 and must retain a non-empty rationale.
+
+[[files]]
+path = "crates/verbatim-daemon/src/main.rs"
+kind = "source"
+baseline_tokens = 153117
+baseline_lines = 19391
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/ingest.rs"
+kind = "source"
+baseline_tokens = 95977
+baseline_lines = 12305
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/store.rs"
+kind = "source"
+baseline_tokens = 56577
+baseline_lines = 7237
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-cli/src/main.rs"
+kind = "source"
+baseline_tokens = 48026
+baseline_lines = 6120
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/retrieve.rs"
+kind = "source"
+baseline_tokens = 46146
+baseline_lines = 5966
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-cli/src/render.rs"
+kind = "source"
+baseline_tokens = 28514
+baseline_lines = 3849
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/provider/openai_compatible.rs"
+kind = "source"
+baseline_tokens = 27924
+baseline_lines = 3619
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/config.rs"
+kind = "source"
+baseline_tokens = 22726
+baseline_lines = 3037
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/generate.rs"
+kind = "source"
+baseline_tokens = 16701
+baseline_lines = 2328
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-cli/src/client.rs"
+kind = "source"
+baseline_tokens = 16294
+baseline_lines = 1981
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/task.rs"
+kind = "source"
+baseline_tokens = 11747
+baseline_lines = 1620
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/types.rs"
+kind = "source"
+baseline_tokens = 11707
+baseline_lines = 1613
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/graphrag.rs"
+kind = "source"
+baseline_tokens = 10975
+baseline_lines = 1459
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/api.rs"
+kind = "source"
+baseline_tokens = 9477
+baseline_lines = 1290
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/graph_extraction.rs"
+kind = "source"
+baseline_tokens = 9084
+baseline_lines = 1229
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/index_gc.rs"
+kind = "source"
+baseline_tokens = 8266
+baseline_lines = 1095
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/collection.rs"
+kind = "source"
+baseline_tokens = 6651
+baseline_lines = 950
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/upstream.rs"
+kind = "source"
+baseline_tokens = 6716
+baseline_lines = 924
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/index/qdrant.rs"
+kind = "source"
+baseline_tokens = 6899
+baseline_lines = 904
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-core/src/resource.rs"
+kind = "source"
+baseline_tokens = 5901
+baseline_lines = 873
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "scripts/qdrant_spike.py"
+kind = "source"
+baseline_tokens = 13328
+baseline_lines = 1496
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet."
+
+[[files]]
+path = "crates/verbatim-cli/src/local.rs"
+kind = "source"
+baseline_tokens = 6065
+baseline_lines = 718
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet; pinned-tokenizer recalibration lowered token counts below the global threshold but the row is retained as an immutable no-growth cap."
+
+[[files]]
+path = "crates/verbatim-core/src/index/sqlite_fts.rs"
+kind = "source"
+baseline_tokens = 6221
+baseline_lines = 769
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet; pinned-tokenizer recalibration lowered token counts below the global threshold but the row is retained as an immutable no-growth cap."
+
+[[files]]
+path = "crates/verbatim-core/src/provider/endpoint_capability.rs"
+kind = "source"
+baseline_tokens = 5764
+baseline_lines = 800
+issue = "368"
+rationale = "Pre-existing monolith debt retained under an immutable no-growth ratchet; pinned-tokenizer recalibration lowered token counts below the global threshold but the row is retained as an immutable no-growth cap."
+
+[tokenizer]
+command = "tokuin"
+version = "0.3.0"
+revision = "c68d1f804a4c172846716b7be99e9378e16512b7"
+model = "gpt-4o"
+format = "json"
+timeout_seconds = 30
+max_output_bytes = 1048576
+known_answer_input = "Verbatim tokenizer attestation v1"
+known_answer_tokens = 7

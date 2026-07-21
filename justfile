@@ -3,6 +3,8 @@
 # AI AGENT: Do NOT modify this file or use `git commit -n`/`--no-verify`.
 
 set shell := ["bash", "-c"]
+# IO scheduling: run cargo at idle priority to avoid starving interactive processes
+_cargo_io_prefix := "ionice -c 3 nice -n 19"
 set tempdir := "."
 set dotenv-load := true
 
@@ -15,18 +17,59 @@ default: pre-commit
 # Core Workflow
 # ==============================================================================
 
-# Fast pre-commit: version validation and focused version tests plus formatting and linting.
+# Fast pre-commit: formatting completes before the immutable staged snapshot gates.
 pre-commit-fast scope="staged":
-    just check-version-bumped {{quote(scope)}}
-    just version-check-test
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export GIT_NO_REPLACE_OBJECTS=1
+    scope={{quote(scope)}}
     just fmt
+    if [ "$scope" = staged ]; then
+        validated_tree="$(git write-tree)"
+        assert_staged_tree() {
+            local step="$1"
+            local actual_tree
+            actual_tree="$(git write-tree)"
+            [ "$actual_tree" = "$validated_tree" ] \
+                || { printf 'ERROR: staged index changed after %s\n' "$step" >&2; exit 2; }
+        }
+        scripts/hooks/check-version-bumped.sh --scope staged --expected-tree "$validated_tree"
+        assert_staged_tree version-check
+        scripts/monolith/check.sh --scope staged --expected-tree "$validated_tree"
+        assert_staged_tree monolith-check
+    else
+        just check-version-bumped "$scope"
+        just check-monolith "$scope"
+    fi
+    just version-check-test
+    if [ "$scope" = staged ]; then assert_staged_tree version-fixtures; fi
+    just monolith-check-test
+    if [ "$scope" = staged ]; then assert_staged_tree monolith-fixtures; fi
+    just gate-fixture-contract-test
+    if [ "$scope" = staged ]; then assert_staged_tree gate-fixtures; fi
     just clippy
+    if [ "$scope" = staged ]; then assert_staged_tree clippy; fi
     just deny
+    if [ "$scope" = staged ]; then
+        assert_staged_tree deny
+        printf 'Final staged tree receipt: %s\n' "$validated_tree"
+    fi
 
 # Full pre-commit: version validation in the selected snapshot plus formatting, linting, and tests.
 pre-commit scope="staged":
     just pre-commit-fast {{quote(scope)}}
     just test
+
+# Internal pre-push aggregate. It intentionally omits hook fixture suites to avoid recursion.
+pre-push-gate scope="head":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just check-version-bumped {{quote(scope)}}
+    just check-monolith {{quote(scope)}}
+    just clippy
+    just deny
+    just test
+    printf 'pre-push-gate: PARTIAL PASS (%s)\n' {{quote(scope)}}
 
 # ==============================================================================
 # Versioning
@@ -36,9 +79,35 @@ pre-commit scope="staged":
 check-version-bumped scope="staged":
     scripts/hooks/check-version-bumped.sh --scope {{quote(scope)}}
 
+# Enforce the immutable monolith no-growth policy for a Git snapshot.
+check-monolith scope="staged":
+    scripts/monolith/check.sh --scope {{quote(scope)}}
+
 # Test staged and HEAD workspace-version snapshot semantics.
 version-check-test:
-    bash scripts/tests/version-check-tests.sh
+    env -u VERSION_CHECK_TEST_CASE -u VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH \
+        bash scripts/tests/version-check-tests.sh
+
+# Run exactly one version-fixture case; this is not a canonical full-suite receipt.
+version-check-test-focused test_case:
+    VERSION_CHECK_TEST_CASE={{quote(test_case)}} bash scripts/tests/version-check-tests.sh
+
+# Test staged/object monolith snapshot and fail-closed policy semantics.
+monolith-check-test:
+    env -u MONOLITH_TEST_CASE bash scripts/tests/monolith-check-tests.sh
+
+# Run exactly one monolith-fixture case; this is not a canonical full-suite receipt.
+monolith-check-test-focused test_case:
+    MONOLITH_TEST_CASE={{quote(test_case)}} bash scripts/tests/monolith-check-tests.sh
+
+# Test canonical local-gate fixture wiring with external selectors removed.
+gate-fixture-contract-test:
+    env -u GATE_FIXTURE_ORACLE -u GATE_FIXTURE_TEST_CASE \
+        bash scripts/tests/gate-fixture-contract-tests.sh
+
+# Exercise the canonical pre-commit wiring without becoming part of its six-case suite.
+gate-fixture-contract-wiring-test:
+    GATE_FIXTURE_ORACLE=canonical-wiring bash scripts/tests/gate-fixture-contract-tests.sh
 
 # Bump the workspace patch version and refresh Cargo.lock.
 bump-patch:
@@ -65,7 +134,7 @@ bump-patch:
     path.write_text(text[:match.start()] + match.group(1) + new_version + match.group(5) + text[match.end():])
     print(f"Workspace version bumped: {old_version} -> {new_version}")
     PY
-    cargo metadata --format-version 1 >/dev/null
+    {{_cargo_io_prefix}} cargo metadata --format-version 1 >/dev/null
 
 # ==============================================================================
 # Quality Gates
@@ -101,21 +170,22 @@ fmt:
     if (( ${#staged_rs[@]} == 0 )); then
         exit 0
     fi
-    cargo fmt --all
-    printf '%s\0' "${staged_rs[@]}" | xargs -0 git add --
+    {{_cargo_io_prefix}} cargo fmt --all
+    printf '%s\0' "${staged_rs[@]}" \
+        | GIT_LITERAL_PATHSPECS=1 git add --pathspec-from-file=- --pathspec-file-nul
 
 # Clippy for entire workspace (strict).
 clippy:
-    cargo clippy --workspace --all-features -- -D warnings
+    {{_cargo_io_prefix}} cargo clippy --workspace --all-features -- -D warnings
 
 # Clippy for a specific crate.
 # Usage: just clippy-p verbatim-core
 clippy-p package:
-    cargo clippy -p {{package}} --all-features -- -D warnings
+    {{_cargo_io_prefix}} cargo clippy -p {{package}} --all-features -- -D warnings
 
 # Security audit (requires cargo-deny).
 deny:
-    cargo deny check --hide-inclusion-graph
+    {{_cargo_io_prefix}} cargo deny check --hide-inclusion-graph
 
 # ==============================================================================
 # Testing
@@ -127,18 +197,18 @@ bench-qdrant-spike *args:
 
 # Run all workspace tests.
 test:
-    cargo nextest run --workspace --no-tests=warn
-    cargo nextest run --workspace --all-features --no-tests=warn
+    {{_cargo_io_prefix}} cargo nextest run --workspace --no-tests=warn
+    {{_cargo_io_prefix}} cargo nextest run --workspace --all-features --no-tests=warn
 
 # Test a specific crate.
 # Usage: just test-p verbatim-core
 test-p package:
-    cargo nextest run -p {{package}} --all-features --no-tests=warn
+    {{_cargo_io_prefix}} cargo nextest run -p {{package}} --all-features --no-tests=warn
 
 # Test by name pattern.
 # Usage: just test-f chunk_overlap
 test-f pattern:
-    cargo nextest run --workspace --all-features -E 'test({{pattern}})' --no-tests=warn
+    {{_cargo_io_prefix}} cargo nextest run --workspace --all-features -E 'test({{pattern}})' --no-tests=warn
 
 # ==============================================================================
 # Build & Install
@@ -146,13 +216,13 @@ test-f pattern:
 
 # Build all workspace members.
 build:
-    cargo build --workspace --all-features
+    {{_cargo_io_prefix}} cargo build --workspace --all-features
 
 # Install release binaries to /usr/local/bin.
 install:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build --release --all-features -p verbatim-daemon -p verbatim-cli
+    {{_cargo_io_prefix}} cargo build --release --all-features -p verbatim-daemon -p verbatim-cli
     target_dir="${CARGO_TARGET_DIR:-{{_repo_root}}/target}"
     install -m 755 "${target_dir}/release/verbatim-daemon" /usr/local/bin/verbatim-daemon
     install -m 755 "${target_dir}/release/verbatim" /usr/local/bin/verbatim
@@ -217,7 +287,7 @@ install-local-daemon:
         exit 1
     fi
 
-    cargo build --release --all-features -p verbatim-daemon -p verbatim-cli
+    {{_cargo_io_prefix}} cargo build --release --all-features -p verbatim-daemon -p verbatim-cli
     target_dir="${CARGO_TARGET_DIR:-{{_repo_root}}/target}"
     install -m 755 "${target_dir}/release/verbatim-daemon" "${daemon_bin}"
     install -m 755 "${target_dir}/release/verbatim" "${cli_bin}"

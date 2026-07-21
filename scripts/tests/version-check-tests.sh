@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
+shopt -s inherit_errexit
 
 root="$(git rev-parse --show-toplevel)"
 checker="$root/scripts/hooks/check-version-bumped.sh"
 pre_push_checker="$root/scripts/hooks/check-pre-push-version-bumps.sh"
+monolith_checker="$root/scripts/monolith/check.sh"
+monolith_baseline="$root/scripts/monolith/baseline.toml"
 test_tmp_root="$(mktemp -d)"
+case_filter="${VERSION_CHECK_TEST_CASE:-}"
+registered_case_count=0
+executed_case_count=0
+declare -A registered_case_names=()
+declare -a registered_case_manifest=()
+readonly expected_case_manifest_sha256="ba97017570a3545b04a986f8c17315c75ee3a040cf2b38638c7487227732913d"
 
 cleanup() {
     local status=$?
@@ -14,13 +23,21 @@ cleanup() {
 trap cleanup EXIT
 
 hostile_hooks="$test_tmp_root/hostile-hooks"
+hostile_template="$test_tmp_root/hostile-template"
 hostile_global_config="$test_tmp_root/hostile.gitconfig"
-mkdir -p "$hostile_hooks"
+hostile_system_config="$test_tmp_root/hostile-system.gitconfig"
+mkdir -p "$hostile_hooks" "$hostile_template/hooks"
 printf '#!/usr/bin/env bash\nexit 99\n' >"$hostile_hooks/pre-commit"
+printf '#!/usr/bin/env bash\nexit 98\n' >"$hostile_template/hooks/pre-commit"
 chmod +x "$hostile_hooks/pre-commit"
-printf '[commit]\n\tgpgSign = true\n[core]\n\thooksPath = %s\n[init]\n\ttemplateDir = %s\n' \
-    "$hostile_hooks" "$hostile_hooks" >"$hostile_global_config"
+chmod +x "$hostile_template/hooks/pre-commit"
+printf '[commit]\n\tgpgSign = true\n' >"$hostile_global_config"
+printf '[core]\n\thooksPath = %s\n[init]\n\ttemplateDir = %s\n' \
+    "$hostile_hooks" "$hostile_template" >"$hostile_system_config"
+unset GIT_CONFIG_NOSYSTEM
 export GIT_CONFIG_GLOBAL="$hostile_global_config"
+export GIT_CONFIG_SYSTEM="$hostile_system_config"
+export GIT_TEMPLATE_DIR="$hostile_template"
 
 run_without_local_git_env() {
     local -a unset_args=()
@@ -33,6 +50,7 @@ run_without_local_git_env() {
 
     env \
         "${unset_args[@]}" \
+        -u GIT_TEMPLATE_DIR \
         GIT_CONFIG_GLOBAL=/dev/null \
         GIT_CONFIG_NOSYSTEM=1 \
         GIT_CONFIG_SYSTEM=/dev/null \
@@ -50,10 +68,10 @@ init_repo() {
     local name="$1"
     local repo="$test_tmp_root/$name"
 
-    mkdir -p "$repo"
-    run_without_local_git_env git -C "$repo" init -q -b main
-    run_without_local_git_env git -C "$repo" config user.email "test@example.invalid"
-    run_without_local_git_env git -C "$repo" config user.name "Version Test"
+    mkdir -p "$repo" || return
+    run_without_local_git_env git -C "$repo" init -q -b main || return
+    run_without_local_git_env git -C "$repo" config user.email "test@example.invalid" || return
+    run_without_local_git_env git -C "$repo" config user.name "Version Test" || return
     printf '%s\n' "$repo"
 }
 
@@ -92,6 +110,18 @@ assert_success() {
         printf 'FAIL: expected success: %s\n%s\n' "$name" "$output" >&2
         exit 1
     fi
+}
+
+assert_success_output() {
+    local name="$1"
+    local output
+    shift
+
+    if ! output="$("$@" 2>&1)"; then
+        printf 'FAIL: expected success: %s\n%s\n' "$name" "$output" >&2
+        exit 1
+    fi
+    printf '%s' "$output"
 }
 
 assert_failure_status_matching() {
@@ -144,7 +174,45 @@ assert_file_content() {
     fi
 }
 
+assert_output_count() {
+    local name="$1"
+    local pattern="$2"
+    local expected="$3"
+    local output="$4"
+    local actual
+
+    actual="$(grep -Ec -- "$pattern" <<<"$output")"
+    if [ "$actual" -ne "$expected" ]; then
+        printf 'FAIL: %s expected %s matches for %s, got %s\n%s\n' \
+            "$name" "$expected" "$pattern" "$actual" "$output" >&2
+        exit 1
+    fi
+}
+
+# shellcheck source=scripts/tests/gate-fixture-contract-tests.sh
+source "$root/scripts/tests/gate-fixture-contract-tests.sh"
+# shellcheck source=scripts/tests/version-pre-push-tests.sh
+source "$root/scripts/tests/version-pre-push-tests.sh"
+
 run_version_case() {
+    local name="$1"
+    shift
+    if [ -n "${registered_case_names[$name]+set}" ]; then
+        printf 'FAIL: duplicate registered case: %s\n' "$name" >&2
+        exit 1
+    fi
+    registered_case_names["$name"]=1
+    registered_case_manifest+=("$name")
+    registered_case_count=$((registered_case_count + 1))
+    if [ -n "$case_filter" ] && [ "$case_filter" != "$name" ]; then
+        return 0
+    fi
+    executed_case_count=$((executed_case_count + 1))
+    printf 'CASE: %s\n' "$name"
+    "$@"
+}
+
+test_version_ordering_case() {
     local name="$1"
     local base_version="$2"
     local candidate_version="$3"
@@ -198,266 +266,144 @@ run_version_case() {
     )
 }
 
-run_pre_push_path() {
-    local repo="$1"
-    local refs="$2"
-    local validator_log="$3"
-    local full_gate_log="$4"
-    local failing_object="${5:-}"
-
-    (
-        cd "$repo"
-        if [ -n "$refs" ]; then
-            printf '%s\n' "$refs"
-        fi | run_without_local_git_env env \
-            BASE_REF=base \
-            PATH="$repo/test-bin:$PATH" \
-            VERSION_CHECK_FAIL_OBJECT="$failing_object" \
-            VERSION_CHECK_FULL_GATE_LOG="$full_gate_log" \
-            VERSION_CHECK_VALIDATOR_LOG="$validator_log" \
-            "$repo/scripts/hooks/check-pre-push-version-bumps.sh"
-    )
-}
-
-run_just_recipe() {
-    local repo="$1"
-    local recipe="$2"
-    local scope="$3"
-
-    (
-        cd "$repo"
-        BASE_REF=base VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH=1 PATH="$repo/test-bin:$PATH" \
-            just "$recipe" "$scope"
-    )
-}
-
-assert_invalid_scope_rejected() {
-    local repo="$1"
-    local recipe="$2"
-    local payload_name="$3"
-    local payload="$4"
-    local sentinel="$5"
-    local output
-    local status
-
-    rm -f -- "$sentinel"
-    if output="$(run_just_recipe "$repo" "$recipe" "$payload" 2>&1)"; then
-        status=0
-    else
-        status=$?
-    fi
-    if [ -e "$sentinel" ]; then
-        printf 'FAIL: scope payload executed a command: %s (%s)\n' \
-            "$recipe" "$payload_name" >&2
+test_version_snapshot_isolation() {
+    local repo hooks
+    repo="$(init_repo snapshot-isolation)"
+    hooks="$(run_without_local_git_env git -C "$repo" \
+        rev-parse --path-format=absolute --git-path hooks)"
+    case "$hooks" in
+        "$repo"/*) ;;
+        *) printf 'FAIL: fixture hooks escaped repository: %s\n' "$hooks" >&2; exit 1 ;;
+    esac
+    [ ! -e "$hooks/pre-commit" ] || {
+        printf 'FAIL: hostile init.templateDir populated the fixture\n' >&2
         exit 1
-    fi
-    if [ "$status" -ne 2 ]; then
-        printf 'FAIL: expected status 2 for invalid scope: %s (%s), got %s\n%s\n' \
-            "$recipe" "$payload_name" "$status" "$output" >&2
-        exit 1
-    fi
-    if ! grep -Fq -- '--scope must be one of: staged, head' <<<"$output"; then
-        printf 'FAIL: invalid scope was not rejected for %s (%s)\n%s\n' \
-            "$recipe" "$payload_name" "$output" >&2
-        exit 1
-    fi
-}
-
-prepare_pre_push_fixture() {
-    local repo="$1"
-
-    assert_file_contains \
-        'pre-push object validator command' \
-        '      run: scripts/hooks/check-pre-push-version-bumps.sh' \
-        "$root/lefthook.yml"
-    assert_file_contains 'pre-push object validator stdin' '      use_stdin: true' "$root/lefthook.yml"
-    mkdir -p "$repo/scripts/hooks" "$repo/scripts/tests" "$repo/test-bin"
-    cp "$root/justfile" "$repo/justfile"
-    cp "$checker" "$repo/scripts/hooks/check-version-bumped.sh"
-    cp "$pre_push_checker" "$repo/scripts/hooks/check-pre-push-version-bumps.sh"
-    cp "$root/scripts/tests/version-check-tests.sh" "$repo/scripts/tests/version-check-tests.sh"
-    chmod +x \
-        "$repo/scripts/hooks/check-pre-push-version-bumps.sh" \
-        "$repo/scripts/hooks/check-version-bumped.sh" \
-        "$repo/scripts/tests/version-check-tests.sh"
-    printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/test-bin/cargo"
-    chmod +x "$repo/test-bin/cargo"
-}
-
-install_pre_push_recorders() {
-    local repo="$1"
-
-    printf '%s\n' \
-        '#!/usr/bin/env bash' \
-        'set -euo pipefail' \
-        ': "${VERSION_CHECK_VALIDATOR_LOG:?}"' \
-        'if [ "$#" -ne 4 ] || [ "$1" != "--scope" ] || [ "$2" != "object" ] || [ "$3" != "--object" ]; then' \
-        '    printf "unexpected validator invocation: %s\\n" "$*" >&2' \
-        '    exit 64' \
-        'fi' \
-        'printf "validator|%s|%s|%s|%s\\n" "$1" "$2" "$3" "$4" >>"$VERSION_CHECK_VALIDATOR_LOG"' \
-        'if [ -n "${VERSION_CHECK_FAIL_OBJECT:-}" ] && [ "$4" = "$VERSION_CHECK_FAIL_OBJECT" ]; then' \
-        '    printf "fixture validator rejected %s\\n" "$4" >&2' \
-        '    exit 1' \
-        'fi' \
-        >"$repo/scripts/hooks/check-version-bumped.sh"
-    printf '%s\n' \
-        '#!/usr/bin/env bash' \
-        'set -euo pipefail' \
-        ': "${VERSION_CHECK_FULL_GATE_LOG:?}"' \
-        'if [ "$#" -ne 2 ] || [ "$1" != "pre-commit" ] || [ "$2" != "head" ]; then' \
-        '    printf "unexpected full gate invocation: %s\\n" "$*" >&2' \
-        '    exit 64' \
-        'fi' \
-        'printf "%s %s\\n" "$1" "$2" >>"$VERSION_CHECK_FULL_GATE_LOG"' \
-        >"$repo/test-bin/just"
-    chmod +x "$repo/scripts/hooks/check-version-bumped.sh" "$repo/test-bin/just"
-}
-
-# Every ordering case runs against both the staged index and the committed HEAD snapshot.
-run_version_case "numeric-ordering" "0.1.9" "0.1.10" success ""
-run_version_case "patch-downgrade" "0.1.10" "0.1.9" failure "lower than base"
-run_version_case "minor-downgrade" "0.2.0" "0.1.99" failure "lower than base"
-run_version_case "major-downgrade" "1.0.0" "0.99.99" failure "lower than base"
-run_version_case "equal-version" "0.1.0" "0.1.0" failure "equal SemVer precedence"
-run_version_case "prerelease-ordering" "1.0.0-rc.2" "1.0.0-rc.10" success ""
-run_version_case "build-metadata-equality" "1.0.0+build.1" "1.0.0+build.2" failure "equal SemVer precedence"
-run_version_case "malformed-base" "1.0" "1.0.1" failure "malformed base version"
-run_version_case "malformed-candidate" "1.0.0" "1.0" failure "malformed .*snapshot version"
-
-repo="$(init_repo snapshot-isolation)"
-commit_manifest "$repo" "0.1.0" base
-run_without_local_git_env git -C "$repo" branch base
-write_manifest "$repo/Cargo.toml" "0.1.1"
-run_without_local_git_env git -C "$repo" add Cargo.toml
-write_manifest "$repo/Cargo.toml" "0.1.0"
-(
-    cd "$repo"
-    assert_success \
-        "staged check ignores a reverted worktree manifest" \
-        run_without_local_git_env "$checker" --scope staged --base-ref base
-    assert_failure_matching \
-        "HEAD check fails when its manifest version is unchanged" \
-        "equal SemVer precedence" \
-        run_without_local_git_env "$checker" --scope head --base-ref base
-)
-run_without_local_git_env git -C "$repo" commit -q -m bump
-printf 'worktree bytes are deliberately not TOML\n' >"$repo/Cargo.toml"
-touch "$repo/unrelated-worktree-file"
-(
-    cd "$repo"
-    assert_success \
-        "HEAD check ignores dirty worktree manifest and unrelated files" \
-        run_without_local_git_env "$checker" --scope head --base-ref base
-)
-
-if [ "${VERSION_CHECK_TEST_SKIP_PRE_PUSH_PATH:-}" != "1" ]; then
-    repo="$(init_repo pre-push-objects)"
+    }
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n: > .fixture-local-pre-commit-ran\n' \
+        >"$hooks/pre-commit"
+    chmod +x "$hooks/pre-commit"
     commit_manifest "$repo" "0.1.0" base
+    [ -e "$repo/.fixture-local-pre-commit-ran" ] || {
+        printf 'FAIL: fixture-local pre-commit hook did not run\n' >&2
+        exit 1
+    }
     run_without_local_git_env git -C "$repo" branch base
-    commit_manifest "$repo" "0.1.1" bumped
-    good_object="$(run_without_local_git_env git -C "$repo" rev-parse HEAD)"
-    run_without_local_git_env git -C "$repo" tag -a v0.1.1 -m v0.1.1
-    tag_object="$(run_without_local_git_env git -C "$repo" rev-parse v0.1.1)"
-    run_without_local_git_env git -C "$repo" switch -q -c unchanged base
-    printf 'unchanged pushed object\n' >"$repo/unchanged-marker"
-    run_without_local_git_env git -C "$repo" add unchanged-marker
-    run_without_local_git_env git -C "$repo" commit -q -m unchanged
-    unchanged_object="$(run_without_local_git_env git -C "$repo" rev-parse HEAD)"
-    run_without_local_git_env git -C "$repo" switch -q main
-    prepare_pre_push_fixture "$repo"
-
-    sentinel="$repo/invalid-scope-sentinel"
-    scope_payload="staged; touch $sentinel"
-    for recipe in check-version-bumped pre-commit-fast pre-commit; do
-        assert_invalid_scope_rejected \
-            "$repo" "$recipe" \
-            'command separator' \
-            "$scope_payload" \
-            "$sentinel"
-    done
-
+    write_manifest "$repo/Cargo.toml" "0.1.1"
+    run_without_local_git_env git -C "$repo" add Cargo.toml
+    write_manifest "$repo/Cargo.toml" "0.1.0"
     (
         cd "$repo"
         assert_success \
-            'object check validates an annotated tag object rather than ambient HEAD' \
-            run_without_local_git_env "$checker" --scope object --object "$tag_object" --base-ref base
+            "staged check ignores a reverted worktree manifest" \
+            run_without_local_git_env "$checker" --scope staged --base-ref base
         assert_failure_matching \
-            'object check rejects a non-HEAD pushed commit with unchanged version' \
+            "HEAD check fails when its manifest version is unchanged" \
+            "equal SemVer precedence" \
+            run_without_local_git_env "$checker" --scope head --base-ref base
+    )
+    run_without_local_git_env git -C "$repo" commit -q -m bump
+    printf 'worktree bytes are deliberately not TOML\n' >"$repo/Cargo.toml"
+    touch "$repo/unrelated-worktree-file"
+    (
+        cd "$repo"
+        assert_success \
+            "HEAD check ignores dirty worktree manifest and unrelated files" \
+            run_without_local_git_env "$checker" --scope head --base-ref base
+    )
+}
+
+test_version_snapshot_object_authority() {
+    local replacement_repo base_repo missing_repo bad_object good_object base_object benign_object
+    local missing_object missing_tree
+
+    replacement_repo="$(init_repo version-replacement-candidate)"
+    commit_manifest "$replacement_repo" "0.1.0" base
+    run_without_local_git_env git -C "$replacement_repo" branch base
+    printf 'unchanged version candidate\n' >"$replacement_repo/marker"
+    run_without_local_git_env git -C "$replacement_repo" add marker
+    run_without_local_git_env git -C "$replacement_repo" commit -q -m bad
+    bad_object="$(run_without_local_git_env git -C "$replacement_repo" rev-parse HEAD)"
+    run_without_local_git_env git -C "$replacement_repo" switch -q -c good base
+    commit_manifest "$replacement_repo" "0.1.1" good
+    good_object="$(run_without_local_git_env git -C "$replacement_repo" rev-parse HEAD)"
+    run_without_local_git_env git -C "$replacement_repo" replace "$bad_object" "$good_object"
+    (
+        cd "$replacement_repo"
+        assert_failure_matching \
+            'replacement candidate cannot hide an unchanged workspace version' \
             'equal SemVer precedence' \
-            run_without_local_git_env "$checker" --scope object --object "$unchanged_object" --base-ref base
+            run_without_local_git_env "$checker" --scope object --object "$bad_object" --base-ref base
     )
 
-    write_manifest "$repo/Cargo.toml" "0.1.0"
-    run_without_local_git_env git -C "$repo" add Cargo.toml
-    install_pre_push_recorders "$repo"
-    validator_log="$repo/validator.log"
-    full_gate_log="$repo/full-gate.log"
-    : >"$validator_log"
-    : >"$full_gate_log"
-    zero_object='0000000000000000000000000000000000000000'
-    multi_ref_input="refs/heads/main $good_object refs/heads/main $zero_object
-refs/tags/v0.1.1 $tag_object refs/tags/v0.1.1 $zero_object"
-    assert_success \
-        'pre-push validates every pushed non-deletion object before the full HEAD gate' \
-        run_pre_push_path "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log"
-    assert_file_content \
-        'pre-push validator calls for multiple refs' \
-        "validator|--scope|object|--object|$good_object
-validator|--scope|object|--object|$tag_object" \
-        "$validator_log"
-    assert_file_content 'pre-push full gate call' 'pre-commit head' "$full_gate_log"
+    base_repo="$(init_repo version-replacement-base)"
+    commit_manifest "$base_repo" "0.1.0" base
+    base_object="$(run_without_local_git_env git -C "$base_repo" rev-parse HEAD)"
+    run_without_local_git_env git -C "$base_repo" branch base
+    run_without_local_git_env git -C "$base_repo" switch -q -c candidate base
+    commit_manifest "$base_repo" "0.1.1" candidate
+    run_without_local_git_env git -C "$base_repo" switch -q -c benign-base base
+    commit_manifest "$base_repo" "9.0.0" benign-base
+    benign_object="$(run_without_local_git_env git -C "$base_repo" rev-parse HEAD)"
+    run_without_local_git_env git -C "$base_repo" replace "$base_object" "$benign_object"
+    run_without_local_git_env git -C "$base_repo" switch -q candidate
+    (
+        cd "$base_repo"
+        assert_success \
+            'replacement trusted base cannot change version authority' \
+            run_without_local_git_env "$checker" --scope head --base-ref base
+    )
 
-    : >"$validator_log"
-    : >"$full_gate_log"
-    assert_failure_matching \
-        'pre-push rejects a non-HEAD pushed object when its validator fails' \
-        'fixture validator rejected' \
-        run_pre_push_path \
-        "$repo" \
-        "refs/heads/unchanged $unchanged_object refs/heads/unchanged $zero_object" \
-        "$validator_log" \
-        "$full_gate_log" \
-        "$unchanged_object"
-    assert_file_content \
-        'failing pre-push validator call' \
-        "validator|--scope|object|--object|$unchanged_object" \
-        "$validator_log"
-    assert_file_content 'full gate is skipped after a validator failure' '' "$full_gate_log"
+    missing_repo="$(init_repo version-missing-cargo-blob)"
+    commit_manifest "$missing_repo" "0.1.0" base
+    run_without_local_git_env git -C "$missing_repo" branch base
+    missing_object="1111111111111111111111111111111111111111"
+    missing_tree="$(printf '100644 blob %s\tCargo.toml\0' "$missing_object" \
+        | run_without_local_git_env git -C "$missing_repo" mktree -z --missing)"
+    bad_object="$(printf 'missing cargo blob\n' \
+        | run_without_local_git_env git -C "$missing_repo" commit-tree "$missing_tree" -p base)"
+    (
+        cd "$missing_repo"
+        assert_failure_matching \
+            'missing regular Cargo.toml blob has a named object failure' \
+            'cannot materialize object snapshot Cargo.toml blob' \
+            run_without_local_git_env "$checker" --scope object --object "$bad_object" --base-ref base
+    )
+}
 
-    : >"$validator_log"
-    : >"$full_gate_log"
-    assert_failure_matching \
-        'pre-push rejects malformed local object IDs before the full gate' \
-        'invalid pre-push local object ID' \
-        run_pre_push_path \
-        "$repo" \
-        "refs/heads/malformed not-an-object refs/heads/malformed $zero_object" \
-        "$validator_log" \
-        "$full_gate_log"
-    assert_file_content 'malformed input does not invoke the validator' '' "$validator_log"
-    assert_file_content 'malformed input does not invoke the full gate' '' "$full_gate_log"
+# Every ordering case runs against both the staged index and the committed HEAD snapshot.
+run_version_case 'V1 numeric ordering' test_version_ordering_case numeric-ordering 0.1.9 0.1.10 success ''
+run_version_case 'V2 patch downgrade' test_version_ordering_case patch-downgrade 0.1.10 0.1.9 failure 'lower than base'
+run_version_case 'V3 minor downgrade' test_version_ordering_case minor-downgrade 0.2.0 0.1.99 failure 'lower than base'
+run_version_case 'V4 major downgrade' test_version_ordering_case major-downgrade 1.0.0 0.99.99 failure 'lower than base'
+run_version_case 'V5 equal version' test_version_ordering_case equal-version 0.1.0 0.1.0 failure 'equal SemVer precedence'
+run_version_case 'V6 prerelease ordering' test_version_ordering_case prerelease-ordering 1.0.0-rc.2 1.0.0-rc.10 success ''
+run_version_case 'V7 build metadata equality' test_version_ordering_case build-metadata-equality 1.0.0+build.1 1.0.0+build.2 failure 'equal SemVer precedence'
+run_version_case 'V8 malformed base' test_version_ordering_case malformed-base 1.0 1.0.1 failure 'malformed base version'
+run_version_case 'V9 malformed candidate' test_version_ordering_case malformed-candidate 1.0.0 1.0 failure 'malformed .*snapshot version'
+run_version_case 'V10 snapshot isolation' test_version_snapshot_isolation
+run_version_case 'V11 object authority' test_version_snapshot_object_authority
+run_version_case 'V12 pre-push path' run_version_pre_push_tests
 
-    : >"$validator_log"
-    : >"$full_gate_log"
-    assert_failure_matching \
-        'pre-push rejects missing reference input' \
-        'missing pre-push reference input' \
-        run_pre_push_path "$repo" '' "$validator_log" "$full_gate_log"
-    assert_file_content 'missing input does not invoke the validator' '' "$validator_log"
-    assert_file_content 'missing input does not invoke the full gate' '' "$full_gate_log"
-
-    : >"$validator_log"
-    : >"$full_gate_log"
-    assert_success \
-        'pre-push skips deletions but still runs the full gate' \
-        run_pre_push_path \
-        "$repo" \
-        "refs/heads/deleted $zero_object refs/heads/deleted $good_object" \
-        "$validator_log" \
-        "$full_gate_log"
-    assert_file_content 'deletion does not invoke the object validator' '' "$validator_log"
-    assert_file_content 'deletion full gate call' 'pre-commit head' "$full_gate_log"
+[ "$registered_case_count" -eq 12 ] || {
+    printf 'FAIL: registered: %s/12\n' "$registered_case_count" >&2
+    exit 1
+}
+actual_case_manifest_sha256="$(
+    printf '%s\n' "${registered_case_manifest[@]}" | case_manifest_sha256
+)"
+if [ "$actual_case_manifest_sha256" != "$expected_case_manifest_sha256" ]; then
+    printf 'FAIL: case manifest mismatch: %s\n' "$actual_case_manifest_sha256" >&2
+    exit 1
 fi
-
-printf 'version-check-tests: PASS\n'
+if [ -n "$case_filter" ]; then
+    [ "$executed_case_count" -eq 1 ] || {
+        printf 'FAIL: selected: %s\n' "$executed_case_count" >&2
+        exit 1
+    }
+else
+    [ "$executed_case_count" -eq "$registered_case_count" ] || {
+        printf 'FAIL: case count mismatch\n' >&2
+        exit 1
+    }
+fi
+printf 'version-check-tests: PASS (%s Tier-4 cases)\n' "$executed_case_count"
