@@ -50,8 +50,8 @@ use crate::resource::{
     TaskResourceProgress,
 };
 use crate::store::{
-    EmbeddingCacheVector, EmbeddingProfileConfig, SourceContentsReplacement, Store,
-    StoredEmbeddingProfileConfig,
+    EmbeddingCacheVector, EmbeddingProfileConfig, SourceContentsReplacement, SqliteWriteOperation,
+    Store, StoredEmbeddingProfileConfig,
 };
 use crate::task::{
     FinishedPhaseTiming, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskId,
@@ -887,7 +887,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             .with_context(|| format!("create data dir: {}", data_dir.display()))?;
 
         let db_path = data_dir.join("verbatim.db");
-        let store = Store::new(&db_path)?;
+        let store = Store::new_with_durability_profile(&db_path, config.store.durability)?;
         let fts_startup_maintenance = SqliteFtsIndex::new(&store)
             .maintain_startup()
             .context("sqlite FTS startup maintenance")?;
@@ -971,7 +971,10 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
 
     pub fn open_readonly(config: &Config, data_dir: &Path) -> Result<Self> {
         let db_path = data_dir.join("verbatim.db");
-        let store = Store::open_existing_readonly(&db_path)?;
+        let store = Store::open_existing_readonly_with_durability_profile(
+            &db_path,
+            config.store.durability,
+        )?;
 
         let embed_client = OpenAiEmbeddingClient::new(&config.embedding);
         let active_profile_id = config.embedding.profile_id.clone();
@@ -1076,6 +1079,17 @@ where
 {
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Refuse a write-heavy ingest or index operation before it consumes the
+    /// configured SQLite filesystem reserve.
+    pub fn ensure_write_capacity(&self, operation: SqliteWriteOperation) -> Result<()> {
+        self.store.ensure_write_capacity(operation)
+    }
+
+    /// Run the profile's scheduled WAL maintenance after an ingest/index job.
+    pub fn checkpoint_wal(&self) -> Result<()> {
+        self.store.checkpoint_wal().map(|_| ())
     }
 
     pub fn hnsw(&self) -> &HnswIndex {

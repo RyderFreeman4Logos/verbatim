@@ -20,6 +20,9 @@ use verbatim_core::types::{
     RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalStageHit, SourceLocator,
 };
 
+#[path = "render_sqlite_durability.rs"]
+mod render_sqlite_durability;
+
 /// Persisted sample used to estimate aggregate task-list progress across CLI calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskListAggregateHistory {
@@ -1961,6 +1964,7 @@ where
     let active_tasks: usize = health.resources.iter().map(|r| r.active).sum();
     let total_completed: u64 = health.resources.iter().map(|r| r.completed).sum();
     write!(writer, " tasks={}/{}", active_tasks, total_completed)?;
+    render_sqlite_durability::write_compact(writer, health)?;
     if let Some(reclaim) = &health.idle_reclaim {
         if reclaim.enabled {
             write!(writer, " idle_reclaim=enabled")?;
@@ -2010,6 +2014,7 @@ where
         "Memory budget: limit={} rss={} MB reserved={} MB available={} enforcement={:?}",
         limit, budget.rss_mb, budget.reserved_mb, available, budget.enforcement
     )?;
+    render_sqlite_durability::write_verbose(writer, health)?;
     if !budget.active_reservations.is_empty() {
         writeln!(writer, "Memory reservations:")?;
         for reservation in &budget.active_reservations {
@@ -3181,9 +3186,8 @@ fn value_string_list(value: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use verbatim_core::api::{
-        CollectionResultProvenance, ConfigResponse, EvidenceResponse, ReadinessHealth,
-        RetrieveControlsResponse, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
-        SourceResponse,
+        CollectionResultProvenance, ConfigResponse, EvidenceResponse, RetrieveControlsResponse,
+        RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
     };
     use verbatim_core::task::{TaskId, TaskKind, TaskStatus};
     use verbatim_core::types::{
@@ -3771,79 +3775,5 @@ mod tests {
         assert!(out.contains("rerank.model=disabled"));
         assert!(out.contains("idle_reclaim=disabled"));
         assert!(out.contains("idle_exit=disabled"));
-    }
-
-    #[test]
-    fn health_compact_shows_status_rss_and_idle_flags() {
-        use verbatim_core::api::{IdleExitHealth, IdleReclaimHealth};
-        use verbatim_core::memory_budget::MemoryBudgetSnapshot;
-        let health = HealthResponse {
-            status: "ok".into(),
-            readiness: ReadinessHealth::ready(),
-            memory_budget: MemoryBudgetSnapshot {
-                rss_mb: 282,
-                ..Default::default()
-            },
-            resources: Vec::new(),
-            idle_reclaim: Some(IdleReclaimHealth {
-                enabled: true,
-                sqlite_shrink_memory: true,
-                malloc_trim: true,
-                currently_idle: true,
-                eligible: false,
-                skip_reason: None,
-                idle_for_millis: 30_000,
-                idle_timeout_millis: 300_000,
-                min_interval_millis: 900_000,
-                next_eligible_in_millis: None,
-                active: Default::default(),
-                last_result: None,
-                last_attempt_result: None,
-            }),
-            idle_exit: Some(IdleExitHealth {
-                enabled: true,
-                count_health_requests: false,
-                allow_with_collection_watcher: true,
-                auto_start_on_cli: true,
-                currently_idle: false,
-                eligible: false,
-                skip_reason: Some("active_tasks".into()),
-                idle_for_millis: 0,
-                timeout_millis: 1_200_000,
-                last_activity_unix_ms: 0,
-                deadline_unix_ms: 0,
-                next_eligible_in_millis: None,
-                active: Default::default(),
-            }),
-        };
-        let mut output = Vec::new();
-        write_health_compact(&mut output, &health).unwrap();
-        let out = String::from_utf8(output).unwrap();
-        assert!(out.contains("ok rss=282MB"));
-        assert!(out.contains("idle_reclaim=enabled"));
-        assert!(out.contains("idle_exit=enabled(1200s)"));
-        assert!(out.contains("--details"));
-    }
-
-    #[test]
-    fn health_compact_minimal_when_no_idle_features() {
-        use verbatim_core::memory_budget::MemoryBudgetSnapshot;
-        let health = HealthResponse {
-            status: "ok".into(),
-            readiness: ReadinessHealth::ready(),
-            memory_budget: MemoryBudgetSnapshot {
-                rss_mb: 100,
-                ..Default::default()
-            },
-            resources: Vec::new(),
-            idle_reclaim: None,
-            idle_exit: None,
-        };
-        let mut output = Vec::new();
-        write_health_compact(&mut output, &health).unwrap();
-        let out = String::from_utf8(output).unwrap();
-        assert!(out.contains("ok rss=100MB"));
-        assert!(!out.contains("idle_reclaim"));
-        assert!(!out.contains("idle_exit"));
     }
 }

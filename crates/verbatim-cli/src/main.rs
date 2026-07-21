@@ -2202,60 +2202,6 @@ fn index_status_help_includes_examples() {
 }
 
 #[cfg(test)]
-#[test]
-fn config_init_template_documents_store_and_parser() {
-    let template = tests::generated_config_template();
-
-    assert!(template.contains("[store]"));
-    assert!(template.contains("SQLite metadata/text"));
-    assert!(template.contains("vectors"));
-    assert!(template.contains("BM25"));
-    assert!(template.contains("[parser]"));
-    assert!(template.contains("born-digital"));
-    assert!(template.contains("scanned/image-only"));
-    assert!(template.contains("image artifact"));
-}
-
-#[cfg(test)]
-#[test]
-fn config_init_template_documents_model_and_retrieval_knobs() {
-    let _env = tests::EnvGuard::capture(&["OPENAI_API_KEY"]);
-    std::env::set_var("OPENAI_API_KEY", "sentinel-secret-value");
-
-    let template = tests::generated_config_template();
-
-    assert!(template.contains("[embedding]"));
-    assert!(template.contains("[rerank]"));
-    assert!(template.contains("endpoint"));
-    assert!(template.contains("model"));
-    assert!(template.contains("concurrency"));
-    assert!(template.contains("timeout"));
-    assert!(template.contains("[retrieval]"));
-    assert!(template.contains("RRF fusion"));
-    assert!(template.contains("page size"));
-    assert!(template.contains("OCR"));
-    assert!(template.contains("vision"));
-    assert!(template.contains("qdrant"));
-    assert!(template.contains("api_key = \"\""));
-    assert!(!template.contains("sentinel-secret-value"));
-}
-
-#[cfg(test)]
-#[test]
-fn config_init_template_documents_daemon_resources_and_watcher() {
-    let template = tests::generated_config_template();
-
-    assert!(template.contains("[daemon]"));
-    assert!(template.contains("bind"));
-    assert!(template.contains("worker threads"));
-    assert!(template.contains("idle reclaim"));
-    assert!(template.contains("idle exit"));
-    assert!(template.contains("[daemon.resources]"));
-    assert!(template.contains("resources"));
-    assert!(template.contains("collection watcher"));
-}
-
-#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::env;
@@ -2267,6 +2213,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[path = "config_template_tests.rs"]
+    mod config_template_tests;
 
     use serde_json::Value;
     use verbatim_core::api::{
@@ -3130,6 +3079,7 @@ mod tests {
                 last_attempt_result: None,
             }),
             idle_exit: None,
+            sqlite_durability: None,
         }));
         let local = MockLocalActions::default();
 
@@ -3158,6 +3108,7 @@ mod tests {
             resources: Vec::new(),
             idle_reclaim: None,
             idle_exit: None,
+            sqlite_durability: None,
         }));
         let local = MockLocalActions::default();
 
@@ -3245,6 +3196,7 @@ mod tests {
                 }),
             }),
             idle_exit: None,
+            sqlite_durability: None,
         }));
         let local = MockLocalActions::default();
 
@@ -3287,6 +3239,7 @@ mod tests {
                     ..IdleExitActivitySnapshot::default()
                 },
             }),
+            sqlite_durability: None,
         }));
         let local = MockLocalActions::default();
 
@@ -5256,6 +5209,7 @@ mod tests {
                     resources: Vec::new(),
                     idle_reclaim: None,
                     idle_exit: None,
+                    sqlite_durability: None,
                 }))
         }
     }
