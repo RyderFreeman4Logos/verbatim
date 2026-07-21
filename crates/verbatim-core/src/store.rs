@@ -440,6 +440,8 @@ impl Store {
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         self.conn.execute_batch(SCHEMA)?;
         self.conn.execute_batch(store_deletion::DELETION_SCHEMA)?;
+        self.conn
+            .execute_batch(store_deletion::PREVENT_RESURRECTED_SOURCES_TRIGGER)?;
         migrate_embedding_profile_tables(&self.conn)?;
         ensure_column(
             &self.conn,

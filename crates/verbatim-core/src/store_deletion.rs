@@ -30,6 +30,16 @@ CREATE INDEX IF NOT EXISTS deletion_reports_source_id_idx
     ON deletion_reports(source_id, id);
 "#;
 
+pub(super) const PREVENT_RESURRECTED_SOURCES_TRIGGER: &str = r#"
+CREATE TRIGGER IF NOT EXISTS prevent_resurrected_sources
+BEFORE INSERT ON sources
+FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM source_tombstones WHERE source_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'source is tombstoned');
+END;
+"#;
+
 impl Store {
     /// Return whether a source id has a durable deletion tombstone.
     pub fn is_tombstoned(&self, source_id: &SourceId) -> Result<bool> {
@@ -106,18 +116,38 @@ impl Store {
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
-    pub(crate) fn set_qdrant_deletion_outcome(
+    /// Persist a Qdrant deletion outcome and its audit receipt atomically.
+    pub(crate) fn finalize_deletion_outcome_tx(
         &self,
+        transaction: &mut Transaction<'_>,
         source_id: &SourceId,
         outcome: DeletionOutcome,
+        retention_policy: RetentionPolicy,
+        report: &DeletionReport,
     ) -> Result<()> {
-        let changed = self.conn.execute(
+        let changed = transaction.execute(
             "UPDATE source_tombstones SET qdrant_outcome = ?2 WHERE source_id = ?1",
             params![&source_id.0, qdrant_outcome_to_str(outcome)],
         )?;
         if changed == 0 {
             bail!("source tombstone not found: {}", source_id.0);
         }
+
+        let retention_policy_json = serde_json::to_string(&retention_policy)
+            .context("serialize deletion-report retention policy")?;
+        let outcomes_json =
+            serde_json::to_string(report).context("serialize deletion-report outcomes")?;
+        transaction.execute(
+            "INSERT INTO deletion_reports
+             (source_id, recorded_at, retention_policy_json, outcomes_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &source_id.0,
+                unix_timestamp_string(),
+                retention_policy_json,
+                outcomes_json,
+            ],
+        )?;
         Ok(())
     }
 

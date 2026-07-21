@@ -137,9 +137,18 @@ fn persisted_tombstone_retention_keeps_backups_pending_until_cleaned_or_held() {
         DeletionOutcome::Pending,
     );
 
+    let report = crate::deletion::DeletionReport::new();
+    let mut transaction = store.connection().unchecked_transaction().unwrap();
     store
-        .set_qdrant_deletion_outcome(&source.id, DeletionOutcome::Erased)
+        .finalize_deletion_outcome_tx(
+            &mut transaction,
+            &source.id,
+            DeletionOutcome::Erased,
+            RetentionPolicy::UntilBackupExpiry(20),
+            &report,
+        )
         .unwrap();
+    transaction.commit().unwrap();
     assert!(store
         .pending_qdrant_deletion_source_ids()
         .unwrap()
@@ -149,6 +158,77 @@ fn persisted_tombstone_retention_keeps_backups_pending_until_cleaned_or_held() {
         .unwrap_err()
         .to_string()
         .contains("tombstoned"));
+}
+
+#[test]
+fn replace_source_contents_cannot_resurrect_tombstoned_source() {
+    let store = Store::in_memory().unwrap();
+    let source = Source {
+        id: SourceId("replace-tombstoned-source".into()),
+        path: std::path::PathBuf::from("replace-tombstoned-source.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    let profile = EmbeddingProfileId::default_profile();
+    store.add_source(&source).unwrap();
+    store.remove_source(&source.id).unwrap();
+
+    let error = store
+        .replace_source_contents(SourceContentsReplacement {
+            source: &source,
+            evidence: &[],
+            chunks: &[],
+            embedding_profile_id: &profile,
+            vectors: &[],
+            links: &[],
+            evidence_spans: &[],
+            image_artifacts: &[],
+            graph_nodes: &[],
+            graph_edges: &[],
+        })
+        .unwrap_err();
+
+    assert!(error.to_string().contains("source is tombstoned"));
+    assert!(store.get_source(&source.id).unwrap().is_none());
+}
+
+#[test]
+fn finalizing_deletion_outcome_persists_report_after_deletion() {
+    let store = Store::in_memory().unwrap();
+    let source = Source {
+        id: SourceId("finalize-deletion-outcome".into()),
+        path: std::path::PathBuf::from("finalize-deletion-outcome.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    store.add_source(&source).unwrap();
+    store.remove_source(&source.id).unwrap();
+    let report = crate::deletion::DeletionReport::new();
+    let mut transaction = store.connection().unchecked_transaction().unwrap();
+
+    store
+        .finalize_deletion_outcome_tx(
+            &mut transaction,
+            &source.id,
+            DeletionOutcome::NotFound,
+            RetentionPolicy::Immediate,
+            &report,
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let persisted_reports = store.list_deletion_reports().unwrap();
+    assert_eq!(persisted_reports.len(), 1);
+    assert_eq!(persisted_reports[0].source_id, source.id);
+    assert_eq!(persisted_reports[0].report, report);
+    assert!(store
+        .pending_qdrant_deletion_source_ids()
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

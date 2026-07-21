@@ -39,13 +39,17 @@ where
         let qdrant_outcome = self.sync_qdrant_delete_source(source_id).await;
         #[cfg(not(feature = "qdrant"))]
         let qdrant_outcome = DeletionOutcome::NotFound;
-        self.store
-            .set_qdrant_deletion_outcome(source_id, qdrant_outcome)?;
-
         let mut report = self.local_deletion_report(source_id, images)?;
         report.set(DeletionProduct::Qdrant, qdrant_outcome);
-        self.store
-            .persist_deletion_report(source_id, retention_policy, &report)?;
+        let mut transaction = self.store.connection().unchecked_transaction()?;
+        self.store.finalize_deletion_outcome_tx(
+            &mut transaction,
+            source_id,
+            qdrant_outcome,
+            retention_policy,
+            &report,
+        )?;
+        transaction.commit()?;
         Ok(report)
     }
 
@@ -69,8 +73,6 @@ where
             let qdrant_outcome = self.sync_qdrant_delete_source(&source_id).await;
             #[cfg(not(feature = "qdrant"))]
             let qdrant_outcome = DeletionOutcome::NotFound;
-            self.store
-                .set_qdrant_deletion_outcome(&source_id, qdrant_outcome)?;
             let mut report = match self.store.latest_deletion_report(&source_id)? {
                 Some(previous) => previous.report,
                 None => self.local_deletion_report(&source_id, DeletionOutcome::Pending)?,
@@ -81,8 +83,15 @@ where
                 self.store
                     .backup_deletion_outcome_at(&source_id, current_unix_timestamp_secs())?,
             );
-            self.store
-                .persist_deletion_report(&source_id, retention_policy, &report)?;
+            let mut transaction = self.store.connection().unchecked_transaction()?;
+            self.store.finalize_deletion_outcome_tx(
+                &mut transaction,
+                &source_id,
+                qdrant_outcome,
+                retention_policy,
+                &report,
+            )?;
+            transaction.commit()?;
             reports.push(report);
         }
         Ok(reports)
