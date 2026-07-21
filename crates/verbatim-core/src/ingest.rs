@@ -101,10 +101,18 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     fts_startup_maintenance: FtsMaintenanceOutcome,
     #[cfg(test)]
     source_commit_observer: Option<SourceCommitObserver>,
+    #[cfg(test)]
+    fail_next_batched_index_stage_with_enospc: bool,
+    #[cfg(test)]
+    fail_next_batched_compensation_write_with_readonly: bool,
 }
 
 #[cfg(test)]
 type SourceCommitObserver = Box<dyn Fn(&Store, &SourceId) + Send + Sync>;
+
+#[cfg(test)]
+#[path = "tests/issue_362_tests.rs"]
+mod issue_362_tests;
 
 struct PreparedIndexes {
     hnsw: HnswIndex,
@@ -116,6 +124,7 @@ struct PreparedIndexes {
 struct BatchedCommittedSource {
     source_id: SourceId,
     task_id: Option<TaskId>,
+    index_generation: u64,
     vector_count: usize,
     cache_stats: EmbeddingCacheStats,
     io_telemetry: SourceCommitIoTelemetry,
@@ -250,12 +259,20 @@ impl SourceCommitIoTelemetry {
         self.db_metadata_inner(source_id, profile_id, Some(generation), 1, false)
     }
 
-    fn batched_db_metadata_without_generation_update(
+    fn batched_db_metadata(
         &self,
         source_id: &SourceId,
         profile_id: &EmbeddingProfileId,
+        generation: u64,
+        generation_advanced: bool,
     ) -> serde_json::Value {
-        self.db_metadata_inner(source_id, profile_id, None, 0, true)
+        self.db_metadata_inner(
+            source_id,
+            profile_id,
+            Some(generation),
+            u64::from(generation_advanced),
+            false,
+        )
     }
 
     fn db_metadata_inner(
@@ -966,6 +983,10 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             fts_startup_maintenance,
             #[cfg(test)]
             source_commit_observer: None,
+            #[cfg(test)]
+            fail_next_batched_index_stage_with_enospc: false,
+            #[cfg(test)]
+            fail_next_batched_compensation_write_with_readonly: false,
         })
     }
 
@@ -1041,6 +1062,10 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             fts_startup_maintenance: FtsMaintenanceOutcome::default(),
             #[cfg(test)]
             source_commit_observer: None,
+            #[cfg(test)]
+            fail_next_batched_index_stage_with_enospc: false,
+            #[cfg(test)]
+            fail_next_batched_compensation_write_with_readonly: false,
         })
     }
 
@@ -1314,6 +1339,10 @@ where
             fts_startup_maintenance: FtsMaintenanceOutcome::default(),
             #[cfg(test)]
             source_commit_observer: None,
+            #[cfg(test)]
+            fail_next_batched_index_stage_with_enospc: false,
+            #[cfg(test)]
+            fail_next_batched_compensation_write_with_readonly: false,
         }
     }
 
@@ -1347,6 +1376,16 @@ where
     {
         self.source_commit_observer = Some(Box::new(observer));
         self
+    }
+
+    #[cfg(test)]
+    fn fail_next_batched_index_stage_with_enospc(&mut self) {
+        self.fail_next_batched_index_stage_with_enospc = true;
+    }
+
+    #[cfg(test)]
+    fn fail_next_batched_compensation_write_with_readonly(&mut self) {
+        self.fail_next_batched_compensation_write_with_readonly = true;
     }
 
     #[cfg(test)]
@@ -2541,6 +2580,7 @@ where
     async fn commit_prepared_source_without_index_publish(
         &mut self,
         profile_id: &EmbeddingProfileId,
+        batch_generation: Option<u64>,
         prepared_source: PreparedSourceIngest,
         vectors: Vec<VectorDocument>,
         cache_stats: EmbeddingCacheStats,
@@ -2595,34 +2635,49 @@ where
                 .with_resource(task_resource_progress(&sqlite_write_permit, "active")),
             &sqlite_write_permit,
         );
-        let lexical_update =
-            match self
+        let replacement = SourceContentsReplacement {
+            source: &source,
+            evidence: &evidence,
+            chunks: &chunks,
+            embedding_profile_id: profile_id,
+            vectors: &vectors,
+            links: &links,
+            evidence_spans: &evidence_spans,
+            image_artifacts: &image_artifacts.artifacts,
+            graph_nodes: &graph_nodes,
+            graph_edges: &graph_edges,
+        };
+        // The first durable source mutation invalidates the old manifest in
+        // the same transaction, before any fallible HNSW staging begins.
+        let commit_result = match batch_generation {
+            Some(generation) => self
                 .store
-                .replace_source_contents_without_generation(SourceContentsReplacement {
-                    source: &source,
-                    evidence: &evidence,
-                    chunks: &chunks,
-                    embedding_profile_id: profile_id,
-                    vectors: &vectors,
-                    links: &links,
-                    evidence_spans: &evidence_spans,
-                    image_artifacts: &image_artifacts.artifacts,
-                    graph_nodes: &graph_nodes,
-                    graph_edges: &graph_edges,
-                }) {
-                Ok(update) => update,
-                Err(err) => {
-                    cleanup_written_image_files(&written_image_files);
-                    return Err(err);
-                }
-            };
+                .replace_source_contents_without_generation(replacement)
+                .map(|lexical_update| (lexical_update, generation, false)),
+            None => self
+                .store
+                .replace_source_contents(replacement)
+                .map(|report| (report.lexical_update, report.generation, true)),
+        };
+        let (lexical_update, index_generation, generation_advanced) = match commit_result {
+            Ok(committed) => committed,
+            Err(err) => {
+                cleanup_written_image_files(&written_image_files);
+                return Err(err);
+            }
+        };
         let completed_sqlite_resource = completed_resource_progress(&sqlite_write_permit);
         drop(sqlite_write_permit);
         self.record_resource_timing(task_id_ref, completed_sqlite_resource);
         self.record_task_phase(
             task_id_ref,
             db_phase,
-            io_telemetry.batched_db_metadata_without_generation_update(&source_id, profile_id),
+            io_telemetry.batched_db_metadata(
+                &source_id,
+                profile_id,
+                index_generation,
+                generation_advanced,
+            ),
         );
         self.record_task_progress(
             task_id_ref,
@@ -2654,6 +2709,7 @@ where
         Ok(BatchedCommittedSource {
             source_id,
             task_id,
+            index_generation,
             vector_count: vectors.len(),
             cache_stats,
             io_telemetry,
@@ -2665,33 +2721,19 @@ where
         &mut self,
         profile_id: &EmbeddingProfileId,
         committed_sources: &[BatchedCommittedSource],
-        generation_before_publish: Option<u64>,
         error: &str,
     ) {
         let source_vector_counts = committed_sources
             .iter()
             .map(|committed| (committed.source_id.clone(), committed.vector_count))
             .collect::<Vec<_>>();
-        let generation_unchanged = generation_before_publish
-            .and_then(|before| {
-                self.store
-                    .index_generation_for_profile(profile_id)
-                    .ok()
-                    .map(|after| after == before)
-            })
-            .unwrap_or(true);
-        let mark_result = if generation_unchanged {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_batched_compensation_write_with_readonly) {
+            self.store.set_query_only_for_test(true).unwrap();
+        }
+        let mark_result =
             self.store
-                .set_source_embedding_failures_and_bump_all_profile_index_generations(
-                    profile_id,
-                    &source_vector_counts,
-                    error,
-                )
-                .map(|_| ())
-        } else {
-            self.store
-                .set_source_embedding_failures(profile_id, &source_vector_counts, error)
-        };
+                .set_source_embedding_failures(profile_id, &source_vector_counts, error);
         if let Err(mark_error) = mark_result {
             tracing::warn!(
                 error = %mark_error,
@@ -2711,8 +2753,15 @@ where
         profile_id: &EmbeddingProfileId,
         committed_sources: &[BatchedCommittedSource],
     ) -> Result<u64> {
-        if committed_sources.is_empty() {
+        let Some(first_committed) = committed_sources.first() else {
             return self.store.index_generation_for_profile(profile_id);
+        };
+        let generation = first_committed.index_generation;
+        if committed_sources
+            .iter()
+            .any(|committed| committed.index_generation != generation)
+        {
+            bail!("batched source commits do not share one index generation");
         }
         let total_sources = usize_to_u64(committed_sources.len());
         let vector_build_phase = PhaseTiming::start(IngestTaskStage::VectorIndex.as_str());
@@ -2769,6 +2818,11 @@ where
                     .with_resource(task_resource_progress(&index_stage_permit, "active")),
             );
         }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_batched_index_stage_with_enospc) {
+            let error = std::io::Error::from_raw_os_error(libc::ENOSPC);
+            bail!("stage batched index artifacts: {error}");
+        }
         let staged = self.stage_prepared_index_artifacts_for_residency(&prepared)?;
         let completed_index_stage_resource = completed_resource_progress(&index_stage_permit);
         drop(index_stage_permit);
@@ -2778,20 +2832,17 @@ where
                 completed_index_stage_resource.clone(),
             );
         }
-        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
-        let generation = match self.store.bump_all_profile_index_generations() {
-            Ok(generation) => generation,
+        let persisted_generation = match self.store.index_generation_for_profile(profile_id) {
+            Ok(persisted_generation) => persisted_generation,
             Err(err) => {
                 remove_staged_index_artifacts(&staged);
                 return Err(err);
             }
         };
-        let completed_sqlite_resource = completed_resource_progress(&sqlite_write_permit);
-        drop(sqlite_write_permit);
-        for committed in committed_sources {
-            self.record_resource_timing(
-                committed.task_id.as_ref(),
-                completed_sqlite_resource.clone(),
+        if persisted_generation != generation {
+            remove_staged_index_artifacts(&staged);
+            bail!(
+                "batched index generation changed before publish: committed {generation}, current {persisted_generation}"
             );
         }
         let staged_index_stats = staged_index_artifact_stats(staged.as_deref(), generation);
@@ -3087,7 +3138,7 @@ where
         let mut stats_by_source = prepared_vectors.cache_stats_by_source;
         let batched_index_publish = source_count > 1;
         let mut outcomes = Vec::with_capacity(source_count);
-        let mut batched_committed_sources = Vec::new();
+        let mut batched_committed_sources = Vec::<BatchedCommittedSource>::new();
         let mut stopped_after_commit_error: Option<String> = None;
         let mut committed_sources_in_batch = early_completed_sources;
         for source in prepared_sources {
@@ -3167,22 +3218,28 @@ where
                                 );
                                 Ok(source_cache_stats.clone())
                             }
-                            Ok(false) if batched_index_publish => match self
-                                .commit_prepared_source_without_index_publish(
-                                    profile_id,
-                                    committable_source,
-                                    source_vectors,
-                                    source_cache_stats.clone(),
-                                )
-                                .await
-                            {
-                                Ok(committed) => {
-                                    let stats = committed.cache_stats.clone();
-                                    batched_committed_sources.push(committed);
-                                    Ok(stats)
+                            Ok(false) if batched_index_publish => {
+                                let batch_generation = batched_committed_sources
+                                    .first()
+                                    .map(|committed| committed.index_generation);
+                                match self
+                                    .commit_prepared_source_without_index_publish(
+                                        profile_id,
+                                        batch_generation,
+                                        committable_source,
+                                        source_vectors,
+                                        source_cache_stats.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok(committed) => {
+                                        let stats = committed.cache_stats.clone();
+                                        batched_committed_sources.push(committed);
+                                        Ok(stats)
+                                    }
+                                    Err(error) => Err(error.to_string()),
                                 }
-                                Err(error) => Err(error.to_string()),
-                            },
+                            }
                             Ok(false) => self
                                 .commit_prepared_source(
                                     profile_id,
@@ -3222,8 +3279,6 @@ where
             });
         }
         if batched_index_publish && !batched_committed_sources.is_empty() {
-            let generation_before_publish =
-                self.store.index_generation_for_profile(profile_id).ok();
             if let Err(error) = self
                 .publish_batched_committed_source_indexes(profile_id, &batched_committed_sources)
                 .await
@@ -3233,7 +3288,6 @@ where
                 self.mark_batched_committed_sources_failed_after_publish_error(
                     profile_id,
                     &batched_committed_sources,
-                    generation_before_publish,
                     &error,
                 );
                 let committed_source_ids = batched_committed_sources
@@ -7395,84 +7449,6 @@ mod tests {
             generation_before + 1,
             "one source batch should publish one vector-index generation, not one per source"
         );
-    }
-
-    #[tokio::test]
-    async fn source_batch_index_publish_failure_marks_committed_sources_stale() {
-        let source_tempdir = tempfile::tempdir().unwrap();
-        let blocked_data_dir = tempfile::NamedTempFile::new().unwrap();
-        let store = Store::in_memory().unwrap();
-        let mut pipeline = IngestPipeline::from_parts(
-            store,
-            HnswIndex::new(),
-            StaticEmbeddingClient,
-            blocked_data_dir.path().to_path_buf(),
-        );
-        let first_path = source_tempdir.path().join("batch-first.md");
-        let second_path = source_tempdir.path().join("batch-second.md");
-        fs::write(&first_path, "# First\n\nAlpha source batch vector body.").unwrap();
-        fs::write(&second_path, "# Second\n\nBeta source batch vector body.").unwrap();
-        let first_id = pipeline.add_source(&first_path).unwrap();
-        let second_id = pipeline.add_source(&second_path).unwrap();
-        let first_task = TaskId("task-batch-publish-fail-first".into());
-        let second_task = TaskId("task-batch-publish-fail-second".into());
-        for (task_id, source_id) in [(&first_task, &first_id), (&second_task, &second_id)] {
-            pipeline
-                .store()
-                .create_task(
-                    task_id,
-                    TaskKind::Ingest,
-                    &serde_json::json!({ "source_id": source_id.0 }),
-                )
-                .unwrap();
-            pipeline.store().start_task(task_id).unwrap();
-        }
-        let profile = EmbeddingProfileId::default_profile();
-        let generation_before = pipeline
-            .store()
-            .index_generation_for_profile(&profile)
-            .unwrap();
-
-        let outcomes = pipeline
-            .ingest_sources_with_tasks(&[
-                (first_id.clone(), first_task.clone()),
-                (second_id.clone(), second_task.clone()),
-            ])
-            .await;
-
-        assert_eq!(outcomes.len(), 2);
-        assert!(outcomes.iter().all(|outcome| {
-            outcome
-                .result
-                .as_ref()
-                .unwrap_err()
-                .contains("batched index publication failed after source commit")
-        }));
-        assert_eq!(
-            pipeline
-                .store()
-                .index_generation_for_profile(&profile)
-                .unwrap(),
-            generation_before + 1,
-            "batch stage failure after committed rows must invalidate the old generation"
-        );
-        assert!(pipeline.hnsw().is_empty());
-        for source_id in [&first_id, &second_id] {
-            assert_eq!(
-                pipeline
-                    .store()
-                    .count_vector_documents_for_profile(&profile, Some(source_id))
-                    .unwrap(),
-                1
-            );
-            assert!(
-                pipeline
-                    .store()
-                    .source_vectors_stale_for_profile(&profile, source_id)
-                    .unwrap(),
-                "committed source must fail freshness after batched publish failure"
-            );
-        }
     }
 
     #[tokio::test]

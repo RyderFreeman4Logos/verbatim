@@ -1643,9 +1643,11 @@ where
 {
     let permit = state.resources.sqlite_reader.acquire().await?;
     let db_path = state.data_dir.join("verbatim.db");
+    let durability_profile = runtime_config_snapshot(state)?.config.store.durability;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let store = Store::open_existing_readonly(&db_path)?;
+        let store =
+            Store::open_existing_readonly_with_durability_profile(&db_path, durability_profile)?;
         operation(&store)
     })
     .await
@@ -9682,6 +9684,9 @@ mod tests {
         VectorIndexResidency,
     };
 
+    #[path = "sqlite_durability_tests.rs"]
+    mod sqlite_durability_tests;
+
     fn has_task_terminalize_span(spans: &[verbatim_core::task::TaskSpan]) -> bool {
         spans
             .iter()
@@ -10648,23 +10653,6 @@ mod tests {
         assert_eq!(reclaim.skip_reason.as_deref(), Some("disabled"));
         assert_eq!(reclaim.active.http_requests, 0);
         assert_eq!(reclaim.active.active_tasks, 0);
-    }
-
-    #[tokio::test]
-    async fn health_reports_effective_sqlite_durability_and_rpo() {
-        use verbatim_core::store::SqliteDurabilityProfile;
-        let td = TestDir::new("sqlite-durability-health");
-        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
-        config.store.durability = SqliteDurabilityProfile::Durable;
-        let pipeline = IngestPipeline::new(&config, td.path()).unwrap();
-        let state = test_state(config, td.path(), pipeline);
-        let Json(health) = health(State(state)).await;
-        let d = health.sqlite_durability.unwrap();
-        assert_eq!(d.effective.profile, SqliteDurabilityProfile::Durable);
-        assert_eq!(d.effective.journal_mode, "wal");
-        assert_eq!(d.effective.synchronous, "full");
-        assert!(d.effective.rpo.contains("RPO=0"));
-        assert!(d.disk.is_some());
     }
 
     #[tokio::test]

@@ -63,6 +63,17 @@ impl Store {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_query_only_for_test(&self, enabled: bool) -> Result<()> {
+        let pragma = if enabled {
+            "PRAGMA query_only = ON;"
+        } else {
+            "PRAGMA query_only = OFF;"
+        };
+        self.conn.execute_batch(pragma)?;
+        Ok(())
+    }
+
     /// Return the selected profile and the PRAGMAs SQLite reports at runtime.
     pub fn effective_durability(&self) -> Result<SqliteEffectiveDurability> {
         sqlite_durability::effective_durability(&self.conn, self.durability_profile)
