@@ -2,6 +2,7 @@ use super::*;
 use crate::deletion::{DeletionOutcome, DeletionProduct, RetentionPolicy};
 use crate::types::{Source, SourceStatus};
 use async_trait::async_trait;
+use std::sync::{Arc, Barrier};
 
 struct DeletionEmbeddingClient;
 
@@ -59,19 +60,20 @@ async fn source_erasure_removes_local_derivatives_tombstones_and_blocks_reingest
         report.status_for(DeletionProduct::SqliteAuthoritative),
         Some(DeletionOutcome::Erased),
     );
-    assert_eq!(
-        report.status_for(DeletionProduct::Hnsw),
-        Some(DeletionOutcome::Erased),
-    );
     for product in [
         DeletionProduct::Chunks,
         DeletionProduct::Vectors,
         DeletionProduct::Graph,
         DeletionProduct::Images,
+    ] {
+        assert_eq!(report.status_for(product), Some(DeletionOutcome::Erased));
+    }
+    for product in [
+        DeletionProduct::Hnsw,
         DeletionProduct::Caches,
         DeletionProduct::Backups,
     ] {
-        assert_eq!(report.status_for(product), Some(DeletionOutcome::Erased));
+        assert_eq!(report.status_for(product), Some(DeletionOutcome::Pending));
     }
     assert_eq!(
         report.status_for(DeletionProduct::Qdrant),
@@ -84,11 +86,15 @@ async fn source_erasure_removes_local_derivatives_tombstones_and_blocks_reingest
         .unwrap_err()
         .to_string()
         .contains("tombstoned"));
+    let persisted_reports = pipeline.store().list_deletion_reports().unwrap();
+    assert_eq!(persisted_reports.len(), 1);
+    assert_eq!(persisted_reports[0].source_id, source_id);
+    assert_eq!(persisted_reports[0].report, report);
     assert!(!format!("{report:?}").contains(restricted_content));
 }
 
 #[test]
-fn persisted_tombstone_retention_honors_backup_expiry_and_legal_hold() {
+fn persisted_tombstone_retention_keeps_backups_pending_until_cleaned_or_held() {
     let store = Store::in_memory().unwrap();
     let source = Source {
         id: SourceId("src-retention".into()),
@@ -113,7 +119,7 @@ fn persisted_tombstone_retention_honors_backup_expiry_and_legal_hold() {
     );
     assert_eq!(
         store.backup_deletion_outcome_at(&source.id, 20).unwrap(),
-        DeletionOutcome::Erased,
+        DeletionOutcome::Pending,
     );
     assert_eq!(
         store.pending_qdrant_deletion_source_ids().unwrap(),
@@ -128,7 +134,7 @@ fn persisted_tombstone_retention_honors_backup_expiry_and_legal_hold() {
     store.release_legal_hold(&source.id).unwrap();
     assert_eq!(
         store.backup_deletion_outcome_at(&source.id, 20).unwrap(),
-        DeletionOutcome::Erased,
+        DeletionOutcome::Pending,
     );
 
     store
@@ -143,4 +149,109 @@ fn persisted_tombstone_retention_honors_backup_expiry_and_legal_hold() {
         .unwrap_err()
         .to_string()
         .contains("tombstoned"));
+}
+
+#[tokio::test]
+async fn missing_source_housekeeping_does_not_tombstone_the_source_id() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let path = tempdir.path().join("missing-source.md");
+    fs::write(&path, "temporary source").unwrap();
+    let store = Store::in_memory().unwrap();
+    let mut pipeline = IngestPipeline::from_parts(
+        store,
+        HnswIndex::new(),
+        DeletionEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    );
+    let source_id = pipeline.add_source(&path).unwrap();
+
+    fs::remove_file(&path).unwrap();
+    assert_eq!(
+        pipeline
+            .remove_missing_sources_for_all_source_ingest(None)
+            .await
+            .unwrap(),
+        vec![source_id.clone()],
+    );
+    assert!(!pipeline.store().is_tombstoned(&source_id).unwrap());
+
+    fs::write(&path, "restored source").unwrap();
+    assert_eq!(pipeline.add_source(&path).unwrap(), source_id);
+}
+
+#[test]
+fn concurrent_erasure_cannot_reintroduce_a_tombstoned_source() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let database_path = tempdir.path().join("verbatim.db");
+    let source = Source {
+        id: SourceId("concurrent-source".into()),
+        path: std::path::PathBuf::from("concurrent-source.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    let store = Store::new(&database_path).unwrap();
+    store.add_source(&source).unwrap();
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let eraser_barrier = Arc::clone(&barrier);
+    let eraser_path = database_path.clone();
+    let eraser_source = source.clone();
+    let eraser = std::thread::spawn(move || {
+        let store = Store::new(&eraser_path).unwrap();
+        eraser_barrier.wait();
+        store.remove_source(&eraser_source.id).unwrap();
+    });
+    let adder_barrier = Arc::clone(&barrier);
+    let adder_path = database_path.clone();
+    let adder_source = source.clone();
+    let adder = std::thread::spawn(move || {
+        let store = Store::new(&adder_path).unwrap();
+        adder_barrier.wait();
+        store.add_source(&adder_source)
+    });
+
+    eraser.join().unwrap();
+    let _ = adder.join().unwrap();
+    let store = Store::new(&database_path).unwrap();
+    assert!(store.is_tombstoned(&source.id).unwrap());
+    assert!(store.get_source(&source.id).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn restart_reconciles_pending_deletion_and_persists_the_retry_report() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let database_path = tempdir.path().join("verbatim.db");
+    let source = Source {
+        id: SourceId("restart-source".into()),
+        path: std::path::PathBuf::from("restart-source.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    let store = Store::new(&database_path).unwrap();
+    store.add_source(&source).unwrap();
+    store.remove_source(&source.id).unwrap();
+    drop(store);
+
+    let pipeline = IngestPipeline::from_parts(
+        Store::new(&database_path).unwrap(),
+        HnswIndex::new(),
+        DeletionEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    );
+    let reports = pipeline.reconcile_deletions().await.unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].status_for(DeletionProduct::Qdrant),
+        Some(DeletionOutcome::NotFound),
+    );
+    let persisted_reports = pipeline.store().list_deletion_reports().unwrap();
+    assert_eq!(persisted_reports.len(), 1);
+    assert_eq!(persisted_reports[0].source_id, source.id);
+    assert_eq!(persisted_reports[0].report, reports[0]);
 }

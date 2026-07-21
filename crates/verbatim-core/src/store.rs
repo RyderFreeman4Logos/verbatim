@@ -439,6 +439,7 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         self.conn.execute_batch(SCHEMA)?;
+        self.conn.execute_batch(store_deletion::DELETION_SCHEMA)?;
         migrate_embedding_profile_tables(&self.conn)?;
         ensure_column(
             &self.conn,
@@ -527,11 +528,12 @@ impl Store {
     // --- Source ---
 
     pub fn add_source(&self, source: &Source) -> Result<()> {
-        if self.is_tombstoned(&source.id)? {
-            bail!("source id is tombstoned: {}", source.id.0);
-        }
-        self.conn.execute(
-            "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        let inserted = self.conn.execute(
+            "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE NOT EXISTS (
+                SELECT 1 FROM source_tombstones WHERE source_id = ?1
+             )",
             params![
                 source.id.0,
                 source.path.to_str().unwrap_or(""),
@@ -541,6 +543,9 @@ impl Store {
                 source.last_ingested_at,
             ],
         )?;
+        if inserted == 0 {
+            bail!("source id is tombstoned: {}", source.id.0);
+        }
         Ok(())
     }
 
@@ -4510,15 +4515,6 @@ CREATE TABLE IF NOT EXISTS sources (
     parser_used TEXT,
     last_ingested_at TEXT
 );
-CREATE TABLE IF NOT EXISTS source_tombstones (
-    source_id TEXT PRIMARY KEY,
-    deleted_at TEXT NOT NULL,
-    backup_expiry_at INTEGER,
-    legal_hold INTEGER NOT NULL DEFAULT 0,
-    qdrant_outcome TEXT NOT NULL DEFAULT 'pending'
-);
-CREATE INDEX IF NOT EXISTS source_tombstones_qdrant_outcome_idx
-    ON source_tombstones(qdrant_outcome);
 CREATE TABLE IF NOT EXISTS collections (
     name TEXT PRIMARY KEY,
     ignore_patterns_json TEXT NOT NULL,

@@ -1,13 +1,21 @@
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
 use super::{
     acquire_ingest_resource, remove_source_image_artifacts, remove_staged_index_artifacts,
-    EmbeddingClient, IngestPipeline,
+    source_path_is_missing, EmbeddingClient, IngestPipeline,
 };
 use crate::deletion::{DeletionOutcome, DeletionProduct, DeletionReport, RetentionPolicy};
+use crate::task::{IngestTaskStage, TaskId, TaskProgressSnapshot};
 use crate::types::SourceId;
+
+#[derive(Clone, Copy)]
+enum SourceRemovalKind {
+    Erasure(RetentionPolicy),
+    Housekeeping,
+}
 
 impl<E> IngestPipeline<E>
 where
@@ -23,50 +31,9 @@ where
         source_id: &SourceId,
         retention_policy: RetentionPolicy,
     ) -> Result<DeletionReport> {
-        self.store
-            .get_source(source_id)?
-            .with_context(|| format!("source not found: {}", source_id.0))?;
-        let active_profile_id = self.active_profile_id.clone();
-        let remaining_vectors = self
-            .store
-            .list_vector_documents_for_profile(&active_profile_id)?
-            .into_iter()
-            .filter(|document| document.source_id != *source_id)
-            .collect::<Vec<_>>();
-        let prepared = self.prepare_indexes_from_vectors(remaining_vectors)?;
-        let index_publish_permit =
-            acquire_ingest_resource("index_publish", "index_publish").await?;
-        let staged = self.stage_prepared_index_artifacts_for_residency(&prepared)?;
-        drop(index_publish_permit);
-        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
-        let generation = match self
-            .store
-            .remove_source_and_replace_vectors_for_profile_with_retention(
-                &active_profile_id,
-                source_id,
-                &prepared.vectors,
-                retention_policy,
-            ) {
-            Ok(generation) => generation,
-            Err(err) => {
-                remove_staged_index_artifacts(&staged);
-                return Err(err);
-            }
-        };
-        drop(sqlite_write_permit);
-        // Clear the resident cache before the next await so a deleted id cannot
-        // be served while derived artifacts and remote deletion are reconciled.
-        self.invalidate_live_indexes()?;
-        let index_publish_permit =
-            acquire_ingest_resource("index_publish", "index_publish").await?;
-        self.publish_committed_indexes(&active_profile_id, generation, staged, prepared)?;
-        drop(index_publish_permit);
-        remove_source_image_artifacts(&self.data_dir, source_id).with_context(|| {
-            format!(
-                "cleanup image artifacts after committed source removal: {}",
-                source_id.0
-            )
-        })?;
+        let images = self
+            .remove_source_locally(source_id, SourceRemovalKind::Erasure(retention_policy))
+            .await?;
 
         #[cfg(feature = "qdrant")]
         let qdrant_outcome = self.sync_qdrant_delete_source(source_id).await;
@@ -75,9 +42,18 @@ where
         self.store
             .set_qdrant_deletion_outcome(source_id, qdrant_outcome)?;
 
-        let mut report = self.local_deletion_report(source_id)?;
+        let mut report = self.local_deletion_report(source_id, images)?;
         report.set(DeletionProduct::Qdrant, qdrant_outcome);
+        self.store
+            .persist_deletion_report(source_id, retention_policy, &report)?;
         Ok(report)
+    }
+
+    /// Remove a missing filesystem or collection member without creating an erasure tombstone.
+    pub async fn remove_source_for_housekeeping(&mut self, source_id: &SourceId) -> Result<()> {
+        self.remove_source_locally(source_id, SourceRemovalKind::Housekeeping)
+            .await?;
+        Ok(())
     }
 
     /// Retry remote deletion for every source whose authoritative local erasure completed.
@@ -85,14 +61,28 @@ where
         let source_ids = self.store.pending_qdrant_deletion_source_ids()?;
         let mut reports = Vec::with_capacity(source_ids.len());
         for source_id in source_ids {
+            let retention_policy = self
+                .store
+                .retention_policy(&source_id)?
+                .with_context(|| format!("source tombstone not found: {}", source_id.0))?;
             #[cfg(feature = "qdrant")]
             let qdrant_outcome = self.sync_qdrant_delete_source(&source_id).await;
             #[cfg(not(feature = "qdrant"))]
             let qdrant_outcome = DeletionOutcome::NotFound;
             self.store
                 .set_qdrant_deletion_outcome(&source_id, qdrant_outcome)?;
-            let mut report = self.local_deletion_report(&source_id)?;
+            let mut report = match self.store.latest_deletion_report(&source_id)? {
+                Some(previous) => previous.report,
+                None => self.local_deletion_report(&source_id, DeletionOutcome::Pending)?,
+            };
             report.set(DeletionProduct::Qdrant, qdrant_outcome);
+            report.set(
+                DeletionProduct::Backups,
+                self.store
+                    .backup_deletion_outcome_at(&source_id, current_unix_timestamp_secs())?,
+            );
+            self.store
+                .persist_deletion_report(&source_id, retention_policy, &report)?;
             reports.push(report);
         }
         Ok(reports)
@@ -116,25 +106,141 @@ where
         }
     }
 
-    fn local_deletion_report(&self, source_id: &SourceId) -> Result<DeletionReport> {
+    async fn remove_source_locally(
+        &mut self,
+        source_id: &SourceId,
+        removal_kind: SourceRemovalKind,
+    ) -> Result<DeletionOutcome> {
+        self.store
+            .get_source(source_id)?
+            .with_context(|| format!("source not found: {}", source_id.0))?;
+        let active_profile_id = self.active_profile_id.clone();
+        let remaining_vectors = self
+            .store
+            .list_vector_documents_for_profile(&active_profile_id)?
+            .into_iter()
+            .filter(|document| document.source_id != *source_id)
+            .collect::<Vec<_>>();
+        let prepared = self.prepare_indexes_from_vectors(remaining_vectors)?;
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
+        let staged = self.stage_prepared_index_artifacts_for_residency(&prepared)?;
+        drop(index_publish_permit);
+        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
+        let generation = match removal_kind {
+            SourceRemovalKind::Erasure(retention_policy) => self
+                .store
+                .remove_source_and_replace_vectors_for_profile_with_retention(
+                    &active_profile_id,
+                    source_id,
+                    &prepared.vectors,
+                    retention_policy,
+                ),
+            SourceRemovalKind::Housekeeping => self
+                .store
+                .remove_source_and_replace_vectors_for_profile_for_housekeeping(
+                    &active_profile_id,
+                    source_id,
+                    &prepared.vectors,
+                ),
+        }
+        .inspect_err(|_error| {
+            remove_staged_index_artifacts(&staged);
+        })?;
+        drop(sqlite_write_permit);
+        // Clear the resident cache before the next await so a deleted id cannot
+        // be served while derived artifacts and remote deletion are reconciled.
+        self.invalidate_live_indexes()?;
+        let index_publish_permit =
+            acquire_ingest_resource("index_publish", "index_publish").await?;
+        self.publish_committed_indexes(&active_profile_id, generation, staged, prepared)?;
+        drop(index_publish_permit);
+
+        match remove_source_image_artifacts(&self.data_dir, source_id) {
+            Ok(()) => Ok(DeletionOutcome::Erased),
+            Err(error) => {
+                tracing::warn!(
+                    source = %source_id.0,
+                    error = %error,
+                    "image artifact cleanup failed after committed source removal"
+                );
+                Ok(DeletionOutcome::Pending)
+            }
+        }
+    }
+
+    fn local_deletion_report(
+        &self,
+        source_id: &SourceId,
+        images: DeletionOutcome,
+    ) -> Result<DeletionReport> {
         let mut report = DeletionReport::new();
         for product in [
             DeletionProduct::SqliteAuthoritative,
             DeletionProduct::Chunks,
             DeletionProduct::Vectors,
-            DeletionProduct::Hnsw,
             DeletionProduct::Graph,
-            DeletionProduct::Images,
-            DeletionProduct::Caches,
         ] {
             report.set(product, DeletionOutcome::Erased);
         }
+        // HNSW generation cleanup and cache invalidation do not yet have a durable
+        // physical-cleanup acknowledgement, so they remain retryable audit work.
+        report.set(DeletionProduct::Hnsw, DeletionOutcome::Pending);
+        report.set(DeletionProduct::Images, images);
+        report.set(DeletionProduct::Caches, DeletionOutcome::Pending);
         report.set(
             DeletionProduct::Backups,
             self.store
                 .backup_deletion_outcome_at(source_id, current_unix_timestamp_secs())?,
         );
         Ok(report)
+    }
+}
+
+impl<E> IngestPipeline<E>
+where
+    E: EmbeddingClient,
+{
+    pub async fn remove_missing_sources_for_all_source_ingest(
+        &mut self,
+        task_id: Option<&TaskId>,
+    ) -> Result<Vec<SourceId>> {
+        self.remove_missing_sources_for_all_source_ingest_with(task_id, source_path_is_missing)
+            .await
+    }
+
+    pub(crate) async fn remove_missing_sources_for_all_source_ingest_with(
+        &mut self,
+        task_id: Option<&TaskId>,
+        mut path_is_missing: impl FnMut(&Path) -> Result<bool>,
+    ) -> Result<Vec<SourceId>> {
+        let missing_source_ids = self
+            .store
+            .list_sources()?
+            .into_iter()
+            .filter_map(|source| match path_is_missing(&source.path) {
+                Ok(true) => Some(Ok(source.id)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let total = missing_source_ids.len();
+        for (index, source_id) in missing_source_ids.iter().enumerate() {
+            tracing::warn!(
+                source = %source_id.0,
+                "removing missing source before all-source ingest"
+            );
+            self.record_task_progress(
+                task_id,
+                TaskProgressSnapshot::phase(IngestTaskStage::Ingest.as_str())
+                    .with_counter("missing_sources", index as u64, Some(total as u64))
+                    .with_recent_status("removing missing source"),
+            );
+            self.remove_source_for_housekeeping(source_id)
+                .await
+                .with_context(|| format!("remove missing source: {}", source_id.0))?;
+        }
+        Ok(missing_source_ids)
     }
 }
 

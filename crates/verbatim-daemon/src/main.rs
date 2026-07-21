@@ -107,8 +107,12 @@ use verbatim_core::types::{
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
+#[path = "deletion_api.rs"]
+mod deletion_api;
 #[path = "sqlite_durability_ops.rs"]
 mod sqlite_durability_ops;
+
+use deletion_api::{delete_source, list_deletion_reports, reconcile_deletions_on_startup};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -2240,31 +2244,6 @@ fn source_response(
         last_ingested_at: source.last_ingested_at,
         diagnostics: Some(diagnostics),
     })
-}
-
-async fn delete_source(
-    State(state): State<SharedState>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    let runtime = tokio::runtime::Handle::current();
-    let source_id = SourceId(id.clone());
-    tokio::task::spawn_blocking(move || {
-        run_with_pipeline(state, move |pipeline| {
-            runtime.block_on(pipeline.remove_source(&source_id))
-        })
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| {
-        if is_pipeline_busy_error(&e) {
-            pipeline_access_error(e)
-        } else {
-            source_remove_error(&id, e)
-        }
-    })?;
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 fn source_remove_error(source_id: &str, error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
@@ -8808,7 +8787,8 @@ async fn maintain_collection_after_watch_event(
                 if !removed.source_path.exists()
                     && pipeline.store().get_source(&removed.source_id)?.is_some()
                 {
-                    runtime.block_on(pipeline.remove_source(&removed.source_id))?;
+                    runtime
+                        .block_on(pipeline.remove_source_for_housekeeping(&removed.source_id))?;
                     ingest_candidates.remove(&removed.source_id);
                 }
             }
@@ -9336,6 +9316,7 @@ fn daemon_router(state: SharedState) -> Router {
         .route("/api/sources", get(list_sources))
         .route("/api/sources/{id}", get(get_source))
         .route("/api/sources/{id}", delete(delete_source))
+        .route("/api/deletions/reports", get(list_deletion_reports))
         .route("/api/sources/check", post(check_stale))
         .route(
             CollectionApiEndpoint::CreateCollection.path_template(),
@@ -9547,6 +9528,9 @@ async fn finish_daemon_startup(
         *cache = startup.index_status_cache;
     }
     restore_pipeline(&state, startup.pipeline)?;
+    reconcile_deletions_on_startup(&state)
+        .await
+        .context("reconcile persisted source deletions")?;
 
     set_readiness(
         &state,

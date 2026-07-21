@@ -1509,48 +1509,6 @@ where
         Ok(report)
     }
 
-    pub async fn remove_missing_sources_for_all_source_ingest(
-        &mut self,
-        task_id: Option<&TaskId>,
-    ) -> Result<Vec<SourceId>> {
-        self.remove_missing_sources_for_all_source_ingest_with(task_id, source_path_is_missing)
-            .await
-    }
-
-    async fn remove_missing_sources_for_all_source_ingest_with(
-        &mut self,
-        task_id: Option<&TaskId>,
-        mut source_path_is_missing: impl FnMut(&Path) -> Result<bool>,
-    ) -> Result<Vec<SourceId>> {
-        let missing_source_ids = self
-            .store
-            .list_sources()?
-            .into_iter()
-            .filter_map(|source| match source_path_is_missing(&source.path) {
-                Ok(true) => Some(Ok(source.id)),
-                Ok(false) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let total = missing_source_ids.len();
-        for (index, source_id) in missing_source_ids.iter().enumerate() {
-            tracing::warn!(
-                source = %source_id.0,
-                "removing missing source before all-source ingest"
-            );
-            self.record_task_progress(
-                task_id,
-                TaskProgressSnapshot::phase(IngestTaskStage::Ingest.as_str())
-                    .with_counter("missing_sources", index as u64, Some(total as u64))
-                    .with_recent_status("removing missing source"),
-            );
-            self.remove_source(source_id)
-                .await
-                .with_context(|| format!("remove missing source: {}", source_id.0))?;
-        }
-        Ok(missing_source_ids)
-    }
-
     pub fn check_stale(&self) -> Result<Vec<SourceId>> {
         let sources = self.store.list_sources()?;
         let mut current_hashes = HashMap::new();
@@ -6400,7 +6358,6 @@ fn source_path_is_missing(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "qdrant")]
     use crate::deletion::{DeletionOutcome, DeletionProduct};
     use anyhow::bail;
     use async_trait::async_trait;
@@ -11918,11 +11875,12 @@ model = "local-vision"
             tempdir.path().to_path_buf(),
         );
 
-        let err = pipeline.remove_source(&first.id).await.unwrap_err();
+        let report = pipeline.remove_source(&first.id).await.unwrap();
 
-        assert!(err
-            .to_string()
-            .contains("cleanup image artifacts after committed source removal"));
+        assert_eq!(
+            report.status_for(DeletionProduct::Images),
+            Some(DeletionOutcome::Pending),
+        );
         assert!(pipeline.store().get_source(&first.id).unwrap().is_none());
         assert!(pipeline.store().get_source(&second.id).unwrap().is_some());
         assert_eq!(pipeline.store().list_vector_documents().unwrap().len(), 1);

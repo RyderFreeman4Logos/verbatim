@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::{HashMap, HashSet};
 
+use crate::types::SourceId;
+
 /// Storage products that participate in a source-erasure request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum DeletionProduct {
     SqliteAuthoritative,
     Chunks,
@@ -33,7 +36,7 @@ impl DeletionProduct {
 }
 
 /// Terminal or retryable state of one deletion product.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum DeletionOutcome {
     Erased,
     Pending,
@@ -42,7 +45,7 @@ pub enum DeletionOutcome {
 }
 
 /// A content-free receipt for one cross-backend deletion request.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DeletionReport {
     outcomes: BTreeMap<DeletionProduct, DeletionOutcome>,
 }
@@ -81,8 +84,17 @@ impl fmt::Debug for DeletionReport {
     }
 }
 
+/// Durable, content-free record of one deletion attempt or reconciliation retry.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PersistedDeletionReport {
+    pub source_id: SourceId,
+    pub recorded_at: String,
+    pub retention_policy: RetentionPolicy,
+    pub report: DeletionReport,
+}
+
 /// Backup-retention state associated with a tombstoned source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum RetentionPolicy {
     Immediate,
     UntilBackupExpiry(u64),
@@ -94,11 +106,9 @@ impl RetentionPolicy {
         Self::UntilBackupExpiry(timestamp)
     }
 
-    pub const fn backup_outcome_at(self, now: u64) -> DeletionOutcome {
+    pub const fn backup_outcome_at(self, _now: u64) -> DeletionOutcome {
         match self {
-            Self::Immediate => DeletionOutcome::Erased,
-            Self::UntilBackupExpiry(expiry) if now >= expiry => DeletionOutcome::Erased,
-            Self::UntilBackupExpiry(_) => DeletionOutcome::Pending,
+            Self::Immediate | Self::UntilBackupExpiry(_) => DeletionOutcome::Pending,
             Self::LegalHold => DeletionOutcome::Held,
         }
     }
@@ -151,13 +161,13 @@ impl DeletionLifecycle {
             DeletionProduct::SqliteAuthoritative,
             DeletionProduct::Chunks,
             DeletionProduct::Vectors,
-            DeletionProduct::Hnsw,
             DeletionProduct::Graph,
-            DeletionProduct::Images,
-            DeletionProduct::Caches,
         ] {
             report.set(product, DeletionOutcome::Erased);
         }
+        report.set(DeletionProduct::Hnsw, DeletionOutcome::Pending);
+        report.set(DeletionProduct::Images, DeletionOutcome::Pending);
+        report.set(DeletionProduct::Caches, DeletionOutcome::Pending);
         let remote_outcome = self.remote_outcome();
         report.set(DeletionProduct::Qdrant, remote_outcome);
         report.set(
@@ -274,10 +284,10 @@ mod tests {
             Some(DeletionOutcome::Held),
         );
         lifecycle.release_legal_hold(source_id).unwrap();
-        let expired = lifecycle.reconcile(source_id, 20).unwrap();
+        let still_pending = lifecycle.reconcile(source_id, 20).unwrap();
         assert_eq!(
-            expired.status_for(DeletionProduct::Backups),
-            Some(DeletionOutcome::Erased),
+            still_pending.status_for(DeletionProduct::Backups),
+            Some(DeletionOutcome::Pending),
         );
         assert!(!lifecycle.can_restore(source_id));
     }

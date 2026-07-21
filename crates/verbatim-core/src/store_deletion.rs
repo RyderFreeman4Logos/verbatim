@@ -5,9 +5,30 @@ use super::{
     bump_all_profile_index_generations, map_storage_error, replace_vector_documents_for_profile_tx,
     unix_timestamp_string, SqliteWriteOperation, Store,
 };
-use crate::deletion::{DeletionOutcome, RetentionPolicy};
+use crate::deletion::{DeletionOutcome, DeletionReport, PersistedDeletionReport, RetentionPolicy};
 use crate::traits::VectorDocument;
 use crate::types::{EmbeddingProfileId, SourceId};
+
+pub(super) const DELETION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS source_tombstones (
+    source_id TEXT PRIMARY KEY,
+    deleted_at TEXT NOT NULL,
+    backup_expiry_at INTEGER,
+    legal_hold INTEGER NOT NULL DEFAULT 0,
+    qdrant_outcome TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE INDEX IF NOT EXISTS source_tombstones_qdrant_outcome_idx
+    ON source_tombstones(qdrant_outcome);
+CREATE TABLE IF NOT EXISTS deletion_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    retention_policy_json TEXT NOT NULL,
+    outcomes_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS deletion_reports_source_id_idx
+    ON deletion_reports(source_id, id);
+"#;
 
 impl Store {
     /// Return whether a source id has a durable deletion tombstone.
@@ -100,8 +121,104 @@ impl Store {
         Ok(())
     }
 
+    /// Append a durable, content-free receipt for an erasure attempt.
+    pub fn persist_deletion_report(
+        &self,
+        source_id: &SourceId,
+        retention_policy: RetentionPolicy,
+        report: &DeletionReport,
+    ) -> Result<()> {
+        let retention_policy_json = serde_json::to_string(&retention_policy)
+            .context("serialize deletion-report retention policy")?;
+        let outcomes_json =
+            serde_json::to_string(report).context("serialize deletion-report outcomes")?;
+        self.conn.execute(
+            "INSERT INTO deletion_reports
+             (source_id, recorded_at, retention_policy_json, outcomes_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &source_id.0,
+                unix_timestamp_string(),
+                retention_policy_json,
+                outcomes_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List durable deletion receipts in insertion order for audit and reconciliation status.
+    pub fn list_deletion_reports(&self) -> Result<Vec<PersistedDeletionReport>> {
+        let mut statement = self.conn.prepare(
+            "SELECT source_id, recorded_at, retention_policy_json, outcomes_json
+             FROM deletion_reports ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (source_id, recorded_at, retention_policy_json, outcomes_json) = row?;
+            deletion_report_from_storage(
+                source_id,
+                recorded_at,
+                retention_policy_json,
+                outcomes_json,
+            )
+        })
+        .collect()
+    }
+
+    pub(crate) fn latest_deletion_report(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<Option<PersistedDeletionReport>> {
+        let report = self
+            .conn
+            .query_row(
+                "SELECT source_id, recorded_at, retention_policy_json, outcomes_json
+                 FROM deletion_reports WHERE source_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![&source_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        report
+            .map(
+                |(source_id, recorded_at, retention_policy_json, outcomes_json)| {
+                    deletion_report_from_storage(
+                        source_id,
+                        recorded_at,
+                        retention_policy_json,
+                        outcomes_json,
+                    )
+                },
+            )
+            .transpose()
+    }
+
     pub fn remove_source(&self, id: &SourceId) -> Result<u64> {
         self.remove_source_with_retention(id, RetentionPolicy::Immediate)
+    }
+
+    /// Remove a source during ordinary filesystem or collection housekeeping.
+    ///
+    /// Unlike an explicit erasure, this deliberately leaves the source id reusable.
+    pub fn remove_source_for_housekeeping(&self, id: &SourceId) -> Result<u64> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
+        let generation = bump_all_profile_index_generations(&tx)?;
+        tx.commit()?;
+        Ok(generation)
     }
 
     pub fn remove_source_with_retention(
@@ -129,6 +246,25 @@ impl Store {
             vectors,
             RetentionPolicy::Immediate,
         )
+    }
+
+    /// Replace a source's derived vectors while removing a missing source without tombstoning it.
+    pub fn remove_source_and_replace_vectors_for_profile_for_housekeeping(
+        &self,
+        profile_id: &EmbeddingProfileId,
+        id: &SourceId,
+        vectors: &[VectorDocument],
+    ) -> Result<u64> {
+        self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
+        (|| {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
+            replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
+            let generation = bump_all_profile_index_generations(&tx)?;
+            tx.commit()?;
+            Ok(generation)
+        })()
+        .map_err(|error| map_storage_error(SqliteWriteOperation::Ingest, error))
     }
 
     pub fn remove_source_and_replace_vectors_for_profile_with_retention(
@@ -161,6 +297,22 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn deletion_report_from_storage(
+    source_id: String,
+    recorded_at: String,
+    retention_policy_json: String,
+    outcomes_json: String,
+) -> Result<PersistedDeletionReport> {
+    Ok(PersistedDeletionReport {
+        source_id: SourceId(source_id),
+        recorded_at,
+        retention_policy: serde_json::from_str(&retention_policy_json)
+            .context("deserialize deletion-report retention policy")?,
+        report: serde_json::from_str(&outcomes_json)
+            .context("deserialize deletion-report outcomes")?,
+    })
 }
 
 fn tombstone_retention_values(policy: RetentionPolicy) -> Result<(Option<i64>, bool)> {
