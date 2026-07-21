@@ -1,10 +1,13 @@
 pub mod api;
 pub mod canonical_chunker;
+mod caption_chunker;
 pub mod chunker;
 pub mod collection;
 pub mod config;
 pub mod context;
 pub mod embed;
+#[path = "types_evidence_spans.rs"]
+pub mod evidence_spans;
 pub mod generate;
 pub mod graph_extraction;
 pub mod graphrag;

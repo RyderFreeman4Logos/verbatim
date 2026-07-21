@@ -27,6 +27,18 @@ use crate::types::{
 };
 use crate::vision_caption::{CaptionAttempt, ImageCaption, ImageCaptionRecord, ImageCaptionStatus};
 
+#[path = "store_evidence_spans.rs"]
+mod evidence_spans;
+#[path = "source_contents_replacement.rs"]
+mod source_contents_replacement;
+pub use source_contents_replacement::{
+    SourceContentsReplacement, SourceContentsReplacementReport, SourceLexicalIndexUpdate,
+};
+
+#[cfg(test)]
+#[path = "store_evidence_spans_tests.rs"]
+mod evidence_spans_tests;
+
 const LEGACY_EMBEDDING_PROFILE_CONFIG_HASH: &str = "legacy";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -121,50 +133,6 @@ pub struct TaskActiveMetadataAggregate {
 pub struct TaskReasonCount {
     pub reason: String,
     pub count: usize,
-}
-
-pub struct SourceContentsReplacement<'a> {
-    pub source: &'a Source,
-    pub evidence: &'a [EvidenceUnit],
-    pub chunks: &'a [Chunk],
-    pub embedding_profile_id: &'a EmbeddingProfileId,
-    pub vectors: &'a [VectorDocument],
-    pub links: &'a [(ChunkId, EvidenceId)],
-    pub image_artifacts: &'a [ImageArtifact],
-    pub graph_nodes: &'a [GraphNode],
-    pub graph_edges: &'a [GraphEdge],
-}
-
-/// Result of replacing one source's stored contents and derived indexes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceContentsReplacementReport {
-    pub generation: u64,
-    pub lexical_update: SourceLexicalIndexUpdate,
-}
-
-/// Bounded timing for SQLite FTS updates triggered by source content replacement.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceLexicalIndexUpdate {
-    pub started_at: String,
-    pub duration_ms: u64,
-    pub deleted_child_chunks: usize,
-    pub indexed_child_chunks: usize,
-}
-
-impl SourceLexicalIndexUpdate {
-    fn start(deleted_child_chunks: usize) -> Self {
-        Self {
-            started_at: unix_timestamp_string(),
-            duration_ms: 0,
-            deleted_child_chunks,
-            indexed_child_chunks: 0,
-        }
-    }
-
-    fn add_elapsed_since(&mut self, started: Instant) {
-        let elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-        self.duration_ms = self.duration_ms.saturating_add(elapsed_ms);
-    }
 }
 
 /// Stable configuration that defines an embedding profile's vector semantics.
@@ -3398,6 +3366,7 @@ fn replace_source_contents_tx(
         embedding_profile_id,
         vectors,
         links,
+        evidence_spans,
         image_artifacts,
         graph_nodes,
         graph_edges,
@@ -3470,6 +3439,7 @@ fn replace_source_contents_tx(
         }
     }
 
+    evidence_spans::insert_chunk_evidence_spans_tx(tx, evidence_spans)?;
     insert_image_artifacts_tx(tx, image_artifacts)?;
     upsert_graph_nodes_tx(tx, graph_nodes)?;
     upsert_graph_edges_tx(tx, graph_edges)?;
@@ -4694,6 +4664,19 @@ CREATE TABLE IF NOT EXISTS chunk_evidence (
     evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
     PRIMARY KEY (chunk_id, evidence_unit_id)
 );
+CREATE TABLE IF NOT EXISTS chunk_evidence_spans (
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(id) ON DELETE CASCADE,
+    chunk_byte_start INTEGER NOT NULL,
+    chunk_byte_end INTEGER NOT NULL,
+    evidence_byte_start INTEGER NOT NULL,
+    evidence_byte_end INTEGER NOT NULL,
+    evidence_text_hash TEXT NOT NULL,
+    locator_json TEXT NOT NULL,
+    trust_json TEXT NOT NULL,
+    PRIMARY KEY (chunk_id, ordinal)
+);
 CREATE TABLE IF NOT EXISTS embedding_profiles (
     id TEXT PRIMARY KEY,
     provider TEXT NOT NULL,
@@ -4707,7 +4690,7 @@ CREATE TABLE IF NOT EXISTS embedding_profiles (
     dtype TEXT,
     quantization TEXT,
     weight_identity TEXT,
-    chunker_version TEXT NOT NULL DEFAULT 'parent-child-v2',
+    chunker_version TEXT NOT NULL DEFAULT 'parent-child-v3',
     child_target_tokens INTEGER NOT NULL DEFAULT 300,
     child_overlap_tokens INTEGER NOT NULL DEFAULT 80,
     parent_children_count INTEGER NOT NULL DEFAULT 5,
@@ -4895,6 +4878,7 @@ END;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunker::CHUNKER_VERSION;
     use crate::task::{
         ask_request_metadata, ask_result_metadata, ingest_request_metadata,
         ingest_task_request_metadata_with_queue_claim, PhaseTiming, TASK_EVENT_MESSAGE_MAX_CHARS,
@@ -4903,7 +4887,7 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
-    fn sample_source() -> Source {
+    pub(super) fn sample_source() -> Source {
         Source {
             id: SourceId("src-1".into()),
             path: PathBuf::from("/tmp/test.pdf"),
@@ -5593,7 +5577,7 @@ mod tests {
         assert_eq!(stored_profile, profile);
     }
 
-    fn sample_evidence(source_id: &str) -> Vec<EvidenceUnit> {
+    pub(super) fn sample_evidence(source_id: &str) -> Vec<EvidenceUnit> {
         vec![
             EvidenceUnit {
                 id: EvidenceId("ev-1".into()),
@@ -5628,7 +5612,7 @@ mod tests {
         ]
     }
 
-    fn sample_chunks(source_id: &str) -> Vec<Chunk> {
+    pub(super) fn sample_chunks(source_id: &str) -> Vec<Chunk> {
         vec![
             Chunk {
                 id: ChunkId("parent-1".into()),
@@ -5771,11 +5755,11 @@ mod tests {
         }
     }
 
-    fn profile_id(id: &str) -> EmbeddingProfileId {
+    pub(super) fn profile_id(id: &str) -> EmbeddingProfileId {
         EmbeddingProfileId::new(id).unwrap()
     }
 
-    fn test_profile_config<'a>(
+    pub(super) fn test_profile_config<'a>(
         provider: &'a str,
         model: &'a str,
         dimension: usize,
@@ -5795,7 +5779,7 @@ mod tests {
             dtype: None,
             quantization: None,
             weight_identity: None,
-            chunker_version: "parent-child-v2",
+            chunker_version: CHUNKER_VERSION,
             child_target_tokens: 300,
             child_overlap_tokens: 80,
             parent_children_count: 5,

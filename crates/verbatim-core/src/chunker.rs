@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use anyhow::{anyhow, ensure, Result};
+use std::collections::{HashMap, HashSet};
 
+use crate::evidence_spans::{ChunkEvidenceSpan, EvidenceSpanTrust};
 use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceUnit, SourceId, SourceLocator,
 };
 
-pub const CHUNKER_VERSION: &str = "parent-child-v2";
+pub const CHUNKER_VERSION: &str = "parent-child-v3";
 const DEFAULT_CHILD_TARGET: usize = 300;
 const DEFAULT_CHILD_OVERLAP: usize = 80;
 const DEFAULT_PARENT_CHILDREN: usize = 5;
@@ -30,6 +32,7 @@ impl Default for ChunkerConfig {
 pub struct ChunkOutput {
     pub chunks: Vec<Chunk>,
     pub links: Vec<(ChunkId, EvidenceId)>,
+    pub evidence_spans: Vec<ChunkEvidenceSpan>,
 }
 
 pub(crate) fn estimate_tokens(text: &str) -> u32 {
@@ -45,71 +48,109 @@ pub fn chunk_evidence(
         return ChunkOutput {
             chunks: Vec::new(),
             links: Vec::new(),
+            evidence_spans: Vec::new(),
         };
     }
 
-    let sections = split_by_top_heading(evidence);
-    let mut all_children = Vec::new();
-    let mut all_links = Vec::new();
-    let mut child_id_counts = HashMap::new();
-
-    for section in &sections {
-        let children = build_children(source_id, section, config, &mut child_id_counts);
-        for child in &children {
-            for eid in &child.evidence_unit_ids {
-                all_links.push((child.id.clone(), eid.clone()));
-            }
-        }
-        all_children.extend(children);
-    }
-
+    let hard_boundary_groups = split_by_hard_boundary(evidence);
     let mut all_chunks = Vec::new();
+    let mut all_links = Vec::new();
+    let mut all_evidence_spans = Vec::new();
+    let mut child_id_counts = HashMap::new();
     let mut parent_id_counts = HashMap::new();
-    for group in all_children.chunks(config.parent_children_count) {
-        let parent = build_parent(source_id, group, &mut parent_id_counts);
-        let parent_id = parent.id.clone();
-        for eid in &parent.evidence_unit_ids {
-            all_links.push((parent_id.clone(), eid.clone()));
-        }
-        all_chunks.push(parent.clone());
-        for child in group {
-            let mut child_with_parent = child.clone();
-            child_with_parent.parent_chunk_id = Some(parent_id.clone());
-            all_chunks.push(child_with_parent);
+
+    for hard_boundary_group in hard_boundary_groups {
+        let children = build_children(
+            source_id,
+            &hard_boundary_group,
+            config,
+            &mut child_id_counts,
+        );
+        for child_group in children.chunks(config.parent_children_count.max(1)) {
+            let parent = build_parent(source_id, child_group, &mut parent_id_counts);
+            let parent_id = parent.chunk.id.clone();
+            append_links(&mut all_links, &parent.chunk);
+            all_evidence_spans.extend(persisted_spans(&parent.chunk, &parent.spans));
+            all_chunks.push(parent.chunk);
+
+            for child in child_group {
+                let mut child_with_parent = child.chunk.clone();
+                child_with_parent.parent_chunk_id = Some(parent_id.clone());
+                append_links(&mut all_links, &child_with_parent);
+                all_evidence_spans.extend(persisted_spans(&child_with_parent, &child.spans));
+                all_chunks.push(child_with_parent);
+            }
         }
     }
 
     ChunkOutput {
         chunks: all_chunks,
         links: all_links,
+        evidence_spans: all_evidence_spans,
     }
 }
 
-fn split_by_top_heading(evidence: &[EvidenceUnit]) -> Vec<Vec<&EvidenceUnit>> {
-    let mut sections: Vec<Vec<&EvidenceUnit>> = Vec::new();
+fn split_by_hard_boundary(evidence: &[EvidenceUnit]) -> Vec<Vec<&EvidenceUnit>> {
+    let mut groups = Vec::new();
     let mut current: Vec<&EvidenceUnit> = Vec::new();
-
-    let top_heading = evidence
-        .iter()
-        .filter(|e| !e.heading_path.is_empty())
-        .map(|e| &e.heading_path[0])
-        .next();
+    let mut current_key = None;
 
     for unit in evidence {
-        let is_new_section = !unit.heading_path.is_empty()
-            && top_heading.is_some_and(|th| unit.heading_path[0] != *th || current.is_empty())
-            && !current.is_empty()
-            && unit.heading_path.len() == 1;
-
-        if is_new_section {
-            sections.push(std::mem::take(&mut current));
+        let key = hard_boundary_key(unit);
+        if current_key
+            .as_ref()
+            .is_some_and(|current_key| current_key != &key)
+        {
+            groups.push(std::mem::take(&mut current));
         }
         current.push(unit);
+        current_key = Some(key);
     }
     if !current.is_empty() {
-        sections.push(current);
+        groups.push(current);
     }
-    sections
+    groups
+}
+
+fn hard_boundary_key(unit: &EvidenceUnit) -> String {
+    let section = unit
+        .heading_path
+        .first()
+        .filter(|heading| !heading.trim().is_empty())
+        .map(|heading| format!("heading:{heading}"));
+    let locator_key = match &unit.locator {
+        SourceLocator::Markdown {
+            path,
+            heading_path,
+            heading_slug,
+            ..
+        } => {
+            let heading = heading_path
+                .first()
+                .filter(|heading| !heading.slug.trim().is_empty())
+                .map(|heading| format!("{}:{}:{}", heading.level, heading.slug, heading.line))
+                .or_else(|| {
+                    heading_slug
+                        .as_deref()
+                        .filter(|heading| !heading.trim().is_empty())
+                        .map(str::to_owned)
+                })
+                .or(section)
+                .unwrap_or_else(|| "preamble".to_string());
+            format!("markdown:{path}:{heading}")
+        }
+        SourceLocator::Pdf { page, .. } | SourceLocator::PdfOcr { page, .. } => {
+            section.unwrap_or_else(|| format!("pdf-page:{page}"))
+        }
+        SourceLocator::PdfImage { page, .. } => format!("pdf-image-page:{page}"),
+        SourceLocator::Document { path_or_url, .. } => section
+            .map(|heading| format!("document:{path_or_url}:{heading}"))
+            .unwrap_or_else(|| format!("document:{path_or_url}")),
+        SourceLocator::Canonical { locator } => {
+            format!("canonical:{}:{}", locator.profile_id, locator.work_id)
+        }
+    };
+    format!("source:{}:{locator_key}", unit.source_id.0)
 }
 
 fn build_children(
@@ -117,56 +158,46 @@ fn build_children(
     section: &[&EvidenceUnit],
     config: &ChunkerConfig,
     id_counts: &mut HashMap<String, usize>,
-) -> Vec<Chunk> {
+) -> Vec<ChunkWithSpans> {
     let target_chars = config.child_target_tokens * CHARS_PER_TOKEN;
     let overlap_chars = config.child_overlap_tokens * CHARS_PER_TOKEN;
     let mut children = Vec::new();
-    let mut current_text = String::new();
-    let mut current_evidence: Vec<EvidenceId> = Vec::new();
-    let mut current_evidence_hashes: Vec<String> = Vec::new();
+    let mut current = TextWithSpans::default();
     let mut current_heading: Vec<String> = Vec::new();
 
     for unit in section {
-        let would_exceed = current_text.len() + unit.text.len() > target_chars + target_chars / 5;
+        let would_exceed = current.text.len() + unit.text.len() > target_chars + target_chars / 5;
 
-        if would_exceed && !current_text.is_empty() {
+        if would_exceed && !current.text.trim().is_empty() {
+            let (text, spans) = current.trimmed();
             children.push(make_child(
                 source_id,
                 id_counts,
-                &current_text,
-                &current_evidence,
-                &current_evidence_hashes,
+                &text,
+                &spans,
                 &current_heading,
             ));
 
             let overlap_start = floor_char_boundary(
-                &current_text,
-                current_text.len().saturating_sub(overlap_chars),
+                &current.text,
+                current.text.len().saturating_sub(overlap_chars),
             );
-            let overlap = current_text[overlap_start..].to_string();
-            current_text = overlap;
-            current_evidence.clear();
-            current_evidence_hashes.clear();
+            current.retain_from(overlap_start);
         }
 
-        if !current_text.is_empty() {
-            current_text.push(' ');
-        }
-        current_text.push_str(&unit.text);
-        current_evidence.push(unit.id.clone());
-        current_evidence_hashes.push(evidence_identity_hash(unit));
+        current.append(unit);
         if current_heading.is_empty() {
             current_heading = unit.heading_path.clone();
         }
     }
 
-    if !current_text.trim().is_empty() {
+    if !current.text.trim().is_empty() {
+        let (text, spans) = current.trimmed();
         children.push(make_child(
             source_id,
             id_counts,
-            &current_text,
-            &current_evidence,
-            &current_evidence_hashes,
+            &text,
+            &spans,
             &current_heading,
         ));
     }
@@ -186,72 +217,376 @@ fn make_child(
     source_id: &SourceId,
     id_counts: &mut HashMap<String, usize>,
     text: &str,
-    evidence_ids: &[EvidenceId],
-    evidence_identity_hashes: &[String],
+    spans: &[PendingEvidenceSpan],
     heading_path: &[String],
-) -> Chunk {
-    let trimmed = text.trim().to_string();
+) -> ChunkWithSpans {
+    let evidence_identity_hashes = unique_evidence_identity_hashes(spans);
     let chunk_hash = deterministic_chunk_hash(
         ChunkType::Child,
-        &trimmed,
+        text,
         heading_path,
-        evidence_identity_hashes,
+        &evidence_identity_hashes,
     );
     let id = unique_chunk_id(source_id, "child", &chunk_hash, id_counts);
-    Chunk {
-        id,
-        source_id: source_id.clone(),
-        chunk_hash,
-        embedding_input_hash: None,
-        text: trimmed,
-        context_text: None,
-        token_count: estimate_tokens(text),
-        chunk_type: ChunkType::Child,
-        parent_chunk_id: None,
-        heading_path: heading_path.to_vec(),
-        evidence_unit_ids: evidence_ids.to_vec(),
+    ChunkWithSpans {
+        spans: spans.to_vec(),
+        chunk: Chunk {
+            id,
+            source_id: source_id.clone(),
+            chunk_hash,
+            embedding_input_hash: None,
+            text: text.to_string(),
+            context_text: None,
+            token_count: estimate_tokens(text),
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path: heading_path.to_vec(),
+            evidence_unit_ids: unique_evidence_ids(spans),
+        },
     }
 }
 
 fn build_parent(
     source_id: &SourceId,
-    children: &[Chunk],
+    children: &[ChunkWithSpans],
     id_counts: &mut HashMap<String, usize>,
-) -> Chunk {
-    let text: String = children
-        .iter()
-        .map(|c| c.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let evidence_ids: Vec<EvidenceId> = children
-        .iter()
-        .flat_map(|c| c.evidence_unit_ids.iter().cloned())
-        .collect();
+) -> ChunkWithSpans {
+    let mut text = String::new();
+    let mut spans = Vec::new();
+    for child in children {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        let offset = text.len() as u64;
+        text.push_str(&child.chunk.text);
+        spans.extend(child.spans.iter().cloned().map(|span| span.rebased(offset)));
+    }
+    let (text, spans) = trim_text_and_spans(&text, &spans);
     let heading_path = children
         .first()
-        .map(|c| c.heading_path.clone())
+        .map(|child| child.chunk.heading_path.clone())
         .unwrap_or_default();
     let child_hashes = children
         .iter()
-        .map(|child| child.chunk_hash.clone())
+        .map(|child| child.chunk.chunk_hash.clone())
         .collect::<Vec<_>>();
-    let trimmed = text.trim().to_string();
     let chunk_hash =
-        deterministic_chunk_hash(ChunkType::Parent, &trimmed, &heading_path, &child_hashes);
+        deterministic_chunk_hash(ChunkType::Parent, &text, &heading_path, &child_hashes);
     let id = unique_chunk_id(source_id, "parent", &chunk_hash, id_counts);
-    Chunk {
-        id,
-        source_id: source_id.clone(),
-        chunk_hash,
-        embedding_input_hash: None,
-        text: trimmed,
-        context_text: None,
-        token_count: estimate_tokens(&text),
-        chunk_type: ChunkType::Parent,
-        parent_chunk_id: None,
-        heading_path,
-        evidence_unit_ids: evidence_ids,
+    let evidence_unit_ids = unique_evidence_ids(&spans);
+    ChunkWithSpans {
+        spans,
+        chunk: Chunk {
+            id,
+            source_id: source_id.clone(),
+            chunk_hash,
+            embedding_input_hash: None,
+            text: text.clone(),
+            context_text: None,
+            token_count: estimate_tokens(&text),
+            chunk_type: ChunkType::Parent,
+            parent_chunk_id: None,
+            heading_path,
+            evidence_unit_ids,
+        },
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct ChunkWithSpans {
+    pub(crate) chunk: Chunk,
+    pub(crate) spans: Vec<PendingEvidenceSpan>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingEvidenceSpan {
+    evidence_id: EvidenceId,
+    chunk_byte_start: u64,
+    chunk_byte_end: u64,
+    evidence_byte_start: u64,
+    evidence_byte_end: u64,
+    evidence_text_hash: String,
+    evidence_identity_hash: String,
+    locator: SourceLocator,
+    trust: EvidenceSpanTrust,
+}
+
+impl PendingEvidenceSpan {
+    fn from_unit(unit: &EvidenceUnit, chunk_byte_start: u64, chunk_byte_end: u64) -> Self {
+        Self {
+            evidence_id: unit.id.clone(),
+            chunk_byte_start,
+            chunk_byte_end,
+            evidence_byte_start: 0,
+            evidence_byte_end: unit.text.len() as u64,
+            evidence_text_hash: unit.text_hash.clone(),
+            evidence_identity_hash: evidence_identity_hash(unit),
+            locator: unit.locator.clone(),
+            trust: if unit.derived_from.is_some() {
+                EvidenceSpanTrust::Derived
+            } else {
+                EvidenceSpanTrust::Direct
+            },
+        }
+    }
+
+    fn rebased(mut self, offset: u64) -> Self {
+        self.chunk_byte_start += offset;
+        self.chunk_byte_end += offset;
+        self
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct TextWithSpans {
+    text: String,
+    spans: Vec<PendingEvidenceSpan>,
+}
+
+impl TextWithSpans {
+    pub(crate) fn append(&mut self, unit: &EvidenceUnit) {
+        if !self.text.is_empty() {
+            self.text.push(' ');
+        }
+        let start = self.text.len() as u64;
+        self.text.push_str(&unit.text);
+        self.spans.push(PendingEvidenceSpan::from_unit(
+            unit,
+            start,
+            self.text.len() as u64,
+        ));
+    }
+
+    pub(crate) fn append_composed(&mut self, text: &str, spans: &[PendingEvidenceSpan]) {
+        if !self.text.is_empty() {
+            self.text.push(' ');
+        }
+        let offset = self.text.len() as u64;
+        self.text.push_str(text);
+        self.spans
+            .extend(spans.iter().cloned().map(|span| span.rebased(offset)));
+    }
+
+    fn retain_from(&mut self, overlap_start: usize) {
+        let overlap_end = self.text.len() as u64;
+        let overlap_start = overlap_start as u64;
+        self.spans = self
+            .spans
+            .iter()
+            .filter_map(|span| {
+                let kept_start = span.chunk_byte_start.max(overlap_start);
+                (kept_start < span.chunk_byte_end).then(|| PendingEvidenceSpan {
+                    chunk_byte_start: kept_start - overlap_start,
+                    chunk_byte_end: span.chunk_byte_end - overlap_start,
+                    evidence_byte_start: span.evidence_byte_start
+                        + kept_start.saturating_sub(span.chunk_byte_start),
+                    evidence_byte_end: span.evidence_byte_end
+                        - span.chunk_byte_end.saturating_sub(overlap_end),
+                    evidence_id: span.evidence_id.clone(),
+                    evidence_text_hash: span.evidence_text_hash.clone(),
+                    evidence_identity_hash: span.evidence_identity_hash.clone(),
+                    locator: span.locator.clone(),
+                    trust: span.trust,
+                })
+            })
+            .collect();
+        self.text = self.text[overlap_start as usize..].to_string();
+    }
+
+    pub(crate) fn trimmed(&self) -> (String, Vec<PendingEvidenceSpan>) {
+        trim_text_and_spans(&self.text, &self.spans)
+    }
+}
+
+fn trim_text_and_spans(
+    text: &str,
+    spans: &[PendingEvidenceSpan],
+) -> (String, Vec<PendingEvidenceSpan>) {
+    let trim_start = (text.len() - text.trim_start().len()) as u64;
+    let trimmed = text.trim();
+    let trim_end = trim_start + trimmed.len() as u64;
+    let spans = spans
+        .iter()
+        .filter_map(|span| {
+            let start = span.chunk_byte_start.max(trim_start);
+            let end = span.chunk_byte_end.min(trim_end);
+            (start < end).then(|| PendingEvidenceSpan {
+                chunk_byte_start: start - trim_start,
+                chunk_byte_end: end - trim_start,
+                evidence_byte_start: span.evidence_byte_start
+                    + start.saturating_sub(span.chunk_byte_start),
+                evidence_byte_end: span.evidence_byte_end - span.chunk_byte_end.saturating_sub(end),
+                evidence_id: span.evidence_id.clone(),
+                evidence_text_hash: span.evidence_text_hash.clone(),
+                evidence_identity_hash: span.evidence_identity_hash.clone(),
+                locator: span.locator.clone(),
+                trust: span.trust,
+            })
+        })
+        .collect();
+    (trimmed.to_string(), spans)
+}
+
+fn unique_evidence_ids(spans: &[PendingEvidenceSpan]) -> Vec<EvidenceId> {
+    let mut seen = HashSet::new();
+    spans
+        .iter()
+        .filter(|span| seen.insert(span.evidence_id.clone()))
+        .map(|span| span.evidence_id.clone())
+        .collect()
+}
+
+fn unique_evidence_identity_hashes(spans: &[PendingEvidenceSpan]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    spans
+        .iter()
+        .filter(|span| seen.insert(span.evidence_identity_hash.as_str()))
+        .map(|span| span.evidence_identity_hash.clone())
+        .collect()
+}
+
+fn append_links(links: &mut Vec<(ChunkId, EvidenceId)>, chunk: &Chunk) {
+    links.extend(
+        chunk
+            .evidence_unit_ids
+            .iter()
+            .cloned()
+            .map(|evidence_id| (chunk.id.clone(), evidence_id)),
+    );
+}
+
+fn persisted_spans(chunk: &Chunk, spans: &[PendingEvidenceSpan]) -> Vec<ChunkEvidenceSpan> {
+    spans
+        .iter()
+        .map(|span| ChunkEvidenceSpan {
+            chunk_id: chunk.id.clone(),
+            evidence_id: span.evidence_id.clone(),
+            chunk_byte_start: span.chunk_byte_start,
+            chunk_byte_end: span.chunk_byte_end,
+            evidence_byte_start: span.evidence_byte_start,
+            evidence_byte_end: span.evidence_byte_end,
+            evidence_text_hash: span.evidence_text_hash.clone(),
+            locator: span.locator.clone(),
+            trust: span.trust,
+        })
+        .collect()
+}
+
+pub(crate) fn persist_spans_checked(
+    chunk: &Chunk,
+    spans: &[PendingEvidenceSpan],
+    evidence: &[EvidenceUnit],
+) -> Result<Vec<ChunkEvidenceSpan>> {
+    let evidence_by_id = evidence
+        .iter()
+        .map(|unit| (&unit.id, unit))
+        .collect::<HashMap<_, _>>();
+
+    for span in spans {
+        let unit = evidence_by_id.get(&span.evidence_id).ok_or_else(|| {
+            anyhow!(
+                "chunk {} references missing evidence {}",
+                chunk.id.0,
+                span.evidence_id.0
+            )
+        })?;
+        let chunk_text = text_for_span(
+            &chunk.text,
+            span.chunk_byte_start,
+            span.chunk_byte_end,
+            "chunk",
+        )?;
+        let evidence_text = text_for_span(
+            &unit.text,
+            span.evidence_byte_start,
+            span.evidence_byte_end,
+            "evidence",
+        )?;
+        ensure!(
+            chunk_text == evidence_text,
+            "chunk {} provenance for evidence {} does not resolve to identical text",
+            chunk.id.0,
+            unit.id.0
+        );
+        ensure!(
+            span.evidence_text_hash == unit.text_hash,
+            "chunk {} provenance text hash mismatches evidence {}",
+            chunk.id.0,
+            unit.id.0
+        );
+        ensure!(
+            span.locator == unit.locator,
+            "chunk {} provenance locator mismatches evidence {}",
+            chunk.id.0,
+            unit.id.0
+        );
+        let expected_trust = if unit.derived_from.is_some() {
+            EvidenceSpanTrust::Derived
+        } else {
+            EvidenceSpanTrust::Direct
+        };
+        ensure!(
+            span.trust == expected_trust,
+            "chunk {} provenance trust mismatches evidence {}",
+            chunk.id.0,
+            unit.id.0
+        );
+    }
+
+    Ok(persisted_spans(chunk, spans))
+}
+
+fn text_for_span<'a>(text: &'a str, start: u64, end: u64, subject: &str) -> Result<&'a str> {
+    let start = usize::try_from(start)
+        .map_err(|_| anyhow!("{subject} provenance start does not fit usize"))?;
+    let end =
+        usize::try_from(end).map_err(|_| anyhow!("{subject} provenance end does not fit usize"))?;
+    text.get(start..end)
+        .ok_or_else(|| anyhow!("{subject} provenance range {start}..{end} is invalid"))
+}
+
+pub(crate) fn full_unit_evidence_spans(
+    chunks: &[Chunk],
+    evidence: &[EvidenceUnit],
+) -> Vec<ChunkEvidenceSpan> {
+    let evidence_by_id = evidence
+        .iter()
+        .map(|unit| (&unit.id, unit))
+        .collect::<HashMap<_, _>>();
+    let mut spans = Vec::new();
+
+    for chunk in chunks {
+        let mut search_start = 0;
+        for evidence_id in &chunk.evidence_unit_ids {
+            let Some(unit) = evidence_by_id.get(evidence_id) else {
+                continue;
+            };
+            let Some(start) = chunk.text[search_start..]
+                .find(&unit.text)
+                .map(|offset| search_start + offset)
+            else {
+                continue;
+            };
+            let end = start + unit.text.len();
+            spans.push(ChunkEvidenceSpan {
+                chunk_id: chunk.id.clone(),
+                evidence_id: unit.id.clone(),
+                chunk_byte_start: start as u64,
+                chunk_byte_end: end as u64,
+                evidence_byte_start: 0,
+                evidence_byte_end: unit.text.len() as u64,
+                evidence_text_hash: unit.text_hash.clone(),
+                locator: unit.locator.clone(),
+                trust: if unit.derived_from.is_some() {
+                    EvidenceSpanTrust::Derived
+                } else {
+                    EvidenceSpanTrust::Direct
+                },
+            });
+            search_start = end;
+        }
+    }
+    spans
 }
 
 pub fn deterministic_chunk_hash(
@@ -313,200 +648,5 @@ fn evidence_identity_hash(unit: &EvidenceUnit) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{EvidenceKind, MarkdownBlockKind, MarkdownHeadingLocator, SourceLocator};
-
-    fn make_evidence(n: usize, heading: &str) -> Vec<EvidenceUnit> {
-        (0..n)
-            .map(|i| EvidenceUnit {
-                id: EvidenceId(format!("ev-{i}")),
-                source_id: SourceId("test".into()),
-                kind: EvidenceKind::Text,
-                derived_from: None,
-                locator: SourceLocator::Pdf {
-                    page: 1,
-                    paragraph: i as u32,
-                    bbox: None,
-                },
-                text: format!("Word{i} ").repeat(80),
-                text_hash: format!("hash-{i}"),
-                heading_path: if heading.is_empty() {
-                    vec![]
-                } else {
-                    vec![heading.to_string()]
-                },
-                position: i as u32,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn produces_parent_child_hierarchy() {
-        let evidence = make_evidence(20, "Chapter 1");
-        let config = ChunkerConfig::default();
-        let output = chunk_evidence(&SourceId("test".into()), &evidence, &config);
-
-        let parents: Vec<_> = output
-            .chunks
-            .iter()
-            .filter(|c| c.chunk_type == ChunkType::Parent)
-            .collect();
-        let children: Vec<_> = output
-            .chunks
-            .iter()
-            .filter(|c| c.chunk_type == ChunkType::Child)
-            .collect();
-
-        assert!(!parents.is_empty());
-        assert!(!children.is_empty());
-
-        for child in &children {
-            assert!(child.parent_chunk_id.is_some());
-        }
-    }
-
-    #[test]
-    fn child_token_count_in_range() {
-        let evidence = make_evidence(20, "Chapter 1");
-        let config = ChunkerConfig::default();
-        let output = chunk_evidence(&SourceId("test".into()), &evidence, &config);
-
-        for chunk in &output.chunks {
-            if chunk.chunk_type == ChunkType::Child {
-                let target = config.child_target_tokens as f64;
-                assert!(
-                    (chunk.token_count as f64) < target * 1.5,
-                    "child too large: {} tokens",
-                    chunk.token_count
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn empty_evidence() {
-        let output = chunk_evidence(&SourceId("test".into()), &[], &ChunkerConfig::default());
-        assert!(output.chunks.is_empty());
-        assert!(output.links.is_empty());
-    }
-
-    #[test]
-    fn links_match_evidence_ids() {
-        let evidence = make_evidence(5, "");
-        let output = chunk_evidence(
-            &SourceId("test".into()),
-            &evidence,
-            &ChunkerConfig::default(),
-        );
-
-        assert!(!output.links.is_empty());
-        for (chunk_id, _eid) in &output.links {
-            assert!(output.chunks.iter().any(|c| c.id == *chunk_id));
-        }
-    }
-
-    #[test]
-    fn unicode_overlap_starts_on_char_boundary() {
-        let mut evidence = make_evidence(2, "中文章节");
-        evidence[0].text = "份".repeat(380);
-        evidence[1].text = "额".repeat(101);
-
-        let output = chunk_evidence(
-            &SourceId("test".into()),
-            &evidence,
-            &ChunkerConfig::default(),
-        );
-
-        assert!(output
-            .chunks
-            .iter()
-            .any(|chunk| chunk.chunk_type == ChunkType::Child));
-    }
-
-    #[test]
-    fn markdown_chunk_identity_survives_insertion_before_section() {
-        let source_id = SourceId("doc".into());
-        let original = vec![
-            markdown_evidence(&source_id, "intro", "Intro text.", "intro-block", 3, 0),
-            markdown_evidence(&source_id, "stable", "Stable text.", "stable-block", 7, 1),
-        ];
-        let shifted = vec![
-            markdown_evidence(
-                &source_id,
-                "inserted",
-                "Inserted text.",
-                "inserted-block",
-                3,
-                0,
-            ),
-            markdown_evidence(&source_id, "intro", "Intro text.", "intro-block", 7, 1),
-            markdown_evidence(&source_id, "stable", "Stable text.", "stable-block", 11, 2),
-        ];
-
-        let original_output = chunk_evidence(&source_id, &original, &ChunkerConfig::default());
-        let shifted_output = chunk_evidence(&source_id, &shifted, &ChunkerConfig::default());
-        let original_stable = child_for_heading(&original_output.chunks, "Stable");
-        let shifted_stable = child_for_heading(&shifted_output.chunks, "Stable");
-
-        assert_eq!(original_stable.chunk_hash, shifted_stable.chunk_hash);
-        assert_eq!(original_stable.id, shifted_stable.id);
-    }
-
-    fn markdown_evidence(
-        source_id: &SourceId,
-        slug: &str,
-        text: &str,
-        block_hash: &str,
-        line_start: u32,
-        position: u32,
-    ) -> EvidenceUnit {
-        let heading_text = title_case(slug);
-        EvidenceUnit {
-            id: EvidenceId(format!("ev-{slug}-{line_start}")),
-            source_id: source_id.clone(),
-            kind: EvidenceKind::Text,
-            derived_from: None,
-            locator: SourceLocator::Markdown {
-                path: "doc.md".into(),
-                line_start,
-                line_end: line_start,
-                byte_start: 0,
-                byte_end: text.len() as u64,
-                block_kind: MarkdownBlockKind::Paragraph,
-                block_index: position,
-                block_hash: block_hash.into(),
-                heading_level: Some(1),
-                heading_slug: Some(slug.into()),
-                heading_path: vec![MarkdownHeadingLocator {
-                    level: 1,
-                    text: heading_text.clone(),
-                    slug: slug.into(),
-                    line: line_start.saturating_sub(2),
-                }],
-            },
-            text: text.into(),
-            text_hash: format!("{slug}-text-hash"),
-            heading_path: vec![heading_text],
-            position,
-        }
-    }
-
-    fn child_for_heading<'a>(chunks: &'a [Chunk], heading: &str) -> &'a Chunk {
-        chunks
-            .iter()
-            .find(|chunk| {
-                chunk.chunk_type == ChunkType::Child
-                    && chunk.heading_path == vec![heading.to_string()]
-            })
-            .expect("child chunk for heading")
-    }
-
-    fn title_case(slug: &str) -> String {
-        let mut chars = slug.chars();
-        match chars.next() {
-            Some(first) => first.to_uppercase().chain(chars).collect(),
-            None => String::new(),
-        }
-    }
-}
+#[path = "chunker_tests.rs"]
+mod tests;
