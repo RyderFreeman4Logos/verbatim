@@ -36,4 +36,5 @@ instant-distance = "0.6"
 tantivy = "0.26"
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"

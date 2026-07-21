@@ -7,11 +7,12 @@
 //! Hard boundary: never cross top-level work boundaries (e.g., Bible books).
 //! Soft boundary: prefer not to cross mid-level boundaries (e.g., chapters).
 
+use anyhow::Result;
 use std::collections::HashMap;
 
 use crate::chunker::{
-    deterministic_chunk_hash, estimate_tokens, full_unit_evidence_spans, unique_chunk_id,
-    ChunkOutput,
+    deterministic_chunk_hash, estimate_tokens, persist_spans_checked, unique_chunk_id, ChunkOutput,
+    ChunkWithSpans, TextWithSpans,
 };
 use crate::types::{
     CanonicalLocator, Chunk, ChunkType, EvidenceId, EvidenceUnit, SourceId, SourceLocator,
@@ -48,13 +49,13 @@ pub fn chunk_canonical_units(
     source_id: &SourceId,
     evidence: &[EvidenceUnit],
     config: &CanonicalChunkerConfig,
-) -> ChunkOutput {
+) -> Result<ChunkOutput> {
     if evidence.is_empty() {
-        return ChunkOutput {
+        return Ok(ChunkOutput {
             chunks: Vec::new(),
             links: Vec::new(),
             evidence_spans: Vec::new(),
-        };
+        });
     }
 
     // Split into groups by hard boundary (book ordinal).
@@ -72,8 +73,8 @@ pub fn chunk_canonical_units(
         for sub_group in sub_groups {
             let children = build_canonical_children(source_id, &sub_group, config, &mut id_counts);
             for child in &children {
-                for eid in &child.evidence_unit_ids {
-                    all_links.push((child.id.clone(), eid.clone()));
+                for eid in &child.chunk.evidence_unit_ids {
+                    all_links.push((child.chunk.id.clone(), eid.clone()));
                 }
             }
             group_children.extend(children);
@@ -86,24 +87,35 @@ pub fn chunk_canonical_units(
         let parent_group_size = 5;
         for children_batch in group_children.chunks(parent_group_size) {
             let parent = build_canonical_parent(source_id, children_batch, &mut id_counts);
-            let parent_id = parent.id.clone();
-            for eid in &parent.evidence_unit_ids {
+            let parent_id = parent.chunk.id.clone();
+            for eid in &parent.chunk.evidence_unit_ids {
                 all_links.push((parent_id.clone(), eid.clone()));
             }
-            all_chunks.push(parent.clone());
+            all_chunks.push(parent);
             for child in children_batch {
                 let mut child_with_parent = child.clone();
-                child_with_parent.parent_chunk_id = Some(parent_id.clone());
+                child_with_parent.chunk.parent_chunk_id = Some(parent_id.clone());
                 all_chunks.push(child_with_parent);
             }
         }
     }
 
-    ChunkOutput {
-        evidence_spans: full_unit_evidence_spans(&all_chunks, evidence),
-        chunks: all_chunks,
-        links: all_links,
+    let mut chunks = Vec::with_capacity(all_chunks.len());
+    let mut evidence_spans = Vec::new();
+    for chunk_with_spans in all_chunks {
+        evidence_spans.extend(persist_spans_checked(
+            &chunk_with_spans.chunk,
+            &chunk_with_spans.spans,
+            evidence,
+        )?);
+        chunks.push(chunk_with_spans.chunk);
     }
+
+    Ok(ChunkOutput {
+        evidence_spans,
+        chunks,
+        links: all_links,
+    })
 }
 
 /// Split evidence into groups that must never be in the same chunk.
@@ -168,7 +180,7 @@ fn build_canonical_children(
     units: &[EvidenceUnit],
     config: &CanonicalChunkerConfig,
     id_counts: &mut HashMap<String, usize>,
-) -> Vec<Chunk> {
+) -> Vec<ChunkWithSpans> {
     let target_chars = config.target_tokens * 4; // CHARS_PER_TOKEN
     let mut children = Vec::new();
     let mut current_units: Vec<&EvidenceUnit> = Vec::new();
@@ -204,13 +216,12 @@ fn make_canonical_child(
     source_id: &SourceId,
     units: &[&EvidenceUnit],
     id_counts: &mut HashMap<String, usize>,
-) -> Chunk {
-    let text: String = units
-        .iter()
-        .map(|u| u.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let trimmed = text.trim().to_string();
+) -> ChunkWithSpans {
+    let mut text_with_spans = TextWithSpans::default();
+    for unit in units {
+        text_with_spans.append(unit);
+    }
+    let (text, spans) = text_with_spans.trimmed();
     let evidence_ids: Vec<EvidenceId> = units.iter().map(|u| u.id.clone()).collect();
     let evidence_hashes: Vec<String> = units.iter().map(|u| evidence_identity_hash(u)).collect();
     let heading_path = units
@@ -218,61 +229,66 @@ fn make_canonical_child(
         .map(|u| u.heading_path.clone())
         .unwrap_or_default();
     let chunk_hash =
-        deterministic_chunk_hash(ChunkType::Child, &trimmed, &heading_path, &evidence_hashes);
+        deterministic_chunk_hash(ChunkType::Child, &text, &heading_path, &evidence_hashes);
     let id = unique_chunk_id(source_id, "child", &chunk_hash, id_counts);
-    Chunk {
-        id,
-        source_id: source_id.clone(),
-        chunk_hash,
-        embedding_input_hash: None,
-        text: trimmed,
-        context_text: None,
-        token_count: estimate_tokens(&text),
-        chunk_type: ChunkType::Child,
-        parent_chunk_id: None,
-        heading_path,
-        evidence_unit_ids: evidence_ids,
+    ChunkWithSpans {
+        spans,
+        chunk: Chunk {
+            id,
+            source_id: source_id.clone(),
+            chunk_hash,
+            embedding_input_hash: None,
+            text: text.clone(),
+            context_text: None,
+            token_count: estimate_tokens(&text),
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path,
+            evidence_unit_ids: evidence_ids,
+        },
     }
 }
 
 fn build_canonical_parent(
     source_id: &SourceId,
-    children: &[Chunk],
+    children: &[ChunkWithSpans],
     id_counts: &mut HashMap<String, usize>,
-) -> Chunk {
-    let text: String = children
-        .iter()
-        .map(|c| c.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
+) -> ChunkWithSpans {
+    let mut text_with_spans = TextWithSpans::default();
+    for child in children {
+        text_with_spans.append_composed(&child.chunk.text, &child.spans);
+    }
+    let (text, spans) = text_with_spans.trimmed();
     let evidence_ids: Vec<EvidenceId> = children
         .iter()
-        .flat_map(|c| c.evidence_unit_ids.iter().cloned())
+        .flat_map(|c| c.chunk.evidence_unit_ids.iter().cloned())
         .collect();
     let heading_path = children
         .first()
-        .map(|c| c.heading_path.clone())
+        .map(|c| c.chunk.heading_path.clone())
         .unwrap_or_default();
     let child_hashes = children
         .iter()
-        .map(|c| c.chunk_hash.clone())
+        .map(|c| c.chunk.chunk_hash.clone())
         .collect::<Vec<_>>();
-    let trimmed = text.trim().to_string();
     let chunk_hash =
-        deterministic_chunk_hash(ChunkType::Parent, &trimmed, &heading_path, &child_hashes);
+        deterministic_chunk_hash(ChunkType::Parent, &text, &heading_path, &child_hashes);
     let id = unique_chunk_id(source_id, "parent", &chunk_hash, id_counts);
-    Chunk {
-        id,
-        source_id: source_id.clone(),
-        chunk_hash,
-        embedding_input_hash: None,
-        text: trimmed,
-        context_text: None,
-        token_count: estimate_tokens(&text),
-        chunk_type: ChunkType::Parent,
-        parent_chunk_id: None,
-        heading_path,
-        evidence_unit_ids: evidence_ids,
+    ChunkWithSpans {
+        spans,
+        chunk: Chunk {
+            id,
+            source_id: source_id.clone(),
+            chunk_hash,
+            embedding_input_hash: None,
+            text: text.clone(),
+            context_text: None,
+            token_count: estimate_tokens(&text),
+            chunk_type: ChunkType::Parent,
+            parent_chunk_id: None,
+            heading_path,
+            evidence_unit_ids: evidence_ids,
+        },
     }
 }
 
@@ -323,6 +339,8 @@ fn evidence_identity_hash(unit: &EvidenceUnit) -> String {
 mod tests {
     use super::*;
     use crate::types::{hex_sha256, EvidenceId, EvidenceKind, SourceId};
+    use proptest::prelude::*;
+    use std::collections::HashMap;
 
     fn make_verse(
         source_id: &SourceId,
@@ -370,6 +388,207 @@ mod tests {
         }
     }
 
+    fn assert_source_content_resolves_to_evidence_spans(
+        output: &ChunkOutput,
+        evidence: &[EvidenceUnit],
+    ) {
+        let evidence_by_id = evidence
+            .iter()
+            .map(|unit| (&unit.id, unit))
+            .collect::<HashMap<_, _>>();
+
+        for chunk in &output.chunks {
+            let spans = output
+                .evidence_spans
+                .iter()
+                .filter(|span| span.chunk_id == chunk.id)
+                .collect::<Vec<_>>();
+            let mut covered = vec![false; chunk.text.len()];
+
+            for span in spans {
+                let chunk_start = span.chunk_byte_start as usize;
+                let chunk_end = span.chunk_byte_end as usize;
+                let evidence_start = span.evidence_byte_start as usize;
+                let evidence_end = span.evidence_byte_end as usize;
+                let unit = evidence_by_id
+                    .get(&span.evidence_id)
+                    .expect("span evidence must persist");
+
+                assert!(chunk.text.is_char_boundary(chunk_start));
+                assert!(chunk.text.is_char_boundary(chunk_end));
+                assert!(unit.text.is_char_boundary(evidence_start));
+                assert!(unit.text.is_char_boundary(evidence_end));
+                assert_eq!(span.evidence_text_hash, unit.text_hash);
+                assert_eq!(span.locator, unit.locator);
+                assert_eq!(
+                    &chunk.text[chunk_start..chunk_end],
+                    &unit.text[evidence_start..evidence_end],
+                    "span must resolve to the exact persisted evidence substring"
+                );
+                covered[chunk_start..chunk_end].fill(true);
+            }
+
+            for (offset, character) in chunk.text.char_indices() {
+                if !character.is_whitespace() {
+                    assert!(
+                        covered[offset..offset + character.len_utf8()]
+                            .iter()
+                            .all(|covered| *covered),
+                        "unresolved source-derived character {character:?} in {}",
+                        chunk.id.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_whitespace_repeated_text_keeps_child_and_parent_provenance() {
+        let source_id = SourceId("canonical-whitespace".into());
+        let unit_a = make_verse(
+            &source_id,
+            0,
+            "John",
+            43,
+            1,
+            1,
+            "  repeated",
+            Some("John 1"),
+        );
+        let unit_b = make_verse(&source_id, 1, "John", 43, 1, 2, "repeated", Some("John 1"));
+        let evidence = vec![unit_a.clone(), unit_b.clone()];
+        let output = chunk_canonical_units(
+            &source_id,
+            &evidence,
+            &CanonicalChunkerConfig {
+                target_tokens: 100,
+                overlap_units: 0,
+                max_units_per_child: 2,
+            },
+        )
+        .expect("canonical provenance must resolve");
+
+        for chunk in output
+            .chunks
+            .iter()
+            .filter(|chunk| matches!(chunk.chunk_type, ChunkType::Child | ChunkType::Parent))
+        {
+            assert_eq!(chunk.text, "repeated repeated");
+            let a_span = output
+                .evidence_spans
+                .iter()
+                .find(|span| span.chunk_id == chunk.id && span.evidence_id == unit_a.id)
+                .expect("unit A span");
+            let b_span = output
+                .evidence_spans
+                .iter()
+                .find(|span| span.chunk_id == chunk.id && span.evidence_id == unit_b.id)
+                .expect("unit B span");
+            assert_eq!((a_span.chunk_byte_start, a_span.chunk_byte_end), (0, 8));
+            assert_eq!(
+                (a_span.evidence_byte_start, a_span.evidence_byte_end),
+                (2, 10)
+            );
+            assert_eq!((b_span.chunk_byte_start, b_span.chunk_byte_end), (9, 17));
+            assert_eq!(
+                (b_span.evidence_byte_start, b_span.evidence_byte_end),
+                (0, 8)
+            );
+        }
+        assert_source_content_resolves_to_evidence_spans(&output, &evidence);
+    }
+
+    #[test]
+    fn canonical_provenance_mismatch_fails_before_ingest() {
+        let source_id = SourceId("canonical-mismatch".into());
+        let unit = make_verse(&source_id, 0, "John", 43, 1, 1, "repeated", Some("John 1"));
+        let output = chunk_canonical_units(
+            &source_id,
+            std::slice::from_ref(&unit),
+            &CanonicalChunkerConfig::default(),
+        )
+        .expect("canonical provenance must resolve before tampering");
+        let mut chunk = output
+            .chunks
+            .iter()
+            .find(|chunk| chunk.chunk_type == ChunkType::Child)
+            .expect("child chunk")
+            .clone();
+        chunk.text = "tampered".into();
+
+        let mut text_with_spans = TextWithSpans::default();
+        text_with_spans.append(&unit);
+        let (_, spans) = text_with_spans.trimmed();
+        let error = persist_spans_checked(&chunk, &spans, std::slice::from_ref(&unit))
+            .expect_err("mismatched canonical provenance must fail ingestion");
+        assert!(error
+            .to_string()
+            .contains("does not resolve to identical text"));
+    }
+
+    fn repeated_unicode_text() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just("你".to_string()),
+                Just("é".to_string()),
+                Just("🙂".to_string()),
+                Just("字".to_string()),
+            ],
+            1..8,
+        )
+        .prop_map(|characters| characters.concat())
+    }
+
+    fn unicode_whitespace() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(" ".to_string()),
+            Just("\t".to_string()),
+            Just("\u{2003}".to_string()),
+            Just("\u{2009}".to_string()),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn canonical_provenance_property_preserves_utf8_repeated_text_across_boundaries(
+            repeated in repeated_unicode_text(),
+            leading in unicode_whitespace(),
+            trailing in unicode_whitespace(),
+            overlap_units in 0usize..3,
+            max_units_per_child in 1usize..4,
+        ) {
+            let source_id = SourceId("canonical-property".into());
+            let mut evidence = Vec::new();
+            for (book, book_ordinal) in [("John", 43), ("Romans", 45)] {
+                for verse in 1..=6 {
+                    evidence.push(make_verse(
+                        &source_id,
+                        evidence.len() as u32,
+                        book,
+                        book_ordinal,
+                        1,
+                        verse,
+                        &format!("{leading}{repeated}{trailing}"),
+                        Some(book),
+                    ));
+                }
+            }
+            let output = chunk_canonical_units(
+                &source_id,
+                &evidence,
+                &CanonicalChunkerConfig {
+                    target_tokens: 1,
+                    overlap_units,
+                    max_units_per_child,
+                },
+            )
+            .expect("canonical provenance must resolve");
+
+            prop_assert!(output.chunks.iter().any(|chunk| chunk.chunk_type == ChunkType::Parent));
+            assert_source_content_resolves_to_evidence_spans(&output, &evidence);
+        }
+    }
+
     #[test]
     fn never_splits_a_unit() {
         let sid = SourceId("test-source".into());
@@ -388,7 +607,8 @@ mod tests {
             })
             .collect();
         let config = CanonicalChunkerConfig::default();
-        let output = chunk_canonical_units(&sid, &verses, &config);
+        let output = chunk_canonical_units(&sid, &verses, &config)
+            .expect("canonical provenance must resolve");
         // Every child chunk should reference whole evidence units
         for chunk in &output.chunks {
             if chunk.chunk_type == ChunkType::Child {
@@ -428,7 +648,8 @@ mod tests {
             ));
         }
         let config = CanonicalChunkerConfig::default();
-        let output = chunk_canonical_units(&sid, &units, &config);
+        let output = chunk_canonical_units(&sid, &units, &config)
+            .expect("canonical provenance must resolve");
 
         // Check that no child *or parent* spans both John and Romans. Parents
         // are retrieval units too, so accepting a cross-book parent would
@@ -478,7 +699,8 @@ mod tests {
             overlap_units: 2,
             max_units_per_child: 10,
         };
-        let output = chunk_canonical_units(&sid, &verses, &config);
+        let output = chunk_canonical_units(&sid, &verses, &config)
+            .expect("canonical provenance must resolve");
         let child_count = output
             .chunks
             .iter()
@@ -493,7 +715,8 @@ mod tests {
     #[test]
     fn empty_evidence_produces_empty_output() {
         let sid = SourceId("empty".into());
-        let output = chunk_canonical_units(&sid, &[], &CanonicalChunkerConfig::default());
+        let output = chunk_canonical_units(&sid, &[], &CanonicalChunkerConfig::default())
+            .expect("empty canonical evidence must resolve");
         assert!(output.chunks.is_empty());
         assert!(output.links.is_empty());
     }

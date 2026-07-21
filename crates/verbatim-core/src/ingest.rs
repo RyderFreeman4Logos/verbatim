@@ -2031,7 +2031,7 @@ where
                     source_id,
                     &searchable_evidence,
                     &crate::canonical_chunker::CanonicalChunkerConfig::default(),
-                )
+                )?
             } else {
                 chunk_evidence(source_id, &searchable_evidence, &chunker_config)
             }

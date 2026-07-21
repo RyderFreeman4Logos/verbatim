@@ -1,5 +1,6 @@
 use super::*;
 use crate::types::{EvidenceKind, MarkdownBlockKind, MarkdownHeadingLocator, SourceLocator};
+use proptest::prelude::*;
 use std::collections::HashMap;
 
 fn make_evidence(n: usize, heading: &str) -> Vec<EvidenceUnit> {
@@ -82,6 +83,67 @@ fn every_source_derived_non_whitespace_character_has_a_resolvable_span() {
             },
         );
 
+        assert_source_content_resolves_to_evidence_spans(&output, &evidence);
+    }
+}
+
+fn repeated_unicode_text() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop_oneof![
+            Just("你".to_string()),
+            Just("é".to_string()),
+            Just("🙂".to_string()),
+            Just("字".to_string()),
+        ],
+        1..8,
+    )
+    .prop_map(|characters| characters.concat())
+}
+
+fn unicode_whitespace() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(" ".to_string()),
+        Just("\t".to_string()),
+        Just("\u{2003}".to_string()),
+        Just("\u{2009}".to_string()),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn generic_provenance_property_preserves_utf8_repeated_text_across_boundaries(
+        repeated in repeated_unicode_text(),
+        leading in unicode_whitespace(),
+        trailing in unicode_whitespace(),
+        overlap_tokens in 0usize..4,
+        parent_children_count in 1usize..4,
+    ) {
+        let mut evidence = make_evidence(2, "First");
+        let mut second_group = make_evidence(2, "Second");
+        for (index, unit) in evidence.iter_mut().chain(second_group.iter_mut()).enumerate() {
+            unit.id = EvidenceId(format!("repeated-{index}"));
+            unit.text = format!("{leading}{repeated}{trailing}");
+            unit.text_hash = crate::types::hex_sha256(unit.text.as_bytes());
+            unit.locator = SourceLocator::Pdf {
+                page: index as u32 + 1,
+                paragraph: index as u32,
+                bbox: None,
+            };
+            unit.position = index as u32;
+        }
+        evidence.extend(second_group);
+
+        let output = chunk_evidence(
+            &SourceId("test".into()),
+            &evidence,
+            &ChunkerConfig {
+                child_target_tokens: 1,
+                child_overlap_tokens: overlap_tokens,
+                parent_children_count,
+            },
+        );
+
+        prop_assert!(output.chunks.iter().any(|chunk| chunk.chunk_type == ChunkType::Parent));
         assert_source_content_resolves_to_evidence_spans(&output, &evidence);
     }
 }

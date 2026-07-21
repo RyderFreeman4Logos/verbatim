@@ -1,3 +1,4 @@
+use anyhow::{anyhow, ensure, Result};
 use std::collections::{HashMap, HashSet};
 
 use crate::evidence_spans::{ChunkEvidenceSpan, EvidenceSpanTrust};
@@ -292,13 +293,13 @@ fn build_parent(
 }
 
 #[derive(Clone)]
-struct ChunkWithSpans {
-    chunk: Chunk,
-    spans: Vec<PendingEvidenceSpan>,
+pub(crate) struct ChunkWithSpans {
+    pub(crate) chunk: Chunk,
+    pub(crate) spans: Vec<PendingEvidenceSpan>,
 }
 
 #[derive(Clone)]
-struct PendingEvidenceSpan {
+pub(crate) struct PendingEvidenceSpan {
     evidence_id: EvidenceId,
     chunk_byte_start: u64,
     chunk_byte_end: u64,
@@ -337,13 +338,13 @@ impl PendingEvidenceSpan {
 }
 
 #[derive(Default)]
-struct TextWithSpans {
+pub(crate) struct TextWithSpans {
     text: String,
     spans: Vec<PendingEvidenceSpan>,
 }
 
 impl TextWithSpans {
-    fn append(&mut self, unit: &EvidenceUnit) {
+    pub(crate) fn append(&mut self, unit: &EvidenceUnit) {
         if !self.text.is_empty() {
             self.text.push(' ');
         }
@@ -354,6 +355,16 @@ impl TextWithSpans {
             start,
             self.text.len() as u64,
         ));
+    }
+
+    pub(crate) fn append_composed(&mut self, text: &str, spans: &[PendingEvidenceSpan]) {
+        if !self.text.is_empty() {
+            self.text.push(' ');
+        }
+        let offset = self.text.len() as u64;
+        self.text.push_str(text);
+        self.spans
+            .extend(spans.iter().cloned().map(|span| span.rebased(offset)));
     }
 
     fn retain_from(&mut self, overlap_start: usize) {
@@ -382,7 +393,7 @@ impl TextWithSpans {
         self.text = self.text[overlap_start as usize..].to_string();
     }
 
-    fn trimmed(&self) -> (String, Vec<PendingEvidenceSpan>) {
+    pub(crate) fn trimmed(&self) -> (String, Vec<PendingEvidenceSpan>) {
         trim_text_and_spans(&self.text, &self.spans)
     }
 }
@@ -459,6 +470,79 @@ fn persisted_spans(chunk: &Chunk, spans: &[PendingEvidenceSpan]) -> Vec<ChunkEvi
             trust: span.trust,
         })
         .collect()
+}
+
+pub(crate) fn persist_spans_checked(
+    chunk: &Chunk,
+    spans: &[PendingEvidenceSpan],
+    evidence: &[EvidenceUnit],
+) -> Result<Vec<ChunkEvidenceSpan>> {
+    let evidence_by_id = evidence
+        .iter()
+        .map(|unit| (&unit.id, unit))
+        .collect::<HashMap<_, _>>();
+
+    for span in spans {
+        let unit = evidence_by_id.get(&span.evidence_id).ok_or_else(|| {
+            anyhow!(
+                "chunk {} references missing evidence {}",
+                chunk.id.0,
+                span.evidence_id.0
+            )
+        })?;
+        let chunk_text = text_for_span(
+            &chunk.text,
+            span.chunk_byte_start,
+            span.chunk_byte_end,
+            "chunk",
+        )?;
+        let evidence_text = text_for_span(
+            &unit.text,
+            span.evidence_byte_start,
+            span.evidence_byte_end,
+            "evidence",
+        )?;
+        ensure!(
+            chunk_text == evidence_text,
+            "chunk {} provenance for evidence {} does not resolve to identical text",
+            chunk.id.0,
+            unit.id.0
+        );
+        ensure!(
+            span.evidence_text_hash == unit.text_hash,
+            "chunk {} provenance text hash mismatches evidence {}",
+            chunk.id.0,
+            unit.id.0
+        );
+        ensure!(
+            span.locator == unit.locator,
+            "chunk {} provenance locator mismatches evidence {}",
+            chunk.id.0,
+            unit.id.0
+        );
+        let expected_trust = if unit.derived_from.is_some() {
+            EvidenceSpanTrust::Derived
+        } else {
+            EvidenceSpanTrust::Direct
+        };
+        ensure!(
+            span.trust == expected_trust,
+            "chunk {} provenance trust mismatches evidence {}",
+            chunk.id.0,
+            unit.id.0
+        );
+    }
+
+    Ok(persisted_spans(chunk, spans))
+}
+
+fn text_for_span<'a>(text: &'a str, start: u64, end: u64, subject: &str) -> Result<&'a str> {
+    let start = usize::try_from(start)
+        .map_err(|_| anyhow!("{subject} provenance start does not fit usize"))?;
+    let end =
+        usize::try_from(end).map_err(|_| anyhow!("{subject} provenance end does not fit usize"))?;
+    text.get(start..end)
+        .ok_or_else(|| anyhow!("{subject} provenance range {start}..{end} is invalid"))
 }
 
 pub(crate) fn full_unit_evidence_spans(
