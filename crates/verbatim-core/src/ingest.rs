@@ -14,10 +14,8 @@ use sha2::{Digest, Sha256};
 use crate::api::{
     ChunkingProfileStatusResponse, EmbeddingCapabilityStatusResponse, IndexStatusResponse,
 };
-use crate::chunker::{
-    chunk_evidence, deterministic_chunk_hash, estimate_tokens, ChunkOutput, ChunkerConfig,
-    CHUNKER_VERSION,
-};
+use crate::caption_chunker::chunk_caption_evidence;
+use crate::chunker::{chunk_evidence, ChunkerConfig, CHUNKER_VERSION};
 use crate::collection::{
     discover_collection_members, CollectionSyncPathInput, CollectionSyncReport,
     CollectionSyncSettings, DEFAULT_COLLECTION_SYNC_MAX_DEPTH,
@@ -25,6 +23,7 @@ use crate::collection::{
 use crate::config::{Config, GraphExtractionConfig};
 use crate::context::ContextGenerator;
 use crate::embed::OpenAiEmbeddingClient;
+use crate::evidence_spans::ChunkEvidenceSpan;
 use crate::graph_extraction::GraphExtractor;
 use crate::image_limits::{
     ImageArtifactBudget, ImageArtifactLimitError, ImageArtifactLimitStage, ImageArtifactLimits,
@@ -724,6 +723,7 @@ struct PreparedSourceIngest {
     evidence: Vec<EvidenceUnit>,
     chunks: Vec<Chunk>,
     links: Vec<(ChunkId, EvidenceId)>,
+    evidence_spans: Vec<ChunkEvidenceSpan>,
     image_artifacts: PreparedImageArtifacts,
     graph_nodes: Vec<GraphNode>,
     graph_edges: Vec<GraphEdge>,
@@ -2054,6 +2054,7 @@ where
 
         let mut chunks = output.chunks;
         let mut links = output.links;
+        let mut evidence_spans = output.evidence_spans;
         if let Some(ctx_gen) = &self.context_gen {
             let phase = PhaseTiming::start(IngestTaskStage::ContextualRetrieval.as_str());
             let title = source
@@ -2085,6 +2086,7 @@ where
         let caption_output = chunk_caption_evidence(source_id, &caption_evidence);
         chunks.extend(caption_output.chunks);
         links.extend(caption_output.links);
+        evidence_spans.extend(caption_output.evidence_spans);
         evidence = searchable_evidence;
         evidence.extend(prepared_image_artifacts.evidence.clone());
         evidence.extend(caption_evidence);
@@ -2165,6 +2167,7 @@ where
             evidence,
             chunks,
             links,
+            evidence_spans,
             image_artifacts: prepared_image_artifacts,
             graph_nodes,
             graph_edges,
@@ -2300,6 +2303,7 @@ where
             evidence,
             chunks,
             links,
+            evidence_spans,
             image_artifacts,
             graph_nodes,
             graph_edges,
@@ -2397,6 +2401,7 @@ where
                     embedding_profile_id: profile_id,
                     vectors: &prepared.vectors,
                     links: &links,
+                    evidence_spans: &evidence_spans,
                     image_artifacts: &image_artifacts.artifacts,
                     graph_nodes: &graph_nodes,
                     graph_edges: &graph_edges,
@@ -2532,6 +2537,7 @@ where
             evidence,
             chunks,
             links,
+            evidence_spans,
             image_artifacts,
             graph_nodes,
             graph_edges,
@@ -2585,6 +2591,7 @@ where
                     embedding_profile_id: profile_id,
                     vectors: &vectors,
                     links: &links,
+                    evidence_spans: &evidence_spans,
                     image_artifacts: &image_artifacts.artifacts,
                     graph_nodes: &graph_nodes,
                     graph_edges: &graph_edges,
@@ -3076,6 +3083,7 @@ where
                 evidence,
                 chunks,
                 links,
+                evidence_spans,
                 image_artifacts,
                 graph_nodes,
                 graph_edges,
@@ -3100,6 +3108,7 @@ where
                 evidence,
                 chunks,
                 links,
+                evidence_spans,
                 image_artifacts,
                 graph_nodes,
                 graph_edges,
@@ -5280,38 +5289,6 @@ async fn push_reported_source_outcome<F, Fut>(
     outcomes.push(outcome);
 }
 
-fn chunk_caption_evidence(source_id: &SourceId, evidence: &[EvidenceUnit]) -> ChunkOutput {
-    let mut chunks = Vec::with_capacity(evidence.len());
-    let mut links = Vec::with_capacity(evidence.len());
-
-    for unit in evidence {
-        let evidence_hashes = vec![format!("evidence:{}:{}", unit.id.0, unit.text_hash)];
-        let chunk_hash = deterministic_chunk_hash(
-            ChunkType::Child,
-            &unit.text,
-            &unit.heading_path,
-            &evidence_hashes,
-        );
-        let chunk_id = ChunkId(format!("{}:chunk:{}", unit.id.0, &chunk_hash[..16]));
-        chunks.push(Chunk {
-            id: chunk_id.clone(),
-            source_id: source_id.clone(),
-            chunk_hash,
-            embedding_input_hash: None,
-            text: unit.text.clone(),
-            context_text: None,
-            token_count: estimate_tokens(&unit.text),
-            chunk_type: ChunkType::Child,
-            parent_chunk_id: None,
-            heading_path: unit.heading_path.clone(),
-            evidence_unit_ids: vec![unit.id.clone()],
-        });
-        links.push((chunk_id, unit.id.clone()));
-    }
-
-    ChunkOutput { chunks, links }
-}
-
 fn build_evidence_graph(
     source: &Source,
     evidence: &[EvidenceUnit],
@@ -6858,6 +6835,7 @@ mod tests {
             evidence: Vec::new(),
             chunks: Vec::new(),
             links: Vec::new(),
+            evidence_spans: Vec::new(),
             image_artifacts: PreparedImageArtifacts {
                 evidence: Vec::new(),
                 artifacts,

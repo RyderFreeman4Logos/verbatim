@@ -9,7 +9,10 @@
 
 use std::collections::HashMap;
 
-use crate::chunker::{deterministic_chunk_hash, estimate_tokens, unique_chunk_id, ChunkOutput};
+use crate::chunker::{
+    deterministic_chunk_hash, estimate_tokens, full_unit_evidence_spans, unique_chunk_id,
+    ChunkOutput,
+};
 use crate::types::{
     CanonicalLocator, Chunk, ChunkType, EvidenceId, EvidenceUnit, SourceId, SourceLocator,
 };
@@ -50,17 +53,19 @@ pub fn chunk_canonical_units(
         return ChunkOutput {
             chunks: Vec::new(),
             links: Vec::new(),
+            evidence_spans: Vec::new(),
         };
     }
 
     // Split into groups by hard boundary (book ordinal).
     let groups = split_by_hard_boundary(evidence);
 
-    let mut all_children = Vec::new();
+    let mut all_chunks = Vec::new();
     let mut all_links = Vec::new();
     let mut id_counts = HashMap::new();
 
     for group in &groups {
+        let mut group_children = Vec::new();
         // Further split by soft boundary (chapter) when chunks would be too large.
         let sub_groups = split_by_soft_boundary(group, config);
 
@@ -71,28 +76,31 @@ pub fn chunk_canonical_units(
                     all_links.push((child.id.clone(), eid.clone()));
                 }
             }
-            all_children.extend(children);
+            group_children.extend(children);
         }
-    }
 
-    // Build parents from consecutive child groups.
-    let mut all_chunks = Vec::new();
-    let parent_group_size = 5;
-    for children_batch in all_children.chunks(parent_group_size) {
-        let parent = build_canonical_parent(source_id, children_batch, &mut id_counts);
-        let parent_id = parent.id.clone();
-        for eid in &parent.evidence_unit_ids {
-            all_links.push((parent_id.clone(), eid.clone()));
-        }
-        all_chunks.push(parent.clone());
-        for child in children_batch {
-            let mut child_with_parent = child.clone();
-            child_with_parent.parent_chunk_id = Some(parent_id.clone());
-            all_chunks.push(child_with_parent);
+        // A parent is an organizational grouping, so hard document boundaries
+        // apply to it just as they do to children.  Building parents per group
+        // prevents the last child of one work and the first child of another
+        // from sharing a parent when the boundary falls on a five-child batch.
+        let parent_group_size = 5;
+        for children_batch in group_children.chunks(parent_group_size) {
+            let parent = build_canonical_parent(source_id, children_batch, &mut id_counts);
+            let parent_id = parent.id.clone();
+            for eid in &parent.evidence_unit_ids {
+                all_links.push((parent_id.clone(), eid.clone()));
+            }
+            all_chunks.push(parent.clone());
+            for child in children_batch {
+                let mut child_with_parent = child.clone();
+                child_with_parent.parent_chunk_id = Some(parent_id.clone());
+                all_chunks.push(child_with_parent);
+            }
         }
     }
 
     ChunkOutput {
+        evidence_spans: full_unit_evidence_spans(&all_chunks, evidence),
         chunks: all_chunks,
         links: all_links,
     }
@@ -422,11 +430,10 @@ mod tests {
         let config = CanonicalChunkerConfig::default();
         let output = chunk_canonical_units(&sid, &units, &config);
 
-        // Check that no chunk spans both John and Romans
+        // Check that no child *or parent* spans both John and Romans. Parents
+        // are retrieval units too, so accepting a cross-book parent would
+        // silently defeat the hard-boundary contract.
         for chunk in &output.chunks {
-            if chunk.chunk_type != ChunkType::Child {
-                continue;
-            }
             let evidence_ids = &chunk.evidence_unit_ids;
             let books: std::collections::HashSet<&str> = evidence_ids
                 .iter()

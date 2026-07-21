@@ -301,6 +301,7 @@ fn approximate_dir_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunker::CHUNKER_VERSION;
     use crate::store::{EmbeddingCacheEntry, EmbeddingProfileConfig, SourceContentsReplacement};
     use crate::traits::VectorDocument;
     use crate::types::{
@@ -326,7 +327,7 @@ mod tests {
             dtype: None,
             quantization: None,
             weight_identity: None,
-            chunker_version: "parent-child-v2",
+            chunker_version: CHUNKER_VERSION,
             child_target_tokens: 300,
             child_overlap_tokens: 80,
             parent_children_count: 5,
@@ -401,6 +402,7 @@ mod tests {
                 embedding_profile_id: profile_id,
                 vectors: std::slice::from_ref(&vector),
                 links: &[(chunk.id.clone(), EvidenceId("ev-1".to_string()))],
+                evidence_spans: &[],
                 image_artifacts: &[],
                 graph_nodes: &[],
                 graph_edges: &[],
