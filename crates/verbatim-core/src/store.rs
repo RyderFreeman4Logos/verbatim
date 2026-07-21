@@ -31,6 +31,8 @@ use crate::vision_caption::{CaptionAttempt, ImageCaption, ImageCaptionRecord, Im
 mod evidence_spans;
 #[path = "source_contents_replacement.rs"]
 mod source_contents_replacement;
+#[path = "store_deletion.rs"]
+mod store_deletion;
 pub use source_contents_replacement::{
     SourceContentsReplacement, SourceContentsReplacementReport, SourceLexicalIndexUpdate,
 };
@@ -525,6 +527,9 @@ impl Store {
     // --- Source ---
 
     pub fn add_source(&self, source: &Source) -> Result<()> {
+        if self.is_tombstoned(&source.id)? {
+            bail!("source id is tombstoned: {}", source.id.0);
+        }
         self.conn.execute(
             "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -572,14 +577,6 @@ impl Store {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
         }
-    }
-
-    pub fn remove_source(&self, id: &SourceId) -> Result<u64> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-        let generation = bump_all_profile_index_generations(&tx)?;
-        tx.commit()?;
-        Ok(generation)
     }
 
     // --- Collections ---
@@ -808,24 +805,6 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![collection_name], |row| row.get::<_, String>(0))?;
         rows.map(|row| row.map_err(Into::into)).collect()
-    }
-
-    pub fn remove_source_and_replace_vectors_for_profile(
-        &self,
-        profile_id: &EmbeddingProfileId,
-        id: &SourceId,
-        vectors: &[VectorDocument],
-    ) -> Result<u64> {
-        self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
-        (|| {
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-            replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
-            let generation = bump_all_profile_index_generations(&tx)?;
-            tx.commit()?;
-            Ok(generation)
-        })()
-        .map_err(|error| map_storage_error(SqliteWriteOperation::Ingest, error))
     }
 
     pub fn replace_source_contents(
@@ -4531,6 +4510,15 @@ CREATE TABLE IF NOT EXISTS sources (
     parser_used TEXT,
     last_ingested_at TEXT
 );
+CREATE TABLE IF NOT EXISTS source_tombstones (
+    source_id TEXT PRIMARY KEY,
+    deleted_at TEXT NOT NULL,
+    backup_expiry_at INTEGER,
+    legal_hold INTEGER NOT NULL DEFAULT 0,
+    qdrant_outcome TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE INDEX IF NOT EXISTS source_tombstones_qdrant_outcome_idx
+    ON source_tombstones(qdrant_outcome);
 CREATE TABLE IF NOT EXISTS collections (
     name TEXT PRIMARY KEY,
     ignore_patterns_json TEXT NOT NULL,

@@ -110,9 +110,14 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
 #[cfg(test)]
 type SourceCommitObserver = Box<dyn Fn(&Store, &SourceId) + Send + Sync>;
 
+#[path = "ingest_deletion.rs"]
+mod ingest_deletion;
 #[cfg(test)]
 #[path = "tests/issue_362_tests.rs"]
 mod issue_362_tests;
+#[cfg(test)]
+#[path = "tests/issue_363_tests.rs"]
+mod issue_363_tests;
 
 struct PreparedIndexes {
     hnsw: HnswIndex,
@@ -1502,50 +1507,6 @@ where
         )?;
         drop(sqlite_write_permit);
         Ok(report)
-    }
-
-    pub async fn remove_source(&mut self, source_id: &SourceId) -> Result<()> {
-        self.store
-            .get_source(source_id)?
-            .with_context(|| format!("source not found: {}", source_id.0))?;
-        let active_profile_id = self.active_profile_id.clone();
-        let remaining_vectors = self
-            .store
-            .list_vector_documents_for_profile(&active_profile_id)?
-            .into_iter()
-            .filter(|document| document.source_id != *source_id)
-            .collect::<Vec<_>>();
-        let prepared = self.prepare_indexes_from_vectors(remaining_vectors)?;
-        let index_publish_permit =
-            acquire_ingest_resource("index_publish", "index_publish").await?;
-        let staged = self.stage_prepared_index_artifacts_for_residency(&prepared)?;
-        drop(index_publish_permit);
-        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
-        let generation = match self.store.remove_source_and_replace_vectors_for_profile(
-            &active_profile_id,
-            source_id,
-            &prepared.vectors,
-        ) {
-            Ok(generation) => generation,
-            Err(err) => {
-                remove_staged_index_artifacts(&staged);
-                return Err(err);
-            }
-        };
-        drop(sqlite_write_permit);
-        let index_publish_permit =
-            acquire_ingest_resource("index_publish", "index_publish").await?;
-        self.publish_committed_indexes(&active_profile_id, generation, staged, prepared)?;
-        drop(index_publish_permit);
-        #[cfg(feature = "qdrant")]
-        self.sync_qdrant_delete_source(source_id).await;
-        remove_source_image_artifacts(&self.data_dir, source_id).with_context(|| {
-            format!(
-                "cleanup image artifacts after committed source removal: {}",
-                source_id.0
-            )
-        })?;
-        Ok(())
     }
 
     pub async fn remove_missing_sources_for_all_source_ingest(
@@ -4744,20 +4705,6 @@ where
     }
 
     #[cfg(feature = "qdrant")]
-    async fn sync_qdrant_delete_source(&self, source_id: &SourceId) {
-        let Some(qdrant) = &self.qdrant else {
-            return;
-        };
-        if let Err(err) = qdrant.delete_source(source_id).await {
-            tracing::warn!(
-                source = %source_id.0,
-                error = %err,
-                "qdrant source delete failed; local removal remains authoritative"
-            );
-        }
-    }
-
-    #[cfg(feature = "qdrant")]
     async fn sync_qdrant_all(&self) {
         self.sync_qdrant_profile_all(&self.active_profile_id).await;
     }
@@ -6453,6 +6400,8 @@ fn source_path_is_missing(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "qdrant")]
+    use crate::deletion::{DeletionOutcome, DeletionProduct};
     use anyhow::bail;
     use async_trait::async_trait;
     use futures::StreamExt;
@@ -10143,6 +10092,66 @@ model = "local-vision"
         let body: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
         assert_eq!(body["filter"]["must"][0]["key"], "source_id");
         assert_eq!(body["filter"]["must"][0]["match"]["value"], "src-1");
+    }
+
+    #[cfg(feature = "qdrant")]
+    #[tokio::test]
+    async fn reconcile_deletions_retries_pending_qdrant_erasure_after_unavailability() {
+        let (qdrant_url, handle) = spawn_qdrant_server(vec![
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                503,
+                r#"{"status":{"error":"temporarily unavailable"},"result":null}"#,
+            ),
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
+            ),
+        ]);
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-reconcile", tempdir.path().join("reconcile.txt"));
+        let chunk = insert_source_with_child(&store, &source, "chunk-reconcile").unwrap();
+        store_vectors_for_chunks(&store, &[chunk.clone()]);
+        let qdrant = QdrantClient::new(qdrant_test_config(qdrant_url));
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            hnsw_with_chunks(&[chunk]),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_qdrant_client(qdrant);
+
+        let initial = pipeline.remove_source(&source.id).await.unwrap();
+        assert!(pipeline.store().get_source(&source.id).unwrap().is_none());
+        assert_eq!(
+            initial.status_for(DeletionProduct::Qdrant),
+            Some(DeletionOutcome::Pending),
+        );
+
+        let reconciled = pipeline.reconcile_deletions().await.unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(
+            reconciled[0].status_for(DeletionProduct::Qdrant),
+            Some(DeletionOutcome::Erased),
+        );
+        assert!(pipeline
+            .store()
+            .pending_qdrant_deletion_source_ids()
+            .unwrap()
+            .is_empty());
+
+        let requests = handle.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[1].line,
+            "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        );
+        assert_eq!(
+            requests[3].line,
+            "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        );
     }
 
     #[cfg(feature = "qdrant")]
