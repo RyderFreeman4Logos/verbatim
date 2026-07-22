@@ -127,6 +127,17 @@ where
         let Some(qdrant) = &self.qdrant else {
             return DeletionOutcome::Pending;
         };
+        let _qdrant_permit = match acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(
+                    source = %source_id.0,
+                    error = %error,
+                    "qdrant source delete could not acquire the upsert exclusion boundary"
+                );
+                return DeletionOutcome::Pending;
+            }
+        };
         match qdrant.delete_source(source_id).await {
             Ok(()) => DeletionOutcome::Erased,
             Err(err) => {

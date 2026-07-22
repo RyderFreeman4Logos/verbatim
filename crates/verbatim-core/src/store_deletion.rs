@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS source_tombstones (
     backup_expiry_at INTEGER,
     legal_hold INTEGER NOT NULL DEFAULT 0,
     qdrant_outcome TEXT NOT NULL DEFAULT 'pending',
-    last_reconcile_attempt_ts INTEGER
+    last_reconcile_attempt_ts INTEGER,
+    last_reconcile_attempt_seq INTEGER
 );
 CREATE INDEX IF NOT EXISTS source_tombstones_qdrant_outcome_idx
     ON source_tombstones(qdrant_outcome);
@@ -144,8 +145,9 @@ impl Store {
     ) -> Result<Vec<SourceId>> {
         // Keep candidate selection on the tombstone table. The previously joined
         // `deletion_reports` history was O(history) before applying a batch limit.
-        // `last_reconcile_attempt_ts` lets the index order new work before retries
-        // while the LIMIT bounds one startup/reconcile round to its batch.
+        // `last_reconcile_attempt_seq` lets the index order new work before retries
+        // without relying on wall-clock timestamp precision, while the LIMIT bounds
+        // one startup/reconcile round to its batch.
         let sql = "
             SELECT source_id
             FROM source_tombstones
@@ -160,7 +162,7 @@ impl Store {
                     OR last_reconcile_attempt_ts IS NULL
                     OR last_reconcile_attempt_ts < backup_expiry_at
                   )
-            ORDER BY last_reconcile_attempt_ts, source_id
+            ORDER BY last_reconcile_attempt_seq, source_id
         ";
         let mut statement = match max_sources {
             Some(max_sources) => {
@@ -194,6 +196,32 @@ impl Store {
             .transpose()
     }
 
+    /// Requeue remote Qdrant erasure after a failed post-upsert compensation.
+    #[cfg(feature = "qdrant")]
+    pub(crate) fn requeue_qdrant_deletion(&self, source_id: &SourceId) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let last_reconcile_attempt_ts =
+            i64::try_from(current_unix_timestamp_secs()).unwrap_or(i64::MAX);
+        let last_reconcile_attempt_seq = next_reconcile_attempt_sequence(&transaction)?;
+        let changed = transaction.execute(
+            "UPDATE source_tombstones
+             SET qdrant_outcome = 'pending',
+                 last_reconcile_attempt_ts = ?2,
+                 last_reconcile_attempt_seq = ?3
+             WHERE source_id = ?1",
+            params![
+                &source_id.0,
+                last_reconcile_attempt_ts,
+                last_reconcile_attempt_seq,
+            ],
+        )?;
+        if changed == 0 {
+            bail!("source tombstone not found: {}", source_id.0);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Persist a Qdrant deletion outcome and an audit receipt from the current tombstone policy.
     pub(crate) fn finalize_deletion_outcome_tx(
         &self,
@@ -209,14 +237,18 @@ impl Store {
         );
         let last_reconcile_attempt_ts =
             i64::try_from(current_unix_timestamp_secs()).unwrap_or(i64::MAX);
+        let last_reconcile_attempt_seq = next_reconcile_attempt_sequence(transaction)?;
         let changed = transaction.execute(
             "UPDATE source_tombstones
-             SET qdrant_outcome = ?2, last_reconcile_attempt_ts = ?3
+             SET qdrant_outcome = ?2,
+                 last_reconcile_attempt_ts = ?3,
+                 last_reconcile_attempt_seq = ?4
              WHERE source_id = ?1",
             params![
                 &source_id.0,
                 qdrant_outcome_to_str(outcome),
                 last_reconcile_attempt_ts,
+                last_reconcile_attempt_seq,
             ],
         )?;
         if changed == 0 {
@@ -515,6 +547,17 @@ fn current_unix_timestamp_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+fn next_reconcile_attempt_sequence(transaction: &Transaction<'_>) -> Result<i64> {
+    let latest = transaction.query_row(
+        "SELECT COALESCE(MAX(last_reconcile_attempt_seq), 0) FROM source_tombstones",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    latest
+        .checked_add(1)
+        .context("reconcile attempt sequence exhausted")
 }
 
 fn record_source_tombstone(

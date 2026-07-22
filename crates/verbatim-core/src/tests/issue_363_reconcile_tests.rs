@@ -146,7 +146,7 @@ fn bounded_reconcile_query_avoids_large_deletion_report_history() {
                      OR last_reconcile_attempt_ts IS NULL
                      OR last_reconcile_attempt_ts < backup_expiry_at
                    )
-             ORDER BY last_reconcile_attempt_ts, source_id
+             ORDER BY last_reconcile_attempt_seq, source_id
              LIMIT 3",
         )
         .unwrap();
@@ -161,7 +161,7 @@ fn bounded_reconcile_query_avoids_large_deletion_report_history() {
 }
 
 #[tokio::test]
-async fn bounded_reconcile_round_robins_pending_tombstones_across_successive_batches() {
+async fn bounded_reconcile_round_robins_pending_tombstones_through_same_timestamp_ties() {
     const BATCH_SIZE: usize = 2;
 
     let tempdir = tempfile::tempdir().unwrap();
@@ -188,37 +188,91 @@ async fn bounded_reconcile_round_robins_pending_tombstones_across_successive_bat
         tempdir.path().to_path_buf(),
     );
 
-    assert_eq!(
-        pipeline
-            .reconcile_deletions_up_to(BATCH_SIZE)
-            .await
-            .unwrap()
-            .len(),
-        BATCH_SIZE,
-    );
-    let first_batch_source_ids = pipeline
-        .store()
-        .list_deletion_reports()
-        .unwrap()
-        .into_iter()
-        .map(|report| report.source_id)
-        .collect::<Vec<_>>();
-    assert_eq!(first_batch_source_ids, source_ids[..BATCH_SIZE]);
+    let expected_batches = [
+        &source_ids[..BATCH_SIZE],
+        &source_ids[BATCH_SIZE..],
+        &source_ids[..BATCH_SIZE],
+        &source_ids[BATCH_SIZE..],
+    ];
+    let mut report_count = 0;
+    for expected_source_ids in expected_batches {
+        assert_eq!(
+            pipeline
+                .reconcile_deletions_up_to(BATCH_SIZE)
+                .await
+                .unwrap()
+                .len(),
+            BATCH_SIZE,
+        );
+        let reports = pipeline.store().list_deletion_reports().unwrap();
+        assert_eq!(
+            reports[report_count..]
+                .iter()
+                .map(|report| report.source_id.clone())
+                .collect::<Vec<_>>(),
+            expected_source_ids,
+        );
+        report_count = reports.len();
+        for source_id in expected_source_ids {
+            pipeline
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE source_tombstones
+                     SET last_reconcile_attempt_ts = 1
+                     WHERE source_id = ?1",
+                    [&source_id.0],
+                )
+                .unwrap();
+        }
+    }
+}
 
+#[cfg(feature = "qdrant")]
+#[tokio::test]
+async fn interrupted_qdrant_compensation_requeues_tombstone_for_reconciliation() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = Store::in_memory().unwrap();
+    let source = Source {
+        id: SourceId("interrupted-qdrant-compensation".into()),
+        path: tempdir.path().join("interrupted-qdrant-compensation.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    store.add_source(&source).unwrap();
+    store.remove_source(&source.id).unwrap();
+    let mut report = DeletionReport::new();
+    let mut transaction = store.connection().unchecked_transaction().unwrap();
+    store
+        .finalize_deletion_outcome_tx(
+            &mut transaction,
+            &source.id,
+            DeletionOutcome::Erased,
+            &mut report,
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+
+    // Simulate process exit after an upsert reached Qdrant but before its
+    // compensating delete could finish. The stale terminal outcome must be
+    // durable-pending so a later process picks the tombstone up.
+    store.requeue_qdrant_deletion(&source.id).unwrap();
+    let pipeline = IngestPipeline::from_parts(
+        store,
+        HnswIndex::new(),
+        ReconcileEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    );
+
+    let reports = pipeline.reconcile_deletions_up_to(1).await.unwrap();
+    assert_eq!(reports.len(), 1);
     assert_eq!(
         pipeline
-            .reconcile_deletions_up_to(BATCH_SIZE)
-            .await
-            .unwrap()
-            .len(),
-        BATCH_SIZE,
+            .store()
+            .qdrant_deletion_outcome(&source.id)
+            .unwrap(),
+        Some(DeletionOutcome::Pending)
     );
-    let all_batch_source_ids = pipeline
-        .store()
-        .list_deletion_reports()
-        .unwrap()
-        .into_iter()
-        .map(|report| report.source_id)
-        .collect::<Vec<_>>();
-    assert_eq!(all_batch_source_ids, source_ids);
 }

@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "qdrant")]
+use crate::deletion::{DeletionOutcome, DeletionReport};
 use crate::types::{Source, SourceStatus};
 use crate::vision_caption::{CaptionAttempt, VISION_CAPTION_PROMPT_VERSION};
 #[cfg(feature = "qdrant")]
@@ -10,7 +12,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "qdrant")]
-use std::{sync::mpsc, thread};
+use std::{sync::mpsc, thread, time::Duration};
 
 #[cfg(feature = "qdrant")]
 struct StaticEmbeddingClient;
@@ -142,27 +144,49 @@ fn qdrant_test_config(url: String) -> QdrantConfig {
 }
 
 #[cfg(feature = "qdrant")]
-fn spawn_pausing_qdrant_upsert_server() -> (
+fn spawn_pausing_qdrant_upsert_server(
+    request_count: usize,
+    failed_request_index: Option<usize>,
+) -> (
     String,
     tokio::sync::oneshot::Receiver<()>,
+    mpsc::Sender<()>,
     mpsc::Sender<()>,
     thread::JoinHandle<Vec<TestHttpRequest>>,
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let (upsert_started_tx, upsert_started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = mpsc::channel();
     let handle = thread::spawn(move || {
         let mut upsert_started_tx = Some(upsert_started_tx);
         let mut requests = Vec::new();
-        for request_index in 0..6 {
-            let (mut stream, _) = listener.accept().unwrap();
-            requests.push(read_http_request(&mut stream));
-            if request_index == 3 {
-                upsert_started_tx.take().unwrap().send(()).unwrap();
-                release_rx.recv().unwrap();
+        while requests.len() < request_count {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request_index = requests.len();
+                    requests.push(read_http_request(&mut stream));
+                    if request_index == 3 {
+                        upsert_started_tx.take().unwrap().send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    let status = if failed_request_index == Some(request_index) {
+                        500
+                    } else {
+                        200
+                    };
+                    write_http_response(&mut stream, status, r#"{"status":"ok","result":{}}"#);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                Err(error) => panic!("accept qdrant test request: {error}"),
             }
-            write_http_response(&mut stream, r#"{"status":"ok","result":{}}"#);
         }
         requests
     });
@@ -170,6 +194,7 @@ fn spawn_pausing_qdrant_upsert_server() -> (
         format!("http://{address}"),
         upsert_started_rx,
         release_tx,
+        stop_tx,
         handle,
     )
 }
@@ -215,10 +240,10 @@ fn http_request_complete(buffer: &[u8]) -> bool {
 }
 
 #[cfg(feature = "qdrant")]
-fn write_http_response(stream: &mut TcpStream, body: &str) {
+fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     )
@@ -242,7 +267,8 @@ async fn tombstone_fence_compensates_qdrant_upsert_racing_source_deletion() {
     let source_id = pipeline.add_source(&source_path).unwrap();
     pipeline.ingest_source(&source_id).await.unwrap();
 
-    let (qdrant_url, upsert_started, release, server) = spawn_pausing_qdrant_upsert_server();
+    let (qdrant_url, upsert_started, release, _stop, server) =
+        spawn_pausing_qdrant_upsert_server(6, None);
     pipeline = pipeline.with_qdrant_client(QdrantClient::new(qdrant_test_config(qdrant_url)));
     let mut sync = Box::pin(pipeline.sync_qdrant_source(&source_id));
     tokio::select! {
@@ -271,5 +297,183 @@ async fn tombstone_fence_compensates_qdrant_upsert_racing_source_deletion() {
     assert_eq!(
         delete_body["filter"]["must"][1]["match"]["value"],
         source_id.0
+    );
+}
+
+#[cfg(feature = "qdrant")]
+fn finalize_qdrant_outcome(store: &Store, source_id: &SourceId, outcome: DeletionOutcome) {
+    let mut report = DeletionReport::new();
+    let mut transaction = store.connection().unchecked_transaction().unwrap();
+    store
+        .finalize_deletion_outcome_tx(&mut transaction, source_id, outcome, &mut report)
+        .unwrap();
+    transaction.commit().unwrap();
+}
+
+#[cfg(feature = "qdrant")]
+#[tokio::test]
+async fn tombstone_fence_marks_failed_qdrant_compensation_pending() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let database_path = tempdir.path().join("verbatim.db");
+    let source_path = tempdir.path().join("failed-qdrant-compensation.md");
+    fs::write(&source_path, "in-flight qdrant source body").unwrap();
+    let mut pipeline = IngestPipeline::from_parts(
+        Store::new(&database_path).unwrap(),
+        HnswIndex::new(),
+        StaticEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    );
+    let source_id = pipeline.add_source(&source_path).unwrap();
+    pipeline.ingest_source(&source_id).await.unwrap();
+
+    let (qdrant_url, upsert_started, release, _stop, server) =
+        spawn_pausing_qdrant_upsert_server(6, Some(5));
+    pipeline = pipeline.with_qdrant_client(QdrantClient::new(qdrant_test_config(qdrant_url)));
+    let mut sync = Box::pin(pipeline.sync_qdrant_source(&source_id));
+    tokio::select! {
+        _ = &mut sync => panic!("qdrant sync completed before the upsert pause"),
+        result = upsert_started => result.unwrap(),
+    }
+
+    let store = Store::new(&database_path).unwrap();
+    store.remove_source(&source_id).unwrap();
+    finalize_qdrant_outcome(&store, &source_id, DeletionOutcome::Erased);
+    release.send(()).unwrap();
+    sync.await;
+
+    let requests = server.join().unwrap();
+    assert_eq!(
+        requests[5].line,
+        "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+    );
+    assert_eq!(
+        store.qdrant_deletion_outcome(&source_id).unwrap(),
+        Some(DeletionOutcome::Pending)
+    );
+}
+
+#[cfg(feature = "qdrant")]
+#[tokio::test]
+async fn tombstone_fence_process_exit_after_qdrant_upsert_reconciles_pending_tombstone() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let database_path = tempdir.path().join("verbatim.db");
+    let source_path = tempdir.path().join("interrupted-qdrant-upsert.md");
+    fs::write(&source_path, "in-flight qdrant source body").unwrap();
+    let mut pipeline = IngestPipeline::from_parts(
+        Store::new(&database_path).unwrap(),
+        HnswIndex::new(),
+        StaticEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    );
+    let source_id = pipeline.add_source(&source_path).unwrap();
+    pipeline.ingest_source(&source_id).await.unwrap();
+
+    // The server confirms the remote upsert response has been written; dropping
+    // the future before polling it again models process exit before compensation.
+    let (qdrant_url, upsert_started, release, _stop, server) =
+        spawn_pausing_qdrant_upsert_server(4, None);
+    pipeline = pipeline.with_qdrant_client(QdrantClient::new(qdrant_test_config(qdrant_url)));
+    let mut sync = Box::pin(pipeline.sync_qdrant_source(&source_id));
+    tokio::select! {
+        _ = &mut sync => panic!("qdrant sync completed before the upsert pause"),
+        result = upsert_started => result.unwrap(),
+    }
+    let store = Store::new(&database_path).unwrap();
+    store.remove_source(&source_id).unwrap();
+    release.send(()).unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(
+        requests[3].line,
+        "PUT /collections/verbatim/points?wait=true HTTP/1.1"
+    );
+    drop(sync);
+    assert_eq!(
+        store.qdrant_deletion_outcome(&source_id).unwrap(),
+        Some(DeletionOutcome::Pending)
+    );
+
+    let (reconcile_url, _upsert_started, _release, _stop, reconcile_server) =
+        spawn_pausing_qdrant_upsert_server(2, None);
+    let reconcile_pipeline = IngestPipeline::from_parts(
+        Store::new(&database_path).unwrap(),
+        HnswIndex::new(),
+        StaticEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    )
+    .with_qdrant_client(QdrantClient::new(qdrant_test_config(reconcile_url)));
+    assert_eq!(
+        reconcile_pipeline
+            .reconcile_deletions_up_to(1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    reconcile_server.join().unwrap();
+    assert_eq!(
+        store.qdrant_deletion_outcome(&source_id).unwrap(),
+        Some(DeletionOutcome::Erased)
+    );
+}
+
+#[cfg(feature = "qdrant")]
+#[tokio::test]
+async fn tombstone_fence_continues_full_profile_compensation_after_a_failure() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let database_path = tempdir.path().join("verbatim.db");
+    let mut pipeline = IngestPipeline::from_parts(
+        Store::new(&database_path).unwrap(),
+        HnswIndex::new(),
+        StaticEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    );
+    let source_ids = ["first", "second"]
+        .into_iter()
+        .map(|name| {
+            let source_path = tempdir.path().join(format!("{name}.md"));
+            fs::write(&source_path, format!("qdrant source {name}")).unwrap();
+            let source_id = pipeline.add_source(&source_path).unwrap();
+            source_id
+        })
+        .collect::<Vec<_>>();
+    for source_id in &source_ids {
+        pipeline.ingest_source(source_id).await.unwrap();
+    }
+
+    let (qdrant_url, upsert_started, release, stop, server) =
+        spawn_pausing_qdrant_upsert_server(8, Some(5));
+    pipeline = pipeline.with_qdrant_client(QdrantClient::new(qdrant_test_config(qdrant_url)));
+    let mut sync =
+        Box::pin(pipeline.sync_qdrant_profile_all(pipeline.active_embedding_profile_id()));
+    tokio::select! {
+        _ = &mut sync => panic!("qdrant full sync completed before the upsert pause"),
+        result = upsert_started => result.unwrap(),
+    }
+
+    let store = Store::new(&database_path).unwrap();
+    for source_id in &source_ids {
+        store.remove_source(source_id).unwrap();
+        finalize_qdrant_outcome(&store, source_id, DeletionOutcome::Erased);
+    }
+    release.send(()).unwrap();
+    sync.await;
+    let _ = stop.send(());
+
+    let requests = server.join().unwrap();
+    let compensating_delete_count = requests
+        .iter()
+        .filter(|request| {
+            request.line == "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        })
+        .count();
+    assert_eq!(compensating_delete_count, 3);
+    assert_eq!(
+        source_ids
+            .iter()
+            .filter(|source_id| {
+                store.qdrant_deletion_outcome(source_id).unwrap() == Some(DeletionOutcome::Pending)
+            })
+            .count(),
+        1
     );
 }

@@ -30,7 +30,7 @@ use crate::image_limits::{
 };
 use crate::index::hnsw::HnswIndex;
 #[cfg(feature = "qdrant")]
-use crate::index::qdrant::{records_from_store_for_profile, QdrantClient};
+use crate::index::qdrant::QdrantClient;
 use crate::index::sqlite_fts::{FtsMaintenanceOutcome, SqliteFtsIndex};
 use crate::index_gc::{apply_index_gc, IndexGcPolicy};
 use crate::index_profile_delete::{
@@ -112,6 +112,8 @@ type SourceCommitObserver = Box<dyn Fn(&Store, &SourceId) + Send + Sync>;
 
 #[path = "ingest_deletion.rs"]
 mod ingest_deletion;
+#[path = "ingest_qdrant_sync.rs"]
+mod ingest_qdrant_sync;
 #[cfg(test)]
 #[path = "tests/issue_362_tests.rs"]
 mod issue_362_tests;
@@ -4623,114 +4625,6 @@ where
     fn invalidate_live_indexes(&mut self) -> Result<()> {
         self.hnsw = HnswIndex::new();
         Ok(())
-    }
-
-    #[cfg(feature = "qdrant")]
-    async fn sync_qdrant_source(&self, source_id: &SourceId) {
-        self.sync_qdrant_profile_source(&self.active_profile_id, source_id)
-            .await;
-    }
-
-    #[cfg(feature = "qdrant")]
-    pub async fn sync_pending_qdrant_profile_resets(&mut self) {
-        let profiles = std::mem::take(&mut self.pending_qdrant_profile_syncs);
-        for profile_id in profiles {
-            self.sync_qdrant_profile_all(&profile_id).await;
-        }
-    }
-
-    #[cfg(not(feature = "qdrant"))]
-    pub async fn sync_pending_qdrant_profile_resets(&mut self) {}
-
-    #[cfg(feature = "qdrant")]
-    async fn sync_qdrant_profile_source(
-        &self,
-        profile_id: &EmbeddingProfileId,
-        source_id: &SourceId,
-    ) {
-        let Some(qdrant) = &self.qdrant else {
-            return;
-        };
-        let result: Result<()> = async {
-            let records = records_from_store_for_profile(&self.store, profile_id, Some(source_id))?;
-            qdrant
-                .delete_source_for_profile(profile_id, source_id)
-                .await?;
-            // A deletion can commit after loading the authoritative records but
-            // before this remote upsert. Avoid the unnecessary write when it is
-            // already visible, then compensate again after the await below for a
-            // tombstone that races the upsert itself.
-            if self.store.is_tombstoned(source_id)? {
-                return Ok(());
-            }
-            let qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
-            qdrant.upsert_records(&records).await?;
-            drop(qdrant_permit);
-            if self.store.is_tombstoned(source_id)? {
-                qdrant
-                    .delete_source_for_profile(profile_id, source_id)
-                    .await?;
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(err) = result {
-            tracing::warn!(
-                embedding_profile_id = %profile_id,
-                source = %source_id.0,
-                error = %err,
-                "qdrant source sync failed; local ingest remains authoritative"
-            );
-        }
-    }
-
-    #[cfg(feature = "qdrant")]
-    async fn sync_qdrant_all(&self) {
-        self.sync_qdrant_profile_all(&self.active_profile_id).await;
-    }
-
-    #[cfg(feature = "qdrant")]
-    async fn sync_qdrant_profile_all(&self, profile_id: &EmbeddingProfileId) {
-        let Some(qdrant) = &self.qdrant else {
-            return;
-        };
-        let result: Result<()> = async {
-            let mut records = records_from_store_for_profile(&self.store, profile_id, None)?;
-            let source_ids = records
-                .iter()
-                .map(|record| record.document.source_id.clone())
-                .collect::<HashSet<_>>();
-            let mut tombstoned_source_ids = HashSet::new();
-            for source_id in &source_ids {
-                if self.store.is_tombstoned(source_id)? {
-                    tombstoned_source_ids.insert(source_id.clone());
-                }
-            }
-            records.retain(|record| !tombstoned_source_ids.contains(&record.document.source_id));
-            qdrant.delete_profile(profile_id).await?;
-            let qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
-            qdrant.upsert_records(&records).await?;
-            drop(qdrant_permit);
-            // The initial tombstone filter closes the stale-read window before the
-            // upsert. Re-check after the await and delete any points written while
-            // a source removal raced this full-profile synchronization.
-            for source_id in source_ids {
-                if self.store.is_tombstoned(&source_id)? {
-                    qdrant
-                        .delete_source_for_profile(profile_id, &source_id)
-                        .await?;
-                }
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(err) = result {
-            tracing::warn!(
-                embedding_profile_id = %profile_id,
-                error = %err,
-                "qdrant full sync failed; local indexes remain authoritative"
-            );
-        }
     }
 
     fn embedding_text(&self, chunk: &Chunk) -> String {
