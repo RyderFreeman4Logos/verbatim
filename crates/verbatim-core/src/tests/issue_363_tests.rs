@@ -68,16 +68,16 @@ async fn source_erasure_removes_local_derivatives_tombstones_and_blocks_reingest
     ] {
         assert_eq!(report.status_for(product), Some(DeletionOutcome::Erased));
     }
-    for product in [
-        DeletionProduct::Hnsw,
-        DeletionProduct::Caches,
-        DeletionProduct::Backups,
-    ] {
+    for product in [DeletionProduct::Hnsw, DeletionProduct::Caches] {
         assert_eq!(report.status_for(product), Some(DeletionOutcome::Pending));
     }
     assert_eq!(
+        report.status_for(DeletionProduct::Backups),
+        Some(DeletionOutcome::Erased),
+    );
+    assert_eq!(
         report.status_for(DeletionProduct::Qdrant),
-        Some(DeletionOutcome::NotFound),
+        Some(DeletionOutcome::Pending),
     );
     assert!(pipeline.hnsw().search(&[1.0, 0.0], 1).is_empty());
     assert!(pipeline.store().is_tombstoned(&source_id).unwrap());
@@ -119,7 +119,7 @@ fn persisted_tombstone_retention_keeps_backups_pending_until_cleaned_or_held() {
     );
     assert_eq!(
         store.backup_deletion_outcome_at(&source.id, 20).unwrap(),
-        DeletionOutcome::Pending,
+        DeletionOutcome::Erased,
     );
     assert_eq!(
         store.pending_qdrant_deletion_source_ids().unwrap(),
@@ -134,7 +134,7 @@ fn persisted_tombstone_retention_keeps_backups_pending_until_cleaned_or_held() {
     store.release_legal_hold(&source.id).unwrap();
     assert_eq!(
         store.backup_deletion_outcome_at(&source.id, 20).unwrap(),
-        DeletionOutcome::Pending,
+        DeletionOutcome::Erased,
     );
 
     let report = crate::deletion::DeletionReport::new();
@@ -229,6 +229,51 @@ fn finalizing_deletion_outcome_persists_report_after_deletion() {
         .pending_qdrant_deletion_source_ids()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn failed_deletion_report_insert_rolls_back_qdrant_outcome() {
+    let store = Store::in_memory().unwrap();
+    let source = Source {
+        id: SourceId("failed-deletion-report".into()),
+        path: std::path::PathBuf::from("failed-deletion-report.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    store.add_source(&source).unwrap();
+    store.remove_source(&source.id).unwrap();
+    store
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_deletion_report_insert
+             BEFORE INSERT ON deletion_reports
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced report insert failure');
+             END;",
+        )
+        .unwrap();
+    let report = crate::deletion::DeletionReport::new();
+    let mut transaction = store.connection().unchecked_transaction().unwrap();
+
+    let error = store
+        .finalize_deletion_outcome_tx(
+            &mut transaction,
+            &source.id,
+            DeletionOutcome::Erased,
+            RetentionPolicy::Immediate,
+            &report,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("forced report insert failure"));
+    drop(transaction);
+
+    assert_eq!(
+        store.pending_qdrant_deletion_source_ids().unwrap(),
+        vec![source.id],
+    );
+    assert!(store.list_deletion_reports().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -328,7 +373,7 @@ async fn restart_reconciles_pending_deletion_and_persists_the_retry_report() {
     assert_eq!(reports.len(), 1);
     assert_eq!(
         reports[0].status_for(DeletionProduct::Qdrant),
-        Some(DeletionOutcome::NotFound),
+        Some(DeletionOutcome::Pending),
     );
     let persisted_reports = pipeline.store().list_deletion_reports().unwrap();
     assert_eq!(persisted_reports.len(), 1);

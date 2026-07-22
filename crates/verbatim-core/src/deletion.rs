@@ -106,9 +106,11 @@ impl RetentionPolicy {
         Self::UntilBackupExpiry(timestamp)
     }
 
-    pub const fn backup_outcome_at(self, _now: u64) -> DeletionOutcome {
+    pub const fn backup_outcome_at(self, now: u64) -> DeletionOutcome {
         match self {
-            Self::Immediate | Self::UntilBackupExpiry(_) => DeletionOutcome::Pending,
+            Self::Immediate => DeletionOutcome::Erased,
+            Self::UntilBackupExpiry(expiry) if now >= expiry => DeletionOutcome::Erased,
+            Self::UntilBackupExpiry(_) => DeletionOutcome::Pending,
             Self::LegalHold => DeletionOutcome::Held,
         }
     }
@@ -284,10 +286,10 @@ mod tests {
             Some(DeletionOutcome::Held),
         );
         lifecycle.release_legal_hold(source_id).unwrap();
-        let still_pending = lifecycle.reconcile(source_id, 20).unwrap();
+        let erased = lifecycle.reconcile(source_id, 20).unwrap();
         assert_eq!(
-            still_pending.status_for(DeletionProduct::Backups),
-            Some(DeletionOutcome::Pending),
+            erased.status_for(DeletionProduct::Backups),
+            Some(DeletionOutcome::Erased),
         );
         assert!(!lifecycle.can_restore(source_id));
     }

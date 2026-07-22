@@ -38,7 +38,7 @@ where
         #[cfg(feature = "qdrant")]
         let qdrant_outcome = self.sync_qdrant_delete_source(source_id).await;
         #[cfg(not(feature = "qdrant"))]
-        let qdrant_outcome = DeletionOutcome::NotFound;
+        let qdrant_outcome = DeletionOutcome::Pending;
         let mut report = self.local_deletion_report(source_id, images)?;
         report.set(DeletionProduct::Qdrant, qdrant_outcome);
         let mut transaction = self.store.connection().unchecked_transaction()?;
@@ -72,7 +72,7 @@ where
             #[cfg(feature = "qdrant")]
             let qdrant_outcome = self.sync_qdrant_delete_source(&source_id).await;
             #[cfg(not(feature = "qdrant"))]
-            let qdrant_outcome = DeletionOutcome::NotFound;
+            let qdrant_outcome = DeletionOutcome::Pending;
             let mut report = match self.store.latest_deletion_report(&source_id)? {
                 Some(previous) => previous.report,
                 None => self.local_deletion_report(&source_id, DeletionOutcome::Pending)?,
@@ -100,7 +100,7 @@ where
     #[cfg(feature = "qdrant")]
     async fn sync_qdrant_delete_source(&self, source_id: &SourceId) -> DeletionOutcome {
         let Some(qdrant) = &self.qdrant else {
-            return DeletionOutcome::NotFound;
+            return DeletionOutcome::Pending;
         };
         match qdrant.delete_source(source_id).await {
             Ok(()) => DeletionOutcome::Erased,
