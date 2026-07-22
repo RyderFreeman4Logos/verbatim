@@ -116,6 +116,9 @@ mod ingest_deletion;
 #[path = "tests/issue_362_tests.rs"]
 mod issue_362_tests;
 #[cfg(test)]
+#[path = "tests/issue_363_reconcile_tests.rs"]
+mod issue_363_reconcile_tests;
+#[cfg(test)]
 #[path = "tests/issue_363_tests.rs"]
 mod issue_363_tests;
 

@@ -141,34 +141,26 @@ impl Store {
         &self,
         max_sources: Option<usize>,
     ) -> Result<Vec<SourceId>> {
-        let tombstones = {
-            match max_sources {
-                Some(max_sources) => {
-                    let max_sources = i64::try_from(max_sources).unwrap_or(i64::MAX);
-                    let mut statement = self.conn.prepare(
-                        "SELECT source_id, qdrant_outcome FROM source_tombstones
-                         ORDER BY source_id LIMIT ?1",
-                    )?;
-                    let rows = statement.query_map(params![max_sources], |row| {
-                        Ok((SourceId(row.get(0)?), row.get::<_, String>(1)?))
-                    })?;
-                    rows.collect::<rusqlite::Result<Vec<_>>>()?
-                }
-                None => {
-                    let mut statement = self.conn.prepare(
-                        "SELECT source_id, qdrant_outcome FROM source_tombstones ORDER BY source_id",
-                    )?;
-                    let rows = statement.query_map([], |row| {
-                        Ok((SourceId(row.get(0)?), row.get::<_, String>(1)?))
-                    })?;
-                    rows.collect::<rusqlite::Result<Vec<_>>>()?
-                }
-            }
-        };
+        let mut statement = self.conn.prepare(
+            "SELECT tombstone.source_id, tombstone.qdrant_outcome,
+                    (SELECT report.id FROM deletion_reports AS report
+                     WHERE report.source_id = tombstone.source_id
+                     ORDER BY report.id DESC LIMIT 1) AS last_attempt_id
+             FROM source_tombstones AS tombstone",
+        )?;
+        let tombstones = statement
+            .query_map([], |row| {
+                Ok((
+                    SourceId(row.get(0)?),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        tombstones
+        let mut eligible = tombstones
             .into_iter()
-            .filter_map(|(source_id, qdrant_outcome)| {
+            .filter_map(|(source_id, qdrant_outcome, last_attempt_id)| {
                 let has_nonterminal_backups = match self.latest_deletion_report(&source_id) {
                     Ok(Some(report)) => matches!(
                         report.report.status_for(DeletionProduct::Backups),
@@ -178,12 +170,24 @@ impl Store {
                     Err(error) => return Some(Err(error)),
                 };
                 if qdrant_outcome == "pending" || has_nonterminal_backups {
-                    Some(Ok(source_id))
+                    Some(Ok((source_id, last_attempt_id)))
                 } else {
                     None
                 }
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        // A report is the durable receipt of the most recent reconciliation attempt.
+        // Prefer untouched tombstones, then rotate retries by their oldest receipt.
+        eligible.sort_by(|left, right| {
+            (left.1.is_some(), left.1, &left.0 .0).cmp(&(right.1.is_some(), right.1, &right.0 .0))
+        });
+        if let Some(max_sources) = max_sources {
+            eligible.truncate(max_sources);
+        }
+        Ok(eligible
+            .into_iter()
+            .map(|(source_id, _)| source_id)
+            .collect())
     }
 
     /// Return the durable Qdrant outcome for a tombstoned source.
