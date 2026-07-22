@@ -1,5 +1,5 @@
 use super::*;
-use crate::deletion::{DeletionOutcome, DeletionProduct, RetentionPolicy};
+use crate::deletion::{DeletionOutcome, DeletionProduct, DeletionReport, RetentionPolicy};
 use crate::types::{Source, SourceStatus};
 use async_trait::async_trait;
 use std::sync::{Arc, Barrier};
@@ -379,4 +379,129 @@ async fn restart_reconciles_pending_deletion_and_persists_the_retry_report() {
     assert_eq!(persisted_reports.len(), 1);
     assert_eq!(persisted_reports[0].source_id, source.id);
     assert_eq!(persisted_reports[0].report, reports[0]);
+}
+
+#[tokio::test]
+async fn reconcile_refreshes_expired_backups_after_qdrant_is_terminal() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = Store::in_memory().unwrap();
+    let source = Source {
+        id: SourceId("terminal-qdrant-expired-backups".into()),
+        path: tempdir.path().join("expired-backups.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    store.add_source(&source).unwrap();
+    let retention_policy = RetentionPolicy::UntilBackupExpiry(0);
+    store
+        .remove_source_with_retention(&source.id, retention_policy)
+        .unwrap();
+    let mut stale_report = DeletionReport::new();
+    stale_report.set(DeletionProduct::Qdrant, DeletionOutcome::Erased);
+    stale_report.set(DeletionProduct::Backups, DeletionOutcome::Pending);
+    let mut transaction = store.connection().unchecked_transaction().unwrap();
+    store
+        .finalize_deletion_outcome_tx(
+            &mut transaction,
+            &source.id,
+            DeletionOutcome::Erased,
+            retention_policy,
+            &stale_report,
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    assert!(store
+        .pending_qdrant_deletion_source_ids()
+        .unwrap()
+        .is_empty());
+
+    let pipeline = IngestPipeline::from_parts(
+        store,
+        HnswIndex::new(),
+        DeletionEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    );
+    let reports = pipeline.reconcile_deletions().await.unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].status_for(DeletionProduct::Qdrant),
+        Some(DeletionOutcome::Erased),
+    );
+    assert_eq!(
+        reports[0].status_for(DeletionProduct::Backups),
+        Some(DeletionOutcome::Erased),
+    );
+    let latest = pipeline
+        .store()
+        .latest_deletion_report(&source.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.report, reports[0]);
+}
+
+#[test]
+fn retention_and_legal_hold_changes_refresh_the_latest_backup_report() {
+    let store = Store::in_memory().unwrap();
+    let source = Source {
+        id: SourceId("refresh-retention-report".into()),
+        path: std::path::PathBuf::from("refresh-retention-report.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    store.add_source(&source).unwrap();
+    let retention_policy = RetentionPolicy::UntilBackupExpiry(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_add(60),
+    );
+    store
+        .remove_source_with_retention(&source.id, retention_policy)
+        .unwrap();
+    let mut report = DeletionReport::new();
+    report.set(DeletionProduct::Qdrant, DeletionOutcome::Erased);
+    report.set(DeletionProduct::Backups, DeletionOutcome::Pending);
+    let mut transaction = store.connection().unchecked_transaction().unwrap();
+    store
+        .finalize_deletion_outcome_tx(
+            &mut transaction,
+            &source.id,
+            DeletionOutcome::Erased,
+            retention_policy,
+            &report,
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+
+    store.place_legal_hold(&source.id).unwrap();
+    let held = store.latest_deletion_report(&source.id).unwrap().unwrap();
+    assert_eq!(held.retention_policy, RetentionPolicy::LegalHold);
+    assert_eq!(
+        held.report.status_for(DeletionProduct::Backups),
+        Some(DeletionOutcome::Held),
+    );
+
+    store.release_legal_hold(&source.id).unwrap();
+    let released = store.latest_deletion_report(&source.id).unwrap().unwrap();
+    assert_eq!(released.retention_policy, retention_policy);
+    assert_eq!(
+        released.report.status_for(DeletionProduct::Backups),
+        Some(DeletionOutcome::Pending),
+    );
+
+    store
+        .set_retention_policy(&source.id, RetentionPolicy::Immediate)
+        .unwrap();
+    let immediate = store.latest_deletion_report(&source.id).unwrap().unwrap();
+    assert_eq!(immediate.retention_policy, RetentionPolicy::Immediate);
+    assert_eq!(
+        immediate.report.status_for(DeletionProduct::Backups),
+        Some(DeletionOutcome::Erased),
+    );
 }

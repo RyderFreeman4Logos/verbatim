@@ -60,19 +60,32 @@ where
         Ok(())
     }
 
-    /// Retry remote deletion for every source whose authoritative local erasure completed.
+    /// Reconcile remote deletion and retained-backup outcomes for deleted sources.
     pub async fn reconcile_deletions(&self) -> Result<Vec<DeletionReport>> {
-        let source_ids = self.store.pending_qdrant_deletion_source_ids()?;
+        let source_ids = self.store.reconciliation_deletion_source_ids()?;
         let mut reports = Vec::with_capacity(source_ids.len());
         for source_id in source_ids {
             let retention_policy = self
                 .store
                 .retention_policy(&source_id)?
                 .with_context(|| format!("source tombstone not found: {}", source_id.0))?;
-            #[cfg(feature = "qdrant")]
-            let qdrant_outcome = self.sync_qdrant_delete_source(&source_id).await;
-            #[cfg(not(feature = "qdrant"))]
-            let qdrant_outcome = DeletionOutcome::Pending;
+            let qdrant_outcome = match self
+                .store
+                .qdrant_deletion_outcome(&source_id)?
+                .with_context(|| format!("source tombstone not found: {}", source_id.0))?
+            {
+                DeletionOutcome::Pending => {
+                    #[cfg(feature = "qdrant")]
+                    {
+                        self.sync_qdrant_delete_source(&source_id).await
+                    }
+                    #[cfg(not(feature = "qdrant"))]
+                    {
+                        DeletionOutcome::Pending
+                    }
+                }
+                outcome => outcome,
+            };
             let mut report = match self.store.latest_deletion_report(&source_id)? {
                 Some(previous) => previous.report,
                 None => self.local_deletion_report(&source_id, DeletionOutcome::Pending)?,
@@ -80,8 +93,7 @@ where
             report.set(DeletionProduct::Qdrant, qdrant_outcome);
             report.set(
                 DeletionProduct::Backups,
-                self.store
-                    .backup_deletion_outcome_at(&source_id, current_unix_timestamp_secs())?,
+                retention_policy.backup_outcome_at(current_unix_timestamp_secs()),
             );
             let mut transaction = self.store.connection().unchecked_transaction()?;
             self.store.finalize_deletion_outcome_tx(

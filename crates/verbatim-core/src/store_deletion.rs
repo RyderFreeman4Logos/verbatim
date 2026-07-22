@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, OptionalExtension, Transaction};
 
@@ -5,7 +7,9 @@ use super::{
     bump_all_profile_index_generations, map_storage_error, replace_vector_documents_for_profile_tx,
     unix_timestamp_string, SqliteWriteOperation, Store,
 };
-use crate::deletion::{DeletionOutcome, DeletionReport, PersistedDeletionReport, RetentionPolicy};
+use crate::deletion::{
+    DeletionOutcome, DeletionProduct, DeletionReport, PersistedDeletionReport, RetentionPolicy,
+};
 use crate::traits::VectorDocument;
 use crate::types::{EmbeddingProfileId, SourceId};
 
@@ -68,7 +72,8 @@ impl Store {
         policy: RetentionPolicy,
     ) -> Result<()> {
         let (backup_expiry_at, legal_hold) = tombstone_retention_values(policy)?;
-        let changed = self.conn.execute(
+        let mut transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
             "UPDATE source_tombstones
              SET backup_expiry_at = ?2, legal_hold = ?3
              WHERE source_id = ?1",
@@ -77,6 +82,8 @@ impl Store {
         if changed == 0 {
             bail!("source tombstone not found: {}", source_id.0);
         }
+        self.refresh_latest_deletion_report_tx(&mut transaction, source_id, policy)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -107,6 +114,7 @@ impl Store {
             }))
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_qdrant_deletion_source_ids(&self) -> Result<Vec<SourceId>> {
         let mut statement = self.conn.prepare(
             "SELECT source_id FROM source_tombstones
@@ -114,6 +122,56 @@ impl Store {
         )?;
         let rows = statement.query_map([], |row| Ok(SourceId(row.get(0)?)))?;
         rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    /// List tombstones that still need Qdrant or retained-backup reconciliation.
+    pub(crate) fn reconciliation_deletion_source_ids(&self) -> Result<Vec<SourceId>> {
+        let tombstones = {
+            let mut statement = self.conn.prepare(
+                "SELECT source_id, qdrant_outcome FROM source_tombstones ORDER BY source_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((SourceId(row.get(0)?), row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        tombstones
+            .into_iter()
+            .filter_map(|(source_id, qdrant_outcome)| {
+                let has_nonterminal_backups = match self.latest_deletion_report(&source_id) {
+                    Ok(Some(report)) => matches!(
+                        report.report.status_for(DeletionProduct::Backups),
+                        Some(DeletionOutcome::Pending | DeletionOutcome::Held)
+                    ),
+                    Ok(None) => false,
+                    Err(error) => return Some(Err(error)),
+                };
+                if qdrant_outcome == "pending" || has_nonterminal_backups {
+                    Some(Ok(source_id))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Return the durable Qdrant outcome for a tombstoned source.
+    pub(crate) fn qdrant_deletion_outcome(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<Option<DeletionOutcome>> {
+        let outcome = self
+            .conn
+            .query_row(
+                "SELECT qdrant_outcome FROM source_tombstones WHERE source_id = ?1",
+                params![&source_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        outcome
+            .map(|outcome| qdrant_outcome_from_str(&outcome))
+            .transpose()
     }
 
     /// Persist a Qdrant deletion outcome and its audit receipt atomically.
@@ -133,6 +191,29 @@ impl Store {
             bail!("source tombstone not found: {}", source_id.0);
         }
 
+        self.persist_deletion_report_tx(transaction, source_id, retention_policy, report)
+    }
+
+    /// Append a durable, content-free receipt for an erasure attempt.
+    pub fn persist_deletion_report(
+        &self,
+        source_id: &SourceId,
+        retention_policy: RetentionPolicy,
+        report: &DeletionReport,
+    ) -> Result<()> {
+        let mut transaction = self.conn.unchecked_transaction()?;
+        self.persist_deletion_report_tx(&mut transaction, source_id, retention_policy, report)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn persist_deletion_report_tx(
+        &self,
+        transaction: &mut Transaction<'_>,
+        source_id: &SourceId,
+        retention_policy: RetentionPolicy,
+        report: &DeletionReport,
+    ) -> Result<()> {
         let retention_policy_json = serde_json::to_string(&retention_policy)
             .context("serialize deletion-report retention policy")?;
         let outcomes_json =
@@ -151,29 +232,30 @@ impl Store {
         Ok(())
     }
 
-    /// Append a durable, content-free receipt for an erasure attempt.
-    pub fn persist_deletion_report(
+    fn refresh_latest_deletion_report_tx(
         &self,
+        transaction: &mut Transaction<'_>,
         source_id: &SourceId,
         retention_policy: RetentionPolicy,
-        report: &DeletionReport,
     ) -> Result<()> {
-        let retention_policy_json = serde_json::to_string(&retention_policy)
-            .context("serialize deletion-report retention policy")?;
-        let outcomes_json =
-            serde_json::to_string(report).context("serialize deletion-report outcomes")?;
-        self.conn.execute(
-            "INSERT INTO deletion_reports
-             (source_id, recorded_at, retention_policy_json, outcomes_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                &source_id.0,
-                unix_timestamp_string(),
-                retention_policy_json,
-                outcomes_json,
-            ],
-        )?;
-        Ok(())
+        let outcomes_json = transaction
+            .query_row(
+                "SELECT outcomes_json FROM deletion_reports
+                 WHERE source_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![&source_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(outcomes_json) = outcomes_json else {
+            return Ok(());
+        };
+        let mut report: DeletionReport = serde_json::from_str(&outcomes_json)
+            .context("deserialize latest deletion-report outcomes")?;
+        report.set(
+            DeletionProduct::Backups,
+            retention_policy.backup_outcome_at(current_unix_timestamp_secs()),
+        );
+        self.persist_deletion_report_tx(transaction, source_id, retention_policy, &report)
     }
 
     /// List durable deletion receipts in insertion order for audit and reconciliation status.
@@ -318,13 +400,17 @@ impl Store {
     }
 
     fn set_legal_hold(&self, source_id: &SourceId, legal_hold: bool) -> Result<()> {
-        let changed = self.conn.execute(
+        let mut transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
             "UPDATE source_tombstones SET legal_hold = ?2 WHERE source_id = ?1",
             params![&source_id.0, legal_hold],
         )?;
         if changed == 0 {
             bail!("source tombstone not found: {}", source_id.0);
         }
+        let retention_policy = retention_policy_in_transaction(&transaction, source_id)?;
+        self.refresh_latest_deletion_report_tx(&mut transaction, source_id, retention_policy)?;
+        transaction.commit()?;
         Ok(())
     }
 }
@@ -369,6 +455,28 @@ fn tombstone_retention_policy(state: (Option<i64>, bool)) -> Result<RetentionPol
     }
 }
 
+fn retention_policy_in_transaction(
+    transaction: &Transaction<'_>,
+    source_id: &SourceId,
+) -> Result<RetentionPolicy> {
+    let state = transaction
+        .query_row(
+            "SELECT backup_expiry_at, legal_hold
+             FROM source_tombstones WHERE source_id = ?1",
+            params![&source_id.0],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()?
+        .with_context(|| format!("source tombstone not found: {}", source_id.0))?;
+    tombstone_retention_policy(state)
+}
+
+fn current_unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 fn record_source_tombstone(
     transaction: &Transaction<'_>,
     source_id: &SourceId,
@@ -396,5 +504,15 @@ fn qdrant_outcome_to_str(outcome: DeletionOutcome) -> &'static str {
         DeletionOutcome::Pending => "pending",
         DeletionOutcome::Held => "held",
         DeletionOutcome::NotFound => "not_found",
+    }
+}
+
+fn qdrant_outcome_from_str(outcome: &str) -> Result<DeletionOutcome> {
+    match outcome {
+        "erased" => Ok(DeletionOutcome::Erased),
+        "pending" => Ok(DeletionOutcome::Pending),
+        "held" => Ok(DeletionOutcome::Held),
+        "not_found" => Ok(DeletionOutcome::NotFound),
+        _ => bail!("unknown qdrant deletion outcome: {outcome}"),
     }
 }
