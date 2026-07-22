@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS source_tombstones (
     deleted_at TEXT NOT NULL,
     backup_expiry_at INTEGER,
     legal_hold INTEGER NOT NULL DEFAULT 0,
-    qdrant_outcome TEXT NOT NULL DEFAULT 'pending'
+    qdrant_outcome TEXT NOT NULL DEFAULT 'pending',
+    last_reconcile_attempt_ts INTEGER
 );
 CREATE INDEX IF NOT EXISTS source_tombstones_qdrant_outcome_idx
     ON source_tombstones(qdrant_outcome);
@@ -141,26 +142,25 @@ impl Store {
         &self,
         max_sources: Option<usize>,
     ) -> Result<Vec<SourceId>> {
-        // Eligibility, fair ordering, and the optional batch cap stay in SQL so a
-        // bounded reconcile (for example max_sources=16) does not deserialize every
-        // tombstone's latest report just to discard most of them.
-        // Prefer never-attempted tombstones, then rotate retries by oldest receipt id.
+        // Keep candidate selection on the tombstone table. The previously joined
+        // `deletion_reports` history was O(history) before applying a batch limit.
+        // `last_reconcile_attempt_ts` lets the index order new work before retries
+        // while the LIMIT bounds one startup/reconcile round to its batch.
         let sql = "
-            SELECT tombstone.source_id
-            FROM source_tombstones AS tombstone
-            LEFT JOIN (
-                SELECT source_id, MAX(id) AS last_attempt_id
-                FROM deletion_reports
-                GROUP BY source_id
-            ) AS latest
-                ON latest.source_id = tombstone.source_id
-            LEFT JOIN deletion_reports AS report
-                ON report.id = latest.last_attempt_id
-            WHERE tombstone.qdrant_outcome = 'pending'
-               OR json_extract(report.outcomes_json, '$.outcomes.Backups') IN ('Pending', 'Held')
-            ORDER BY (latest.last_attempt_id IS NOT NULL),
-                     latest.last_attempt_id,
-                     tombstone.source_id
+            SELECT source_id
+            FROM source_tombstones
+            WHERE (
+                    qdrant_outcome = 'pending'
+                    OR legal_hold = 1
+                    OR backup_expiry_at IS NOT NULL
+                  )
+              AND (
+                    qdrant_outcome = 'pending'
+                    OR legal_hold = 1
+                    OR last_reconcile_attempt_ts IS NULL
+                    OR last_reconcile_attempt_ts < backup_expiry_at
+                  )
+            ORDER BY last_reconcile_attempt_ts, source_id
         ";
         let mut statement = match max_sources {
             Some(max_sources) => {
@@ -207,9 +207,17 @@ impl Store {
             DeletionProduct::Backups,
             retention_policy.backup_outcome_at(current_unix_timestamp_secs()),
         );
+        let last_reconcile_attempt_ts =
+            i64::try_from(current_unix_timestamp_secs()).unwrap_or(i64::MAX);
         let changed = transaction.execute(
-            "UPDATE source_tombstones SET qdrant_outcome = ?2 WHERE source_id = ?1",
-            params![&source_id.0, qdrant_outcome_to_str(outcome)],
+            "UPDATE source_tombstones
+             SET qdrant_outcome = ?2, last_reconcile_attempt_ts = ?3
+             WHERE source_id = ?1",
+            params![
+                &source_id.0,
+                qdrant_outcome_to_str(outcome),
+                last_reconcile_attempt_ts,
+            ],
         )?;
         if changed == 0 {
             bail!("source tombstone not found: {}", source_id.0);

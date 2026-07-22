@@ -50,8 +50,8 @@ use crate::resource::{
     TaskResourceProgress,
 };
 use crate::store::{
-    EmbeddingCacheVector, EmbeddingProfileConfig, SourceContentsReplacement, SqliteWriteOperation,
-    Store, StoredEmbeddingProfileConfig,
+    EmbeddingProfileConfig, SourceContentsReplacement, SourceEmbeddingCacheVector,
+    SqliteWriteOperation, Store, StoredEmbeddingProfileConfig,
 };
 use crate::task::{
     FinishedPhaseTiming, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskId,
@@ -124,6 +124,9 @@ mod issue_363_reconcile_tests;
 #[cfg(test)]
 #[path = "tests/issue_363_tests.rs"]
 mod issue_363_tests;
+#[cfg(test)]
+#[path = "tests/issue_363_tombstone_fence_tests.rs"]
+mod issue_363_tombstone_fence_tests;
 
 struct PreparedIndexes {
     hnsw: HnswIndex,
@@ -4414,13 +4417,14 @@ where
                     acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
                 let cache_entries = embedded_vectors
                     .iter()
-                    .map(|entry| EmbeddingCacheVector {
+                    .map(|entry| SourceEmbeddingCacheVector {
+                        source_id: &entry.document.source_id,
                         embedding_input_hash: &entry.embedding_input_hash,
                         vector: &entry.document.vector,
                     })
                     .collect::<Vec<_>>();
                 let cache_entry_count = cache_entries.len();
-                self.store.upsert_embedding_cache_vectors(
+                self.store.upsert_embedding_cache_vectors_for_live_sources(
                     profile_id,
                     &profile_config_hash,
                     &cache_entries,
@@ -4652,9 +4656,21 @@ where
             qdrant
                 .delete_source_for_profile(profile_id, source_id)
                 .await?;
+            // A deletion can commit after loading the authoritative records but
+            // before this remote upsert. Avoid the unnecessary write when it is
+            // already visible, then compensate again after the await below for a
+            // tombstone that races the upsert itself.
+            if self.store.is_tombstoned(source_id)? {
+                return Ok(());
+            }
             let qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
             qdrant.upsert_records(&records).await?;
             drop(qdrant_permit);
+            if self.store.is_tombstoned(source_id)? {
+                qdrant
+                    .delete_source_for_profile(profile_id, source_id)
+                    .await?;
+            }
             Ok(())
         }
         .await;
@@ -4679,11 +4695,32 @@ where
             return;
         };
         let result: Result<()> = async {
-            let records = records_from_store_for_profile(&self.store, profile_id, None)?;
+            let mut records = records_from_store_for_profile(&self.store, profile_id, None)?;
+            let source_ids = records
+                .iter()
+                .map(|record| record.document.source_id.clone())
+                .collect::<HashSet<_>>();
+            let mut tombstoned_source_ids = HashSet::new();
+            for source_id in &source_ids {
+                if self.store.is_tombstoned(source_id)? {
+                    tombstoned_source_ids.insert(source_id.clone());
+                }
+            }
+            records.retain(|record| !tombstoned_source_ids.contains(&record.document.source_id));
             qdrant.delete_profile(profile_id).await?;
             let qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
             qdrant.upsert_records(&records).await?;
             drop(qdrant_permit);
+            // The initial tombstone filter closes the stale-read window before the
+            // upsert. Re-check after the await and delete any points written while
+            // a source removal raced this full-profile synchronization.
+            for source_id in source_ids {
+                if self.store.is_tombstoned(&source_id)? {
+                    qdrant
+                        .delete_source_for_profile(profile_id, &source_id)
+                        .await?;
+                }
+            }
             Ok(())
         }
         .await;
@@ -4842,7 +4879,8 @@ where
                 CaptionAttempt::skipped("vision caption provider is disabled or not configured");
             let sqlite_write_permit =
                 acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
-            self.store.upsert_image_caption_attempt(
+            self.store.upsert_image_caption_attempt_for_live_source(
+                source_id,
                 &artifact.content_hash,
                 &self.vision_caption_model,
                 VISION_CAPTION_PROMPT_VERSION,
@@ -4881,7 +4919,8 @@ where
         let attempt = request_image_caption(model.as_ref(), &file.bytes, &artifact.mime_type).await;
 
         let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
-        self.store.upsert_image_caption_attempt(
+        self.store.upsert_image_caption_attempt_for_live_source(
+            source_id,
             &artifact.content_hash,
             &self.vision_caption_model,
             VISION_CAPTION_PROMPT_VERSION,

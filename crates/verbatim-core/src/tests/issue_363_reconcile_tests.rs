@@ -70,6 +70,96 @@ fn bounded_reconcile_selects_never_attempted_qdrant_tombstone_after_terminal_and
     assert!(selected.contains(&later_pending.id));
 }
 
+#[test]
+fn bounded_reconcile_query_avoids_large_deletion_report_history() {
+    const BATCH_SIZE: usize = 3;
+    const REPORT_HISTORY_ROWS: usize = 4_096;
+
+    let store = Store::in_memory().unwrap();
+    let terminal = Source {
+        id: SourceId("terminal-history".into()),
+        path: std::path::PathBuf::from("terminal-history.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    store.add_source(&terminal).unwrap();
+    store.remove_source(&terminal.id).unwrap();
+    let mut report = DeletionReport::new();
+    let mut transaction = store.connection().unchecked_transaction().unwrap();
+    store
+        .finalize_deletion_outcome_tx(
+            &mut transaction,
+            &terminal.id,
+            DeletionOutcome::Erased,
+            &mut report,
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    for _ in 0..REPORT_HISTORY_ROWS {
+        store
+            .persist_deletion_report(&terminal.id, RetentionPolicy::Immediate, &report)
+            .unwrap();
+    }
+
+    let pending = (0..BATCH_SIZE + 1)
+        .map(|index| Source {
+            id: SourceId(format!("pending-{index:02}")),
+            path: std::path::PathBuf::from(format!("pending-{index:02}.md")),
+            hash: "test-hash".into(),
+            status: SourceStatus::Pending,
+            parser_used: None,
+            last_ingested_at: None,
+        })
+        .collect::<Vec<_>>();
+    for source in &pending {
+        store.add_source(source).unwrap();
+        store.remove_source(&source.id).unwrap();
+    }
+
+    let selected = store
+        .reconciliation_deletion_source_ids_up_to(BATCH_SIZE)
+        .unwrap();
+    assert_eq!(
+        selected,
+        pending[..BATCH_SIZE]
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let mut statement = store
+        .connection()
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT source_id
+             FROM source_tombstones
+             WHERE (
+                     qdrant_outcome = 'pending'
+                     OR legal_hold = 1
+                     OR backup_expiry_at IS NOT NULL
+                   )
+               AND (
+                     qdrant_outcome = 'pending'
+                     OR legal_hold = 1
+                     OR last_reconcile_attempt_ts IS NULL
+                     OR last_reconcile_attempt_ts < backup_expiry_at
+                   )
+             ORDER BY last_reconcile_attempt_ts, source_id
+             LIMIT 3",
+        )
+        .unwrap();
+    let query_plan = statement
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    assert!(query_plan.contains("source_tombstones_reconcile_attempt_idx"));
+    assert!(!query_plan.contains("deletion_reports"));
+}
+
 #[tokio::test]
 async fn bounded_reconcile_round_robins_pending_tombstones_across_successive_batches() {
     const BATCH_SIZE: usize = 2;
