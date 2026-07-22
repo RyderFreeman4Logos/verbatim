@@ -537,6 +537,19 @@ fn record_source_tombstone(
 /// leave historical V1 cache entries (after a V2 replace) or pre-commit orphan
 /// rows that never gained a live owner.
 fn purge_unreferenced_caches_tx(transaction: &Transaction<'_>) -> Result<()> {
+    // Ensure supporting indexes exist for the anti-join (idempotent).
+    // Created here rather than in DELETION_SCHEMA because some legacy test
+    // fixtures open a reduced schema without these columns.
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS chunks_embedding_input_hash_idx \
+         ON chunks(embedding_input_hash) \
+         WHERE embedding_input_hash IS NOT NULL AND embedding_input_hash != ''",
+    )?;
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS image_artifacts_content_hash_idx \
+         ON image_artifacts(content_hash) \
+         WHERE content_hash != ''",
+    )?;
     transaction.execute(
         "DELETE FROM embedding_cache
          WHERE NOT EXISTS (
