@@ -112,7 +112,10 @@ mod deletion_api;
 #[path = "sqlite_durability_ops.rs"]
 mod sqlite_durability_ops;
 
-use deletion_api::{delete_source, list_deletion_reports, reconcile_deletions_on_startup};
+use deletion_api::{
+    delete_source, list_deletion_reports, reconcile_deletions_on_startup,
+    STARTUP_DELETION_RECONCILE_BATCH_SIZE,
+};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -9528,7 +9531,7 @@ async fn finish_daemon_startup(
         *cache = startup.index_status_cache;
     }
     restore_pipeline(&state, startup.pipeline)?;
-    reconcile_deletions_on_startup(&state)
+    reconcile_deletions_on_startup(&state, STARTUP_DELETION_RECONCILE_BATCH_SIZE)
         .await
         .context("reconcile persisted source deletions")?;
 

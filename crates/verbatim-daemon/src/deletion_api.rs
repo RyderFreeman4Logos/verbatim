@@ -3,6 +3,8 @@
 use super::*;
 use verbatim_core::deletion::PersistedDeletionReport;
 
+pub(super) const STARTUP_DELETION_RECONCILE_BATCH_SIZE: usize = 16;
+
 pub(super) async fn delete_source(
     State(state): State<SharedState>,
     Path(id): Path<String>,
@@ -39,12 +41,15 @@ pub(super) async fn list_deletion_reports(
 }
 
 /// Reconcile pending remote erasures after the pipeline has been restored at startup.
-pub(super) async fn reconcile_deletions_on_startup(state: &SharedState) -> Result<()> {
+pub(super) async fn reconcile_deletions_on_startup(
+    state: &SharedState,
+    max_sources: usize,
+) -> Result<()> {
     let state = Arc::clone(state);
     let runtime = tokio::runtime::Handle::current();
     let reports = tokio::task::spawn_blocking(move || {
         run_with_pipeline(state, move |pipeline| {
-            runtime.block_on(pipeline.reconcile_deletions())
+            runtime.block_on(pipeline.reconcile_deletions_up_to(max_sources))
         })
     })
     .await
@@ -52,6 +57,7 @@ pub(super) async fn reconcile_deletions_on_startup(state: &SharedState) -> Resul
     if !reports.is_empty() {
         tracing::info!(
             count = reports.len(),
+            max_sources,
             "reconciled pending source deletions at startup"
         );
     }

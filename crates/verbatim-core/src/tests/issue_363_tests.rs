@@ -4,6 +4,14 @@ use crate::types::{Source, SourceStatus};
 use async_trait::async_trait;
 use std::sync::{Arc, Barrier};
 
+#[cfg(feature = "qdrant")]
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    sync::mpsc,
+    time::Duration,
+};
+
 struct DeletionEmbeddingClient;
 
 #[async_trait]
@@ -137,15 +145,14 @@ fn persisted_tombstone_retention_keeps_backups_pending_until_cleaned_or_held() {
         DeletionOutcome::Erased,
     );
 
-    let report = crate::deletion::DeletionReport::new();
+    let mut report = crate::deletion::DeletionReport::new();
     let mut transaction = store.connection().unchecked_transaction().unwrap();
     store
         .finalize_deletion_outcome_tx(
             &mut transaction,
             &source.id,
             DeletionOutcome::Erased,
-            RetentionPolicy::UntilBackupExpiry(20),
-            &report,
+            &mut report,
         )
         .unwrap();
     transaction.commit().unwrap();
@@ -207,7 +214,7 @@ fn finalizing_deletion_outcome_persists_report_after_deletion() {
     };
     store.add_source(&source).unwrap();
     store.remove_source(&source.id).unwrap();
-    let report = crate::deletion::DeletionReport::new();
+    let mut report = crate::deletion::DeletionReport::new();
     let mut transaction = store.connection().unchecked_transaction().unwrap();
 
     store
@@ -215,8 +222,7 @@ fn finalizing_deletion_outcome_persists_report_after_deletion() {
             &mut transaction,
             &source.id,
             DeletionOutcome::NotFound,
-            RetentionPolicy::Immediate,
-            &report,
+            &mut report,
         )
         .unwrap();
     transaction.commit().unwrap();
@@ -254,7 +260,7 @@ fn failed_deletion_report_insert_rolls_back_qdrant_outcome() {
              END;",
         )
         .unwrap();
-    let report = crate::deletion::DeletionReport::new();
+    let mut report = crate::deletion::DeletionReport::new();
     let mut transaction = store.connection().unchecked_transaction().unwrap();
 
     let error = store
@@ -262,8 +268,7 @@ fn failed_deletion_report_insert_rolls_back_qdrant_outcome() {
             &mut transaction,
             &source.id,
             DeletionOutcome::Erased,
-            RetentionPolicy::Immediate,
-            &report,
+            &mut report,
         )
         .unwrap_err();
     assert!(error.to_string().contains("forced report insert failure"));
@@ -345,6 +350,207 @@ fn concurrent_erasure_cannot_reintroduce_a_tombstoned_source() {
     assert!(store.get_source(&source.id).unwrap().is_none());
 }
 
+#[cfg(feature = "qdrant")]
+#[tokio::test]
+async fn finalize_rechecks_a_legal_hold_placed_during_qdrant_wait() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+    let (release_response_tx, release_response_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut collection_request, _) = listener.accept().unwrap();
+        read_hanging_qdrant_request(&mut collection_request);
+        let body = r#"{"status":"ok","result":{}}"#;
+        write!(
+            collection_request,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+        .unwrap();
+
+        let (mut deletion_request, _) = listener.accept().unwrap();
+        read_hanging_qdrant_request(&mut deletion_request);
+        delete_started_tx.send(()).unwrap();
+        release_response_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let body = r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#;
+        write!(
+            deletion_request,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+        .unwrap();
+    });
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let database_path = tempdir.path().join("verbatim.db");
+    let source = Source {
+        id: SourceId("legal-hold-during-qdrant-wait".into()),
+        path: tempdir.path().join("legal-hold-during-qdrant-wait.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    let store = Store::new(&database_path).unwrap();
+    store.add_source(&source).unwrap();
+    let qdrant = crate::index::qdrant::QdrantClient::new(crate::config::QdrantConfig {
+        enabled: true,
+        url: format!("http://{address}"),
+        collection: "verbatim".into(),
+        prefer_for_search: false,
+        timeout_seconds: 5,
+    });
+    let mut pipeline = IngestPipeline::from_parts(
+        store,
+        HnswIndex::new(),
+        DeletionEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    )
+    .with_qdrant_client(qdrant);
+    let hold_store = Store::new(&database_path).unwrap();
+
+    let mut deletion = Box::pin(pipeline.remove_source(&source.id));
+    tokio::select! {
+        result = &mut deletion => panic!("deletion completed before Qdrant wait: {result:?}"),
+        result = delete_started_rx => result.unwrap(),
+    }
+    hold_store.place_legal_hold(&source.id).unwrap();
+    release_response_tx.send(()).unwrap();
+    let report = deletion.await.unwrap();
+    server.join().unwrap();
+
+    assert_eq!(
+        report.status_for(DeletionProduct::Backups),
+        Some(DeletionOutcome::Held),
+    );
+    let latest = hold_store
+        .latest_deletion_report(&source.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.retention_policy, RetentionPolicy::LegalHold);
+    assert_eq!(
+        latest.report.status_for(DeletionProduct::Backups),
+        Some(DeletionOutcome::Held),
+    );
+}
+
+#[cfg(feature = "qdrant")]
+#[tokio::test]
+async fn bounded_reconcile_stops_after_one_hanging_qdrant_attempt() {
+    const BATCH_SIZE: usize = 1;
+    const TOMBSTONE_COUNT: usize = BATCH_SIZE + 2;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (delete_started_tx, delete_started_rx) = mpsc::channel();
+    let (release_response_tx, release_response_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut collection_request, _) = listener.accept().unwrap();
+        read_hanging_qdrant_request(&mut collection_request);
+        let body = r#"{"status":"ok","result":{}}"#;
+        write!(
+            collection_request,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+        .unwrap();
+
+        let (mut deletion_request, _) = listener.accept().unwrap();
+        read_hanging_qdrant_request(&mut deletion_request);
+        delete_started_tx.send(()).unwrap();
+        release_response_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+    });
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = Store::in_memory().unwrap();
+    for index in 0..TOMBSTONE_COUNT {
+        let source = Source {
+            id: SourceId(format!("bounded-hanging-qdrant-{index:02}")),
+            path: tempdir
+                .path()
+                .join(format!("bounded-hanging-qdrant-{index:02}.md")),
+            hash: "test-hash".into(),
+            status: SourceStatus::Pending,
+            parser_used: None,
+            last_ingested_at: None,
+        };
+        store.add_source(&source).unwrap();
+        store.remove_source(&source.id).unwrap();
+    }
+    let qdrant = crate::index::qdrant::QdrantClient::new(crate::config::QdrantConfig {
+        enabled: true,
+        url: format!("http://{address}"),
+        collection: "verbatim".into(),
+        prefer_for_search: false,
+        timeout_seconds: 1,
+    });
+    let pipeline = IngestPipeline::from_parts(
+        store,
+        HnswIndex::new(),
+        DeletionEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    )
+    .with_qdrant_client(qdrant);
+
+    let reports = pipeline
+        .reconcile_deletions_up_to(BATCH_SIZE)
+        .await
+        .unwrap();
+
+    assert_eq!(delete_started_rx.try_recv(), Ok(()));
+    assert_eq!(reports.len(), BATCH_SIZE);
+    assert_eq!(
+        reports[0].status_for(DeletionProduct::Qdrant),
+        Some(DeletionOutcome::Pending),
+    );
+    assert_eq!(
+        pipeline
+            .store()
+            .pending_qdrant_deletion_source_ids()
+            .unwrap()
+            .len(),
+        TOMBSTONE_COUNT,
+    );
+    assert_eq!(
+        pipeline.store().list_deletion_reports().unwrap().len(),
+        BATCH_SIZE,
+    );
+
+    release_response_tx.send(()).unwrap();
+    server.join().unwrap();
+}
+
+#[cfg(feature = "qdrant")]
+fn read_hanging_qdrant_request(stream: &mut std::net::TcpStream) {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut buffer).unwrap();
+        assert_ne!(read, 0, "qdrant client closed request before sending it");
+        request.extend_from_slice(&buffer[..read]);
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if request.len() >= header_end + 4 + content_length {
+            return;
+        }
+    }
+}
+
 #[tokio::test]
 async fn restart_reconciles_pending_deletion_and_persists_the_retry_report() {
     let tempdir = tempfile::tempdir().unwrap();
@@ -398,20 +604,21 @@ async fn reconcile_refreshes_expired_backups_after_qdrant_is_terminal() {
     store
         .remove_source_with_retention(&source.id, retention_policy)
         .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE source_tombstones SET qdrant_outcome = 'erased' WHERE source_id = ?1",
+            [&source.id.0],
+        )
+        .unwrap();
+    // Simulate a receipt written by an older process before finalization re-read
+    // the tombstone's already-expired retention policy.
     let mut stale_report = DeletionReport::new();
     stale_report.set(DeletionProduct::Qdrant, DeletionOutcome::Erased);
     stale_report.set(DeletionProduct::Backups, DeletionOutcome::Pending);
-    let mut transaction = store.connection().unchecked_transaction().unwrap();
     store
-        .finalize_deletion_outcome_tx(
-            &mut transaction,
-            &source.id,
-            DeletionOutcome::Erased,
-            retention_policy,
-            &stale_report,
-        )
+        .persist_deletion_report(&source.id, retention_policy, &stale_report)
         .unwrap();
-    transaction.commit().unwrap();
     assert!(store
         .pending_qdrant_deletion_source_ids()
         .unwrap()
@@ -473,8 +680,7 @@ fn retention_and_legal_hold_changes_refresh_the_latest_backup_report() {
             &mut transaction,
             &source.id,
             DeletionOutcome::Erased,
-            retention_policy,
-            &report,
+            &mut report,
         )
         .unwrap();
     transaction.commit().unwrap();

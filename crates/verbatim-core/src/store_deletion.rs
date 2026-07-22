@@ -126,14 +126,44 @@ impl Store {
 
     /// List tombstones that still need Qdrant or retained-backup reconciliation.
     pub(crate) fn reconciliation_deletion_source_ids(&self) -> Result<Vec<SourceId>> {
+        self.reconciliation_deletion_source_ids_with_limit(None)
+    }
+
+    /// List no more than `max_sources` tombstones for one bounded reconciliation batch.
+    pub(crate) fn reconciliation_deletion_source_ids_up_to(
+        &self,
+        max_sources: usize,
+    ) -> Result<Vec<SourceId>> {
+        self.reconciliation_deletion_source_ids_with_limit(Some(max_sources))
+    }
+
+    fn reconciliation_deletion_source_ids_with_limit(
+        &self,
+        max_sources: Option<usize>,
+    ) -> Result<Vec<SourceId>> {
         let tombstones = {
-            let mut statement = self.conn.prepare(
-                "SELECT source_id, qdrant_outcome FROM source_tombstones ORDER BY source_id",
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok((SourceId(row.get(0)?), row.get::<_, String>(1)?))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
+            match max_sources {
+                Some(max_sources) => {
+                    let max_sources = i64::try_from(max_sources).unwrap_or(i64::MAX);
+                    let mut statement = self.conn.prepare(
+                        "SELECT source_id, qdrant_outcome FROM source_tombstones
+                         ORDER BY source_id LIMIT ?1",
+                    )?;
+                    let rows = statement.query_map(params![max_sources], |row| {
+                        Ok((SourceId(row.get(0)?), row.get::<_, String>(1)?))
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                }
+                None => {
+                    let mut statement = self.conn.prepare(
+                        "SELECT source_id, qdrant_outcome FROM source_tombstones ORDER BY source_id",
+                    )?;
+                    let rows = statement.query_map([], |row| {
+                        Ok((SourceId(row.get(0)?), row.get::<_, String>(1)?))
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                }
+            }
         };
 
         tombstones
@@ -174,15 +204,19 @@ impl Store {
             .transpose()
     }
 
-    /// Persist a Qdrant deletion outcome and its audit receipt atomically.
+    /// Persist a Qdrant deletion outcome and an audit receipt from the current tombstone policy.
     pub(crate) fn finalize_deletion_outcome_tx(
         &self,
         transaction: &mut Transaction<'_>,
         source_id: &SourceId,
         outcome: DeletionOutcome,
-        retention_policy: RetentionPolicy,
-        report: &DeletionReport,
+        report: &mut DeletionReport,
     ) -> Result<()> {
+        let retention_policy = retention_policy_in_transaction(transaction, source_id)?;
+        report.set(
+            DeletionProduct::Backups,
+            retention_policy.backup_outcome_at(current_unix_timestamp_secs()),
+        );
         let changed = transaction.execute(
             "UPDATE source_tombstones SET qdrant_outcome = ?2 WHERE source_id = ?1",
             params![&source_id.0, qdrant_outcome_to_str(outcome)],

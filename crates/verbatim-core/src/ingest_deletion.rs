@@ -46,8 +46,7 @@ where
             &mut transaction,
             source_id,
             qdrant_outcome,
-            retention_policy,
-            &report,
+            &mut report,
         )?;
         transaction.commit()?;
         Ok(report)
@@ -63,12 +62,26 @@ where
     /// Reconcile remote deletion and retained-backup outcomes for deleted sources.
     pub async fn reconcile_deletions(&self) -> Result<Vec<DeletionReport>> {
         let source_ids = self.store.reconciliation_deletion_source_ids()?;
+        self.reconcile_deletion_source_ids(source_ids).await
+    }
+
+    /// Reconcile no more than `max_sources` deletion candidates in one batch.
+    pub async fn reconcile_deletions_up_to(
+        &self,
+        max_sources: usize,
+    ) -> Result<Vec<DeletionReport>> {
+        let source_ids = self
+            .store
+            .reconciliation_deletion_source_ids_up_to(max_sources)?;
+        self.reconcile_deletion_source_ids(source_ids).await
+    }
+
+    async fn reconcile_deletion_source_ids(
+        &self,
+        source_ids: Vec<SourceId>,
+    ) -> Result<Vec<DeletionReport>> {
         let mut reports = Vec::with_capacity(source_ids.len());
         for source_id in source_ids {
-            let retention_policy = self
-                .store
-                .retention_policy(&source_id)?
-                .with_context(|| format!("source tombstone not found: {}", source_id.0))?;
             let qdrant_outcome = match self
                 .store
                 .qdrant_deletion_outcome(&source_id)?
@@ -91,17 +104,12 @@ where
                 None => self.local_deletion_report(&source_id, DeletionOutcome::Pending)?,
             };
             report.set(DeletionProduct::Qdrant, qdrant_outcome);
-            report.set(
-                DeletionProduct::Backups,
-                retention_policy.backup_outcome_at(current_unix_timestamp_secs()),
-            );
             let mut transaction = self.store.connection().unchecked_transaction()?;
             self.store.finalize_deletion_outcome_tx(
                 &mut transaction,
                 &source_id,
                 qdrant_outcome,
-                retention_policy,
-                &report,
+                &mut report,
             )?;
             transaction.commit()?;
             reports.push(report);
