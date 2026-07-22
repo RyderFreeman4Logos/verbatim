@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::EmbeddingCacheEntry;
+use crate::store::{EmbeddingCacheEntry, SourceContentsReplacement};
 use crate::types::{
     Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, ImageId,
     Source, SourceLocator, SourceStatus,
@@ -220,6 +220,388 @@ fn sole_source_erasure_prevents_cache_hit_resurrection_for_reseeded_source() {
         .is_none());
     assert_eq!(embedding_cache_row_count(&store), 0);
     assert!(store.list_image_captions().unwrap().is_empty());
+}
+
+#[test]
+fn v1_to_v2_replace_then_erase_purges_historical_v1_caches() {
+    let store = Store::in_memory().unwrap();
+    let profile = EmbeddingProfileId::default_profile();
+    let source = Source {
+        id: SourceId("v1-v2-replace-source".into()),
+        path: std::path::PathBuf::from("v1-v2-replace-source.md"),
+        hash: "v1-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    // V1 content + content-addressed caches.
+    seed_source_with_caches(
+        &store,
+        &source,
+        "child-v1",
+        "ev-v1",
+        "img-v1",
+        "v1-input-hash",
+        "v1-image-hash",
+        &profile,
+        "config-a",
+    );
+    assert_eq!(
+        store
+            .get_embedding_cache_vector(&profile, "config-a", "v1-input-hash")
+            .unwrap()
+            .unwrap(),
+        vec![0.25, 0.75]
+    );
+    assert!(store
+        .get_image_caption("v1-image-hash", "vision-test", "prompt-hash")
+        .unwrap()
+        .is_some());
+
+    // V2 replace with different content: CASCADE drops V1 live rows, but leaves
+    // historical content-addressed cache rows unless erasure anti-join purges them.
+    let v2_source = Source {
+        id: source.id.clone(),
+        path: source.path.clone(),
+        hash: "v2-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    let v2_evidence = EvidenceUnit {
+        id: EvidenceId("ev-v2".into()),
+        source_id: source.id.clone(),
+        kind: EvidenceKind::Image,
+        derived_from: None,
+        locator: SourceLocator::Pdf {
+            page: 1,
+            paragraph: 1,
+            bbox: None,
+        },
+        text: "image evidence for v2".into(),
+        text_hash: "hash-ev-v2".into(),
+        heading_path: vec!["Images".into()],
+        position: 0,
+    };
+    let v2_chunk = Chunk {
+        id: ChunkId("child-v2".into()),
+        source_id: source.id.clone(),
+        chunk_hash: "chunk-hash-child-v2".into(),
+        embedding_input_hash: Some("v2-input-hash".into()),
+        text: "chunk text for v2".into(),
+        context_text: None,
+        token_count: 8,
+        chunk_type: ChunkType::Child,
+        parent_chunk_id: None,
+        heading_path: vec!["Images".into()],
+        evidence_unit_ids: vec![EvidenceId("ev-v2".into())],
+    };
+    let v2_image = ImageArtifact {
+        image_id: ImageId("img-v2".into()),
+        source_id: source.id.clone(),
+        evidence_id: EvidenceId("ev-v2".into()),
+        relative_path: std::path::PathBuf::from("images/img-v2.png"),
+        content_hash: "v2-image-hash".into(),
+        mime_type: "image/png".into(),
+        width: 16,
+        height: 8,
+        page: 1,
+        image_index: 1,
+        bbox: None,
+    };
+    store
+        .replace_source_contents(SourceContentsReplacement {
+            source: &v2_source,
+            evidence: std::slice::from_ref(&v2_evidence),
+            chunks: std::slice::from_ref(&v2_chunk),
+            embedding_profile_id: &profile,
+            vectors: &[],
+            links: &[(ChunkId("child-v2".into()), EvidenceId("ev-v2".into()))],
+            evidence_spans: &[],
+            image_artifacts: std::slice::from_ref(&v2_image),
+            graph_nodes: &[],
+            graph_edges: &[],
+        })
+        .unwrap();
+    // Seed V2 caches after replace so the current-source collection path would
+    // only see V2 keys at delete time.
+    store
+        .upsert_embedding_cache_entries(
+            &profile,
+            "config-a",
+            &[EmbeddingCacheEntry {
+                embedding_input_hash: "v2-input-hash".into(),
+                vector: vec![0.5, 0.5],
+            }],
+        )
+        .unwrap();
+    let v2_caption = ImageCaption {
+        content_type: ImageCaptionContentType::Other,
+        short_caption: "v2 caption".into(),
+        detailed_description: "v2 detailed caption".into(),
+        visible_text: vec![],
+        key_entities: vec![],
+        relationships: vec![],
+        answerable_questions: vec![],
+        uncertainties: vec![],
+    };
+    store
+        .upsert_image_caption_attempt(
+            "v2-image-hash",
+            "vision-test",
+            VISION_CAPTION_PROMPT_VERSION,
+            "prompt-hash",
+            &CaptionAttempt::success(v2_caption, r#"{"ok":true}"#.into(), 1),
+        )
+        .unwrap();
+
+    // Historical V1 cache still present after replace (pre-fix orphan risk).
+    assert!(store
+        .get_embedding_cache_vector(&profile, "config-a", "v1-input-hash")
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_image_caption("v1-image-hash", "vision-test", "prompt-hash")
+        .unwrap()
+        .is_some());
+
+    store.remove_source(&source.id).unwrap();
+
+    // V1 caches must be anti-join purged even though delete only saw V2 live rows.
+    assert!(store
+        .get_embedding_cache_vector(&profile, "config-a", "v1-input-hash")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_image_caption("v1-image-hash", "vision-test", "prompt-hash")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_embedding_cache_vector(&profile, "config-a", "v2-input-hash")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_image_caption("v2-image-hash", "vision-test", "prompt-hash")
+        .unwrap()
+        .is_none());
+    assert_eq!(embedding_cache_row_count(&store), 0);
+    assert!(store.list_image_captions().unwrap().is_empty());
+
+    // A brand-new source reusing V1 content hashes must not hit leftover caches.
+    let reseeded = Source {
+        id: SourceId("v1-v2-reseeded-source".into()),
+        path: std::path::PathBuf::from("v1-v2-reseeded-source.md"),
+        hash: "reseed-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    store.add_source(&reseeded).unwrap();
+    store
+        .bulk_insert_evidence(&[EvidenceUnit {
+            id: EvidenceId("ev-reseed-v1".into()),
+            source_id: reseeded.id.clone(),
+            kind: EvidenceKind::Image,
+            derived_from: None,
+            locator: SourceLocator::Pdf {
+                page: 1,
+                paragraph: 1,
+                bbox: None,
+            },
+            text: "image evidence reusing v1 content".into(),
+            text_hash: "hash-ev-reseed-v1".into(),
+            heading_path: vec!["Images".into()],
+            position: 0,
+        }])
+        .unwrap();
+    store
+        .bulk_insert_chunks(&[Chunk {
+            id: ChunkId("child-reseed-v1".into()),
+            source_id: reseeded.id.clone(),
+            chunk_hash: "chunk-hash-child-reseed-v1".into(),
+            embedding_input_hash: Some("v1-input-hash".into()),
+            text: "chunk text reusing v1 content".into(),
+            context_text: None,
+            token_count: 8,
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path: vec!["Images".into()],
+            evidence_unit_ids: vec![EvidenceId("ev-reseed-v1".into())],
+        }])
+        .unwrap();
+    store
+        .bulk_insert_image_artifacts(&[ImageArtifact {
+            image_id: ImageId("img-reseed-v1".into()),
+            source_id: reseeded.id.clone(),
+            evidence_id: EvidenceId("ev-reseed-v1".into()),
+            relative_path: std::path::PathBuf::from("images/img-reseed-v1.png"),
+            content_hash: "v1-image-hash".into(),
+            mime_type: "image/png".into(),
+            width: 16,
+            height: 8,
+            page: 1,
+            image_index: 1,
+            bbox: None,
+        }])
+        .unwrap();
+
+    assert!(store
+        .get_embedding_cache_vector(&profile, "config-a", "v1-input-hash")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_image_caption("v1-image-hash", "vision-test", "prompt-hash")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn pre_commit_orphan_caches_are_purged_on_erasure() {
+    let store = Store::in_memory().unwrap();
+    let profile = EmbeddingProfileId::default_profile();
+    // Live source with its own caches (erasure victim / trigger).
+    let live = Source {
+        id: SourceId("orphan-purge-live".into()),
+        path: std::path::PathBuf::from("orphan-purge-live.md"),
+        hash: "live-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    seed_source_with_caches(
+        &store,
+        &live,
+        "child-live",
+        "ev-live",
+        "img-live",
+        "live-input-hash",
+        "live-image-hash",
+        &profile,
+        "config-a",
+    );
+
+    // Simulate cache write that never gained a committed live owner (crash before
+    // source commit). These rows are invisible to current-source hash collection.
+    store
+        .upsert_embedding_cache_entries(
+            &profile,
+            "config-a",
+            &[EmbeddingCacheEntry {
+                embedding_input_hash: "orphan-input-hash".into(),
+                vector: vec![0.1, 0.9],
+            }],
+        )
+        .unwrap();
+    let orphan_caption = ImageCaption {
+        content_type: ImageCaptionContentType::Other,
+        short_caption: "orphan caption".into(),
+        detailed_description: "orphan detailed caption".into(),
+        visible_text: vec![],
+        key_entities: vec![],
+        relationships: vec![],
+        answerable_questions: vec![],
+        uncertainties: vec![],
+    };
+    store
+        .upsert_image_caption_attempt(
+            "orphan-image-hash",
+            "vision-test",
+            VISION_CAPTION_PROMPT_VERSION,
+            "prompt-hash",
+            &CaptionAttempt::success(orphan_caption, r#"{"ok":true}"#.into(), 1),
+        )
+        .unwrap();
+    assert!(store
+        .get_embedding_cache_vector(&profile, "config-a", "orphan-input-hash")
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_image_caption("orphan-image-hash", "vision-test", "prompt-hash")
+        .unwrap()
+        .is_some());
+    assert_eq!(embedding_cache_row_count(&store), 2);
+    assert_eq!(store.list_image_captions().unwrap().len(), 2);
+
+    store.remove_source(&live.id).unwrap();
+
+    // Anti-join purge must remove both the live-owned caches and pre-commit orphans.
+    assert!(store
+        .get_embedding_cache_vector(&profile, "config-a", "orphan-input-hash")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_image_caption("orphan-image-hash", "vision-test", "prompt-hash")
+        .unwrap()
+        .is_none());
+    assert_eq!(embedding_cache_row_count(&store), 0);
+    assert!(store.list_image_captions().unwrap().is_empty());
+
+    // Re-use of the orphaned content hashes must recompute (no cache hit).
+    let recompute = Source {
+        id: SourceId("orphan-recompute-source".into()),
+        path: std::path::PathBuf::from("orphan-recompute-source.md"),
+        hash: "recompute-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    store.add_source(&recompute).unwrap();
+    store
+        .bulk_insert_evidence(&[EvidenceUnit {
+            id: EvidenceId("ev-recompute".into()),
+            source_id: recompute.id.clone(),
+            kind: EvidenceKind::Image,
+            derived_from: None,
+            locator: SourceLocator::Pdf {
+                page: 1,
+                paragraph: 1,
+                bbox: None,
+            },
+            text: "image evidence for recompute".into(),
+            text_hash: "hash-ev-recompute".into(),
+            heading_path: vec!["Images".into()],
+            position: 0,
+        }])
+        .unwrap();
+    store
+        .bulk_insert_chunks(&[Chunk {
+            id: ChunkId("child-recompute".into()),
+            source_id: recompute.id.clone(),
+            chunk_hash: "chunk-hash-child-recompute".into(),
+            embedding_input_hash: Some("orphan-input-hash".into()),
+            text: "chunk text for recompute".into(),
+            context_text: None,
+            token_count: 8,
+            chunk_type: ChunkType::Child,
+            parent_chunk_id: None,
+            heading_path: vec!["Images".into()],
+            evidence_unit_ids: vec![EvidenceId("ev-recompute".into())],
+        }])
+        .unwrap();
+    store
+        .bulk_insert_image_artifacts(&[ImageArtifact {
+            image_id: ImageId("img-recompute".into()),
+            source_id: recompute.id.clone(),
+            evidence_id: EvidenceId("ev-recompute".into()),
+            relative_path: std::path::PathBuf::from("images/img-recompute.png"),
+            content_hash: "orphan-image-hash".into(),
+            mime_type: "image/png".into(),
+            width: 16,
+            height: 8,
+            page: 1,
+            image_index: 1,
+            bbox: None,
+        }])
+        .unwrap();
+
+    assert!(store
+        .get_embedding_cache_vector(&profile, "config-a", "orphan-input-hash")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_image_caption("orphan-image-hash", "vision-test", "prompt-hash")
+        .unwrap()
+        .is_none());
 }
 
 fn seed_source_with_caches(

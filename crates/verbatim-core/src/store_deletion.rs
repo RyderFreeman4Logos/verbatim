@@ -363,12 +363,12 @@ impl Store {
         retention_policy: RetentionPolicy,
     ) -> Result<u64> {
         let tx = self.conn.unchecked_transaction()?;
-        // Collect content-addressed cache keys while the source still owns
-        // live rows, then purge only hashes that no other LIVE source shares.
-        let cache_hashes = collect_source_cache_hashes(&tx, id)?;
+        // Delete first so CASCADE drops this source's live rows; then anti-join
+        // purge every content-addressed cache row no remaining live source owns.
+        // This catches historical V1 hashes after V2 replace and pre-commit orphans.
         tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
         record_source_tombstone(&tx, id, retention_policy)?;
-        purge_unreferenced_caches_tx(&tx, &cache_hashes)?;
+        purge_unreferenced_caches_tx(&tx)?;
         let generation = bump_all_profile_index_generations(&tx)?;
         tx.commit()?;
         Ok(generation)
@@ -417,12 +417,12 @@ impl Store {
         self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
         (|| {
             let tx = self.conn.unchecked_transaction()?;
-            // Collect content-addressed cache keys while the source still owns
-            // live rows, then purge only hashes that no other LIVE source shares.
-            let cache_hashes = collect_source_cache_hashes(&tx, id)?;
+            // Delete first so CASCADE drops this source's live rows; then anti-join
+            // purge every content-addressed cache row no remaining live source owns.
+            // This catches historical V1 hashes after V2 replace and pre-commit orphans.
             tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
             record_source_tombstone(&tx, id, retention_policy)?;
-            purge_unreferenced_caches_tx(&tx, &cache_hashes)?;
+            purge_unreferenced_caches_tx(&tx)?;
             replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
             let generation = bump_all_profile_index_generations(&tx)?;
             tx.commit()?;
@@ -530,82 +530,34 @@ fn record_source_tombstone(
     Ok(())
 }
 
-#[derive(Default)]
-struct SourceCacheHashes {
-    embedding_input_hashes: Vec<String>,
-    image_hashes: Vec<String>,
-}
-
-fn collect_source_cache_hashes(
-    transaction: &Transaction<'_>,
-    source_id: &SourceId,
-) -> Result<SourceCacheHashes> {
-    let mut embedding_input_hashes = transaction
-        .prepare(
-            "SELECT DISTINCT embedding_input_hash
+/// Purge content-addressed cache rows that no remaining live source references.
+///
+/// Uses anti-joins against *all* live chunks / image_artifacts, not only hashes
+/// collected from the deleted source's current rows. Explicit erasure must not
+/// leave historical V1 cache entries (after a V2 replace) or pre-commit orphan
+/// rows that never gained a live owner.
+fn purge_unreferenced_caches_tx(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM embedding_cache
+         WHERE NOT EXISTS (
+             SELECT 1
              FROM chunks
-             WHERE source_id = ?1
-               AND embedding_input_hash IS NOT NULL
-               AND embedding_input_hash != ''",
-        )?
-        .query_map(params![&source_id.0], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    embedding_input_hashes.sort();
-    embedding_input_hashes.dedup();
-
-    let mut image_hashes = transaction
-        .prepare(
-            "SELECT DISTINCT content_hash
+             WHERE chunks.embedding_input_hash = embedding_cache.embedding_input_hash
+               AND chunks.embedding_input_hash IS NOT NULL
+               AND chunks.embedding_input_hash != ''
+         )",
+        [],
+    )?;
+    transaction.execute(
+        "DELETE FROM image_captions
+         WHERE NOT EXISTS (
+             SELECT 1
              FROM image_artifacts
-             WHERE source_id = ?1
-               AND content_hash != ''",
-        )?
-        .query_map(params![&source_id.0], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    image_hashes.sort();
-    image_hashes.dedup();
-
-    Ok(SourceCacheHashes {
-        embedding_input_hashes,
-        image_hashes,
-    })
-}
-
-fn purge_unreferenced_caches_tx(
-    transaction: &Transaction<'_>,
-    hashes: &SourceCacheHashes,
-) -> Result<()> {
-    for embedding_input_hash in &hashes.embedding_input_hashes {
-        let still_referenced: i64 = transaction.query_row(
-            "SELECT COUNT(*)
-             FROM chunks
-             WHERE embedding_input_hash = ?1",
-            params![embedding_input_hash],
-            |row| row.get(0),
-        )?;
-        if still_referenced == 0 {
-            transaction.execute(
-                "DELETE FROM embedding_cache WHERE embedding_input_hash = ?1",
-                params![embedding_input_hash],
-            )?;
-        }
-    }
-
-    for image_hash in &hashes.image_hashes {
-        let still_referenced: i64 = transaction.query_row(
-            "SELECT COUNT(*)
-             FROM image_artifacts
-             WHERE content_hash = ?1",
-            params![image_hash],
-            |row| row.get(0),
-        )?;
-        if still_referenced == 0 {
-            transaction.execute(
-                "DELETE FROM image_captions WHERE image_hash = ?1",
-                params![image_hash],
-            )?;
-        }
-    }
+             WHERE image_artifacts.content_hash = image_captions.image_hash
+               AND image_artifacts.content_hash != ''
+         )",
+        [],
+    )?;
     Ok(())
 }
 
