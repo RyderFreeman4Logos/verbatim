@@ -141,53 +141,39 @@ impl Store {
         &self,
         max_sources: Option<usize>,
     ) -> Result<Vec<SourceId>> {
-        let mut statement = self.conn.prepare(
-            "SELECT tombstone.source_id, tombstone.qdrant_outcome,
-                    (SELECT report.id FROM deletion_reports AS report
-                     WHERE report.source_id = tombstone.source_id
-                     ORDER BY report.id DESC LIMIT 1) AS last_attempt_id
-             FROM source_tombstones AS tombstone",
-        )?;
-        let tombstones = statement
-            .query_map([], |row| {
-                Ok((
-                    SourceId(row.get(0)?),
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        let mut eligible = tombstones
-            .into_iter()
-            .filter_map(|(source_id, qdrant_outcome, last_attempt_id)| {
-                let has_nonterminal_backups = match self.latest_deletion_report(&source_id) {
-                    Ok(Some(report)) => matches!(
-                        report.report.status_for(DeletionProduct::Backups),
-                        Some(DeletionOutcome::Pending | DeletionOutcome::Held)
-                    ),
-                    Ok(None) => false,
-                    Err(error) => return Some(Err(error)),
-                };
-                if qdrant_outcome == "pending" || has_nonterminal_backups {
-                    Some(Ok((source_id, last_attempt_id)))
-                } else {
-                    None
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // A report is the durable receipt of the most recent reconciliation attempt.
-        // Prefer untouched tombstones, then rotate retries by their oldest receipt.
-        eligible.sort_by(|left, right| {
-            (left.1.is_some(), left.1, &left.0 .0).cmp(&(right.1.is_some(), right.1, &right.0 .0))
-        });
-        if let Some(max_sources) = max_sources {
-            eligible.truncate(max_sources);
-        }
-        Ok(eligible
-            .into_iter()
-            .map(|(source_id, _)| source_id)
-            .collect())
+        // Eligibility, fair ordering, and the optional batch cap stay in SQL so a
+        // bounded reconcile (for example max_sources=16) does not deserialize every
+        // tombstone's latest report just to discard most of them.
+        // Prefer never-attempted tombstones, then rotate retries by oldest receipt id.
+        let sql = "
+            SELECT tombstone.source_id
+            FROM source_tombstones AS tombstone
+            LEFT JOIN (
+                SELECT source_id, MAX(id) AS last_attempt_id
+                FROM deletion_reports
+                GROUP BY source_id
+            ) AS latest
+                ON latest.source_id = tombstone.source_id
+            LEFT JOIN deletion_reports AS report
+                ON report.id = latest.last_attempt_id
+            WHERE tombstone.qdrant_outcome = 'pending'
+               OR json_extract(report.outcomes_json, '$.outcomes.Backups') IN ('Pending', 'Held')
+            ORDER BY (latest.last_attempt_id IS NOT NULL),
+                     latest.last_attempt_id,
+                     tombstone.source_id
+        ";
+        let mut statement = match max_sources {
+            Some(max_sources) => {
+                let limited = format!("{sql} LIMIT ?1");
+                let mut statement = self.conn.prepare(&limited)?;
+                let limit = i64::try_from(max_sources).unwrap_or(i64::MAX);
+                let rows = statement.query_map(params![limit], |row| Ok(SourceId(row.get(0)?)))?;
+                return rows.map(|row| row.map_err(Into::into)).collect();
+            }
+            None => self.conn.prepare(sql)?,
+        };
+        let rows = statement.query_map([], |row| Ok(SourceId(row.get(0)?)))?;
+        rows.map(|row| row.map_err(Into::into)).collect()
     }
 
     /// Return the durable Qdrant outcome for a tombstoned source.
@@ -377,8 +363,12 @@ impl Store {
         retention_policy: RetentionPolicy,
     ) -> Result<u64> {
         let tx = self.conn.unchecked_transaction()?;
+        // Collect content-addressed cache keys while the source still owns
+        // live rows, then purge only hashes that no other LIVE source shares.
+        let cache_hashes = collect_source_cache_hashes(&tx, id)?;
         tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
         record_source_tombstone(&tx, id, retention_policy)?;
+        purge_unreferenced_caches_tx(&tx, &cache_hashes)?;
         let generation = bump_all_profile_index_generations(&tx)?;
         tx.commit()?;
         Ok(generation)
@@ -427,8 +417,12 @@ impl Store {
         self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
         (|| {
             let tx = self.conn.unchecked_transaction()?;
+            // Collect content-addressed cache keys while the source still owns
+            // live rows, then purge only hashes that no other LIVE source shares.
+            let cache_hashes = collect_source_cache_hashes(&tx, id)?;
             tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
             record_source_tombstone(&tx, id, retention_policy)?;
+            purge_unreferenced_caches_tx(&tx, &cache_hashes)?;
             replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
             let generation = bump_all_profile_index_generations(&tx)?;
             tx.commit()?;
@@ -533,6 +527,85 @@ fn record_source_tombstone(
             legal_hold,
         ],
     )?;
+    Ok(())
+}
+
+#[derive(Default)]
+struct SourceCacheHashes {
+    embedding_input_hashes: Vec<String>,
+    image_hashes: Vec<String>,
+}
+
+fn collect_source_cache_hashes(
+    transaction: &Transaction<'_>,
+    source_id: &SourceId,
+) -> Result<SourceCacheHashes> {
+    let mut embedding_input_hashes = transaction
+        .prepare(
+            "SELECT DISTINCT embedding_input_hash
+             FROM chunks
+             WHERE source_id = ?1
+               AND embedding_input_hash IS NOT NULL
+               AND embedding_input_hash != ''",
+        )?
+        .query_map(params![&source_id.0], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    embedding_input_hashes.sort();
+    embedding_input_hashes.dedup();
+
+    let mut image_hashes = transaction
+        .prepare(
+            "SELECT DISTINCT content_hash
+             FROM image_artifacts
+             WHERE source_id = ?1
+               AND content_hash != ''",
+        )?
+        .query_map(params![&source_id.0], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    image_hashes.sort();
+    image_hashes.dedup();
+
+    Ok(SourceCacheHashes {
+        embedding_input_hashes,
+        image_hashes,
+    })
+}
+
+fn purge_unreferenced_caches_tx(
+    transaction: &Transaction<'_>,
+    hashes: &SourceCacheHashes,
+) -> Result<()> {
+    for embedding_input_hash in &hashes.embedding_input_hashes {
+        let still_referenced: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM chunks
+             WHERE embedding_input_hash = ?1",
+            params![embedding_input_hash],
+            |row| row.get(0),
+        )?;
+        if still_referenced == 0 {
+            transaction.execute(
+                "DELETE FROM embedding_cache WHERE embedding_input_hash = ?1",
+                params![embedding_input_hash],
+            )?;
+        }
+    }
+
+    for image_hash in &hashes.image_hashes {
+        let still_referenced: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM image_artifacts
+             WHERE content_hash = ?1",
+            params![image_hash],
+            |row| row.get(0),
+        )?;
+        if still_referenced == 0 {
+            transaction.execute(
+                "DELETE FROM image_captions WHERE image_hash = ?1",
+                params![image_hash],
+            )?;
+        }
+    }
     Ok(())
 }
 

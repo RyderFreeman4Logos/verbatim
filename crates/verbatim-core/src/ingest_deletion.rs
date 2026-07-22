@@ -41,6 +41,9 @@ where
         let qdrant_outcome = DeletionOutcome::Pending;
         let mut report = self.local_deletion_report(source_id, images)?;
         report.set(DeletionProduct::Qdrant, qdrant_outcome);
+        // Finalize after the remote await so we re-read retention under the same
+        // single-writer bulkhead used by other durable SQLite writers.
+        let _sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let mut transaction = self.store.connection().unchecked_transaction()?;
         self.store.finalize_deletion_outcome_tx(
             &mut transaction,
@@ -104,6 +107,8 @@ where
                 None => self.local_deletion_report(&source_id, DeletionOutcome::Pending)?,
             };
             report.set(DeletionProduct::Qdrant, qdrant_outcome);
+            let _sqlite_write_permit =
+                acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
             let mut transaction = self.store.connection().unchecked_transaction()?;
             self.store.finalize_deletion_outcome_tx(
                 &mut transaction,
@@ -212,11 +217,13 @@ where
         ] {
             report.set(product, DeletionOutcome::Erased);
         }
-        // HNSW generation cleanup and cache invalidation do not yet have a durable
-        // physical-cleanup acknowledgement, so they remain retryable audit work.
+        // HNSW generation cleanup does not yet have a durable physical-cleanup
+        // acknowledgement, so it remains retryable audit work.
         report.set(DeletionProduct::Hnsw, DeletionOutcome::Pending);
         report.set(DeletionProduct::Images, images);
-        report.set(DeletionProduct::Caches, DeletionOutcome::Pending);
+        // Explicit erasure purges unreferenced content-addressed cache rows in the
+        // same transaction as source removal; success is recorded as Erased.
+        report.set(DeletionProduct::Caches, DeletionOutcome::Erased);
         report.set(
             DeletionProduct::Backups,
             self.store

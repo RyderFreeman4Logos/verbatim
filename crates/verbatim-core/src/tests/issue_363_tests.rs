@@ -73,12 +73,14 @@ async fn source_erasure_removes_local_derivatives_tombstones_and_blocks_reingest
         DeletionProduct::Vectors,
         DeletionProduct::Graph,
         DeletionProduct::Images,
+        DeletionProduct::Caches,
     ] {
         assert_eq!(report.status_for(product), Some(DeletionOutcome::Erased));
     }
-    for product in [DeletionProduct::Hnsw, DeletionProduct::Caches] {
-        assert_eq!(report.status_for(product), Some(DeletionOutcome::Pending));
-    }
+    assert_eq!(
+        report.status_for(DeletionProduct::Hnsw),
+        Some(DeletionOutcome::Pending)
+    );
     assert_eq!(
         report.status_for(DeletionProduct::Backups),
         Some(DeletionOutcome::Erased),
