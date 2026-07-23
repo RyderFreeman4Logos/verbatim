@@ -125,6 +125,9 @@ mod issue_363_cache_purge_tests;
 #[cfg(test)]
 #[path = "tests/issue_363_deletion_lifecycle_tests.rs"]
 mod issue_363_deletion_lifecycle_tests;
+#[cfg(all(test, not(feature = "qdrant")))]
+#[path = "tests/issue_363_no_qdrant_tests.rs"]
+mod issue_363_no_qdrant_tests;
 #[cfg(test)]
 #[path = "tests/issue_363_qdrant_mutation_fence_tests.rs"]
 mod issue_363_qdrant_mutation_fence_tests;

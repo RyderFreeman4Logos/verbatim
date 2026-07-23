@@ -3,10 +3,13 @@ use super::*;
 use crate::deletion::DeletionProduct;
 use crate::deletion::{DeletionOutcome, DeletionReport, RetentionPolicy};
 use crate::types::{Source, SourceStatus};
+#[cfg(feature = "qdrant")]
 use async_trait::async_trait;
 
+#[cfg(feature = "qdrant")]
 struct ReconcileEmbeddingClient;
 
+#[cfg(feature = "qdrant")]
 #[async_trait]
 impl EmbeddingClient for ReconcileEmbeddingClient {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {

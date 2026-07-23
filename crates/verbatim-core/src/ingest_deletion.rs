@@ -114,7 +114,7 @@ where
                     }
                     #[cfg(not(feature = "qdrant"))]
                     {
-                        DeletionOutcome::Pending
+                        DeletionOutcome::NotFound
                     }
                 }
                 outcome => outcome,
