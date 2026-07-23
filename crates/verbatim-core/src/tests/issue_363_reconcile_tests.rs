@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "qdrant")]
+use crate::deletion::DeletionProduct;
 use crate::deletion::{DeletionOutcome, DeletionReport, RetentionPolicy};
 use crate::types::{Source, SourceStatus};
 use async_trait::async_trait;
@@ -244,6 +246,7 @@ async fn interrupted_qdrant_compensation_requeues_tombstone_for_reconciliation()
     store.add_source(&source).unwrap();
     store.remove_source(&source.id).unwrap();
     let mut report = DeletionReport::new();
+    report.set(DeletionProduct::Qdrant, DeletionOutcome::Erased);
     let mut transaction = store.connection().unchecked_transaction().unwrap();
     store
         .finalize_deletion_outcome_tx(
@@ -259,6 +262,12 @@ async fn interrupted_qdrant_compensation_requeues_tombstone_for_reconciliation()
     // compensating delete could finish. The stale terminal outcome must be
     // durable-pending so a later process picks the tombstone up.
     store.requeue_qdrant_deletion(&source.id).unwrap();
+    let latest = store.latest_deletion_report(&source.id).unwrap().unwrap();
+    assert_eq!(
+        latest.report.status_for(DeletionProduct::Qdrant),
+        Some(DeletionOutcome::Pending),
+    );
+    assert_eq!(store.list_deletion_reports().unwrap().len(), 2);
     let pipeline = IngestPipeline::from_parts(
         store,
         HnswIndex::new(),
@@ -274,5 +283,49 @@ async fn interrupted_qdrant_compensation_requeues_tombstone_for_reconciliation()
             .qdrant_deletion_outcome(&source.id)
             .unwrap(),
         Some(DeletionOutcome::Pending)
+    );
+}
+
+#[cfg(feature = "qdrant")]
+#[test]
+fn requeue_qdrant_deletion_keeps_pending_report_after_retention_change() {
+    let store = Store::in_memory().unwrap();
+    let source = Source {
+        id: SourceId("requeued-qdrant-retention-report".into()),
+        path: std::path::PathBuf::from("requeued-qdrant-retention-report.md"),
+        hash: "test-hash".into(),
+        status: SourceStatus::Pending,
+        parser_used: None,
+        last_ingested_at: None,
+    };
+    store.add_source(&source).unwrap();
+    store.remove_source(&source.id).unwrap();
+    let mut report = DeletionReport::new();
+    report.set(DeletionProduct::Qdrant, DeletionOutcome::Erased);
+    let mut transaction = store.connection().unchecked_transaction().unwrap();
+    store
+        .finalize_deletion_outcome_tx(
+            &mut transaction,
+            &source.id,
+            DeletionOutcome::Erased,
+            &mut report,
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+
+    store.requeue_qdrant_deletion(&source.id).unwrap();
+    store
+        .set_retention_policy(&source.id, RetentionPolicy::LegalHold)
+        .unwrap();
+
+    let latest = store.latest_deletion_report(&source.id).unwrap().unwrap();
+    assert_eq!(latest.retention_policy, RetentionPolicy::LegalHold);
+    assert_eq!(
+        latest.report.status_for(DeletionProduct::Qdrant),
+        Some(DeletionOutcome::Pending),
+    );
+    assert_eq!(
+        latest.report.status_for(DeletionProduct::Backups),
+        Some(DeletionOutcome::Held),
     );
 }

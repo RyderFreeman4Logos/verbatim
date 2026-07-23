@@ -199,7 +199,20 @@ impl Store {
     /// Requeue remote Qdrant erasure after a failed post-upsert compensation.
     #[cfg(feature = "qdrant")]
     pub(crate) fn requeue_qdrant_deletion(&self, source_id: &SourceId) -> Result<()> {
-        let transaction = self.conn.unchecked_transaction()?;
+        let mut transaction = self.conn.unchecked_transaction()?;
+        let retention_policy = retention_policy_in_transaction(&transaction, source_id)?;
+        let outcomes_json = transaction
+            .query_row(
+                "SELECT outcomes_json FROM deletion_reports
+                 WHERE source_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![&source_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .with_context(|| format!("latest deletion report not found: {}", source_id.0))?;
+        let mut report: DeletionReport = serde_json::from_str(&outcomes_json)
+            .context("deserialize latest deletion-report outcomes")?;
+        report.set(DeletionProduct::Qdrant, DeletionOutcome::Pending);
         let last_reconcile_attempt_ts =
             i64::try_from(current_unix_timestamp_secs()).unwrap_or(i64::MAX);
         let last_reconcile_attempt_seq = next_reconcile_attempt_sequence(&transaction)?;
@@ -218,6 +231,7 @@ impl Store {
         if changed == 0 {
             bail!("source tombstone not found: {}", source_id.0);
         }
+        self.persist_deletion_report_tx(&mut transaction, source_id, retention_policy, &report)?;
         transaction.commit()?;
         Ok(())
     }
@@ -315,6 +329,17 @@ impl Store {
         };
         let mut report: DeletionReport = serde_json::from_str(&outcomes_json)
             .context("deserialize latest deletion-report outcomes")?;
+        let qdrant_outcome = transaction
+            .query_row(
+                "SELECT qdrant_outcome FROM source_tombstones WHERE source_id = ?1",
+                params![&source_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|outcome| qdrant_outcome_from_str(&outcome))
+            .transpose()?
+            .with_context(|| format!("source tombstone not found: {}", source_id.0))?;
+        report.set(DeletionProduct::Qdrant, qdrant_outcome);
         report.set(
             DeletionProduct::Backups,
             retention_policy.backup_outcome_at(current_unix_timestamp_secs()),
