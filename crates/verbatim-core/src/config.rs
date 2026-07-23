@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::image_limits::ImageArtifactLimits;
 use crate::index_gc::IndexGcConfig;
 use crate::store::SqliteDurabilityProfile;
+use crate::DaemonAuthConfig;
 
 #[path = "config_store.rs"]
 mod config_store;
@@ -1045,6 +1046,8 @@ fn default_qdrant_timeout_seconds() -> u64 {
 pub struct DaemonConfig {
     #[serde(default = "default_daemon_bind")]
     pub bind: String,
+    #[serde(default)]
+    pub auth: DaemonAuthConfig,
     /// Number of tokio worker threads. Defaults to 4 to limit glibc malloc
     /// arena proliferation (each thread gets its own arena, each up to 128 MB).
     /// Set to 0 or omit for num_cpus (tokio default).
@@ -1062,6 +1065,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             bind: default_daemon_bind(),
+            auth: DaemonAuthConfig::default(),
             worker_threads: default_worker_threads(),
             idle_reclaim: DaemonIdleReclaimConfig::default(),
             idle_exit: DaemonIdleExitConfig::default(),

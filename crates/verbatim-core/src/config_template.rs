@@ -232,6 +232,14 @@ bind = "127.0.0.1:7700"
 # Set to 0 for num_cpus (tokio default, can cause 1+ GB RSS on many-core machines).
 worker_threads = 4
 
+[daemon.auth]
+# local-anonymous permits only loopback callers. static-token requires a Bearer token.
+mode = "local-anonymous"
+# Configure this only for static-token mode. VERBATIM_AUTH_TOKEN overrides it.
+static_token = ""
+# Role granted to callers with the configured static token: reader, editor, or admin.
+static_token_role = "admin"
+
 [daemon.idle_reclaim]
 # idle reclaim trims memory after idle periods; it can pause briefly when it runs.
 # Disabled by default because SQLite shrink and allocator trim can pause briefly.

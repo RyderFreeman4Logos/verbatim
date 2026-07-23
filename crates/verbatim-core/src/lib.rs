@@ -1,3 +1,6 @@
+/// Shared identities, roles, and daemon authentication configuration.
+pub mod auth;
+pub use auth::{AuthMode, DaemonAuthConfig, Principal, Role};
 pub mod api;
 pub mod canonical_chunker;
 mod caption_chunker;

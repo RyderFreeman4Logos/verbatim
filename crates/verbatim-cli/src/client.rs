@@ -2,8 +2,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use reqwest::blocking::Client;
-use reqwest::blocking::RequestBuilder;
+use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -22,7 +21,7 @@ use verbatim_core::api::{
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
 
-use crate::{render, sse};
+use crate::{auth, render, sse};
 
 const MAX_HTTP_ERROR_BODY_BYTES: usize = 4096;
 const HTTP_ERROR_TRUNCATION_MARKER: &str = "...[truncated]";
@@ -172,7 +171,7 @@ pub struct HttpDaemonClient {
 impl HttpDaemonClient {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: auth::daemon_client(),
             base_url: None,
         }
     }
