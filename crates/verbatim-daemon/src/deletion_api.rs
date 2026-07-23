@@ -1,20 +1,33 @@
 //! Daemon-bound erasure handlers and startup reconciliation.
 
 use super::*;
-use verbatim_core::deletion::PersistedDeletionReport;
+use verbatim_core::deletion::{DeletionOutcome, DeletionProduct, PersistedDeletionReport};
 
 pub(super) const STARTUP_DELETION_RECONCILE_BATCH_SIZE: usize = 16;
+pub(super) const DELETION_RECONCILE_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(30)
+};
 
 pub(super) async fn delete_source(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let state = Arc::clone(&state);
     let runtime = tokio::runtime::Handle::current();
     let source_id = SourceId(id.clone());
-    tokio::task::spawn_blocking(move || {
+    let qdrant_enabled = runtime_config_snapshot(&state)
+        .map(|runtime| runtime.config.qdrant.enabled)
+        .unwrap_or(false);
+    let state = Arc::clone(&state);
+    let receipt = tokio::task::spawn_blocking(move || {
         run_with_pipeline(state, move |pipeline| {
-            runtime.block_on(pipeline.remove_source(&source_id))
+            runtime.block_on(pipeline.remove_source(&source_id))?;
+            pipeline
+                .store()
+                .latest_deletion_report(&source_id)?
+                .ok_or_else(|| anyhow::anyhow!("missing deletion receipt for {}", source_id.0))
         })
     })
     .await
@@ -27,7 +40,18 @@ pub(super) async fn delete_source(
         }
     })?;
 
-    Ok(StatusCode::NO_CONTENT)
+    // HNSW's pending status is an audit marker, not a scheduler-owned operation.
+    // Only remote, image-artifact, and retained-backup work should make deletion async.
+    let has_pending_work = (qdrant_enabled
+        && receipt.report.status_for(DeletionProduct::Qdrant) == Some(DeletionOutcome::Pending))
+        || [DeletionProduct::Images, DeletionProduct::Backups]
+            .into_iter()
+            .any(|product| receipt.report.status_for(product) == Some(DeletionOutcome::Pending));
+    if has_pending_work {
+        Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+    } else {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    }
 }
 
 /// Return durable, content-free deletion receipts for operational audit.
@@ -40,11 +64,8 @@ pub(super) async fn list_deletion_reports(
     Ok(Json(reports))
 }
 
-/// Reconcile pending remote erasures after the pipeline has been restored at startup.
-pub(super) async fn reconcile_deletions_on_startup(
-    state: &SharedState,
-    max_sources: usize,
-) -> Result<()> {
+/// Reconcile one bounded batch of pending erasures after the pipeline is restored.
+async fn reconcile_deletions_batch(state: &SharedState, max_sources: usize) -> Result<usize> {
     let state = Arc::clone(state);
     let runtime = tokio::runtime::Handle::current();
     let reports = tokio::task::spawn_blocking(move || {
@@ -53,13 +74,40 @@ pub(super) async fn reconcile_deletions_on_startup(
         })
     })
     .await
-    .context("join startup deletion reconciliation")??;
+    .context("join deletion reconciliation")??;
     if !reports.is_empty() {
         tracing::info!(
             count = reports.len(),
             max_sources,
-            "reconciled pending source deletions at startup"
+            "reconciled pending source deletions"
         );
     }
+    Ok(reports.len())
+}
+
+/// Reconcile the first bounded deletion batch before reporting the daemon ready.
+pub(super) async fn reconcile_deletions_on_startup(
+    state: &SharedState,
+    max_sources: usize,
+) -> Result<()> {
+    reconcile_deletions_batch(state, max_sources).await?;
     Ok(())
+}
+
+/// Continue bounded deletion reconciliation after the daemon becomes ready.
+pub(super) fn start_deletion_reconcile_scheduler(
+    state: SharedState,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(DELETION_RECONCILE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                reconcile_deletions_batch(&state, STARTUP_DELETION_RECONCILE_BATCH_SIZE).await
+            {
+                tracing::warn!(error = %error, "background deletion reconciliation failed");
+            }
+        }
+    })
 }

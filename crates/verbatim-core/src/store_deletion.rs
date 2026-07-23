@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use super::{
     bump_all_profile_index_generations, map_storage_error, replace_vector_documents_for_profile_tx,
@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS source_tombstones (
     backup_expiry_at INTEGER,
     legal_hold INTEGER NOT NULL DEFAULT 0,
     qdrant_outcome TEXT NOT NULL DEFAULT 'pending',
+    images_outcome TEXT NOT NULL DEFAULT 'pending',
     last_reconcile_attempt_ts INTEGER,
     last_reconcile_attempt_seq INTEGER
 );
@@ -45,6 +46,45 @@ BEGIN
     SELECT RAISE(ABORT, 'source is tombstoned');
 END;
 "#;
+
+const RECONCILE_ATTEMPT_INDEX_DEFINITION: &str = "
+CREATE INDEX source_tombstones_reconcile_attempt_idx
+    ON source_tombstones(last_reconcile_attempt_seq, source_id)
+    WHERE qdrant_outcome = 'pending'
+       OR images_outcome = 'pending'
+       OR (legal_hold = 0 AND backup_expiry_at IS NOT NULL)
+";
+
+pub(super) fn ensure_reconcile_attempt_index(connection: &Connection) -> Result<()> {
+    let existing: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'source_tombstones_reconcile_attempt_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.as_deref().is_some_and(|sql| {
+        normalized_sql(sql) != normalized_sql(RECONCILE_ATTEMPT_INDEX_DEFINITION)
+    }) {
+        connection.execute_batch("DROP INDEX source_tombstones_reconcile_attempt_idx;")?;
+    }
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS source_tombstones_reconcile_attempt_idx
+             ON source_tombstones(last_reconcile_attempt_seq, source_id)
+             WHERE qdrant_outcome = 'pending'
+                OR images_outcome = 'pending'
+                OR (legal_hold = 0 AND backup_expiry_at IS NOT NULL);",
+    )?;
+    Ok(())
+}
+
+fn normalized_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace() && *character != ';')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
 
 impl Store {
     /// Return whether a source id has a durable deletion tombstone.
@@ -143,38 +183,43 @@ impl Store {
         &self,
         max_sources: Option<usize>,
     ) -> Result<Vec<SourceId>> {
-        // Keep candidate selection on the tombstone table. The previously joined
-        // `deletion_reports` history was O(history) before applying a batch limit.
-        // `last_reconcile_attempt_seq` lets the index order new work before retries
-        // without relying on wall-clock timestamp precision, while the LIMIT bounds
-        // one startup/reconcile round to its batch.
+        // Select candidates from tombstones, avoiding an O(history) scan of deletion reports.
+        // The sequence puts new work before retries without wall-clock precision; LIMIT bounds
+        // each startup or scheduler reconciliation batch.
+        let now = i64::try_from(current_unix_timestamp_secs()).unwrap_or(i64::MAX);
         let sql = "
             SELECT source_id
             FROM source_tombstones
             WHERE (
                     qdrant_outcome = 'pending'
-                    OR legal_hold = 1
-                    OR backup_expiry_at IS NOT NULL
+                    OR images_outcome = 'pending'
+                    OR (legal_hold = 0 AND backup_expiry_at IS NOT NULL)
                   )
               AND (
                     qdrant_outcome = 'pending'
-                    OR legal_hold = 1
-                    OR last_reconcile_attempt_ts IS NULL
-                    OR last_reconcile_attempt_ts < backup_expiry_at
+                    OR images_outcome = 'pending'
+                    OR (
+                        backup_expiry_at <= ?1
+                        AND (
+                            last_reconcile_attempt_ts IS NULL
+                            OR last_reconcile_attempt_ts < backup_expiry_at
+                        )
+                    )
                   )
             ORDER BY last_reconcile_attempt_seq, source_id
         ";
         let mut statement = match max_sources {
             Some(max_sources) => {
-                let limited = format!("{sql} LIMIT ?1");
+                let limited = format!("{sql} LIMIT ?2");
                 let mut statement = self.conn.prepare(&limited)?;
                 let limit = i64::try_from(max_sources).unwrap_or(i64::MAX);
-                let rows = statement.query_map(params![limit], |row| Ok(SourceId(row.get(0)?)))?;
+                let rows =
+                    statement.query_map(params![now, limit], |row| Ok(SourceId(row.get(0)?)))?;
                 return rows.map(|row| row.map_err(Into::into)).collect();
             }
             None => self.conn.prepare(sql)?,
         };
-        let rows = statement.query_map([], |row| Ok(SourceId(row.get(0)?)))?;
+        let rows = statement.query_map(params![now], |row| Ok(SourceId(row.get(0)?)))?;
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 
@@ -187,6 +232,24 @@ impl Store {
             .conn
             .query_row(
                 "SELECT qdrant_outcome FROM source_tombstones WHERE source_id = ?1",
+                params![&source_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        outcome
+            .map(|outcome| qdrant_outcome_from_str(&outcome))
+            .transpose()
+    }
+
+    /// Return the durable image-artifact cleanup outcome for a tombstoned source.
+    pub(crate) fn image_deletion_outcome(
+        &self,
+        source_id: &SourceId,
+    ) -> Result<Option<DeletionOutcome>> {
+        let outcome = self
+            .conn
+            .query_row(
+                "SELECT images_outcome FROM source_tombstones WHERE source_id = ?1",
                 params![&source_id.0],
                 |row| row.get::<_, String>(0),
             )
@@ -237,11 +300,34 @@ impl Store {
     }
 
     /// Persist a Qdrant deletion outcome and an audit receipt from the current tombstone policy.
+    #[cfg(test)]
     pub(crate) fn finalize_deletion_outcome_tx(
         &self,
         transaction: &mut Transaction<'_>,
         source_id: &SourceId,
         outcome: DeletionOutcome,
+        report: &mut DeletionReport,
+    ) -> Result<()> {
+        let images_outcome = transaction
+            .query_row(
+                "SELECT images_outcome FROM source_tombstones WHERE source_id = ?1",
+                params![&source_id.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|outcome| qdrant_outcome_from_str(&outcome))
+            .transpose()?
+            .with_context(|| format!("source tombstone not found: {}", source_id.0))?;
+        self.finalize_deletion_outcomes_tx(transaction, source_id, outcome, images_outcome, report)
+    }
+
+    /// Persist remote and image-artifact deletion outcomes with their audit receipt atomically.
+    pub(crate) fn finalize_deletion_outcomes_tx(
+        &self,
+        transaction: &mut Transaction<'_>,
+        source_id: &SourceId,
+        qdrant_outcome: DeletionOutcome,
+        images_outcome: DeletionOutcome,
         report: &mut DeletionReport,
     ) -> Result<()> {
         let retention_policy = retention_policy_in_transaction(transaction, source_id)?;
@@ -255,12 +341,14 @@ impl Store {
         let changed = transaction.execute(
             "UPDATE source_tombstones
              SET qdrant_outcome = ?2,
-                 last_reconcile_attempt_ts = ?3,
-                 last_reconcile_attempt_seq = ?4
+                 images_outcome = ?3,
+                 last_reconcile_attempt_ts = ?4,
+                 last_reconcile_attempt_seq = ?5
              WHERE source_id = ?1",
             params![
                 &source_id.0,
-                qdrant_outcome_to_str(outcome),
+                qdrant_outcome_to_str(qdrant_outcome),
+                qdrant_outcome_to_str(images_outcome),
                 last_reconcile_attempt_ts,
                 last_reconcile_attempt_seq,
             ],
@@ -329,17 +417,26 @@ impl Store {
         };
         let mut report: DeletionReport = serde_json::from_str(&outcomes_json)
             .context("deserialize latest deletion-report outcomes")?;
-        let qdrant_outcome = transaction
+        let (qdrant_outcome, images_outcome) = transaction
             .query_row(
-                "SELECT qdrant_outcome FROM source_tombstones WHERE source_id = ?1",
+                "SELECT qdrant_outcome, images_outcome
+                 FROM source_tombstones WHERE source_id = ?1",
                 params![&source_id.0],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
-            .map(|outcome| qdrant_outcome_from_str(&outcome))
+            .map(
+                |(qdrant, images)| -> Result<(DeletionOutcome, DeletionOutcome)> {
+                    Ok((
+                        qdrant_outcome_from_str(&qdrant)?,
+                        qdrant_outcome_from_str(&images)?,
+                    ))
+                },
+            )
             .transpose()?
             .with_context(|| format!("source tombstone not found: {}", source_id.0))?;
         report.set(DeletionProduct::Qdrant, qdrant_outcome);
+        report.set(DeletionProduct::Images, images_outcome);
         report.set(
             DeletionProduct::Backups,
             retention_policy.backup_outcome_at(current_unix_timestamp_secs()),
@@ -373,7 +470,8 @@ impl Store {
         .collect()
     }
 
-    pub(crate) fn latest_deletion_report(
+    /// Load the newest durable receipt for one tombstoned source.
+    pub fn latest_deletion_report(
         &self,
         source_id: &SourceId,
     ) -> Result<Option<PersistedDeletionReport>> {
@@ -427,12 +525,15 @@ impl Store {
         id: &SourceId,
         retention_policy: RetentionPolicy,
     ) -> Result<u64> {
-        let tx = self.conn.unchecked_transaction()?;
+        let mut tx = self.conn.unchecked_transaction()?;
         // Delete first so CASCADE drops this source's live rows; then anti-join
         // purge every content-addressed cache row no remaining live source owns.
         // This catches historical V1 hashes after V2 replace and pre-commit orphans.
         tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-        record_source_tombstone(&tx, id, retention_policy)?;
+        if record_source_tombstone(&mut tx, id, retention_policy)? {
+            let report = initial_deletion_report(retention_policy);
+            self.persist_deletion_report_tx(&mut tx, id, retention_policy, &report)?;
+        }
         purge_unreferenced_caches_tx(&tx)?;
         let generation = bump_all_profile_index_generations(&tx)?;
         tx.commit()?;
@@ -481,12 +582,15 @@ impl Store {
     ) -> Result<u64> {
         self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
         (|| {
-            let tx = self.conn.unchecked_transaction()?;
+            let mut tx = self.conn.unchecked_transaction()?;
             // Delete first so CASCADE drops this source's live rows; then anti-join
             // purge every content-addressed cache row no remaining live source owns.
             // This catches historical V1 hashes after V2 replace and pre-commit orphans.
             tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-            record_source_tombstone(&tx, id, retention_policy)?;
+            if record_source_tombstone(&mut tx, id, retention_policy)? {
+                let report = initial_deletion_report(retention_policy);
+                self.persist_deletion_report_tx(&mut tx, id, retention_policy, &report)?;
+            }
             purge_unreferenced_caches_tx(&tx)?;
             replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
             let generation = bump_all_profile_index_generations(&tx)?;
@@ -586,12 +690,12 @@ fn next_reconcile_attempt_sequence(transaction: &Transaction<'_>) -> Result<i64>
 }
 
 fn record_source_tombstone(
-    transaction: &Transaction<'_>,
+    transaction: &mut Transaction<'_>,
     source_id: &SourceId,
     retention_policy: RetentionPolicy,
-) -> Result<()> {
+) -> Result<bool> {
     let (backup_expiry_at, legal_hold) = tombstone_retention_values(retention_policy)?;
-    transaction.execute(
+    let inserted = transaction.execute(
         "INSERT INTO source_tombstones
          (source_id, deleted_at, backup_expiry_at, legal_hold, qdrant_outcome)
          VALUES (?1, ?2, ?3, ?4, 'pending')
@@ -603,7 +707,32 @@ fn record_source_tombstone(
             legal_hold,
         ],
     )?;
-    Ok(())
+    Ok(inserted == 1)
+}
+
+fn initial_deletion_report(retention_policy: RetentionPolicy) -> DeletionReport {
+    let mut report = DeletionReport::new();
+    for product in [
+        DeletionProduct::SqliteAuthoritative,
+        DeletionProduct::Chunks,
+        DeletionProduct::Vectors,
+        DeletionProduct::Graph,
+        DeletionProduct::Caches,
+    ] {
+        report.set(product, DeletionOutcome::Erased);
+    }
+    for product in [
+        DeletionProduct::Hnsw,
+        DeletionProduct::Qdrant,
+        DeletionProduct::Images,
+    ] {
+        report.set(product, DeletionOutcome::Pending);
+    }
+    report.set(
+        DeletionProduct::Backups,
+        retention_policy.backup_outcome_at(current_unix_timestamp_secs()),
+    );
+    report
 }
 
 /// Purge content-addressed cache rows that no remaining live source references.

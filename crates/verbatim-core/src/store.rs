@@ -449,6 +449,16 @@ impl Store {
         ensure_column(
             &self.conn,
             "source_tombstones",
+            "images_outcome",
+            "ALTER TABLE source_tombstones ADD COLUMN images_outcome TEXT NOT NULL DEFAULT 'pending'",
+        )?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS source_tombstones_images_outcome_idx
+             ON source_tombstones(images_outcome);",
+        )?;
+        ensure_column(
+            &self.conn,
+            "source_tombstones",
             "last_reconcile_attempt_ts",
             "ALTER TABLE source_tombstones ADD COLUMN last_reconcile_attempt_ts INTEGER",
         )?;
@@ -458,14 +468,7 @@ impl Store {
             "last_reconcile_attempt_seq",
             "ALTER TABLE source_tombstones ADD COLUMN last_reconcile_attempt_seq INTEGER",
         )?;
-        self.conn.execute_batch(
-            "DROP INDEX IF EXISTS source_tombstones_reconcile_attempt_idx;
-             CREATE INDEX source_tombstones_reconcile_attempt_idx
-                ON source_tombstones(last_reconcile_attempt_seq, source_id)
-                WHERE qdrant_outcome = 'pending'
-                   OR legal_hold = 1
-                   OR backup_expiry_at IS NOT NULL;",
-        )?;
+        store_deletion::ensure_reconcile_attempt_index(&self.conn)?;
         ensure_column(
             &self.conn,
             "evidence_units",

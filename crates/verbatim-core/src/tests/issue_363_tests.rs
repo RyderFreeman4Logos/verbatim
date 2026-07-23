@@ -97,9 +97,9 @@ async fn source_erasure_removes_local_derivatives_tombstones_and_blocks_reingest
         .to_string()
         .contains("tombstoned"));
     let persisted_reports = pipeline.store().list_deletion_reports().unwrap();
-    assert_eq!(persisted_reports.len(), 1);
-    assert_eq!(persisted_reports[0].source_id, source_id);
-    assert_eq!(persisted_reports[0].report, report);
+    assert_eq!(persisted_reports.len(), 2);
+    assert_eq!(persisted_reports[1].source_id, source_id);
+    assert_eq!(persisted_reports[1].report, report);
     assert!(!format!("{report:?}").contains(restricted_content));
 }
 
@@ -230,9 +230,9 @@ fn finalizing_deletion_outcome_persists_report_after_deletion() {
     transaction.commit().unwrap();
 
     let persisted_reports = store.list_deletion_reports().unwrap();
-    assert_eq!(persisted_reports.len(), 1);
-    assert_eq!(persisted_reports[0].source_id, source.id);
-    assert_eq!(persisted_reports[0].report, report);
+    assert_eq!(persisted_reports.len(), 2);
+    assert_eq!(persisted_reports[1].source_id, source.id);
+    assert_eq!(persisted_reports[1].report, report);
     assert!(store
         .pending_qdrant_deletion_source_ids()
         .unwrap()
@@ -252,6 +252,7 @@ fn failed_deletion_report_insert_rolls_back_qdrant_outcome() {
     };
     store.add_source(&source).unwrap();
     store.remove_source(&source.id).unwrap();
+    let initial_report_count = store.list_deletion_reports().unwrap().len();
     store
         .connection()
         .execute_batch(
@@ -280,7 +281,10 @@ fn failed_deletion_report_insert_rolls_back_qdrant_outcome() {
         store.pending_qdrant_deletion_source_ids().unwrap(),
         vec![source.id],
     );
-    assert!(store.list_deletion_reports().unwrap().is_empty());
+    assert_eq!(
+        store.list_deletion_reports().unwrap().len(),
+        initial_report_count
+    );
 }
 
 #[tokio::test]
@@ -497,6 +501,7 @@ async fn bounded_reconcile_stops_after_one_hanging_qdrant_attempt() {
         tempdir.path().to_path_buf(),
     )
     .with_qdrant_client(qdrant);
+    let initial_report_count = pipeline.store().list_deletion_reports().unwrap().len();
 
     let reports = pipeline
         .reconcile_deletions_up_to(BATCH_SIZE)
@@ -519,7 +524,7 @@ async fn bounded_reconcile_stops_after_one_hanging_qdrant_attempt() {
     );
     assert_eq!(
         pipeline.store().list_deletion_reports().unwrap().len(),
-        BATCH_SIZE,
+        initial_report_count + BATCH_SIZE,
     );
 
     release_response_tx.send(()).unwrap();
@@ -584,9 +589,9 @@ async fn restart_reconciles_pending_deletion_and_persists_the_retry_report() {
         Some(DeletionOutcome::Pending),
     );
     let persisted_reports = pipeline.store().list_deletion_reports().unwrap();
-    assert_eq!(persisted_reports.len(), 1);
-    assert_eq!(persisted_reports[0].source_id, source.id);
-    assert_eq!(persisted_reports[0].report, reports[0]);
+    assert_eq!(persisted_reports.len(), 2);
+    assert_eq!(persisted_reports[1].source_id, source.id);
+    assert_eq!(persisted_reports[1].report, reports[0]);
 }
 
 #[tokio::test]

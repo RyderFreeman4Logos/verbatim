@@ -47,10 +47,11 @@ where
         // single-writer bulkhead used by other durable SQLite writers.
         let _sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let mut transaction = self.store.connection().unchecked_transaction()?;
-        self.store.finalize_deletion_outcome_tx(
+        self.store.finalize_deletion_outcomes_tx(
             &mut transaction,
             source_id,
             qdrant_outcome,
+            images,
             &mut report,
         )?;
         transaction.commit()?;
@@ -104,18 +105,40 @@ where
                 }
                 outcome => outcome,
             };
+            let images_outcome = match self
+                .store
+                .image_deletion_outcome(&source_id)?
+                .with_context(|| format!("source tombstone not found: {}", source_id.0))?
+            {
+                DeletionOutcome::Pending => {
+                    match remove_source_image_artifacts(&self.data_dir, &source_id) {
+                        Ok(()) => DeletionOutcome::Erased,
+                        Err(error) => {
+                            tracing::warn!(
+                                source = %source_id.0,
+                                error = %error,
+                                "image artifact cleanup retry failed after committed source removal"
+                            );
+                            DeletionOutcome::Pending
+                        }
+                    }
+                }
+                outcome => outcome,
+            };
             let mut report = match self.store.latest_deletion_report(&source_id)? {
                 Some(previous) => previous.report,
                 None => self.local_deletion_report(&source_id, DeletionOutcome::Pending)?,
             };
             report.set(DeletionProduct::Qdrant, qdrant_outcome);
+            report.set(DeletionProduct::Images, images_outcome);
             let _sqlite_write_permit =
                 acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
             let mut transaction = self.store.connection().unchecked_transaction()?;
-            self.store.finalize_deletion_outcome_tx(
+            self.store.finalize_deletion_outcomes_tx(
                 &mut transaction,
                 &source_id,
                 qdrant_outcome,
+                images_outcome,
                 &mut report,
             )?;
             transaction.commit()?;

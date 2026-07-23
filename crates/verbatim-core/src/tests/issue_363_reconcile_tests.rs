@@ -139,26 +139,37 @@ fn bounded_reconcile_query_avoids_large_deletion_report_history() {
              FROM source_tombstones
              WHERE (
                      qdrant_outcome = 'pending'
-                     OR legal_hold = 1
-                     OR backup_expiry_at IS NOT NULL
+                     OR images_outcome = 'pending'
+                     OR (legal_hold = 0 AND backup_expiry_at IS NOT NULL)
                    )
                AND (
                      qdrant_outcome = 'pending'
-                     OR legal_hold = 1
-                     OR last_reconcile_attempt_ts IS NULL
-                     OR last_reconcile_attempt_ts < backup_expiry_at
+                     OR images_outcome = 'pending'
+                     OR (
+                         backup_expiry_at <= ?1
+                         AND (
+                             last_reconcile_attempt_ts IS NULL
+                             OR last_reconcile_attempt_ts < backup_expiry_at
+                         )
+                     )
                    )
              ORDER BY last_reconcile_attempt_seq, source_id
-             LIMIT 3",
+             LIMIT ?2",
         )
         .unwrap();
     let query_plan = statement
-        .query_map([], |row| row.get::<_, String>(3))
+        .query_map(
+            rusqlite::params![i64::MAX, i64::try_from(BATCH_SIZE).unwrap()],
+            |row| row.get::<_, String>(3),
+        )
         .unwrap()
         .collect::<std::result::Result<Vec<_>, _>>()
         .unwrap()
         .join("\n");
-    assert!(query_plan.contains("source_tombstones_reconcile_attempt_idx"));
+    assert!(
+        query_plan.contains("source_tombstones_reconcile_attempt_idx"),
+        "expected bounded reconciliation index in query plan: {query_plan}"
+    );
     assert!(!query_plan.contains("deletion_reports"));
 }
 
@@ -196,7 +207,7 @@ async fn bounded_reconcile_round_robins_pending_tombstones_through_same_timestam
         &source_ids[..BATCH_SIZE],
         &source_ids[BATCH_SIZE..],
     ];
-    let mut report_count = 0;
+    let mut report_count = pipeline.store().list_deletion_reports().unwrap().len();
     for expected_source_ids in expected_batches {
         assert_eq!(
             pipeline
@@ -267,7 +278,9 @@ async fn interrupted_qdrant_compensation_requeues_tombstone_for_reconciliation()
         latest.report.status_for(DeletionProduct::Qdrant),
         Some(DeletionOutcome::Pending),
     );
-    assert_eq!(store.list_deletion_reports().unwrap().len(), 2);
+    // The initial erasure receipt, terminal compensation receipt, and requeue receipt
+    // are each durable audit events.
+    assert_eq!(store.list_deletion_reports().unwrap().len(), 3);
     let pipeline = IngestPipeline::from_parts(
         store,
         HnswIndex::new(),

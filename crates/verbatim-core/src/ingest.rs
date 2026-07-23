@@ -123,6 +123,9 @@ mod issue_362_tests;
 #[path = "tests/issue_363_cache_purge_tests.rs"]
 mod issue_363_cache_purge_tests;
 #[cfg(test)]
+#[path = "tests/issue_363_deletion_lifecycle_tests.rs"]
+mod issue_363_deletion_lifecycle_tests;
+#[cfg(test)]
 #[path = "tests/issue_363_qdrant_mutation_fence_tests.rs"]
 mod issue_363_qdrant_mutation_fence_tests;
 #[cfg(test)]
@@ -934,8 +937,16 @@ struct IndexManifest {
     generation: u64,
 }
 
+fn validate_qdrant_runtime_support(enabled: bool, compiled_support: bool) -> Result<()> {
+    if enabled && !compiled_support {
+        bail!("qdrant.enabled=true requires a binary built with the verbatim-core/qdrant feature");
+    }
+    Ok(())
+}
+
 impl IngestPipeline<OpenAiEmbeddingClient> {
     pub fn new(config: &Config, data_dir: &Path) -> Result<Self> {
+        validate_qdrant_runtime_support(config.qdrant.enabled, cfg!(feature = "qdrant"))?;
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("create data dir: {}", data_dir.display()))?;
 
@@ -1027,6 +1038,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
     }
 
     pub fn open_readonly(config: &Config, data_dir: &Path) -> Result<Self> {
+        validate_qdrant_runtime_support(config.qdrant.enabled, cfg!(feature = "qdrant"))?;
         let db_path = data_dir.join("verbatim.db");
         let store = Store::open_existing_readonly_with_durability_profile(
             &db_path,
@@ -1106,6 +1118,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
     }
 
     pub fn reload_runtime_config(&mut self, config: &Config) -> Result<()> {
+        validate_qdrant_runtime_support(config.qdrant.enabled, cfg!(feature = "qdrant"))?;
         self.embed_client = OpenAiEmbeddingClient::new(&config.embedding);
         self.embedding_enabled = config.embedding.enabled;
         self.context_gen = if config.context.enabled {
