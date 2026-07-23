@@ -3,6 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
+mod deletion_outcome;
+
+use deletion_outcome::{outcome_from_str, outcome_to_str};
+
 use super::{
     bump_all_profile_index_generations, map_storage_error, replace_vector_documents_for_profile_tx,
     unix_timestamp_string, SqliteWriteOperation, Store,
@@ -237,7 +241,7 @@ impl Store {
             )
             .optional()?;
         outcome
-            .map(|outcome| qdrant_outcome_from_str(&outcome))
+            .map(|outcome| outcome_from_str(&outcome))
             .transpose()
     }
 
@@ -255,7 +259,7 @@ impl Store {
             )
             .optional()?;
         outcome
-            .map(|outcome| qdrant_outcome_from_str(&outcome))
+            .map(|outcome| outcome_from_str(&outcome))
             .transpose()
     }
 
@@ -315,7 +319,7 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .optional()?
-            .map(|outcome| qdrant_outcome_from_str(&outcome))
+            .map(|outcome| outcome_from_str(&outcome))
             .transpose()?
             .with_context(|| format!("source tombstone not found: {}", source_id.0))?;
         self.finalize_deletion_outcomes_tx(transaction, source_id, outcome, images_outcome, report)
@@ -347,8 +351,8 @@ impl Store {
              WHERE source_id = ?1",
             params![
                 &source_id.0,
-                qdrant_outcome_to_str(qdrant_outcome),
-                qdrant_outcome_to_str(images_outcome),
+                outcome_to_str(qdrant_outcome),
+                outcome_to_str(images_outcome),
                 last_reconcile_attempt_ts,
                 last_reconcile_attempt_seq,
             ],
@@ -427,10 +431,7 @@ impl Store {
             .optional()?
             .map(
                 |(qdrant, images)| -> Result<(DeletionOutcome, DeletionOutcome)> {
-                    Ok((
-                        qdrant_outcome_from_str(&qdrant)?,
-                        qdrant_outcome_from_str(&images)?,
-                    ))
+                    Ok((outcome_from_str(&qdrant)?, outcome_from_str(&images)?))
                 },
             )
             .transpose()?
@@ -530,8 +531,8 @@ impl Store {
         // purge every content-addressed cache row no remaining live source owns.
         // This catches historical V1 hashes after V2 replace and pre-commit orphans.
         tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-        if record_source_tombstone(&mut tx, id, retention_policy)? {
-            let report = initial_deletion_report(retention_policy);
+        if record_source_tombstone(&mut tx, id, retention_policy, DeletionOutcome::Pending)? {
+            let report = initial_deletion_report(retention_policy, DeletionOutcome::Pending);
             self.persist_deletion_report_tx(&mut tx, id, retention_policy, &report)?;
         }
         purge_unreferenced_caches_tx(&tx)?;
@@ -551,6 +552,7 @@ impl Store {
             id,
             vectors,
             RetentionPolicy::Immediate,
+            DeletionOutcome::Pending,
         )
     }
 
@@ -579,6 +581,7 @@ impl Store {
         id: &SourceId,
         vectors: &[VectorDocument],
         retention_policy: RetentionPolicy,
+        qdrant_outcome: DeletionOutcome,
     ) -> Result<u64> {
         self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
         (|| {
@@ -587,8 +590,8 @@ impl Store {
             // purge every content-addressed cache row no remaining live source owns.
             // This catches historical V1 hashes after V2 replace and pre-commit orphans.
             tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-            if record_source_tombstone(&mut tx, id, retention_policy)? {
-                let report = initial_deletion_report(retention_policy);
+            if record_source_tombstone(&mut tx, id, retention_policy, qdrant_outcome)? {
+                let report = initial_deletion_report(retention_policy, qdrant_outcome);
                 self.persist_deletion_report_tx(&mut tx, id, retention_policy, &report)?;
             }
             purge_unreferenced_caches_tx(&tx)?;
@@ -693,24 +696,29 @@ fn record_source_tombstone(
     transaction: &mut Transaction<'_>,
     source_id: &SourceId,
     retention_policy: RetentionPolicy,
+    qdrant_outcome: DeletionOutcome,
 ) -> Result<bool> {
     let (backup_expiry_at, legal_hold) = tombstone_retention_values(retention_policy)?;
     let inserted = transaction.execute(
         "INSERT INTO source_tombstones
          (source_id, deleted_at, backup_expiry_at, legal_hold, qdrant_outcome)
-         VALUES (?1, ?2, ?3, ?4, 'pending')
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(source_id) DO NOTHING",
         params![
             &source_id.0,
             unix_timestamp_string(),
             backup_expiry_at,
             legal_hold,
+            outcome_to_str(qdrant_outcome),
         ],
     )?;
     Ok(inserted == 1)
 }
 
-fn initial_deletion_report(retention_policy: RetentionPolicy) -> DeletionReport {
+fn initial_deletion_report(
+    retention_policy: RetentionPolicy,
+    qdrant_outcome: DeletionOutcome,
+) -> DeletionReport {
     let mut report = DeletionReport::new();
     for product in [
         DeletionProduct::SqliteAuthoritative,
@@ -721,13 +729,10 @@ fn initial_deletion_report(retention_policy: RetentionPolicy) -> DeletionReport 
     ] {
         report.set(product, DeletionOutcome::Erased);
     }
-    for product in [
-        DeletionProduct::Hnsw,
-        DeletionProduct::Qdrant,
-        DeletionProduct::Images,
-    ] {
+    for product in [DeletionProduct::Hnsw, DeletionProduct::Images] {
         report.set(product, DeletionOutcome::Pending);
     }
+    report.set(DeletionProduct::Qdrant, qdrant_outcome);
     report.set(
         DeletionProduct::Backups,
         retention_policy.backup_outcome_at(current_unix_timestamp_secs()),
@@ -777,23 +782,4 @@ fn purge_unreferenced_caches_tx(transaction: &Transaction<'_>) -> Result<()> {
         [],
     )?;
     Ok(())
-}
-
-fn qdrant_outcome_to_str(outcome: DeletionOutcome) -> &'static str {
-    match outcome {
-        DeletionOutcome::Erased => "erased",
-        DeletionOutcome::Pending => "pending",
-        DeletionOutcome::Held => "held",
-        DeletionOutcome::NotFound => "not_found",
-    }
-}
-
-fn qdrant_outcome_from_str(outcome: &str) -> Result<DeletionOutcome> {
-    match outcome {
-        "erased" => Ok(DeletionOutcome::Erased),
-        "pending" => Ok(DeletionOutcome::Pending),
-        "held" => Ok(DeletionOutcome::Held),
-        "not_found" => Ok(DeletionOutcome::NotFound),
-        _ => bail!("unknown qdrant deletion outcome: {outcome}"),
-    }
 }

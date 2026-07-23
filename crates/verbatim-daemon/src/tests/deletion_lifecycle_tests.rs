@@ -29,6 +29,34 @@ async fn delete_source_returns_accepted_when_remote_erasure_is_pending() {
 }
 
 #[tokio::test]
+async fn delete_source_with_disabled_qdrant_persists_terminal_receipt_and_returns_no_content() {
+    let test_dir = TestDir::new("delete-source-disabled-qdrant");
+    let source_path = test_dir.path().join("doc.md");
+    fs::write(&source_path, "delete me without Qdrant").unwrap();
+    let config = retrieve_test_config("http://127.0.0.1:9/v1");
+    assert!(!config.qdrant.enabled);
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let source_id = pipeline.add_source(&source_path).unwrap();
+    let state = test_state(config, test_dir.path(), pipeline);
+
+    let response = delete_source(State(Arc::clone(&state)), Path(source_id.0.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let report = with_task_store_read(&state, move |store| store.latest_deletion_report(&source_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report
+            .report
+            .status_for(verbatim_core::deletion::DeletionProduct::Qdrant),
+        Some(verbatim_core::deletion::DeletionOutcome::NotFound),
+    );
+}
+
+#[tokio::test]
 async fn deletion_scheduler_continues_beyond_the_startup_batch_limit() {
     let test_dir = TestDir::new("deletion-reconcile-scheduler-continuation");
     let mut config = retrieve_test_config("http://127.0.0.1:9/v1");

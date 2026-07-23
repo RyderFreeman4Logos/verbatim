@@ -17,9 +17,6 @@ pub(super) async fn delete_source(
     let state = Arc::clone(&state);
     let runtime = tokio::runtime::Handle::current();
     let source_id = SourceId(id.clone());
-    let qdrant_enabled = runtime_config_snapshot(&state)
-        .map(|runtime| runtime.config.qdrant.enabled)
-        .unwrap_or(false);
     let state = Arc::clone(&state);
     let receipt = tokio::task::spawn_blocking(move || {
         run_with_pipeline(state, move |pipeline| {
@@ -42,11 +39,13 @@ pub(super) async fn delete_source(
 
     // HNSW's pending status is an audit marker, not a scheduler-owned operation.
     // Only remote, image-artifact, and retained-backup work should make deletion async.
-    let has_pending_work = (qdrant_enabled
-        && receipt.report.status_for(DeletionProduct::Qdrant) == Some(DeletionOutcome::Pending))
-        || [DeletionProduct::Images, DeletionProduct::Backups]
-            .into_iter()
-            .any(|product| receipt.report.status_for(product) == Some(DeletionOutcome::Pending));
+    let has_pending_work = [
+        DeletionProduct::Qdrant,
+        DeletionProduct::Images,
+        DeletionProduct::Backups,
+    ]
+    .into_iter()
+    .any(|product| receipt.report.status_for(product) == Some(DeletionOutcome::Pending));
     if has_pending_work {
         Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
     } else {

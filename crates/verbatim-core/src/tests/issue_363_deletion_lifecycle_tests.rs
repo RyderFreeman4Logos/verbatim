@@ -97,6 +97,89 @@ async fn reconciliation_retries_a_persisted_pending_image_cleanup() {
 }
 
 #[tokio::test]
+async fn disabled_qdrant_tombstone_is_not_selected_on_repeated_scheduler_ticks() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let source_path = tempdir.path().join("disabled-qdrant-source.md");
+    std::fs::write(&source_path, "Qdrant is disabled for this deletion").unwrap();
+    let store = Store::in_memory().unwrap();
+    let mut pipeline = IngestPipeline::from_parts(
+        store,
+        HnswIndex::new(),
+        DeletionLifecycleEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    );
+    let source_id = pipeline.add_source(&source_path).unwrap();
+
+    let report = pipeline.remove_source(&source_id).await.unwrap();
+
+    assert_eq!(
+        report.status_for(DeletionProduct::Qdrant),
+        Some(DeletionOutcome::NotFound),
+    );
+    assert_eq!(
+        pipeline
+            .store()
+            .qdrant_deletion_outcome(&source_id)
+            .unwrap(),
+        Some(DeletionOutcome::NotFound),
+    );
+    let report_count = pipeline.store().list_deletion_reports().unwrap().len();
+    for _ in 0..3 {
+        assert!(pipeline
+            .reconcile_deletions_up_to(16)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    assert_eq!(
+        pipeline.store().list_deletion_reports().unwrap().len(),
+        report_count
+    );
+}
+
+#[cfg(feature = "qdrant")]
+#[tokio::test]
+async fn configured_qdrant_failure_remains_pending_and_retryable() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let source_path = tempdir.path().join("retryable-qdrant-source.md");
+    std::fs::write(&source_path, "Qdrant is configured but unavailable").unwrap();
+    let qdrant = crate::index::qdrant::QdrantClient::new(crate::config::QdrantConfig {
+        enabled: true,
+        url: "http://127.0.0.1:9".into(),
+        collection: "verbatim".into(),
+        prefer_for_search: false,
+        timeout_seconds: 1,
+    });
+    let store = Store::in_memory().unwrap();
+    let mut pipeline = IngestPipeline::from_parts(
+        store,
+        HnswIndex::new(),
+        DeletionLifecycleEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    )
+    .with_qdrant_client(qdrant);
+    let source_id = pipeline.add_source(&source_path).unwrap();
+
+    let initial = pipeline.remove_source(&source_id).await.unwrap();
+
+    assert_eq!(
+        initial.status_for(DeletionProduct::Qdrant),
+        Some(DeletionOutcome::Pending),
+    );
+    let report_count = pipeline.store().list_deletion_reports().unwrap().len();
+    let retry = pipeline.reconcile_deletions_up_to(1).await.unwrap();
+    assert_eq!(retry.len(), 1);
+    assert_eq!(
+        retry[0].status_for(DeletionProduct::Qdrant),
+        Some(DeletionOutcome::Pending),
+    );
+    assert_eq!(
+        pipeline.store().list_deletion_reports().unwrap().len(),
+        report_count + 1
+    );
+}
+
+#[tokio::test]
 async fn reconciliation_selects_only_actionable_tombstones() {
     let tempdir = tempfile::tempdir().unwrap();
     let store = Store::in_memory().unwrap();

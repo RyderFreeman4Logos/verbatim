@@ -87,7 +87,7 @@ async fn source_erasure_removes_local_derivatives_tombstones_and_blocks_reingest
     );
     assert_eq!(
         report.status_for(DeletionProduct::Qdrant),
-        Some(DeletionOutcome::Pending),
+        Some(DeletionOutcome::NotFound),
     );
     assert!(pipeline.hnsw().search(&[1.0, 0.0], 1).is_empty());
     assert!(pipeline.store().is_tombstoned(&source_id).unwrap());
@@ -559,7 +559,7 @@ fn read_hanging_qdrant_request(stream: &mut std::net::TcpStream) {
 }
 
 #[tokio::test]
-async fn restart_reconciles_pending_deletion_and_persists_the_retry_report() {
+async fn restart_terminalizes_pending_deletion_when_qdrant_is_not_configured() {
     let tempdir = tempfile::tempdir().unwrap();
     let database_path = tempdir.path().join("verbatim.db");
     let source = Source {
@@ -586,7 +586,7 @@ async fn restart_reconciles_pending_deletion_and_persists_the_retry_report() {
     assert_eq!(reports.len(), 1);
     assert_eq!(
         reports[0].status_for(DeletionProduct::Qdrant),
-        Some(DeletionOutcome::Pending),
+        Some(DeletionOutcome::NotFound),
     );
     let persisted_reports = pipeline.store().list_deletion_reports().unwrap();
     assert_eq!(persisted_reports.len(), 2);

@@ -15,7 +15,10 @@ use crate::types::SourceId;
 
 #[derive(Clone, Copy)]
 enum SourceRemovalKind {
-    Erasure(RetentionPolicy),
+    Erasure {
+        retention_policy: RetentionPolicy,
+        qdrant_outcome: DeletionOutcome,
+    },
     Housekeeping,
 }
 
@@ -33,14 +36,25 @@ where
         source_id: &SourceId,
         retention_policy: RetentionPolicy,
     ) -> Result<DeletionReport> {
+        let initial_qdrant_outcome = self.initial_qdrant_deletion_outcome();
         let images = self
-            .remove_source_locally(source_id, SourceRemovalKind::Erasure(retention_policy))
+            .remove_source_locally(
+                source_id,
+                SourceRemovalKind::Erasure {
+                    retention_policy,
+                    qdrant_outcome: initial_qdrant_outcome,
+                },
+            )
             .await?;
 
         #[cfg(feature = "qdrant")]
-        let qdrant_outcome = self.sync_qdrant_delete_source(source_id).await;
+        let qdrant_outcome = if initial_qdrant_outcome == DeletionOutcome::Pending {
+            self.sync_qdrant_delete_source(source_id).await
+        } else {
+            initial_qdrant_outcome
+        };
         #[cfg(not(feature = "qdrant"))]
-        let qdrant_outcome = DeletionOutcome::Pending;
+        let qdrant_outcome = initial_qdrant_outcome;
         let mut report = self.local_deletion_report(source_id, images)?;
         report.set(DeletionProduct::Qdrant, qdrant_outcome);
         // Finalize after the remote await so we re-read retention under the same
@@ -150,7 +164,7 @@ where
     #[cfg(feature = "qdrant")]
     async fn sync_qdrant_delete_source(&self, source_id: &SourceId) -> DeletionOutcome {
         let Some(qdrant) = &self.qdrant else {
-            return DeletionOutcome::Pending;
+            return DeletionOutcome::NotFound;
         };
         // Acquire this before the throughput permit. It excludes both in-flight
         // source/profile upserts and any later upsert from the Erased receipt's
@@ -202,13 +216,17 @@ where
         drop(index_publish_permit);
         let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
         let generation = match removal_kind {
-            SourceRemovalKind::Erasure(retention_policy) => self
+            SourceRemovalKind::Erasure {
+                retention_policy,
+                qdrant_outcome,
+            } => self
                 .store
                 .remove_source_and_replace_vectors_for_profile_with_retention(
                     &active_profile_id,
                     source_id,
                     &prepared.vectors,
                     retention_policy,
+                    qdrant_outcome,
                 ),
             SourceRemovalKind::Housekeeping => self
                 .store
@@ -270,6 +288,19 @@ where
                 .backup_deletion_outcome_at(source_id, current_unix_timestamp_secs())?,
         );
         Ok(report)
+    }
+
+    fn initial_qdrant_deletion_outcome(&self) -> DeletionOutcome {
+        #[cfg(feature = "qdrant")]
+        {
+            self.qdrant
+                .as_ref()
+                .map_or(DeletionOutcome::NotFound, |_| DeletionOutcome::Pending)
+        }
+        #[cfg(not(feature = "qdrant"))]
+        {
+            DeletionOutcome::NotFound
+        }
     }
 }
 

@@ -18,6 +18,17 @@ impl EmbeddingClient for ReconcileEmbeddingClient {
     }
 }
 
+#[cfg(feature = "qdrant")]
+fn unavailable_qdrant_client() -> crate::index::qdrant::QdrantClient {
+    crate::index::qdrant::QdrantClient::new(crate::config::QdrantConfig {
+        enabled: true,
+        url: "http://127.0.0.1:9".into(),
+        collection: "verbatim".into(),
+        prefer_for_search: false,
+        timeout_seconds: 1,
+    })
+}
+
 #[test]
 fn bounded_reconcile_selects_never_attempted_qdrant_tombstone_after_terminal_and_held_prefix() {
     const STARTUP_BATCH_CAP: usize = 16;
@@ -173,6 +184,7 @@ fn bounded_reconcile_query_avoids_large_deletion_report_history() {
     assert!(!query_plan.contains("deletion_reports"));
 }
 
+#[cfg(feature = "qdrant")]
 #[tokio::test]
 async fn bounded_reconcile_round_robins_pending_tombstones_through_same_timestamp_ties() {
     const BATCH_SIZE: usize = 2;
@@ -199,7 +211,8 @@ async fn bounded_reconcile_round_robins_pending_tombstones_through_same_timestam
         HnswIndex::new(),
         ReconcileEmbeddingClient,
         tempdir.path().to_path_buf(),
-    );
+    )
+    .with_qdrant_client(unavailable_qdrant_client());
 
     let expected_batches = [
         &source_ids[..BATCH_SIZE],
@@ -286,7 +299,8 @@ async fn interrupted_qdrant_compensation_requeues_tombstone_for_reconciliation()
         HnswIndex::new(),
         ReconcileEmbeddingClient,
         tempdir.path().to_path_buf(),
-    );
+    )
+    .with_qdrant_client(unavailable_qdrant_client());
 
     let reports = pipeline.reconcile_deletions_up_to(1).await.unwrap();
     assert_eq!(reports.len(), 1);
