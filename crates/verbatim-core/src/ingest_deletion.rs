@@ -76,6 +76,13 @@ where
     pub async fn remove_source_for_housekeeping(&mut self, source_id: &SourceId) -> Result<()> {
         self.remove_source_locally(source_id, SourceRemovalKind::Housekeeping)
             .await?;
+        // Clean up Qdrant points for the removed source without creating a
+        // deletion tombstone. This preserves the deliberate no-tombstone/ID-reuse
+        // semantics while ensuring cross-backend cleanup.
+        #[cfg(feature = "qdrant")]
+        {
+            self.sync_qdrant_delete_source(source_id).await;
+        }
         Ok(())
     }
 
