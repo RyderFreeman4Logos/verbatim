@@ -25,15 +25,20 @@ use crate::types::{
     EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, ImageArtifact,
     ImageId, Source, SourceEmbeddingStatus, SourceId, SourceStatus, DEFAULT_EMBEDDING_PROFILE_ID,
 };
-use crate::vision_caption::{CaptionAttempt, ImageCaption, ImageCaptionRecord, ImageCaptionStatus};
+use crate::vision_caption::{ImageCaption, ImageCaptionRecord, ImageCaptionStatus};
 
 #[path = "store_evidence_spans.rs"]
 mod evidence_spans;
 #[path = "source_contents_replacement.rs"]
 mod source_contents_replacement;
+#[path = "store_cache.rs"]
+mod store_cache;
+#[path = "store_deletion.rs"]
+mod store_deletion;
 pub use source_contents_replacement::{
     SourceContentsReplacement, SourceContentsReplacementReport, SourceLexicalIndexUpdate,
 };
+pub use store_cache::SourceEmbeddingCacheVector;
 
 #[cfg(test)]
 #[path = "store_evidence_spans_tests.rs"]
@@ -437,7 +442,33 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         self.conn.execute_batch(SCHEMA)?;
+        self.conn.execute_batch(store_deletion::DELETION_SCHEMA)?;
+        self.conn
+            .execute_batch(store_deletion::PREVENT_RESURRECTED_SOURCES_TRIGGER)?;
         migrate_embedding_profile_tables(&self.conn)?;
+        ensure_column(
+            &self.conn,
+            "source_tombstones",
+            "images_outcome",
+            "ALTER TABLE source_tombstones ADD COLUMN images_outcome TEXT NOT NULL DEFAULT 'pending'",
+        )?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS source_tombstones_images_outcome_idx
+             ON source_tombstones(images_outcome);",
+        )?;
+        ensure_column(
+            &self.conn,
+            "source_tombstones",
+            "last_reconcile_attempt_ts",
+            "ALTER TABLE source_tombstones ADD COLUMN last_reconcile_attempt_ts INTEGER",
+        )?;
+        ensure_column(
+            &self.conn,
+            "source_tombstones",
+            "last_reconcile_attempt_seq",
+            "ALTER TABLE source_tombstones ADD COLUMN last_reconcile_attempt_seq INTEGER",
+        )?;
+        store_deletion::ensure_reconcile_attempt_index(&self.conn)?;
         ensure_column(
             &self.conn,
             "evidence_units",
@@ -525,8 +556,12 @@ impl Store {
     // --- Source ---
 
     pub fn add_source(&self, source: &Source) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        let inserted = self.conn.execute(
+            "INSERT INTO sources (id, path, hash, status, parser_used, last_ingested_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE NOT EXISTS (
+                SELECT 1 FROM source_tombstones WHERE source_id = ?1
+             )",
             params![
                 source.id.0,
                 source.path.to_str().unwrap_or(""),
@@ -536,6 +571,9 @@ impl Store {
                 source.last_ingested_at,
             ],
         )?;
+        if inserted == 0 {
+            bail!("source id is tombstoned: {}", source.id.0);
+        }
         Ok(())
     }
 
@@ -572,14 +610,6 @@ impl Store {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
         }
-    }
-
-    pub fn remove_source(&self, id: &SourceId) -> Result<u64> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-        let generation = bump_all_profile_index_generations(&tx)?;
-        tx.commit()?;
-        Ok(generation)
     }
 
     // --- Collections ---
@@ -808,24 +838,6 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![collection_name], |row| row.get::<_, String>(0))?;
         rows.map(|row| row.map_err(Into::into)).collect()
-    }
-
-    pub fn remove_source_and_replace_vectors_for_profile(
-        &self,
-        profile_id: &EmbeddingProfileId,
-        id: &SourceId,
-        vectors: &[VectorDocument],
-    ) -> Result<u64> {
-        self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
-        (|| {
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
-            replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
-            let generation = bump_all_profile_index_generations(&tx)?;
-            tx.commit()?;
-            Ok(generation)
-        })()
-        .map_err(|error| map_storage_error(SqliteWriteOperation::Ingest, error))
     }
 
     pub fn replace_source_contents(
@@ -1216,48 +1228,6 @@ impl Store {
         )?;
         let rows = stmt.query_map([], row_to_image_caption_record)?;
         rows.map(|row| row.map_err(Into::into)).collect()
-    }
-
-    pub(crate) fn upsert_image_caption_attempt(
-        &self,
-        image_hash: &str,
-        model: &str,
-        prompt_version: &str,
-        prompt_hash: &str,
-        attempt: &CaptionAttempt,
-    ) -> Result<()> {
-        let caption_json = attempt
-            .caption
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .context("serialize image caption")?;
-        let now = unix_timestamp_string();
-        self.conn.execute(
-            "INSERT INTO image_captions (image_hash, model, prompt_version, prompt_hash, status, caption_json, raw_response, error_message, attempt_count, cache_hits, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10)
-             ON CONFLICT(image_hash, model, prompt_hash) DO UPDATE SET
-                prompt_version = excluded.prompt_version,
-                status = excluded.status,
-                caption_json = excluded.caption_json,
-                raw_response = excluded.raw_response,
-                error_message = excluded.error_message,
-                attempt_count = excluded.attempt_count,
-                updated_at = excluded.updated_at",
-            params![
-                image_hash,
-                model,
-                prompt_version,
-                prompt_hash,
-                image_caption_status_to_str(attempt.status),
-                caption_json,
-                attempt.raw_response.as_deref(),
-                attempt.error_message.as_deref(),
-                attempt.attempt_count,
-                now,
-            ],
-        )?;
-        Ok(())
     }
 
     pub(crate) fn record_image_caption_cache_hit(
@@ -2054,63 +2024,6 @@ impl Store {
                 now,
             ],
         )?;
-        Ok(())
-    }
-
-    pub fn upsert_embedding_cache_entries(
-        &self,
-        profile_id: &EmbeddingProfileId,
-        profile_config_hash: &str,
-        entries: &[EmbeddingCacheEntry],
-    ) -> Result<()> {
-        let vectors = entries
-            .iter()
-            .map(|entry| EmbeddingCacheVector {
-                embedding_input_hash: &entry.embedding_input_hash,
-                vector: &entry.vector,
-            })
-            .collect::<Vec<_>>();
-        self.upsert_embedding_cache_vectors(profile_id, profile_config_hash, &vectors)
-    }
-
-    /// Upsert cache rows from borrowed vectors without taking ownership of the payloads.
-    pub fn upsert_embedding_cache_vectors(
-        &self,
-        profile_id: &EmbeddingProfileId,
-        profile_config_hash: &str,
-        entries: &[EmbeddingCacheVector<'_>],
-    ) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        let now = unix_timestamp_string();
-        let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO embedding_cache
-                    (profile_id, profile_config_hash, embedding_input_hash, vector_json, vector_blob, dimension, cache_hits, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?7)
-                 ON CONFLICT(profile_id, profile_config_hash, embedding_input_hash) DO UPDATE SET
-                    vector_json = excluded.vector_json,
-                    vector_blob = excluded.vector_blob,
-                    dimension = excluded.dimension,
-                    updated_at = excluded.updated_at",
-            )?;
-            for entry in entries {
-                let vector_blob = vector_to_blob(entry.vector);
-                stmt.execute(params![
-                    profile_id.as_str(),
-                    profile_config_hash,
-                    entry.embedding_input_hash,
-                    "",
-                    vector_blob,
-                    sql_usize(entry.vector.len()),
-                    &now,
-                ])?;
-            }
-        }
-        tx.commit()?;
         Ok(())
     }
 

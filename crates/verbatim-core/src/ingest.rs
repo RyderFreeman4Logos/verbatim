@@ -4,6 +4,8 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "qdrant")]
+use std::sync::LazyLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -30,7 +32,7 @@ use crate::image_limits::{
 };
 use crate::index::hnsw::HnswIndex;
 #[cfg(feature = "qdrant")]
-use crate::index::qdrant::{records_from_store_for_profile, QdrantClient};
+use crate::index::qdrant::QdrantClient;
 use crate::index::sqlite_fts::{FtsMaintenanceOutcome, SqliteFtsIndex};
 use crate::index_gc::{apply_index_gc, IndexGcPolicy};
 use crate::index_profile_delete::{
@@ -50,8 +52,8 @@ use crate::resource::{
     TaskResourceProgress,
 };
 use crate::store::{
-    EmbeddingCacheVector, EmbeddingProfileConfig, SourceContentsReplacement, SqliteWriteOperation,
-    Store, StoredEmbeddingProfileConfig,
+    EmbeddingProfileConfig, SourceContentsReplacement, SourceEmbeddingCacheVector,
+    SqliteWriteOperation, Store, StoredEmbeddingProfileConfig,
 };
 use crate::task::{
     FinishedPhaseTiming, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskId,
@@ -101,6 +103,8 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     fts_startup_maintenance: FtsMaintenanceOutcome,
     #[cfg(test)]
     source_commit_observer: Option<SourceCommitObserver>,
+    #[cfg(all(test, feature = "qdrant"))]
+    qdrant_requeue_store_observer: Option<QdrantRequeueStoreObserver>,
     #[cfg(test)]
     fail_next_batched_index_stage_with_enospc: bool,
     #[cfg(test)]
@@ -109,10 +113,37 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
 
 #[cfg(test)]
 type SourceCommitObserver = Box<dyn Fn(&Store, &SourceId) + Send + Sync>;
+#[cfg(all(test, feature = "qdrant"))]
+type QdrantRequeueStoreObserver = Arc<dyn Fn(&Store) + Send + Sync>;
 
+#[path = "ingest_deletion.rs"]
+mod ingest_deletion;
+#[path = "ingest_qdrant_sync.rs"]
+mod ingest_qdrant_sync;
 #[cfg(test)]
 #[path = "tests/issue_362_tests.rs"]
 mod issue_362_tests;
+#[cfg(test)]
+#[path = "tests/issue_363_cache_purge_tests.rs"]
+mod issue_363_cache_purge_tests;
+#[cfg(test)]
+#[path = "tests/issue_363_deletion_lifecycle_tests.rs"]
+mod issue_363_deletion_lifecycle_tests;
+#[cfg(all(test, not(feature = "qdrant")))]
+#[path = "tests/issue_363_no_qdrant_tests.rs"]
+mod issue_363_no_qdrant_tests;
+#[cfg(test)]
+#[path = "tests/issue_363_qdrant_mutation_fence_tests.rs"]
+mod issue_363_qdrant_mutation_fence_tests;
+#[cfg(test)]
+#[path = "tests/issue_363_reconcile_tests.rs"]
+mod issue_363_reconcile_tests;
+#[cfg(test)]
+#[path = "tests/issue_363_tests.rs"]
+mod issue_363_tests;
+#[cfg(test)]
+#[path = "tests/issue_363_tombstone_fence_tests.rs"]
+mod issue_363_tombstone_fence_tests;
 
 struct PreparedIndexes {
     hnsw: HnswIndex,
@@ -374,6 +405,21 @@ impl SourceCommitIoTelemetry {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Serializes destructive Qdrant mutations against source/profile upserts.
+///
+/// Upserts hold a shared guard across their remote mutation and compensation;
+/// deletion holds the exclusive guard. Tokio's fair `RwLock` admits the writer
+/// only after already-running upserts finish and prevents later upserts from
+/// starting until the deletion's remote erase is complete.
+#[cfg(feature = "qdrant")]
+static QDRANT_MUTATION_FENCE: LazyLock<tokio::sync::RwLock<()>> =
+    LazyLock::new(|| tokio::sync::RwLock::new(()));
+
+#[cfg(feature = "qdrant")]
+fn qdrant_mutation_fence() -> &'static tokio::sync::RwLock<()> {
+    &QDRANT_MUTATION_FENCE
 }
 
 fn ingest_resource(name: &'static str, kind: &'static str) -> Arc<ObservableResource> {
@@ -898,8 +944,16 @@ struct IndexManifest {
     generation: u64,
 }
 
+fn validate_qdrant_runtime_support(enabled: bool, compiled_support: bool) -> Result<()> {
+    if enabled && !compiled_support {
+        bail!("qdrant.enabled=true requires a binary built with the verbatim-core/qdrant feature");
+    }
+    Ok(())
+}
+
 impl IngestPipeline<OpenAiEmbeddingClient> {
     pub fn new(config: &Config, data_dir: &Path) -> Result<Self> {
+        validate_qdrant_runtime_support(config.qdrant.enabled, cfg!(feature = "qdrant"))?;
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("create data dir: {}", data_dir.display()))?;
 
@@ -983,6 +1037,8 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             fts_startup_maintenance,
             #[cfg(test)]
             source_commit_observer: None,
+            #[cfg(all(test, feature = "qdrant"))]
+            qdrant_requeue_store_observer: None,
             #[cfg(test)]
             fail_next_batched_index_stage_with_enospc: false,
             #[cfg(test)]
@@ -991,6 +1047,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
     }
 
     pub fn open_readonly(config: &Config, data_dir: &Path) -> Result<Self> {
+        validate_qdrant_runtime_support(config.qdrant.enabled, cfg!(feature = "qdrant"))?;
         let db_path = data_dir.join("verbatim.db");
         let store = Store::open_existing_readonly_with_durability_profile(
             &db_path,
@@ -1062,6 +1119,8 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             fts_startup_maintenance: FtsMaintenanceOutcome::default(),
             #[cfg(test)]
             source_commit_observer: None,
+            #[cfg(all(test, feature = "qdrant"))]
+            qdrant_requeue_store_observer: None,
             #[cfg(test)]
             fail_next_batched_index_stage_with_enospc: false,
             #[cfg(test)]
@@ -1070,6 +1129,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
     }
 
     pub fn reload_runtime_config(&mut self, config: &Config) -> Result<()> {
+        validate_qdrant_runtime_support(config.qdrant.enabled, cfg!(feature = "qdrant"))?;
         self.embed_client = OpenAiEmbeddingClient::new(&config.embedding);
         self.embedding_enabled = config.embedding.enabled;
         self.context_gen = if config.context.enabled {
@@ -1339,6 +1399,8 @@ where
             fts_startup_maintenance: FtsMaintenanceOutcome::default(),
             #[cfg(test)]
             source_commit_observer: None,
+            #[cfg(all(test, feature = "qdrant"))]
+            qdrant_requeue_store_observer: None,
             #[cfg(test)]
             fail_next_batched_index_stage_with_enospc: false,
             #[cfg(test)]
@@ -1375,6 +1437,15 @@ where
         F: Fn(&Store, &SourceId) + Send + Sync + 'static,
     {
         self.source_commit_observer = Some(Box::new(observer));
+        self
+    }
+
+    #[cfg(all(test, feature = "qdrant"))]
+    fn with_qdrant_requeue_store_observer<F>(mut self, observer: F) -> Self
+    where
+        F: Fn(&Store) + Send + Sync + 'static,
+    {
+        self.qdrant_requeue_store_observer = Some(Arc::new(observer));
         self
     }
 
@@ -1502,92 +1573,6 @@ where
         )?;
         drop(sqlite_write_permit);
         Ok(report)
-    }
-
-    pub async fn remove_source(&mut self, source_id: &SourceId) -> Result<()> {
-        self.store
-            .get_source(source_id)?
-            .with_context(|| format!("source not found: {}", source_id.0))?;
-        let active_profile_id = self.active_profile_id.clone();
-        let remaining_vectors = self
-            .store
-            .list_vector_documents_for_profile(&active_profile_id)?
-            .into_iter()
-            .filter(|document| document.source_id != *source_id)
-            .collect::<Vec<_>>();
-        let prepared = self.prepare_indexes_from_vectors(remaining_vectors)?;
-        let index_publish_permit =
-            acquire_ingest_resource("index_publish", "index_publish").await?;
-        let staged = self.stage_prepared_index_artifacts_for_residency(&prepared)?;
-        drop(index_publish_permit);
-        let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
-        let generation = match self.store.remove_source_and_replace_vectors_for_profile(
-            &active_profile_id,
-            source_id,
-            &prepared.vectors,
-        ) {
-            Ok(generation) => generation,
-            Err(err) => {
-                remove_staged_index_artifacts(&staged);
-                return Err(err);
-            }
-        };
-        drop(sqlite_write_permit);
-        let index_publish_permit =
-            acquire_ingest_resource("index_publish", "index_publish").await?;
-        self.publish_committed_indexes(&active_profile_id, generation, staged, prepared)?;
-        drop(index_publish_permit);
-        #[cfg(feature = "qdrant")]
-        self.sync_qdrant_delete_source(source_id).await;
-        remove_source_image_artifacts(&self.data_dir, source_id).with_context(|| {
-            format!(
-                "cleanup image artifacts after committed source removal: {}",
-                source_id.0
-            )
-        })?;
-        Ok(())
-    }
-
-    pub async fn remove_missing_sources_for_all_source_ingest(
-        &mut self,
-        task_id: Option<&TaskId>,
-    ) -> Result<Vec<SourceId>> {
-        self.remove_missing_sources_for_all_source_ingest_with(task_id, source_path_is_missing)
-            .await
-    }
-
-    async fn remove_missing_sources_for_all_source_ingest_with(
-        &mut self,
-        task_id: Option<&TaskId>,
-        mut source_path_is_missing: impl FnMut(&Path) -> Result<bool>,
-    ) -> Result<Vec<SourceId>> {
-        let missing_source_ids = self
-            .store
-            .list_sources()?
-            .into_iter()
-            .filter_map(|source| match source_path_is_missing(&source.path) {
-                Ok(true) => Some(Ok(source.id)),
-                Ok(false) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let total = missing_source_ids.len();
-        for (index, source_id) in missing_source_ids.iter().enumerate() {
-            tracing::warn!(
-                source = %source_id.0,
-                "removing missing source before all-source ingest"
-            );
-            self.record_task_progress(
-                task_id,
-                TaskProgressSnapshot::phase(IngestTaskStage::Ingest.as_str())
-                    .with_counter("missing_sources", index as u64, Some(total as u64))
-                    .with_recent_status("removing missing source"),
-            );
-            self.remove_source(source_id)
-                .await
-                .with_context(|| format!("remove missing source: {}", source_id.0))?;
-        }
-        Ok(missing_source_ids)
     }
 
     pub fn check_stale(&self) -> Result<Vec<SourceId>> {
@@ -4489,13 +4474,14 @@ where
                     acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
                 let cache_entries = embedded_vectors
                     .iter()
-                    .map(|entry| EmbeddingCacheVector {
+                    .map(|entry| SourceEmbeddingCacheVector {
+                        source_id: &entry.document.source_id,
                         embedding_input_hash: &entry.embedding_input_hash,
                         vector: &entry.document.vector,
                     })
                     .collect::<Vec<_>>();
                 let cache_entry_count = cache_entries.len();
-                self.store.upsert_embedding_cache_vectors(
+                self.store.upsert_embedding_cache_vectors_for_live_sources(
                     profile_id,
                     &profile_config_hash,
                     &cache_entries,
@@ -4696,95 +4682,6 @@ where
         Ok(())
     }
 
-    #[cfg(feature = "qdrant")]
-    async fn sync_qdrant_source(&self, source_id: &SourceId) {
-        self.sync_qdrant_profile_source(&self.active_profile_id, source_id)
-            .await;
-    }
-
-    #[cfg(feature = "qdrant")]
-    pub async fn sync_pending_qdrant_profile_resets(&mut self) {
-        let profiles = std::mem::take(&mut self.pending_qdrant_profile_syncs);
-        for profile_id in profiles {
-            self.sync_qdrant_profile_all(&profile_id).await;
-        }
-    }
-
-    #[cfg(not(feature = "qdrant"))]
-    pub async fn sync_pending_qdrant_profile_resets(&mut self) {}
-
-    #[cfg(feature = "qdrant")]
-    async fn sync_qdrant_profile_source(
-        &self,
-        profile_id: &EmbeddingProfileId,
-        source_id: &SourceId,
-    ) {
-        let Some(qdrant) = &self.qdrant else {
-            return;
-        };
-        let result: Result<()> = async {
-            let records = records_from_store_for_profile(&self.store, profile_id, Some(source_id))?;
-            qdrant
-                .delete_source_for_profile(profile_id, source_id)
-                .await?;
-            let qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
-            qdrant.upsert_records(&records).await?;
-            drop(qdrant_permit);
-            Ok(())
-        }
-        .await;
-        if let Err(err) = result {
-            tracing::warn!(
-                embedding_profile_id = %profile_id,
-                source = %source_id.0,
-                error = %err,
-                "qdrant source sync failed; local ingest remains authoritative"
-            );
-        }
-    }
-
-    #[cfg(feature = "qdrant")]
-    async fn sync_qdrant_delete_source(&self, source_id: &SourceId) {
-        let Some(qdrant) = &self.qdrant else {
-            return;
-        };
-        if let Err(err) = qdrant.delete_source(source_id).await {
-            tracing::warn!(
-                source = %source_id.0,
-                error = %err,
-                "qdrant source delete failed; local removal remains authoritative"
-            );
-        }
-    }
-
-    #[cfg(feature = "qdrant")]
-    async fn sync_qdrant_all(&self) {
-        self.sync_qdrant_profile_all(&self.active_profile_id).await;
-    }
-
-    #[cfg(feature = "qdrant")]
-    async fn sync_qdrant_profile_all(&self, profile_id: &EmbeddingProfileId) {
-        let Some(qdrant) = &self.qdrant else {
-            return;
-        };
-        let result: Result<()> = async {
-            let records = records_from_store_for_profile(&self.store, profile_id, None)?;
-            qdrant.delete_profile(profile_id).await?;
-            let qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
-            qdrant.upsert_records(&records).await?;
-            drop(qdrant_permit);
-            Ok(())
-        }
-        .await;
-        if let Err(err) = result {
-            tracing::warn!(
-                embedding_profile_id = %profile_id,
-                error = %err,
-                "qdrant full sync failed; local indexes remain authoritative"
-            );
-        }
-    }
-
     fn embedding_text(&self, chunk: &Chunk) -> String {
         self.embed_client
             .prepare_document(&chunk_search_text(chunk), &chunk.heading_path.join(" > "))
@@ -4931,7 +4828,8 @@ where
                 CaptionAttempt::skipped("vision caption provider is disabled or not configured");
             let sqlite_write_permit =
                 acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
-            self.store.upsert_image_caption_attempt(
+            self.store.upsert_image_caption_attempt_for_live_source(
+                source_id,
                 &artifact.content_hash,
                 &self.vision_caption_model,
                 VISION_CAPTION_PROMPT_VERSION,
@@ -4970,7 +4868,8 @@ where
         let attempt = request_image_caption(model.as_ref(), &file.bytes, &artifact.mime_type).await;
 
         let sqlite_write_permit = acquire_ingest_resource("sqlite_writer", "sqlite_write").await?;
-        self.store.upsert_image_caption_attempt(
+        self.store.upsert_image_caption_attempt_for_live_source(
+            source_id,
             &artifact.content_hash,
             &self.vision_caption_model,
             VISION_CAPTION_PROMPT_VERSION,
@@ -6453,6 +6352,7 @@ fn source_path_is_missing(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deletion::{DeletionOutcome, DeletionProduct};
     use anyhow::bail;
     use async_trait::async_trait;
     use futures::StreamExt;
@@ -10147,6 +10047,66 @@ model = "local-vision"
 
     #[cfg(feature = "qdrant")]
     #[tokio::test]
+    async fn reconcile_deletions_retries_pending_qdrant_erasure_after_unavailability() {
+        let (qdrant_url, handle) = spawn_qdrant_server(vec![
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                503,
+                r#"{"status":{"error":"temporarily unavailable"},"result":null}"#,
+            ),
+            (200, r#"{"status":"ok","result":{}}"#),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
+            ),
+        ]);
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        let source = test_source("src-reconcile", tempdir.path().join("reconcile.txt"));
+        let chunk = insert_source_with_child(&store, &source, "chunk-reconcile").unwrap();
+        store_vectors_for_chunks(&store, &[chunk.clone()]);
+        let qdrant = QdrantClient::new(qdrant_test_config(qdrant_url));
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            hnsw_with_chunks(&[chunk]),
+            StaticEmbeddingClient,
+            tempdir.path().to_path_buf(),
+        )
+        .with_qdrant_client(qdrant);
+
+        let initial = pipeline.remove_source(&source.id).await.unwrap();
+        assert!(pipeline.store().get_source(&source.id).unwrap().is_none());
+        assert_eq!(
+            initial.status_for(DeletionProduct::Qdrant),
+            Some(DeletionOutcome::Pending),
+        );
+
+        let reconciled = pipeline.reconcile_deletions().await.unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(
+            reconciled[0].status_for(DeletionProduct::Qdrant),
+            Some(DeletionOutcome::Erased),
+        );
+        assert!(pipeline
+            .store()
+            .pending_qdrant_deletion_source_ids()
+            .unwrap()
+            .is_empty());
+
+        let requests = handle.join().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[1].line,
+            "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        );
+        assert_eq!(
+            requests[3].line,
+            "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+        );
+    }
+
+    #[cfg(feature = "qdrant")]
+    #[tokio::test]
     async fn force_ingest_rewrites_active_qdrant_profile_after_local_ingest() {
         let (qdrant_url, handle) = spawn_qdrant_server(vec![
             (404, r#"{"status":{"error":"missing"},"result":null}"#),
@@ -11909,11 +11869,12 @@ model = "local-vision"
             tempdir.path().to_path_buf(),
         );
 
-        let err = pipeline.remove_source(&first.id).await.unwrap_err();
+        let report = pipeline.remove_source(&first.id).await.unwrap();
 
-        assert!(err
-            .to_string()
-            .contains("cleanup image artifacts after committed source removal"));
+        assert_eq!(
+            report.status_for(DeletionProduct::Images),
+            Some(DeletionOutcome::Pending),
+        );
         assert!(pipeline.store().get_source(&first.id).unwrap().is_none());
         assert!(pipeline.store().get_source(&second.id).unwrap().is_some());
         assert_eq!(pipeline.store().list_vector_documents().unwrap().len(), 1);

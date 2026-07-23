@@ -205,6 +205,10 @@ test:
 test-p package:
     {{_cargo_io_prefix}} cargo nextest run -p {{package}} --all-features --no-tests=warn
 
+# Run a focused verbatim-core test with Qdrant support excluded.
+test-core-no-qdrant-f pattern:
+    {{_cargo_io_prefix}} cargo nextest run -p verbatim-core --no-default-features -E 'test({{pattern}})' --no-tests=warn
+
 # Test by name pattern.
 # Usage: just test-f chunk_overlap
 test-f pattern:

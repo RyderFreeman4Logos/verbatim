@@ -9,7 +9,7 @@ name = "verbatim-daemon"
 path = "src/main.rs"
 
 [dependencies]
-verbatim-core = { path = "../verbatim-core", default-features = false, features = ["parser-pdf-oxide"] }
+verbatim-core = { path = "../verbatim-core", default-features = false, features = ["parser-pdf-oxide", "qdrant"] }
 tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true

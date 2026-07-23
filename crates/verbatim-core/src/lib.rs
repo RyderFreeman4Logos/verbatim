@@ -5,6 +5,7 @@ pub mod chunker;
 pub mod collection;
 pub mod config;
 pub mod context;
+pub mod deletion;
 pub mod embed;
 #[path = "types_evidence_spans.rs"]
 pub mod evidence_spans;

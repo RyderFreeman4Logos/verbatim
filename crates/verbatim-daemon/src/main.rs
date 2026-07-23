@@ -107,8 +107,15 @@ use verbatim_core::types::{
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
+#[path = "deletion_api.rs"]
+mod deletion_api;
 #[path = "sqlite_durability_ops.rs"]
 mod sqlite_durability_ops;
+
+use deletion_api::{
+    delete_source, list_deletion_reports, reconcile_deletions_on_startup,
+    start_deletion_reconcile_scheduler, STARTUP_DELETION_RECONCILE_BATCH_SIZE,
+};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -2240,31 +2247,6 @@ fn source_response(
         last_ingested_at: source.last_ingested_at,
         diagnostics: Some(diagnostics),
     })
-}
-
-async fn delete_source(
-    State(state): State<SharedState>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    let state = Arc::clone(&state);
-    let runtime = tokio::runtime::Handle::current();
-    let source_id = SourceId(id.clone());
-    tokio::task::spawn_blocking(move || {
-        run_with_pipeline(state, move |pipeline| {
-            runtime.block_on(pipeline.remove_source(&source_id))
-        })
-    })
-    .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
-    .map_err(|e| {
-        if is_pipeline_busy_error(&e) {
-            pipeline_access_error(e)
-        } else {
-            source_remove_error(&id, e)
-        }
-    })?;
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 fn source_remove_error(source_id: &str, error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
@@ -8808,7 +8790,8 @@ async fn maintain_collection_after_watch_event(
                 if !removed.source_path.exists()
                     && pipeline.store().get_source(&removed.source_id)?.is_some()
                 {
-                    runtime.block_on(pipeline.remove_source(&removed.source_id))?;
+                    runtime
+                        .block_on(pipeline.remove_source_for_housekeeping(&removed.source_id))?;
                     ingest_candidates.remove(&removed.source_id);
                 }
             }
@@ -9336,6 +9319,7 @@ fn daemon_router(state: SharedState) -> Router {
         .route("/api/sources", get(list_sources))
         .route("/api/sources/{id}", get(get_source))
         .route("/api/sources/{id}", delete(delete_source))
+        .route("/api/deletions/reports", get(list_deletion_reports))
         .route("/api/sources/check", post(check_stale))
         .route(
             CollectionApiEndpoint::CreateCollection.path_template(),
@@ -9406,6 +9390,7 @@ struct StartupRuntimeHandles {
     _config_watcher: RecommendedWatcher,
     _collection_watcher: tokio::task::JoinHandle<()>,
     _idle_reclaim_scheduler: tokio::task::JoinHandle<()>,
+    _deletion_reconcile_scheduler: tokio::task::JoinHandle<()>,
     _idle_exit_scheduler: tokio::task::JoinHandle<()>,
 }
 
@@ -9547,6 +9532,9 @@ async fn finish_daemon_startup(
         *cache = startup.index_status_cache;
     }
     restore_pipeline(&state, startup.pipeline)?;
+    reconcile_deletions_on_startup(&state, STARTUP_DELETION_RECONCILE_BATCH_SIZE)
+        .await
+        .context("reconcile persisted source deletions")?;
 
     set_readiness(
         &state,
@@ -9586,11 +9574,13 @@ async fn finish_daemon_startup(
     let idle_exit_scheduler = start_idle_exit_scheduler(Arc::clone(&state), idle_exit_shutdown_tx);
     schedule_ingest_queue(Arc::clone(&state));
     set_readiness(&state, ReadinessHealth::ready());
+    let deletion_reconcile_scheduler = start_deletion_reconcile_scheduler(Arc::clone(&state));
 
     Ok(StartupRuntimeHandles {
         _config_watcher: config_watcher,
         _collection_watcher: collection_watcher,
         _idle_reclaim_scheduler: idle_reclaim_scheduler,
+        _deletion_reconcile_scheduler: deletion_reconcile_scheduler,
         _idle_exit_scheduler: idle_exit_scheduler,
     })
 }
@@ -13171,15 +13161,17 @@ mod tests {
         let source_id = pipeline.add_source(&source_path).unwrap();
         let state = test_state(config, test_dir.path(), pipeline);
 
-        let status = delete_source(State(Arc::clone(&state)), Path(source_id.0.clone()))
+        let response = delete_source(State(Arc::clone(&state)), Path(source_id.0.clone()))
             .await
             .unwrap();
 
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let pipeline = state.pipeline.lock().unwrap();
         let pipeline = pipeline.as_ref().unwrap();
         assert!(pipeline.store().get_source(&source_id).unwrap().is_none());
     }
+
+    include!("tests/deletion_lifecycle_tests.rs");
 
     #[tokio::test]
     async fn delete_source_publish_wait_serves_cached_index_status() {
@@ -13228,12 +13220,12 @@ mod tests {
             .any(|message| message.contains("last-known index status")));
 
         drop(publish_permit);
-        let status = tokio::time::timeout(Duration::from_secs(5), delete_task)
+        let response = tokio::time::timeout(Duration::from_secs(5), delete_task)
             .await
             .expect("delete_source completes after publish permit release")
             .expect("delete task joins")
             .unwrap();
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let pipeline = state.pipeline.lock().unwrap();
         let pipeline = pipeline.as_ref().unwrap();
         assert!(pipeline.store().get_source(&source_id).unwrap().is_none());
