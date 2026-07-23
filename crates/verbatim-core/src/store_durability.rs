@@ -3,6 +3,11 @@
 use super::*;
 
 impl Store {
+    /// Return the on-disk database path, if this store is not in-memory.
+    pub(crate) fn database_path(&self) -> Option<&Path> {
+        self.database_path.as_deref()
+    }
+
     pub fn new(path: &Path) -> Result<Self> {
         Self::new_with_durability_profile(path, SqliteDurabilityProfile::default())
     }

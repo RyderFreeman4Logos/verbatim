@@ -99,7 +99,7 @@ impl QdrantMutationFenceServer {
             let mut release_deletion_rx = Some(release_deletion_rx);
             let mut request_index = 0;
 
-            while request_index < 6 {
+            while request_index < 8 {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let current_index = request_index;
@@ -111,9 +111,9 @@ impl QdrantMutationFenceServer {
                         let release_upsert =
                             (current_index == 3).then(|| release_upsert_rx.take().unwrap());
                         let deletion_started =
-                            (current_index == 5).then(|| deletion_started_tx.take().unwrap());
+                            (current_index == 7).then(|| deletion_started_tx.take().unwrap());
                         let release_deletion =
-                            (current_index == 5).then(|| release_deletion_rx.take().unwrap());
+                            (current_index == 7).then(|| release_deletion_rx.take().unwrap());
                         handlers.push(thread::spawn(move || {
                             if let Some(started) = upsert_started {
                                 started.send(()).unwrap();
@@ -260,6 +260,7 @@ fn write_http_response(stream: &mut TcpStream) -> std::io::Result<()> {
 async fn assert_dropped_sync_precedes_erasure(
     sync: impl std::future::Future<Output = ()>,
     delete_pipeline: &mut IngestPipeline<StaticEmbeddingClient>,
+    database_path: &std::path::Path,
     source_id: &SourceId,
     server: &mut QdrantMutationFenceServer,
 ) {
@@ -278,7 +279,22 @@ async fn assert_dropped_sync_precedes_erasure(
         matches!(futures::poll!(deletion.as_mut()), std::task::Poll::Pending),
         "the source deletion must queue while the stale Qdrant upsert holds the fence"
     );
+    // The server accepted the stale upsert and keeps applying it after this
+    // caller gives up. Its lease and tombstone compensation must outlive this
+    // future so the terminal deletion cannot pass the still-running mutation.
     drop(sync);
+    assert!(
+        qdrant_mutation_fence().try_write().is_err(),
+        "dropping the caller must not release the stale Qdrant upsert lease before compensation"
+    );
+    assert_eq!(
+        Store::open_existing_readonly(database_path)
+            .unwrap()
+            .qdrant_deletion_outcome(source_id)
+            .unwrap(),
+        Some(DeletionOutcome::Pending),
+        "the deletion receipt must remain pending while the cancelled caller's upsert is in flight"
+    );
     server.release_upsert();
     tokio::select! {
         result = &mut deletion => panic!("the deletion returned before its Qdrant erase request: {result:?}"),
@@ -298,7 +314,7 @@ async fn assert_dropped_sync_precedes_erasure(
 
 #[cfg(feature = "qdrant")]
 #[tokio::test]
-async fn capacity_two_source_sync_crash_cannot_leave_a_qdrant_resurrection_after_erased() {
+async fn stale_source_upsert_survives_caller_cancellation_before_erasure() {
     let _capacity = QdrantUpsertCapacityGuard::capacity_two();
     let tempdir = tempfile::tempdir().unwrap();
     let database_path = tempdir.path().join("verbatim.db");
@@ -327,6 +343,7 @@ async fn capacity_two_source_sync_crash_cannot_leave_a_qdrant_resurrection_after
     assert_dropped_sync_precedes_erasure(
         sync_pipeline.sync_qdrant_source(&source_id),
         &mut delete_pipeline,
+        &database_path,
         &source_id,
         &mut server,
     )
@@ -339,6 +356,10 @@ async fn capacity_two_source_sync_crash_cannot_leave_a_qdrant_resurrection_after
     );
     assert_eq!(
         requests[5].line,
+        "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+    );
+    assert_eq!(
+        requests[7].line,
         "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
     );
     assert_eq!(
@@ -381,6 +402,7 @@ async fn capacity_two_full_profile_sync_crash_cannot_leave_a_qdrant_resurrection
     assert_dropped_sync_precedes_erasure(
         sync_pipeline.sync_qdrant_profile_all(sync_pipeline.active_embedding_profile_id()),
         &mut delete_pipeline,
+        &database_path,
         &source_id,
         &mut server,
     )
@@ -393,6 +415,10 @@ async fn capacity_two_full_profile_sync_crash_cannot_leave_a_qdrant_resurrection
     );
     assert_eq!(
         requests[5].line,
+        "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+    );
+    assert_eq!(
+        requests[7].line,
         "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
     );
     assert_eq!(
