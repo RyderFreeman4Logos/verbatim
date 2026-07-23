@@ -57,6 +57,9 @@ where
             let task_profile_id = profile_id.clone();
             let task_source_id = source_id.clone();
             let task_records = records.clone();
+            let task_durability_profile = self.store.durability_profile();
+            #[cfg(test)]
+            let task_requeue_store_observer = self.qdrant_requeue_store_observer.clone();
             tokio::spawn(async move {
                 let tombstone_database_path = database_path.clone();
                 sync_qdrant_profile_source_mutation(
@@ -64,7 +67,17 @@ where
                         let store = Store::open_existing_readonly(&tombstone_database_path)?;
                         store.is_tombstoned(source_id)
                     },
-                    move |source_id| Store::new(&database_path)?.requeue_qdrant_deletion(source_id),
+                    move |source_id| {
+                        let store = Store::new_with_durability_profile(
+                            &database_path,
+                            task_durability_profile,
+                        )?;
+                        #[cfg(test)]
+                        if let Some(observer) = &task_requeue_store_observer {
+                            observer(&store);
+                        }
+                        store.requeue_qdrant_deletion(source_id)
+                    },
                     &task_qdrant,
                     &task_profile_id,
                     &task_source_id,
@@ -109,6 +122,9 @@ where
             let task_qdrant = qdrant.clone();
             let task_profile_id = profile_id.clone();
             let task_records = records.clone();
+            let task_durability_profile = self.store.durability_profile();
+            #[cfg(test)]
+            let task_requeue_store_observer = self.qdrant_requeue_store_observer.clone();
             tokio::spawn(async move {
                 let tombstone_database_path = database_path.clone();
                 sync_qdrant_profile_all_mutation(
@@ -116,7 +132,17 @@ where
                         let store = Store::open_existing_readonly(&tombstone_database_path)?;
                         store.is_tombstoned(source_id)
                     },
-                    move |source_id| Store::new(&database_path)?.requeue_qdrant_deletion(source_id),
+                    move |source_id| {
+                        let store = Store::new_with_durability_profile(
+                            &database_path,
+                            task_durability_profile,
+                        )?;
+                        #[cfg(test)]
+                        if let Some(observer) = &task_requeue_store_observer {
+                            observer(&store);
+                        }
+                        store.requeue_qdrant_deletion(source_id)
+                    },
                     &task_qdrant,
                     &task_profile_id,
                     task_records,

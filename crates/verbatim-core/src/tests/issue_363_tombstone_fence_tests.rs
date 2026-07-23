@@ -312,13 +312,20 @@ fn finalize_qdrant_outcome(store: &Store, source_id: &SourceId, outcome: Deletio
 
 #[cfg(feature = "qdrant")]
 #[tokio::test]
-async fn tombstone_fence_marks_failed_qdrant_compensation_pending() {
+async fn durable_tombstone_fence_requeues_failed_qdrant_compensation_with_full_synchronous_writer()
+{
     let tempdir = tempfile::tempdir().unwrap();
     let database_path = tempdir.path().join("verbatim.db");
     let source_path = tempdir.path().join("failed-qdrant-compensation.md");
     fs::write(&source_path, "in-flight qdrant source body").unwrap();
+    let observed_synchronous = Arc::new(Mutex::new(None));
+    let requeue_writer = Arc::clone(&observed_synchronous);
     let mut pipeline = IngestPipeline::from_parts(
-        Store::new(&database_path).unwrap(),
+        Store::new_with_durability_profile(
+            &database_path,
+            crate::store::SqliteDurabilityProfile::Durable,
+        )
+        .unwrap(),
         HnswIndex::new(),
         StaticEmbeddingClient,
         tempdir.path().to_path_buf(),
@@ -328,14 +335,23 @@ async fn tombstone_fence_marks_failed_qdrant_compensation_pending() {
 
     let (qdrant_url, upsert_started, release, _stop, server) =
         spawn_pausing_qdrant_upsert_server(6, Some(5));
-    pipeline = pipeline.with_qdrant_client(QdrantClient::new(qdrant_test_config(qdrant_url)));
+    pipeline = pipeline
+        .with_qdrant_requeue_store_observer(move |store| {
+            *requeue_writer.lock().unwrap() =
+                Some(store.effective_durability().unwrap().synchronous);
+        })
+        .with_qdrant_client(QdrantClient::new(qdrant_test_config(qdrant_url)));
     let mut sync = Box::pin(pipeline.sync_qdrant_source(&source_id));
     tokio::select! {
         _ = &mut sync => panic!("qdrant sync completed before the upsert pause"),
         result = upsert_started => result.unwrap(),
     }
 
-    let store = Store::new(&database_path).unwrap();
+    let store = Store::new_with_durability_profile(
+        &database_path,
+        crate::store::SqliteDurabilityProfile::Durable,
+    )
+    .unwrap();
     store.remove_source(&source_id).unwrap();
     finalize_qdrant_outcome(&store, &source_id, DeletionOutcome::Erased);
     release.send(()).unwrap();
@@ -345,6 +361,11 @@ async fn tombstone_fence_marks_failed_qdrant_compensation_pending() {
     assert_eq!(
         requests[5].line,
         "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
+    );
+    assert_eq!(
+        *observed_synchronous.lock().unwrap(),
+        Some("full".to_owned()),
+        "the detached compensation task must reopen its requeue writer with the Durable profile"
     );
     assert_eq!(
         store.qdrant_deletion_outcome(&source_id).unwrap(),

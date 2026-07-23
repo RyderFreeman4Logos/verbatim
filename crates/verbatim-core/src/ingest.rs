@@ -103,6 +103,8 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
     fts_startup_maintenance: FtsMaintenanceOutcome,
     #[cfg(test)]
     source_commit_observer: Option<SourceCommitObserver>,
+    #[cfg(all(test, feature = "qdrant"))]
+    qdrant_requeue_store_observer: Option<QdrantRequeueStoreObserver>,
     #[cfg(test)]
     fail_next_batched_index_stage_with_enospc: bool,
     #[cfg(test)]
@@ -111,6 +113,8 @@ pub struct IngestPipeline<E = OpenAiEmbeddingClient> {
 
 #[cfg(test)]
 type SourceCommitObserver = Box<dyn Fn(&Store, &SourceId) + Send + Sync>;
+#[cfg(all(test, feature = "qdrant"))]
+type QdrantRequeueStoreObserver = Arc<dyn Fn(&Store) + Send + Sync>;
 
 #[path = "ingest_deletion.rs"]
 mod ingest_deletion;
@@ -1033,6 +1037,8 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             fts_startup_maintenance,
             #[cfg(test)]
             source_commit_observer: None,
+            #[cfg(all(test, feature = "qdrant"))]
+            qdrant_requeue_store_observer: None,
             #[cfg(test)]
             fail_next_batched_index_stage_with_enospc: false,
             #[cfg(test)]
@@ -1113,6 +1119,8 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
             fts_startup_maintenance: FtsMaintenanceOutcome::default(),
             #[cfg(test)]
             source_commit_observer: None,
+            #[cfg(all(test, feature = "qdrant"))]
+            qdrant_requeue_store_observer: None,
             #[cfg(test)]
             fail_next_batched_index_stage_with_enospc: false,
             #[cfg(test)]
@@ -1391,6 +1399,8 @@ where
             fts_startup_maintenance: FtsMaintenanceOutcome::default(),
             #[cfg(test)]
             source_commit_observer: None,
+            #[cfg(all(test, feature = "qdrant"))]
+            qdrant_requeue_store_observer: None,
             #[cfg(test)]
             fail_next_batched_index_stage_with_enospc: false,
             #[cfg(test)]
@@ -1427,6 +1437,15 @@ where
         F: Fn(&Store, &SourceId) + Send + Sync + 'static,
     {
         self.source_commit_observer = Some(Box::new(observer));
+        self
+    }
+
+    #[cfg(all(test, feature = "qdrant"))]
+    fn with_qdrant_requeue_store_observer<F>(mut self, observer: F) -> Self
+    where
+        F: Fn(&Store) + Send + Sync + 'static,
+    {
+        self.qdrant_requeue_store_observer = Some(Arc::new(observer));
         self
     }
 
