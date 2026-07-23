@@ -4,6 +4,8 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "qdrant")]
+use std::sync::LazyLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -120,6 +122,9 @@ mod issue_362_tests;
 #[cfg(test)]
 #[path = "tests/issue_363_cache_purge_tests.rs"]
 mod issue_363_cache_purge_tests;
+#[cfg(test)]
+#[path = "tests/issue_363_qdrant_mutation_fence_tests.rs"]
+mod issue_363_qdrant_mutation_fence_tests;
 #[cfg(test)]
 #[path = "tests/issue_363_reconcile_tests.rs"]
 mod issue_363_reconcile_tests;
@@ -390,6 +395,21 @@ impl SourceCommitIoTelemetry {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Serializes destructive Qdrant mutations against source/profile upserts.
+///
+/// Upserts hold a shared guard across their remote mutation and compensation;
+/// deletion holds the exclusive guard. Tokio's fair `RwLock` admits the writer
+/// only after already-running upserts finish and prevents later upserts from
+/// starting until the deletion's remote erase is complete.
+#[cfg(feature = "qdrant")]
+static QDRANT_MUTATION_FENCE: LazyLock<tokio::sync::RwLock<()>> =
+    LazyLock::new(|| tokio::sync::RwLock::new(()));
+
+#[cfg(feature = "qdrant")]
+fn qdrant_mutation_fence() -> &'static tokio::sync::RwLock<()> {
+    &QDRANT_MUTATION_FENCE
 }
 
 fn ingest_resource(name: &'static str, kind: &'static str) -> Arc<ObservableResource> {

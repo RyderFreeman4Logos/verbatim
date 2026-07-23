@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 #[cfg(not(feature = "qdrant"))]
 use super::IngestPipeline;
 #[cfg(feature = "qdrant")]
-use super::{acquire_ingest_resource, EmbeddingClient, IngestPipeline};
+use super::{acquire_ingest_resource, qdrant_mutation_fence, EmbeddingClient, IngestPipeline};
 #[cfg(feature = "qdrant")]
 use crate::index::qdrant::{records_from_store_for_profile, QdrantClient};
 #[cfg(feature = "qdrant")]
@@ -40,10 +40,10 @@ where
         };
         let result: Result<()> = async {
             let records = records_from_store_for_profile(&self.store, profile_id, Some(source_id))?;
-            // Source deletion takes this same permit, so once this critical section
-            // begins its durable outcome cannot advance to Erased behind a later
-            // upsert. A process exit therefore leaves either no upsert or a pending
-            // tombstone for the deletion/reconcile path to finish.
+            // The shared mutation guard is independent of the configurable upsert
+            // capacity. A queued deletion writer therefore waits for this stale
+            // upsert and then blocks all later upserts until remote erasure ends.
+            let _qdrant_mutation_fence = qdrant_mutation_fence().read().await;
             let _qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
             if self.store.is_tombstoned(source_id)? {
                 return Ok(());
@@ -83,9 +83,10 @@ where
                 .iter()
                 .map(|record| record.document.source_id.clone())
                 .collect::<HashSet<_>>();
-            // Source deletion takes this same permit. Filtering under the permit
-            // closes the stale-read window before the replacement upsert, while the
-            // post-upsert compensation covers tombstones committed during its await.
+            // Keep the full-profile replacement and every tombstone compensation
+            // behind the shared guard so an exclusive deletion cannot record Erased
+            // before this stale upsert has completed or been cancelled.
+            let _qdrant_mutation_fence = qdrant_mutation_fence().read().await;
             let _qdrant_permit = acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await?;
             let mut tombstoned_source_ids = HashSet::new();
             for source_id in &source_ids {

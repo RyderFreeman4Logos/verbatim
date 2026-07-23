@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
+#[cfg(feature = "qdrant")]
+use super::qdrant_mutation_fence;
 use super::{
     acquire_ingest_resource, remove_source_image_artifacts, remove_staged_index_artifacts,
     source_path_is_missing, EmbeddingClient, IngestPipeline,
@@ -127,6 +129,10 @@ where
         let Some(qdrant) = &self.qdrant else {
             return DeletionOutcome::Pending;
         };
+        // Acquire this before the throughput permit. It excludes both in-flight
+        // source/profile upserts and any later upsert from the Erased receipt's
+        // remote mutation, regardless of qdrant_upsert_concurrency.
+        let _qdrant_mutation_fence = qdrant_mutation_fence().write().await;
         let _qdrant_permit = match acquire_ingest_resource("qdrant_upsert", "qdrant_upsert").await {
             Ok(permit) => permit,
             Err(error) => {
