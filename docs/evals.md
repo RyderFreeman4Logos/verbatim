@@ -47,3 +47,17 @@ verbatim ask "What behaviors are regression-critical?" --show-retrieval
 ```
 
 The expected manual signal is an answer with citations plus retrieval debug output. Treat model wording as non-deterministic; inspect citation grounding and retrieval stages rather than exact prose.
+
+## Benchmark Governance (EVAL-015)
+
+Promotion of benchmarks beyond the fast deterministic fixtures follows the
+benchmark governance policy:
+
+- Policy: [architecture/benchmark-governance.md](architecture/benchmark-governance.md)
+- Schema: [evals/benchmark-manifest.schema.toml](evals/benchmark-manifest.schema.toml)
+- Examples: [evals/examples/](evals/examples/)
+- Offline validation: `bash scripts/tests/benchmark-governance-tests.sh`
+
+This walking skeleton covers split group isolation, required statistical
+fields, contamination baseline declarations, and gold-source rules. Full
+harness rewiring remains residual under issue #340.

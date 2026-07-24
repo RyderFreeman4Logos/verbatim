@@ -1,0 +1,42 @@
+# INVALID fixture: same group_id in train and test (group leakage).
+# Used only by negative offline tests. Do not promote.
+# Schema: docs/evals/benchmark-manifest.schema.toml
+# Policy: docs/architecture/benchmark-governance.md
+
+schema_version = 1
+kind = "benchmark-promotion-manifest"
+benchmark_id = "verbatim-eval-group-leakage-fixture"
+spec = "EVAL-015"
+
+confidence_method = "paired_bootstrap"
+effect_size_min = 0.02
+regression_tolerance = 0.01
+
+contamination_baselines = [
+    "no_context",
+    "oracle_context",
+    "retrieved_context",
+    "opaque_corpus",
+]
+
+# LEAKAGE: group "shared-thread" appears in both train and test.
+[splits.train]
+group_ids = ["thread-a", "shared-thread"]
+
+[splits.validation]
+group_ids = ["thread-c"]
+
+[splits.test]
+group_ids = ["shared-thread", "thread-d"]
+
+[hidden_final_set]
+group_ids = ["thread-f"]
+separate_from_tuning = true
+
+[dataset_change_policy]
+review_required = true
+
+[gold]
+source = "human_qrels"
+independent_validation = true
+gold_from_filename = false

@@ -1,0 +1,78 @@
+# EVAL-015 benchmark promotion manifest schema (walking skeleton)
+# Policy: docs/architecture/benchmark-governance.md
+# Validate: bash scripts/tests/benchmark-governance-tests.sh
+#
+# Machine-readable contract for benchmark promotion manifests. Validators parse
+# it with Python tomllib and enforce the required fields below.
+# schema_version applies to this schema document and to conforming manifests.
+
+schema_version = 1
+kind = "benchmark-manifest-schema"
+spec = "EVAL-015"
+issue = 340
+policy = "docs/architecture/benchmark-governance.md"
+
+# ---------------------------------------------------------------------------
+# Promotion manifest contract
+# ---------------------------------------------------------------------------
+
+[promotion_manifest]
+kind = "benchmark-promotion-manifest"
+required_top_level = [
+    "schema_version",
+    "kind",
+    "benchmark_id",
+    "splits",
+    "hidden_final_set",
+    "confidence_method",
+    "effect_size_min",
+    "regression_tolerance",
+    "contamination_baselines",
+    "dataset_change_policy",
+]
+
+# Standard split roles that MUST be present under splits.<role>.
+required_split_roles = ["train", "validation", "test"]
+
+# Historical name retained for docs; validators isolate ALL declared split
+# roles plus hidden_final (including tuning/calibration/custom).
+isolated_split_roles = ["train", "validation", "test", "hidden_final"]
+
+# Required keys inside each splits.<role> table when the role is present.
+required_split_fields = ["group_ids"]
+
+# Required keys inside hidden_final_set.
+required_hidden_final_fields = ["group_ids", "separate_from_tuning"]
+
+# Required keys inside dataset_change_policy.
+required_dataset_change_policy_fields = ["review_required"]
+
+# Allowed contamination baseline names (lowercase).
+allowed_contamination_baselines = [
+    "no_context",
+    "oracle_context",
+    "retrieved_context",
+    "opaque_corpus",
+]
+
+# Minimum set that a conforming manifest SHOULD list (validators require at
+# least one allowed baseline; policy recommends all four for promotion).
+recommended_contamination_baselines = [
+    "no_context",
+    "oracle_context",
+    "retrieved_context",
+    "opaque_corpus",
+]
+
+# Allowed confidence method tokens for this schema version.
+allowed_confidence_methods = [
+    "paired_bootstrap",
+    "bootstrap",
+    "wilcoxon_signed_rank",
+    "permutation_test",
+    "declared_other",
+]
+
+# Gold labeling rules: gold_from_filename is forbidden unless independent_validation is true.
+[promotion_manifest.gold]
+forbidden_without_independent_validation = ["gold_from_filename", "gold_from_generator_metadata"]
