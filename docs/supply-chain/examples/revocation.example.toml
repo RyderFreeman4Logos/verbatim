@@ -1,0 +1,15 @@
+# Example revocation list for SUPPLY-001 (fixture).
+# Schema: docs/supply-chain/provenance-manifest.schema.toml
+# Policy: docs/architecture/supply-chain-provenance.md
+
+schema_version = 1
+kind = "revocation-list"
+spec = "SUPPLY-001"
+list_id = "verbatim-revocation-example-v1"
+
+[[revoked]]
+digest_alg = "sha256"
+digest = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+reason = "Example compromised quant pack digest (fixture only; not a real artifact)."
+revoked_on = "2026-07-24"
+component_hint = "model"

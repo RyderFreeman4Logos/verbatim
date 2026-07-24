@@ -1,0 +1,80 @@
+# SUPPLY-001 provenance manifest schema (walking skeleton)
+# Policy: docs/architecture/supply-chain-provenance.md
+# Validate: bash scripts/tests/supply-chain-provenance-tests.sh
+#
+# This file is the machine-readable contract for runtime profiles and
+# revocation lists. Validators parse it with Python tomllib and enforce the
+# required fields/classes below. schema_version applies to this schema doc.
+
+schema_version = 1
+kind = "provenance-manifest-schema"
+spec = "SUPPLY-001"
+issue = 341
+policy = "docs/architecture/supply-chain-provenance.md"
+
+# ---------------------------------------------------------------------------
+# Runtime profile contract
+# ---------------------------------------------------------------------------
+
+[runtime_profile]
+kind = "runtime-profile"
+required_top_level = ["schema_version", "profile_id", "app", "components"]
+required_app_fields = ["name", "version", "git_sha"]
+required_component_fields = ["id", "class", "name", "digest_alg", "digest"]
+
+# Every profile MUST include at least one component for each required class
+# (after alias normalization).
+required_classes = [
+    "binary",
+    "crate",
+    "container",
+    "model",
+    "workflow",
+    "parser",
+]
+
+# Canonical class -> accepted aliases (lowercase).
+[runtime_profile.class_aliases]
+binary = ["binary"]
+crate = ["crate", "native", "native-dep", "dependency"]
+container = ["container", "image", "oci"]
+model = ["model", "tokenizer", "quant", "model-tokenizer-quant"]
+workflow = ["workflow", "skill", "workflow-skill"]
+parser = [
+    "parser",
+    "ocr",
+    "converter",
+    "adapter",
+    "parser-ocr-converter-adapter",
+]
+
+[runtime_profile.digest]
+# Allowed algorithms for this schema version.
+allowed_algs = ["sha256", "sha512", "blake3"]
+# Hex digests only; length checked against algorithm below when known.
+hex_pattern = "^[0-9a-f]+$"
+
+[runtime_profile.digest.min_hex_len]
+sha256 = 64
+sha512 = 128
+blake3 = 64
+
+# Optional but recommended component identity fields by class.
+[runtime_profile.recommended_fields_by_class]
+binary = ["version", "platform"]
+crate = ["version", "source"]
+container = ["version", "platform", "image_ref"]
+model = ["version", "role"]
+workflow = ["version", "path"]
+parser = ["version", "role"]
+
+# ---------------------------------------------------------------------------
+# Revocation list contract
+# ---------------------------------------------------------------------------
+
+[revocation_list]
+kind = "revocation-list"
+required_top_level = ["schema_version", "revoked"]
+required_entry_fields = ["digest_alg", "digest", "reason", "revoked_on"]
+# ISO-8601 date YYYY-MM-DD
+revoked_on_pattern = "^\\d{4}-\\d{2}-\\d{2}$"
