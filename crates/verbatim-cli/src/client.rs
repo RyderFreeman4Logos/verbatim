@@ -21,10 +21,11 @@ use verbatim_core::api::{
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
 
+#[cfg(test)]
+use crate::auth::HTTP_ERROR_TRUNCATION_MARKER;
 use crate::{auth, render, sse};
 
 const MAX_HTTP_ERROR_BODY_BYTES: usize = 4096;
-const HTTP_ERROR_TRUNCATION_MARKER: &str = "...[truncated]";
 const DEFAULT_DAEMON_HTTP_TIMEOUT_SECONDS: u64 = 300;
 const DAEMON_HTTP_TIMEOUT_PADDING_SECONDS: u64 = 120;
 const TASK_WAIT_TIMEOUT_EXIT_CODE: u8 = 124;
@@ -166,6 +167,7 @@ pub enum TaskWaitTimeout {
 pub struct HttpDaemonClient {
     client: Client,
     base_url: Option<String>,
+    auth_token: Option<String>,
 }
 
 impl HttpDaemonClient {
@@ -173,6 +175,7 @@ impl HttpDaemonClient {
         Self {
             client: auth::daemon_client(),
             base_url: None,
+            auth_token: auth::daemon_auth_token(),
         }
     }
 
@@ -181,6 +184,7 @@ impl HttpDaemonClient {
         Self {
             client: Client::new(),
             base_url: Some(base_url.into()),
+            auth_token: None,
         }
     }
 
@@ -204,7 +208,7 @@ impl HttpDaemonClient {
             DaemonConfig::default().bind
         };
 
-        Ok(bind_to_base_url(&bind))
+        Ok(auth::bind_to_base_url(&bind))
     }
 
     fn url(&self, path: &str) -> CliResult<String> {
@@ -288,7 +292,14 @@ impl HttpDaemonClient {
     {
         let url = self.url(path)?;
         let policy = json_timeout_policy(&method, path);
-        let mut request = self.apply_timeout(self.client.request(method, &url), policy)?;
+        let mut request = self.apply_timeout(
+            auth::authorize_request(
+                self.client.request(method, &url),
+                &url,
+                self.auth_token.as_deref(),
+            ),
+            policy,
+        )?;
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -325,7 +336,10 @@ impl DaemonClient for HttpDaemonClient {
     fn remove_source(&self, id: &str) -> CliResult<()> {
         let url = self.url(&format!("/api/sources/{id}"))?;
         let response = self
-            .apply_timeout(self.client.delete(&url), RequestTimeoutPolicy::LongRunning)?
+            .apply_timeout(
+                auth::authorize_request(self.client.delete(&url), &url, self.auth_token.as_deref()),
+                RequestTimeoutPolicy::LongRunning,
+            )?
             .send()
             .map_err(|error| request_error(&url, error))?;
         if response.status() == StatusCode::NO_CONTENT {
@@ -382,7 +396,11 @@ impl DaemonClient for HttpDaemonClient {
         let url = self.url(&route.path(name))?;
         let response = self
             .apply_timeout(
-                self.client.request(collection_method(route), &url),
+                auth::authorize_request(
+                    self.client.request(collection_method(route), &url),
+                    &url,
+                    self.auth_token.as_deref(),
+                ),
                 RequestTimeoutPolicy::LongRunning,
             )?
             .send()
@@ -586,7 +604,8 @@ impl DaemonClient for HttpDaemonClient {
         };
         let url = self.url(&path)?;
         let effective_timeout = self.task_wait_timeout(timeout)?;
-        let mut request = self.client.get(&url);
+        let mut request =
+            auth::authorize_request(self.client.get(&url), &url, self.auth_token.as_deref());
         if let Some(timeout) = effective_timeout {
             request = request.timeout(timeout);
         }
@@ -643,7 +662,10 @@ impl DaemonClient for HttpDaemonClient {
     {
         let url = self.url("/api/ask/stream")?;
         let response = self
-            .apply_timeout(self.client.post(&url), RequestTimeoutPolicy::Finite)?
+            .apply_timeout(
+                auth::authorize_request(self.client.post(&url), &url, self.auth_token.as_deref()),
+                RequestTimeoutPolicy::Finite,
+            )?
             .json(request)
             .send()
             .map_err(|error| request_error(&url, error))?;
@@ -672,14 +694,6 @@ impl DaemonClient for HttpDaemonClient {
 
     fn health(&self) -> CliResult<HealthResponse> {
         self.request_json::<HealthResponse, ()>(Method::GET, "/api/health", None)
-    }
-}
-
-pub fn bind_to_base_url(bind: &str) -> String {
-    if bind.starts_with("http://") || bind.starts_with("https://") {
-        bind.trim_end_matches('/').to_string()
-    } else {
-        format!("http://{}", bind.trim_end_matches('/'))
     }
 }
 
@@ -834,7 +848,7 @@ fn http_error(status: StatusCode, mut response: reqwest::blocking::Response) -> 
 fn daemon_error_message(body: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(body).ok()?;
     let message = value.get("error")?.as_str()?.trim();
-    (!message.is_empty()).then(|| redact_json_like_text(message))
+    (!message.is_empty()).then(|| auth::redact_text_secrets(message))
 }
 
 fn request_error(url: &str, error: reqwest::Error) -> CliError {
@@ -908,143 +922,7 @@ where
 }
 
 fn bounded_redacted_body(body: &str, truncated: bool) -> String {
-    let mut redacted = if let Ok(mut value) = serde_json::from_str::<Value>(body) {
-        redact_json(&mut value);
-        serde_json::to_string(&value).unwrap_or_else(|_| redact_json_like_text(body))
-    } else {
-        redact_json_like_text(body)
-    };
-
-    if truncated {
-        redacted.push_str(HTTP_ERROR_TRUNCATION_MARKER);
-    }
-    redacted
-}
-
-fn redact_json(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                if is_secret_key(key) {
-                    *child = Value::String("<redacted>".into());
-                } else {
-                    redact_json(child);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                redact_json(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn is_secret_key(key: &str) -> bool {
-    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
-    normalized.contains("apikey")
-        || normalized.contains("token")
-        || normalized.contains("secret")
-        || normalized.contains("password")
-        || normalized.contains("authorization")
-        || normalized.contains("bearer")
-}
-
-fn redact_json_like_text(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut index = 0;
-
-    while let Some(relative_quote) = input[index..].find('"') {
-        let quote = index + relative_quote;
-        output.push_str(&input[index..quote]);
-
-        let Some((key, key_end)) = parse_json_string(input, quote) else {
-            output.push_str(&input[quote..]);
-            return output;
-        };
-        output.push_str(&input[quote..key_end]);
-
-        let Some(after_colon) = colon_after_key(input, key_end) else {
-            index = key_end;
-            continue;
-        };
-
-        if !is_secret_key(&key) {
-            index = key_end;
-            continue;
-        }
-
-        output.push_str(&input[key_end..after_colon]);
-        let value_start = skip_ascii_whitespace(input, after_colon);
-        output.push_str(&input[after_colon..value_start]);
-
-        if input[value_start..].starts_with('"') {
-            output.push_str("\"<redacted>\"");
-            if let Some((_, value_end)) = parse_json_string(input, value_start) {
-                index = value_end;
-                continue;
-            }
-            return output;
-        }
-
-        output.push_str("\"<redacted>\"");
-        index = next_json_value_boundary(input, value_start);
-    }
-
-    output.push_str(&input[index..]);
-    output
-}
-
-fn parse_json_string(input: &str, quote: usize) -> Option<(String, usize)> {
-    if !input[quote..].starts_with('"') {
-        return None;
-    }
-
-    let mut escaped = false;
-    let mut value = String::new();
-    for (offset, character) in input[quote + 1..].char_indices() {
-        let index = quote + 1 + offset;
-        if escaped {
-            value.push(character);
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == '"' {
-            return Some((value, index + 1));
-        } else {
-            value.push(character);
-        }
-    }
-    None
-}
-
-fn colon_after_key(input: &str, key_end: usize) -> Option<usize> {
-    let colon = skip_ascii_whitespace(input, key_end);
-    if input[colon..].starts_with(':') {
-        Some(colon + 1)
-    } else {
-        None
-    }
-}
-
-fn skip_ascii_whitespace(input: &str, mut index: usize) -> usize {
-    while let Some(character) = input[index..].chars().next() {
-        if !character.is_ascii_whitespace() {
-            break;
-        }
-        index += character.len_utf8();
-    }
-    index
-}
-
-fn next_json_value_boundary(input: &str, start: usize) -> usize {
-    input[start..]
-        .char_indices()
-        .find_map(|(offset, character)| {
-            matches!(character, ',' | '}' | ']' | '\n' | '\r').then_some(start + offset)
-        })
-        .unwrap_or(input.len())
+    auth::redact_response_body(body, truncated)
 }
 
 #[cfg(test)]
@@ -1059,9 +937,12 @@ mod tests {
 
     #[test]
     fn bind_to_base_url_adds_http_scheme() {
-        assert_eq!(bind_to_base_url("127.0.0.1:7700"), "http://127.0.0.1:7700");
         assert_eq!(
-            bind_to_base_url("http://127.0.0.1:7700/"),
+            auth::bind_to_base_url("127.0.0.1:7700"),
+            "http://127.0.0.1:7700"
+        );
+        assert_eq!(
+            auth::bind_to_base_url("http://127.0.0.1:7700/"),
             "http://127.0.0.1:7700"
         );
     }
