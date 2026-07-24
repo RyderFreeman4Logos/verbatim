@@ -1,6 +1,6 @@
 //! Authentication and route-level authorization middleware for the daemon.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{bail, Result};
 use axum::extract::connect_info::ConnectInfo;
@@ -21,14 +21,33 @@ pub(super) fn validate_daemon_auth_bind(daemon: &DaemonConfig) -> Result<()> {
             daemon.bind
         );
     }
+    if matches!(daemon.auth.mode, AuthMode::StaticToken)
+        && !is_loopback_bind(&daemon.bind)
+        && !daemon.auth.allow_insecure_transport
+    {
+        bail!(
+            "refusing to start daemon with daemon.auth.mode = \"static-token\" on non-loopback bind {}; static bearer tokens require encrypted transport, set daemon.auth.allow_insecure_transport = true only for an explicitly trusted network",
+            daemon.bind
+        );
+    }
     Ok(())
 }
 
 fn is_loopback_bind(bind: &str) -> bool {
-    bind.starts_with("127.0.0.1")
-        || bind.starts_with("localhost")
-        || bind.starts_with("::1")
-        || bind.starts_with("[::1]")
+    if let Ok(address) = bind.parse::<SocketAddr>() {
+        return address.ip().is_loopback();
+    }
+
+    let Some((host, _port)) = bind.rsplit_once(':') else {
+        return false;
+    };
+    if host.contains(':') {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+    host == "localhost"
 }
 
 /// Immutable authentication data captured when the daemon router starts.
@@ -250,7 +269,12 @@ mod tests {
             .contains("daemon.auth.mode = \"local-anonymous\""));
         assert!(error.to_string().contains("0.0.0.0:7700"));
 
-        for bind in ["127.0.0.1:7700", "localhost:7700", "[::1]:7700", "::1:7700"] {
+        for bind in [
+            "127.0.0.1:7700",
+            "127.0.0.2:7700",
+            "localhost:7700",
+            "[::1]:7700",
+        ] {
             config.bind = bind.into();
             assert!(
                 validate_daemon_auth_bind(&config).is_ok(),
@@ -258,8 +282,28 @@ mod tests {
             );
         }
 
+        config.bind = "::1:7700".into();
+        assert!(
+            validate_daemon_auth_bind(&config).is_err(),
+            "unbracketed IPv6 socket addresses must not be accepted"
+        );
+
+        for bind in ["127.0.0.1.example:7700", "localhost.evil:7700"] {
+            config.bind = bind.into();
+            assert!(
+                validate_daemon_auth_bind(&config).is_err(),
+                "{bind} must not be treated as loopback"
+            );
+        }
+
         config.bind = "0.0.0.0:7700".into();
         config.auth.mode = AuthMode::StaticToken;
+        let error = validate_daemon_auth_bind(&config).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("allow_insecure_transport = true"));
+
+        config.auth.allow_insecure_transport = true;
         assert!(validate_daemon_auth_bind(&config).is_ok());
     }
 
@@ -283,6 +327,7 @@ mod tests {
         let config = DaemonAuthConfig {
             mode: AuthMode::StaticToken,
             static_token: "fixture-token".into(),
+            allow_insecure_transport: false,
             static_token_role: Role::Reader,
         };
 
@@ -316,6 +361,7 @@ mod tests {
         let response = auth_router(DaemonAuthConfig {
             mode: AuthMode::StaticToken,
             static_token: "fixture-token".into(),
+            allow_insecure_transport: false,
             static_token_role: Role::Admin,
         })
         .oneshot(request(Method::GET, "/api/health", None, "192.0.2.1:43210"))
@@ -330,6 +376,7 @@ mod tests {
         let response = auth_router(DaemonAuthConfig {
             mode: AuthMode::StaticToken,
             static_token: "fixture-token".into(),
+            allow_insecure_transport: false,
             static_token_role: Role::Editor,
         })
         .oneshot(request(

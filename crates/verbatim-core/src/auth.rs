@@ -44,6 +44,9 @@ pub struct DaemonAuthConfig {
     /// Static bearer token used by static-token mode.
     #[serde(default)]
     pub static_token: String,
+    /// Permit sending static bearer tokens over an unencrypted non-loopback bind.
+    #[serde(default)]
+    pub allow_insecure_transport: bool,
     /// Role granted to callers authenticated with the static bearer token.
     #[serde(default)]
     pub static_token_role: Role,
@@ -59,10 +62,14 @@ mod tests {
         let auth = DaemonAuthConfig::default();
 
         assert_eq!(auth.mode, AuthMode::LocalAnonymous);
+        assert!(!auth.allow_insecure_transport);
         assert_eq!(auth.static_token_role, Role::Admin);
-        let static_token: DaemonAuthConfig =
-            toml::from_str("mode = \"static-token\"\nstatic_token_role = \"reader\"").unwrap();
+        let static_token: DaemonAuthConfig = toml::from_str(
+            "mode = \"static-token\"\nallow_insecure_transport = true\nstatic_token_role = \"reader\"",
+        )
+        .unwrap();
         assert_eq!(static_token.mode, AuthMode::StaticToken);
+        assert!(static_token.allow_insecure_transport);
         assert_eq!(static_token.static_token_role, Role::Reader);
         assert!(matches!(
             Principal::LocalAnonymous,
@@ -76,11 +83,12 @@ mod tests {
         assert_eq!(default_config.daemon.auth, DaemonAuthConfig::default());
 
         let config: Config = toml::from_str(
-            "[daemon.auth]\nmode = \"static-token\"\nstatic_token = \"fixture-token\"\nstatic_token_role = \"editor\"",
+            "[daemon.auth]\nmode = \"static-token\"\nstatic_token = \"fixture-token\"\nallow_insecure_transport = true\nstatic_token_role = \"editor\"",
         )
         .unwrap();
         assert_eq!(config.daemon.auth.mode, AuthMode::StaticToken);
         assert_eq!(config.daemon.auth.static_token, "fixture-token");
+        assert!(config.daemon.auth.allow_insecure_transport);
         assert_eq!(config.daemon.auth.static_token_role, Role::Editor);
     }
 }

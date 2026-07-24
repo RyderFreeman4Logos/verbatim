@@ -39,21 +39,29 @@ pub(crate) fn daemon_client() -> Client {
 }
 
 fn client_with_token(auth_token: Option<String>) -> Client {
+    let Some(headers) = auth_headers(auth_token.as_deref()) else {
+        eprintln!(
+            "warning: invalid daemon auth token; sending requests without an Authorization header"
+        );
+        return Client::new();
+    };
+
     Client::builder()
-        .default_headers(auth_headers(auth_token.as_deref()))
+        .default_headers(headers)
         .build()
-        .expect("daemon HTTP client construction must succeed")
+        .unwrap_or_else(|error| {
+            eprintln!("warning: failed to construct daemon HTTP client: {error}");
+            Client::new()
+        })
 }
 
-fn auth_headers(auth_token: Option<&str>) -> HeaderMap {
+fn auth_headers(auth_token: Option<&str>) -> Option<HeaderMap> {
     let mut headers = HeaderMap::new();
     if let Some(token) = auth_token {
-        let value = format!("Bearer {token}")
-            .parse()
-            .expect("daemon auth tokens must be valid HTTP header values");
+        let value = format!("Bearer {token}").parse().ok()?;
         headers.insert(AUTHORIZATION, value);
     }
-    headers
+    Some(headers)
 }
 
 #[cfg(test)]
@@ -76,7 +84,7 @@ mod tests {
     #[test]
     fn daemon_client_headers_include_the_bearer_token() {
         let token = ["fixture", "token"].join("-");
-        let headers = auth_headers(Some(&token));
+        let headers = auth_headers(Some(&token)).expect("fixture token is a valid header value");
         let authorization = headers
             .get(AUTHORIZATION)
             .expect("authorization header is present")
@@ -84,5 +92,14 @@ mod tests {
             .expect("authorization header is valid text");
 
         assert_eq!(authorization, format!("Bearer {token}"));
+    }
+
+    #[test]
+    fn malformed_auth_token_does_not_panic_or_set_an_authorization_header() {
+        let client = std::panic::catch_unwind(|| client_with_token(Some("invalid\ntoken".into())))
+            .expect("malformed auth tokens must not panic");
+
+        assert!(auth_headers(Some("invalid\ntoken")).is_none());
+        drop(client);
     }
 }

@@ -49,6 +49,8 @@ fn config_init_template_documents_daemon_resources_and_watcher() {
 
     assert!(template.contains("[daemon]"));
     assert!(template.contains("bind"));
+    assert!(template.contains("allow_insecure_transport = false"));
+    assert!(template.contains("non-loopback HTTP binds expose credentials"));
     assert!(template.contains("worker threads"));
     assert!(template.contains("idle reclaim"));
     assert!(template.contains("idle exit"));

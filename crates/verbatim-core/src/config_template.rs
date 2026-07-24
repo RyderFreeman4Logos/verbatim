@@ -237,6 +237,9 @@ worker_threads = 4
 mode = "local-anonymous"
 # Configure this only for static-token mode. VERBATIM_AUTH_TOKEN overrides it.
 static_token = ""
+# Static tokens on non-loopback HTTP binds expose credentials. Keep false unless
+# the network is explicitly trusted and secured outside this daemon.
+allow_insecure_transport = false
 # Role granted to callers with the configured static token: reader, editor, or admin.
 static_token_role = "admin"
 
