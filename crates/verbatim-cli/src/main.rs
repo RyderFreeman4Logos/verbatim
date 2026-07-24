@@ -16,6 +16,7 @@ use verbatim_core::api::{
     IndexProfileDeleteResponse, IndexStatusResponse, VectorJsonCleanupResponse,
 };
 
+mod auth;
 mod client;
 mod local;
 mod render;

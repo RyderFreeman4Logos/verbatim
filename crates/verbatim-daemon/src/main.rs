@@ -5,6 +5,7 @@ use std::convert::Infallible;
 use std::fs;
 use std::future::Future;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -107,6 +108,8 @@ use verbatim_core::types::{
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
+#[path = "auth_middleware.rs"]
+mod auth_middleware;
 #[path = "deletion_api.rs"]
 mod deletion_api;
 #[path = "sqlite_durability_ops.rs"]
@@ -9262,6 +9265,7 @@ fn main() -> Result<()> {
     // Read worker_threads from config before creating the runtime.
     let config_path = config::config_path();
     let config = Config::load_from(&config_path).context("failed to load config")?;
+    auth_middleware::validate_daemon_auth_bind(&config.daemon)?;
     let worker_threads = if config.daemon.worker_threads == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -9312,6 +9316,13 @@ where
 }
 
 fn daemon_router(state: SharedState) -> Router {
+    let auth_config = state
+        .runtime_config
+        .read()
+        .map(|runtime| runtime.config.daemon.auth.clone())
+        .unwrap_or_default();
+    let auth_state = auth_middleware::AuthMiddlewareState::from_runtime_config(auth_config);
+
     Router::new()
         .route("/api/health", get(health))
         .route("/api/config", get(get_config))
@@ -9382,6 +9393,10 @@ fn daemon_router(state: SharedState) -> Router {
             Arc::clone(&state),
             track_http_activity,
         ))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            auth_middleware::authenticate_request,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -9425,6 +9440,7 @@ where
 }
 
 async fn run_daemon_with_config(config: Config) -> Result<()> {
+    auth_middleware::validate_daemon_auth_bind(&config.daemon)?;
     tracing_subscriber::fmt::init();
 
     let config_path = config::config_path();
@@ -9473,10 +9489,13 @@ async fn run_daemon_with_config(config: Config) -> Result<()> {
         .with_context(|| format!("failed to bind {bind_addr}"))?;
 
     let mut server_task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal(idle_exit_shutdown_rx))
-            .await
-            .context("server error")
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal(idle_exit_shutdown_rx))
+        .await
+        .context("server error")
     });
 
     let startup =
@@ -9675,6 +9694,8 @@ mod tests {
         VectorIndexResidency,
     };
 
+    #[path = "../auth_middleware_daemon_tests.rs"]
+    mod auth_middleware_daemon_tests;
     #[path = "sqlite_durability_tests.rs"]
     mod sqlite_durability_tests;
 
