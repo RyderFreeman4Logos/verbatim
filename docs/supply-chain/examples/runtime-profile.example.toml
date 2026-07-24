@@ -1,0 +1,78 @@
+# Example runtime profile for SUPPLY-001 (fixture, not a live release).
+# Digests are deterministic placeholders for validation tests.
+# Schema: docs/supply-chain/provenance-manifest.schema.toml
+# Policy: docs/architecture/supply-chain-provenance.md
+
+schema_version = 1
+kind = "runtime-profile"
+profile_id = "verbatim-runtime-example-v1"
+spec = "SUPPLY-001"
+
+[app]
+name = "verbatim"
+version = "0.1.96"
+git_sha = "PLACEHOLDER_GIT_SHA"
+
+[[components]]
+id = "app-binary-verbatim"
+class = "binary"
+name = "verbatim"
+version = "0.1.96"
+platform = "x86_64-unknown-linux-gnu"
+digest_alg = "sha256"
+digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[components]]
+id = "crate-serde"
+class = "crate"
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+digest_alg = "sha256"
+digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[[components]]
+id = "container-verbatim-runtime"
+class = "container"
+name = "verbatim-runtime"
+version = "0.1.96"
+platform = "linux/amd64"
+image_ref = "ghcr.io/example/verbatim-runtime:0.1.96"
+digest_alg = "sha256"
+digest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+[[components]]
+id = "model-embed-stub"
+class = "model"
+name = "example-embed-model"
+version = "stub-1"
+role = "embedding"
+digest_alg = "sha256"
+digest = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
+[[components]]
+id = "tokenizer-stub"
+class = "tokenizer"
+name = "example-tokenizer"
+version = "stub-1"
+role = "tokenizer"
+digest_alg = "sha256"
+digest = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+[[components]]
+id = "skill-query-workflows"
+class = "skill"
+name = "verbatim-query-workflows"
+version = "0.1.0"
+path = "skills/verbatim-query-workflows/SKILL.md"
+digest_alg = "sha256"
+digest = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+[[components]]
+id = "parser-ocr-tesseract-stub"
+class = "ocr"
+name = "tesseract"
+version = "5.x-stub"
+role = "ocr"
+digest_alg = "sha256"
+digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
