@@ -3803,6 +3803,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "url",
  "verbatim-core",
 ]
 

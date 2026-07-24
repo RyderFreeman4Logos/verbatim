@@ -4,6 +4,7 @@ use reqwest::blocking::{Client, RequestBuilder};
 #[cfg(test)]
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use serde_json::Value;
+use url::Host;
 use verbatim_core::config::{self, Config};
 
 pub(crate) const HTTP_ERROR_TRUNCATION_MARKER: &str = "...[truncated]";
@@ -46,21 +47,24 @@ pub(crate) fn daemon_client() -> Client {
 /// Check whether the given URL is safe for sending bearer tokens.
 /// Safe means HTTPS, or loopback HTTP, or explicit insecure opt-in.
 pub(crate) fn is_safe_transport(url: &str) -> bool {
-    if url.starts_with("https://") {
-        return true;
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+
+    match parsed.scheme() {
+        "https" => true,
+        "http" => {
+            let Some(host) = parsed.host() else {
+                return false;
+            };
+            match host {
+                Host::Ipv4(ip) => ip.is_loopback(),
+                Host::Ipv6(ip) => ip.is_loopback(),
+                Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+            }
+        }
+        _ => false,
     }
-    if !url.starts_with("http://") {
-        return false; // unknown scheme
-    }
-    // Extract host from http://host:port/path
-    let after_scheme = &url["http://".len()..];
-    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
-    let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
-    // Check if host is a loopback IP literal
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return ip.is_loopback();
-    }
-    host == "localhost" || host == "127.0.0.1"
 }
 
 /// Read `allow_insecure_transport` from config (if available).
@@ -292,12 +296,17 @@ mod tests {
     }
 
     #[test]
-    fn transport_safety_checks_loopback_https_and_insecure() {
-        assert!(is_safe_transport("https://0.0.0.0:7700"));
+    fn transport_safety_uses_the_parsed_url_host() {
+        assert!(!is_safe_transport(
+            "http://127.0.0.1:80@attacker.example/api/config"
+        ));
+        assert!(is_safe_transport("http://[::1]:7700"));
         assert!(is_safe_transport("http://127.0.0.1:7700"));
         assert!(is_safe_transport("http://127.0.0.2:7700"));
         assert!(is_safe_transport("http://localhost:7700"));
         assert!(!is_safe_transport("http://192.0.2.10:7700"));
         assert!(!is_safe_transport("http://0.0.0.0:7700"));
+        assert!(is_safe_transport("https://0.0.0.0:7700"));
+        assert!(!is_safe_transport("http://localhost.attacker.example:7700"));
     }
 }
