@@ -195,11 +195,17 @@ fn run_external_ocr_command(
 
 #[cfg(unix)]
 fn configure_ocr_command(command: &mut Command) {
+    // Place the OCR helper in its own process group so timeout teardown can
+    // signal the whole tree. Network is denied by the fail-closed ingest
+    // security policy (INGEST-SEC-001 / #337); this is not a full OS sandbox.
     command.process_group(0);
+    crate::ingest_security::IngestSecurityPolicy::default().apply_to_external_command(command);
 }
 
 #[cfg(not(unix))]
-fn configure_ocr_command(_command: &mut Command) {}
+fn configure_ocr_command(command: &mut Command) {
+    crate::ingest_security::IngestSecurityPolicy::default().apply_to_external_command(command);
+}
 
 fn write_child_stdin(child: &mut Child, input: &[u8]) -> Result<()> {
     let mut stdin = child.stdin.take().context("open OCR command stdin")?;

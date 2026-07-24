@@ -20,6 +20,7 @@ pub mod index;
 pub mod index_gc;
 pub mod index_profile_delete;
 pub mod ingest;
+pub mod ingest_security;
 pub mod memory_budget;
 pub mod ocr;
 pub mod parser;
