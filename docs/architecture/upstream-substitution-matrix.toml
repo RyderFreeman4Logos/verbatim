@@ -1,0 +1,318 @@
+# UPSTREAM-001 substitution matrix (walking skeleton)
+# Policy: docs/architecture/upstream-first.md
+# Validate: bash scripts/tests/upstream-matrix-tests.sh
+# Supply-chain recording expectations: SUPPLY-001 (hashes, features, licenses,
+# advisories, MSRV, upgrade evidence). This file does not replace SUPPLY-001.
+
+schema_version = 1
+policy = "docs/architecture/upstream-first.md"
+reviewed_on = "2026-07-24"
+spec = "UPSTREAM-001"
+issue = 364
+
+# disposition ∈ {ADOPT, WRAP, UPSTREAM, KEEP, DELETE}
+# KEEP rows require non-empty rationale, owner, reviewed_on, reconsider_when.
+
+[[subsystem]]
+id = "workflow-agent-runtime"
+subsystem = "workflow/agent runtime"
+disposition = "UPSTREAM"
+rationale = """
+No built-in ADK/agent workflow stack ships yet. Future agent orchestration must
+adopt an upstream deep module (planned ADK-001 / adk-rust) rather than growing a
+Verbatim-only workflow engine. Temporary local orchestration, if any, stays a
+deletable shim."""
+owner = "architecture"
+reviewed_on = "2026-07-24"
+reconsider_when = ""
+upstream_candidates = ["adk-rust (zavora-ai/adk-rust)", "tokio runtime primitives"]
+conformance_suite = ""
+related_specs = ["ADK-001", "UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "model-provider-clients"
+subsystem = "model provider clients"
+disposition = "WRAP"
+rationale = """
+HTTP transport uses reqwest; OpenAI-compatible request/response shaping,
+diagnostic envelopes, and role-specific client policy live behind Verbatim
+adapters under crates/verbatim-core/src/provider and upstream.rs."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = ""
+upstream_candidates = ["reqwest", "async-openai (evaluate if public API fits)"]
+conformance_suite = ""
+related_specs = ["UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "retry-cancellation"
+subsystem = "retry/cancellation"
+disposition = "KEEP"
+rationale = """
+Task cancel, ingest-batch cancel, config-reload debounce, idle reclaim/exit, and
+task-wait polling are product-specific control-plane semantics wired into
+daemon task state machines rather than a generic retry crate. Commodity backoff
+helpers may still be ADOPT/WRAP later for pure HTTP retries without changing
+task cancel contracts."""
+owner = "verbatim-daemon"
+reviewed_on = "2026-07-24"
+reconsider_when = """
+When a conformance suite isolates pure HTTP retry from task cancel semantics,
+and an upstream cancel/backoff crate matches daemon task metadata bounds without
+weakening cancel observability."""
+upstream_candidates = ["tokio::time", "tokio_util::sync::CancellationToken", "backoff crates"]
+conformance_suite = ""
+related_specs = ["UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "session-checkpoint"
+subsystem = "session/checkpoint"
+disposition = "KEEP"
+rationale = """
+Persistent task records, bounded metadata, events, and recovery are Verbatim
+product contracts (task.rs + SQLite store), not generic agent session
+checkpoints. They encode retention, abort, and resource-progress semantics."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = """
+If ADK-001 or another upstream runtime offers a public session model that can
+carry Verbatim task metadata bounds and evidence linkage without format capture."""
+upstream_candidates = ["adk-rust session primitives (future)", "rusqlite persistence"]
+conformance_suite = ""
+related_specs = ["ADK-001", "UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "auth-product-contracts"
+subsystem = "auth (product contracts)"
+disposition = "KEEP"
+rationale = """
+#333 landed product auth: AuthMode, DaemonAuthConfig, role levels (Reader/
+Editor/Admin), and data-layer authorization over sources/chunks. These are
+Verbatim security contracts and must not be outsourced."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = """
+Only if a future identity standard can express the same role matrix and
+source/chunk authorization decisions without changing wire/API meaning; generic
+HTTP auth middleware may still be WRAP independently."""
+upstream_candidates = []
+conformance_suite = ""
+related_specs = ["#333", "UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "auth-http-middleware"
+subsystem = "auth (HTTP middleware)"
+disposition = "WRAP"
+rationale = """
+Daemon HTTP auth middleware is a thin Axum/tower adapter enforcing product
+AuthMode and bearer rules. Generic middleware crates may replace plumbing, not
+authorization meaning."""
+owner = "verbatim-daemon"
+reviewed_on = "2026-07-24"
+reconsider_when = ""
+upstream_candidates = ["axum", "tower", "tower-http"]
+conformance_suite = ""
+related_specs = ["#333", "UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "telemetry"
+subsystem = "telemetry"
+disposition = "ADOPT"
+rationale = """
+Structured logging uses tracing and tracing-subscriber directly. No
+Verbatim-owned telemetry exporter is maintained."""
+owner = "verbatim-daemon"
+reviewed_on = "2026-07-24"
+reconsider_when = ""
+upstream_candidates = ["tracing", "tracing-subscriber", "opentelemetry (optional future)"]
+conformance_suite = ""
+related_specs = ["UPSTREAM-001", "SUPPLY-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "evaluation-harness"
+subsystem = "evaluation/harness"
+disposition = "KEEP"
+rationale = """
+Deterministic MVP regression fixtures and docs/evals.md encode Verbatim evidence
+and citation contracts. Commodity LLM eval frameworks do not own EvidenceId,
+locator, or grounded-answer publication rules."""
+owner = "docs-evals"
+reviewed_on = "2026-07-24"
+reconsider_when = """
+When an upstream harness can run Verbatim fixtures with stable evidence IDs and
+citation checks without redefining product goldens."""
+upstream_candidates = ["criterion (benches only)", "external eval runners (evaluate)"]
+conformance_suite = "docs/evals.md"
+related_specs = ["UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "rag-adapters"
+subsystem = "RAG adapters"
+disposition = "KEEP"
+rationale = """
+Hybrid retrieval fusion, graph expansion, rerank policy, completeness/abstention,
+and ContextPack assembly are product retrieval contracts. Adapters to external
+vector or search engines must preserve EvidencePack meaning."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = """
+If an upstream RAG framework can be constrained to Verbatim EvidencePack/
+ContextPack contracts under a conformance suite without ownership of goldens."""
+upstream_candidates = []
+conformance_suite = "docs/evals.md"
+related_specs = ["UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "vector-clients"
+subsystem = "vector clients (Qdrant, future DiskANN)"
+disposition = "WRAP"
+rationale = """
+Local HNSW uses instant-distance; optional Qdrant is a feature-gated remote
+adapter (index/qdrant.rs) with product sync/search gates. Future DiskANN or
+other engines should remain thin clients, not primary truth stores."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = ""
+upstream_candidates = ["instant-distance", "qdrant client crates", "future DiskANN clients"]
+conformance_suite = "docs/qdrant-primary-vector-spike.md"
+related_specs = ["UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "parsers"
+subsystem = "parsers"
+disposition = "WRAP"
+rationale = """
+Format parsers ADOPT upstream crates (pulldown-cmark, pdf_oxide/pdfplumber,
+lopdf, image) and WRAP results into Verbatim source/evidence spans and locators.
+Product span/locator contracts stay Verbatim-owned."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = ""
+upstream_candidates = ["pulldown-cmark", "pdf_oxide", "pdfplumber", "lopdf", "image"]
+conformance_suite = ""
+related_specs = ["UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "caches"
+subsystem = "caches"
+disposition = "KEEP"
+rationale = """
+Embedding cache rows, vector BLOB/JSON dual-read, and store_cache behavior encode
+local durability and migration semantics for Verbatim indexes, not a generic
+cache library."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = """
+If a generic cache crate can own transport caching without touching embedding
+vector payloads or SQLite durability profiles."""
+upstream_candidates = ["moka/cached (HTTP-only evaluation)", "rusqlite-backed store"]
+conformance_suite = ""
+related_specs = ["UPSTREAM-001", "#362"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "migrations"
+subsystem = "migrations"
+disposition = "KEEP"
+rationale = """
+Schema evolution is tied to Verbatim store invariants, vector payload formats,
+and generation safety. Commodity migration frameworks must not own product DDL
+truth without a conformance suite."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = """
+When migrations are extracted behind a narrow trait with fixture parity against
+current Store open/upgrade paths."""
+upstream_candidates = ["refinery/rusqlite migration tools (evaluate)"]
+conformance_suite = ""
+related_specs = ["UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "backup-durability"
+subsystem = "backup/durability"
+disposition = "KEEP"
+rationale = """
+SQLite durability profiles, WAL checkpoint policy, disk-full behavior, RPO
+contracts, and recovery drills (#362 / docs/sqlite-durability.md) are product
+reliability contracts. rusqlite/SQLite are ADOPTed engines underneath."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = """
+If upstream durability tooling can express Verbatim RPO profiles and fail-closed
+disk-full behavior with documented drill parity."""
+upstream_candidates = ["rusqlite", "sqlite"]
+conformance_suite = "docs/sqlite-durability.md"
+related_specs = ["#362", "UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "http-protocol"
+subsystem = "HTTP protocol (Axum)"
+disposition = "ADOPT"
+rationale = """
+Daemon HTTP server uses axum, tower, and tower-http directly for routing, JSON,
+and CORS. Product routes and auth middleware remain WRAP/KEEP layers above."""
+owner = "verbatim-daemon"
+reviewed_on = "2026-07-24"
+reconsider_when = ""
+upstream_candidates = ["axum", "tower", "tower-http"]
+conformance_suite = ""
+related_specs = ["UPSTREAM-001", "SUPPLY-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "cli-plumbing"
+subsystem = "CLI plumbing"
+disposition = "WRAP"
+rationale = """
+clap and reqwest provide commodity CLI/HTTP plumbing; command shapes, renderers,
+and daemon client contracts stay Verbatim product surface."""
+owner = "verbatim-cli"
+reviewed_on = "2026-07-24"
+reconsider_when = ""
+upstream_candidates = ["clap", "reqwest"]
+conformance_suite = "docs/cli-api-parity.md"
+related_specs = ["UPSTREAM-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "bm25-search"
+subsystem = "BM25 search index"
+disposition = "ADOPT"
+rationale = """
+Lexical search builds on Tantivy. Verbatim owns query planning and evidence
+mapping around the index, not a fork of BM25."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = ""
+upstream_candidates = ["tantivy"]
+conformance_suite = ""
+related_specs = ["UPSTREAM-001", "SUPPLY-001"]
+deletion_issue = ""
+
+[[subsystem]]
+id = "sqlite-engine"
+subsystem = "SQLite storage engine"
+disposition = "ADOPT"
+rationale = """
+Metadata and vector payload storage use rusqlite (bundled SQLite). Product schema
+and durability policy remain KEEP above the engine."""
+owner = "verbatim-core"
+reviewed_on = "2026-07-24"
+reconsider_when = ""
+upstream_candidates = ["rusqlite", "sqlite"]
+conformance_suite = ""
+related_specs = ["UPSTREAM-001", "SUPPLY-001"]
+deletion_issue = ""

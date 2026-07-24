@@ -43,6 +43,12 @@ For the SQLite durability profile, WAL checkpoint policy, disk-full behavior,
 RPO contract, and backup/restore drill, see
 [SQLite durability and recovery](docs/sqlite-durability.md).
 
+For the upstream-first engineering policy, substitution matrix, and new-issue
+reuse checklist, see
+[Upstream-first policy](docs/architecture/upstream-first.md),
+[substitution matrix](docs/architecture/upstream-substitution-matrix.toml), and
+[upstream-reuse check](docs/templates/upstream-reuse-check.md).
+
 Minimal model role configurations:
 
 ```toml
