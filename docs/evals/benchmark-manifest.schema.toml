@@ -20,6 +20,7 @@ policy = "docs/architecture/benchmark-governance.md"
 kind = "benchmark-promotion-manifest"
 required_top_level = [
     "schema_version",
+    "kind",
     "benchmark_id",
     "splits",
     "hidden_final_set",
@@ -30,8 +31,11 @@ required_top_level = [
     "dataset_change_policy",
 ]
 
-# Roles that participate in group isolation checks. A group_id MUST NOT appear
-# in more than one of these roles.
+# Standard split roles that MUST be present under splits.<role>.
+required_split_roles = ["train", "validation", "test"]
+
+# Historical name retained for docs; validators isolate ALL declared split
+# roles plus hidden_final (including tuning/calibration/custom).
 isolated_split_roles = ["train", "validation", "test", "hidden_final"]
 
 # Required keys inside each splits.<role> table when the role is present.

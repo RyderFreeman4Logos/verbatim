@@ -62,9 +62,11 @@ Promotion reports MUST include, at minimum:
 3. **Regression tolerance** — how much degradation is allowed before a change
    is blocked (`regression_tolerance`).
 4. **Distributions for model-backed runs** — when model-backed workflows are
-   repeated, report distribution summaries plus hard-invariant failures
-   (residual for full harness work; the field surface is reserved on the
-   schema).
+   repeated, report distribution summaries plus hard-invariant failures.
+   Residual for full harness work: the walking-skeleton schema does not yet
+   reserve machine-readable fields for these summaries; promotion reports
+   must still carry them in narrative or sidecar form until that residual
+   lands.
 
 Non-goal: requiring a single statistical test for every metric. Non-goal:
 uncalibrated LLM judges as ground truth.
