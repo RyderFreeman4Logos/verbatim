@@ -40,8 +40,18 @@ pub(crate) fn select_auth_token(
 
 /// Build a daemon HTTP client. Auth headers are applied per-request after
 /// transport safety checks, not as client defaults.
+/// Redirects are disabled so Authorization cannot ride an HTTPS→HTTP downgrade.
 pub(crate) fn daemon_client() -> Client {
-    Client::new()
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("warning: failed to construct no-redirect daemon HTTP client: {error}");
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_| Client::new())
+        })
 }
 
 /// Check whether the given URL is safe for sending bearer tokens.
@@ -275,6 +285,11 @@ mod tests {
             Some("config-token".into())
         );
         assert_eq!(select_auth_token(None, String::new()), None);
+    }
+
+    #[test]
+    fn daemon_client_constructs_without_panic() {
+        let _client = daemon_client();
     }
 
     #[test]
