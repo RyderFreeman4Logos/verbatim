@@ -1,0 +1,48 @@
+# Valid minimal benchmark promotion manifest (EVAL-015 walking skeleton).
+# Schema: docs/evals/benchmark-manifest.schema.toml
+# Policy: docs/architecture/benchmark-governance.md
+
+schema_version = 1
+kind = "benchmark-promotion-manifest"
+benchmark_id = "verbatim-eval-minimal-v1"
+spec = "EVAL-015"
+
+# Statistical promotion gates (top-level keys before tables)
+confidence_method = "paired_bootstrap"
+effect_size_min = 0.02
+regression_tolerance = 0.01
+
+contamination_baselines = [
+    "no_context",
+    "oracle_context",
+    "retrieved_context",
+    "opaque_corpus",
+]
+
+# Immutable groups: each group_id appears in exactly one isolated split role.
+[splits.train]
+group_ids = ["thread-a", "thread-b"]
+
+[splits.validation]
+group_ids = ["thread-c"]
+
+[splits.test]
+group_ids = ["thread-d", "thread-e"]
+
+# Hidden final set is declared separately from tuning/calibration.
+[hidden_final_set]
+group_ids = ["thread-f"]
+separate_from_tuning = true
+
+[temporal_holdout]
+cutoff = "2026-01-01"
+rolling_windows_days = [30, 90]
+
+[dataset_change_policy]
+review_required = true
+notes = "Dataset and qrel edits require the same review path as code."
+
+[gold]
+source = "human_qrels"
+independent_validation = true
+gold_from_filename = false
