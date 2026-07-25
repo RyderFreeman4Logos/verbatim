@@ -29,6 +29,7 @@ pub mod profiles;
 pub mod provider;
 pub mod resource;
 pub mod retrieve;
+pub mod source_metadata;
 pub mod store;
 pub mod task;
 pub mod traits;
