@@ -416,7 +416,7 @@ def terminate_owned_processes(
             child,
             selector,
             captures,
-            min(absolute_deadline, time.monotonic() + 0.05),
+            min(absolute_deadline, time.monotonic() + 0.1),
         )
     # The root stays unreaped until this final group fence, so its PGID cannot
     # be reused while killpg is still possible.
@@ -525,7 +525,7 @@ def run_command(
     global _INTERRUPTED_SIGNAL
     started = time.monotonic()
     absolute_deadline = started + timeout_seconds
-    cleanup_reserve = min(0.5, max(0.2, timeout_seconds * 0.2))
+    cleanup_reserve = min(1.0, max(0.5, timeout_seconds * 0.5))
     work_deadline = absolute_deadline - cleanup_reserve
     term_deadline = work_deadline + cleanup_reserve / 2
     _INTERRUPTED_SIGNAL = None
@@ -623,8 +623,23 @@ def run_command(
             absolute_deadline,
         )
         if not cleanup_succeeded:
-            outcome = Outcome.CLEANUP_FAILED
-            status = None
+            keep = outcome in (
+                Outcome.TIMED_OUT, Outcome.INTERRUPTED, Outcome.OUTPUT_LIMIT,
+            )
+            if keep:
+                hard = time.monotonic() + 0.5
+                while time.monotonic() < hard and owned_descendants(child.identity):
+                    signal_process_group(child.identity, signal.SIGKILL)
+                    for identity in owned_descendants(child.identity):
+                        signal_identity(identity, signal.SIGKILL)
+                    observe_child(child)
+                    reap_adopted_children(child.identity)
+                    if child.observed_status is not None:
+                        reap_root(child)
+                    time.sleep(0.01)
+            if not keep or owned_descendants(child.identity):
+                outcome = Outcome.CLEANUP_FAILED
+                status = None
         close_streams(selector, captures)
         value: int | None = None
         protocol_error: str | None = None
