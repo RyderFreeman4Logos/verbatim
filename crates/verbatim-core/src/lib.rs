@@ -23,6 +23,7 @@ pub mod index_profile_delete;
 pub mod ingest;
 pub mod ingest_security;
 pub mod memory_budget;
+pub mod migration_framework;
 pub mod ocr;
 pub mod parser;
 pub mod profiles;
