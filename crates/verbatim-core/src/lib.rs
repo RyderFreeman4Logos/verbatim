@@ -2,6 +2,7 @@
 pub mod auth;
 pub use auth::{AuthMode, DaemonAuthConfig, Principal, Role};
 pub mod api;
+pub mod cache_identity;
 pub mod canonical_chunker;
 mod caption_chunker;
 pub mod chunker;
