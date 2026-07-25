@@ -207,6 +207,67 @@ pub(crate) fn build_router(state: SharedState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::retrieve_test_config;
+    use axum::body::Body;
+    use axum::extract::connect_info::ConnectInfo;
+    use axum::http::{Method, Request, StatusCode};
+    use std::collections::BTreeSet;
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+    use verbatim_core::ingest::IngestPipeline;
+
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Minimal `SharedState` for constructing the production router in tests.
+    fn test_state(name: &str) -> (TestDir, SharedState) {
+        let unique = format!(
+            "verbatim-daemon-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let data_dir = TestDir(std::env::temp_dir().join(unique));
+        std::fs::create_dir_all(&data_dir.0).unwrap();
+        let config = retrieve_test_config("http://127.0.0.1:9/v1");
+        let pipeline = IngestPipeline::new(&config, &data_dir.0).unwrap();
+        let state = crate::tests::test_state(config, &data_dir.0, pipeline);
+        (data_dir, state)
+    }
+
+    /// Materialize Axum path templates so oneshot requests hit the registered
+    /// route (path params only need a non-empty segment).
+    fn materialize_probe_path(template: &str) -> String {
+        template
+            .replace("{id}", "probe-id")
+            .replace("{name}", "probe-name")
+            .replace("{eid}", "probe-eid")
+    }
+
+    /// Probe with an unused method so a registered path yields 405 while an
+    /// unregistered path yields routing-level 404 — without entering handlers
+    /// that may themselves return application 404 for missing resources.
+    async fn probe_registration(app: &Router, path: &str) -> StatusCode {
+        let mut request = Request::builder()
+            .method(Method::PATCH)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        // local-anonymous auth rejects non-loopback / missing ConnectInfo with
+        // 403 before routing; loopback ConnectInfo lets the probe reach the
+        // route table.
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),
+        ));
+        app.clone().oneshot(request).await.unwrap().status()
+    }
 
     #[test]
     fn route_inventory_matches_registration_count() {
@@ -292,6 +353,48 @@ mod tests {
                 PATH_EVIDENCE_BY_EID,
             ]
         );
+    }
+
+    /// Couples [`ROUTE_PATH_TEMPLATES`] to the live Router from [`build_router`]:
+    /// each inventory path must match a registration (status is not 404).
+    ///
+    /// Uses PATCH so path-matched routes return 405 without invoking handlers.
+    /// Unregistered inventory entries get routing-level 404 and fail. A control
+    /// path that is deliberately absent must 404, proving the probe can detect
+    /// missing registrations. GET would also work for many routes (405 on
+    /// POST-only paths; 401 on auth-gated paths) but can collide with
+    /// handler-level resource 404s on path-param GET routes.
+    #[tokio::test]
+    async fn route_inventory_paths_are_registered_in_actual_router() {
+        let (_test_dir, state) = test_state("route-inventory-router");
+        let app = build_router(state);
+
+        let control_status = probe_registration(&app, "/api/__not_registered_by_inventory__").await;
+        assert_eq!(
+            control_status,
+            StatusCode::NOT_FOUND,
+            "control path must be unregistered so the probe can detect inventory drift"
+        );
+
+        let mut probed = BTreeSet::new();
+        for template in ROUTE_PATH_TEMPLATES {
+            let path = materialize_probe_path(template);
+            if !probed.insert(path.clone()) {
+                // Duplicate inventory slots share one physical path (e.g. GET+POST
+                // on `/api/collections`); one successful probe covers the path.
+                continue;
+            }
+            let status = probe_registration(&app, &path).await;
+            // 405 Method Not Allowed proves the path is registered but PATCH is
+            // not accepted. 401/403 would also prove registration if auth blocked
+            // before method matching. Only 404 means the path is missing from
+            // the constructed Router.
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "inventory path template {template} (probe {path}) must be registered on the constructed Router; got {status}"
+            );
+        }
     }
 
     #[test]
