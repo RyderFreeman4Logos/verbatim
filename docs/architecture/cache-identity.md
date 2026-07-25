@@ -8,15 +8,16 @@ Code: `crates/verbatim-core/src/cache_identity.rs`.
 
 Caching can leak unauthorized or stale data when keys omit principal scope,
 authorization scope, query/plan identity, source/index generation, model
-fingerprints, trust domain, or policy version. Edits, deletion, ACL changes,
-lifecycle transitions, model drift, profile changes, graph rebuilds, and
-retention updates must invalidate every affected layer.
+fingerprints, trust domain, policy version, or ContextPack hash. Edits,
+deletion, ACL changes, lifecycle transitions, model drift, profile changes,
+graph rebuilds, and retention updates must invalidate every affected layer.
 
 ## Contract summary
 
 | Type | Role |
 | --- | --- |
 | `CacheIdentity` | Canonical inputs for any cache entry |
+| `CacheIdentityFields` | Field bundle for constructing `CacheIdentity` |
 | `CacheKey` | Content-addressed key derived from identity; retains match fields |
 | `CacheDependencyGraph` | Artifact/generation lineage for fan-out invalidation |
 | `InvalidationEvent` | Edit/delete/snapshot/ACL/lifecycle/model/profile/graph/retention |
@@ -32,7 +33,9 @@ retention updates must invalidate every affected layer.
 5. `model_fingerprint` — served model version hash
 6. `trust_domain` — trust classification
 7. `policy_version` — cache/lifecycle/retention policy version
-8. `schema_version` — forward-compatible wire version (currently `1`)
+8. `context_pack_hash` — hash of the ContextPack / grounded context payload
+   (answer cache boundary: hits must not cross distinct packs)
+9. `schema_version` — forward-compatible wire version (currently `1`)
 
 Shared reuse is opt-in only when **all** fields are equivalent. Query text
 equality alone is never a valid key.
@@ -50,8 +53,9 @@ Invalidation is field-explicit and principal-safe:
 - `CacheDependencyGraph` records multi-artifact lineage so future adapters can
   fan out one event to many entries without widening cross-principal reuse.
 
-Decode helpers (`decode_cache_identity_json`, `decode_cache_key_json`) reject
-unknown schema versions instead of silently accepting them as current schema.
+Decode helpers (`decode_cache_identity_json`, `decode_cache_key_json`,
+`decode_cache_dependency_graph_json`) reject unknown schema versions instead of
+silently accepting them as current schema.
 
 ## Cache classes that will eventually adopt this contract
 
@@ -72,8 +76,10 @@ lookup or write paths.
 
 - Module export from `verbatim-core` (`pub mod cache_identity`)
 - Deterministic key derivation and invalidation match helpers
-- Unit tests for principal/ACL isolation, determinism, invalidation, serde
-  roundtrip, and unknown-schema rejection
+- Dedicated `context_pack_hash` field fencing answer-cache ContextPack reuse
+- Unit tests for principal/ACL/ContextPack isolation, per-field digest isolation,
+  invalidation match/non-match (including Edit/Snapshot/Lifecycle/Profile/Graph),
+  serde roundtrip, and unknown-schema rejection for identity/key/dependency graph
 
 ## What this slice does **not** do (residual)
 
@@ -81,6 +87,9 @@ lookup or write paths.
 - Remote/local tombstone propagation end-to-end
 - Storage TTL, encryption, or hit/miss telemetry surfaces
 - Poisoning/stale-generation integration tests against live stores
+- Dedicated `InvalidationEvent::TrustDomain` variant (trust isolation is still
+  enforced via `content_digest` / key fields; event-driven trust-domain
+  invalidation remains residual)
 - Closing epic #339
 
 ## Integration notes
@@ -88,6 +97,8 @@ lookup or write paths.
 When a later slice touches a cache class, construct a `CacheIdentity` at the
 authorization boundary, derive `CacheKey` once, and store
 `CacheDependencyGraph` beside the value. Prefer matching invalidation through
-`cache_key_matches_invalidation` rather than ad-hoc string compares. Do not grow
-`store.rs`, `main.rs`, or `client.rs` solely to adopt this contract; keep
-adapters in non-capped modules.
+`cache_key_matches_invalidation` rather than ad-hoc string compares. Answer and
+ContextPack caches must populate `context_pack_hash` so distinct packs never
+share a key under the same principal/query/ACL. Do not grow `store.rs`,
+`main.rs`, or `client.rs` solely to adopt this contract; keep adapters in
+non-capped modules.

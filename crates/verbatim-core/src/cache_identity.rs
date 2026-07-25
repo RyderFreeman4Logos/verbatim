@@ -3,12 +3,12 @@
 //! This module is the first walking skeleton for cache correctness: a typed,
 //! testable specification of what every cache key must include so that hits
 //! cannot cross principals, ACL scopes, query plans, source generations, model
-//! fingerprints, trust domains, or policy versions.
+//! fingerprints, trust domains, policy versions, or ContextPack hashes.
 //!
 //! Residual (not in this slice): wiring existing embedding/retrieval/answer/
 //! graph/provider caches to adopt the key, remote tombstone propagation,
-//! storage TTL/encryption bounds, and closing epic #339. See
-//! `docs/architecture/cache-identity.md`.
+//! storage TTL/encryption bounds, trust-domain invalidation events, and closing
+//! epic #339. See `docs/architecture/cache-identity.md`.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -44,28 +44,39 @@ pub struct CacheIdentity {
     pub trust_domain: String,
     /// Cache policy / lifecycle / retention policy version.
     pub policy_version: String,
+    /// Hash of the ContextPack (or equivalent grounded context payload).
+    ///
+    /// Answer / generation caches must include this so two responses for the
+    /// same principal/query/ACL cannot share an entry across distinct packs.
+    pub context_pack_hash: String,
+}
+
+/// Field bundle for [`CacheIdentity::new`] to keep the constructor arity small.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CacheIdentityFields {
+    pub principal: String,
+    pub acl_scope: String,
+    pub query_plan_hash: String,
+    pub source_generation: String,
+    pub model_fingerprint: String,
+    pub trust_domain: String,
+    pub policy_version: String,
+    pub context_pack_hash: String,
 }
 
 impl CacheIdentity {
     /// Build a current-schema identity from canonical field strings.
-    pub fn new(
-        principal: impl Into<String>,
-        acl_scope: impl Into<String>,
-        query_plan_hash: impl Into<String>,
-        source_generation: impl Into<String>,
-        model_fingerprint: impl Into<String>,
-        trust_domain: impl Into<String>,
-        policy_version: impl Into<String>,
-    ) -> Self {
+    pub fn new(fields: CacheIdentityFields) -> Self {
         Self {
             schema_version: CACHE_IDENTITY_SCHEMA_VERSION,
-            principal: principal.into(),
-            acl_scope: acl_scope.into(),
-            query_plan_hash: query_plan_hash.into(),
-            source_generation: source_generation.into(),
-            model_fingerprint: model_fingerprint.into(),
-            trust_domain: trust_domain.into(),
-            policy_version: policy_version.into(),
+            principal: fields.principal,
+            acl_scope: fields.acl_scope,
+            query_plan_hash: fields.query_plan_hash,
+            source_generation: fields.source_generation,
+            model_fingerprint: fields.model_fingerprint,
+            trust_domain: fields.trust_domain,
+            policy_version: fields.policy_version,
+            context_pack_hash: fields.context_pack_hash,
         }
     }
 
@@ -87,6 +98,7 @@ impl CacheIdentity {
             model_fingerprint: self.model_fingerprint.clone(),
             trust_domain: self.trust_domain.clone(),
             policy_version: self.policy_version.clone(),
+            context_pack_hash: self.context_pack_hash.clone(),
         })
     }
 
@@ -102,6 +114,7 @@ impl CacheIdentity {
         append_field(&mut payload, self.model_fingerprint.as_bytes());
         append_field(&mut payload, self.trust_domain.as_bytes());
         append_field(&mut payload, self.policy_version.as_bytes());
+        append_field(&mut payload, self.context_pack_hash.as_bytes());
         hex_sha256(&payload)
     }
 }
@@ -109,8 +122,8 @@ impl CacheIdentity {
 /// Content-addressed cache key derived from [`CacheIdentity`].
 ///
 /// The digest is the primary address. Matching fields are retained so
-/// invalidation can target principal, ACL, generation, model, or policy scope
-/// without re-materializing the original identity document.
+/// invalidation can target principal, ACL, generation, model, policy, or
+/// ContextPack scope without re-materializing the original identity document.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CacheKey {
     pub schema_version: u32,
@@ -123,6 +136,7 @@ pub struct CacheKey {
     pub model_fingerprint: String,
     pub trust_domain: String,
     pub policy_version: String,
+    pub context_pack_hash: String,
 }
 
 impl CacheKey {
@@ -253,6 +267,13 @@ pub fn decode_cache_key_json(bytes: &[u8]) -> Result<CacheKey> {
     Ok(key)
 }
 
+/// Decode a JSON [`CacheDependencyGraph`] and reject unknown schema versions.
+pub fn decode_cache_dependency_graph_json(bytes: &[u8]) -> Result<CacheDependencyGraph> {
+    let deps: CacheDependencyGraph = serde_json::from_slice(bytes)?;
+    deps.validate_schema()?;
+    Ok(deps)
+}
+
 fn validate_schema_version(schema_version: u32) -> Result<()> {
     if schema_version != CACHE_IDENTITY_SCHEMA_VERSION {
         bail!(
@@ -277,7 +298,7 @@ mod tests {
     use super::*;
 
     fn sample_identity() -> CacheIdentity {
-        CacheIdentity::new(
+        identity_with(
             "user-a",
             "collection:alpha",
             "plan-deadbeef",
@@ -285,12 +306,35 @@ mod tests {
             "model-fp-1",
             "trust:internal",
             "policy-v1",
+            "ctx-pack-1",
         )
+    }
+
+    fn identity_with(
+        principal: &str,
+        acl_scope: &str,
+        query_plan_hash: &str,
+        source_generation: &str,
+        model_fingerprint: &str,
+        trust_domain: &str,
+        policy_version: &str,
+        context_pack_hash: &str,
+    ) -> CacheIdentity {
+        CacheIdentity::new(CacheIdentityFields {
+            principal: principal.into(),
+            acl_scope: acl_scope.into(),
+            query_plan_hash: query_plan_hash.into(),
+            source_generation: source_generation.into(),
+            model_fingerprint: model_fingerprint.into(),
+            trust_domain: trust_domain.into(),
+            policy_version: policy_version.into(),
+            context_pack_hash: context_pack_hash.into(),
+        })
     }
 
     #[test]
     fn different_principals_same_query_produce_different_keys() {
-        let left = CacheIdentity::new(
+        let left = identity_with(
             "user-a",
             "collection:alpha",
             "plan-same",
@@ -298,8 +342,9 @@ mod tests {
             "model-fp-1",
             "trust:internal",
             "policy-v1",
+            "ctx-pack-1",
         );
-        let right = CacheIdentity::new(
+        let right = identity_with(
             "user-b",
             "collection:alpha",
             "plan-same",
@@ -307,6 +352,7 @@ mod tests {
             "model-fp-1",
             "trust:internal",
             "policy-v1",
+            "ctx-pack-1",
         );
 
         let left_key = left.to_cache_key().unwrap();
@@ -317,7 +363,7 @@ mod tests {
 
     #[test]
     fn different_acl_scopes_produce_different_keys() {
-        let left = CacheIdentity::new(
+        let left = identity_with(
             "user-a",
             "collection:alpha",
             "plan-same",
@@ -325,8 +371,9 @@ mod tests {
             "model-fp-1",
             "trust:internal",
             "policy-v1",
+            "ctx-pack-1",
         );
-        let right = CacheIdentity::new(
+        let right = identity_with(
             "user-a",
             "collection:beta",
             "plan-same",
@@ -334,12 +381,141 @@ mod tests {
             "model-fp-1",
             "trust:internal",
             "policy-v1",
+            "ctx-pack-1",
         );
 
         assert_ne!(
             left.to_cache_key().unwrap().digest,
             right.to_cache_key().unwrap().digest
         );
+    }
+
+    #[test]
+    fn different_context_pack_hashes_produce_different_keys() {
+        // Answer cache cannot cross ContextPack hash for the same principal,
+        // query plan, and ACL scope.
+        let left = identity_with(
+            "user-a",
+            "collection:alpha",
+            "plan-same",
+            "src-gen-1",
+            "model-fp-1",
+            "trust:internal",
+            "policy-v1",
+            "ctx-pack-aaa",
+        );
+        let right = identity_with(
+            "user-a",
+            "collection:alpha",
+            "plan-same",
+            "src-gen-1",
+            "model-fp-1",
+            "trust:internal",
+            "policy-v1",
+            "ctx-pack-bbb",
+        );
+
+        let left_key = left.to_cache_key().unwrap();
+        let right_key = right.to_cache_key().unwrap();
+        assert_ne!(left_key.digest, right_key.digest);
+        assert_ne!(left_key.context_pack_hash, right_key.context_pack_hash);
+    }
+
+    #[test]
+    fn content_digest_isolates_each_semantic_field() {
+        // Each content_digest participant differing alone must change the key.
+        let baseline = sample_identity();
+        let cases = [
+            identity_with(
+                "user-b",
+                "collection:alpha",
+                "plan-deadbeef",
+                "src-gen-1",
+                "model-fp-1",
+                "trust:internal",
+                "policy-v1",
+                "ctx-pack-1",
+            ),
+            identity_with(
+                "user-a",
+                "collection:beta",
+                "plan-deadbeef",
+                "src-gen-1",
+                "model-fp-1",
+                "trust:internal",
+                "policy-v1",
+                "ctx-pack-1",
+            ),
+            identity_with(
+                "user-a",
+                "collection:alpha",
+                "plan-other",
+                "src-gen-1",
+                "model-fp-1",
+                "trust:internal",
+                "policy-v1",
+                "ctx-pack-1",
+            ),
+            identity_with(
+                "user-a",
+                "collection:alpha",
+                "plan-deadbeef",
+                "src-gen-2",
+                "model-fp-1",
+                "trust:internal",
+                "policy-v1",
+                "ctx-pack-1",
+            ),
+            identity_with(
+                "user-a",
+                "collection:alpha",
+                "plan-deadbeef",
+                "src-gen-1",
+                "model-fp-2",
+                "trust:internal",
+                "policy-v1",
+                "ctx-pack-1",
+            ),
+            identity_with(
+                "user-a",
+                "collection:alpha",
+                "plan-deadbeef",
+                "src-gen-1",
+                "model-fp-1",
+                "trust:external",
+                "policy-v1",
+                "ctx-pack-1",
+            ),
+            identity_with(
+                "user-a",
+                "collection:alpha",
+                "plan-deadbeef",
+                "src-gen-1",
+                "model-fp-1",
+                "trust:internal",
+                "policy-v2",
+                "ctx-pack-1",
+            ),
+            identity_with(
+                "user-a",
+                "collection:alpha",
+                "plan-deadbeef",
+                "src-gen-1",
+                "model-fp-1",
+                "trust:internal",
+                "policy-v1",
+                "ctx-pack-2",
+            ),
+        ];
+
+        let baseline_digest = baseline.to_cache_key().unwrap().digest;
+        for (idx, case) in cases.iter().enumerate() {
+            assert_ne!(
+                baseline_digest,
+                case.to_cache_key().unwrap().digest,
+                "case {idx} must isolate content_digest"
+            );
+        }
     }
 
     #[test]
@@ -371,6 +547,81 @@ mod tests {
     }
 
     #[test]
+    fn principal_scoped_invalidation_events_match_and_miss() {
+        let key = sample_identity().to_cache_key().unwrap();
+        let match_cases = [
+            InvalidationEvent::Edit {
+                principal: "user-a".into(),
+                source_generation: "src-gen-1".into(),
+            },
+            InvalidationEvent::Snapshot {
+                principal: "user-a".into(),
+                source_generation: "src-gen-1".into(),
+            },
+            InvalidationEvent::Lifecycle {
+                principal: "user-a".into(),
+                source_generation: "src-gen-1".into(),
+            },
+        ];
+        for event in &match_cases {
+            assert!(
+                cache_key_matches_invalidation(&key, event),
+                "expected match for {event:?}"
+            );
+        }
+
+        let miss_cases = [
+            InvalidationEvent::Edit {
+                principal: "user-b".into(),
+                source_generation: "src-gen-1".into(),
+            },
+            InvalidationEvent::Snapshot {
+                principal: "user-a".into(),
+                source_generation: "src-gen-other".into(),
+            },
+            InvalidationEvent::Lifecycle {
+                principal: "user-b".into(),
+                source_generation: "src-gen-other".into(),
+            },
+        ];
+        for event in &miss_cases {
+            assert!(
+                !cache_key_matches_invalidation(&key, event),
+                "expected non-match for {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_and_graph_invalidation_match_and_miss() {
+        let key = sample_identity().to_cache_key().unwrap();
+        assert!(cache_key_matches_invalidation(
+            &key,
+            &InvalidationEvent::Profile {
+                query_plan_hash: "plan-deadbeef".into(),
+            }
+        ));
+        assert!(!cache_key_matches_invalidation(
+            &key,
+            &InvalidationEvent::Profile {
+                query_plan_hash: "plan-other".into(),
+            }
+        ));
+        assert!(cache_key_matches_invalidation(
+            &key,
+            &InvalidationEvent::Graph {
+                graph_generation: "src-gen-1".into(),
+            }
+        ));
+        assert!(!cache_key_matches_invalidation(
+            &key,
+            &InvalidationEvent::Graph {
+                graph_generation: "src-gen-other".into(),
+            }
+        ));
+    }
+
+    #[test]
     fn serialization_roundtrip_preserves_identity_and_key() {
         let identity = sample_identity();
         let key = identity.to_cache_key().unwrap();
@@ -390,8 +641,7 @@ mod tests {
 
         let identity_back = decode_cache_identity_json(&identity_bytes).unwrap();
         let key_back = decode_cache_key_json(&key_bytes).unwrap();
-        let deps_back: CacheDependencyGraph = serde_json::from_slice(&deps_bytes).unwrap();
-        deps_back.validate_schema().unwrap();
+        let deps_back = decode_cache_dependency_graph_json(&deps_bytes).unwrap();
 
         assert_eq!(identity_back, identity);
         assert_eq!(key_back, key);
@@ -433,6 +683,15 @@ mod tests {
         assert!(key_err
             .to_string()
             .contains("unsupported cache identity schema version 7"));
+
+        let mut deps = CacheDependencyGraph::new();
+        deps.schema_version = 42;
+        let deps_bytes = serde_json::to_vec(&deps).unwrap();
+        let deps_err = decode_cache_dependency_graph_json(&deps_bytes)
+            .expect_err("dependency graph decode must fail closed");
+        assert!(deps_err
+            .to_string()
+            .contains("unsupported cache identity schema version 42"));
     }
 
     #[test]
