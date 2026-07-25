@@ -277,10 +277,17 @@ fn status_is_success(status: MigrationApplyStatus) -> bool {
 }
 
 /// Append-only style history of applied migrations with checksums.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Prefer [`MigrationHistory::new`]; `Default` matches it (not zero schema).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationHistory {
     pub schema_version: u32,
     pub entries: Vec<MigrationHistoryEntry>,
+}
+
+impl Default for MigrationHistory {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MigrationHistory {
@@ -352,36 +359,6 @@ pub trait BackupHook {
     fn create_backup(&mut self, label: &str) -> Result<String>;
 }
 
-/// No-op backup hook for pure unit tests.
-#[derive(Debug, Default)]
-pub struct NoopBackupHook {
-    pub calls: Vec<String>,
-}
-
-impl BackupHook for NoopBackupHook {
-    fn create_backup(&mut self, label: &str) -> Result<String> {
-        self.calls.push(label.to_string());
-        Ok(format!("noop-backup:{label}"))
-    }
-}
-
-/// Recording backup hook that can be configured to fail.
-#[derive(Debug, Default)]
-pub struct RecordingBackupHook {
-    pub calls: Vec<String>,
-    pub fail: bool,
-}
-
-impl BackupHook for RecordingBackupHook {
-    fn create_backup(&mut self, label: &str) -> Result<String> {
-        self.calls.push(label.to_string());
-        if self.fail {
-            bail!("backup hook failed for label {label}");
-        }
-        Ok(format!("backup:{label}"))
-    }
-}
-
 /// Preflight outcome before mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightReport {
@@ -451,6 +428,13 @@ impl MigrationFramework {
     pub fn register(&mut self, step: MigrationStep) -> Result<()> {
         if self.steps.contains_key(&step.id) {
             bail!("duplicate migration id: {}", step.id);
+        }
+        if self
+            .steps
+            .values()
+            .any(|existing| existing.sequence == step.sequence)
+        {
+            bail!("duplicate migration sequence: {}", step.sequence);
         }
         self.steps.insert(step.id.clone(), step);
         Ok(())
@@ -564,7 +548,8 @@ impl MigrationFramework {
         Ok(())
     }
 
-    /// Preflight: window, disk space, optional backup hook, history integrity.
+    /// Preflight: pure validation first (window → history → disk → path), then backup.
+    /// Side-effecting backup runs last so failed checks never leave orphan backups.
     pub fn preflight(
         &self,
         current: SchemaVersion,
@@ -575,13 +560,7 @@ impl MigrationFramework {
         backup_label: &str,
     ) -> Result<PreflightReport> {
         self.validate_schema()?;
-        history.validate_schema()?;
-        self.verify_history_checksums(history)?;
-        if history.has_unrecovered_interruption() {
-            bail!(
-                "unrecovered interrupted or failed migration present in history; recover before starting a new migration"
-            );
-        }
+        // 1. Compatibility window (current + target) and downgrade fence.
         match self.window.classify(current) {
             VersionRelation::TooOld => bail!(
                 "current schema {current} is older than min_supported {}; offline upgrade required",
@@ -603,15 +582,26 @@ impl MigrationFramework {
         if target < current {
             bail!("downgrade from {current} to {target} is not supported by this framework");
         }
+        // 2. History / document schema integrity.
+        history.validate_schema()?;
+        self.verify_history_checksums(history)?;
+        if history.has_unrecovered_interruption() {
+            bail!(
+                "unrecovered interrupted or failed migration present in history; recover before starting a new migration"
+            );
+        }
+        // 3. Disk space.
         disk.validate()?;
+        // 4. Path completeness before any side-effecting backup.
+        if current != target {
+            let _plan = self.plan_upgrade(current, target)?;
+        }
+        // 5. Backup only after all pure validation succeeded.
         let (backup_created, backup_id) = if let Some(hook) = backup {
             (true, Some(hook.create_backup(backup_label)?))
         } else {
             (false, None)
         };
-        if current != target {
-            let _plan = self.plan_upgrade(current, target)?;
-        }
         Ok(PreflightReport {
             schema_version: MIGRATION_FRAMEWORK_SCHEMA_VERSION,
             current_version: current,

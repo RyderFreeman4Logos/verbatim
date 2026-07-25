@@ -1,8 +1,26 @@
 //! Contract tests for the versioned migration framework (MIGRATE-001 / issue #335).
 
 use super::*;
+use anyhow::{bail, Result};
 
 const APP_ID: u32 = 0x5645_5242; // 'VERB'
+
+/// Test-only backup hook that records labels and can be forced to fail.
+#[derive(Debug, Default)]
+struct RecordingBackupHook {
+    calls: Vec<String>,
+    fail: bool,
+}
+
+impl BackupHook for RecordingBackupHook {
+    fn create_backup(&mut self, label: &str) -> Result<String> {
+        self.calls.push(label.to_string());
+        if self.fail {
+            bail!("backup hook failed for label {label}");
+        }
+        Ok(format!("backup:{label}"))
+    }
+}
 
 fn v(major: u32, minor: u32, patch: u32) -> SchemaVersion {
     SchemaVersion::new(major, minor, patch)
@@ -443,6 +461,76 @@ fn incomplete_migration_path_fails_planning() {
         err.to_string().contains("incomplete migration path"),
         "{err}"
     );
+}
+
+#[test]
+fn preflight_incomplete_path_never_calls_backup_hook() {
+    let mut fw = MigrationFramework::new(APP_ID, window(v(1, 0, 0), v(1, 2, 0)));
+    // Only first hop registered — path incomplete.
+    fw.register(step("only_first", 10, v(1, 0, 0), v(1, 1, 0), "body"))
+        .unwrap();
+    let history = MigrationHistory::new();
+    let disk = DiskSpaceRequirement {
+        available_bytes: 10_000,
+        required_bytes: 1,
+    };
+    let mut backup = RecordingBackupHook::default();
+    let err = fw
+        .preflight(
+            v(1, 0, 0),
+            v(1, 2, 0),
+            disk,
+            &history,
+            Some(&mut backup),
+            "must-not-run",
+        )
+        .expect_err("incomplete path must fail preflight");
+    assert!(
+        err.to_string().contains("incomplete migration path"),
+        "{err}"
+    );
+    assert!(
+        backup.calls.is_empty(),
+        "backup hook must not run before path completeness succeeds; calls={:?}",
+        backup.calls
+    );
+}
+
+#[test]
+fn register_rejects_duplicate_id_and_sequence() {
+    let mut fw = MigrationFramework::new(APP_ID, window(v(1, 0, 0), v(1, 2, 0)));
+    fw.register(step("m_a", 10, v(1, 0, 0), v(1, 1, 0), "body-a"))
+        .unwrap();
+
+    let id_err = fw
+        .register(step("m_a", 11, v(1, 1, 0), v(1, 2, 0), "body-dup-id"))
+        .expect_err("duplicate id");
+    assert!(
+        id_err.to_string().contains("duplicate migration id"),
+        "{id_err}"
+    );
+
+    let seq_err = fw
+        .register(step("m_b", 10, v(1, 1, 0), v(1, 2, 0), "body-dup-seq"))
+        .expect_err("duplicate sequence");
+    assert!(
+        seq_err.to_string().contains("duplicate migration sequence"),
+        "{seq_err}"
+    );
+}
+
+#[test]
+fn migration_history_default_uses_framework_schema_version() {
+    let from_default = MigrationHistory::default();
+    let from_new = MigrationHistory::new();
+    assert_eq!(
+        from_default.schema_version,
+        MIGRATION_FRAMEWORK_SCHEMA_VERSION
+    );
+    assert_eq!(from_default, from_new);
+    from_default
+        .validate_schema()
+        .expect("Default history must pass validate_schema");
 }
 
 #[test]

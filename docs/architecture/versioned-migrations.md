@@ -59,6 +59,15 @@ irrecoverable half-states.
 
 ### Preflight
 
+`preflight` runs pure validation first and only then the optional backup hook,
+so a failed check never leaves an orphan backup:
+
+1. compatibility window (current + target) and downgrade fence
+2. history / document schema integrity (checksums, unrecovered interruption)
+3. disk space
+4. upgrade path completeness (`plan_upgrade` when `current != target`)
+5. `BackupHook::create_backup` (side-effecting; last)
+
 `preflight` refuses:
 
 - unknown framework document schema versions
@@ -67,8 +76,8 @@ irrecoverable half-states.
 - current/target outside window
 - downgrade (`target < current`)
 - insufficient disk space
-- backup hook failure
 - incomplete upgrade path
+- backup hook failure
 
 ### Artifact versions
 
@@ -85,7 +94,9 @@ hatch; immutable packs are never in-place mutated by migrations.
 - Artifact version classification with read-only adapter
 - Unit tests: idempotent re-apply, forward-version fail-closed, checksum
   mismatch, disk space, compatibility window, read-only escape hatch,
-  interrupted migration recovery, serde/unknown-schema rejection
+  interrupted migration recovery, serde/unknown-schema rejection,
+  incomplete-path preflight without backup side effects, register
+  id/sequence collision, `MigrationHistory::default` schema version
 
 ## What this slice does **not** do (residual)
 
