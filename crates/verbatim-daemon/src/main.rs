@@ -14,10 +14,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::middleware::{self, Next};
+use axum::middleware::Next;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+#[cfg(test)]
+use axum::routing::{get, post};
 use axum::{extract::Request, Json, Router};
 use futures::stream;
 use futures::Stream;
@@ -26,17 +27,16 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
-use tower_http::cors::CorsLayer;
 
 use verbatim_core::api::{
     AddCollectionRootRequest, AddCollectionRootResponse, AddSourceRequest, AddSourceResponse,
     AppliedCollectionFilterResponse, AskCitationEvent, AskErrorEvent, AskRequest, AskResponse,
-    AskTokenEvent, CheckStaleResponse, CitationResponse, CollectionApiEndpoint,
-    CollectionFilterRequest, CollectionFilterResponse, CollectionResponse,
-    CollectionResultProvenance, CollectionStatusResponse, CollectionSyncPathRequest,
-    CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
-    CollectionWatcherStatus, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
-    ConfigResponse, CreateCollectionRequest, ErrorResponse, EvidenceResponse, HealthResponse,
+    AskTokenEvent, CheckStaleResponse, CitationResponse, CollectionFilterRequest,
+    CollectionFilterResponse, CollectionResponse, CollectionResultProvenance,
+    CollectionStatusResponse, CollectionSyncPathRequest, CollectionSyncRequest,
+    CollectionSyncResponse, CollectionWatcherResponse, CollectionWatcherStatus,
+    CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
+    CreateCollectionRequest, ErrorResponse, EvidenceResponse, HealthResponse,
     IdleExitActivitySnapshot, IdleExitHealth, IdleReclaimActivitySnapshot,
     IdleReclaimBackendResult, IdleReclaimCycleResult, IdleReclaimHealth, ImageArtifactResponse,
     IndexGcRequest, IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse,
@@ -112,6 +112,8 @@ use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 mod auth_middleware;
 #[path = "deletion_api.rs"]
 mod deletion_api;
+#[path = "routes.rs"]
+mod routes;
 #[path = "sqlite_durability_ops.rs"]
 mod sqlite_durability_ops;
 
@@ -9316,89 +9318,7 @@ where
 }
 
 fn daemon_router(state: SharedState) -> Router {
-    let auth_config = state
-        .runtime_config
-        .read()
-        .map(|runtime| runtime.config.daemon.auth.clone())
-        .unwrap_or_default();
-    let auth_state = auth_middleware::AuthMiddlewareState::from_runtime_config(auth_config);
-
-    Router::new()
-        .route("/api/health", get(health))
-        .route("/api/config", get(get_config))
-        .route("/api/sources", post(add_source))
-        .route("/api/sources", get(list_sources))
-        .route("/api/sources/{id}", get(get_source))
-        .route("/api/sources/{id}", delete(delete_source))
-        .route("/api/deletions/reports", get(list_deletion_reports))
-        .route("/api/sources/check", post(check_stale))
-        .route(
-            CollectionApiEndpoint::CreateCollection.path_template(),
-            post(create_collection),
-        )
-        .route(
-            CollectionApiEndpoint::ListCollections.path_template(),
-            get(list_collections),
-        )
-        .route(
-            CollectionApiEndpoint::GetCollection.path_template(),
-            get(get_collection),
-        )
-        .route(
-            CollectionApiEndpoint::DeleteCollection.path_template(),
-            delete(delete_collection),
-        )
-        .route(
-            CollectionApiEndpoint::AddCollectionRoot.path_template(),
-            post(add_collection_root),
-        )
-        .route(
-            CollectionApiEndpoint::SyncCollection.path_template(),
-            post(sync_collection),
-        )
-        .route(
-            CollectionApiEndpoint::CollectionStatus.path_template(),
-            get(collection_status),
-        )
-        .route(
-            CollectionApiEndpoint::ListCollectionWatcherStatuses.path_template(),
-            get(list_collection_watcher_statuses),
-        )
-        .route(
-            CollectionApiEndpoint::CollectionWatcherStatus.path_template(),
-            get(collection_watcher_status).put(update_collection_watcher),
-        )
-        .route("/api/ingest", post(ingest_all))
-        .route("/api/ingest/{id}", post(ingest_one))
-        .route("/api/reindex", post(reindex))
-        .route("/api/index/status", get(index_status))
-        .route("/api/index/gc", post(index_gc))
-        .route("/api/index/profiles/delete", post(index_delete_profile))
-        .route("/api/index/vector-json/cleanup", post(vector_json_cleanup))
-        .route("/api/ask", post(ask))
-        .route("/api/ask/stream", post(ask_stream))
-        .route("/api/retrieve", post(retrieve))
-        .route("/api/tasks/ask", post(submit_ask_task))
-        .route("/api/tasks/ingest", post(submit_ingest_task))
-        .route("/api/tasks/reindex", post(submit_reindex_task))
-        .route("/api/tasks", get(list_tasks_handler))
-        .route("/api/tasks/{id}", get(show_task))
-        .route("/api/tasks/{id}/profile", get(task_profile_handler))
-        .route("/api/tasks/{id}/events", get(list_task_events_handler))
-        .route("/api/tasks/{id}/wait", get(wait_task))
-        .route("/api/tasks/{id}/cancel", post(cancel_task_handler))
-        .route("/api/tasks/{id}/resume", post(resume_task_handler))
-        .route("/api/evidence/{eid}", get(get_evidence))
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            track_http_activity,
-        ))
-        .layer(middleware::from_fn_with_state(
-            auth_state,
-            auth_middleware::authenticate_request,
-        ))
-        .layer(CorsLayer::permissive())
-        .with_state(state)
+    routes::build_router(state)
 }
 
 struct StartupRuntimeHandles {
