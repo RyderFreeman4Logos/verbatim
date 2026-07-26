@@ -29,6 +29,7 @@ pub mod ocr;
 pub mod parser;
 pub mod profiles;
 pub mod provider;
+pub mod remote_storage_client;
 pub mod resource;
 pub mod retrieve;
 pub mod source_metadata;
