@@ -11,17 +11,51 @@ use super::identity::RemoteClientIdentity;
 use super::stream::{BoundedPageRequest, StreamReadRequest};
 use super::trace::RemoteTraceCarrier;
 
+/// Capability class of a remote operation for authorization and retry cross-checks.
+///
+/// This is part of the operation identity, not the client-chosen [`RetryPolicy`].
+/// Pre-flight mutation auth uses this class; envelopes where `class` disagrees with
+/// [`RetryPolicy::kind`] fail closed as invalid requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteOperationClass {
+    /// Non-mutating list/get/search/head-style call.
+    Read,
+    /// Mutating put/upsert/publish/enqueue/claim/finish/delete-style call.
+    Mutation,
+}
+
+impl RemoteOperationClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Mutation => "mutation",
+        }
+    }
+
+    pub fn is_mutation(self) -> bool {
+        matches!(self, Self::Mutation)
+    }
+}
+
 /// Named remote operation against a storage port capability.
+///
+/// `class` is authoritative for mutation authorization. Free-form `operation`
+/// names label the call for adapters; they cannot reclassify a `Mutation` op as
+/// a read by spoofing [`RetryPolicy::kind`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteOperation {
     pub capability: StorageCapabilityKind,
     pub operation: String,
+    /// Read vs mutation class — drives preflight authz, independent of retry kind.
+    pub class: RemoteOperationClass,
 }
 
 impl RemoteOperation {
     pub fn new(
         capability: StorageCapabilityKind,
         operation: impl Into<String>,
+        class: RemoteOperationClass,
     ) -> StorageResult<Self> {
         let operation = operation.into();
         if operation.trim().is_empty() {
@@ -32,7 +66,24 @@ impl RemoteOperation {
         Ok(Self {
             capability,
             operation,
+            class,
         })
+    }
+
+    /// Convenience constructor for read-class operations.
+    pub fn read(
+        capability: StorageCapabilityKind,
+        operation: impl Into<String>,
+    ) -> StorageResult<Self> {
+        Self::new(capability, operation, RemoteOperationClass::Read)
+    }
+
+    /// Convenience constructor for mutation-class operations.
+    pub fn mutation(
+        capability: StorageCapabilityKind,
+        operation: impl Into<String>,
+    ) -> StorageResult<Self> {
+        Self::new(capability, operation, RemoteOperationClass::Mutation)
     }
 
     pub fn validate(&self) -> StorageResult<()> {
@@ -126,6 +177,14 @@ impl RemoteRequestEnvelope {
         self.bounds.validate()?;
         self.retry.validate()?;
         self.compatibility.validate()?;
+        // Operation class is authoritative; client-chosen RetryPolicy.kind must agree.
+        if self.operation.class.is_mutation() != self.retry.kind.is_mutation() {
+            return Err(StorageError::invalid_request(format!(
+                "remote operation class {} is inconsistent with retry kind {}",
+                self.operation.class.as_str(),
+                self.retry.kind.as_str()
+            )));
+        }
         if let Some(trace) = &self.trace {
             trace.validate()?;
         }
@@ -140,9 +199,13 @@ impl RemoteRequestEnvelope {
 
     /// Pre-flight authorization gate: unauthenticated identities cannot
     /// enumerate or fetch; readers cannot mutate.
+    ///
+    /// Mutation vs read is decided by [`RemoteOperation::class`], never by the
+    /// client-declared [`RetryPolicy::kind`] alone. Class/kind mismatches are
+    /// rejected in [`Self::validate`] before this gate runs.
     pub fn authorize_preflight(&self) -> StorageResult<()> {
         self.validate()?;
-        if self.retry.kind.is_mutation() {
+        if self.operation.class.is_mutation() {
             self.identity.require_mutation(&self.operation.operation)?;
         } else {
             self.identity

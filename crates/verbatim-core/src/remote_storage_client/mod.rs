@@ -33,7 +33,10 @@ pub use outcome::{
     map_remote_outcome_to_storage_error, PartialResultMeta, RemoteOutcome, RemoteResult,
     RemoteStatus,
 };
-pub use request::{decode_remote_request_envelope_json, RemoteOperation, RemoteRequestEnvelope};
+pub use request::{
+    decode_remote_request_envelope_json, RemoteOperation, RemoteOperationClass,
+    RemoteRequestEnvelope,
+};
 pub use stream::{
     BoundedPageRequest, RangeReadRequest, StreamChunkHint, StreamReadRequest, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT, MAX_RANGE_BYTES, MAX_STREAM_CHUNK_BYTES,

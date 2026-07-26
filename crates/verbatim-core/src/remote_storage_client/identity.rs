@@ -22,12 +22,30 @@ pub enum ServiceRole {
 }
 
 impl ServiceRole {
+    /// Remote-layer role label (service principal vocabulary).
+    ///
+    /// For port projection use [`Self::port_role_wire_name`] — ports speak
+    /// `reader` / `editor` / `admin` from [`crate::auth::Role`].
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Reader => "reader",
             Self::Writer => "writer",
             Self::Admin => "admin",
             Self::ServicePeer => "service_peer",
+        }
+    }
+
+    /// Map onto storage-port token role wire names (`reader`/`editor`/`admin`).
+    ///
+    /// - `Writer` → `editor` (port / `auth::Role` vocabulary from #350)
+    /// - `ServicePeer` → `admin` for this walking skeleton; peer identity is
+    ///   preserved in [`StorageAuthContext::acl_scope`] as `service:{id}` so
+    ///   ports do not receive an unknown role string.
+    pub fn port_role_wire_name(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Writer => "editor",
+            Self::Admin | Self::ServicePeer => "admin",
         }
     }
 
@@ -183,22 +201,36 @@ impl RemoteClientIdentity {
     }
 
     /// Project onto a [`StorageAuthContext`] for port-level calls.
+    ///
+    /// Role strings use the port vocabulary (`reader` / `editor` / `admin`).
+    /// Service principals keep `service_id` in `acl_scope` as `service:{id}`
+    /// (or `service:{id};{existing_scope}`) because ports have no service
+    /// principal variant yet.
     pub fn to_storage_auth(&self) -> StorageResult<StorageAuthContext> {
         self.validate()?;
-        let principal = match &self.principal {
+        let (role, service_id) = match &self.principal {
             RemoteServicePrincipal::Unauthenticated => {
                 return Err(StorageError::unauthorized(
                     "cannot project unauthenticated remote identity to storage auth",
                 ));
             }
-            RemoteServicePrincipal::Service { role, .. }
-            | RemoteServicePrincipal::Token { role } => StoragePrincipal::Token {
-                role: role.as_str().to_string(),
-            },
+            RemoteServicePrincipal::Service { service_id, role } => {
+                (*role, Some(service_id.as_str()))
+            }
+            RemoteServicePrincipal::Token { role } => (*role, None),
+        };
+        let principal = StoragePrincipal::Token {
+            role: role.port_role_wire_name().to_string(),
         };
         let mut auth = StorageAuthContext::new(principal);
-        if let Some(scope) = &self.acl_scope {
-            auth = auth.with_acl_scope(scope.clone());
+        let scope = match (service_id, &self.acl_scope) {
+            (Some(service_id), Some(existing)) => Some(format!("service:{service_id};{existing}")),
+            (Some(service_id), None) => Some(format!("service:{service_id}")),
+            (None, Some(existing)) => Some(existing.clone()),
+            (None, None) => None,
+        };
+        if let Some(scope) = scope {
+            auth = auth.with_acl_scope(scope);
         }
         auth.validate()?;
         Ok(auth)

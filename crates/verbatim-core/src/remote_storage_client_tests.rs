@@ -1,8 +1,10 @@
 //! Unit/contract tests for remote storage client walking skeleton.
 
 use super::*;
+use crate::observability_contract::{TraceContext, TraceContextFields};
 use crate::storage_ports::{
-    StorageCapabilityKind, StorageError, StorageGeneration, STORAGE_PORTS_SCHEMA_VERSION,
+    StorageCapabilityKind, StorageError, StorageGeneration, StoragePrincipal,
+    STORAGE_PORTS_SCHEMA_VERSION,
 };
 
 fn service_identity() -> RemoteClientIdentity {
@@ -10,11 +12,11 @@ fn service_identity() -> RemoteClientIdentity {
 }
 
 fn read_op() -> RemoteOperation {
-    RemoteOperation::new(StorageCapabilityKind::CatalogStore, "list_sources").expect("op")
+    RemoteOperation::read(StorageCapabilityKind::CatalogStore, "list_sources").expect("op")
 }
 
 fn mutate_op() -> RemoteOperation {
-    RemoteOperation::new(StorageCapabilityKind::EvidenceStore, "put_evidence").expect("op")
+    RemoteOperation::mutation(StorageCapabilityKind::EvidenceStore, "put_evidence").expect("op")
 }
 
 fn read_retry() -> RetryPolicy {
@@ -79,6 +81,73 @@ fn reader_cannot_mutate() {
 }
 
 #[test]
+fn reader_write_shaped_op_with_read_retry_kind_is_unauthorized() {
+    // Spoof attempt: free-form write-shaped name + MutationKind::Read must not
+    // skip mutation auth — operation class is authoritative.
+    let identity = RemoteClientIdentity::token(ServiceRole::Reader);
+    for name in ["put_evidence", "publish", "enqueue"] {
+        let op = RemoteOperation::mutation(StorageCapabilityKind::EvidenceStore, name).expect("op");
+        // Honest mutation retry must fail preflight as Unauthorized (reader).
+        let envelope = RemoteRequestEnvelope::new(
+            identity.clone(),
+            op,
+            RequestBounds::test_defaults(),
+            upsert_retry(&format!("spoof-{name}")),
+        )
+        .expect("envelope");
+        let preflight = envelope.authorize_preflight().expect_err("reader mutate");
+        assert!(
+            matches!(preflight, StorageError::Unauthorized { .. }),
+            "expected Unauthorized for {name}, got {preflight:?}"
+        );
+    }
+}
+
+#[test]
+fn envelope_rejects_operation_class_retry_kind_mismatch() {
+    // Mutation-class op + Read retry kind → InvalidRequest (fail closed).
+    let mut envelope = RemoteRequestEnvelope::new(
+        service_identity(),
+        mutate_op(),
+        RequestBounds::test_defaults(),
+        upsert_retry("mismatch-1"),
+    )
+    .expect("envelope");
+    envelope.retry = read_retry();
+    let err = envelope.validate().expect_err("class/kind mismatch");
+    assert!(matches!(err, StorageError::InvalidRequest { .. }));
+    assert!(err.to_string().contains("inconsistent"));
+
+    // Read-class op + Upsert retry kind → InvalidRequest.
+    let mut envelope = RemoteRequestEnvelope::new(
+        service_identity(),
+        read_op(),
+        RequestBounds::test_defaults(),
+        read_retry(),
+    )
+    .expect("envelope");
+    envelope.retry = upsert_retry("mismatch-2");
+    let err = envelope.validate().expect_err("read/mutation mismatch");
+    assert!(matches!(err, StorageError::InvalidRequest { .. }));
+
+    // Decode path also fail-closed: mutation class + read kind is invalid.
+    // Prefer round-tripping a valid envelope after mutating fields so serde
+    // shape stays aligned with the wire types.
+    let mut spoof = RemoteRequestEnvelope::new(
+        RemoteClientIdentity::token(ServiceRole::Reader),
+        RemoteOperation::mutation(StorageCapabilityKind::EvidenceStore, "put_evidence")
+            .expect("op"),
+        RequestBounds::test_defaults(),
+        upsert_retry("decode-spoof"),
+    )
+    .expect("envelope");
+    spoof.retry = read_retry();
+    let bytes = serde_json::to_vec(&spoof).expect("json");
+    let decoded = decode_remote_request_envelope_json(&bytes).expect_err("spoof decode");
+    assert!(matches!(decoded, StorageError::InvalidRequest { .. }));
+}
+
+#[test]
 fn writer_may_mutate_and_project_storage_auth() {
     let identity = service_identity().with_acl_scope("col-a");
     identity
@@ -86,7 +155,45 @@ fn writer_may_mutate_and_project_storage_auth() {
         .expect("writer ok");
     let auth = identity.to_storage_auth().expect("auth");
     assert_eq!(auth.schema_version, STORAGE_PORTS_SCHEMA_VERSION);
-    assert_eq!(auth.acl_scope.as_deref(), Some("col-a"));
+    // Service id preserved; existing acl_scope appended after service: prefix.
+    assert_eq!(auth.acl_scope.as_deref(), Some("service:coord-1;col-a"));
+    match &auth.principal {
+        StoragePrincipal::Token { role } => assert_eq!(role, "editor"),
+        other => panic!("expected Token principal, got {other:?}"),
+    }
+}
+
+#[test]
+fn port_principal_projection_maps_roles_and_keeps_service_id() {
+    let cases = [
+        (ServiceRole::Reader, "reader"),
+        (ServiceRole::Writer, "editor"),
+        (ServiceRole::Admin, "admin"),
+        (ServiceRole::ServicePeer, "admin"),
+    ];
+    for (remote_role, expected_port_role) in cases {
+        let identity = RemoteClientIdentity::service("svc-42", remote_role).expect("identity");
+        let auth = identity.to_storage_auth().expect("auth");
+        match &auth.principal {
+            StoragePrincipal::Token { role } => {
+                assert_eq!(
+                    role, expected_port_role,
+                    "remote role {remote_role:?} should project to {expected_port_role}"
+                );
+            }
+            other => panic!("expected Token, got {other:?}"),
+        }
+        assert_eq!(auth.acl_scope.as_deref(), Some("service:svc-42"));
+    }
+
+    // Token principal has no service_id; acl_scope is only the caller's scope.
+    let token = RemoteClientIdentity::token(ServiceRole::Writer).with_acl_scope("tenant-a");
+    let auth = token.to_storage_auth().expect("auth");
+    match &auth.principal {
+        StoragePrincipal::Token { role } => assert_eq!(role, "editor"),
+        other => panic!("expected Token, got {other:?}"),
+    }
+    assert_eq!(auth.acl_scope.as_deref(), Some("tenant-a"));
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +441,71 @@ fn request_envelope_authorizes_authenticated_read() {
     let outbound = envelope.trace.as_ref().unwrap().outbound_context().unwrap();
     assert_eq!(outbound.request_id, "req-1");
     assert!(outbound.span_id.is_none());
+}
+
+#[test]
+fn child_span_outbound_opens_real_child() {
+    let parent = TraceContext::new(TraceContextFields {
+        request_id: "req-child".into(),
+        retrieval_run_id: None,
+        context_pack_id: None,
+        workflow_run_id: None,
+        task_id: None,
+        publication_generation: None,
+        trace_id: Some("trace-aabb".into()),
+        span_id: Some("span-parent-01".into()),
+        parent_span_id: Some("span-root-00".into()),
+    })
+    .expect("parent");
+    let carrier =
+        RemoteTraceCarrier::new(TracePropagationMode::ChildSpan, parent.clone()).expect("carrier");
+    let child = carrier.outbound_context().expect("child");
+    assert_eq!(child.request_id, parent.request_id);
+    assert_eq!(child.trace_id, parent.trace_id);
+    assert_ne!(child.span_id, parent.span_id);
+    assert!(child.span_id.as_ref().is_some_and(|s| !s.is_empty()));
+    assert_eq!(child.parent_span_id, parent.span_id);
+
+    // Second child must also differ from inbound (fresh allocation).
+    let child2 = carrier.outbound_context().expect("child2");
+    assert_ne!(child2.span_id, parent.span_id);
+    assert_ne!(child2.span_id, child.span_id);
+    assert_eq!(child2.parent_span_id, parent.span_id);
+}
+
+#[test]
+fn async_link_and_correlation_only_remain_distinct() {
+    let parent = TraceContext::new(TraceContextFields {
+        request_id: "req-modes".into(),
+        retrieval_run_id: Some("rr-1".into()),
+        context_pack_id: None,
+        workflow_run_id: None,
+        task_id: None,
+        publication_generation: None,
+        trace_id: Some("trace-cc".into()),
+        span_id: Some("span-in".into()),
+        parent_span_id: Some("span-grand".into()),
+    })
+    .expect("parent");
+
+    let async_out = RemoteTraceCarrier::new(TracePropagationMode::AsyncLink, parent.clone())
+        .expect("async")
+        .outbound_context()
+        .expect("out");
+    assert_eq!(async_out.request_id, "req-modes");
+    assert_eq!(async_out.retrieval_run_id.as_deref(), Some("rr-1"));
+    assert_eq!(async_out.trace_id.as_deref(), Some("trace-cc"));
+    assert!(async_out.span_id.is_none());
+    assert!(async_out.parent_span_id.is_none());
+
+    let corr_out = RemoteTraceCarrier::new(TracePropagationMode::CorrelationOnly, parent)
+        .expect("corr")
+        .outbound_context()
+        .expect("out");
+    assert_eq!(corr_out.request_id, "req-modes");
+    assert!(corr_out.span_id.is_none());
+    assert!(corr_out.parent_span_id.is_none());
+    assert!(corr_out.trace_id.is_none());
 }
 
 #[test]

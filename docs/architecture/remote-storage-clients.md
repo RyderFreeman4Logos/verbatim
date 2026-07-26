@@ -16,15 +16,15 @@ partial-failure behavior — layered on the narrow ports from DIST-004 (#350).
 
 | Type | Role |
 | --- | --- |
-| `RemoteClientIdentity` / `RemoteServicePrincipal` / `ServiceRole` | Authenticated service principal (no secrets on the wire type) |
+| `RemoteClientIdentity` / `RemoteServicePrincipal` / `ServiceRole` | Authenticated service principal (no secrets on the wire type). Port projection: `Writer`→`editor`, `ServicePeer`→`admin` + `service:{id}` in `acl_scope` |
 | `RequestBounds` / `RequestDeadline` / `PayloadLimits` / `ConcurrencyBound` / `QueueBound` / `CancellationToken` | Deadlines, payload ceilings, concurrency/queue bounds, cancel correlation |
 | `IdempotencyKey` / `MutationKind` / `RetryClass` / `RetryPolicy` | Mutation keys and safe vs unsafe retry classification |
 | `RemoteStatus` / `RemoteOutcome` / `PartialResultMeta` | Typed unavailable, timeout, conflict, stale-generation, unauthorized, unsupported, partial-result |
 | `map_remote_outcome_to_storage_error` | Project non-success remote statuses onto `storage_ports::StorageError` |
 | `CompatibilityOffer` / `CompatibilityWindow` / `ProtocolVersion` / `SchemaVersion` | Protocol/schema negotiation; fail closed on unsupported versions |
-| `RemoteTraceCarrier` / `TracePropagationMode` | Trace propagation hooks over `observability_contract::TraceContext` |
+| `RemoteTraceCarrier` / `TracePropagationMode` | Trace hooks; `ChildSpan` opens a real child via `TraceContext::child_span` |
 | `BoundedPageRequest` / `RangeReadRequest` / `StreamReadRequest` / `StreamChunkHint` | Streaming/range-read and bounded pagination request shapes |
-| `RemoteRequestEnvelope` / `RemoteOperation` | Composite pre-flight envelope for every remote call |
+| `RemoteRequestEnvelope` / `RemoteOperation` / `RemoteOperationClass` | Composite pre-flight envelope; operation class (read vs mutation) is authoritative for authz |
 | `REMOTE_STORAGE_CLIENT_SCHEMA_VERSION` / `REMOTE_STORAGE_CLIENT_PROTOCOL_VERSION` | Wire identity; unknown versions fail closed |
 
 ### Design principles
@@ -62,9 +62,12 @@ partial-failure behavior — layered on the narrow ports from DIST-004 (#350).
 
 Every remote call is described by `RemoteRequestEnvelope`:
 
-1. Validate schema, bounds, retry policy, compatibility offer.
+1. Validate schema, bounds, retry policy, compatibility offer, and that
+   `RemoteOperation.class` agrees with `RetryPolicy.kind` (mismatches →
+   `InvalidRequest`).
 2. `authorize_preflight` — refuse unauthenticated enumerate/fetch and unauthorized
-   mutations; honor cancellation tokens.
+   mutations based on **operation class** (not client-declared retry kind);
+   honor cancellation tokens.
 3. Optionally attach `RemoteTraceCarrier`, expected `StorageGeneration`, bounded
    page, or stream/range shapes.
 4. Transport adapter (later slice) serializes the envelope + payload and maps
