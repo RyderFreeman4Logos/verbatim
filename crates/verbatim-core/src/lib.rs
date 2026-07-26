@@ -34,6 +34,7 @@ pub mod provider;
 pub mod remote_storage_client;
 pub mod resource;
 pub mod retrieve;
+pub mod sdk;
 pub mod source_metadata;
 pub mod storage_ports;
 pub mod store;
