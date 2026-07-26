@@ -32,6 +32,7 @@ pub mod provider;
 pub mod resource;
 pub mod retrieve;
 pub mod source_metadata;
+pub mod storage_ports;
 pub mod store;
 pub mod task;
 pub mod traits;
