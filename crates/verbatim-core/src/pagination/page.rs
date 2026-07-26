@@ -142,12 +142,15 @@ pub struct SnapshotPageResponse<T> {
     pub publication_generation: StorageGeneration,
     /// True when the server knows no further items exist under this snapshot.
     pub exhausted: bool,
-    /// Optional total hint when cheap; never required for correctness.
+    /// Optional total when the server truly knows it. Never invent this from a
+    /// single page's `items.len()` (last-page length ≠ snapshot total). Prefer
+    /// `None` over a false total.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_hint: Option<u64>,
 }
 
 impl<T> SnapshotPageResponse<T> {
+    /// Empty exhausted page with a known total of zero.
     pub fn empty(mode: PaginationMode, publication_generation: StorageGeneration) -> Self {
         Self {
             mode,
@@ -159,18 +162,19 @@ impl<T> SnapshotPageResponse<T> {
         }
     }
 
+    /// Build a page envelope.
+    ///
+    /// `total_hint` must be supplied only when the caller has a known snapshot
+    /// total. Exhausted multi-page last pages must pass `None` unless the true
+    /// total is known — never derive it from `items.len()`.
     pub fn page(
         mode: PaginationMode,
         publication_generation: StorageGeneration,
         items: Vec<T>,
         next_cursor: Option<PageCursor>,
         exhausted: bool,
+        total_hint: Option<u64>,
     ) -> Self {
-        let total_hint = if exhausted {
-            Some(items.len() as u64)
-        } else {
-            None
-        };
         Self {
             mode,
             items,

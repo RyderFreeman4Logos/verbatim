@@ -134,14 +134,23 @@ impl CursorError {
                 available,
                 detail,
             } => {
-                let actual = available.unwrap_or(StorageGeneration::INITIAL);
-                let mut err = StorageError::stale_generation(*bound, actual);
-                if let StorageError::StaleGeneration { detail: slot, .. } = &mut err {
-                    *slot = Some(detail.clone().unwrap_or_else(|| {
-                        "cursor publication generation is gone or no longer readable".into()
-                    }));
+                let detail_msg = detail.clone().unwrap_or_else(|| {
+                    "cursor publication generation is gone or no longer readable".into()
+                });
+                // Only map to StaleGeneration when a real observed generation is
+                // known. Do not invent StorageGeneration::INITIAL as `actual`.
+                match available {
+                    Some(actual) => {
+                        let mut err = StorageError::stale_generation(*bound, *actual);
+                        if let StorageError::StaleGeneration { detail: slot, .. } = &mut err {
+                            *slot = Some(detail_msg);
+                        }
+                        err
+                    }
+                    None => StorageError::unavailable(format!(
+                        "cursor generation gone: bound {bound}: {detail_msg}"
+                    )),
                 }
-                err
             }
             Self::ProfileChanged { expected, actual } => StorageError::invalid_request(format!(
                 "cursor profile changed: expected {expected}, actual {actual}"

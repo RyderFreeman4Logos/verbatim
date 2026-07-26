@@ -198,9 +198,11 @@ fn ranked_and_exhaustive_modes_are_not_interchangeable() {
         vec!["hit-a"],
         None,
         true,
+        None,
     );
     assert!(page.exhausted);
     assert_eq!(page.mode, PaginationMode::RankedSearch);
+    assert!(page.total_hint.is_none());
     assert!(
         SnapshotPageResponse::<&str>::empty(
             PaginationMode::ExhaustiveEnumeration,
@@ -208,6 +210,59 @@ fn ranked_and_exhaustive_modes_are_not_interchangeable() {
         )
         .exhausted
     );
+}
+
+#[test]
+fn exhausted_last_page_does_not_invent_total_hint_from_page_len() {
+    // Multi-page walk: conceptual total 110, last page holds only 10 items.
+    let last_page_items = vec![
+        "r101", "r102", "r103", "r104", "r105", "r106", "r107", "r108", "r109", "r110",
+    ];
+    assert_eq!(last_page_items.len(), 10);
+
+    let last = SnapshotPageResponse::page(
+        PaginationMode::ExhaustiveEnumeration,
+        StorageGeneration::new(5),
+        last_page_items.clone(),
+        None,
+        true,
+        None,
+    );
+    assert!(last.exhausted);
+    assert!(last.next_cursor.is_none());
+    assert_eq!(last.items.len(), 10);
+    assert!(
+        last.total_hint.is_none(),
+        "generic helper must not invent total_hint from last-page length"
+    );
+
+    let with_known_total = SnapshotPageResponse::page(
+        PaginationMode::ExhaustiveEnumeration,
+        StorageGeneration::new(5),
+        last_page_items,
+        None,
+        true,
+        Some(110),
+    );
+    assert_eq!(with_known_total.total_hint, Some(110));
+
+    let mid = SnapshotPageResponse::page(
+        PaginationMode::RankedSearch,
+        StorageGeneration::new(5),
+        vec!["hit"; 50],
+        Some(PageCursor::new("opaque-next").unwrap()),
+        false,
+        None,
+    );
+    assert!(!mid.exhausted);
+    assert!(mid.total_hint.is_none());
+
+    // Empty snapshot is the one case where a known total of 0 is correct.
+    let empty = SnapshotPageResponse::<&str>::empty(
+        PaginationMode::RankedSearch,
+        StorageGeneration::new(1),
+    );
+    assert_eq!(empty.total_hint, Some(0));
 }
 
 #[test]
@@ -296,6 +351,59 @@ fn mutation_idempotency_rejects_key_reuse_with_different_fingerprint() {
         other => panic!("expected conflict, got {other:?}"),
     }
     assert_eq!(err.to_storage_error().class_name(), "conflict");
+}
+
+#[test]
+fn mutation_complete_without_claim_and_result_token_conflict() {
+    let mut reg = InMemoryIdempotencyRegistry::new();
+    let key = MutationIdempotencyKey::new("idem-3").unwrap();
+    let op = MutationOperationFingerprint::new("upload:x").unwrap();
+    let result_a = MutationResultToken::new("token-a").unwrap();
+    let result_b = MutationResultToken::new("token-b").unwrap();
+
+    let err = reg
+        .complete("user:alice", &key, &op, result_a.clone())
+        .unwrap_err();
+    match err {
+        IdempotencyError::Invalid { detail } => {
+            assert!(detail.contains("claim first"), "{detail}");
+        }
+        other => panic!("expected invalid (complete without claim), got {other:?}"),
+    }
+
+    assert_eq!(
+        reg.claim("user:alice", &key, &op).unwrap(),
+        IdempotencyClaim::Fresh
+    );
+    reg.complete("user:alice", &key, &op, result_a).unwrap();
+    let err = reg.complete("user:alice", &key, &op, result_b).unwrap_err();
+    match err {
+        IdempotencyError::Conflict { detail, .. } => {
+            assert!(detail.contains("different result token"), "{detail}");
+        }
+        other => panic!("expected conflict on result token mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn generation_gone_without_available_does_not_fabricate_initial() {
+    let err = CursorError::generation_gone(
+        StorageGeneration::new(7),
+        None,
+        "bound generation no longer retained",
+    );
+    let storage = err.to_storage_error();
+    assert_eq!(storage.class_name(), "unavailable");
+    assert!(
+        !matches!(
+            storage,
+            crate::storage_ports::StorageError::StaleGeneration {
+                actual: StorageGeneration::INITIAL,
+                ..
+            }
+        ),
+        "must not invent generation 0 as actual when available is None: {storage:?}"
+    );
 }
 
 #[test]
