@@ -27,6 +27,7 @@ pub mod memory_budget;
 pub mod migration_framework;
 pub mod observability_contract;
 pub mod ocr;
+pub mod pagination;
 pub mod parser;
 pub mod profiles;
 pub mod provider;
