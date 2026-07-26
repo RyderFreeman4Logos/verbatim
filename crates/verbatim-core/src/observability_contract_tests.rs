@@ -304,9 +304,69 @@ fn slo_error_budget_burn_and_remaining() {
 fn slo_rejects_invalid_targets() {
     assert!(LatencyTarget::new(0, 100).is_err());
     assert!(LatencyTarget::new(101, 100).is_err());
+    assert!(LatencyTarget::new(50, 0).is_err());
     assert!(sample_slo(1.5, 1.0, vec![SloFailureDomain::Cache]).is_err());
     assert!(sample_slo(0.99, 0.0, vec![SloFailureDomain::Cache]).is_err());
     assert!(sample_slo(0.99, 1.0, vec![]).is_err());
+}
+
+#[test]
+fn decode_slo_rejects_invalid_nested_latency() {
+    // Serde accepts raw structs; validate/decode must fail closed on nested latency.
+    let zero_percentile = br#"{
+        "schema_version": 1,
+        "name": "ask_success",
+        "description": "ok",
+        "success_ratio_target": 0.99,
+        "latency": {"percentile": 0, "max_latency_ms": 100},
+        "window_secs": 3600,
+        "sampling_ratio": 0.1,
+        "retention_secs": 86400,
+        "failure_domains": ["cache"]
+    }"#;
+    let err = decode_slo_definition_json(zero_percentile).unwrap_err();
+    assert!(
+        err.to_string().contains("percentile"),
+        "expected percentile error, got {err}"
+    );
+
+    let zero_max_latency = br#"{
+        "schema_version": 1,
+        "name": "ask_success",
+        "description": "ok",
+        "success_ratio_target": 0.99,
+        "latency": {"percentile": 99, "max_latency_ms": 0},
+        "window_secs": 3600,
+        "sampling_ratio": 0.1,
+        "retention_secs": 86400,
+        "failure_domains": ["cache"]
+    }"#;
+    let err = decode_slo_definition_json(zero_max_latency).unwrap_err();
+    assert!(
+        err.to_string().contains("max_latency_ms"),
+        "expected max_latency_ms error, got {err}"
+    );
+
+    let both_zero = br#"{
+        "schema_version": 1,
+        "name": "ask_success",
+        "description": "ok",
+        "success_ratio_target": 0.99,
+        "latency": {"percentile": 0, "max_latency_ms": 0},
+        "window_secs": 3600,
+        "sampling_ratio": 0.1,
+        "retention_secs": 86400,
+        "failure_domains": ["cache"]
+    }"#;
+    assert!(decode_slo_definition_json(both_zero).is_err());
+
+    // Direct validate path (bypass constructor) must also reject nested latency.
+    let mut slo = sample_slo(0.99, 0.1, vec![SloFailureDomain::Cache]).unwrap();
+    slo.latency = LatencyTarget {
+        percentile: 0,
+        max_latency_ms: 0,
+    };
+    assert!(slo.validate().is_err());
 }
 
 #[test]

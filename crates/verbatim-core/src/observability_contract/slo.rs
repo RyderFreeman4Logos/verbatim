@@ -29,16 +29,23 @@ pub struct LatencyTarget {
 
 impl LatencyTarget {
     pub fn new(percentile: u8, max_latency_ms: u64) -> Result<Self> {
-        if percentile == 0 || percentile > 100 {
-            bail!("latency percentile must be in 1..=100");
-        }
-        if max_latency_ms == 0 {
-            bail!("max_latency_ms must be >= 1");
-        }
-        Ok(Self {
+        let target = Self {
             percentile,
             max_latency_ms,
-        })
+        };
+        target.validate()?;
+        Ok(target)
+    }
+
+    /// Fail closed when percentile is outside 1..=100 or max_latency_ms is zero.
+    pub fn validate(&self) -> Result<()> {
+        if self.percentile == 0 || self.percentile > 100 {
+            bail!("latency percentile must be in 1..=100");
+        }
+        if self.max_latency_ms == 0 {
+            bail!("max_latency_ms must be >= 1");
+        }
+        Ok(())
     }
 }
 
@@ -110,6 +117,7 @@ impl SloDefinition {
                 self.success_ratio_target
             );
         }
+        self.latency.validate()?;
         if self.window_secs == 0 {
             bail!("SLO window_secs must be >= 1");
         }
