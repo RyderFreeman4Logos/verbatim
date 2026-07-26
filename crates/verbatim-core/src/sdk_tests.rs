@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::*;
+use crate::index_publication::PointerEpoch;
 use crate::pagination::{
     PaginationMode, SnapshotPageRequest, SnapshotPageRequestFields, SnapshotPageResponse,
 };
@@ -132,6 +133,21 @@ fn sdk_config_json_round_trip() {
     assert_eq!(back.timeout, cfg.timeout);
     assert_eq!(back.user_agent, cfg.user_agent);
     back.validate().unwrap();
+}
+
+#[test]
+fn sdk_config_fields_debug_redacts_auth_token() {
+    let fields = SdkConfigFields {
+        endpoint: "https://verbatim.example/api".into(),
+        auth_token: Some("super-secret-bearer-token".into()),
+        timeout: Duration::from_secs(DEFAULT_SDK_TIMEOUT_SECS),
+        user_agent: DEFAULT_SDK_USER_AGENT.to_string(),
+        capability_cache: CapabilityCache::empty(),
+    };
+    let debug = format!("{fields:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("super-secret-bearer-token"));
+    assert!(!debug.contains("bearer"));
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +417,48 @@ fn cursor_iterator_rejects_mode_and_generation_mismatch() {
     let err = iter.advance_with(&gen_bad).unwrap_err();
     assert_eq!(err.class_name(), "pagination");
     assert!(err.to_string().contains("generation"));
+}
+
+#[test]
+fn cursor_iterator_preserves_pointer_epoch_across_pages() {
+    let epoch = PointerEpoch::new(4);
+    let request = SnapshotPageRequest::new(SnapshotPageRequestFields {
+        mode: PaginationMode::RankedSearch,
+        limit: 10,
+        query_plan_hash: "qp-hash-epoch".into(),
+        principal: "user:alice".into(),
+        publication_generation: StorageGeneration::new(7),
+        profile_ref: "profile:default".into(),
+        policy_version: "policy-v3".into(),
+        cursor: None,
+        pointer_epoch: Some(epoch),
+    })
+    .unwrap();
+
+    let mut iter = CursorIterator::from_request(&request).unwrap();
+    assert_eq!(iter.pointer_epoch, Some(epoch));
+
+    let first_req = iter.next_request().unwrap().unwrap();
+    assert_eq!(first_req.pointer_epoch, Some(epoch));
+
+    let page: SnapshotPageResponse<String> = SnapshotPageResponse::page(
+        PaginationMode::RankedSearch,
+        StorageGeneration::new(7),
+        vec!["a".to_string()],
+        Some(PageCursor::new("cursor-page-2").unwrap()),
+        false,
+        None,
+    );
+    iter.advance_with(&page).unwrap();
+    assert_eq!(iter.pointer_epoch, Some(epoch));
+    assert!(!iter.is_exhausted());
+
+    let cont = iter.next_request().unwrap().unwrap();
+    assert_eq!(cont.pointer_epoch, Some(epoch));
+    assert_eq!(
+        cont.cursor.as_ref().map(|c| c.0.as_str()),
+        Some("cursor-page-2")
+    );
 }
 
 // ---------------------------------------------------------------------------

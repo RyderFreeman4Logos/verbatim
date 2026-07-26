@@ -14,13 +14,30 @@ pub const DEFAULT_SDK_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_SDK_USER_AGENT: &str = "verbatim-sdk/0.1";
 
 /// Field bundle for constructing [`SdkConfig`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Secrets stay off Debug (token redacted), matching [`SdkConfig`].
+#[derive(Clone, PartialEq, Eq)]
 pub struct SdkConfigFields {
     pub endpoint: String,
     pub auth_token: Option<String>,
     pub timeout: Duration,
     pub user_agent: String,
     pub capability_cache: CapabilityCache,
+}
+
+impl std::fmt::Debug for SdkConfigFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SdkConfigFields")
+            .field("endpoint", &self.endpoint)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("timeout", &self.timeout)
+            .field("user_agent", &self.user_agent)
+            .field("capability_cache", &self.capability_cache)
+            .finish()
+    }
 }
 
 /// Client-side configuration for a Verbatim SDK binding.

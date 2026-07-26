@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::index_publication::PointerEpoch;
 use crate::pagination::{PaginationMode, SnapshotPageRequest, SnapshotPageResponse};
 use crate::storage_ports::{PageCursor, StorageGeneration};
 
@@ -39,6 +40,11 @@ pub struct CursorIterator {
     pub publication_generation: StorageGeneration,
     pub profile_ref: String,
     pub policy_version: String,
+    /// Optional pointer-epoch fence from the first-page request template.
+    ///
+    /// Multi-page walks must keep this fence so epoch-bound publications do
+    /// not silently drop their constraint on page 2+.
+    pub pointer_epoch: Option<PointerEpoch>,
     pub next_cursor: Option<PageCursor>,
     pub exhausted: bool,
 }
@@ -57,6 +63,7 @@ impl CursorIterator {
             publication_generation: request.publication_generation,
             profile_ref: request.profile_ref.clone(),
             policy_version: request.policy_version.clone(),
+            pointer_epoch: request.pointer_epoch,
             next_cursor: request.cursor.clone(),
             exhausted: false,
         })
@@ -84,7 +91,7 @@ impl CursorIterator {
             profile_ref: self.profile_ref.clone(),
             policy_version: self.policy_version.clone(),
             cursor: self.next_cursor.clone(),
-            pointer_epoch: None,
+            pointer_epoch: self.pointer_epoch,
         })
         .map_err(|err| ClientError::validation(err.to_string()))?;
         Ok(Some(req))
