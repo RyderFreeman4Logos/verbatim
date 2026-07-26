@@ -373,6 +373,62 @@ fn restage_of_active_generation_is_rejected() {
     );
 }
 
+#[test]
+fn promote_rejects_empty_updated_at_without_mutating_registry() {
+    let mut coord = InMemoryPublicationCoordinator::new(initial_pointer()).expect("coord");
+    coord.stage(ready_manifest(1)).expect("stage");
+
+    let err = coord
+        .promote(
+            gen(1),
+            gen(0),
+            PointerEpoch::INITIAL,
+            "",
+            Some(&profile("default")),
+        )
+        .expect_err("empty updated_at must fail closed");
+    assert!(matches!(err, StorageError::InvalidRequest { .. }));
+    assert!(err.to_string().contains("updated_at"), "err={err}");
+
+    // Pointer and all registry statuses must be unchanged.
+    assert_eq!(coord.active_pointer().active_generation, gen(0));
+    assert_eq!(coord.active_pointer().epoch, PointerEpoch::INITIAL);
+    assert_eq!(
+        coord.get_manifest(gen(1)).expect("m").status,
+        BuildStatus::Ready
+    );
+}
+
+#[test]
+fn rollback_rejects_empty_updated_at_without_mutating_registry() {
+    let mut coord = InMemoryPublicationCoordinator::new(initial_pointer()).expect("coord");
+    coord.stage(ready_manifest(1)).expect("stage");
+    coord
+        .promote(
+            gen(1),
+            gen(0),
+            PointerEpoch::INITIAL,
+            "t1",
+            Some(&profile("default")),
+        )
+        .expect("promote");
+
+    let epoch = coord.active_pointer().epoch;
+    let err = coord
+        .rollback(gen(1), epoch, "")
+        .expect_err("empty updated_at must fail closed");
+    assert!(matches!(err, StorageError::InvalidRequest { .. }));
+    assert!(err.to_string().contains("updated_at"), "err={err}");
+
+    // Successful promote state must remain intact.
+    assert_eq!(coord.active_pointer().active_generation, gen(1));
+    assert_eq!(coord.active_pointer().epoch, epoch);
+    assert_eq!(
+        coord.get_manifest(gen(1)).expect("m").status,
+        BuildStatus::Active
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Reconciliation findings
 // ---------------------------------------------------------------------------

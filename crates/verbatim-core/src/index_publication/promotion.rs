@@ -209,8 +209,17 @@ impl PublicationCoordinator for InMemoryPublicationCoordinator {
             return Ok(PromotionOutcome::Rejected { reason });
         }
 
-        // Mark previous active (if tracked) as rolled back in our registry.
+        // Construct the next pointer before any registry mutation so empty
+        // updated_at (or other pointer validation failure) cannot desync
+        // registry statuses from the live pointer.
         let previous = self.pointer.active_generation;
+        let mut pointer =
+            ActiveGenerationPointer::new(generation, expected_epoch.next(), updated_at)?;
+        if previous != generation {
+            pointer = pointer.with_previous(previous);
+        }
+
+        // Mark previous active (if tracked) as rolled back in our registry.
         if let Some(prev) = self.manifests.get_mut(&Self::gen_key(previous)) {
             if matches!(prev.status, BuildStatus::Active) {
                 prev.status = BuildStatus::RolledBack;
@@ -219,12 +228,6 @@ impl PublicationCoordinator for InMemoryPublicationCoordinator {
 
         let promoted = self.manifests.get_mut(&key).expect("checked above");
         promoted.status = BuildStatus::Active;
-
-        let mut pointer =
-            ActiveGenerationPointer::new(generation, expected_epoch.next(), updated_at)?;
-        if previous != generation {
-            pointer = pointer.with_previous(previous);
-        }
         self.pointer = pointer.clone();
 
         Ok(PromotionOutcome::Promoted {
@@ -262,6 +265,13 @@ impl PublicationCoordinator for InMemoryPublicationCoordinator {
             });
         };
 
+        // Construct the restored pointer before registry mutation so empty
+        // updated_at cannot leave statuses desynced from the live pointer.
+        // After rollback, "previous" of the restored gen is the demoted one;
+        // further nested history is residual for durable adapters.
+        let pointer = ActiveGenerationPointer::new(previous, expected_epoch.next(), updated_at)?
+            .with_previous(expected_current);
+
         // Demote current active.
         let current_key = Self::gen_key(expected_current);
         if let Some(current) = self.manifests.get_mut(&current_key) {
@@ -274,10 +284,6 @@ impl PublicationCoordinator for InMemoryPublicationCoordinator {
             prev.status = BuildStatus::Active;
         }
 
-        let pointer = ActiveGenerationPointer::new(previous, expected_epoch.next(), updated_at)?
-            .with_previous(expected_current);
-        // After rollback, "previous" of the restored gen is the demoted one;
-        // further nested history is residual for durable adapters.
         self.pointer = pointer.clone();
 
         Ok(PromotionOutcome::RolledBack {
