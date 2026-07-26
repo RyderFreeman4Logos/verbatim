@@ -24,6 +24,7 @@ pub mod ingest;
 pub mod ingest_security;
 pub mod memory_budget;
 pub mod migration_framework;
+pub mod observability_contract;
 pub mod ocr;
 pub mod parser;
 pub mod profiles;
