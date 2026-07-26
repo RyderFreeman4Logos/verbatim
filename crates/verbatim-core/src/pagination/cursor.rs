@@ -246,13 +246,16 @@ pub fn validate_cursor_continuation(
         ));
     }
     let bound = claims.publication_generation();
+    // Request binding ≠ sealed cursor generation is a binding mismatch, not
+    // "generation gone". Do not project request gen into StaleGeneration.actual.
     if bound != ctx.publication_generation {
-        return Err(CursorError::generation_gone(
+        return Err(CursorError::generation_mismatch(
             bound,
-            Some(ctx.publication_generation),
+            ctx.publication_generation,
             "cursor publication generation does not match request binding",
         ));
     }
+    // True unavailability: bound generation no longer readable / not retained.
     if let Some(available) = ctx.available_generation {
         if available != bound {
             return Err(CursorError::generation_gone(

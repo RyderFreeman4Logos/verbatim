@@ -31,7 +31,7 @@ retries return one logical operation.
 | `CursorSealKey` | Server-only key material (never on the wire) |
 | `seal_cursor` / `open_cursor` | `v1.<base64url(claims)>.<hex_seal>` with keyed SHA-256 seal |
 | `validate_cursor_continuation` | Expiry, principal, generation, profile, policy, query, mode |
-| `CursorError` | `expired` / `invalid` / `unauthorized` / `generation_gone` / `profile_changed` / `policy_changed` / `query_mismatch` / `mode_mismatch` |
+| `CursorError` | `expired` / `invalid` / `unauthorized` / `generation_gone` / `generation_mismatch` / `profile_changed` / `policy_changed` / `query_mismatch` / `mode_mismatch` |
 | `PaginationMode` | `ranked_search` vs `exhaustive_enumeration` |
 | `SnapshotPageRequest` / `SnapshotPageResponse` | Mode-aware page envelopes bound to a generation |
 | `MutationIdempotencyKey` | Client mutation identity (≤256 bytes) |
@@ -53,8 +53,15 @@ form maps to `CursorError::Invalid`.
 - Pagination **never** silently crosses query, policy, principal, profile, mode,
   or generation boundaries.
 - Expired cursors return `expired` (recoverable: restart from page 0).
-- Generation no longer readable returns `generation_gone` (maps to
-  `StorageError::StaleGeneration`).
+- Request publication binding ≠ sealed cursor generation returns
+  `generation_mismatch` (maps to `StorageError::InvalidRequest`). This is a
+  binding error; it must **not** invent `StaleGeneration.actual` from the
+  request id.
+- Bound generation no longer readable / not retained returns `generation_gone`:
+  - observed available known (`available: Some`) → maps to
+    `StorageError::StaleGeneration { expected: bound, actual: observed }`
+  - observed available missing (`available: None`) → maps to
+    `StorageError::Unavailable` (do not invent `StorageGeneration::INITIAL`)
 - Principal mismatch returns `unauthorized`.
 - Ranked and exhaustive cursors are not interchangeable (`mode_mismatch`).
 

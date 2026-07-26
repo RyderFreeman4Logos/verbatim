@@ -23,10 +23,25 @@ pub enum CursorError {
     /// Principal / authorization scope does not match the sealed cursor.
     Unauthorized { detail: String },
     /// Bound publication generation is no longer readable / retained.
+    ///
+    /// `available` is a real observed retained generation when known; never a
+    /// request-binding id. Mapping: `Some` → `StorageError::StaleGeneration`,
+    /// `None` → `StorageError::Unavailable` (do not invent `INITIAL`).
     GenerationGone {
         bound: StorageGeneration,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         available: Option<StorageGeneration>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// Request publication binding does not match the sealed cursor generation.
+    ///
+    /// This is a client/adapter binding error, not "bound generation is gone".
+    /// Must not project into `StorageError::StaleGeneration` (that requires an
+    /// authoritative observed available generation).
+    GenerationMismatch {
+        bound: StorageGeneration,
+        request: StorageGeneration,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
@@ -75,6 +90,18 @@ impl CursorError {
         }
     }
 
+    pub fn generation_mismatch(
+        bound: StorageGeneration,
+        request: StorageGeneration,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::GenerationMismatch {
+            bound,
+            request,
+            detail: Some(detail.into()),
+        }
+    }
+
     pub fn profile_changed(expected: impl Into<String>, actual: impl Into<String>) -> Self {
         Self::ProfileChanged {
             expected: expected.into(),
@@ -107,6 +134,7 @@ impl CursorError {
             Self::Invalid { .. } => "invalid",
             Self::Unauthorized { .. } => "unauthorized",
             Self::GenerationGone { .. } => "generation_gone",
+            Self::GenerationMismatch { .. } => "generation_mismatch",
             Self::ProfileChanged { .. } => "profile_changed",
             Self::PolicyChanged { .. } => "policy_changed",
             Self::QueryMismatch { .. } => "query_mismatch",
@@ -152,6 +180,20 @@ impl CursorError {
                     )),
                 }
             }
+            // Binding mismatch is not StaleGeneration: request id is not an
+            // authoritative available generation.
+            Self::GenerationMismatch {
+                bound,
+                request,
+                detail,
+            } => {
+                let detail_msg = detail.clone().unwrap_or_else(|| {
+                    "cursor publication generation does not match request binding".into()
+                });
+                StorageError::invalid_request(format!(
+                    "cursor generation mismatch: bound {bound}, request {request}: {detail_msg}"
+                ))
+            }
             Self::ProfileChanged { expected, actual } => StorageError::invalid_request(format!(
                 "cursor profile changed: expected {expected}, actual {actual}"
             )),
@@ -191,6 +233,20 @@ impl fmt::Display for CursorError {
                 if let Some(available) = available {
                     write!(f, ", available {available}")?;
                 }
+                if let Some(detail) = detail {
+                    write!(f, ": {detail}")?;
+                }
+                Ok(())
+            }
+            Self::GenerationMismatch {
+                bound,
+                request,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "cursor generation mismatch: bound {bound}, request {request}"
+                )?;
                 if let Some(detail) = detail {
                     write!(f, ": {detail}")?;
                 }

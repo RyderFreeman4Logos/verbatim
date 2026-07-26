@@ -105,18 +105,44 @@ fn principal_mismatch_fails_closed() {
 }
 
 #[test]
-fn generation_mismatch_and_gone_fail_closed() {
+fn request_generation_mismatch_is_not_stale_generation() {
     let claims = sample_claims(PaginationMode::RankedSearch);
     let mut ctx = sample_ctx(&claims, 1_700_000_000);
+    // Request binding differs from sealed cursor generation (binding error).
     ctx.publication_generation = StorageGeneration::new(99);
     let err = validate_cursor_continuation(&claims, &ctx).unwrap_err();
-    assert_eq!(err.class_name(), "generation_gone");
-    assert_eq!(err.to_storage_error().class_name(), "stale_generation");
+    assert_eq!(err.class_name(), "generation_mismatch");
+    let storage = err.to_storage_error();
+    assert_eq!(storage.class_name(), "invalid_request");
+    assert!(
+        !matches!(
+            storage,
+            crate::storage_ports::StorageError::StaleGeneration { .. }
+        ),
+        "request binding must not fabricate StaleGeneration.actual: {storage:?}"
+    );
+}
 
-    let mut ctx2 = sample_ctx(&claims, 1_700_000_000);
-    ctx2.available_generation = Some(StorageGeneration::new(1));
-    let err2 = validate_cursor_continuation(&claims, &ctx2).unwrap_err();
-    assert_eq!(err2.class_name(), "generation_gone");
+#[test]
+fn available_generation_gone_maps_to_stale_when_observed() {
+    let claims = sample_claims(PaginationMode::RankedSearch);
+    let mut ctx = sample_ctx(&claims, 1_700_000_000);
+    // Bound still matches request; observed available differs → truly gone.
+    let observed = StorageGeneration::new(1);
+    ctx.available_generation = Some(observed);
+    let err = validate_cursor_continuation(&claims, &ctx).unwrap_err();
+    assert_eq!(err.class_name(), "generation_gone");
+    let storage = err.to_storage_error();
+    assert_eq!(storage.class_name(), "stale_generation");
+    match storage {
+        crate::storage_ports::StorageError::StaleGeneration {
+            expected, actual, ..
+        } => {
+            assert_eq!(expected, claims.publication_generation());
+            assert_eq!(actual, observed);
+        }
+        other => panic!("expected StaleGeneration with real observed actual, got {other:?}"),
+    }
 }
 
 #[test]
