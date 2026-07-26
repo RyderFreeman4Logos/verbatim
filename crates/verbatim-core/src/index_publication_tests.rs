@@ -335,6 +335,44 @@ fn rollback_restores_previous_generation() {
     }
 }
 
+#[test]
+fn restage_of_active_generation_is_rejected() {
+    let mut coord = InMemoryPublicationCoordinator::new(initial_pointer()).expect("coord");
+    coord.stage(ready_manifest(1)).expect("stage");
+    let outcome = coord
+        .promote(
+            gen(1),
+            gen(0),
+            PointerEpoch::INITIAL,
+            "2026-07-26T00:01:00Z",
+            Some(&profile("default")),
+        )
+        .expect("promote");
+    assert!(matches!(outcome, PromotionOutcome::Promoted { .. }));
+    assert_eq!(coord.active_pointer().active_generation, gen(1));
+    assert_eq!(
+        coord.get_manifest(gen(1)).expect("m").status,
+        BuildStatus::Active
+    );
+
+    let err = coord
+        .stage(ready_manifest(1))
+        .expect_err("restaging active generation must fail closed");
+    assert!(matches!(err, StorageError::InvalidRequest { .. }));
+    assert!(
+        err.to_string().contains("active generation")
+            || err.to_string().contains("already marked Active"),
+        "err={err}"
+    );
+
+    // Pointer and registry must be unchanged on reject.
+    assert_eq!(coord.active_pointer().active_generation, gen(1));
+    assert_eq!(
+        coord.get_manifest(gen(1)).expect("m").status,
+        BuildStatus::Active
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Reconciliation findings
 // ---------------------------------------------------------------------------

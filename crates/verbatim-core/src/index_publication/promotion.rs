@@ -68,7 +68,7 @@ pub trait PublicationCoordinator: Send + Sync {
         expected_profile: Option<&EmbeddingProfileId>,
     ) -> StorageResult<()>;
 
-    /// CAS-promote a validated Ready generation to active.
+    /// CAS-promote a Ready generation to active after live re-validation.
     fn promote(
         &mut self,
         generation: StorageGeneration,
@@ -92,12 +92,13 @@ pub trait PublicationCoordinator: Send + Sync {
 }
 
 /// Pure in-memory coordinator for contract tests and single-process staging.
+///
+/// Promote re-validates live via [`validate_for_promotion`]; there is no
+/// separate recorded validate→promote fence in this walking skeleton.
 #[derive(Debug)]
 pub struct InMemoryPublicationCoordinator {
     pointer: ActiveGenerationPointer,
     manifests: HashMap<u64, IndexPublicationManifest>,
-    /// Tracks last validated generation ids (Ready after validate()).
-    validated: HashMap<u64, bool>,
     lock: Mutex<()>,
 }
 
@@ -107,7 +108,6 @@ impl InMemoryPublicationCoordinator {
         Ok(Self {
             pointer: initial,
             manifests: HashMap::new(),
-            validated: HashMap::new(),
             lock: Mutex::new(()),
         })
     }
@@ -124,14 +124,28 @@ impl PublicationCoordinator for InMemoryPublicationCoordinator {
             .lock()
             .map_err(|_| StorageError::unavailable("publication coordinator lock poisoned"))?;
         manifest.validate_structure()?;
-        // Staging never mutates active; status must not already be Active.
+        // Staging never mutates the active pointer; reject Active payloads and
+        // refuse to overwrite the live generation (pointer or registry).
         if matches!(manifest.status, BuildStatus::Active) {
             return Err(StorageError::invalid_request(
                 "cannot stage a manifest that is already active; stage as ready/building first",
             ));
         }
+        if manifest.generation == self.pointer.active_generation {
+            return Err(StorageError::invalid_request(
+                "cannot restage the active generation; pointer and registry would desync",
+            ));
+        }
         let key = Self::gen_key(manifest.generation);
-        self.validated.remove(&key);
+        if self
+            .manifests
+            .get(&key)
+            .is_some_and(|existing| matches!(existing.status, BuildStatus::Active))
+        {
+            return Err(StorageError::invalid_request(
+                "cannot restage a generation already marked Active in the registry",
+            ));
+        }
         self.manifests.insert(key, manifest);
         Ok(())
     }
@@ -212,7 +226,6 @@ impl PublicationCoordinator for InMemoryPublicationCoordinator {
             pointer = pointer.with_previous(previous);
         }
         self.pointer = pointer.clone();
-        self.validated.insert(key, true);
 
         Ok(PromotionOutcome::Promoted {
             pointer,

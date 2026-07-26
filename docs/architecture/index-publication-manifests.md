@@ -51,14 +51,15 @@ space.
 ### Promotion state machine
 
 ```
-stage(manifest)  -- no active mutation; rejects already-Active status
-   │
+stage(manifest)  -- no active mutation; rejects Active payloads and restage of
+   │                 the live generation (pointer id or registry Active row)
    ▼
 validate(generation)  -- completeness, profile, referential integrity, digests;
-   │                    Ready only (Building/Failed cannot promote)
+   │                    Ready only (Building/Failed cannot promote); advisory
+   │                    check — promote re-validates live (no recorded fence)
    ▼
-promote(gen, expected_current, expected_epoch)  -- CAS pointer; conflict → typed stale
-   │
+promote(gen, expected_current, expected_epoch)  -- live re-validate + CAS pointer;
+   │                                               conflict → typed stale
    ▼
 rollback(expected_current, expected_epoch)  -- restore previous_generation if present
 ```
@@ -86,8 +87,8 @@ moves (adapter residual).
 - Module export from `verbatim-core` (`pub mod index_publication`)
 - Pure contract types and in-memory coordinator
 - Unit tests: happy promote, reject incomplete, hash integrity, concurrent CAS
-  conflict, rollback, unknown schema fail-closed, reconciliation construction,
-  query binding round-trip
+  conflict, rollback, restage-of-active reject, unknown schema fail-closed,
+  reconciliation construction, query binding round-trip
 
 ## What this slice does **not** do (residual)
 
