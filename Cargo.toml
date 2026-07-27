@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.115"
+version = "0.1.116"
 edition = "2021"
 license = "Apache-2.0"
 
