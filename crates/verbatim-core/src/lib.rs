@@ -6,6 +6,7 @@ pub mod cache_identity;
 pub mod canonical_chunker;
 mod caption_chunker;
 pub mod chunker;
+pub mod citation_audit;
 pub mod collection;
 pub mod compare_sources;
 pub mod config;
