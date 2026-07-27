@@ -12,6 +12,7 @@ pub mod compare_sources;
 pub mod config;
 pub mod context;
 pub mod deletion;
+pub mod durability;
 pub mod embed;
 #[path = "types_evidence_spans.rs"]
 pub mod evidence_spans;
