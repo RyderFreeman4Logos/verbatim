@@ -1,6 +1,7 @@
 /// Shared identities, roles, and daemon authentication configuration.
 pub mod auth;
 pub use auth::{AuthMode, DaemonAuthConfig, Principal, Role};
+pub mod adk_integration;
 pub mod api;
 pub mod cache_identity;
 pub mod canonical_chunker;
