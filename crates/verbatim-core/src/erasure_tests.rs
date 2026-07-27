@@ -1,0 +1,224 @@
+use super::*;
+
+fn canonical_plan() -> DeletionPlan {
+    let matrix = DeletionPropagationMatrix::canonical();
+    let scope = DeletionScope::new(vec!["source-363".into()], &matrix).expect("valid scope");
+    DeletionPlan::new(scope, DeletionPolicy::default(), matrix).expect("valid plan")
+}
+
+fn assert_code(error: ErasureError, expected: ErasureDiagnosticCode) {
+    assert_eq!(error, ErasureError::validation(expected));
+    assert_eq!(error.to_string(), format!("erasure.{}", expected.as_str()));
+    assert_eq!(
+        format!("{error:?}"),
+        format!("ErasureError({})", expected.as_str())
+    );
+}
+
+#[test]
+fn canonical_matrix_covers_every_target_and_enforces_authoritative_derived_cache_remote_order() {
+    let matrix = DeletionPropagationMatrix::canonical();
+    matrix.validate().expect("canonical matrix is valid");
+    assert_eq!(matrix.entries().len(), DeletionTarget::ALL.len());
+
+    let orders: Vec<_> = matrix
+        .entries()
+        .iter()
+        .map(|entry| entry.ordering)
+        .collect();
+    assert!(orders.windows(2).all(|window| window[0] <= window[1]));
+    assert_eq!(
+        matrix.entries()[0].ordering,
+        DeletionOrdering::Authoritative
+    );
+    assert_eq!(
+        matrix.entries().last().expect("non-empty matrix").ordering,
+        DeletionOrdering::RemoteReplica
+    );
+}
+
+#[test]
+fn every_product_target_state_combination_is_validated_fail_closed() {
+    let canonical = DeletionPropagationMatrix::canonical();
+    for target in DeletionTarget::ALL {
+        let canonical_entry = canonical.entry(target).expect("target is covered");
+        for product in DataProduct::ALL {
+            for state in DeletionState::ALL {
+                let mut entries = canonical.entries().to_vec();
+                let position = entries
+                    .iter()
+                    .position(|entry| entry.target == target)
+                    .expect("target is covered");
+                entries[position].product = product;
+                entries[position].state = state;
+                let candidate = DeletionPropagationMatrix::new(entries);
+                assert_eq!(
+                    candidate.validate().is_ok(),
+                    product == canonical_entry.product && state == canonical_entry.state,
+                    "{target:?} {product:?} {state:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn deletion_scope_fences_stale_reads_and_validates_all_target_classifications() {
+    let matrix = DeletionPropagationMatrix::canonical();
+    let scope = DeletionScope::new(vec!["source-363".into()], &matrix).expect("valid scope");
+    assert!(scope.blocks_serving());
+    scope.validate(&matrix).expect("scope tracks every target");
+
+    let mut bad_scope = scope.clone();
+    bad_scope.targets.remove(&DeletionTarget::Qdrant);
+    assert_code(
+        bad_scope
+            .validate(&matrix)
+            .expect_err("partial scope rejected"),
+        ErasureDiagnosticCode::ScopeTargetSetIncomplete,
+    );
+}
+
+#[test]
+fn legal_hold_and_incomplete_propagation_fail_closed() {
+    let matrix = DeletionPropagationMatrix::canonical();
+    let scope = DeletionScope::new(vec!["source-363".into()], &matrix).expect("valid scope");
+
+    let held_policy = DeletionPolicy {
+        legal_hold: true,
+        ..DeletionPolicy::default()
+    };
+    assert_code(
+        DeletionPlan::new(scope.clone(), held_policy, matrix.clone())
+            .expect_err("legal hold blocks all deletion"),
+        ErasureDiagnosticCode::LegalHoldBlocksDeletion,
+    );
+
+    let incomplete_policy = DeletionPolicy {
+        propagation: PolicyPropagation {
+            cache_keys: false,
+            ..PolicyPropagation::required()
+        },
+        ..DeletionPolicy::default()
+    };
+    assert_code(
+        DeletionPlan::new(scope, incomplete_policy, matrix).expect_err("cache fence is mandatory"),
+        ErasureDiagnosticCode::PolicyPropagationIncomplete,
+    );
+}
+
+#[test]
+fn remote_failures_must_enter_dead_letter_with_operator_alert() {
+    let retry = RetryPolicy::default();
+    let reconciliation = RemoteReconciliation::remote_failure(DeletionTarget::Qdrant, retry)
+        .expect("remote failure is tracked");
+    reconciliation.validate().expect("dead letter is required");
+    assert_eq!(reconciliation.dead_letter, DeadLetterState::Enqueued);
+    assert_eq!(reconciliation.operator_alert, OperatorAlertState::Required);
+
+    let invalid = RemoteReconciliation {
+        dead_letter: DeadLetterState::NotRequired,
+        ..reconciliation
+    };
+    assert_code(
+        invalid.validate().expect_err("failure cannot be dropped"),
+        ErasureDiagnosticCode::RemoteFailureDeadLetterRequired,
+    );
+}
+
+#[test]
+fn cryptographic_erasure_requires_key_rotation_when_backup_rewrite_is_impractical() {
+    let invalid = CryptographicErasure {
+        backup_rewrite_impractical: true,
+        key_rotation: KeyRotationRequirement::NotApplicable,
+    };
+    assert_code(
+        invalid.validate().expect_err("key rotation is mandatory"),
+        ErasureDiagnosticCode::CryptographicErasureKeyRotationRequired,
+    );
+    CryptographicErasure::default()
+        .validate()
+        .expect("default applies key rotation requirement");
+}
+
+#[test]
+fn scope_matrix_propagation_reconciliation_and_plan_json_round_trip() {
+    let plan = canonical_plan();
+    let bytes = encode_deletion_plan_json(&plan).expect("plan encodes");
+    let decoded = decode_deletion_plan_json(&bytes).expect("plan decodes and revalidates");
+    assert_eq!(decoded, plan);
+
+    let propagation = PropagationReceipt::complete(&decoded).expect("ordered propagation");
+    let reconciliation = ReconciliationReceipt::new(
+        propagation,
+        RemoteReconciliation::complete(RetryPolicy::default()),
+    )
+    .expect("reconciliation is valid");
+    let proof = DeletionProof::from_reconciliation(&decoded, &reconciliation)
+        .expect("proof is redaction safe and verifiable");
+    proof.validate().expect("proof validates");
+    assert_eq!(proof.source_count, 1);
+}
+
+#[test]
+fn deletion_proof_excludes_restricted_content_and_errors_render_only_codes() {
+    let restricted_content = "restricted source body must never appear in proof or errors";
+    let plan = canonical_plan();
+    let reconciliation = ReconciliationReceipt::new(
+        PropagationReceipt::complete(&plan).expect("complete propagation"),
+        RemoteReconciliation::complete(RetryPolicy::default()),
+    )
+    .expect("valid reconciliation");
+    let proof = DeletionProof::from_reconciliation(&plan, &reconciliation).expect("proof");
+    let encoded = serde_json::to_string(&proof).expect("proof serializes");
+    assert!(!encoded.contains(restricted_content));
+    assert!(!format!("{proof:?}").contains(restricted_content));
+
+    assert_code(
+        decode_deletion_plan_json(b"not-json").expect_err("untrusted JSON is rejected"),
+        ErasureDiagnosticCode::InvalidPlanJson,
+    );
+}
+
+#[test]
+fn workflow_trait_requires_plan_propagate_reconcile_report_sequence() {
+    struct ContractWorkflow;
+
+    impl DeletionWorkflow for ContractWorkflow {
+        fn plan(
+            &self,
+            scope: DeletionScope,
+            policy: DeletionPolicy,
+        ) -> ErasureResult<DeletionPlan> {
+            DeletionPlan::new(scope, policy, DeletionPropagationMatrix::canonical())
+        }
+
+        fn propagate(&self, plan: &DeletionPlan) -> ErasureResult<PropagationReceipt> {
+            PropagationReceipt::complete(plan)
+        }
+
+        fn reconcile(
+            &self,
+            propagation: PropagationReceipt,
+        ) -> ErasureResult<ReconciliationReceipt> {
+            ReconciliationReceipt::new(
+                propagation,
+                RemoteReconciliation::complete(RetryPolicy::default()),
+            )
+        }
+
+        fn report(
+            &self,
+            plan: &DeletionPlan,
+            reconciliation: &ReconciliationReceipt,
+        ) -> ErasureResult<DeletionProof> {
+            DeletionProof::from_reconciliation(plan, reconciliation)
+        }
+    }
+
+    let plan = canonical_plan();
+    let workflow = ContractWorkflow;
+    let propagated = workflow.propagate(&plan).expect("propagation");
+    let reconciled = workflow.reconcile(propagated).expect("reconciliation");
+    workflow.report(&plan, &reconciled).expect("proof");
+}

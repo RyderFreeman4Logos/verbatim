@@ -14,6 +14,7 @@ pub mod context;
 pub mod deletion;
 pub mod durability;
 pub mod embed;
+pub mod erasure;
 #[path = "types_evidence_spans.rs"]
 pub mod evidence_spans;
 pub mod exhaustive_audit;
