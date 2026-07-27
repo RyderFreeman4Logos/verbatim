@@ -176,10 +176,7 @@ impl ComparisonScope {
         self.left.require_resolved_authorization()?;
         self.right.require_resolved_authorization()?;
         for source in [&self.left, &self.right] {
-            if matches!(
-                source.lifecycle,
-                SourceLifecycle::Retired | SourceLifecycle::Archived
-            ) {
+            if source.lifecycle != SourceLifecycle::Active {
                 return Err(ComparisonError::scope_unresolved(format!(
                     "lifecycle {} is not comparable for {}@{}",
                     source.lifecycle.as_str(),

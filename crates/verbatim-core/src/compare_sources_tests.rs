@@ -88,31 +88,43 @@ fn cell(alignment: DimensionAlignment) -> ComparisonCell {
     }
 }
 
-fn result() -> ComparisonResult {
+fn result_for_scope(scope: &ComparisonScope) -> ComparisonResult {
     ComparisonResult::new(
         ComparisonResultFields {
             result_id: "result-1".into(),
-            scope_hash: digest(3),
+            scope_hash: content_hash_of(scope).expect("scope hashes"),
             cells: vec![cell(DimensionAlignment::Difference)],
             summary_interpretation: Some("Eligibility is narrower.".into()),
         },
-        &scope(),
+        scope,
     )
     .expect("valid structured result")
 }
 
-fn pack() -> ComparisonContextPack {
+fn result() -> ComparisonResult {
+    let scope = scope();
+    result_for_scope(&scope)
+}
+
+fn pack_for_scope(scope: &ComparisonScope, result: &ComparisonResult) -> ComparisonContextPack {
     ComparisonContextPack::new(
         ComparisonContextPackFields {
             pack_id: "pack-1".into(),
-            scope_hash: digest(3),
-            comparison_result_hash: digest(4),
-            cells: result().cells,
+            scope_hash: content_hash_of(scope).expect("scope hashes"),
+            comparison_result_hash: content_hash_of(result).expect("result hashes"),
+            cells: result.cells.clone(),
             wire_context_pack: None,
         },
-        &scope(),
+        scope,
+        result,
     )
     .expect("valid reusable pack")
+}
+
+fn pack() -> ComparisonContextPack {
+    let scope = scope();
+    let result = result_for_scope(&scope);
+    pack_for_scope(&scope, &result)
 }
 
 #[test]
@@ -144,6 +156,9 @@ fn scope_requires_distinct_versions_and_fails_closed_for_every_resolution_state(
 
 #[test]
 fn scope_rejects_incompatible_lifecycle_and_declared_constraints() {
+    scope()
+        .require_comparable()
+        .expect("both active authorized sides are comparable");
     let comparable = source_with_constraints(
         "right",
         "v2",
@@ -152,7 +167,11 @@ fn scope_rejects_incompatible_lifecycle_and_declared_constraints() {
         &["US"],
         &["standard"],
     );
-    for lifecycle in [SourceLifecycle::Retired, SourceLifecycle::Archived] {
+    for lifecycle in [
+        SourceLifecycle::Superseded,
+        SourceLifecycle::Retired,
+        SourceLifecycle::Archived,
+    ] {
         let incompatible = ComparisonScope::new(ComparisonScopeFields {
             scope_id: format!("scope-{}", lifecycle.as_str()),
             left: source_with_constraints(
@@ -196,38 +215,6 @@ fn scope_rejects_incompatible_lifecycle_and_declared_constraints() {
             incompatible.require_comparable(),
             Err(ComparisonError::ScopeUnresolved { .. })
         ));
-    }
-}
-
-#[test]
-fn all_lifecycle_availability_alignment_and_stage_variants_are_reachable() {
-    for lifecycle in [
-        SourceLifecycle::Active,
-        SourceLifecycle::Superseded,
-        SourceLifecycle::Retired,
-        SourceLifecycle::Archived,
-    ] {
-        assert!(!lifecycle.as_str().is_empty());
-    }
-    for availability in [
-        SourceAvailability::Authorized,
-        SourceAvailability::AclDenied,
-        SourceAvailability::VersionGone,
-        SourceAvailability::Unresolved,
-    ] {
-        assert!(!availability.as_str().is_empty());
-    }
-    for alignment in [
-        DimensionAlignment::Agreement,
-        DimensionAlignment::Difference,
-        DimensionAlignment::Conflict,
-        DimensionAlignment::Missing,
-        DimensionAlignment::Incomparable,
-    ] {
-        assert!(!alignment.as_str().is_empty());
-    }
-    for stage in ComparisonStage::all() {
-        assert!(!stage.as_str().is_empty());
     }
 }
 
@@ -467,12 +454,12 @@ fn record_stage_rejects_wrong_active_stage_and_preserves_usage_on_exhaustion() {
 }
 
 #[test]
-fn record_stage_accounts_cost_and_rejects_checked_overflow() {
+fn record_stage_accounts_cost_and_rejects_cost_only_exhaustion() {
     let budget = ComparisonBudget::new(ComparisonBudgetFields {
         max_dimensions: 1,
         max_sources: 2,
         max_candidates: 1,
-        max_tokens: u64::MAX,
+        max_tokens: u64::MAX - 1,
         max_cost_units: 1,
         max_wall_time_ms: 1,
     })
@@ -504,29 +491,6 @@ fn record_stage_accounts_cost_and_rejects_checked_overflow() {
         run.usage, before,
         "failed cost accounting must not mutate usage"
     );
-
-    run.usage.tokens = u64::MAX;
-    let overflow = record_stage(
-        &mut run,
-        ComparisonStageRecord {
-            stage: ComparisonStage::Decomposing,
-            artifact_hash: Some(digest(8)),
-            input_fingerprint: None,
-            output_fingerprint: None,
-            usage_delta: ComparisonBudgetUsage {
-                tokens: 1,
-                ..Default::default()
-            },
-            cost: ComparisonCost::default(),
-            ok: true,
-            detail: None,
-        },
-    );
-    assert!(matches!(
-        overflow,
-        Err(ComparisonError::BudgetExhausted { .. })
-    ));
-    assert_eq!(run.usage.tokens, u64::MAX, "overflow must not mutate usage");
 }
 
 #[test]
@@ -617,6 +581,43 @@ fn completion_rejects_cross_scope_or_mismatched_result_artifacts() {
 }
 
 #[test]
+fn artifact_constructors_bind_hashes_to_the_supplied_scope_and_result() {
+    let scope = scope();
+    let valid_result = result_for_scope(&scope);
+    let mut other_scope = scope.clone();
+    other_scope.scope_id = "other-scope".into();
+    let unrelated_scope_hash = content_hash_of(&other_scope).expect("other scope hashes");
+
+    assert!(matches!(
+        ComparisonResult::new(
+            ComparisonResultFields {
+                result_id: "wrong-scope".into(),
+                scope_hash: unrelated_scope_hash,
+                cells: vec![cell(DimensionAlignment::Difference)],
+                summary_interpretation: None,
+            },
+            &scope,
+        ),
+        Err(ComparisonError::Validation { .. })
+    ));
+
+    assert!(matches!(
+        ComparisonContextPack::new(
+            ComparisonContextPackFields {
+                pack_id: "wrong-result".into(),
+                scope_hash: content_hash_of(&scope).expect("scope hashes"),
+                comparison_result_hash: digest(4),
+                cells: valid_result.cells.clone(),
+                wire_context_pack: None,
+            },
+            &scope,
+            &valid_result,
+        ),
+        Err(ComparisonError::Validation { .. })
+    ));
+}
+
+#[test]
 fn terminal_runs_cannot_be_completed_or_transitioned_again() {
     let mut disabled = start_run(
         "disabled".into(),
@@ -668,6 +669,42 @@ fn terminal_runs_cannot_be_completed_or_transitioned_again() {
         ),
         Err(ComparisonError::IllegalTransition { .. })
     ));
+
+    let mut incomplete = start_run(
+        "incomplete".into(),
+        &scope(),
+        ComparisonBudget::skeleton_default(),
+    )
+    .expect("starts");
+    incomplete
+        .mark_incomplete("incomplete for test")
+        .expect("marks incomplete");
+
+    for run in [&mut disabled, &mut complete, &mut incomplete] {
+        let before = run.clone();
+        assert!(matches!(
+            run.record_stage(ComparisonStageRecord {
+                stage: run.current_stage,
+                artifact_hash: None,
+                input_fingerprint: None,
+                output_fingerprint: None,
+                usage_delta: ComparisonBudgetUsage::default(),
+                cost: ComparisonCost::default(),
+                ok: true,
+                detail: None,
+            }),
+            Err(ComparisonError::IllegalTransition { .. })
+        ));
+        assert!(matches!(
+            run.add_warning(ComparisonWarning {
+                severity: ComparisonWarningSeverity::Info,
+                code: "late".into(),
+                detail: "terminal mutation".into(),
+            }),
+            Err(ComparisonError::IllegalTransition { .. })
+        ));
+        assert_eq!(*run, before, "terminal public mutators must not mutate");
+    }
 }
 
 #[test]
@@ -691,14 +728,15 @@ fn run_json_round_trip_and_unknown_schema_fail_closed() {
 
 #[test]
 fn context_pack_and_result_preserve_unresolved_alignment_visibility() {
+    let scope = scope();
     let conflict = ComparisonResult::new(
         ComparisonResultFields {
             result_id: "conflict-result".into(),
-            scope_hash: digest(3),
+            scope_hash: content_hash_of(&scope).expect("scope hashes"),
             cells: vec![cell(DimensionAlignment::Conflict)],
             summary_interpretation: None,
         },
-        &scope(),
+        &scope,
     )
     .expect("conflict remains a structured supported output");
     assert!(conflict.has_unresolved_cells());

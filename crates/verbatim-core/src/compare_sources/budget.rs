@@ -74,6 +74,16 @@ impl ComparisonBudget {
                 "max_sources must not exceed 2 in the two-sided walking skeleton",
             ));
         }
+        if self.max_dimensions == u32::MAX
+            || self.max_candidates == u32::MAX
+            || self.max_tokens == u64::MAX
+            || self.max_cost_units == u64::MAX
+            || self.max_wall_time_ms == u64::MAX
+        {
+            return Err(ComparisonError::validation(
+                "budget caps must leave room for exhaustion evidence",
+            ));
+        }
         Ok(())
     }
 }
@@ -103,8 +113,13 @@ fn is_zero_u64(value: &u64) -> bool {
 }
 
 fn budget_overflow(dimension: ComparisonBudgetDimension, limit: u64) -> ComparisonError {
+    let Some(used) = limit.checked_add(1) else {
+        return ComparisonError::validation(
+            "validated budget cap must leave room for overflow exhaustion evidence",
+        );
+    };
     ComparisonError::budget_exhausted(
-        ComparisonBudgetExhaustion::new(dimension, limit, limit),
+        ComparisonBudgetExhaustion::new(dimension, limit, used),
         format!("{} usage addition overflowed", dimension.as_str()),
     )
 }

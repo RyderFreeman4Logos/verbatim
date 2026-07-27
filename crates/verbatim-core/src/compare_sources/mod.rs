@@ -55,3 +55,7 @@ pub const COMPARE_SOURCES_CONTRACT_SCHEMA_VERSION: u32 = COMPARE_SOURCES_WORKFLO
 #[cfg(test)]
 #[path = "../compare_sources_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../compare_sources_variant_tests.rs"]
+mod variant_tests;

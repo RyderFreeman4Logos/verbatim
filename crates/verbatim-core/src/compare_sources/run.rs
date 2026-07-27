@@ -167,6 +167,11 @@ impl CompareSourcesWorkflowRun {
     }
 
     pub fn record_stage(&mut self, record: ComparisonStageRecord) -> ComparisonResultType<()> {
+        if self.status.is_terminal() {
+            return Err(ComparisonError::IllegalTransition {
+                detail: "cannot record a stage on a terminal comparison run".into(),
+            });
+        }
         record.validate()?;
         let cost_usage = ComparisonBudgetUsage {
             tokens: record.cost.tokens,
@@ -183,6 +188,11 @@ impl CompareSourcesWorkflowRun {
     }
 
     pub fn add_warning(&mut self, warning: ComparisonWarning) -> ComparisonResultType<()> {
+        if self.status.is_terminal() {
+            return Err(ComparisonError::IllegalTransition {
+                detail: "cannot add a warning to a terminal comparison run".into(),
+            });
+        }
         require_non_empty("warning.code", &warning.code)?;
         require_non_empty("warning.detail", &warning.detail)?;
         self.warnings.push(warning);
@@ -197,13 +207,13 @@ impl CompareSourcesWorkflowRun {
         }
         let detail = detail.into();
         require_non_empty("incomplete.detail", &detail)?;
-        self.current_stage = ComparisonStage::Incomplete;
-        self.status = ComparisonRunStatus::Incomplete;
         self.add_warning(ComparisonWarning {
             severity: ComparisonWarningSeverity::Warning,
             code: "incomplete".into(),
             detail,
         })?;
+        self.current_stage = ComparisonStage::Incomplete;
+        self.status = ComparisonRunStatus::Incomplete;
         self.validate()
     }
 
@@ -215,12 +225,12 @@ impl CompareSourcesWorkflowRun {
         }
         let detail = detail.into();
         require_non_empty("disabled.detail", &detail)?;
-        self.status = ComparisonRunStatus::Disabled;
         self.add_warning(ComparisonWarning {
             severity: ComparisonWarningSeverity::Info,
             code: "disabled".into(),
             detail,
         })?;
+        self.status = ComparisonRunStatus::Disabled;
         self.validate()
     }
 

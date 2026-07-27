@@ -6,6 +6,7 @@ use crate::wire_schemas::ContextPackEnvelope;
 
 use super::dimension::{ComparisonDimension, DimensionAlignment, DimensionValue};
 use super::error::{ComparisonError, ComparisonResultType};
+use super::run::content_hash_of;
 use super::scope::ComparisonScope;
 use super::util::{require_digest, require_non_empty};
 
@@ -126,6 +127,11 @@ impl ComparisonResult {
         scope.require_comparable()?;
         require_non_empty("result_id", &self.result_id)?;
         require_digest("scope_hash", &self.scope_hash)?;
+        if self.scope_hash != content_hash_of(scope)? {
+            return Err(ComparisonError::validation(
+                "comparison result scope_hash must bind to the supplied scope",
+            ));
+        }
         if self.cells.is_empty() {
             return Err(ComparisonError::missing_evidence(
                 "comparison result requires at least one cell",
@@ -184,6 +190,7 @@ impl ComparisonContextPack {
     pub fn new(
         fields: ComparisonContextPackFields,
         scope: &ComparisonScope,
+        result: &ComparisonResult,
     ) -> ComparisonResultType<Self> {
         let pack = Self {
             pack_id: fields.pack_id,
@@ -192,14 +199,29 @@ impl ComparisonContextPack {
             cells: fields.cells,
             wire_context_pack: fields.wire_context_pack,
         };
-        pack.validate_for_scope(scope)?;
+        pack.validate_for_scope(scope, result)?;
         Ok(pack)
     }
 
-    pub fn validate_for_scope(&self, scope: &ComparisonScope) -> ComparisonResultType<()> {
+    pub fn validate_for_scope(
+        &self,
+        scope: &ComparisonScope,
+        result: &ComparisonResult,
+    ) -> ComparisonResultType<()> {
         require_non_empty("pack_id", &self.pack_id)?;
         require_digest("scope_hash", &self.scope_hash)?;
         require_digest("comparison_result_hash", &self.comparison_result_hash)?;
+        if self.scope_hash != content_hash_of(scope)? {
+            return Err(ComparisonError::validation(
+                "comparison context pack scope_hash must bind to the supplied scope",
+            ));
+        }
+        result.validate_for_scope(scope)?;
+        if self.comparison_result_hash != content_hash_of(result)? {
+            return Err(ComparisonError::validation(
+                "comparison context pack result hash must bind to the supplied result",
+            ));
+        }
         if self.cells.is_empty() {
             return Err(ComparisonError::missing_evidence(
                 "comparison context pack requires cells",
