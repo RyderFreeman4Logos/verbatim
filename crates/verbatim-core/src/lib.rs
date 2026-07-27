@@ -26,6 +26,7 @@ pub mod ingest;
 pub mod ingest_security;
 pub mod memory_budget;
 pub mod migration_framework;
+pub mod multi_hop_research;
 pub mod observability_contract;
 pub mod ocr;
 pub mod pagination;
