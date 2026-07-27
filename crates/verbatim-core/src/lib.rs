@@ -38,6 +38,7 @@ pub mod profiles;
 pub mod provider;
 pub mod remote_storage_client;
 pub mod resource;
+pub mod result_diversity;
 pub mod retrieve;
 pub mod sdk;
 pub mod source_metadata;
