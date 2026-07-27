@@ -184,7 +184,9 @@ impl AuditWorkflowRun {
         let primary_enumeration = evidence
             .enumerations
             .iter()
-            .find(|enumeration| enumeration.is_deterministic_primary())
+            .find(|enumeration| {
+                enumeration.scope_hash == self.scope_hash && enumeration.is_deterministic_primary()
+            })
             .ok_or_else(|| {
                 ExhaustiveAuditError::validation(
                     "exhaustive evidence requires deterministic primary enumeration",

@@ -359,6 +359,61 @@ fn forged_exhaustive_json_requires_canonical_evidence() {
 }
 
 #[test]
+fn mixed_scope_primary_evidence_binds_to_declared_scope_and_rejects_foreign_primary() {
+    let scope = scope();
+    let in_scope_primary = primary_enumeration(&scope);
+    let foreign_primary = CandidateEnumeration::new(CandidateEnumerationFields {
+        enumeration_id: "foreign-lexical-all".into(),
+        scope_hash: digest(9),
+        method: EnumerationMethod::Lexical,
+        query_fingerprint: digest(10),
+        candidate_ids: vec!["foreign-v1".into()],
+        deterministic: true,
+    })
+    .expect("valid foreign lexical enumeration");
+    let mut run = AuditWorkflowRun::new(AuditWorkflowRunFields {
+        run_id: "mixed-scope-run".into(),
+        scope_hash: content_hash_of(&scope).expect("scope hash"),
+        target: CompletenessTarget::All,
+        budget: ExhaustiveAuditBudget::skeleton_default(),
+    })
+    .expect("new run");
+    for stage in [
+        AuditStage::Enumerating,
+        AuditStage::Covering,
+        AuditStage::Reconciling,
+        AuditStage::Reporting,
+    ] {
+        advance_stage(&mut run, stage).expect("legal stage transition");
+    }
+    report(
+        &mut run,
+        &scope,
+        &exhaustive_coverage(&scope),
+        &[foreign_primary.clone(), in_scope_primary.clone()],
+    )
+    .expect("report uses declared-scope primary evidence");
+
+    let in_scope_hash = content_hash_of(&in_scope_primary).expect("in-scope primary hash");
+    assert_eq!(
+        run.primary_enumeration_hash.as_deref(),
+        Some(in_scope_hash.as_str())
+    );
+    assert_eq!(
+        run.stage_records[1].artifact_hash, in_scope_hash,
+        "enumerating stage must bind the declared-scope primary"
+    );
+
+    let foreign_hash = content_hash_of(&foreign_primary).expect("foreign primary hash");
+    let mut forged = run;
+    forged.primary_enumeration_hash = Some(foreign_hash.clone());
+    forged.primary_query_fingerprint = Some(foreign_primary.query_fingerprint.clone());
+    forged.stage_records[1].artifact_hash = foreign_hash;
+    let bytes = serde_json::to_vec(&forged).expect("encode foreign-primary fixture");
+    assert!(decode_audit_workflow_run_json(&bytes).is_err());
+}
+
+#[test]
 fn workflow_run_json_roundtrip_rejects_unknown_schema_and_unbound_exhaustive_status() {
     let scope = scope();
     let mut run = AuditWorkflowRun::new(AuditWorkflowRunFields {

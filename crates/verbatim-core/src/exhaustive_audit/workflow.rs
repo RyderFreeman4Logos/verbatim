@@ -85,7 +85,9 @@ pub fn report(
     let primary_evidence = enumerations
         .iter()
         .zip(&enumeration_hashes)
-        .find(|(enumeration, _)| enumeration.is_deterministic_primary())
+        .find(|(enumeration, _)| {
+            enumeration.scope_hash == scope_hash && enumeration.is_deterministic_primary()
+        })
         .map(|(enumeration, hash)| (hash.clone(), enumeration.query_fingerprint.clone()));
     let reconciliation_hash = super::content_hash_of(&(scope, manifest, enumerations))?;
     let report_hash = super::content_hash_of(&(run.target, scope, manifest, enumerations))?;
