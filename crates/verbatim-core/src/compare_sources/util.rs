@@ -10,7 +10,18 @@ pub fn require_non_empty(field: &str, value: &str) -> ComparisonResultType<()> {
 }
 
 pub fn require_digest(field: &str, value: &str) -> ComparisonResultType<()> {
-    require_non_empty(field, value)
+    require_non_empty(field, value)?;
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(ComparisonError::validation(format!(
+            "{field} must be a sha256: prefixed 64-character hexadecimal digest"
+        )));
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ComparisonError::validation(format!(
+            "{field} must be a sha256: prefixed 64-character hexadecimal digest"
+        )));
+    }
+    Ok(())
 }
 
 pub fn require_unique_non_empty(field: &str, values: &[String]) -> ComparisonResultType<()> {

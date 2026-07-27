@@ -12,6 +12,7 @@ use super::run::{
 };
 use super::scope::ComparisonScope;
 use super::stage::ComparisonStage;
+use super::util::require_digest;
 
 /// Legal state-machine edge for the pure workflow helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +84,20 @@ pub fn try_complete(
             detail: "comparison completion requires rendering stage".into(),
         });
     }
+    require_digest("result.scope_hash", &result.scope_hash)?;
+    require_digest("pack.scope_hash", &pack.scope_hash)?;
+    require_digest("pack.comparison_result_hash", &pack.comparison_result_hash)?;
+    if result.scope_hash != run.scope_hash || pack.scope_hash != run.scope_hash {
+        return Err(ComparisonError::validation(
+            "comparison result and context pack scope hashes must match the run scope hash",
+        ));
+    }
     let result_hash = content_hash_of(result)?;
+    if pack.comparison_result_hash != result_hash {
+        return Err(ComparisonError::validation(
+            "comparison context pack result hash must match the rendered result hash",
+        ));
+    }
     let pack_hash = content_hash_of(pack)?;
     run.complete(result_hash, pack_hash)?;
     Ok(ComparisonOutcome::Complete(Box::new(pack.clone())))
@@ -94,6 +108,11 @@ pub fn fail_closed(
     run: &mut CompareSourcesWorkflowRun,
     error: ComparisonError,
 ) -> ComparisonResultType<ComparisonOutcome> {
+    if run.status.is_terminal() {
+        return Err(ComparisonError::IllegalTransition {
+            detail: "cannot fail-close a terminal comparison run".into(),
+        });
+    }
     match error {
         error @ ComparisonError::Disabled { .. } => {
             run.mark_disabled(error.to_string())?;

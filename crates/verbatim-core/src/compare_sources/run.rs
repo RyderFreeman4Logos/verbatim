@@ -168,8 +168,14 @@ impl CompareSourcesWorkflowRun {
 
     pub fn record_stage(&mut self, record: ComparisonStageRecord) -> ComparisonResultType<()> {
         record.validate()?;
-        let candidate_usage = self.usage.saturating_add(&record.usage_delta);
-        candidate_usage.check_against(&self.budget)?;
+        let cost_usage = ComparisonBudgetUsage {
+            tokens: record.cost.tokens,
+            cost_units: record.cost.cost_units,
+            wall_time_ms: record.cost.wall_time_ms,
+            ..ComparisonBudgetUsage::default()
+        };
+        let stage_usage = record.usage_delta.checked_add(&cost_usage, &self.budget)?;
+        let candidate_usage = self.usage.checked_add(&stage_usage, &self.budget)?;
         self.usage = candidate_usage;
         self.current_stage = record.stage;
         self.records.push(record);
@@ -184,6 +190,11 @@ impl CompareSourcesWorkflowRun {
     }
 
     pub fn mark_incomplete(&mut self, detail: impl Into<String>) -> ComparisonResultType<()> {
+        if self.status.is_terminal() {
+            return Err(ComparisonError::IllegalTransition {
+                detail: "cannot mark a terminal comparison run incomplete".into(),
+            });
+        }
         let detail = detail.into();
         require_non_empty("incomplete.detail", &detail)?;
         self.current_stage = ComparisonStage::Incomplete;
@@ -197,6 +208,11 @@ impl CompareSourcesWorkflowRun {
     }
 
     pub fn mark_disabled(&mut self, detail: impl Into<String>) -> ComparisonResultType<()> {
+        if self.status.is_terminal() {
+            return Err(ComparisonError::IllegalTransition {
+                detail: "cannot mark a terminal comparison run disabled".into(),
+            });
+        }
         let detail = detail.into();
         require_non_empty("disabled.detail", &detail)?;
         self.status = ComparisonRunStatus::Disabled;
@@ -213,6 +229,11 @@ impl CompareSourcesWorkflowRun {
         result_hash: String,
         context_pack_hash: String,
     ) -> ComparisonResultType<()> {
+        if self.status != ComparisonRunStatus::Running {
+            return Err(ComparisonError::IllegalTransition {
+                detail: "completion requires a running comparison run".into(),
+            });
+        }
         require_digest("comparison_result_hash", &result_hash)?;
         require_digest("context_pack_hash", &context_pack_hash)?;
         if self.current_stage != ComparisonStage::Rendering {

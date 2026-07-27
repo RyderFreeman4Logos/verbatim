@@ -169,14 +169,52 @@ impl ComparisonScope {
         Ok(())
     }
 
-    /// Fail closed before extract/align: both sides must be resolved and ACL-authorized.
+    /// Fail closed before extract/align: both sides must be authorized and
+    /// share an active lifecycle and declared comparison constraints.
     pub fn require_comparable(&self) -> ComparisonResultType<()> {
         self.validate()?;
         self.left.require_resolved_authorization()?;
-        self.right.require_resolved_authorization()
+        self.right.require_resolved_authorization()?;
+        for source in [&self.left, &self.right] {
+            if matches!(
+                source.lifecycle,
+                SourceLifecycle::Retired | SourceLifecycle::Archived
+            ) {
+                return Err(ComparisonError::scope_unresolved(format!(
+                    "lifecycle {} is not comparable for {}@{}",
+                    source.lifecycle.as_str(),
+                    source.source_id,
+                    source.version_id
+                )));
+            }
+        }
+        if self.left.effective_date != self.right.effective_date {
+            return Err(ComparisonError::scope_unresolved(
+                "source effective-date constraints do not match",
+            ));
+        }
+        require_shared_constraint(
+            "jurisdiction",
+            &self.left.jurisdictions,
+            &self.right.jurisdictions,
+        )?;
+        require_shared_constraint("product", &self.left.products, &self.right.products)
     }
 
     pub fn source_count(&self) -> u32 {
         2
     }
+}
+
+fn require_shared_constraint(
+    field: &str,
+    left: &[String],
+    right: &[String],
+) -> ComparisonResultType<()> {
+    if left.is_empty() || right.is_empty() || !left.iter().any(|value| right.contains(value)) {
+        return Err(ComparisonError::scope_unresolved(format!(
+            "source {field} constraints have no shared value"
+        )));
+    }
+    Ok(())
 }

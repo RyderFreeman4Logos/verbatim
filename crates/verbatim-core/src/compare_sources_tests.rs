@@ -1,5 +1,9 @@
 use super::*;
 
+fn digest(seed: u8) -> String {
+    format!("sha256:{seed:064x}")
+}
+
 fn source(source_id: &str, version_id: &str, availability: SourceAvailability) -> SourceVersion {
     SourceVersion::new(SourceVersionFields {
         source_id: source_id.into(),
@@ -11,6 +15,26 @@ fn source(source_id: &str, version_id: &str, availability: SourceAvailability) -
         availability,
     })
     .expect("valid source version")
+}
+
+fn source_with_constraints(
+    source_id: &str,
+    version_id: &str,
+    lifecycle: SourceLifecycle,
+    effective_date: &str,
+    jurisdictions: &[&str],
+    products: &[&str],
+) -> SourceVersion {
+    SourceVersion::new(SourceVersionFields {
+        source_id: source_id.into(),
+        version_id: version_id.into(),
+        lifecycle,
+        effective_date: Some(effective_date.into()),
+        jurisdictions: jurisdictions.iter().map(|value| (*value).into()).collect(),
+        products: products.iter().map(|value| (*value).into()).collect(),
+        availability: SourceAvailability::Authorized,
+    })
+    .expect("structurally valid source version")
 }
 
 fn scope() -> ComparisonScope {
@@ -48,7 +72,7 @@ fn value(source_id: &str, version_id: &str, wording: &str) -> DimensionValue {
             source_id: source_id.into(),
             version_id: version_id.into(),
             locator: "section 1".into(),
-            content_hash: format!("sha256:{version_id}"),
+            content_hash: digest(if version_id == "v1" { 1 } else { 2 }),
         }],
     })
     .expect("value has quotation and provenance")
@@ -68,7 +92,7 @@ fn result() -> ComparisonResult {
     ComparisonResult::new(
         ComparisonResultFields {
             result_id: "result-1".into(),
-            scope_hash: "sha256:scope".into(),
+            scope_hash: digest(3),
             cells: vec![cell(DimensionAlignment::Difference)],
             summary_interpretation: Some("Eligibility is narrower.".into()),
         },
@@ -81,8 +105,8 @@ fn pack() -> ComparisonContextPack {
     ComparisonContextPack::new(
         ComparisonContextPackFields {
             pack_id: "pack-1".into(),
-            scope_hash: "sha256:scope".into(),
-            comparison_result_hash: "sha256:result".into(),
+            scope_hash: digest(3),
+            comparison_result_hash: digest(4),
             cells: result().cells,
             wire_context_pack: None,
         },
@@ -115,6 +139,63 @@ fn scope_requires_distinct_versions_and_fails_closed_for_every_resolution_state(
         .expect("identity remains structurally valid until resolve");
         let error = denied.require_comparable().expect_err("must fail closed");
         assert_eq!(error.class_name(), expected);
+    }
+}
+
+#[test]
+fn scope_rejects_incompatible_lifecycle_and_declared_constraints() {
+    let comparable = source_with_constraints(
+        "right",
+        "v2",
+        SourceLifecycle::Active,
+        "2026-01-01",
+        &["US"],
+        &["standard"],
+    );
+    for lifecycle in [SourceLifecycle::Retired, SourceLifecycle::Archived] {
+        let incompatible = ComparisonScope::new(ComparisonScopeFields {
+            scope_id: format!("scope-{}", lifecycle.as_str()),
+            left: source_with_constraints(
+                "left",
+                "v1",
+                lifecycle,
+                "2026-01-01",
+                &["US"],
+                &["standard"],
+            ),
+            right: comparable.clone(),
+            comparison_question: None,
+        })
+        .expect("identity remains structurally valid until comparison");
+        assert!(matches!(
+            incompatible.require_comparable(),
+            Err(ComparisonError::ScopeUnresolved { .. })
+        ));
+    }
+
+    for (scope_id, effective_date, jurisdictions, products) in [
+        ("date", "2027-01-01", vec!["US"], vec!["standard"]),
+        ("jurisdiction", "2026-01-01", vec!["CA"], vec!["standard"]),
+        ("product", "2026-01-01", vec!["US"], vec!["premium"]),
+    ] {
+        let incompatible = ComparisonScope::new(ComparisonScopeFields {
+            scope_id: format!("scope-{scope_id}"),
+            left: source_with_constraints(
+                "left",
+                "v1",
+                SourceLifecycle::Active,
+                effective_date,
+                &jurisdictions,
+                &products,
+            ),
+            right: comparable.clone(),
+            comparison_question: None,
+        })
+        .expect("identity remains structurally valid until comparison");
+        assert!(matches!(
+            incompatible.require_comparable(),
+            Err(ComparisonError::ScopeUnresolved { .. })
+        ));
     }
 }
 
@@ -320,7 +401,14 @@ fn state_machine_allows_only_ordered_pipeline_and_completion_needs_rendered_arti
             Ok(StageAdvance::Advanced(_))
         ));
     }
-    let complete = try_complete(&mut run, &result(), &pack()).expect("rendered artifacts complete");
+    let mut rendered_result = result();
+    rendered_result.scope_hash = run.scope_hash.clone();
+    let mut rendered_pack = pack();
+    rendered_pack.scope_hash = run.scope_hash.clone();
+    rendered_pack.comparison_result_hash =
+        content_hash_of(&rendered_result).expect("result hashes");
+    let complete = try_complete(&mut run, &rendered_result, &rendered_pack)
+        .expect("rendered artifacts complete");
     assert!(matches!(complete, ComparisonOutcome::Complete(_)));
     assert_eq!(run.status, ComparisonRunStatus::Complete);
     assert!(matches!(
@@ -341,7 +429,7 @@ fn record_stage_rejects_wrong_active_stage_and_preserves_usage_on_exhaustion() {
         &mut run,
         ComparisonStageRecord {
             stage: ComparisonStage::Resolving,
-            artifact_hash: Some("sha256:resolve".into()),
+            artifact_hash: Some(digest(5)),
             input_fingerprint: None,
             output_fingerprint: None,
             usage_delta: ComparisonBudgetUsage::default(),
@@ -359,7 +447,7 @@ fn record_stage_rejects_wrong_active_stage_and_preserves_usage_on_exhaustion() {
         &mut run,
         ComparisonStageRecord {
             stage: ComparisonStage::Decomposing,
-            artifact_hash: Some("sha256:decompose".into()),
+            artifact_hash: Some(digest(6)),
             input_fingerprint: None,
             output_fingerprint: None,
             usage_delta: ComparisonBudgetUsage {
@@ -376,6 +464,69 @@ fn record_stage_rejects_wrong_active_stage_and_preserves_usage_on_exhaustion() {
         Err(ComparisonError::BudgetExhausted { .. })
     ));
     assert_eq!(run.usage, before, "failed accounting must not mutate usage");
+}
+
+#[test]
+fn record_stage_accounts_cost_and_rejects_checked_overflow() {
+    let budget = ComparisonBudget::new(ComparisonBudgetFields {
+        max_dimensions: 1,
+        max_sources: 2,
+        max_candidates: 1,
+        max_tokens: u64::MAX,
+        max_cost_units: 1,
+        max_wall_time_ms: 1,
+    })
+    .expect("bounded budget");
+    let mut run = start_run("run-cost".into(), &scope(), budget).expect("starts");
+    let before = run.usage.clone();
+    let cost_only = record_stage(
+        &mut run,
+        ComparisonStageRecord {
+            stage: ComparisonStage::Decomposing,
+            artifact_hash: Some(digest(7)),
+            input_fingerprint: None,
+            output_fingerprint: None,
+            usage_delta: ComparisonBudgetUsage::default(),
+            cost: ComparisonCost {
+                cost_units: 2,
+                ..Default::default()
+            },
+            ok: true,
+            detail: None,
+        },
+    );
+    assert!(matches!(
+        cost_only,
+        Err(ComparisonError::BudgetExhausted { exhaustion, .. })
+            if exhaustion.dimension == ComparisonBudgetDimension::CostUnits
+    ));
+    assert_eq!(
+        run.usage, before,
+        "failed cost accounting must not mutate usage"
+    );
+
+    run.usage.tokens = u64::MAX;
+    let overflow = record_stage(
+        &mut run,
+        ComparisonStageRecord {
+            stage: ComparisonStage::Decomposing,
+            artifact_hash: Some(digest(8)),
+            input_fingerprint: None,
+            output_fingerprint: None,
+            usage_delta: ComparisonBudgetUsage {
+                tokens: 1,
+                ..Default::default()
+            },
+            cost: ComparisonCost::default(),
+            ok: true,
+            detail: None,
+        },
+    );
+    assert!(matches!(
+        overflow,
+        Err(ComparisonError::BudgetExhausted { .. })
+    ));
+    assert_eq!(run.usage.tokens, u64::MAX, "overflow must not mutate usage");
 }
 
 #[test]
@@ -409,6 +560,117 @@ fn fail_closed_marks_acl_budget_and_missing_evidence_incomplete_but_disabled_dis
 }
 
 #[test]
+fn completion_rejects_cross_scope_or_mismatched_result_artifacts() {
+    let run_scope = scope();
+    let mut other_scope = scope();
+    other_scope.scope_id = "scope-2".into();
+    let other_scope_hash = content_hash_of(&other_scope).expect("other scope hashes");
+
+    let mut cross_scope_result = result();
+    cross_scope_result.scope_hash = other_scope_hash.clone();
+    let mut cross_scope_pack = pack();
+    cross_scope_pack.scope_hash = other_scope_hash;
+    cross_scope_pack.comparison_result_hash =
+        content_hash_of(&cross_scope_result).expect("result hashes");
+
+    let mut cross_scope_run = start_run(
+        "cross-scope".into(),
+        &run_scope,
+        ComparisonBudget::skeleton_default(),
+    )
+    .expect("starts");
+    for stage in [
+        ComparisonStage::Resolving,
+        ComparisonStage::Extracting,
+        ComparisonStage::Aligning,
+        ComparisonStage::Rendering,
+    ] {
+        advance_stage(&mut cross_scope_run, stage).expect("advances");
+    }
+    assert!(matches!(
+        try_complete(&mut cross_scope_run, &cross_scope_result, &cross_scope_pack),
+        Err(ComparisonError::Validation { .. })
+    ));
+
+    let mut result_for_run = result();
+    result_for_run.scope_hash = cross_scope_run.scope_hash.clone();
+    let mut mismatched_pack = pack();
+    mismatched_pack.scope_hash = cross_scope_run.scope_hash.clone();
+    mismatched_pack.comparison_result_hash = digest(7);
+    assert!(matches!(
+        try_complete(&mut cross_scope_run, &result_for_run, &mismatched_pack),
+        Err(ComparisonError::Validation { .. })
+    ));
+
+    assert!(matches!(
+        ComparisonResult::new(
+            ComparisonResultFields {
+                result_id: "malformed-digest".into(),
+                scope_hash: "not-a-digest".into(),
+                cells: vec![cell(DimensionAlignment::Difference)],
+                summary_interpretation: None,
+            },
+            &scope(),
+        ),
+        Err(ComparisonError::Validation { .. })
+    ));
+}
+
+#[test]
+fn terminal_runs_cannot_be_completed_or_transitioned_again() {
+    let mut disabled = start_run(
+        "disabled".into(),
+        &scope(),
+        ComparisonBudget::skeleton_default(),
+    )
+    .expect("starts");
+    for stage in [
+        ComparisonStage::Resolving,
+        ComparisonStage::Extracting,
+        ComparisonStage::Aligning,
+        ComparisonStage::Rendering,
+    ] {
+        advance_stage(&mut disabled, stage).expect("advances");
+    }
+    disabled
+        .mark_disabled("disabled for test")
+        .expect("disables");
+    assert!(matches!(
+        disabled.complete(digest(8), digest(9)),
+        Err(ComparisonError::IllegalTransition { .. })
+    ));
+
+    let mut complete = start_run(
+        "complete".into(),
+        &scope(),
+        ComparisonBudget::skeleton_default(),
+    )
+    .expect("starts");
+    for stage in [
+        ComparisonStage::Resolving,
+        ComparisonStage::Extracting,
+        ComparisonStage::Aligning,
+        ComparisonStage::Rendering,
+    ] {
+        advance_stage(&mut complete, stage).expect("advances");
+    }
+    complete
+        .complete(digest(10), digest(11))
+        .expect("completes");
+    assert!(matches!(
+        complete.complete(digest(12), digest(13)),
+        Err(ComparisonError::IllegalTransition { .. })
+    ));
+    assert!(matches!(
+        fail_closed(
+            &mut complete,
+            ComparisonError::missing_evidence("late failure")
+        ),
+        Err(ComparisonError::IllegalTransition { .. })
+    ));
+}
+
+#[test]
 fn run_json_round_trip_and_unknown_schema_fail_closed() {
     let run = start_run(
         "run-1".into(),
@@ -432,7 +694,7 @@ fn context_pack_and_result_preserve_unresolved_alignment_visibility() {
     let conflict = ComparisonResult::new(
         ComparisonResultFields {
             result_id: "conflict-result".into(),
-            scope_hash: "sha256:scope".into(),
+            scope_hash: digest(3),
             cells: vec![cell(DimensionAlignment::Conflict)],
             summary_interpretation: None,
         },

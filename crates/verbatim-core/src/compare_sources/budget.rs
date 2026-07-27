@@ -102,16 +102,67 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn budget_overflow(dimension: ComparisonBudgetDimension, limit: u64) -> ComparisonError {
+    ComparisonError::budget_exhausted(
+        ComparisonBudgetExhaustion::new(dimension, limit, limit),
+        format!("{} usage addition overflowed", dimension.as_str()),
+    )
+}
+
 impl ComparisonBudgetUsage {
-    pub fn saturating_add(&self, other: &Self) -> Self {
-        Self {
-            dimensions: self.dimensions.saturating_add(other.dimensions),
-            sources: self.sources.saturating_add(other.sources),
-            candidates: self.candidates.saturating_add(other.candidates),
-            tokens: self.tokens.saturating_add(other.tokens),
-            cost_units: self.cost_units.saturating_add(other.cost_units),
-            wall_time_ms: self.wall_time_ms.saturating_add(other.wall_time_ms),
-        }
+    /// Add usage without allowing a saturated value to pass a maximum cap.
+    pub fn checked_add(
+        &self,
+        other: &Self,
+        budget: &ComparisonBudget,
+    ) -> ComparisonResultType<Self> {
+        budget.validate()?;
+        let usage = Self {
+            dimensions: self
+                .dimensions
+                .checked_add(other.dimensions)
+                .ok_or_else(|| {
+                    budget_overflow(
+                        ComparisonBudgetDimension::Dimensions,
+                        u64::from(budget.max_dimensions),
+                    )
+                })?,
+            sources: self.sources.checked_add(other.sources).ok_or_else(|| {
+                budget_overflow(
+                    ComparisonBudgetDimension::Sources,
+                    u64::from(budget.max_sources),
+                )
+            })?,
+            candidates: self
+                .candidates
+                .checked_add(other.candidates)
+                .ok_or_else(|| {
+                    budget_overflow(
+                        ComparisonBudgetDimension::Candidates,
+                        u64::from(budget.max_candidates),
+                    )
+                })?,
+            tokens: self.tokens.checked_add(other.tokens).ok_or_else(|| {
+                budget_overflow(ComparisonBudgetDimension::Tokens, budget.max_tokens)
+            })?,
+            cost_units: self
+                .cost_units
+                .checked_add(other.cost_units)
+                .ok_or_else(|| {
+                    budget_overflow(ComparisonBudgetDimension::CostUnits, budget.max_cost_units)
+                })?,
+            wall_time_ms: self
+                .wall_time_ms
+                .checked_add(other.wall_time_ms)
+                .ok_or_else(|| {
+                    budget_overflow(
+                        ComparisonBudgetDimension::WallTimeMs,
+                        budget.max_wall_time_ms,
+                    )
+                })?,
+        };
+        usage.check_against(budget)?;
+        Ok(usage)
     }
 
     /// Check every cap in stable order; the first excess is a typed error.
