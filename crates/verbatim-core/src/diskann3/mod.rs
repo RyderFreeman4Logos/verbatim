@@ -27,7 +27,9 @@ pub use dimension::VectorDimension;
 pub use error::{VectorSearchDiagnosticCode, VectorSearchError, VectorSearchResult};
 pub use filter::{FilterPredicate, LifecycleState, TypedMetadataValue};
 pub use retrieval::{
-    BoundedCandidates, CandidateGenerationPath, ExactScanThreshold, RetrievalStage, VectorCandidate,
+    BoundedCandidates, CandidateGenerationPath, ExactScanThreshold, FilteredCandidates,
+    FusedCandidates, GeneratedCandidates, HydratedCandidates, RerankedCandidates,
+    RescoredCandidates, RetrievalStage, VectorCandidate,
 };
 pub use shard::{
     decode_ssd_shard_manifest_json, encode_ssd_shard_manifest_json, PublicationGeneration,
@@ -41,3 +43,7 @@ pub const DISKANN3_CONTRACT_SCHEMA_VERSION: u32 = 1;
 #[cfg(test)]
 #[path = "../diskann3_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../diskann3_stage_contract_tests.rs"]
+mod stage_contract_tests;

@@ -128,7 +128,7 @@ impl ShardChecksum {
 
     fn is_sha256(&self) -> bool {
         self.0.strip_prefix("sha256:").is_some_and(|value| {
-            value.len() >= 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
     }
 }

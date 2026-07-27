@@ -5,9 +5,19 @@ use serde::{Deserialize, Serialize};
 use super::{VectorSearchDiagnosticCode, VectorSearchError, VectorSearchResult};
 
 /// The only supported embedding dimension: 4,096 finite `f32` values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct VectorDimension(u32);
+
+impl<'de> Deserialize<'de> for VectorDimension {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        Self::new(value as usize).map_err(serde::de::Error::custom)
+    }
+}
 
 impl VectorDimension {
     /// Number of original full-precision float32 dimensions retained per vector.

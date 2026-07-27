@@ -51,10 +51,26 @@ impl VectorBackend {
 }
 
 /// A backend selection proves that a legacy path had explicit operator opt-in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct BackendSelection {
     backend: VectorBackend,
     legacy_opt_in: bool,
+}
+
+#[derive(Deserialize)]
+struct SerializedBackendSelection {
+    backend: VectorBackend,
+    legacy_opt_in: bool,
+}
+
+impl<'de> Deserialize<'de> for BackendSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let serialized = SerializedBackendSelection::deserialize(deserializer)?;
+        Self::new(serialized.backend, serialized.legacy_opt_in).map_err(serde::de::Error::custom)
+    }
 }
 
 impl BackendSelection {

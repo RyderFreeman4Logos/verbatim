@@ -1,30 +1,51 @@
 //! Vector search trait and stateless fail-closed policy helpers.
 
+use super::retrieval::decode_hydrated_candidates;
 use super::{
-    BoundedCandidates, FilterPredicate, PublicationGeneration, RetrievalStageBudget, SearchBudget,
-    VectorDimension, VectorSearchDiagnosticCode, VectorSearchError, VectorSearchResult,
+    FilterPredicate, FilteredCandidates, FusedCandidates, GeneratedCandidates, HydratedCandidates,
+    PublicationGeneration, RerankedCandidates, RescoredCandidates, RetrievalStageBudget,
+    SearchBudget, VectorDimension, VectorSearchDiagnosticCode, VectorSearchError,
+    VectorSearchResult,
 };
 
-/// Pure adapter boundary: candidate generation, rescore, and hydration remain bounded.
+/// Pure adapter boundary with a mandatory, typed retrieval pipeline.
 pub trait VectorSearchContract {
     fn search(
         &self,
         query: &[f32],
         budget: &SearchBudget,
         filters: &[FilterPredicate],
-    ) -> VectorSearchResult<BoundedCandidates>;
+    ) -> VectorSearchResult<GeneratedCandidates>;
 
     fn rescore(
         &self,
-        candidates: BoundedCandidates,
+        candidates: GeneratedCandidates,
         budget: &SearchBudget,
-    ) -> VectorSearchResult<BoundedCandidates>;
+    ) -> VectorSearchResult<RescoredCandidates>;
+
+    fn apply_filters(
+        &self,
+        candidates: RescoredCandidates,
+        budget: &SearchBudget,
+    ) -> VectorSearchResult<FilteredCandidates>;
+
+    fn fuse(
+        &self,
+        candidates: FilteredCandidates,
+        budget: &SearchBudget,
+    ) -> VectorSearchResult<FusedCandidates>;
+
+    fn rerank(
+        &self,
+        candidates: FusedCandidates,
+        budget: &SearchBudget,
+    ) -> VectorSearchResult<RerankedCandidates>;
 
     fn hydrate(
         &self,
-        candidates: BoundedCandidates,
+        candidates: RerankedCandidates,
         budget: &SearchBudget,
-    ) -> VectorSearchResult<BoundedCandidates>;
+    ) -> VectorSearchResult<HydratedCandidates>;
 }
 
 /// Stateless enforcement helpers that adapters call at every DiskANN3 boundary.
@@ -100,7 +121,7 @@ pub fn decode_search_budget_json(input: &str) -> VectorSearchResult<SearchBudget
 }
 
 pub fn encode_bounded_candidates_json(
-    candidates: &BoundedCandidates,
+    candidates: &HydratedCandidates,
 ) -> VectorSearchResult<String> {
     let permissive_budget = RetrievalStageBudget::uniform(u32::MAX)?;
     candidates.validate(&permissive_budget)?;
@@ -111,11 +132,6 @@ pub fn encode_bounded_candidates_json(
 pub fn decode_bounded_candidates_json(
     input: &str,
     budget: &RetrievalStageBudget,
-) -> VectorSearchResult<BoundedCandidates> {
-    let candidates: BoundedCandidates = serde_json::from_str(input)
-        .map_err(|_| VectorSearchError::contract(VectorSearchDiagnosticCode::InvalidCandidates))?;
-    candidates
-        .validate(budget)
-        .map_err(|_| VectorSearchError::contract(VectorSearchDiagnosticCode::InvalidCandidates))?;
-    Ok(candidates)
+) -> VectorSearchResult<HydratedCandidates> {
+    decode_hydrated_candidates(input, budget)
 }
