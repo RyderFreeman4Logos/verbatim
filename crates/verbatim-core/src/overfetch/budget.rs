@@ -122,8 +122,43 @@ impl SearchBudget {
     pub fn total_retriever_candidates(self) -> OverfetchResult<u32> {
         self.dense_candidate_k
             .checked_add(self.lexical_candidate_k)
-            .and_then(|total| total.checked_add(self.exact_candidate_k))
-            .and_then(|total| total.checked_add(self.graph_candidate_k))
+            .and_then(|sum| sum.checked_add(self.exact_candidate_k))
+            .and_then(|sum| sum.checked_add(self.graph_candidate_k))
             .ok_or(OverfetchError::BudgetExceeded)
+    }
+
+    /// Returns a validated copy with the effective retriever request caps.
+    ///
+    /// Strict-filter policy may narrow individual retrievers, but it may never
+    /// widen any of the caller-supplied stage limits.
+    pub(crate) fn with_retriever_candidate_ks(
+        self,
+        dense_candidate_k: u32,
+        lexical_candidate_k: u32,
+        exact_candidate_k: u32,
+        graph_candidate_k: u32,
+    ) -> OverfetchResult<Self> {
+        Self::new(SearchBudgetFields {
+            dense_candidate_k,
+            lexical_candidate_k,
+            exact_candidate_k,
+            graph_candidate_k,
+            fused_pool_size: self.fused_pool_size,
+            rerank_input_size: self.rerank_input_size,
+            final_hydration_list_size: self.final_hydration_list_size,
+            debug_output_size: self.debug_output_size,
+        })
+    }
+
+    /// Returns true when every stage limit is at most the caller's request.
+    pub(crate) fn is_within(&self, requested: &Self) -> bool {
+        self.dense_candidate_k <= requested.dense_candidate_k
+            && self.lexical_candidate_k <= requested.lexical_candidate_k
+            && self.exact_candidate_k <= requested.exact_candidate_k
+            && self.graph_candidate_k <= requested.graph_candidate_k
+            && self.fused_pool_size <= requested.fused_pool_size
+            && self.rerank_input_size <= requested.rerank_input_size
+            && self.final_hydration_list_size <= requested.final_hydration_list_size
+            && self.debug_output_size <= requested.debug_output_size
     }
 }

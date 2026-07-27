@@ -1,5 +1,7 @@
 //! Typed strict-filter, candidate-validation, and adaptive-overfetch policy.
 
+use std::fmt;
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{OverfetchError, OverfetchResult, SearchBudget};
@@ -18,7 +20,7 @@ pub enum LifecycleState {
 }
 
 /// A required predicate which must be applied before normal result hydration.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum StrictFilter {
     Source(String),
@@ -60,8 +62,23 @@ impl StrictFilter {
     }
 }
 
+impl fmt::Debug for StrictFilter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(_) => formatter.write_str("StrictFilter::Source([REDACTED])"),
+            Self::Collection(_) => formatter.write_str("StrictFilter::Collection([REDACTED])"),
+            Self::Tenant(_) => formatter.write_str("StrictFilter::Tenant([REDACTED])"),
+            Self::Acl(_) => formatter.write_str("StrictFilter::Acl([REDACTED])"),
+            Self::Lifecycle(state) => formatter
+                .debug_tuple("StrictFilter::Lifecycle")
+                .field(state)
+                .finish(),
+        }
+    }
+}
+
 /// A bounded conjunction of strict retrieval predicates.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+#[derive(Clone, PartialEq, Eq, Serialize, Default)]
 pub struct RetrievalFilters {
     predicates: Vec<StrictFilter>,
 }
@@ -102,10 +119,27 @@ impl RetrievalFilters {
     pub fn is_strict(&self) -> bool {
         !self.predicates.is_empty()
     }
+
+    /// Returns whether this plan retains every required strict predicate.
+    pub(crate) fn preserves(&self, required: &Self) -> bool {
+        required
+            .predicates
+            .iter()
+            .all(|predicate| self.predicates.contains(predicate))
+    }
+}
+
+impl fmt::Debug for RetrievalFilters {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetrievalFilters")
+            .field("predicate_count", &self.predicates.len())
+            .finish()
+    }
 }
 
 /// Opaque candidate identifier that is validated before it enters a stage list.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct CandidateId(String);
 
@@ -133,8 +167,14 @@ impl CandidateId {
     }
 }
 
+impl fmt::Debug for CandidateId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CandidateId([REDACTED])")
+    }
+}
+
 /// A finite-score candidate returned by one bounded retriever.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct RetrievalCandidate {
     id: CandidateId,
     score: f32,
@@ -173,34 +213,40 @@ impl RetrievalCandidate {
     }
 }
 
+impl fmt::Debug for RetrievalCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetrievalCandidate")
+            .field("id", &self.id)
+            .field("score", &self.score)
+            .finish()
+    }
+}
+
 /// Lightweight acceptance of a candidate before any complete record is fetched.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CandidateValidation {
+pub(crate) struct CandidateValidation {
     candidate: RetrievalCandidate,
 }
 
 impl CandidateValidation {
-    pub fn new(candidate: RetrievalCandidate) -> OverfetchResult<Self> {
+    pub(crate) fn new(candidate: RetrievalCandidate) -> OverfetchResult<Self> {
         if !candidate.score().is_finite() {
             return Err(OverfetchError::BudgetExceeded);
         }
         Ok(Self { candidate })
     }
-
-    pub fn candidate(&self) -> &RetrievalCandidate {
-        &self.candidate
-    }
 }
 
 /// Validated lightweight candidates, capped before reranking and hydration.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ValidatedCandidates {
+pub(crate) struct ValidatedCandidates {
     candidates: Vec<CandidateValidation>,
 }
 
 impl ValidatedCandidates {
     /// Hard-truncates validated candidates to the rerank input cap.
-    pub fn new(
+    pub(crate) fn new(
         mut candidates: Vec<CandidateValidation>,
         budget: &SearchBudget,
     ) -> OverfetchResult<Self> {
@@ -209,23 +255,17 @@ impl ValidatedCandidates {
         Ok(Self { candidates })
     }
 
-    pub fn candidates(&self) -> &[CandidateValidation] {
+    pub(crate) fn candidates(&self) -> &[CandidateValidation] {
         &self.candidates
     }
 
     /// Final hydration input is capped before the hydration adapter is called.
-    pub fn for_hydration(&self, budget: &SearchBudget) -> Vec<CandidateValidation> {
+    pub(crate) fn for_hydration(&self, budget: &SearchBudget) -> Vec<CandidateValidation> {
         self.candidates
             .iter()
             .take(budget.final_hydration_list_size as usize)
             .cloned()
             .collect()
-    }
-
-    pub(crate) fn truncate_to(self, budget: &SearchBudget) -> Self {
-        let mut candidates = self.candidates;
-        candidates.truncate(budget.rerank_input_size as usize);
-        Self { candidates }
     }
 }
 
@@ -335,7 +375,12 @@ impl StrictFilterSupport {
             return Err(OverfetchError::BudgetExceeded);
         }
         match self {
-            Self::Native => Ok(requested_k),
+            Self::Native => {
+                if u64::from(requested_k) >= corpus_size {
+                    return Err(OverfetchError::CorpusSizeTopKForbidden);
+                }
+                Ok(requested_k)
+            }
             Self::Adaptive(policy) => {
                 policy.candidate_k_for_attempt(attempt, retriever_cap, corpus_size)
             }

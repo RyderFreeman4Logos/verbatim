@@ -1,105 +1,324 @@
-//! Ordered bounded retrieval-orchestration trait and stage values.
+//! Atomic bounded retrieval orchestration.
+//!
+//! The public contract exposes one sealed entry point. Planning, count gating,
+//! retriever execution, candidate stages, and complete hydration remain
+//! crate-internal so callers cannot skip a boundary or substitute a looser
+//! intermediate plan.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
-use super::{
-    BatchHydrationPort, OverfetchError, OverfetchResult, RetrievalCandidate, RetrievalFilters,
-    RetrieverKind, SearchBudget, StatementCountInstrumentation, StrictFilterSupport,
-    ValidatedCandidates,
+use super::backend::{
+    PrimaryBackendOutcome, PrimaryBackendSelection, RetrievalBackend, TypedBackendFailure,
 };
-use super::{CountPort, HydrationBatch};
+use super::budget::SearchBudget;
+use super::count::CountPort;
+use super::error::{OverfetchError, OverfetchResult};
+use super::hydration::{BatchHydrationPort, HydrationBatch};
+use super::instrumentation::StatementCountInstrumentation;
+use super::policy::{
+    RetrievalCandidate, RetrievalFilters, StrictFilterSupport, ValidatedCandidates,
+};
 
-/// Explicit diagnostic-output mode. Full output is never the implicit default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiagnosticMode {
-    Disabled,
-    Compact,
-    Full,
+/// Internal marker that prevents external implementations from bypassing the
+/// bounded orchestration pipeline.
+pub(crate) mod sealed {
+    pub trait Sealed {}
 }
 
-/// Immutable, serializable plan for one normal bounded retrieval request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RetrievalPlan {
-    budget: SearchBudget,
-    filters: RetrievalFilters,
-    diagnostic_mode: DiagnosticMode,
+/// Serializes a validated normal-query budget for an explicit caller boundary.
+pub fn encode_search_budget_json(budget: &SearchBudget) -> OverfetchResult<String> {
+    budget.validate()?;
+    serde_json::to_string(budget).map_err(|_| OverfetchError::BudgetExceeded)
 }
 
-#[derive(Deserialize)]
-struct RetrievalPlanFields {
-    budget: SearchBudget,
-    filters: RetrievalFilters,
-    diagnostic_mode: DiagnosticMode,
+/// Decodes and revalidates an untrusted normal-query budget.
+pub fn decode_search_budget_json(input: &str) -> OverfetchResult<SearchBudget> {
+    let budget =
+        serde_json::from_str::<SearchBudget>(input).map_err(|_| OverfetchError::BudgetExceeded)?;
+    budget.validate()?;
+    Ok(budget)
 }
 
-impl<'de> Deserialize<'de> for RetrievalPlan {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let fields = RetrievalPlanFields::deserialize(deserializer)?;
-        Self::new(fields.budget, fields.filters)
-            .map(|plan| plan.with_diagnostic_mode(fields.diagnostic_mode))
-            .map_err(serde::de::Error::custom)
+/// The only normal-retrieval entry point.
+///
+/// Implementations are sealed to this crate. Every invocation validates the
+/// caller request, creates and revalidates an internal plan, counts strict
+/// filters before a retriever request, executes the selected primary first,
+/// and verifies complete hydration instrumentation before reporting.
+pub(crate) trait BoundedRetrievalContract: sealed::Sealed {
+    type Report;
+
+    fn retrieve(
+        &self,
+        budget: &SearchBudget,
+        filters: &RetrievalFilters,
+        strict_filter_support: &StrictFilterSupport,
+        primary_backend_selection: &PrimaryBackendSelection,
+        statements: &mut StatementCountInstrumentation,
+    ) -> OverfetchResult<Self::Report>;
+}
+
+/// Crate-only adapter hooks invoked by the sealed bounded contract.
+pub(crate) trait RetrievalAdapter: CountPort + BatchHydrationPort + sealed::Sealed {
+    type Report;
+
+    fn plan(
+        &self,
+        budget: &SearchBudget,
+        filters: &RetrievalFilters,
+        strict_filter_support: &StrictFilterSupport,
+        primary_backend_selection: &PrimaryBackendSelection,
+    ) -> OverfetchResult<RetrievalPlan>;
+
+    fn execute_retrievers(
+        &self,
+        plan: &RetrievalPlan,
+        backend: RetrievalBackend,
+    ) -> OverfetchResult<PrimaryBackendAttempt>;
+
+    fn fuse_truncate(
+        &self,
+        candidates: RetrieverCandidates,
+        plan: &RetrievalPlan,
+    ) -> OverfetchResult<FusedCandidates>;
+
+    fn validate_candidates(
+        &self,
+        candidates: FusedCandidates,
+        plan: &RetrievalPlan,
+    ) -> OverfetchResult<ValidatedCandidates>;
+
+    /// Uses the complete-hydration port by default, after final candidate
+    /// truncation. Adapter overrides are still checked by the caller-visible
+    /// complete-batch instrumentation assertion.
+    fn hydrate_batch(
+        &self,
+        candidates: ValidatedCandidates,
+        plan: &RetrievalPlan,
+        statements: &mut StatementCountInstrumentation,
+    ) -> OverfetchResult<HydrationBatch<Self::Hydrated>> {
+        let hydration_candidates = candidates.for_hydration(plan.budget());
+        let hydrated = self.hydrate_full_batch(&hydration_candidates, statements)?;
+        HydrationBatch::new(hydrated, plan.budget())
     }
+
+    fn report(
+        &self,
+        plan: &RetrievalPlan,
+        hydrated: HydrationBatch<Self::Hydrated>,
+        statements: &StatementCountInstrumentation,
+    ) -> OverfetchResult<Self::Report>;
+}
+
+impl<T> BoundedRetrievalContract for T
+where
+    T: RetrievalAdapter,
+{
+    type Report = T::Report;
+
+    fn retrieve(
+        &self,
+        budget: &SearchBudget,
+        filters: &RetrievalFilters,
+        strict_filter_support: &StrictFilterSupport,
+        primary_backend_selection: &PrimaryBackendSelection,
+        statements: &mut StatementCountInstrumentation,
+    ) -> OverfetchResult<Self::Report> {
+        budget.validate()?;
+        primary_backend_selection.validate()?;
+
+        let planned = self.plan(
+            budget,
+            filters,
+            strict_filter_support,
+            primary_backend_selection,
+        )?;
+        planned.validate_for_request(
+            budget,
+            filters,
+            strict_filter_support,
+            primary_backend_selection,
+        )?;
+
+        // Strict filtering must be evaluated against a bounded indexed count
+        // before a retriever receives an effective candidate cap.
+        let corpus_size = self.count_indexed(planned.filters())?;
+        let plan = planned.with_effective_strict_filter_budget(corpus_size)?;
+
+        let retrieved = execute_primary_then_optional_typed_fallback(self, &plan)?;
+        let fused = self.fuse_truncate(retrieved, &plan)?;
+        let validated = self.validate_candidates(fused, &plan)?;
+        let hydrated = self.hydrate_batch(validated, &plan, statements)?;
+
+        // A duplicate batch is caught when recorded. This check additionally
+        // rejects omitted batches and unclassified per-candidate statements.
+        statements.assert_complete_batched_hydration()?;
+        self.report(&plan, hydrated, statements)
+    }
+}
+
+fn execute_primary_then_optional_typed_fallback<T>(
+    adapter: &T,
+    plan: &RetrievalPlan,
+) -> OverfetchResult<RetrieverCandidates>
+where
+    T: RetrievalAdapter,
+{
+    let selection = *plan.primary_backend_selection();
+    let primary = selection.primary();
+    selection.validate_first_attempt(primary)?;
+
+    match adapter.execute_retrievers(plan, primary)? {
+        PrimaryBackendAttempt::Satisfied(candidates) => Ok(candidates),
+        PrimaryBackendAttempt::DeclaredInsufficientResults => {
+            // Deliberately invoke the selection policy here so this path cannot
+            // accidentally grow a direct fallback in future orchestration code.
+            selection.fallback_after(PrimaryBackendOutcome::DeclaredInsufficientResults)?;
+            Err(OverfetchError::PrimaryBackendRequired)
+        }
+        PrimaryBackendAttempt::TypedFailure(failure) => {
+            let fallback = selection
+                .fallback_after(PrimaryBackendOutcome::TypedFailure(failure))?
+                .ok_or(OverfetchError::PrimaryBackendRequired)?;
+            match adapter.execute_retrievers(plan, fallback)? {
+                PrimaryBackendAttempt::Satisfied(candidates) => Ok(candidates),
+                PrimaryBackendAttempt::DeclaredInsufficientResults
+                | PrimaryBackendAttempt::TypedFailure(_) => {
+                    Err(OverfetchError::PrimaryBackendRequired)
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of one selected backend attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PrimaryBackendAttempt {
+    Satisfied(RetrieverCandidates),
+    DeclaredInsufficientResults,
+    TypedFailure(TypedBackendFailure),
+}
+
+/// Internal plan that cannot be serialized or supplied directly by callers.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RetrievalPlan {
+    budget: SearchBudget,
+    filters: RetrievalFilters,
+    strict_filter_support: StrictFilterSupport,
+    primary_backend_selection: PrimaryBackendSelection,
+    diagnostic_mode: DiagnosticMode,
 }
 
 impl RetrievalPlan {
-    /// Creates a normal-query plan with debugging disabled by default.
-    pub fn new(budget: SearchBudget, filters: RetrievalFilters) -> OverfetchResult<Self> {
-        let plan = Self {
+    pub(crate) fn new(
+        budget: SearchBudget,
+        filters: RetrievalFilters,
+        strict_filter_support: StrictFilterSupport,
+        primary_backend_selection: PrimaryBackendSelection,
+    ) -> OverfetchResult<Self> {
+        budget.validate()?;
+        primary_backend_selection.validate()?;
+        Ok(Self {
             budget,
             filters,
+            strict_filter_support,
+            primary_backend_selection,
             diagnostic_mode: DiagnosticMode::Disabled,
-        };
-        plan.validate()?;
-        Ok(plan)
+        })
     }
 
-    /// Explicit opt-in for compact or still-capped full diagnostics.
-    pub const fn with_diagnostic_mode(mut self, diagnostic_mode: DiagnosticMode) -> Self {
-        self.diagnostic_mode = diagnostic_mode;
-        self
-    }
-
-    pub const fn budget(&self) -> &SearchBudget {
+    pub(crate) fn budget(&self) -> &SearchBudget {
         &self.budget
     }
 
-    pub fn filters(&self) -> &RetrievalFilters {
+    pub(crate) fn filters(&self) -> &RetrievalFilters {
         &self.filters
     }
 
-    pub const fn diagnostic_mode(&self) -> DiagnosticMode {
-        self.diagnostic_mode
+    pub(crate) fn strict_filter_support(&self) -> &StrictFilterSupport {
+        &self.strict_filter_support
     }
 
-    pub fn validate(&self) -> OverfetchResult<()> {
-        self.budget.validate()
+    pub(crate) fn primary_backend_selection(&self) -> &PrimaryBackendSelection {
+        &self.primary_backend_selection
     }
 
-    /// Bounded request cap for a strict-filtered retriever attempt.
-    pub fn strict_filter_candidate_k(
+    fn validate_for_request(
         &self,
-        retriever: RetrieverKind,
-        support: &StrictFilterSupport,
-        corpus_size: u64,
-        attempt: u8,
-    ) -> OverfetchResult<u32> {
-        let requested = self.budget.candidate_k(retriever);
-        if !self.filters.is_strict() {
-            return Ok(requested);
+        requested_budget: &SearchBudget,
+        requested_filters: &RetrievalFilters,
+        requested_strict_filter_support: &StrictFilterSupport,
+        requested_primary_backend_selection: &PrimaryBackendSelection,
+    ) -> OverfetchResult<()> {
+        self.budget.validate()?;
+        self.primary_backend_selection.validate()?;
+        if !self.budget.is_within(requested_budget) {
+            return Err(OverfetchError::BudgetExceeded);
         }
-        support.candidate_k_for_attempt(requested, requested, corpus_size, attempt)
+        if !self.filters.preserves(requested_filters)
+            || self.strict_filter_support != *requested_strict_filter_support
+        {
+            return Err(OverfetchError::UnsupportedStrictFilter);
+        }
+        if self.primary_backend_selection != *requested_primary_backend_selection {
+            return Err(OverfetchError::PrimaryBackendRequired);
+        }
+        Ok(())
+    }
+
+    fn with_effective_strict_filter_budget(mut self, corpus_size: u64) -> OverfetchResult<Self> {
+        if !self.filters.is_strict() {
+            return Ok(self);
+        }
+
+        self.budget = self.budget.with_retriever_candidate_ks(
+            self.strict_filter_support.candidate_k_for_attempt(
+                self.budget.dense_candidate_k,
+                self.budget.dense_candidate_k,
+                corpus_size,
+                0,
+            )?,
+            self.strict_filter_support.candidate_k_for_attempt(
+                self.budget.lexical_candidate_k,
+                self.budget.lexical_candidate_k,
+                corpus_size,
+                0,
+            )?,
+            self.strict_filter_support.candidate_k_for_attempt(
+                self.budget.exact_candidate_k,
+                self.budget.exact_candidate_k,
+                corpus_size,
+                0,
+            )?,
+            self.strict_filter_support.candidate_k_for_attempt(
+                self.budget.graph_candidate_k,
+                self.budget.graph_candidate_k,
+                corpus_size,
+                0,
+            )?,
+        )?;
+        Ok(self)
     }
 }
 
-/// Bounded output from the four normal-query retrievers.
+impl fmt::Debug for RetrievalPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetrievalPlan")
+            .field("budget", &self.budget)
+            .field("filters", &self.filters)
+            .field("strict_filter_support", &self.strict_filter_support)
+            .field("primary_backend_selection", &self.primary_backend_selection)
+            .field("diagnostic_mode", &self.diagnostic_mode)
+            .finish()
+    }
+}
+
+/// Candidate lists returned by independently bounded retrievers.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RetrieverCandidates {
+pub(crate) struct RetrieverCandidates {
     dense: Vec<RetrievalCandidate>,
     lexical: Vec<RetrievalCandidate>,
     exact: Vec<RetrievalCandidate>,
@@ -107,8 +326,7 @@ pub struct RetrieverCandidates {
 }
 
 impl RetrieverCandidates {
-    /// Hard-truncates every retriever output before fusion can observe it.
-    pub fn new(
+    pub(crate) fn new(
         budget: &SearchBudget,
         mut dense: Vec<RetrievalCandidate>,
         mut lexical: Vec<RetrievalCandidate>,
@@ -128,47 +346,31 @@ impl RetrieverCandidates {
         })
     }
 
-    pub fn dense(&self) -> &[RetrievalCandidate] {
+    pub(crate) fn dense(&self) -> &[RetrievalCandidate] {
         &self.dense
     }
 
-    pub fn lexical(&self) -> &[RetrievalCandidate] {
+    pub(crate) fn lexical(&self) -> &[RetrievalCandidate] {
         &self.lexical
     }
 
-    pub fn exact(&self) -> &[RetrievalCandidate] {
+    pub(crate) fn exact(&self) -> &[RetrievalCandidate] {
         &self.exact
     }
 
-    pub fn graph(&self) -> &[RetrievalCandidate] {
+    pub(crate) fn graph(&self) -> &[RetrievalCandidate] {
         &self.graph
-    }
-
-    pub fn total_len(&self) -> usize {
-        self.dense.len() + self.lexical.len() + self.exact.len() + self.graph.len()
-    }
-
-    pub(crate) fn truncate_to(mut self, budget: &SearchBudget) -> Self {
-        self.dense.truncate(budget.dense_candidate_k as usize);
-        self.lexical.truncate(budget.lexical_candidate_k as usize);
-        self.exact.truncate(budget.exact_candidate_k as usize);
-        self.graph.truncate(budget.graph_candidate_k as usize);
-        self
     }
 }
 
-/// Deterministically fused and bounded candidate pool.
+/// Fused candidate collection, hard-truncated before validation or reranking.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FusedCandidates {
+pub(crate) struct FusedCandidates {
     candidates: Vec<RetrievalCandidate>,
 }
 
 impl FusedCandidates {
-    /// Sorts/deduplicates the already bounded retriever pool, then truncates it.
-    ///
-    /// The input has at most `SearchBudget::total_retriever_candidates()` items,
-    /// so fusion is `O(candidate_budget log candidate_budget)`.
-    pub fn fuse_truncate(
+    pub(crate) fn fuse_truncate(
         candidates: RetrieverCandidates,
         budget: &SearchBudget,
     ) -> OverfetchResult<Self> {
@@ -191,14 +393,18 @@ impl FusedCandidates {
         Ok(Self { candidates: all })
     }
 
-    pub fn candidates(&self) -> &[RetrievalCandidate] {
+    pub(crate) fn candidates(&self) -> &[RetrievalCandidate] {
         &self.candidates
     }
+}
 
-    pub(crate) fn truncate_to(mut self, budget: &SearchBudget) -> Self {
-        self.candidates.truncate(budget.fused_pool_size as usize);
-        self
-    }
+/// Opt-in bounded diagnostic collection mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticMode {
+    Disabled,
+    Compact,
+    Full,
 }
 
 /// Bounded diagnostic output collected only in an explicit enabled mode.
@@ -256,99 +462,4 @@ impl ComplexityInvariant {
     pub const FUSION: &'static str = "O(candidate_budget log candidate_budget)";
     pub const HYDRATION_SQL_CALLS: &'static str = "O(1) batches";
     pub const HYDRATED_TEXT: &'static str = "O(final_limit + bounded_rerank_candidates)";
-}
-
-/// Pure adapter boundary with a required bounded retrieval orchestration order.
-pub trait BoundedRetrievalContract: CountPort + BatchHydrationPort {
-    type Report;
-
-    fn plan(
-        &self,
-        budget: &SearchBudget,
-        filters: &RetrievalFilters,
-    ) -> OverfetchResult<RetrievalPlan>;
-
-    fn execute_retrievers(&self, plan: &RetrievalPlan) -> OverfetchResult<RetrieverCandidates>;
-
-    fn fuse_truncate(
-        &self,
-        candidates: RetrieverCandidates,
-        plan: &RetrievalPlan,
-    ) -> OverfetchResult<FusedCandidates>;
-
-    fn validate_candidates(
-        &self,
-        candidates: FusedCandidates,
-        plan: &RetrievalPlan,
-    ) -> OverfetchResult<ValidatedCandidates>;
-
-    /// Default final stage: truncate lightweight validations before any complete
-    /// fetch and reject oversize completed hydration output.
-    fn hydrate_batch(
-        &self,
-        candidates: ValidatedCandidates,
-        plan: &RetrievalPlan,
-        statements: &mut StatementCountInstrumentation,
-    ) -> OverfetchResult<HydrationBatch<Self::Hydrated>> {
-        let hydration_input = candidates.for_hydration(plan.budget());
-        let hydrated = self.hydrate_full_batch(&hydration_input, statements)?;
-        HydrationBatch::new(hydrated, plan.budget())
-    }
-
-    fn report(
-        &self,
-        plan: &RetrievalPlan,
-        hydrated: HydrationBatch<Self::Hydrated>,
-        statements: &StatementCountInstrumentation,
-    ) -> OverfetchResult<Self::Report>;
-
-    /// Executes the required sequence and reapplies each cap at every hand-off.
-    fn retrieve(
-        &self,
-        budget: &SearchBudget,
-        filters: &RetrievalFilters,
-        statements: &mut StatementCountInstrumentation,
-    ) -> OverfetchResult<Self::Report> {
-        budget.validate()?;
-        let plan = self.plan(budget, filters)?;
-        plan.validate()?;
-
-        let candidates = self.execute_retrievers(&plan)?.truncate_to(plan.budget());
-        let fused = self
-            .fuse_truncate(candidates, &plan)?
-            .truncate_to(plan.budget());
-        let validated = self
-            .validate_candidates(fused, &plan)?
-            .truncate_to(plan.budget());
-        let hydrated = self.hydrate_batch(validated, &plan, statements)?;
-        self.report(&plan, hydrated, statements)
-    }
-}
-
-/// Encodes a validated budget without carrying any error detail to callers.
-pub fn encode_search_budget_json(budget: &SearchBudget) -> OverfetchResult<String> {
-    budget.validate()?;
-    serde_json::to_string(budget).map_err(|_| OverfetchError::BudgetExceeded)
-}
-
-/// Decodes and validates a budget before it can create retrieval work.
-pub fn decode_search_budget_json(input: &str) -> OverfetchResult<SearchBudget> {
-    let budget: SearchBudget =
-        serde_json::from_str(input).map_err(|_| OverfetchError::BudgetExceeded)?;
-    budget.validate()?;
-    Ok(budget)
-}
-
-/// Encodes a validated plan for a bounded request.
-pub fn encode_retrieval_plan_json(plan: &RetrievalPlan) -> OverfetchResult<String> {
-    plan.validate()?;
-    serde_json::to_string(plan).map_err(|_| OverfetchError::BudgetExceeded)
-}
-
-/// Decodes and validates a retrieval plan before it reaches an adapter.
-pub fn decode_retrieval_plan_json(input: &str) -> OverfetchResult<RetrievalPlan> {
-    let plan: RetrievalPlan =
-        serde_json::from_str(input).map_err(|_| OverfetchError::BudgetExceeded)?;
-    plan.validate()?;
-    Ok(plan)
 }

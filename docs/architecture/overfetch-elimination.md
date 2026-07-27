@@ -48,6 +48,11 @@ to the following stage. Adapters must also issue their backend request with the
 plan's cap; truncating a response protects later stages but cannot make an
 already materialized corpus-sized backend response acceptable.
 
+The crate's normal-retrieval lifecycle has only this atomic `retrieve` entry point. Retrieval
+plans, stage collections, hydration ports, and adapter hooks are crate-internal:
+callers cannot serialize or supply a plan, invoke a middle stage, or reorder the
+required gates.
+
 `CandidateValidation` is intentionally lightweight and precedes complete
 result construction. It carries a candidate identifier and finite retrieval
 score, not bodies, parent records, or evidence text. `FullHydration<T>` only
@@ -97,7 +102,10 @@ All methods receive the bounded final candidate slice and a
 `StatementCountInstrumentation`. An adapter records one SQL statement for each
 batch kind. A repeated batch kind is a deterministic `n_plus_one_detected`
 failure, rather than an observational performance regression. The instrumentation
-also enforces a total statement cap, making it possible to test the same bounded
+also verifies that all five batch kinds account for exactly five total statements:
+a missing batch or an unclassified per-candidate query is therefore a deterministic
+failure even when a broader statement cap has spare capacity. This makes it
+possible to test the same bounded
 statement count with synthetic corpus cardinalities of 10, 10,000, and
 1,000,000 without materializing those corpora.
 
@@ -133,9 +141,10 @@ fallback. `validate_first_attempt` requires the selected primary to run first.
 In particular, selecting Qdrant does not permit an unconditional local-dense
 pre-search.
 
-A fallback is available only after `PrimaryBackendOutcome::TypedFailure` or
-`DeclaredInsufficientResults`. A satisfied primary result has no fallback, and
-a missing or preemptive fallback yields `primary_backend_required`.
+A successful primary result has no fallback. A fallback is available only after
+`PrimaryBackendOutcome::TypedFailure`; declared insufficient results fail closed
+with `primary_backend_required`, even when a fallback was declared. A missing or
+preemptive fallback likewise yields `primary_backend_required`.
 
 ## Complexity invariants
 
@@ -165,8 +174,10 @@ expose corpus-proportional candidate vectors, debug output, or hydrated text.
 - `primary_backend_required`.
 
 Its `Debug` and `Display` implementations retain no caller-controlled strings,
-SQL, filters, IDs, secrets, or provider details. Budget and retrieval-plan JSON
-helpers serialize only validated values and revalidate after deserialization.
+SQL, filters, IDs, secrets, or provider details. The public budget JSON helper
+serializes only validated values and revalidates after deserialization. Retrieval
+plans and intermediate stage collections are crate-internal and cannot be
+serialized or supplied independently of `BoundedRetrievalContract::retrieve`.
 
 ## Adapter checklist
 

@@ -7,11 +7,14 @@
 
 mod backend;
 mod budget;
+#[cfg_attr(not(test), allow(dead_code))]
 mod contract;
 mod count;
 mod error;
+#[cfg_attr(not(test), allow(dead_code))]
 mod hydration;
 mod instrumentation;
+#[cfg_attr(not(test), allow(dead_code))]
 mod policy;
 
 pub use backend::{
@@ -19,18 +22,14 @@ pub use backend::{
 };
 pub use budget::{RetrieverKind, SearchBudget, SearchBudgetFields};
 pub use contract::{
-    decode_retrieval_plan_json, decode_search_budget_json, encode_retrieval_plan_json,
-    encode_search_budget_json, BoundedRetrievalContract, ComplexityInvariant, DebugOutput,
-    DiagnosticMode, FusedCandidates, RetrievalPlan, RetrieverCandidates,
+    decode_search_budget_json, encode_search_budget_json, ComplexityInvariant, DebugOutput,
+    DiagnosticMode,
 };
-pub use count::CountPort;
 pub use error::{OverfetchError, OverfetchResult};
-pub use hydration::{BatchHydrationPort, FullHydration, HydrationBatch};
 pub use instrumentation::{HydrationBatchKind, StatementCountInstrumentation};
 pub use policy::{
-    AdaptiveOverfetchPolicy, AdaptiveOverfetchPolicyFields, CandidateId, CandidateValidation,
-    LifecycleState, RetrievalCandidate, RetrievalFilters, StrictFilter, StrictFilterSupport,
-    ValidatedCandidates,
+    AdaptiveOverfetchPolicy, AdaptiveOverfetchPolicyFields, CandidateId, LifecycleState,
+    RetrievalCandidate, RetrievalFilters, StrictFilter, StrictFilterSupport,
 };
 
 /// Contract schema version for bounded retrieval orchestration documents.

@@ -89,7 +89,11 @@ impl PrimaryBackendSelection {
         Ok(())
     }
 
-    /// Returns a fallback only after a typed failure or declared insufficiency.
+    /// Returns a fallback only after a typed primary-backend failure.
+    ///
+    /// A primary result that merely declares insufficient results is not a
+    /// backend failure. Retrying it against another backend would silently
+    /// widen normal retrieval, so that outcome fails closed.
     pub fn fallback_after(
         &self,
         outcome: PrimaryBackendOutcome,
@@ -97,11 +101,13 @@ impl PrimaryBackendSelection {
         self.validate()?;
         match outcome {
             PrimaryBackendOutcome::Satisfied => Ok(None),
-            PrimaryBackendOutcome::DeclaredInsufficientResults
-            | PrimaryBackendOutcome::TypedFailure(_) => self
+            PrimaryBackendOutcome::TypedFailure(_) => self
                 .fallback
                 .map(Some)
                 .ok_or(OverfetchError::PrimaryBackendRequired),
+            PrimaryBackendOutcome::DeclaredInsufficientResults => {
+                Err(OverfetchError::PrimaryBackendRequired)
+            }
         }
     }
 }

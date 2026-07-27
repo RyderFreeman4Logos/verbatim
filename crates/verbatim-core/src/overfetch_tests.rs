@@ -1,16 +1,17 @@
-use std::cell::RefCell;
-
+use super::contract::{FusedCandidates, RetrieverCandidates};
+use super::count::CountPort;
+use super::hydration::{FullHydration, HydrationBatch};
+use super::policy::{CandidateValidation, ValidatedCandidates};
 use crate::overfetch::{
-    decode_retrieval_plan_json, decode_search_budget_json, encode_retrieval_plan_json,
-    encode_search_budget_json, AdaptiveOverfetchPolicy, AdaptiveOverfetchPolicyFields,
-    BatchHydrationPort, BoundedRetrievalContract, CandidateId, CandidateValidation,
-    ComplexityInvariant, CountPort, DebugOutput, DiagnosticMode, FullHydration, FusedCandidates,
-    HydrationBatch, HydrationBatchKind, LifecycleState, OverfetchError, OverfetchResult,
-    PrimaryBackendOutcome, PrimaryBackendSelection, RetrievalBackend, RetrievalCandidate,
-    RetrievalFilters, RetrievalPlan, RetrieverCandidates, SearchBudget, SearchBudgetFields,
-    StatementCountInstrumentation, StrictFilter, StrictFilterSupport, TypedBackendFailure,
-    ValidatedCandidates,
+    decode_search_budget_json, encode_search_budget_json, AdaptiveOverfetchPolicy,
+    AdaptiveOverfetchPolicyFields, CandidateId, ComplexityInvariant, DebugOutput, DiagnosticMode,
+    HydrationBatchKind, OverfetchError, OverfetchResult, PrimaryBackendOutcome,
+    PrimaryBackendSelection, RetrievalBackend, RetrievalCandidate, RetrievalFilters, SearchBudget,
+    SearchBudgetFields, StatementCountInstrumentation, StrictFilterSupport, TypedBackendFailure,
 };
+
+#[path = "overfetch_pipeline_tests.rs"]
+mod pipeline_tests;
 
 fn budget() -> SearchBudget {
     SearchBudget::new(SearchBudgetFields {
@@ -32,29 +33,13 @@ fn candidate(id: &str, score: f32) -> RetrievalCandidate {
 }
 
 #[test]
-fn overfetch_contract_budget_and_plan_round_trip_revalidate_all_dimensions() {
+fn overfetch_contract_budget_round_trip_revalidates_all_dimensions() {
     let budget = budget();
-    let filters = RetrievalFilters::new(vec![
-        StrictFilter::source("source-a").expect("source filter"),
-        StrictFilter::collection("collection-a").expect("collection filter"),
-        StrictFilter::tenant("tenant-a").expect("tenant filter"),
-        StrictFilter::acl("group-a").expect("ACL filter"),
-        StrictFilter::lifecycle(LifecycleState::Active),
-    ])
-    .expect("all strict predicates are bounded");
-    let plan = RetrievalPlan::new(budget, filters)
-        .expect("valid plan")
-        .with_diagnostic_mode(DiagnosticMode::Full);
 
     let budget_json = encode_search_budget_json(&budget).expect("budget encodes");
     assert_eq!(
         decode_search_budget_json(&budget_json).expect("budget decodes"),
         budget
-    );
-    let plan_json = encode_retrieval_plan_json(&plan).expect("plan encodes");
-    assert_eq!(
-        decode_retrieval_plan_json(&plan_json).expect("plan decodes"),
-        plan
     );
 
     let invalid_budget = r#"{
@@ -200,6 +185,12 @@ fn overfetch_contract_adaptive_overfetch_and_unsupported_filters_fail_closed() {
             .expect_err("corpus-sized top-k is forbidden"),
         OverfetchError::CorpusSizeTopKForbidden
     );
+    assert_eq!(
+        StrictFilterSupport::Native
+            .candidate_k_for_attempt(4, 4, 4, 0)
+            .expect_err("native strict filtering also forbids corpus-sized top-k"),
+        OverfetchError::CorpusSizeTopKForbidden
+    );
 
     assert_eq!(
         StrictFilterSupport::Unsupported
@@ -233,8 +224,8 @@ fn overfetch_contract_primary_backend_runs_first_and_fallback_is_conditional() {
     assert_eq!(
         selection
             .fallback_after(PrimaryBackendOutcome::DeclaredInsufficientResults)
-            .expect("declared insufficiency permits fallback"),
-        Some(RetrievalBackend::LocalDense)
+            .expect_err("declared insufficiency must fail closed without fallback"),
+        OverfetchError::PrimaryBackendRequired
     );
     assert_eq!(
         selection
@@ -273,6 +264,9 @@ fn overfetch_contract_sql_statement_count_is_constant_and_detects_n_plus_one() {
                 .expect("one statement per batch kind");
         }
         assert_eq!(statements.observed_statements(), 5);
+        statements
+            .assert_complete_batched_hydration()
+            .expect("all required batches are recorded exactly once");
     }
 
     let mut statements = StatementCountInstrumentation::new(6).expect("statement cap");
@@ -285,29 +279,22 @@ fn overfetch_contract_sql_statement_count_is_constant_and_detects_n_plus_one() {
             .expect_err("a repeated batch is deterministic N+1"),
         OverfetchError::NPlusOneDetected
     );
-}
 
-#[test]
-fn overfetch_contract_runs_the_required_pipeline_in_order() {
-    let contract = ContractStub::default();
-    let mut statements = StatementCountInstrumentation::new(5).expect("statement cap");
-    let hydrated_count = contract
-        .retrieve(&budget(), &RetrievalFilters::default(), &mut statements)
-        .expect("bounded orchestration succeeds");
-
-    assert_eq!(hydrated_count, 1);
+    let mut extra_statement = StatementCountInstrumentation::new(6).expect("statement cap");
+    for batch in HydrationBatchKind::ALL {
+        extra_statement
+            .record_hydration_batch(batch)
+            .expect("complete batch accounting");
+    }
+    extra_statement
+        .record_statement()
+        .expect("spare statement capacity is intentionally available");
     assert_eq!(
-        contract.calls.borrow().as_slice(),
-        [
-            "plan",
-            "execute_retrievers",
-            "fuse_truncate",
-            "validate_candidates",
-            "hydrate_batch",
-            "report",
-        ]
+        extra_statement
+            .assert_complete_batched_hydration()
+            .expect_err("extra per-candidate SQL must not be hidden by a broad cap"),
+        OverfetchError::NPlusOneDetected
     );
-    assert_eq!(statements.observed_statements(), 5);
 }
 
 #[test]
@@ -334,152 +321,5 @@ struct IndexedCountPort {
 impl CountPort for IndexedCountPort {
     fn count_indexed(&self, _filters: &RetrievalFilters) -> OverfetchResult<u64> {
         Ok(self.corpus_size)
-    }
-}
-
-#[derive(Default)]
-struct ContractStub {
-    calls: RefCell<Vec<&'static str>>,
-}
-
-impl ContractStub {
-    fn record(&self, call: &'static str) {
-        self.calls.borrow_mut().push(call);
-    }
-}
-
-impl CountPort for ContractStub {
-    fn count_indexed(&self, _filters: &RetrievalFilters) -> OverfetchResult<u64> {
-        Ok(1)
-    }
-}
-
-impl BatchHydrationPort for ContractStub {
-    type ChunkHeader = ();
-    type ChunkBody = ();
-    type ParentLink = ();
-    type ChunkEvidenceLink = ();
-    type EvidenceUnit = ();
-    type Hydrated = ();
-
-    fn fetch_chunk_headers(
-        &self,
-        candidates: &[CandidateValidation],
-        statements: &mut StatementCountInstrumentation,
-    ) -> OverfetchResult<Vec<Self::ChunkHeader>> {
-        statements.record_hydration_batch(HydrationBatchKind::ChunkHeaders)?;
-        Ok(vec![(); candidates.len()])
-    }
-
-    fn fetch_chunk_bodies(
-        &self,
-        candidates: &[CandidateValidation],
-        statements: &mut StatementCountInstrumentation,
-    ) -> OverfetchResult<Vec<Self::ChunkBody>> {
-        statements.record_hydration_batch(HydrationBatchKind::ChunkBodies)?;
-        Ok(vec![(); candidates.len()])
-    }
-
-    fn fetch_parent_links(
-        &self,
-        candidates: &[CandidateValidation],
-        statements: &mut StatementCountInstrumentation,
-    ) -> OverfetchResult<Vec<Self::ParentLink>> {
-        statements.record_hydration_batch(HydrationBatchKind::ParentLinks)?;
-        Ok(vec![(); candidates.len()])
-    }
-
-    fn fetch_chunk_evidence_links(
-        &self,
-        candidates: &[CandidateValidation],
-        statements: &mut StatementCountInstrumentation,
-    ) -> OverfetchResult<Vec<Self::ChunkEvidenceLink>> {
-        statements.record_hydration_batch(HydrationBatchKind::ChunkEvidenceLinks)?;
-        Ok(vec![(); candidates.len()])
-    }
-
-    fn fetch_evidence_units(
-        &self,
-        candidates: &[CandidateValidation],
-        statements: &mut StatementCountInstrumentation,
-    ) -> OverfetchResult<Vec<Self::EvidenceUnit>> {
-        statements.record_hydration_batch(HydrationBatchKind::EvidenceUnits)?;
-        Ok(vec![(); candidates.len()])
-    }
-
-    fn hydrate_full_batch(
-        &self,
-        candidates: &[CandidateValidation],
-        statements: &mut StatementCountInstrumentation,
-    ) -> OverfetchResult<Vec<FullHydration<Self::Hydrated>>> {
-        self.record("hydrate_batch");
-        self.fetch_chunk_headers(candidates, statements)?;
-        self.fetch_chunk_bodies(candidates, statements)?;
-        self.fetch_parent_links(candidates, statements)?;
-        self.fetch_chunk_evidence_links(candidates, statements)?;
-        self.fetch_evidence_units(candidates, statements)?;
-        Ok(candidates
-            .iter()
-            .cloned()
-            .map(|candidate| FullHydration::new(candidate, ()))
-            .collect())
-    }
-}
-
-impl BoundedRetrievalContract for ContractStub {
-    type Report = usize;
-
-    fn plan(
-        &self,
-        budget: &SearchBudget,
-        filters: &RetrievalFilters,
-    ) -> OverfetchResult<RetrievalPlan> {
-        self.record("plan");
-        RetrievalPlan::new(*budget, filters.clone())
-    }
-
-    fn execute_retrievers(&self, plan: &RetrievalPlan) -> OverfetchResult<RetrieverCandidates> {
-        self.record("execute_retrievers");
-        RetrieverCandidates::new(
-            plan.budget(),
-            vec![candidate("only", 1.0)],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
-    }
-
-    fn fuse_truncate(
-        &self,
-        candidates: RetrieverCandidates,
-        plan: &RetrievalPlan,
-    ) -> OverfetchResult<FusedCandidates> {
-        self.record("fuse_truncate");
-        FusedCandidates::fuse_truncate(candidates, plan.budget())
-    }
-
-    fn validate_candidates(
-        &self,
-        candidates: FusedCandidates,
-        plan: &RetrievalPlan,
-    ) -> OverfetchResult<ValidatedCandidates> {
-        self.record("validate_candidates");
-        let validations = candidates
-            .candidates()
-            .iter()
-            .cloned()
-            .map(CandidateValidation::new)
-            .collect::<OverfetchResult<Vec<_>>>()?;
-        ValidatedCandidates::new(validations, plan.budget())
-    }
-
-    fn report(
-        &self,
-        _plan: &RetrievalPlan,
-        hydrated: HydrationBatch<Self::Hydrated>,
-        _statements: &StatementCountInstrumentation,
-    ) -> OverfetchResult<Self::Report> {
-        self.record("report");
-        Ok(hydrated.items().len())
     }
 }

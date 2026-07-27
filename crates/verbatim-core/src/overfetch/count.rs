@@ -7,6 +7,6 @@ use super::{OverfetchResult, RetrievalFilters};
 /// Implementations must use an indexed `COUNT(*)` or equivalent metadata count.
 /// They must not derive a count by materializing chunks, text, evidence links, or
 /// any `list_all()?.len()` equivalent.
-pub trait CountPort {
+pub(crate) trait CountPort {
     fn count_indexed(&self, filters: &RetrievalFilters) -> OverfetchResult<u64>;
 }

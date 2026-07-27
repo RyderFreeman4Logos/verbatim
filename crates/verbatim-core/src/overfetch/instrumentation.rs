@@ -102,8 +102,15 @@ impl StatementCountInstrumentation {
     }
 
     /// Verifies every complete-hydration batch has one and only one statement.
+    ///
+    /// The total must also equal the five required batches: otherwise an
+    /// unclassified per-candidate query could fit below a permissive statement
+    /// cap and escape the duplicate-batch detector.
     pub fn assert_complete_batched_hydration(&self) -> OverfetchResult<()> {
-        if self.observed_hydration_batches() != HydrationBatchKind::ALL.len() as u32 {
+        let required_batches = HydrationBatchKind::ALL.len() as u32;
+        if self.observed_hydration_batches() != required_batches
+            || self.observed_statements != required_batches
+        {
             return Err(OverfetchError::NPlusOneDetected);
         }
         Ok(())
