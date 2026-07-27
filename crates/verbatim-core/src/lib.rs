@@ -13,6 +13,7 @@ pub mod compare_sources;
 pub mod config;
 pub mod context;
 pub mod deletion;
+pub mod diskann3;
 pub mod durability;
 pub mod embed;
 pub mod erasure;
