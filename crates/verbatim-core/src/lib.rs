@@ -14,6 +14,7 @@ pub mod deletion;
 pub mod embed;
 #[path = "types_evidence_spans.rs"]
 pub mod evidence_spans;
+pub mod exhaustive_audit;
 pub mod generate;
 pub mod graph_extraction;
 pub mod graphrag;
