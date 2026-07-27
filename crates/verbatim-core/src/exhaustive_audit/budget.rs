@@ -77,49 +77,64 @@ impl ExhaustiveAuditUsage {
         budget: &ExhaustiveAuditBudget,
     ) -> ExhaustiveAuditResult<Self> {
         let next = Self {
-            scope_members: self.scope_members.saturating_add(increment.scope_members),
-            enumerations: self.enumerations.saturating_add(increment.enumerations),
-            candidates: self.candidates.saturating_add(increment.candidates),
-            cost_units: self.cost_units.saturating_add(increment.cost_units),
-            wall_time_ms: self.wall_time_ms.saturating_add(increment.wall_time_ms),
-        };
-        for (dimension, used, limit) in [
-            (
+            scope_members: checked_dimension_add(
                 ExhaustiveAuditBudgetDimension::ScopeMembers,
-                next.scope_members,
+                self.scope_members,
+                increment.scope_members,
                 budget.max_scope_members,
-            ),
-            (
+            )?,
+            enumerations: checked_dimension_add(
                 ExhaustiveAuditBudgetDimension::Enumerations,
-                next.enumerations,
+                self.enumerations,
+                increment.enumerations,
                 budget.max_enumerations,
-            ),
-            (
+            )?,
+            candidates: checked_dimension_add(
                 ExhaustiveAuditBudgetDimension::Candidates,
-                next.candidates,
+                self.candidates,
+                increment.candidates,
                 budget.max_candidates,
-            ),
-            (
+            )?,
+            cost_units: checked_dimension_add(
                 ExhaustiveAuditBudgetDimension::CostUnits,
-                next.cost_units,
+                self.cost_units,
+                increment.cost_units,
                 budget.max_cost_units,
-            ),
-            (
+            )?,
+            wall_time_ms: checked_dimension_add(
                 ExhaustiveAuditBudgetDimension::WallTimeMs,
-                next.wall_time_ms,
+                self.wall_time_ms,
+                increment.wall_time_ms,
                 budget.max_wall_time_ms,
-            ),
-        ] {
-            if used > limit {
-                return Err(ExhaustiveAuditError::BudgetExhausted {
-                    exhaustion: ExhaustiveAuditBudgetExhaustion {
-                        dimension,
-                        limit,
-                        used,
-                    },
-                });
-            }
-        }
+            )?,
+        };
         Ok(next)
     }
+}
+
+fn checked_dimension_add(
+    dimension: ExhaustiveAuditBudgetDimension,
+    used: u64,
+    increment: u64,
+    limit: u64,
+) -> ExhaustiveAuditResult<u64> {
+    let next = used
+        .checked_add(increment)
+        .ok_or(ExhaustiveAuditError::BudgetExhausted {
+            exhaustion: ExhaustiveAuditBudgetExhaustion {
+                dimension,
+                limit,
+                used: u64::MAX,
+            },
+        })?;
+    if next > limit {
+        return Err(ExhaustiveAuditError::BudgetExhausted {
+            exhaustion: ExhaustiveAuditBudgetExhaustion {
+                dimension,
+                limit,
+                used: next,
+            },
+        });
+    }
+    Ok(next)
 }

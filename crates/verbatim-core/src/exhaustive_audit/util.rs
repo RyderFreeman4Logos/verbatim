@@ -13,10 +13,14 @@ pub(crate) fn require_non_empty(field: &str, value: &str) -> ExhaustiveAuditResu
 }
 
 pub(crate) fn require_digest(field: &str, value: &str) -> ExhaustiveAuditResult<()> {
-    require_non_empty(field, value)?;
-    if value.chars().any(char::is_whitespace) {
+    let Some(hex) = value.strip_prefix("sha256:") else {
         return Err(ExhaustiveAuditError::validation(format!(
-            "{field} must not contain whitespace"
+            "{field} must be a sha256 digest"
+        )));
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ExhaustiveAuditError::validation(format!(
+            "{field} must be a sha256 digest"
         )));
     }
     Ok(())

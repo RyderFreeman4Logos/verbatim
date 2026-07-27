@@ -33,7 +33,8 @@ pub use error::{
 };
 pub use run::{
     decode_audit_workflow_run_json, encode_audit_workflow_run_json, AuditStageRecord, AuditWarning,
-    AuditWorkflowRun, AuditWorkflowRunFields, EXHAUSTIVE_AUDIT_WORKFLOW_SCHEMA_VERSION,
+    AuditWorkflowRun, AuditWorkflowRunFields, ExhaustiveAuditEvidence,
+    EXHAUSTIVE_AUDIT_WORKFLOW_SCHEMA_VERSION,
 };
 pub use scope::{
     AuditScopeMember, AuditScopeMemberFields, DeclaredAuditScope, DeclaredAuditScopeFields,

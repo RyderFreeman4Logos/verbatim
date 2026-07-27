@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use super::coverage::{establish_completeness, CompletenessStatus, CoverageManifest};
 use super::enumeration::{CandidateEnumeration, DeduplicatedCandidate};
 use super::error::{ExhaustiveAuditError, ExhaustiveAuditResult};
-use super::run::AuditWorkflowRun;
+use super::run::{AuditWorkflowRun, ExhaustiveAuditEvidence};
 use super::scope::DeclaredAuditScope;
 use super::stage::AuditStage;
 
@@ -77,17 +77,70 @@ pub fn report(
             "run scope hash must match declared audit scope",
         ));
     }
-    run.coverage_manifest_hash = Some(super::content_hash_of(manifest)?);
-    run.enumeration_hashes = enumerations
+    let coverage_manifest_hash = super::content_hash_of(manifest)?;
+    let enumeration_hashes = enumerations
         .iter()
         .map(super::content_hash_of)
         .collect::<ExhaustiveAuditResult<Vec<_>>>()?;
+    let primary_evidence = enumerations
+        .iter()
+        .zip(&enumeration_hashes)
+        .find(|(enumeration, _)| enumeration.is_deterministic_primary())
+        .map(|(enumeration, hash)| (hash.clone(), enumeration.query_fingerprint.clone()));
+    let reconciliation_hash = super::content_hash_of(&(scope, manifest, enumerations))?;
+    let report_hash = super::content_hash_of(&(run.target, scope, manifest, enumerations))?;
+    run.coverage_manifest_hash = Some(coverage_manifest_hash.clone());
+    run.enumeration_hashes = enumeration_hashes;
+    run.primary_enumeration_hash = primary_evidence.as_ref().map(|(hash, _)| hash.clone());
+    run.primary_query_fingerprint = primary_evidence
+        .as_ref()
+        .map(|(_, fingerprint)| fingerprint.clone());
     run.query_fingerprints = enumerations
         .iter()
         .map(|enumeration| enumeration.query_fingerprint.clone())
         .collect();
-    run.report_hash = Some(super::content_hash_of(&(scope, manifest, enumerations))?);
+    run.reconciliation_hash = Some(reconciliation_hash.clone());
+    run.report_hash = Some(report_hash.clone());
     run.status = status;
+    run.exhaustive_evidence =
+        (status == CompletenessStatus::ExhaustiveOverDeclaredScope).then(|| {
+            ExhaustiveAuditEvidence {
+                scope: scope.clone(),
+                coverage_manifest: manifest.clone(),
+                enumerations: enumerations.to_vec(),
+            }
+        });
+    if status == CompletenessStatus::ExhaustiveOverDeclaredScope {
+        let (primary_enumeration_hash, _) = primary_evidence.ok_or_else(|| {
+            ExhaustiveAuditError::validation(
+                "exhaustive status requires deterministic primary enumeration evidence",
+            )
+        })?;
+        run.stage_records = vec![
+            super::AuditStageRecord {
+                stage: AuditStage::Declared,
+                artifact_hash: scope_hash,
+            },
+            super::AuditStageRecord {
+                stage: AuditStage::Enumerating,
+                artifact_hash: primary_enumeration_hash,
+            },
+            super::AuditStageRecord {
+                stage: AuditStage::Covering,
+                artifact_hash: coverage_manifest_hash,
+            },
+            super::AuditStageRecord {
+                stage: AuditStage::Reconciling,
+                artifact_hash: reconciliation_hash,
+            },
+            super::AuditStageRecord {
+                stage: AuditStage::Reporting,
+                artifact_hash: report_hash,
+            },
+        ];
+    } else {
+        run.stage_records.clear();
+    }
     run.current_stage = match status {
         CompletenessStatus::ExhaustiveOverDeclaredScope => AuditStage::Complete,
         CompletenessStatus::Incomplete => AuditStage::Incomplete,

@@ -3,8 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 use super::budget::{ExhaustiveAuditBudget, ExhaustiveAuditUsage};
-use super::coverage::{CompletenessStatus, CompletenessTarget};
+use super::coverage::{
+    establish_completeness, CompletenessStatus, CompletenessTarget, CoverageManifest,
+};
+use super::enumeration::CandidateEnumeration;
 use super::error::{ExhaustiveAuditError, ExhaustiveAuditResult};
+use super::scope::DeclaredAuditScope;
 use super::stage::AuditStage;
 use super::util::{require_digest, require_non_empty};
 
@@ -22,6 +26,14 @@ pub struct AuditWarning {
     pub detail: String,
 }
 
+/// Canonical inputs that substantiate a persisted exhaustive status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExhaustiveAuditEvidence {
+    pub scope: DeclaredAuditScope,
+    pub coverage_manifest: CoverageManifest,
+    pub enumerations: Vec<CandidateEnumeration>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditWorkflowRun {
     pub schema_version: u32,
@@ -33,7 +45,10 @@ pub struct AuditWorkflowRun {
     pub budget: ExhaustiveAuditBudget,
     pub usage: ExhaustiveAuditUsage,
     pub stage_records: Vec<AuditStageRecord>,
+    pub exhaustive_evidence: Option<ExhaustiveAuditEvidence>,
     pub enumeration_hashes: Vec<String>,
+    pub primary_enumeration_hash: Option<String>,
+    pub primary_query_fingerprint: Option<String>,
     pub coverage_manifest_hash: Option<String>,
     pub reconciliation_hash: Option<String>,
     pub report_hash: Option<String>,
@@ -63,7 +78,10 @@ impl AuditWorkflowRun {
             budget: fields.budget,
             usage: ExhaustiveAuditUsage::default(),
             stage_records: Vec::new(),
+            exhaustive_evidence: None,
             enumeration_hashes: Vec::new(),
+            primary_enumeration_hash: None,
+            primary_query_fingerprint: None,
             coverage_manifest_hash: None,
             reconciliation_hash: None,
             report_hash: None,
@@ -83,10 +101,15 @@ impl AuditWorkflowRun {
         }
         require_non_empty("run_id", &self.run_id)?;
         require_digest("scope_hash", &self.scope_hash)?;
+        for record in &self.stage_records {
+            require_digest("stage artifact_hash", &record.artifact_hash)?;
+        }
         for hash in &self.enumeration_hashes {
             require_digest("enumeration_hash", hash)?;
         }
         for hash in [
+            self.primary_enumeration_hash.as_deref(),
+            self.primary_query_fingerprint.as_deref(),
             self.coverage_manifest_hash.as_deref(),
             self.reconciliation_hash.as_deref(),
             self.report_hash.as_deref(),
@@ -114,11 +137,142 @@ impl AuditWorkflowRun {
                 "terminal audit stage must match completeness status",
             ));
         }
-        if self.status == CompletenessStatus::ExhaustiveOverDeclaredScope
-            && self.report_hash.is_none()
+        if self.status == CompletenessStatus::ExhaustiveOverDeclaredScope {
+            self.require_bound_exhaustive_evidence()?;
+        }
+        Ok(())
+    }
+
+    fn require_bound_exhaustive_evidence(&self) -> ExhaustiveAuditResult<()> {
+        let evidence = self.exhaustive_evidence.as_ref().ok_or_else(|| {
+            ExhaustiveAuditError::validation("exhaustive status requires canonical evidence")
+        })?;
+        evidence.scope.validate()?;
+        let scope_hash = super::content_hash_of(&evidence.scope)?;
+        if self.scope_hash != scope_hash {
+            return Err(ExhaustiveAuditError::validation(
+                "exhaustive evidence scope must bind the run scope hash",
+            ));
+        }
+        evidence
+            .coverage_manifest
+            .validate_for(&evidence.scope, &self.scope_hash)?;
+        for enumeration in &evidence.enumerations {
+            enumeration.validate()?;
+        }
+        if establish_completeness(
+            self.target,
+            &evidence.scope,
+            &evidence.coverage_manifest,
+            &evidence.enumerations,
+        )? != CompletenessStatus::ExhaustiveOverDeclaredScope
         {
             return Err(ExhaustiveAuditError::validation(
-                "exhaustive status requires a bound report hash",
+                "exhaustive evidence must establish completeness",
+            ));
+        }
+        let expected_enumeration_hashes = evidence
+            .enumerations
+            .iter()
+            .map(super::content_hash_of)
+            .collect::<ExhaustiveAuditResult<Vec<_>>>()?;
+        if self.enumeration_hashes != expected_enumeration_hashes {
+            return Err(ExhaustiveAuditError::validation(
+                "enumeration hashes must bind canonical exhaustive evidence",
+            ));
+        }
+        let primary_enumeration = evidence
+            .enumerations
+            .iter()
+            .find(|enumeration| enumeration.is_deterministic_primary())
+            .ok_or_else(|| {
+                ExhaustiveAuditError::validation(
+                    "exhaustive evidence requires deterministic primary enumeration",
+                )
+            })?;
+        let expected_primary_enumeration_hash = super::content_hash_of(primary_enumeration)?;
+        let coverage_manifest_hash = required_digest(
+            "exhaustive status requires a bound coverage manifest hash",
+            self.coverage_manifest_hash.as_deref(),
+        )?;
+        if coverage_manifest_hash != super::content_hash_of(&evidence.coverage_manifest)? {
+            return Err(ExhaustiveAuditError::validation(
+                "coverage manifest hash must bind canonical exhaustive evidence",
+            ));
+        }
+        let primary_enumeration_hash = required_digest(
+            "exhaustive status requires a deterministic primary enumeration hash",
+            self.primary_enumeration_hash.as_deref(),
+        )?;
+        if primary_enumeration_hash != expected_primary_enumeration_hash {
+            return Err(ExhaustiveAuditError::validation(
+                "primary enumeration hash must bind canonical exhaustive evidence",
+            ));
+        }
+        let primary_query_fingerprint = required_digest(
+            "exhaustive status requires a deterministic primary query fingerprint",
+            self.primary_query_fingerprint.as_deref(),
+        )?;
+        if primary_query_fingerprint != primary_enumeration.query_fingerprint {
+            return Err(ExhaustiveAuditError::validation(
+                "primary query fingerprint must bind canonical exhaustive evidence",
+            ));
+        }
+        let expected_query_fingerprints = evidence
+            .enumerations
+            .iter()
+            .map(|enumeration| enumeration.query_fingerprint.clone())
+            .collect::<Vec<_>>();
+        if self.query_fingerprints != expected_query_fingerprints {
+            return Err(ExhaustiveAuditError::validation(
+                "query fingerprints must bind canonical exhaustive evidence",
+            ));
+        }
+        let reconciliation_hash = required_digest(
+            "exhaustive status requires a bound reconciliation hash",
+            self.reconciliation_hash.as_deref(),
+        )?;
+        let expected_reconciliation_hash = super::content_hash_of(&(
+            &evidence.scope,
+            &evidence.coverage_manifest,
+            &evidence.enumerations,
+        ))?;
+        if reconciliation_hash != expected_reconciliation_hash {
+            return Err(ExhaustiveAuditError::validation(
+                "reconciliation hash must bind canonical exhaustive evidence",
+            ));
+        }
+        let report_hash = required_digest(
+            "exhaustive status requires a bound report hash",
+            self.report_hash.as_deref(),
+        )?;
+        let expected_report_hash = super::content_hash_of(&(
+            self.target,
+            &evidence.scope,
+            &evidence.coverage_manifest,
+            &evidence.enumerations,
+        ))?;
+        if report_hash != expected_report_hash {
+            return Err(ExhaustiveAuditError::validation(
+                "report hash must bind canonical exhaustive evidence",
+            ));
+        }
+        let expected_stage_records = [
+            (AuditStage::Declared, self.scope_hash.as_str()),
+            (AuditStage::Enumerating, primary_enumeration_hash),
+            (AuditStage::Covering, coverage_manifest_hash),
+            (AuditStage::Reconciling, reconciliation_hash),
+            (AuditStage::Reporting, report_hash),
+        ];
+        if self.stage_records.len() != expected_stage_records.len()
+            || !self.stage_records.iter().zip(expected_stage_records).all(
+                |(record, (stage, artifact_hash))| {
+                    record.stage == stage && record.artifact_hash == artifact_hash
+                },
+            )
+        {
+            return Err(ExhaustiveAuditError::validation(
+                "exhaustive status requires complete bound stage evidence",
             ));
         }
         Ok(())
@@ -139,6 +293,12 @@ impl AuditWorkflowRun {
         self.usage = self.usage.checked_add(&increment, &self.budget)?;
         Ok(())
     }
+}
+
+fn required_digest<'a>(field: &str, value: Option<&'a str>) -> ExhaustiveAuditResult<&'a str> {
+    let value = value.ok_or_else(|| ExhaustiveAuditError::validation(field))?;
+    require_digest(field, value)?;
+    Ok(value)
 }
 
 /// Decode a run and reject unknown schemas or inconsistent terminal status.

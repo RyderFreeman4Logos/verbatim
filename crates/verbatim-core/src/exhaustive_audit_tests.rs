@@ -288,6 +288,77 @@ fn budgets_fail_closed_before_usage_mutation() {
 }
 
 #[test]
+fn budgets_fail_closed_on_arithmetic_overflow() {
+    let budget = ExhaustiveAuditBudget::new(ExhaustiveAuditBudgetFields {
+        max_scope_members: u64::MAX,
+        max_enumerations: u64::MAX,
+        max_candidates: u64::MAX,
+        max_cost_units: u64::MAX,
+        max_wall_time_ms: u64::MAX,
+    })
+    .expect("maximum budget is valid");
+    let err = ExhaustiveAuditUsage {
+        candidates: u64::MAX,
+        ..ExhaustiveAuditUsage::default()
+    }
+    .checked_add(
+        &ExhaustiveAuditUsage {
+            candidates: 1,
+            ..ExhaustiveAuditUsage::default()
+        },
+        &budget,
+    )
+    .expect_err("overflow must exhaust the candidate budget");
+    assert!(matches!(
+        err,
+        ExhaustiveAuditError::BudgetExhausted {
+            exhaustion: ExhaustiveAuditBudgetExhaustion {
+                dimension: ExhaustiveAuditBudgetDimension::Candidates,
+                limit: u64::MAX,
+                used: u64::MAX,
+            }
+        }
+    ));
+}
+
+#[test]
+fn forged_exhaustive_json_requires_canonical_evidence() {
+    let digest = format!("sha256:{}", "0".repeat(64));
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": EXHAUSTIVE_AUDIT_WORKFLOW_SCHEMA_VERSION,
+        "run_id": "forged-run",
+        "scope_hash": digest,
+        "target": "all",
+        "current_stage": "complete",
+        "status": "exhaustive_over_declared_scope",
+        "budget": {
+            "max_scope_members": 1,
+            "max_enumerations": 1,
+            "max_candidates": 1,
+            "max_cost_units": 1,
+            "max_wall_time_ms": 1,
+        },
+        "usage": {
+            "scope_members": 0,
+            "enumerations": 0,
+            "candidates": 0,
+            "cost_units": 0,
+            "wall_time_ms": 0,
+        },
+        "stage_records": [],
+        "enumeration_hashes": [],
+        "coverage_manifest_hash": null,
+        "reconciliation_hash": null,
+        "report_hash": format!("sha256:{}", "1".repeat(64)),
+        "query_fingerprints": [],
+        "warnings": [],
+    }))
+    .expect("encode forged exhaustive fixture");
+
+    assert!(decode_audit_workflow_run_json(&bytes).is_err());
+}
+
+#[test]
 fn workflow_run_json_roundtrip_rejects_unknown_schema_and_unbound_exhaustive_status() {
     let scope = scope();
     let mut run = AuditWorkflowRun::new(AuditWorkflowRunFields {
@@ -317,6 +388,11 @@ fn workflow_run_json_roundtrip_rejects_unknown_schema_and_unbound_exhaustive_sta
         decode_audit_workflow_run_json(&bytes).expect("decodes run"),
         run
     );
+
+    let mut forged = run.clone();
+    forged.coverage_manifest_hash = None;
+    let bytes = serde_json::to_vec(&forged).expect("encode forged exhaustive fixture");
+    assert!(decode_audit_workflow_run_json(&bytes).is_err());
 
     let mut unknown = run.clone();
     unknown.schema_version = 99;
