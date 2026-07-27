@@ -155,7 +155,7 @@ impl AdkCrateName {
     }
 }
 
-/// The #364 adoption disposition for an ADK-Rust crate.
+/// An adoption disposition for an ADK-Rust crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdkCrateDisposition {
@@ -163,7 +163,6 @@ pub enum AdkCrateDisposition {
     Wrap,
     Upstream,
     Keep,
-    Delete,
 }
 
 /// A constraint preventing an adopted capability from becoming a Verbatim domain type.

@@ -41,6 +41,30 @@ fn standard_catalog_covers_every_adk_crate_with_the_policy_disposition() {
 }
 
 #[test]
+fn only_supported_dispositions_decode_and_are_reachable_in_the_standard_catalog() {
+    assert!(
+        serde_json::from_str::<AdkCrateDisposition>("\"delete\"").is_err(),
+        "deleting upstream ADK crates is not an integration disposition"
+    );
+
+    let catalog = AdkCrateCatalog::standard();
+    for disposition in [
+        AdkCrateDisposition::Adopt,
+        AdkCrateDisposition::Wrap,
+        AdkCrateDisposition::Upstream,
+        AdkCrateDisposition::Keep,
+    ] {
+        assert!(
+            catalog
+                .entries()
+                .iter()
+                .any(|entry| entry.disposition() == disposition),
+            "{disposition:?} must be reachable in the standard catalog"
+        );
+    }
+}
+
+#[test]
 fn catalog_validates_before_and_after_a_json_round_trip() {
     let catalog = AdkCrateCatalog::standard();
     policy()
@@ -62,7 +86,6 @@ fn disposition_and_constraint_validation_rejects_non_policy_catalog_entries() {
         AdkCrateDisposition::Wrap,
         AdkCrateDisposition::Upstream,
         AdkCrateDisposition::Keep,
-        AdkCrateDisposition::Delete,
     ] {
         let mut wrong_disposition = serde_json::to_value(catalog.clone()).expect("catalog value");
         let entries = wrong_disposition["entries"]
