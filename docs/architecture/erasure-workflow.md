@@ -50,8 +50,9 @@ adapter silently treating an index, cache, or remote replica as optional.
 3. `DeletionPolicy` requires stale-read fencing and propagation to cache keys,
    active cursors, derived artifacts, and model eligibility. No one surface may
    be disabled for a deletion plan.
-4. `legal_hold` rejects plan creation before propagation. `DeletionState` also
-   makes legal hold terminal for deletion transitions.
+4. `legal_hold` is a `DeletionPolicy` gate, not a lifecycle state: it rejects
+   plan creation before propagation. The `DeletionState` transition matrix is
+   limited to active deletion and terminal cleanup states.
 5. Remote failure is never best effort: Qdrant failures require a positive,
    bounded retry policy, a persisted dead-letter state, and an operator alert.
    A reconciliation receipt must exactly match pending remote targets to those
@@ -80,11 +81,11 @@ be retained as audit evidence without serving as a content leak.
 
 ## Adapter boundary and residual work
 
-`DeletionWorkflow` forces the only lifecycle sequence:
-`plan → propagate → reconcile → report`. Future implementations must use the
-validated `DeletionPlan`, record ordered acknowledgements, persist dead-letter
-work, issue alerts, enforce the stale-read fence at every serving surface, and
-only then construct/verify a proof.
+`DeletionWorkflow` exposes one atomic `execute` operation. An implementation
+must perform `plan → propagate → reconcile → report` internally, using a
+validated plan, ordered acknowledgements, remote dead-letter work, and alerts
+before it constructs and verifies a proof. Callers cannot invoke or reorder
+individual lifecycle phases through the public workflow boundary.
 
 Still intentionally out of scope for this first contract slice:
 

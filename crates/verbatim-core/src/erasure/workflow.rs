@@ -1,6 +1,6 @@
 //! Pure `plan → propagate → reconcile → report` adapter boundary.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -10,12 +10,23 @@ use super::{
 };
 
 /// Serializable, validated input to future backend adapters.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeletionPlan {
     pub schema_version: u32,
     pub scope: DeletionScope,
     pub policy: DeletionPolicy,
     pub matrix: DeletionPropagationMatrix,
+}
+
+impl fmt::Debug for DeletionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeletionPlan")
+            .field("schema_version", &self.schema_version)
+            .field("source_id_count", &self.scope.source_ids.len())
+            .field("target_count", &self.scope.targets.len())
+            .field("matrix_entry_count", &self.matrix.entries().len())
+            .finish()
+    }
 }
 
 impl DeletionPlan {
@@ -134,6 +145,7 @@ pub struct ReconciliationReceipt {
 
 impl ReconciliationReceipt {
     pub fn new(
+        plan: &DeletionPlan,
         propagation: PropagationReceipt,
         remote: RemoteReconciliation,
     ) -> ErasureResult<Self> {
@@ -141,7 +153,7 @@ impl ReconciliationReceipt {
             propagation,
             remote,
         };
-        receipt.remote.validate()?;
+        receipt.validate(plan)?;
         Ok(receipt)
     }
 
@@ -157,17 +169,11 @@ impl ReconciliationReceipt {
     }
 }
 
-/// Adapter boundary for a future live backend implementation. Implementations
-/// cannot omit a lifecycle phase because the trait exposes only this sequence.
+/// Adapter boundary for a future live backend implementation. Its only public
+/// operation is atomic so callers cannot bypass the required lifecycle phases.
 pub trait DeletionWorkflow {
-    fn plan(&self, scope: DeletionScope, policy: DeletionPolicy) -> ErasureResult<DeletionPlan>;
-    fn propagate(&self, plan: &DeletionPlan) -> ErasureResult<PropagationReceipt>;
-    fn reconcile(&self, propagation: PropagationReceipt) -> ErasureResult<ReconciliationReceipt>;
-    fn report(
-        &self,
-        plan: &DeletionPlan,
-        reconciliation: &ReconciliationReceipt,
-    ) -> ErasureResult<DeletionProof>;
+    fn execute(&self, scope: DeletionScope, policy: DeletionPolicy)
+        -> ErasureResult<DeletionProof>;
 }
 
 pub fn encode_deletion_plan_json(plan: &DeletionPlan) -> ErasureResult<Vec<u8>> {

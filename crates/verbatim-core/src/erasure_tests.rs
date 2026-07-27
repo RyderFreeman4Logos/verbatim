@@ -80,6 +80,52 @@ fn deletion_scope_fences_stale_reads_and_validates_all_target_classifications() 
 }
 
 #[test]
+fn scope_and_plan_debug_redact_source_identifiers() {
+    let restricted_source_id = "restricted-source-id-363";
+    let matrix = DeletionPropagationMatrix::canonical();
+    let scope =
+        DeletionScope::new(vec![restricted_source_id.into()], &matrix).expect("valid scope");
+    let plan =
+        DeletionPlan::new(scope.clone(), DeletionPolicy::default(), matrix).expect("valid plan");
+
+    let scope_debug = format!("{scope:?}");
+    assert!(scope_debug.contains("source_id_count: 1"));
+    assert!(!scope_debug.contains(restricted_source_id));
+
+    let plan_debug = format!("{plan:?}");
+    assert!(plan_debug.contains("DeletionPlan"));
+    assert!(!plan_debug.contains(restricted_source_id));
+}
+
+#[test]
+fn deletion_state_transition_matrix_is_exhaustive() {
+    for from in DeletionState::ALL {
+        for to in DeletionState::ALL {
+            let expected = matches!(
+                (from, to),
+                (DeletionState::LogicalDelete, DeletionState::Quarantine)
+                    | (DeletionState::LogicalDelete, DeletionState::Tombstone)
+                    | (DeletionState::Quarantine, DeletionState::Tombstone)
+                    | (
+                        DeletionState::Quarantine,
+                        DeletionState::ImmediatePhysicalErase
+                    )
+                    | (
+                        DeletionState::Tombstone,
+                        DeletionState::ImmediatePhysicalErase
+                    )
+                    | (DeletionState::Tombstone, DeletionState::DelayedBackupExpiry)
+            );
+            assert_eq!(
+                from.can_transition_to(to),
+                expected,
+                "unexpected transition from {from:?} to {to:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn legal_hold_and_incomplete_propagation_fail_closed() {
     let matrix = DeletionPropagationMatrix::canonical();
     let scope = DeletionScope::new(vec!["source-363".into()], &matrix).expect("valid scope");
@@ -127,6 +173,26 @@ fn remote_failures_must_enter_dead_letter_with_operator_alert() {
 }
 
 #[test]
+fn pending_remote_propagation_requires_matching_dead_letter_reconciliation() {
+    let plan = canonical_plan();
+    let pending_remote = PropagationReceipt::with_pending_remote(
+        &plan,
+        [DeletionTarget::Qdrant].into_iter().collect(),
+    )
+    .expect("Qdrant may await reconciliation");
+
+    assert_code(
+        ReconciliationReceipt::new(
+            &plan,
+            pending_remote,
+            RemoteReconciliation::complete(RetryPolicy::default()),
+        )
+        .expect_err("pending remote work cannot be reconciled as complete"),
+        ErasureDiagnosticCode::ReconciliationMismatch,
+    );
+}
+
+#[test]
 fn cryptographic_erasure_requires_key_rotation_when_backup_rewrite_is_impractical() {
     let invalid = CryptographicErasure {
         backup_rewrite_impractical: true,
@@ -150,6 +216,7 @@ fn scope_matrix_propagation_reconciliation_and_plan_json_round_trip() {
 
     let propagation = PropagationReceipt::complete(&decoded).expect("ordered propagation");
     let reconciliation = ReconciliationReceipt::new(
+        &decoded,
         propagation,
         RemoteReconciliation::complete(RetryPolicy::default()),
     )
@@ -165,6 +232,7 @@ fn deletion_proof_excludes_restricted_content_and_errors_render_only_codes() {
     let restricted_content = "restricted source body must never appear in proof or errors";
     let plan = canonical_plan();
     let reconciliation = ReconciliationReceipt::new(
+        &plan,
         PropagationReceipt::complete(&plan).expect("complete propagation"),
         RemoteReconciliation::complete(RetryPolicy::default()),
     )
@@ -181,44 +249,31 @@ fn deletion_proof_excludes_restricted_content_and_errors_render_only_codes() {
 }
 
 #[test]
-fn workflow_trait_requires_plan_propagate_reconcile_report_sequence() {
+fn workflow_trait_only_allows_atomic_execute() {
     struct ContractWorkflow;
 
     impl DeletionWorkflow for ContractWorkflow {
-        fn plan(
+        fn execute(
             &self,
             scope: DeletionScope,
             policy: DeletionPolicy,
-        ) -> ErasureResult<DeletionPlan> {
-            DeletionPlan::new(scope, policy, DeletionPropagationMatrix::canonical())
-        }
-
-        fn propagate(&self, plan: &DeletionPlan) -> ErasureResult<PropagationReceipt> {
-            PropagationReceipt::complete(plan)
-        }
-
-        fn reconcile(
-            &self,
-            propagation: PropagationReceipt,
-        ) -> ErasureResult<ReconciliationReceipt> {
-            ReconciliationReceipt::new(
+        ) -> ErasureResult<DeletionProof> {
+            let plan = DeletionPlan::new(scope, policy, DeletionPropagationMatrix::canonical())?;
+            let propagation = PropagationReceipt::complete(&plan)?;
+            let reconciliation = ReconciliationReceipt::new(
+                &plan,
                 propagation,
                 RemoteReconciliation::complete(RetryPolicy::default()),
-            )
-        }
-
-        fn report(
-            &self,
-            plan: &DeletionPlan,
-            reconciliation: &ReconciliationReceipt,
-        ) -> ErasureResult<DeletionProof> {
-            DeletionProof::from_reconciliation(plan, reconciliation)
+            )?;
+            DeletionProof::from_reconciliation(&plan, &reconciliation)
         }
     }
 
-    let plan = canonical_plan();
+    let matrix = DeletionPropagationMatrix::canonical();
+    let scope = DeletionScope::new(vec!["source-363".into()], &matrix).expect("valid scope");
     let workflow = ContractWorkflow;
-    let propagated = workflow.propagate(&plan).expect("propagation");
-    let reconciled = workflow.reconcile(propagated).expect("reconciliation");
-    workflow.report(&plan, &reconciled).expect("proof");
+    let proof = workflow
+        .execute(scope, DeletionPolicy::default())
+        .expect("atomic workflow execution");
+    proof.validate().expect("proof validates");
 }

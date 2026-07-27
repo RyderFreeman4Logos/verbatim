@@ -1,6 +1,9 @@
 //! Request scope and stale-read fence for one deletion lifecycle.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,12 +14,23 @@ use super::{
 
 /// A source-bounded erasure request. Source identifiers are inputs to planning
 /// only; reports deliberately retain only a non-reversible commitment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeletionScope {
     pub source_ids: Vec<String>,
     pub targets: BTreeSet<DeletionTarget>,
     pub products: BTreeMap<DeletionTarget, DataProduct>,
     pub state: DeletionState,
+}
+
+impl fmt::Debug for DeletionScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeletionScope")
+            .field("source_id_count", &self.source_ids.len())
+            .field("target_count", &self.targets.len())
+            .field("product_count", &self.products.len())
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 impl DeletionScope {
