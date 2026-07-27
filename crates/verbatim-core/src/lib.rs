@@ -16,6 +16,7 @@ pub mod evidence_spans;
 pub mod generate;
 pub mod graph_extraction;
 pub mod graphrag;
+pub mod grounded_answer;
 pub mod image_limits;
 pub mod index;
 pub mod index_gc;
