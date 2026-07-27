@@ -227,8 +227,7 @@ pub struct ClaimVerificationReportFields {
 
 impl ClaimVerificationReport {
     pub fn new(fields: ClaimVerificationReportFields) -> WorkflowResult<Self> {
-        let all_publishable =
-            !fields.verdicts.is_empty() && fields.verdicts.iter().all(ClaimVerdict::is_publishable);
+        let all_publishable = compute_all_publishable(&fields.verdicts);
         let report = Self {
             context_pack_hash: fields.context_pack_hash,
             draft_hash: fields.draft_hash,
@@ -251,7 +250,7 @@ impl ClaimVerificationReport {
         for v in &self.verdicts {
             v.validate()?;
         }
-        let expected = self.verdicts.iter().all(ClaimVerdict::is_publishable);
+        let expected = compute_all_publishable(&self.verdicts);
         if self.all_publishable != expected {
             return Err(WorkflowError::validation(
                 "all_publishable flag does not match claim verdicts",
@@ -268,6 +267,24 @@ impl ClaimVerificationReport {
             .map(|v| &v.claim_id)
             .collect()
     }
+}
+
+/// Aggregate: every **factual** claim is publishable and at least one exists.
+///
+/// [`ClaimSupportClass::NonFactual`] verdicts are excluded — they are never
+/// published as grounded claims and must not force `all_publishable=false`.
+fn compute_all_publishable(verdicts: &[ClaimVerdict]) -> bool {
+    let mut saw_factual = false;
+    for verdict in verdicts {
+        if verdict.support == ClaimSupportClass::NonFactual {
+            continue;
+        }
+        saw_factual = true;
+        if !verdict.is_publishable() {
+            return false;
+        }
+    }
+    saw_factual
 }
 
 pub(crate) fn require_non_empty(field: &str, value: &str) -> WorkflowResult<()> {

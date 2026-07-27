@@ -318,8 +318,32 @@ impl WorkflowRun {
     }
 
     /// Record a successful stage advance with optional artifact hash / cost.
+    ///
+    /// Fail-closed: `record.stage` must be a legal successor of
+    /// [`Self::current_stage`] (or `Abstained` from any non-terminal). Same-stage
+    /// re-records are allowed only for [`WorkflowStage::Generating`] (plan then
+    /// draft). Terminal stages reject further records. Published is finalized
+    /// only via [`Self::publish`].
     pub fn record_stage(&mut self, record: WorkflowStageRecord) -> WorkflowResult<()> {
         record.validate()?;
+        if self.current_stage.is_terminal() || self.final_status.is_terminal() {
+            return Err(WorkflowError::illegal_transition(
+                self.current_stage,
+                record.stage,
+                "terminal stage cannot record further advances",
+            ));
+        }
+        if !is_legal_stage_record(self.current_stage, record.stage) {
+            return Err(WorkflowError::illegal_transition(
+                self.current_stage,
+                record.stage,
+                format!(
+                    "stage {} is not a legal successor of {}",
+                    record.stage.as_str(),
+                    self.current_stage.as_str()
+                ),
+            ));
+        }
         if let Some(cost) = &record.cost {
             self.total_cost = self.total_cost.saturating_add(cost);
         }
@@ -347,10 +371,15 @@ impl WorkflowRun {
                     }
                 }
             }
-            WorkflowStage::Published => {
-                if let Some(h) = &record.artifact_hash {
-                    self.grounded_answer_hash = Some(h.clone());
-                }
+            WorkflowStage::Abstained => {
+                // Allow terminal abstain from any non-terminal via record_stage.
+                let reason = record
+                    .detail
+                    .clone()
+                    .filter(|d| !d.trim().is_empty())
+                    .unwrap_or_else(|| "abstained".into());
+                self.final_status = WorkflowFinalStatus::Abstained;
+                self.abstention_reason = Some(reason);
             }
             _ => {}
         }
@@ -392,8 +421,20 @@ impl WorkflowRun {
     }
 
     /// Finalize as published with a grounded answer content hash.
+    ///
+    /// Requires [`WorkflowStage::Rendering`]. Binds the answer digests to this
+    /// run: `query_plan_hash` must match, and when the run already carries a
+    /// `context_pack_hash` it must equal the answer's.
     pub fn publish(&mut self, grounded_answer: &GroundedAnswer) -> WorkflowResult<()> {
         grounded_answer.validate()?;
+        if self.current_stage != WorkflowStage::Rendering {
+            return Err(WorkflowError::illegal_transition(
+                self.current_stage,
+                WorkflowStage::Published,
+                "publish requires rendering stage",
+            ));
+        }
+        bind_answer_digests_to_run(self, grounded_answer)?;
         let hash = content_hash_of(grounded_answer)?;
         self.grounded_answer_hash = Some(hash.clone());
         self.context_pack_hash = Some(grounded_answer.context_pack_hash.clone());
@@ -437,6 +478,47 @@ pub fn content_hash_of<T: Serialize>(value: &T) -> WorkflowResult<String> {
     let bytes = encode_wire_document(value)
         .map_err(|err| WorkflowError::validation(format!("content hash encode: {err}")))?;
     Ok(wire_content_hash(&bytes))
+}
+
+/// Legal `record_stage` successors (mirrors [`super::workflow::advance_stage`]).
+///
+/// - `Abstained` is allowed from any non-terminal stage.
+/// - `Generating` may re-record itself (answer plan then draft).
+/// - `Published` is not a record_stage successor; use [`WorkflowRun::publish`].
+fn is_legal_stage_record(current: WorkflowStage, next: WorkflowStage) -> bool {
+    if next == WorkflowStage::Abstained {
+        return !current.is_terminal();
+    }
+    matches!(
+        (current, next),
+        (WorkflowStage::Planned, WorkflowStage::Retrieving)
+            | (WorkflowStage::Retrieving, WorkflowStage::Assembling)
+            | (WorkflowStage::Assembling, WorkflowStage::Generating)
+            | (WorkflowStage::Generating, WorkflowStage::Generating)
+            | (WorkflowStage::Generating, WorkflowStage::Verifying)
+            | (WorkflowStage::Verifying, WorkflowStage::Rendering)
+            | (WorkflowStage::Verifying, WorkflowStage::Generating)
+    )
+}
+
+/// Fail closed when a GroundedAnswer is not bound to this run's digests.
+pub(crate) fn bind_answer_digests_to_run(
+    run: &WorkflowRun,
+    answer: &GroundedAnswer,
+) -> WorkflowResult<()> {
+    if answer.query_plan_hash != run.query_plan_hash {
+        return Err(WorkflowError::validation(
+            "answer query_plan_hash does not match run query_plan_hash",
+        ));
+    }
+    if let Some(run_cp) = &run.context_pack_hash {
+        if run_cp != &answer.context_pack_hash {
+            return Err(WorkflowError::validation(
+                "answer context_pack_hash does not match run context_pack_hash",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Alias kept for docs / external naming symmetry with issue language.

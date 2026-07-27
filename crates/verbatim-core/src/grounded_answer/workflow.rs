@@ -151,14 +151,15 @@ pub fn decide_after_verification(
 
 /// Build a published outcome only when answer validates; otherwise error
 /// (caller must abstain — never invent a verified answer).
+///
+/// Requires [`WorkflowStage::Rendering`] and binds answer digests to the run
+/// (`query_plan_hash`, and `context_pack_hash` when already set on the run).
 pub fn try_publish(
     mut run: WorkflowRun,
     answer: GroundedAnswer,
 ) -> WorkflowResult<WorkflowOutcome> {
     answer.validate()?;
-    if run.current_stage != WorkflowStage::Rendering
-        && run.current_stage != WorkflowStage::Published
-    {
+    if run.current_stage != WorkflowStage::Rendering {
         return Err(WorkflowError::illegal_transition(
             run.current_stage,
             WorkflowStage::Published,

@@ -260,6 +260,47 @@ fn unknown_evidence_not_publishable() {
     assert!(!verdict.is_publishable());
 }
 
+#[test]
+fn all_publishable_ignores_non_factual_when_factual_supported() {
+    let report = ClaimVerificationReport::new(ClaimVerificationReportFields {
+        context_pack_hash: "cp-hash-1".into(),
+        draft_hash: "draft-hash-1".into(),
+        verdicts: vec![
+            publishable_verdict(),
+            ClaimVerdict {
+                claim_id: ClaimId::new("meta").unwrap(),
+                support: ClaimSupportClass::NonFactual,
+                quotation_checks: vec![],
+                notes: vec!["meta remark".into()],
+            },
+        ],
+        revise_allowed: false,
+    })
+    .unwrap();
+    assert!(report.all_publishable);
+    assert_eq!(
+        decide_after_verification(&report).unwrap(),
+        WorkflowTransition::StartRender
+    );
+}
+
+#[test]
+fn all_publishable_false_when_only_non_factual() {
+    let report = ClaimVerificationReport::new(ClaimVerificationReportFields {
+        context_pack_hash: "cp-hash-1".into(),
+        draft_hash: "draft-hash-1".into(),
+        verdicts: vec![ClaimVerdict {
+            claim_id: ClaimId::new("meta").unwrap(),
+            support: ClaimSupportClass::NonFactual,
+            quotation_checks: vec![],
+            notes: vec![],
+        }],
+        revise_allowed: false,
+    })
+    .unwrap();
+    assert!(!report.all_publishable);
+}
+
 // ---------------------------------------------------------------------------
 // Citations
 // ---------------------------------------------------------------------------
@@ -338,6 +379,21 @@ fn grounded_answer_requires_claim_citation_bijection() {
         .unwrap(),
     );
     assert!(bad.validate().is_err());
+}
+
+#[test]
+fn grounded_answer_rejects_citation_evidence_not_bound_to_claim() {
+    let plan = sample_query_plan();
+    let plan_hash = plan.header.identity.content_hash.as_str();
+    let mut answer = sample_grounded_answer(plan_hash, "context-hash-1");
+    // Claim still asserts eu-a, but citation is rewritten to point at eu-b.
+    answer.citations.citations[0].evidence_unit_id = "eu-b".into();
+    let err = answer.validate().unwrap_err();
+    assert_eq!(err.class_name(), "validation");
+    assert!(
+        err.to_string().contains("evidence_unit_id"),
+        "expected evidence binding failure, got {err}"
+    );
 }
 
 #[test]
@@ -532,6 +588,97 @@ fn publish_without_rendering_fails() {
     let answer = sample_grounded_answer(&plan_hash, "ctx");
     let err = try_publish(run, answer).unwrap_err();
     assert_eq!(err.class_name(), "illegal_transition");
+}
+
+#[test]
+fn record_stage_rejects_illegal_jump() {
+    let plan = sample_query_plan();
+    let mut run = WorkflowRun::new(WorkflowRunFields {
+        run_id: "run-jump".into(),
+        query_plan_hash: plan.header.identity.content_hash.as_str().into(),
+        profile_ref: None,
+        generation: None,
+    })
+    .unwrap();
+    let err = run
+        .record_stage(WorkflowStageRecord {
+            stage: WorkflowStage::Rendering,
+            artifact_hash: None,
+            model_fingerprint: None,
+            cost: None,
+            ok: true,
+            detail: None,
+        })
+        .unwrap_err();
+    assert_eq!(err.class_name(), "illegal_transition");
+}
+
+#[test]
+fn publish_from_non_rendering_fails_on_run() {
+    let plan = sample_query_plan();
+    let plan_hash = plan.header.identity.content_hash.as_str().to_string();
+    let mut run = WorkflowRun::new(WorkflowRunFields {
+        run_id: "run-pub-stage".into(),
+        query_plan_hash: plan_hash.clone(),
+        profile_ref: None,
+        generation: None,
+    })
+    .unwrap();
+    run.record_stage(WorkflowStageRecord {
+        stage: WorkflowStage::Retrieving,
+        artifact_hash: Some("ep-hash".into()),
+        model_fingerprint: None,
+        cost: None,
+        ok: true,
+        detail: None,
+    })
+    .unwrap();
+    let answer = sample_grounded_answer(&plan_hash, "cp-hash");
+    let err = run.publish(&answer).unwrap_err();
+    assert_eq!(err.class_name(), "illegal_transition");
+}
+
+#[test]
+fn publish_rejects_mismatched_query_plan_hash() {
+    let plan = sample_query_plan();
+    let plan_hash = plan.header.identity.content_hash.as_str().to_string();
+    let mut run = WorkflowRun::new(WorkflowRunFields {
+        run_id: "run-digest".into(),
+        query_plan_hash: plan_hash.clone(),
+        profile_ref: None,
+        generation: None,
+    })
+    .unwrap();
+    for stage in [
+        WorkflowStage::Retrieving,
+        WorkflowStage::Assembling,
+        WorkflowStage::Generating,
+        WorkflowStage::Verifying,
+        WorkflowStage::Rendering,
+    ] {
+        let artifact_hash = match stage {
+            WorkflowStage::Retrieving => Some("ep-hash".into()),
+            WorkflowStage::Assembling => Some("cp-hash".into()),
+            WorkflowStage::Generating => Some("ap-hash".into()),
+            _ => None,
+        };
+        run.record_stage(WorkflowStageRecord {
+            stage,
+            artifact_hash,
+            model_fingerprint: None,
+            cost: None,
+            ok: true,
+            detail: None,
+        })
+        .unwrap();
+    }
+    let answer = sample_grounded_answer("other-query-plan-hash", "cp-hash");
+    let err = try_publish(run, answer).unwrap_err();
+    assert_eq!(err.class_name(), "validation");
+    assert!(
+        err.to_string().contains("query_plan_hash"),
+        "expected plan hash binding failure, got {err}"
+    );
 }
 
 #[test]

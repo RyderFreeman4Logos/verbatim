@@ -224,11 +224,23 @@ impl GroundedAnswer {
                 "grounded answer text must equal citations.rendered_text",
             ));
         }
-        // Every citation claim_id must map to a grounded claim.
+        // Every citation claim_id must map to a grounded claim, and the cited
+        // evidence_unit_id must be among that claim's evidence_unit_ids.
         for c in &self.citations.citations {
-            if !self.claims.iter().any(|gc| gc.claim_id == c.claim_id) {
+            let Some(claim) = self.claims.iter().find(|gc| gc.claim_id == c.claim_id) else {
                 return Err(WorkflowError::validation(format!(
                     "citation claim_id {} has no grounded claim",
+                    c.claim_id.as_str()
+                )));
+            };
+            if !claim
+                .evidence_unit_ids
+                .iter()
+                .any(|id| id == &c.evidence_unit_id)
+            {
+                return Err(WorkflowError::validation(format!(
+                    "citation evidence_unit_id {} is not bound to claim {}",
+                    c.evidence_unit_id,
                     c.claim_id.as_str()
                 )));
             }
