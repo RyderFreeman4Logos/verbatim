@@ -269,6 +269,71 @@ fn aggregate_coverage_and_run_json_are_hash_bound_and_fail_closed() {
 }
 
 #[test]
+fn run_json_decode_rejects_invalid_budget_and_over_cap_usage() {
+    let document = source_document();
+    let run = start_run(
+        "budget-validation-run".into(),
+        &document,
+        CitationAuditBudget::skeleton_default(),
+    )
+    .expect("run starts with a valid budget");
+
+    let mut zero_cap = run.clone();
+    zero_cap.budget.max_claims = 0;
+    let zero_cap_json = serde_json::to_vec(&zero_cap).expect("encode zero-cap run fixture");
+    assert!(matches!(
+        decode_citation_audit_run_json(&zero_cap_json),
+        Err(CitationAuditError::Validation { .. })
+    ));
+
+    for (dimension, usage) in [
+        (
+            CitationAuditBudgetDimension::Claims,
+            CitationAuditUsage {
+                claims: run.budget.max_claims + 1,
+                ..Default::default()
+            },
+        ),
+        (
+            CitationAuditBudgetDimension::Candidates,
+            CitationAuditUsage {
+                candidates: run.budget.max_candidates + 1,
+                ..Default::default()
+            },
+        ),
+        (
+            CitationAuditBudgetDimension::Classifications,
+            CitationAuditUsage {
+                classifications: run.budget.max_classifications + 1,
+                ..Default::default()
+            },
+        ),
+        (
+            CitationAuditBudgetDimension::CostUnits,
+            CitationAuditUsage {
+                cost_units: run.budget.max_cost_units + 1,
+                ..Default::default()
+            },
+        ),
+        (
+            CitationAuditBudgetDimension::WallTimeMs,
+            CitationAuditUsage {
+                wall_time_ms: run.budget.max_wall_time_ms + 1,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let mut over_cap = run.clone();
+        over_cap.usage = usage;
+        let over_cap_json = serde_json::to_vec(&over_cap).expect("encode over-cap run fixture");
+        assert!(matches!(
+            decode_citation_audit_run_json(&over_cap_json),
+            Err(CitationAuditError::BudgetExhausted { exhaustion }) if exhaustion.dimension == dimension
+        ));
+    }
+}
+
+#[test]
 fn budget_caps_are_checked_before_usage_mutates() {
     let budget = CitationAuditBudget::new(CitationAuditBudgetFields {
         max_claims: 1,

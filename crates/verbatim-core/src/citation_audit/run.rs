@@ -81,6 +81,14 @@ impl CitationAuditRun {
         }
         require_non_empty("citation_audit_run.run_id", &self.run_id)?;
         super::util::require_sha256("citation_audit_run.document_hash", &self.document_hash)?;
+        let budget = CitationAuditBudget::new(super::CitationAuditBudgetFields {
+            max_claims: self.budget.max_claims,
+            max_candidates: self.budget.max_candidates,
+            max_classifications: self.budget.max_classifications,
+            max_cost_units: self.budget.max_cost_units,
+            max_wall_time_ms: self.budget.max_wall_time_ms,
+        })?;
+        CitationAuditUsage::default().checked_add(self.usage, &budget)?;
         for value in [
             &self.segmentation_hash,
             &self.results_hash,
