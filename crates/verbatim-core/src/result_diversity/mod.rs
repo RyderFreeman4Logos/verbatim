@@ -18,7 +18,7 @@ pub use budget::{
     DiversityBudget, DiversityBudgetDimension, DiversityBudgetExhaustion, DiversityBudgetFields,
     DiversityUsage,
 };
-pub use error::{DiversityError, DiversityResult};
+pub use error::{DiversityDiagnosticCode, DiversityError, DiversityResult};
 pub use model::{
     CollapseReason, DiversityGroup, DiversityGroupFields, EvidenceStrength, GroupIdentity,
     GroupedMember, OccurrenceCount, RawCandidate, RawCandidateFields, RawCandidateRanking, RawRank,

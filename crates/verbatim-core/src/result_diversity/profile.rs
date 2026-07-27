@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{DiversityError, DiversityResult};
+use super::{DiversityDiagnosticCode, DiversityError, DiversityResult};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiversityProfileFields {
@@ -43,7 +43,7 @@ impl DiversityProfile {
     pub fn hash_fields(fields: &DiversityProfileFields) -> DiversityResult<String> {
         validate_fields(fields)?;
         let canonical = serde_json::to_vec(fields).map_err(|_| {
-            DiversityError::validation("result-diversity profile could not be serialized")
+            DiversityError::validation(DiversityDiagnosticCode::ProfileSerializationFailed)
         })?;
         Ok(format!("{:x}", Sha256::digest(canonical)))
     }
@@ -59,7 +59,7 @@ impl DiversityProfile {
         let expected_hash = Self::hash_fields(&fields)?;
         if self.profile_hash != expected_hash {
             return Err(DiversityError::validation(
-                "result-diversity profile hash does not match profile fields",
+                DiversityDiagnosticCode::ProfileHashMismatch,
             ));
         }
         Ok(())
@@ -93,19 +93,19 @@ impl DiversityProfile {
 fn validate_fields(fields: &DiversityProfileFields) -> DiversityResult<()> {
     if fields.version == 0 {
         return Err(DiversityError::validation(
-            "result-diversity profile version must be positive",
+            DiversityDiagnosticCode::ProfileVersionInvalid,
         ));
     }
     if fields.near_duplicate_threshold_basis_points == 0
         || fields.near_duplicate_threshold_basis_points > 10_000
     {
         return Err(DiversityError::validation(
-            "near-duplicate threshold must be between 1 and 10000 basis points",
+            DiversityDiagnosticCode::NearDuplicateThresholdInvalid,
         ));
     }
     if fields.max_per_source == Some(0) || fields.max_per_thread == Some(0) {
         return Err(DiversityError::validation(
-            "result-diversity quotas must be positive when configured",
+            DiversityDiagnosticCode::ProfileQuotaInvalid,
         ));
     }
     Ok(())

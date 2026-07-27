@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{DiversityError, DiversityResult};
+use super::{DiversityDiagnosticCode, DiversityError, DiversityResult};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiversityBudget {
@@ -33,7 +33,7 @@ impl DiversityBudget {
         .contains(&0)
         {
             return Err(DiversityError::validation(
-                "every result-diversity budget cap must be positive",
+                DiversityDiagnosticCode::BudgetCapsMustBePositive,
             ));
         }
         Ok(budget)

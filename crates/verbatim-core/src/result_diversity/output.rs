@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DiversityBudget, DiversityError, DiversityGroup, DiversityProfile, DiversityResult,
-    DiversityUsage, GroupedMember, RawCandidateRanking,
+    DiversityBudget, DiversityDiagnosticCode, DiversityError, DiversityGroup, DiversityProfile,
+    DiversityResult, DiversityUsage, GroupedMember, RawCandidateRanking,
 };
 
 /// The only durable result of this contract: representatives are a projection,
@@ -34,7 +34,7 @@ impl DiversityStageOutput {
         }
         if groups.is_empty() {
             return Err(DiversityError::validation(
-                "diversity stage output requires at least one group",
+                DiversityDiagnosticCode::StageOutputRequiresGroup,
             ));
         }
         let mut seen_members = BTreeSet::new();
@@ -42,7 +42,7 @@ impl DiversityStageOutput {
             for member in group.members() {
                 if !seen_members.insert(member.hit_id()) {
                     return Err(DiversityError::validation(
-                        "diversity stage output must attribute every raw candidate exactly once",
+                        DiversityDiagnosticCode::StageOutputMemberAttributionInvalid,
                     ));
                 }
             }
@@ -54,7 +54,7 @@ impl DiversityStageOutput {
             .collect();
         if seen_members != expected {
             return Err(DiversityError::validation(
-                "diversity stage output must retain every raw candidate in a group",
+                DiversityDiagnosticCode::StageOutputMemberRetentionInvalid,
             ));
         }
         let collapsed_members = groups
@@ -92,7 +92,7 @@ impl DiversityStageOutput {
         };
         if self.usage != expected_usage {
             return Err(DiversityError::validation(
-                "decoded diversity stage output usage does not match retained members",
+                DiversityDiagnosticCode::DecodedOutputUsageInvalid,
             ));
         }
         let mut seen_members = BTreeSet::new();
@@ -100,7 +100,7 @@ impl DiversityStageOutput {
             for member in group.members() {
                 if !seen_members.insert(member.hit_id()) {
                     return Err(DiversityError::validation(
-                        "decoded diversity stage output duplicates a raw member",
+                        DiversityDiagnosticCode::DecodedOutputDuplicatesRawMember,
                     ));
                 }
             }
@@ -113,7 +113,7 @@ impl DiversityStageOutput {
             .collect();
         if seen_members != expected {
             return Err(DiversityError::validation(
-                "decoded diversity stage output does not retain every raw candidate",
+                DiversityDiagnosticCode::DecodedOutputMemberRetentionInvalid,
             ));
         }
         Ok(())
@@ -148,7 +148,7 @@ impl DiversityStageOutput {
 /// attribution, and usage invariants. Unknown/malformed values fail closed.
 pub fn decode_diversity_stage_output_json(input: &str) -> DiversityResult<DiversityStageOutput> {
     let output: DiversityStageOutput = serde_json::from_str(input)
-        .map_err(|_| DiversityError::validation("invalid result-diversity stage output JSON"))?;
+        .map_err(|_| DiversityError::validation(DiversityDiagnosticCode::InvalidStageOutputJson))?;
     output.validate()?;
     Ok(output)
 }
@@ -159,6 +159,6 @@ pub fn encode_diversity_stage_output_json(
 ) -> DiversityResult<String> {
     output.validate()?;
     serde_json::to_string(output).map_err(|_| {
-        DiversityError::validation("result-diversity stage output could not be encoded")
+        DiversityError::validation(DiversityDiagnosticCode::StageOutputSerializationFailed)
     })
 }

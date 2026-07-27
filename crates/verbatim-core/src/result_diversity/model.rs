@@ -5,7 +5,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 
 use serde::{Deserialize, Serialize};
 
-use super::{DiversityError, DiversityResult};
+use super::{DiversityDiagnosticCode, DiversityError, DiversityResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -13,9 +13,9 @@ pub struct RawRank(NonZeroU32);
 
 impl RawRank {
     pub fn new(value: u32) -> DiversityResult<Self> {
-        NonZeroU32::new(value)
-            .map(Self)
-            .ok_or_else(|| DiversityError::validation("raw rank must be positive"))
+        NonZeroU32::new(value).map(Self).ok_or_else(|| {
+            DiversityError::validation(DiversityDiagnosticCode::RawRankMustBePositive)
+        })
     }
 
     pub fn get(self) -> u32 {
@@ -29,9 +29,9 @@ pub struct OccurrenceCount(NonZeroU64);
 
 impl OccurrenceCount {
     pub fn new(value: u64) -> DiversityResult<Self> {
-        NonZeroU64::new(value)
-            .map(Self)
-            .ok_or_else(|| DiversityError::validation("occurrence count must be positive"))
+        NonZeroU64::new(value).map(Self).ok_or_else(|| {
+            DiversityError::validation(DiversityDiagnosticCode::OccurrenceCountMustBePositive)
+        })
     }
 
     pub fn get(self) -> u64 {
@@ -99,7 +99,7 @@ impl RawCandidate {
     pub fn validate(&self) -> DiversityResult<()> {
         if self.hit_id.trim().is_empty() {
             return Err(DiversityError::validation(
-                "raw candidate hit id must not be empty",
+                DiversityDiagnosticCode::RawCandidateHitIdEmpty,
             ));
         }
         Ok(())
@@ -136,7 +136,7 @@ impl RawCandidateRanking {
     pub fn new(candidates: Vec<RawCandidate>) -> DiversityResult<Self> {
         if candidates.is_empty() {
             return Err(DiversityError::validation(
-                "raw candidate ranking requires at least one candidate",
+                DiversityDiagnosticCode::RawCandidateRankingRequiresCandidates,
             ));
         }
         let mut ids = BTreeSet::new();
@@ -144,12 +144,12 @@ impl RawCandidateRanking {
         for candidate in &candidates {
             if !ids.insert(candidate.hit_id()) {
                 return Err(DiversityError::validation(
-                    "raw candidate ranking must not duplicate hit ids",
+                    DiversityDiagnosticCode::RawCandidateRankingDuplicateHitIds,
                 ));
             }
             if !ranks.insert(candidate.raw_rank()) {
                 return Err(DiversityError::validation(
-                    "raw candidate ranking must not duplicate raw ranks",
+                    DiversityDiagnosticCode::RawCandidateRankingDuplicateRawRanks,
                 ));
             }
         }
@@ -161,7 +161,7 @@ impl RawCandidateRanking {
     pub fn validate(&self) -> DiversityResult<()> {
         if self.candidates.is_empty() {
             return Err(DiversityError::validation(
-                "raw candidate ranking requires at least one candidate",
+                DiversityDiagnosticCode::RawCandidateRankingRequiresCandidates,
             ));
         }
         let mut ids = BTreeSet::new();
@@ -170,12 +170,12 @@ impl RawCandidateRanking {
             candidate.validate()?;
             if !ids.insert(candidate.hit_id()) {
                 return Err(DiversityError::validation(
-                    "raw candidate ranking must not duplicate hit ids",
+                    DiversityDiagnosticCode::RawCandidateRankingDuplicateHitIds,
                 ));
             }
             if !ranks.insert(candidate.raw_rank()) {
                 return Err(DiversityError::validation(
-                    "raw candidate ranking must not duplicate raw ranks",
+                    DiversityDiagnosticCode::RawCandidateRankingDuplicateRawRanks,
                 ));
             }
         }
@@ -222,10 +222,31 @@ impl GroupIdentity {
         };
         if identifier.trim().is_empty() {
             return Err(DiversityError::validation(
-                "group identity must retain a non-empty provenance key",
+                DiversityDiagnosticCode::GroupIdentityMissingProvenance,
             ));
         }
         Ok(())
+    }
+
+    fn is_similarity_only(&self) -> bool {
+        matches!(self, Self::NearDuplicate { .. })
+    }
+
+    fn is_compatible_with(&self, reason: &CollapseReason) -> bool {
+        matches!(
+            (self, reason),
+            (Self::ExactDuplicate { .. }, CollapseReason::ExactDuplicate)
+                | (Self::NearDuplicate { .. }, CollapseReason::NearDuplicate)
+                | (Self::Overlap { .. }, CollapseReason::Overlap)
+                | (Self::ParentChild { .. }, CollapseReason::ParentChild)
+                | (Self::Thread { .. }, CollapseReason::ThreadQuota)
+                | (Self::Source { .. }, CollapseReason::SourceQuota)
+                | (Self::Mirror { .. }, CollapseReason::Mirror)
+                | (
+                    Self::Version { .. },
+                    CollapseReason::ExplicitEquivalentVersion
+                )
+        )
     }
 }
 
@@ -294,7 +315,7 @@ impl DiversityGroup {
         fields.identity.validate()?;
         if fields.representative_hit_id.trim().is_empty() || fields.member_hit_ids.is_empty() {
             return Err(DiversityError::validation(
-                "diversity group requires representative and members",
+                DiversityDiagnosticCode::DiversityGroupRequiresRepresentativeAndMembers,
             ));
         }
         let mut member_ids = BTreeSet::new();
@@ -302,35 +323,39 @@ impl DiversityGroup {
         for hit_id in &fields.member_hit_ids {
             if !member_ids.insert(hit_id) {
                 return Err(DiversityError::validation(
-                    "diversity group must not duplicate member hit ids",
+                    DiversityDiagnosticCode::DiversityGroupDuplicateMembers,
                 ));
             }
             let candidate = ranking.candidate(hit_id).ok_or_else(|| {
-                DiversityError::validation("diversity group member is absent from raw ranking")
+                DiversityError::validation(DiversityDiagnosticCode::DiversityGroupMemberAbsent)
             })?;
             resolved.push(candidate);
         }
         if !member_ids.contains(&fields.representative_hit_id) {
             return Err(DiversityError::validation(
-                "diversity representative must be a raw group member",
+                DiversityDiagnosticCode::DiversityRepresentativeNotMember,
             ));
         }
         let representative = ranking
             .candidate(&fields.representative_hit_id)
             .ok_or_else(|| {
-                DiversityError::validation("diversity representative is absent from raw ranking")
+                DiversityError::validation(DiversityDiagnosticCode::DiversityRepresentativeAbsent)
             })?;
         let strongest = resolved
             .iter()
             .map(|candidate| candidate.evidence_strength())
             .min()
-            .ok_or_else(|| DiversityError::validation("diversity group requires members"))?;
+            .ok_or_else(|| {
+                DiversityError::validation(
+                    DiversityDiagnosticCode::DiversityGroupRequiresRepresentativeAndMembers,
+                )
+            })?;
         if representative.evidence_strength() != strongest {
             return Err(DiversityError::validation(
-                "direct or stronger evidence must be selected before weaker diverse evidence",
+                DiversityDiagnosticCode::DiversityRepresentativeWeakerThanMember,
             ));
         }
-        if fields.collapse_reason.is_similarity_only()
+        if (fields.identity.is_similarity_only() || fields.collapse_reason.is_similarity_only())
             && resolved.iter().any(|candidate| {
                 candidate
                     .semantic_distinction()
@@ -338,7 +363,12 @@ impl DiversityGroup {
             })
         {
             return Err(DiversityError::validation(
-                "legally distinct versions and translations cannot collapse solely by similarity",
+                DiversityDiagnosticCode::ProtectedSemanticDistinctionSimilarityCollapse,
+            ));
+        }
+        if !fields.identity.is_compatible_with(&fields.collapse_reason) {
+            return Err(DiversityError::validation(
+                DiversityDiagnosticCode::IncompatibleGroupIdentityAndCollapseReason,
             ));
         }
         let members = resolved
@@ -374,7 +404,7 @@ impl DiversityGroup {
         )?;
         if rebuilt != *self {
             return Err(DiversityError::validation(
-                "decoded diversity group does not retain canonical raw-member attribution",
+                DiversityDiagnosticCode::DecodedGroupAttributionInvalid,
             ));
         }
         Ok(())
