@@ -34,9 +34,19 @@ impl VectorSpaceId {
 }
 
 /// Monotonic, nonzero index publication generation used for atomic reads and rollback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PublicationGeneration(u64);
+
+impl<'de> Deserialize<'de> for PublicationGeneration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl PublicationGeneration {
     pub fn new(value: u64) -> VectorSearchResult<Self> {

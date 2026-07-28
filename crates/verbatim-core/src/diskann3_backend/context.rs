@@ -1,5 +1,7 @@
 //! Validated generation, predicate, and budget context for adapter operations.
 
+use std::fmt;
+
 use crate::diskann3::{FilterPredicate, PublicationGeneration};
 use crate::search_planner::SearchBudget;
 
@@ -67,6 +69,11 @@ impl GenerationContext {
         vector_space.vector_space_id().validate().map_err(|_| {
             DiskAnnBackendError::contract(DiskAnnBackendDiagnosticCode::InvalidGenerationContext)
         })?;
+        if generation.value() == 0 {
+            return Err(DiskAnnBackendError::contract(
+                DiskAnnBackendDiagnosticCode::InvalidGenerationContext,
+            ));
+        }
         Ok(Self {
             vector_space,
             generation,
@@ -96,7 +103,7 @@ impl GenerationContext {
 }
 
 /// A bounded filter plan that must be applied during candidate generation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PredicatePlan {
     filters: Vec<FilterPredicate>,
 }
@@ -131,8 +138,14 @@ impl PredicatePlan {
     }
 }
 
+impl fmt::Debug for PredicatePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PredicatePlan(REDACTED)")
+    }
+}
+
 /// Generation context plus the predicate plan required for a search operation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct SearchContext {
     generation: GenerationContext,
     predicate: PredicatePlan,
@@ -163,5 +176,15 @@ impl SearchContext {
     /// Returns the predicate that must constrain candidate generation.
     pub const fn predicate(&self) -> &PredicatePlan {
         &self.predicate
+    }
+}
+
+impl fmt::Debug for SearchContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SearchContext")
+            .field("generation", &self.generation)
+            .field("predicate", &"REDACTED")
+            .finish()
     }
 }

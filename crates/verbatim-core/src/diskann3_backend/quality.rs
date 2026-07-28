@@ -1,10 +1,12 @@
 //! Full-quality guarantees and exact-vector rescore boundary types.
 
+use std::collections::BTreeSet;
+
 use crate::diskann3::PublicationGeneration;
 
 use super::{
     DiskAnnBackendDiagnosticCode, DiskAnnBackendError, DiskAnnBackendResult, GenerationContext,
-    StableVectorId, VectorInput, VectorMetric, VectorSpaceSpec,
+    SearchPage, StableVectorId, VectorInput, VectorMetric, VectorSpaceSpec,
 };
 
 /// Representation allowed only for approximate candidate generation.
@@ -83,7 +85,10 @@ impl CandidateScore {
         raw_distance: f32,
         normalized_score: f32,
     ) -> DiskAnnBackendResult<Self> {
-        if !raw_distance.is_finite() || !normalized_score.is_finite() {
+        if !raw_distance.is_finite()
+            || !normalized_score.is_finite()
+            || (metric == VectorMetric::L2 && raw_distance < 0.0)
+        {
             return Err(DiskAnnBackendError::contract(
                 DiskAnnBackendDiagnosticCode::InvalidCandidateScore,
             ));
@@ -111,25 +116,22 @@ impl CandidateScore {
     }
 }
 
-/// Candidate identity plus proof that its original vector may be fetched for final rescoring.
+/// Candidate identity issued only from a validated search page for final rescoring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExactRescoreCandidate {
     vector_id: StableVectorId,
     generation: PublicationGeneration,
-    exact_rescore_eligible: bool,
 }
 
 impl ExactRescoreCandidate {
-    /// Marks whether the backend can fetch this candidate's original SSD vector.
-    pub const fn new(
+    /// Issues an eligibility token only while materializing a validated search result page.
+    pub(super) const fn from_search_page(
         vector_id: StableVectorId,
         generation: PublicationGeneration,
-        exact_rescore_eligible: bool,
     ) -> Self {
         Self {
             vector_id,
             generation,
-            exact_rescore_eligible,
         }
     }
 
@@ -147,8 +149,12 @@ pub struct ExactVectorFetchRequest {
 }
 
 impl ExactVectorFetchRequest {
-    /// Requires a nonempty, generation-consistent, exact-rescoreable final candidate set.
-    pub fn new(
+    /// Binds exact-vector fetches to the final candidates emitted by one validated search page.
+    pub fn from_search_page(page: &SearchPage) -> DiskAnnBackendResult<Self> {
+        Self::from_issued_candidates(page.context().clone(), page.exact_rescore_candidates())
+    }
+
+    fn from_issued_candidates(
         context: GenerationContext,
         candidates: Vec<ExactRescoreCandidate>,
     ) -> DiskAnnBackendResult<Self> {
@@ -162,15 +168,16 @@ impl ExactVectorFetchRequest {
                 DiskAnnBackendDiagnosticCode::InvalidExactRescoreRequest,
             ));
         }
+        let mut vector_ids = BTreeSet::new();
         for candidate in &candidates {
             if candidate.generation != context.generation() {
                 return Err(DiskAnnBackendError::contract(
                     DiskAnnBackendDiagnosticCode::GenerationMismatch,
                 ));
             }
-            if !candidate.exact_rescore_eligible {
+            if !vector_ids.insert(candidate.vector_id) {
                 return Err(DiskAnnBackendError::contract(
-                    DiskAnnBackendDiagnosticCode::ExactRescoreIneligible,
+                    DiskAnnBackendDiagnosticCode::InvalidExactRescoreRequest,
                 ));
             }
         }
@@ -227,9 +234,43 @@ pub struct ExactVectorFetchResponse {
 }
 
 impl ExactVectorFetchResponse {
-    /// Creates a response whose entries are individually validated by [`ExactVector::new`].
-    pub fn new(vectors: Vec<ExactVector>) -> Self {
-        Self { vectors }
+    /// Binds a provider response exactly to the request's unique, budget-bounded candidate IDs.
+    pub fn new(
+        request: &ExactVectorFetchRequest,
+        vectors: Vec<ExactVector>,
+    ) -> DiskAnnBackendResult<Self> {
+        let limit = request
+            .context
+            .budget_binding()
+            .operation_budget()
+            .fields()
+            .full_precision_rescore_limit as usize;
+        if vectors.len() > limit || vectors.len() != request.candidates.len() {
+            return Err(DiskAnnBackendError::contract(
+                DiskAnnBackendDiagnosticCode::InvalidExactRescoreRequest,
+            ));
+        }
+
+        let requested_ids = request
+            .candidates
+            .iter()
+            .map(ExactRescoreCandidate::vector_id)
+            .collect::<BTreeSet<_>>();
+        let mut response_ids = BTreeSet::new();
+        for vector in &vectors {
+            request.context.validate_input(&vector.input)?;
+            if !response_ids.insert(vector.vector_id) {
+                return Err(DiskAnnBackendError::contract(
+                    DiskAnnBackendDiagnosticCode::InvalidExactRescoreRequest,
+                ));
+            }
+        }
+        if response_ids != requested_ids {
+            return Err(DiskAnnBackendError::contract(
+                DiskAnnBackendDiagnosticCode::InvalidExactRescoreRequest,
+            ));
+        }
+        Ok(Self { vectors })
     }
 
     /// Returns the fetched original vectors.

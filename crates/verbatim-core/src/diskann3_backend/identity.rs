@@ -90,6 +90,11 @@ impl ChunkIdMapping {
         vector_space_id.validate().map_err(|_| {
             DiskAnnBackendError::contract(DiskAnnBackendDiagnosticCode::InvalidChunkIdMapping)
         })?;
+        if generation.value() == 0 {
+            return Err(DiskAnnBackendError::contract(
+                DiskAnnBackendDiagnosticCode::InvalidChunkIdMapping,
+            ));
+        }
 
         let mut by_vector_id = BTreeMap::new();
         for entry in entries {

@@ -166,6 +166,69 @@ fn diskann3_backend_versions_chunk_id_mappings() {
 }
 
 #[test]
+fn diskann3_backend_rejects_stable_id_and_mapping_constructor_failures() {
+    assert_eq!(
+        StableVectorId::new(0)
+            .expect_err("stable vector IDs must be nonzero")
+            .diagnostic_code(),
+        DiskAnnBackendDiagnosticCode::InvalidStableVectorId
+    );
+    assert_eq!(
+        MappingVersion::new(0)
+            .expect_err("mapping versions must be nonzero")
+            .diagnostic_code(),
+        DiskAnnBackendDiagnosticCode::InvalidMappingVersion
+    );
+
+    let generation = PublicationGeneration::new(7).expect("generation");
+    let profile = EmbeddingProfileId::new("default").expect("embedding profile");
+    let invalid_vector_space = serde_json::from_str::<VectorSpaceId>("\"not/a-space\"")
+        .expect("untrusted serialized vector-space ID");
+    assert_eq!(
+        ChunkIdMapping::new(
+            MappingVersion::new(1).expect("mapping version"),
+            invalid_vector_space,
+            profile.clone(),
+            generation,
+            vec![],
+        )
+        .expect_err("mappings must revalidate their vector-space envelope")
+        .diagnostic_code(),
+        DiskAnnBackendDiagnosticCode::InvalidChunkIdMapping
+    );
+
+    let vector_space = VectorSpaceId::new("text-default").expect("vector space");
+    let vector_id = StableVectorId::new(11).expect("stable ID");
+    assert_eq!(
+        ChunkIdMapping::new(
+            MappingVersion::new(1).expect("mapping version"),
+            vector_space.clone(),
+            profile.clone(),
+            generation,
+            vec![ChunkIdMappingEntry::new(vector_id, ChunkId(" ".to_owned()))],
+        )
+        .expect_err("mappings must reject blank authoritative chunk IDs")
+        .diagnostic_code(),
+        DiskAnnBackendDiagnosticCode::InvalidChunkIdMapping
+    );
+    assert_eq!(
+        ChunkIdMapping::new(
+            MappingVersion::new(1).expect("mapping version"),
+            vector_space,
+            profile,
+            generation,
+            vec![
+                ChunkIdMappingEntry::new(vector_id, ChunkId("chunk-11".to_owned())),
+                ChunkIdMappingEntry::new(vector_id, ChunkId("chunk-11-copy".to_owned())),
+            ],
+        )
+        .expect_err("mappings must reject duplicate stable vector IDs")
+        .diagnostic_code(),
+        DiskAnnBackendDiagnosticCode::DuplicateStableVectorId
+    );
+}
+
+#[test]
 fn diskann3_backend_rejects_widened_operation_budget() {
     let caller_budget = search_budget(10);
     let widened_operation_budget = search_budget(11);

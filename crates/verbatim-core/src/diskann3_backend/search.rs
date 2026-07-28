@@ -4,25 +4,40 @@ use crate::diskann3::PublicationGeneration;
 
 use super::{
     CandidateScore, DiskAnnBackendDiagnosticCode, DiskAnnBackendError, DiskAnnBackendResult,
-    SearchContext, StableVectorId, VectorInput,
+    ExactRescoreCandidate, GenerationContext, SearchContext, StableVectorId, VectorInput,
+    VectorMetric,
 };
 
 /// A finite inclusive range over metric-labelled raw distances.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RawDistanceRange {
+    metric: VectorMetric,
     minimum: f32,
     maximum: f32,
 }
 
 impl RawDistanceRange {
-    /// Creates a finite, ordered raw-distance interval without assuming metric comparability.
-    pub fn new(minimum: f32, maximum: f32) -> DiskAnnBackendResult<Self> {
-        if !minimum.is_finite() || !maximum.is_finite() || minimum > maximum {
+    /// Creates a finite, ordered raw-distance interval bound to one metric domain.
+    pub fn new(metric: VectorMetric, minimum: f32, maximum: f32) -> DiskAnnBackendResult<Self> {
+        if !minimum.is_finite()
+            || !maximum.is_finite()
+            || minimum > maximum
+            || (metric == VectorMetric::L2 && minimum < 0.0)
+        {
             return Err(DiskAnnBackendError::contract(
                 DiskAnnBackendDiagnosticCode::InvalidDistanceRange,
             ));
         }
-        Ok(Self { minimum, maximum })
+        Ok(Self {
+            metric,
+            minimum,
+            maximum,
+        })
+    }
+
+    /// Returns the metric that gives meaning to this raw-distance interval.
+    pub const fn metric(&self) -> VectorMetric {
+        self.metric
     }
 
     /// Returns the inclusive lower bound.
@@ -95,6 +110,11 @@ impl RangeSearchRequest {
     ) -> DiskAnnBackendResult<Self> {
         validate_result_limit(&context, limit)?;
         context.generation().validate_input(&query)?;
+        if range.metric() != context.generation().vector_space().metric() {
+            return Err(DiskAnnBackendError::contract(
+                DiskAnnBackendDiagnosticCode::InvalidDistanceRange,
+            ));
+        }
         Ok(Self {
             context,
             query,
@@ -160,21 +180,32 @@ impl SearchCandidate {
 /// Bounded candidate page from either Top-K or range search.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchPage {
+    context: GenerationContext,
     candidates: Vec<SearchCandidate>,
 }
 
 impl SearchPage {
-    /// Validates generation consistency and result cardinality before returning a candidate page.
-    pub fn new(
-        context: &SearchContext,
+    /// Builds a page whose cardinality is bound to one concrete Top-K request.
+    pub fn from_top_k_request(
+        request: &TopKSearchRequest,
         candidates: Vec<SearchCandidate>,
     ) -> DiskAnnBackendResult<Self> {
-        let limit = context
-            .generation()
-            .budget_binding()
-            .operation_budget()
-            .fields()
-            .result_limit as usize;
+        Self::from_request(request.context(), request.limit(), candidates)
+    }
+
+    /// Builds a page whose cardinality is bound to one concrete range-search request.
+    pub fn from_range_search_request(
+        request: &RangeSearchRequest,
+        candidates: Vec<SearchCandidate>,
+    ) -> DiskAnnBackendResult<Self> {
+        Self::from_request(request.context(), request.limit(), candidates)
+    }
+
+    fn from_request(
+        context: &SearchContext,
+        limit: usize,
+        candidates: Vec<SearchCandidate>,
+    ) -> DiskAnnBackendResult<Self> {
         if candidates.len() > limit {
             return Err(DiskAnnBackendError::contract(
                 DiskAnnBackendDiagnosticCode::InvalidSearchRequest,
@@ -188,12 +219,40 @@ impl SearchPage {
                 DiskAnnBackendDiagnosticCode::GenerationMismatch,
             ));
         }
-        Ok(Self { candidates })
+        if candidates.iter().any(|candidate| {
+            candidate.score.metric() != context.generation().vector_space().metric()
+        }) {
+            return Err(DiskAnnBackendError::contract(
+                DiskAnnBackendDiagnosticCode::InvalidCandidateScore,
+            ));
+        }
+        Ok(Self {
+            context: context.generation().clone(),
+            candidates,
+        })
+    }
+
+    /// Returns the generation context that issued this page.
+    pub const fn context(&self) -> &GenerationContext {
+        &self.context
     }
 
     /// Returns the bounded candidate page.
     pub fn candidates(&self) -> &[SearchCandidate] {
         &self.candidates
+    }
+
+    /// Issues exact-rescore candidates only from this validated final candidate page.
+    pub fn exact_rescore_candidates(&self) -> Vec<ExactRescoreCandidate> {
+        self.candidates
+            .iter()
+            .map(|candidate| {
+                ExactRescoreCandidate::from_search_page(
+                    candidate.vector_id,
+                    self.context.generation(),
+                )
+            })
+            .collect()
     }
 }
 

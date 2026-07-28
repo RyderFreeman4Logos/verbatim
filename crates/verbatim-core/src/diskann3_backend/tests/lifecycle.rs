@@ -2,8 +2,9 @@ use crate::diskann3::{PublicationGeneration, ShardId, VectorSpaceId};
 use crate::diskann3_backend::{
     CandidateRepresentation, DiskAnnBackendDiagnosticCode, DiskAnnCapabilities,
     DiskAnnCapabilityFields, DiskAnnVectorSearch, FullQualityGuarantee, GenerationContext,
-    IdempotencyKey, PageCacheDiagnosticFields, PageCacheDiagnostics, SearchBudget,
-    SearchBudgetBinding, SearchBudgetFields, ShardGenerationRequest, StableVectorId,
+    IdempotencyKey, PageCacheDiagnosticFields, PageCacheDiagnostics, RecoverySource,
+    RestoreOrRebuildRequest, SearchBudget, SearchBudgetBinding, SearchBudgetFields,
+    ShardGenerationRequest, ShutdownReceipt, SnapshotId, SnapshotReceipt, StableVectorId,
     TombstoneBatchRequest, VectorMetric, VectorSpaceSpec,
 };
 use crate::types::EmbeddingProfileId;
@@ -156,4 +157,74 @@ fn diskann3_backend_contract_extends_vector_search() {
     fn requires_adapter_contract<T: DiskAnnVectorSearch>() {
         requires_vector_search::<T>();
     }
+}
+
+#[test]
+fn diskann3_backend_redacts_and_restricts_snapshot_identifiers() {
+    let snapshot_secret = "snapshot-secret-42";
+    let context = generation_context();
+    let snapshot = SnapshotId::new(snapshot_secret).expect("non-path snapshot identifier");
+    let receipt = SnapshotReceipt::new(context.clone(), snapshot.clone());
+    let recovery = RestoreOrRebuildRequest::new(context, RecoverySource::Snapshot(snapshot));
+    let rendered = format!("{receipt:?} {recovery:?}");
+
+    assert!(!rendered.contains(snapshot_secret));
+    assert!(rendered.contains("REDACTED"));
+    for path_shaped in [
+        "snapshot/42",
+        r"snapshot\\42",
+        "snapshot..42",
+        "../snapshot",
+    ] {
+        assert_eq!(
+            SnapshotId::new(path_shaped)
+                .expect_err("snapshot identifiers must use a non-path alphabet")
+                .diagnostic_code(),
+            DiskAnnBackendDiagnosticCode::InvalidSnapshotId
+        );
+    }
+    SnapshotId::new("snapshot_42-v1").expect("opaque non-path snapshot identifier");
+}
+
+#[test]
+fn diskann3_backend_rejects_zero_generation_deserialization() {
+    assert!(
+        serde_json::from_str::<PublicationGeneration>("0").is_err(),
+        "serde must preserve the nonzero generation invariant"
+    );
+    assert_eq!(
+        serde_json::from_str::<PublicationGeneration>("7")
+            .expect("nonzero generation deserializes")
+            .value(),
+        7
+    );
+}
+
+#[test]
+fn diskann3_backend_covers_capability_and_shutdown_error_paths() {
+    let mut invalid_fields = capabilities().fields().clone();
+    invalid_fields.supported_metrics.clear();
+    assert_eq!(
+        DiskAnnCapabilities::new(invalid_fields)
+            .expect_err("capability envelopes need at least one metric")
+            .diagnostic_code(),
+        DiskAnnBackendDiagnosticCode::InvalidCapabilities
+    );
+
+    let mut constrained_fields = capabilities().fields().clone();
+    constrained_fields.max_page_reads = 9;
+    let constrained = DiskAnnCapabilities::new(constrained_fields).expect("bounded capabilities");
+    assert_eq!(
+        constrained
+            .validate_budget(generation_context().budget_binding())
+            .expect_err("operation budgets cannot exceed advertised page authority")
+            .diagnostic_code(),
+        DiskAnnBackendDiagnosticCode::CapabilityBudgetExceeded
+    );
+    assert_eq!(
+        ShutdownReceipt::released(false)
+            .expect_err("incomplete shutdown must fail closed")
+            .diagnostic_code(),
+        DiskAnnBackendDiagnosticCode::ShutdownNotComplete
+    );
 }
