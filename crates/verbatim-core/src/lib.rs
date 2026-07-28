@@ -48,6 +48,7 @@ pub mod provider;
 pub mod remote_storage_client;
 pub mod resource;
 pub mod result_diversity;
+pub mod retrieval_budgets;
 pub mod retrieve;
 pub mod sdk;
 pub mod search_planner;
