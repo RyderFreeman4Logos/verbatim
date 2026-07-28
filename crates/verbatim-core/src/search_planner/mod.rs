@@ -36,7 +36,9 @@ pub use plan::{
 };
 pub use planner::{SearchPlanner, SearchPlannerContract};
 pub use report::{CompletionState, PublicRetrievalRecord};
-pub use request::{PlannerRequest, RetrievalIntent, StrictPredicateHandlingMode};
+pub use request::{
+    PlannerRequest, RetrievalIntent, StrictPredicateHandlingMode, WarmCacheAttestation,
+};
 pub use selectivity::{CrossoverThresholds, SelectivityClass, SelectivityProfile};
 pub use usage::SearchBudgetUsage;
 

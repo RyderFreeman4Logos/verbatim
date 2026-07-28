@@ -102,6 +102,11 @@ impl SearchPlanner {
         request.capability.validate_budget(&request.budget)?;
         match request.cardinality.disposition(request.estimate_handling)? {
             EstimateDisposition::Degraded => {
+                if request.strict_predicate_required
+                    && !request.capability.supports_strict_pre_rank_predicates()
+                {
+                    return Self::strict_failure(request);
+                }
                 return Ok((
                     SelectedPath::NamedDegradedProfile(NamedDegradedProfile::UntrustedCardinality),
                     PlannedCompleteness::DegradedPartial,

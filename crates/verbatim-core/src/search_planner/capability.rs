@@ -113,6 +113,11 @@ impl BackendCapability {
     /// Revalidates basic discovery facts before a request is planned.
     pub fn validate(&self) -> SearchPlannerResult<()> {
         let fields = &self.fields;
+        if matches!(fields.cold_cache_behavior, ColdCacheBehavior::Unsupported) {
+            return Err(SearchPlannerError::new(
+                SearchPlannerDiagnosticCode::CapabilityUnsupported,
+            ));
+        }
         if fields.supported_metrics.is_empty()
             || fields.min_dimension == 0
             || fields.min_dimension > fields.max_dimension
@@ -157,6 +162,14 @@ impl BackendCapability {
 
     pub(crate) const fn supports_strict_pre_rank_predicates(&self) -> bool {
         self.fields.supports_pre_rank_predicates || self.fields.supports_in_traversal_predicates
+    }
+
+    /// Returns whether planning must receive a verified warm-cache attestation.
+    pub(crate) const fn requires_verified_warm_cache_attestation(&self) -> bool {
+        matches!(
+            self.fields.cold_cache_behavior,
+            ColdCacheBehavior::RequiresWarmCache
+        )
     }
 
     pub(crate) const fn supports_exhaustive_enumeration(&self) -> bool {

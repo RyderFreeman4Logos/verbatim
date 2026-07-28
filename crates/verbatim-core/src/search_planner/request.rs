@@ -24,6 +24,13 @@ pub enum StrictPredicateHandlingMode {
     NamedBoundedDegradedProfile,
 }
 
+/// Verified precondition required by backends that cannot safely serve a cold cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WarmCacheAttestation {
+    /// The authorization-bound backend adapter verified the cache is warm.
+    Verified,
+}
+
 /// Fully authorization-bound input accepted by the planner's single validation gate.
 ///
 /// This type deliberately contains no query payload, identifier, tenant value, or
@@ -34,6 +41,7 @@ pub struct PlannerRequest {
     pub(crate) cardinality: CardinalityEstimate,
     pub(crate) selectivity: SelectivityProfile,
     pub(crate) capability: BackendCapability,
+    pub(crate) warm_cache_attestation: Option<WarmCacheAttestation>,
     pub(crate) generation: GenerationBinding,
     pub(crate) intent: RetrievalIntent,
     pub(crate) estimate_handling: EstimateHandlingMode,
@@ -51,6 +59,7 @@ impl PlannerRequest {
         cardinality: CardinalityEstimate,
         selectivity: SelectivityProfile,
         capability: BackendCapability,
+        warm_cache_attestation: Option<WarmCacheAttestation>,
         generation: GenerationBinding,
         intent: RetrievalIntent,
         estimate_handling: EstimateHandlingMode,
@@ -64,6 +73,7 @@ impl PlannerRequest {
             cardinality,
             selectivity,
             capability,
+            warm_cache_attestation,
             generation,
             intent,
             estimate_handling,
@@ -80,6 +90,13 @@ impl PlannerRequest {
         self.budget.validate()?;
         self.selectivity.validate()?;
         self.capability.validate()?;
+        if self.capability.requires_verified_warm_cache_attestation()
+            && self.warm_cache_attestation.is_none()
+        {
+            return Err(SearchPlannerError::new(
+                SearchPlannerDiagnosticCode::CapabilityUnsupported,
+            ));
+        }
         if self.vector_dimension == 0
             || !self.capability.supports_dimension(self.vector_dimension)
             || !self.capability.supports_metric(self.vector_metric)

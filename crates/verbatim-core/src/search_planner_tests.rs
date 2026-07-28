@@ -93,7 +93,35 @@ fn tight_budgets_reject_overflow_widening_and_every_excess_dimension() {
 
     let excessive_usages = [
         SearchBudgetUsage {
+            result_records: 2,
+            ..SearchBudgetUsage::default()
+        },
+        SearchBudgetUsage {
             dense_candidates: 2,
+            ..SearchBudgetUsage::default()
+        },
+        SearchBudgetUsage {
+            lexical_candidates: 2,
+            ..SearchBudgetUsage::default()
+        },
+        SearchBudgetUsage {
+            exact_candidates: 2,
+            ..SearchBudgetUsage::default()
+        },
+        SearchBudgetUsage {
+            graph_candidates: 2,
+            ..SearchBudgetUsage::default()
+        },
+        SearchBudgetUsage {
+            fused_records: 2,
+            ..SearchBudgetUsage::default()
+        },
+        SearchBudgetUsage {
+            reranked_records: 2,
+            ..SearchBudgetUsage::default()
+        },
+        SearchBudgetUsage {
+            full_precision_rescored_records: 2,
             ..SearchBudgetUsage::default()
         },
         SearchBudgetUsage {
@@ -126,6 +154,10 @@ fn tight_budgets_reject_overflow_widening_and_every_excess_dimension() {
         },
         SearchBudgetUsage {
             stage_attempts: 2,
+            ..SearchBudgetUsage::default()
+        },
+        SearchBudgetUsage {
+            debug_records: 2,
             ..SearchBudgetUsage::default()
         },
     ];

@@ -143,7 +143,24 @@ impl RetrievalPlan {
         budget.ensure_not_wider_than(&caller_budget)?;
         let fields = budget.fields();
         let requires_approximation = path == SelectedPath::PredicateAwareDiskAnn3;
-        if requires_approximation != approximate_profile.is_some()
+        let path_completeness_is_valid = matches!(
+            (path, planned_completeness),
+            (
+                SelectedPath::PredicateAwareDiskAnn3,
+                PlannedCompleteness::ApproximatePartial
+            ) | (
+                SelectedPath::ExactSimdScan,
+                PlannedCompleteness::ExactWithinAuthorizedScope
+            ) | (
+                SelectedPath::ExhaustiveEnumeration,
+                PlannedCompleteness::ExhaustiveWithinAuthorizedScope
+            ) | (
+                SelectedPath::NamedDegradedProfile(_),
+                PlannedCompleteness::DegradedPartial
+            )
+        );
+        if !path_completeness_is_valid
+            || requires_approximation != approximate_profile.is_some()
             || full_precision_rescore_budget.candidate_limit() > fields.full_precision_rescore_limit
             || full_precision_rescore_budget.cpu_micros() > fields.max_cpu_micros
         {
