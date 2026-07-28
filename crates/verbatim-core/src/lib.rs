@@ -55,6 +55,7 @@ pub mod task;
 pub mod traits;
 pub mod types;
 pub mod upstream;
+pub mod vector_shards;
 pub mod vision_caption;
 
 #[cfg(test)]
