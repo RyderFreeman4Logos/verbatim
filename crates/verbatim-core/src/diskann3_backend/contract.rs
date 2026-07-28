@@ -4,6 +4,11 @@ use async_trait::async_trait;
 
 use crate::storage_ports::VectorSearch;
 
+mod sealed {
+    /// Marker implemented only by crate-owned DiskANN3 adapter types.
+    pub trait Sealed {}
+}
+
 use super::{
     BatchUpsertRequest, DiskAnnBackendResult, DiskAnnCapabilities, ExactVectorFetchRequest,
     ExactVectorFetchResponse, GenerationContext, GenerationReceipt, GenerationStatus,
@@ -12,13 +17,18 @@ use super::{
     TopKSearchRequest,
 };
 
-/// DiskANN3 lifecycle and exact-rescore operations layered over the core [`VectorSearch`] port.
+/// Crate-owned walking-skeleton adapter contract layered over the core [`VectorSearch`] port.
 ///
-/// A provider must also implement [`VectorSearch`], so ordinary dense search remains reachable
-/// through the repository-standard storage capability while backend-specific operations stay
-/// generation-, predicate-, and budget-bound at this adapter boundary.
+/// This trait is deliberately sealed: it is not a downstream provider extension point.
+/// [`SearchPage`] issuance remains crate-private, so a future out-of-crate provider
+/// needs a separate issuer boundary rather than implementing this trait directly.
+///
+/// A crate-owned adapter must also implement [`VectorSearch`], so ordinary dense search
+/// remains reachable through the repository-standard storage capability while
+/// backend-specific operations stay generation-, predicate-, and budget-bound at this
+/// adapter boundary.
 #[async_trait]
-pub trait DiskAnnVectorSearch: VectorSearch {
+pub trait DiskAnnVectorSearch: sealed::Sealed + VectorSearch {
     /// Persist validated shard-generation inputs before a build may begin.
     async fn stage_shard_generation(
         &self,

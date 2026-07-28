@@ -1,0 +1,17 @@
+error[E0277]: the trait bound `ExternalProvider: diskann3_backend::contract::sealed::Sealed` is not satisfied
+  --> tests/ui/diskann3_backend_external_impl.rs:30:30
+   |
+30 | impl DiskAnnVectorSearch for ExternalProvider {
+   |                              ^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `diskann3_backend::contract::sealed::Sealed` is not implemented for `ExternalProvider`
+  --> tests/ui/diskann3_backend_external_impl.rs:14:1
+   |
+14 | struct ExternalProvider;
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `DiskAnnVectorSearch`
+  --> src/diskann3_backend/contract.rs
+   |
+   | pub trait DiskAnnVectorSearch: sealed::Sealed + VectorSearch {
+   |                                ^^^^^^^^^^^^^^ required by this bound in `DiskAnnVectorSearch`
+   = note: `DiskAnnVectorSearch` is a "sealed trait", because to implement it you also need to implement `verbatim_core::diskann3_backend::contract::sealed::Sealed`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it

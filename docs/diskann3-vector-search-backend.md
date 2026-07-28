@@ -1,21 +1,36 @@
 # DiskANN3 VectorSearch backend adapter contract
 
-`verbatim_core::diskann3_backend` is the **adapter contract**, not a DiskANN3
-implementation. It defines the validated inputs, operation surface, observable
-capabilities, and fail-closed diagnostic vocabulary that a future DiskANN3
-provider must honor before it can be used as a `storage_ports::VectorSearch`.
+`verbatim_core::diskann3_backend` is a **crate-owned walking-skeleton adapter
+contract**, not a DiskANN3 implementation or public provider-extension API. It
+defines the validated inputs, operation surface, observable capabilities, and
+fail-closed diagnostic vocabulary that a future crate-owned DiskANN3 integration
+must honor before it can be used as a `storage_ports::VectorSearch`.
 
 ## Boundary ownership
 
 | Layer | Owns | Does not own |
 | --- | --- | --- |
 | `diskann3` | Publication generations, shard identities, predicate types, and architecture-specific invariants | An upstream ANN dependency, native lifecycle, or SSD I/O |
-| `diskann3_backend` | The anti-corruption adapter contract, validated provider operations, mapping/version bindings, capabilities, and diagnostics | A concrete `DataProvider`, Daemon, page-cache implementation, or upstream types in public APIs |
+| `diskann3_backend` | The crate-owned anti-corruption adapter contract, validated adapter operations, mapping/version bindings, capabilities, and diagnostics | A concrete `DataProvider`, daemon, page-cache implementation, upstream types in public APIs, or an out-of-crate provider extension boundary |
 | `storage_ports::VectorSearch` | The repository-standard dense search capability used by callers | DiskANN3-specific lifecycle, recovery, and exact-rescore details |
 
-`DiskAnnVectorSearch` extends `storage_ports::VectorSearch`. A concrete backend
-therefore remains reachable through the standard repository port, while its
-DiskANN3-specific operations stay behind one explicit contract boundary.
+`DiskAnnVectorSearch` extends `storage_ports::VectorSearch`, but is deliberately
+sealed and crate-owned: only `verbatim_core` may implement it. The trait records
+the walking skeleton's internal adapter boundary; it is not a downstream provider
+plugin contract. A concrete crate-owned backend therefore remains reachable
+through the standard repository port while its DiskANN3-specific operations stay
+behind one explicit contract boundary.
+
+### Page issuance and future extensions
+
+`SearchCandidate` and `SearchPage` are opaque public result types, but their
+issuance constructors are crate-private. Public callers can consume an issued
+page but cannot forge a candidate or page, and an out-of-crate provider cannot
+implement `DiskAnnVectorSearch` to issue one. A future out-of-crate provider
+needs a separately designed issuer boundary whose crate-owned side validates raw
+provider output and materializes pages. That boundary is not part of this slice;
+this contract intentionally exposes no public `SearchCandidate` or `SearchPage`
+factory.
 
 ## Invariants at the boundary
 
@@ -39,9 +54,9 @@ can receive it:
 The contract accepts no implicit default vector space, profile, generation,
 metric, score interpretation, or resource budget.
 
-## Required provider operations
+## Required crate-owned adapter operations
 
-A `DiskAnnVectorSearch` implementation must provide contract operations for:
+A crate-owned `DiskAnnVectorSearch` implementation must provide contract operations for:
 
 1. staging, building, loading, and validating a shard generation;
 2. idempotent batch upserts and stable-ID tombstones;
@@ -91,7 +106,7 @@ representation.
 ## Future upstream adoption and pinning policy
 
 This contract intentionally adds **no** upstream DiskANN3 dependency or pin.
-When a concrete provider is proposed, the owner must first record an audited,
+When a concrete integration is proposed, the owner must first record an audited,
 immutable upstream release/tag and source revision, package name and enabled
 features, license, checksum or source provenance, MSRV compatibility, unsafe
 and FFI surface, security/advisory review, benchmark evidence, and rollback
