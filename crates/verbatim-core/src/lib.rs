@@ -46,6 +46,7 @@ pub mod resource;
 pub mod result_diversity;
 pub mod retrieve;
 pub mod sdk;
+pub mod search_planner;
 pub mod source_metadata;
 pub mod storage_ports;
 pub mod store;
