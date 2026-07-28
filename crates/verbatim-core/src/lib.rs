@@ -17,6 +17,7 @@ pub mod diskann3;
 pub mod diskann3_backend;
 pub mod durability;
 pub mod embed;
+pub mod enterprise_predicates;
 pub mod erasure;
 #[path = "types_evidence_spans.rs"]
 pub mod evidence_spans;
