@@ -14,6 +14,7 @@ pub mod config;
 pub mod context;
 pub mod deletion;
 pub mod diskann3;
+pub mod diskann3_backend;
 pub mod durability;
 pub mod embed;
 pub mod erasure;
@@ -55,4 +56,8 @@ pub mod traits;
 pub mod types;
 pub mod upstream;
 pub mod vision_caption;
+
+#[cfg(test)]
+#[path = "diskann3_backend/tests.rs"]
+mod diskann3_backend_tests;
 pub mod wire_schemas;
