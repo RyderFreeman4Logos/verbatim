@@ -144,7 +144,7 @@ impl RangeSearchRequest {
     }
 }
 
-/// One generation-bound approximate candidate and its explicitly metric-labelled score.
+/// Opaque provider-issued approximate candidate with an explicitly metric-labelled score.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchCandidate {
     vector_id: StableVectorId,
@@ -153,8 +153,9 @@ pub struct SearchCandidate {
 }
 
 impl SearchCandidate {
-    /// Creates a candidate whose score cannot be interpreted without its metric label.
-    pub const fn new(
+    /// Issues a candidate only after the adapter receives a provider search result.
+    #[allow(dead_code)]
+    pub(crate) const fn new(
         vector_id: StableVectorId,
         generation: PublicationGeneration,
         score: CandidateScore,
@@ -177,7 +178,7 @@ impl SearchCandidate {
     }
 }
 
-/// Bounded candidate page from either Top-K or range search.
+/// Opaque bounded candidate page issued by either Top-K or range search.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchPage {
     context: GenerationContext,
@@ -185,22 +186,25 @@ pub struct SearchPage {
 }
 
 impl SearchPage {
-    /// Builds a page whose cardinality is bound to one concrete Top-K request.
-    pub fn from_top_k_request(
+    /// Issues a page only after the adapter completes a concrete Top-K provider search.
+    #[allow(dead_code)]
+    pub(crate) fn from_top_k_request(
         request: &TopKSearchRequest,
         candidates: Vec<SearchCandidate>,
     ) -> DiskAnnBackendResult<Self> {
         Self::from_request(request.context(), request.limit(), candidates)
     }
 
-    /// Builds a page whose cardinality is bound to one concrete range-search request.
-    pub fn from_range_search_request(
+    /// Issues a page only after the adapter completes a concrete range provider search.
+    #[allow(dead_code)]
+    pub(crate) fn from_range_search_request(
         request: &RangeSearchRequest,
         candidates: Vec<SearchCandidate>,
     ) -> DiskAnnBackendResult<Self> {
         Self::from_request(request.context(), request.limit(), candidates)
     }
 
+    #[allow(dead_code)]
     fn from_request(
         context: &SearchContext,
         limit: usize,

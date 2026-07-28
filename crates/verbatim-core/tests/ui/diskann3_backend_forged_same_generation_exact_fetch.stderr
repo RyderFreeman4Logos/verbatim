@@ -1,0 +1,28 @@
+error[E0624]: associated function `new` is private
+  --> tests/ui/diskann3_backend_forged_same_generation_exact_fetch.rs:59:38
+   |
+59 |       let candidate = SearchCandidate::new(
+   |                                        ^^^ private associated function
+   |
+  ::: src/diskann3_backend/search.rs
+   |
+   | /     pub(crate) const fn new(
+   | |         vector_id: StableVectorId,
+   | |         generation: PublicationGeneration,
+   | |         score: CandidateScore,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
+
+error[E0624]: associated function `from_top_k_request` is private
+  --> tests/ui/diskann3_backend_forged_same_generation_exact_fetch.rs:64:28
+   |
+64 |       let page = SearchPage::from_top_k_request(&request, vec![candidate])
+   |                              ^^^^^^^^^^^^^^^^^^ private associated function
+   |
+  ::: src/diskann3_backend/search.rs
+   |
+   | /     pub(crate) fn from_top_k_request(
+   | |         request: &TopKSearchRequest,
+   | |         candidates: Vec<SearchCandidate>,
+   | |     ) -> DiskAnnBackendResult<Self> {
+   | |___________________________________- private associated function defined here
