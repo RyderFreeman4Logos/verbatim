@@ -36,6 +36,7 @@ pub mod migration_framework;
 pub mod multi_hop_research;
 pub mod observability_contract;
 pub mod ocr;
+pub mod overfetch;
 pub mod pagination;
 pub mod parser;
 pub mod profiles;
