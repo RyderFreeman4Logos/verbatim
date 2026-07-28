@@ -278,6 +278,34 @@ fn overfetch_contract_retrieve_rejects_omitted_and_unrecorded_hydration_batches(
 }
 
 #[test]
+fn overfetch_contract_retrieve_rejects_prefilled_instrumentation_before_zero_record_hydration() {
+    let contract = ContractStub::configured(
+        1_000,
+        &[Attempt::Satisfied],
+        PlanTampering::None,
+        HydrationMode::ZeroRecord,
+    );
+    let mut statements = StatementCountInstrumentation::new(5).expect("statement cap");
+    for batch in HydrationBatchKind::ALL {
+        statements
+            .record_hydration_batch(batch)
+            .expect("prefilled complete instrumentation");
+    }
+
+    assert_eq!(
+        retrieve(
+            &contract,
+            &RetrievalFilters::default(),
+            &StrictFilterSupport::Native,
+            &mut statements,
+        )
+        .expect_err("prefilled instrumentation must not make zero-record hydration pass"),
+        OverfetchError::NPlusOneDetected
+    );
+    assert!(contract.calls.borrow().is_empty());
+}
+
+#[test]
 fn overfetch_contract_retrieve_rejects_extra_per_candidate_sql_with_spare_capacity() {
     let contract = ContractStub::configured(
         1_000,
@@ -367,6 +395,7 @@ enum HydrationMode {
     Complete,
     OmitEvidenceUnits,
     Unrecorded,
+    ZeroRecord,
     PerCandidate,
 }
 
@@ -501,6 +530,7 @@ impl BatchHydrationPort for ContractStub {
                     statements.record_statement()?;
                 }
             }
+            HydrationMode::ZeroRecord => {}
             HydrationMode::Complete
             | HydrationMode::OmitEvidenceUnits
             | HydrationMode::PerCandidate => {

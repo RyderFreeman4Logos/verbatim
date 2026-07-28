@@ -69,6 +69,14 @@ impl StatementCountInstrumentation {
         self.observed_statements
     }
 
+    /// Rejects counter state reused from an earlier retrieval.
+    pub(crate) fn assert_fresh(&self) -> OverfetchResult<()> {
+        if self.observed_statements != 0 || self.observed_hydration_batches() != 0 {
+            return Err(OverfetchError::NPlusOneDetected);
+        }
+        Ok(())
+    }
+
     /// Records any one SQL statement and rejects a request that crosses its cap.
     pub fn record_statement(&mut self) -> OverfetchResult<()> {
         let next = self

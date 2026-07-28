@@ -126,6 +126,7 @@ where
         primary_backend_selection: &PrimaryBackendSelection,
         statements: &mut StatementCountInstrumentation,
     ) -> OverfetchResult<Self::Report> {
+        statements.assert_fresh()?;
         budget.validate()?;
         primary_backend_selection.validate()?;
 
