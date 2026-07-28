@@ -4,11 +4,13 @@ use super::*;
 
 impl Store {
     /// Return the on-disk database path, if this store is not in-memory.
+    #[allow(dead_code)]
     pub(crate) fn database_path(&self) -> Option<&Path> {
         self.database_path.as_deref()
     }
 
     /// Return the durability profile selected when this store was opened.
+    #[allow(dead_code)]
     pub(crate) fn durability_profile(&self) -> SqliteDurabilityProfile {
         self.durability_profile
     }
