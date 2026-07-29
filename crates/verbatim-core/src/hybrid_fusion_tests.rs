@@ -492,6 +492,48 @@ fn decode_rejects_invalid_completeness_coverage() {
     .expect_err("invalid coverage must be rejected");
     assert_eq!(
         error.diagnostic_code(),
-        FusionDiagnosticCode::CompletenessCoverageInvalid
+        FusionDiagnosticCode::InvalidStageOutputJson
+    );
+}
+
+#[test]
+fn direct_serde_deserialize_rejects_invalid_coverage() {
+    let output = FusionStageOutput::new(
+        profile(),
+        vec![dense_result(), exhaustive_result("authorized-snapshot")],
+        vec![exact_candidate()],
+        exact_scope("authorized-snapshot"),
+        &budget(),
+    )
+    .expect("valid test output");
+    let encoded = encode_fusion_stage_output_json(&output).expect("valid output encodes");
+    let mut tampered: serde_json::Value = serde_json::from_str(&encoded).expect("valid test json");
+    tampered["completeness"]["coverage"]["enumerated"] = serde_json::json!(0);
+
+    let result: Result<FusionStageOutput, _> =
+        serde_json::from_str(&serde_json::to_string(&tampered).expect("tampered json encodes"));
+    assert!(
+        result.is_err(),
+        "direct serde must reject invalid coverage via custom deserializer"
+    );
+}
+
+#[test]
+fn output_coverage_must_match_qualifying_exhaustive_retriever() {
+    let mismatched_coverage = CompletenessState::ExactScopeEnumerated {
+        scope_id: ExhaustiveScopeId::new("authorized-snapshot".into()).expect("test scope"),
+        coverage: CoverageAccount::new(99, 99).expect("different coverage"),
+    };
+    let error = FusionStageOutput::new(
+        profile(),
+        vec![dense_result(), exhaustive_result("authorized-snapshot")],
+        vec![exact_candidate()],
+        mismatched_coverage,
+        &budget(),
+    )
+    .expect_err("coverage mismatch must be rejected");
+    assert_eq!(
+        error.diagnostic_code(),
+        FusionDiagnosticCode::CompletenessApproximateCannotClaimExhaustive
     );
 }

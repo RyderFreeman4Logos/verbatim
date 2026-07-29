@@ -204,18 +204,33 @@ fn validate_exact_scope_claim(
     retriever_results: &[RetrieverResult],
     candidates: &[FusionCandidate],
 ) -> FusionResult<()> {
-    let CompletenessState::ExactScopeEnumerated { scope_id, .. } = completeness else {
+    let CompletenessState::ExactScopeEnumerated {
+        scope_id,
+        coverage: output_coverage,
+    } = completeness
+    else {
         return Ok(());
     };
     let has_matching_exhaustive_contribution = retriever_results.iter().any(|result| {
-        result.may_claim_exhaustive()
-            && result.completeness().scope_id() == Some(scope_id)
-            && candidates.iter().any(|candidate| {
-                candidate
-                    .provenance()
-                    .iter()
-                    .any(|entry| entry.retriever_id() == result.retriever_id())
-            })
+        if !result.may_claim_exhaustive() || result.completeness().scope_id() != Some(scope_id) {
+            return false;
+        }
+        // The output's coverage must match the qualifying exhaustive retriever's.
+        if let CompletenessState::ExactScopeEnumerated {
+            coverage: retriever_coverage,
+            ..
+        } = result.completeness()
+        {
+            if retriever_coverage != output_coverage {
+                return false;
+            }
+        }
+        candidates.iter().any(|candidate| {
+            candidate
+                .provenance()
+                .iter()
+                .any(|entry| entry.retriever_id() == result.retriever_id())
+        })
     });
     if !has_matching_exhaustive_contribution {
         return Err(FusionError::completeness_violation(

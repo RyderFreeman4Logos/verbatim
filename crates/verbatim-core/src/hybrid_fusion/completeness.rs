@@ -43,10 +43,25 @@ impl fmt::Display for ExhaustiveScopeId {
 /// `enumerated` is the number of items the exhaustive workflow visited;
 /// `matched` is how many of those satisfied the retrieval predicate. The
 /// invariant `matched <= enumerated` is enforced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CoverageAccount {
     enumerated: u64,
     matched: u64,
+}
+
+impl<'de> Deserialize<'de> for CoverageAccount {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            enumerated: u64,
+            matched: u64,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::new(raw.enumerated, raw.matched).map_err(serde::de::Error::custom)
+    }
 }
 
 impl CoverageAccount {
@@ -95,7 +110,7 @@ impl CoverageAccount {
 /// is only permitted when an exhaustive scope has been declared and its
 /// coverage tracked. `CoverageIncomplete` records that coverage could not be
 /// established and no exhaustive claim may be made.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CompletenessState {
     /// Approximate Top-K fusion. No exhaustive claim is permitted.
@@ -109,6 +124,33 @@ pub enum CompletenessState {
     },
     /// Coverage could not be established. No exhaustive claim is permitted.
     CoverageIncomplete { scope_id: ExhaustiveScopeId },
+}
+
+impl<'de> Deserialize<'de> for CompletenessState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Raw {
+            ApproximateTopK,
+            ExactScopeEnumerated {
+                scope_id: ExhaustiveScopeId,
+                coverage: CoverageAccount,
+            },
+            CoverageIncomplete {
+                scope_id: ExhaustiveScopeId,
+            },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::ApproximateTopK => Ok(Self::ApproximateTopK),
+            Raw::ExactScopeEnumerated { scope_id, coverage } => {
+                Ok(Self::ExactScopeEnumerated { scope_id, coverage })
+            }
+            Raw::CoverageIncomplete { scope_id } => Ok(Self::CoverageIncomplete { scope_id }),
+        }
+    }
 }
 
 impl CompletenessState {
