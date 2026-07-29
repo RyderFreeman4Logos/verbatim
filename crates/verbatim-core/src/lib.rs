@@ -25,6 +25,7 @@ pub mod evidence_spans;
 pub mod exact_scan;
 pub mod exhaustive_audit;
 pub mod generate;
+pub mod generation_publication;
 pub mod graph_extraction;
 pub mod graphrag;
 pub mod grounded_answer;
