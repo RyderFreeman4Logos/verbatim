@@ -152,7 +152,7 @@ impl BackendAttribute {
             )
             | (BackendAttributeKey::QdrantRescore, BackendAttributeValue::Boolean(_)) => Ok(()),
             (_, BackendAttributeValue::Unsigned(_)) => Err(TelemetryError::contract(
-                TelemetryDiagnosticCode::BackendAttributeValueOutOfBounds,
+                TelemetryDiagnosticCode::InvalidBackendAttribute,
             )),
             _ => Err(TelemetryError::contract(
                 TelemetryDiagnosticCode::InvalidBackendAttribute,

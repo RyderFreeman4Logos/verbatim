@@ -255,3 +255,81 @@ fn retrieval_telemetry_deserialization_revalidates_invariants() {
 
     assert!(serde_json::from_value::<RedactedTelemetryId>(serde_json::json!("raw-id"),).is_err());
 }
+
+#[test]
+fn categorical_key_with_unsigned_value_is_invalid_attribute() {
+    let error = BackendAttribute::new(
+        BackendAttributeKey::DiskannProviderLayout,
+        BackendAttributeValue::Unsigned(1),
+    )
+    .expect_err("unsigned value with categorical key must fail");
+    assert_eq!(
+        error.diagnostic_code(),
+        TelemetryDiagnosticCode::InvalidBackendAttribute
+    );
+}
+
+#[test]
+fn numeric_key_zero_value_is_out_of_bounds() {
+    let error = BackendAttribute::new(
+        BackendAttributeKey::DiskannSearchEffort,
+        BackendAttributeValue::Unsigned(0),
+    )
+    .expect_err("zero numeric value must fail");
+    assert_eq!(
+        error.diagnostic_code(),
+        TelemetryDiagnosticCode::BackendAttributeValueOutOfBounds
+    );
+}
+
+#[test]
+fn numeric_key_over_limit_is_out_of_bounds() {
+    let error = BackendAttribute::new(
+        BackendAttributeKey::DiskannSearchEffort,
+        BackendAttributeValue::Unsigned(u64::MAX),
+    )
+    .expect_err("over-limit numeric value must fail");
+    assert_eq!(
+        error.diagnostic_code(),
+        TelemetryDiagnosticCode::BackendAttributeValueOutOfBounds
+    );
+}
+
+#[test]
+fn memory_snapshot_exceeds_bound_is_diagnostic() {
+    use crate::retrieval_telemetry::MemorySnapshotFields;
+    let error = MemorySnapshot::new(MemorySnapshotFields {
+        cgroup_current_bytes: u64::MAX,
+        cgroup_peak_bytes: 10,
+        events: Default::default(),
+        anonymous_bytes: 0,
+        file_bytes: 0,
+        kernel_bytes: 0,
+    })
+    .expect_err("exceeds-bound snapshot must fail");
+    assert_eq!(
+        error.diagnostic_code(),
+        TelemetryDiagnosticCode::MemorySnapshotExceedsBound
+    );
+}
+
+#[test]
+fn redacted_telemetry_id_empty_token_is_diagnostic() {
+    let error = RedactedTelemetryId::new(String::new()).expect_err("empty token must fail");
+    assert_eq!(
+        error.diagnostic_code(),
+        TelemetryDiagnosticCode::InvalidRedactedTelemetryId
+    );
+}
+
+#[test]
+fn span_extend_overflow_is_diagnostic() {
+    let mut span = StageSpan::new(SpanKind::DenseRetrieval, 0, 1).expect("valid span");
+    let error = span
+        .extend_by_micros(u64::MAX)
+        .expect_err("overflow must fail");
+    assert_eq!(
+        error.diagnostic_code(),
+        TelemetryDiagnosticCode::SpanDurationExceeded
+    );
+}
