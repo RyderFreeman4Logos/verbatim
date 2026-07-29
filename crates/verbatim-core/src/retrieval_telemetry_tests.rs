@@ -296,6 +296,19 @@ fn numeric_key_over_limit_is_out_of_bounds() {
 }
 
 #[test]
+fn exact_scan_cardinality_over_limit_is_out_of_bounds() {
+    let error = BackendAttribute::new(
+        BackendAttributeKey::ExactScanCardinality,
+        BackendAttributeValue::Unsigned(u64::MAX),
+    )
+    .expect_err("over-limit cardinality must fail with bounds error");
+    assert_eq!(
+        error.diagnostic_code(),
+        TelemetryDiagnosticCode::BackendAttributeValueOutOfBounds
+    );
+}
+
+#[test]
 fn memory_snapshot_exceeds_bound_is_diagnostic() {
     use crate::retrieval_telemetry::MemorySnapshotFields;
     let error = MemorySnapshot::new(MemorySnapshotFields {
@@ -310,6 +323,24 @@ fn memory_snapshot_exceeds_bound_is_diagnostic() {
     assert_eq!(
         error.diagnostic_code(),
         TelemetryDiagnosticCode::MemorySnapshotExceedsBound
+    );
+}
+
+#[test]
+fn memory_snapshot_current_exceeds_peak_is_invalid() {
+    use crate::retrieval_telemetry::MemorySnapshotFields;
+    let error = MemorySnapshot::new(MemorySnapshotFields {
+        cgroup_current_bytes: 100,
+        cgroup_peak_bytes: 50,
+        events: Default::default(),
+        anonymous_bytes: 0,
+        file_bytes: 0,
+        kernel_bytes: 0,
+    })
+    .expect_err("current > peak must fail");
+    assert_eq!(
+        error.diagnostic_code(),
+        TelemetryDiagnosticCode::InvalidMemorySnapshot
     );
 }
 

@@ -141,6 +141,10 @@ impl BackendAttribute {
             {
                 Ok(())
             }
+            // ExactScanCardinality is numeric — an out-of-range value is a bounds error.
+            (BackendAttributeKey::ExactScanCardinality, BackendAttributeValue::Unsigned(_)) => Err(
+                TelemetryError::contract(TelemetryDiagnosticCode::BackendAttributeValueOutOfBounds),
+            ),
             (
                 BackendAttributeKey::DiskannProviderLayout,
                 BackendAttributeValue::DiskannProviderLayout(_),
