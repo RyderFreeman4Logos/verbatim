@@ -3,7 +3,7 @@
 //! The only durable result of this contract: the fused candidates carry full
 //! per-retriever provenance (raw ranks/scores), while the complete retriever
 //! results remain embedded for audit. JSON decode revalidates profile,
-//! candidate, provenance, and usage invariants.
+//! candidate, provenance, completeness, and usage invariants.
 
 use std::collections::BTreeSet;
 
@@ -18,7 +18,7 @@ use super::{
 ///
 /// Candidates are the merged pool; `retriever_results` retains every
 /// contributing retriever's raw ranked output so raw ranks/scores survive to
-/// debug/evaluation artifacts. Usage is checked against the budget.
+/// debug/evaluation artifacts. Usage is checked against the stored budget.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FusionStageOutput {
     profile: FusionProfile,
@@ -26,11 +26,12 @@ pub struct FusionStageOutput {
     candidates: Vec<FusionCandidate>,
     completeness: CompletenessState,
     usage: FusionUsage,
+    budget: FusionBudget,
 }
 
 impl FusionStageOutput {
     /// Builds an output only after validating profile, retriever results,
-    /// candidates, provenance attribution, and budget usage.
+    /// candidates, provenance attribution, completeness, and budget usage.
     pub fn new(
         profile: FusionProfile,
         retriever_results: Vec<RetrieverResult>,
@@ -38,74 +39,8 @@ impl FusionStageOutput {
         completeness: CompletenessState,
         budget: &FusionBudget,
     ) -> FusionResult<Self> {
-        profile.validate()?;
-        if retriever_results.is_empty() {
-            return Err(FusionError::validation(
-                FusionDiagnosticCode::StageOutputRequiresRetrieverResults,
-            ));
-        }
-        for result in &retriever_results {
-            result.validate()?;
-        }
-        if candidates.is_empty() {
-            return Err(FusionError::validation(
-                FusionDiagnosticCode::StageOutputRequiresCandidates,
-            ));
-        }
-        for candidate in &candidates {
-            candidate.validate()?;
-        }
-        // Every candidate's contributing retriever must exist among the
-        // retriever results; every candidate hit id must exist in at least one
-        // retriever result.
-        let retriever_ids: BTreeSet<&str> = retriever_results
-            .iter()
-            .map(RetrieverResult::retriever_id)
-            .collect();
-        let mut candidate_hit_ids: BTreeSet<&str> = BTreeSet::new();
-        for candidate in &candidates {
-            if !candidate_hit_ids.insert(candidate.hit_id()) {
-                return Err(FusionError::validation(
-                    FusionDiagnosticCode::StageOutputDuplicateCandidateHitId,
-                ));
-            }
-            for entry in candidate.provenance() {
-                if !retriever_ids.contains(entry.retriever_id()) {
-                    return Err(FusionError::validation(
-                        FusionDiagnosticCode::StageOutputProvenanceRetrieverAbsent,
-                    ));
-                }
-            }
-        }
-        // Each candidate hit id must appear in at least one retriever result.
-        let all_retriever_hit_ids: BTreeSet<&str> = retriever_results
-            .iter()
-            .flat_map(|r| r.candidates().iter().map(|c| c.hit_id()))
-            .collect();
-        for hit_id in &candidate_hit_ids {
-            if !all_retriever_hit_ids.contains(hit_id) {
-                return Err(FusionError::validation(
-                    FusionDiagnosticCode::StageOutputCandidateHitIdAbsentFromRetrievers,
-                ));
-            }
-        }
-        // Completeness consistency: if any contributing retriever is
-        // approximate, the overall state may not be ExactScopeEnumerated
-        // unless an exhaustive retriever is also present and covers the scope.
-        let any_approximate = retriever_results.iter().any(|r| r.kind().is_approximate());
-        completeness.validate_against_approximate(
-            any_approximate && { !retriever_results.iter().any(|r| r.may_claim_exhaustive()) },
-        )?;
-        let usage = FusionUsage {
-            retriever_candidates: retriever_results
-                .iter()
-                .map(|r| r.candidates().len() as u32)
-                .sum(),
-            fused_pool: candidates.len() as u32,
-            rerank_input: 0,
-            final_hydration_list: 0,
-            debug_output: 0,
-        };
+        validate_output_components(&profile, &retriever_results, &candidates, &completeness)?;
+        let usage = recompute_usage(&retriever_results, &candidates);
         usage.check(budget)?;
         Ok(Self {
             profile,
@@ -113,58 +48,24 @@ impl FusionStageOutput {
             candidates,
             completeness,
             usage,
+            budget: *budget,
         })
     }
 
+    /// Revalidates every persisted invariant before output is used or encoded.
     pub fn validate(&self) -> FusionResult<()> {
-        self.profile.validate()?;
-        if self.retriever_results.is_empty() {
+        validate_output_components(
+            &self.profile,
+            &self.retriever_results,
+            &self.candidates,
+            &self.completeness,
+        )?;
+        let usage = recompute_usage(&self.retriever_results, &self.candidates);
+        usage.check(&self.budget)?;
+        if self.usage != usage {
             return Err(FusionError::validation(
-                FusionDiagnosticCode::StageOutputRequiresRetrieverResults,
+                FusionDiagnosticCode::StageOutputUsageMismatch,
             ));
-        }
-        for result in &self.retriever_results {
-            result.validate()?;
-        }
-        if self.candidates.is_empty() {
-            return Err(FusionError::validation(
-                FusionDiagnosticCode::StageOutputRequiresCandidates,
-            ));
-        }
-        for candidate in &self.candidates {
-            candidate.validate()?;
-        }
-        let retriever_ids: BTreeSet<&str> = self
-            .retriever_results
-            .iter()
-            .map(RetrieverResult::retriever_id)
-            .collect();
-        let mut candidate_hit_ids: BTreeSet<&str> = BTreeSet::new();
-        for candidate in &self.candidates {
-            if !candidate_hit_ids.insert(candidate.hit_id()) {
-                return Err(FusionError::validation(
-                    FusionDiagnosticCode::StageOutputDuplicateCandidateHitId,
-                ));
-            }
-            for entry in candidate.provenance() {
-                if !retriever_ids.contains(entry.retriever_id()) {
-                    return Err(FusionError::validation(
-                        FusionDiagnosticCode::StageOutputProvenanceRetrieverAbsent,
-                    ));
-                }
-            }
-        }
-        let all_retriever_hit_ids: BTreeSet<&str> = self
-            .retriever_results
-            .iter()
-            .flat_map(|r| r.candidates().iter().map(|c| c.hit_id()))
-            .collect();
-        for hit_id in &candidate_hit_ids {
-            if !all_retriever_hit_ids.contains(hit_id) {
-                return Err(FusionError::validation(
-                    FusionDiagnosticCode::StageOutputCandidateHitIdAbsentFromRetrievers,
-                ));
-            }
         }
         Ok(())
     }
@@ -187,6 +88,131 @@ impl FusionStageOutput {
 
     pub const fn usage(&self) -> FusionUsage {
         self.usage
+    }
+}
+
+fn validate_output_components(
+    profile: &FusionProfile,
+    retriever_results: &[RetrieverResult],
+    candidates: &[FusionCandidate],
+    completeness: &CompletenessState,
+) -> FusionResult<()> {
+    profile.validate()?;
+    if retriever_results.is_empty() {
+        return Err(FusionError::validation(
+            FusionDiagnosticCode::StageOutputRequiresRetrieverResults,
+        ));
+    }
+    for result in retriever_results {
+        result.validate()?;
+    }
+    if candidates.is_empty() {
+        return Err(FusionError::validation(
+            FusionDiagnosticCode::StageOutputRequiresCandidates,
+        ));
+    }
+
+    let mut candidate_hit_ids = BTreeSet::new();
+    for candidate in candidates {
+        candidate.validate()?;
+        if !candidate_hit_ids.insert(candidate.hit_id()) {
+            return Err(FusionError::validation(
+                FusionDiagnosticCode::StageOutputDuplicateCandidateHitId,
+            ));
+        }
+        validate_provenance_binding(candidate, retriever_results)?;
+    }
+
+    let all_retriever_hit_ids: BTreeSet<&str> = retriever_results
+        .iter()
+        .flat_map(|result| {
+            result
+                .candidates()
+                .iter()
+                .map(|candidate| candidate.hit_id())
+        })
+        .collect();
+    for hit_id in candidate_hit_ids {
+        if !all_retriever_hit_ids.contains(hit_id) {
+            return Err(FusionError::validation(
+                FusionDiagnosticCode::StageOutputCandidateHitIdAbsentFromRetrievers,
+            ));
+        }
+    }
+
+    validate_exact_scope_claim(completeness, retriever_results, candidates)
+}
+
+fn validate_provenance_binding(
+    candidate: &FusionCandidate,
+    retriever_results: &[RetrieverResult],
+) -> FusionResult<()> {
+    for entry in candidate.provenance() {
+        let result = retriever_results
+            .iter()
+            .find(|result| result.retriever_id() == entry.retriever_id())
+            .ok_or_else(|| {
+                FusionError::validation(FusionDiagnosticCode::StageOutputProvenanceRetrieverAbsent)
+            })?;
+        let retriever_candidate = result
+            .candidates()
+            .iter()
+            .find(|retriever_candidate| retriever_candidate.hit_id() == candidate.hit_id())
+            .ok_or_else(|| {
+                FusionError::validation(FusionDiagnosticCode::StageOutputProvenanceMismatch)
+            })?;
+        if result.kind() != entry.kind()
+            || retriever_candidate.raw_rank() != entry.raw_rank()
+            || retriever_candidate.raw_score() != entry.raw_score()
+        {
+            return Err(FusionError::validation(
+                FusionDiagnosticCode::StageOutputProvenanceMismatch,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_scope_claim(
+    completeness: &CompletenessState,
+    retriever_results: &[RetrieverResult],
+    candidates: &[FusionCandidate],
+) -> FusionResult<()> {
+    let CompletenessState::ExactScopeEnumerated { scope_id, .. } = completeness else {
+        return Ok(());
+    };
+    let has_matching_exhaustive_contribution = retriever_results.iter().any(|result| {
+        result.may_claim_exhaustive()
+            && result.completeness().scope_id() == Some(scope_id)
+            && candidates.iter().any(|candidate| {
+                candidate
+                    .provenance()
+                    .iter()
+                    .any(|entry| entry.retriever_id() == result.retriever_id())
+            })
+    });
+    if !has_matching_exhaustive_contribution {
+        return Err(FusionError::completeness_violation(
+            completeness.clone(),
+            FusionDiagnosticCode::CompletenessApproximateCannotClaimExhaustive,
+        ));
+    }
+    Ok(())
+}
+
+fn recompute_usage(
+    retriever_results: &[RetrieverResult],
+    candidates: &[FusionCandidate],
+) -> FusionUsage {
+    FusionUsage {
+        retriever_candidates: retriever_results
+            .iter()
+            .map(|result| result.candidates().len() as u32)
+            .sum(),
+        fused_pool: candidates.len() as u32,
+        rerank_input: 0,
+        final_hydration_list: 0,
+        debug_output: 0,
     }
 }
 

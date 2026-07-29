@@ -263,3 +263,195 @@ fn diagnostics_render_only_stable_codes() {
     assert!(!format!("{error:?}").contains(secret));
     assert!(!error.to_string().contains(secret));
 }
+
+fn exact_scope(scope_id: &str) -> CompletenessState {
+    CompletenessState::ExactScopeEnumerated {
+        scope_id: ExhaustiveScopeId::new(scope_id.into()).expect("test scope"),
+        coverage: CoverageAccount::new(2, 1).expect("test coverage"),
+    }
+}
+
+fn exhaustive_result(scope_id: &str) -> RetrieverResult {
+    RetrieverResult::new(
+        "enumerator".into(),
+        RetrieverKind::ExhaustiveEnumeration,
+        RetrieverGeneration::new("snapshot-1".into()).expect("test generation"),
+        None,
+        vec![RetrieverCandidate::new(
+            "hit-1".into(),
+            RawRank::new(1).expect("test rank"),
+            RawScore::new(1.0, ScoreDirection::Descending).expect("test score"),
+        )
+        .expect("test retriever candidate")],
+        exact_scope(scope_id),
+    )
+    .expect("test exhaustive result")
+}
+
+fn exact_candidate() -> FusionCandidate {
+    FusionCandidate::new(FusionCandidateFields {
+        hit_id: "hit-1".into(),
+        provenance: vec![
+            ProvenanceEntry::new(
+                "dense".into(),
+                RetrieverKind::DenseAnn,
+                RawRank::new(1).expect("test rank"),
+                RawScore::new(0.25, ScoreDirection::Ascending).expect("test score"),
+            )
+            .expect("test dense provenance"),
+            ProvenanceEntry::new(
+                "enumerator".into(),
+                RetrieverKind::ExhaustiveEnumeration,
+                RawRank::new(1).expect("test rank"),
+                RawScore::new(1.0, ScoreDirection::Descending).expect("test score"),
+            )
+            .expect("test exhaustive provenance"),
+        ],
+        inclusion_reason: InclusionReason::ExhaustiveScopeMatch,
+    })
+    .expect("test exact fusion candidate")
+}
+
+#[test]
+fn fusion_error_is_not_serde_serializable() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui/hybrid_fusion_error_not_serializable.rs");
+}
+
+#[test]
+fn stage_output_rejects_provenance_not_matching_bound_retriever() {
+    fn assert_provenance_mismatch(provenance: ProvenanceEntry) {
+        let mismatched = FusionCandidate::new(FusionCandidateFields {
+            hit_id: "hit-1".into(),
+            provenance: vec![provenance],
+            inclusion_reason: InclusionReason::RankedTopK,
+        })
+        .expect("test fusion candidate");
+
+        let error = FusionStageOutput::new(
+            profile(),
+            vec![dense_result()],
+            vec![mismatched],
+            CompletenessState::ApproximateTopK,
+            &budget(),
+        )
+        .expect_err("mismatched provenance must be rejected");
+        assert_eq!(
+            error.diagnostic_code(),
+            FusionDiagnosticCode::StageOutputProvenanceMismatch
+        );
+    }
+
+    assert_provenance_mismatch(
+        ProvenanceEntry::new(
+            "dense".into(),
+            RetrieverKind::DenseAnn,
+            RawRank::new(2).expect("mismatched test rank"),
+            RawScore::new(0.25, ScoreDirection::Ascending).expect("test score"),
+        )
+        .expect("rank-mismatched provenance"),
+    );
+    assert_provenance_mismatch(
+        ProvenanceEntry::new(
+            "dense".into(),
+            RetrieverKind::DenseAnn,
+            RawRank::new(1).expect("test rank"),
+            RawScore::new(0.5, ScoreDirection::Ascending).expect("mismatched test score"),
+        )
+        .expect("score-mismatched provenance"),
+    );
+    assert_provenance_mismatch(
+        ProvenanceEntry::new(
+            "dense".into(),
+            RetrieverKind::LexicalBm25,
+            RawRank::new(1).expect("test rank"),
+            RawScore::new(0.25, ScoreDirection::Ascending).expect("test score"),
+        )
+        .expect("kind-mismatched provenance"),
+    );
+}
+
+#[test]
+fn stage_output_exact_scope_requires_matching_exhaustive_contribution() {
+    let mismatched_scope = FusionStageOutput::new(
+        profile(),
+        vec![dense_result(), exhaustive_result("different-snapshot")],
+        vec![dense_candidate()],
+        exact_scope("authorized-snapshot"),
+        &budget(),
+    );
+    assert!(matches!(
+        mismatched_scope,
+        Err(FusionError::CompletenessViolation {
+            code: FusionDiagnosticCode::CompletenessApproximateCannotClaimExhaustive,
+            ..
+        })
+    ));
+
+    let missing_contribution = FusionStageOutput::new(
+        profile(),
+        vec![dense_result(), exhaustive_result("authorized-snapshot")],
+        vec![dense_candidate()],
+        exact_scope("authorized-snapshot"),
+        &budget(),
+    );
+    assert!(matches!(
+        missing_contribution,
+        Err(FusionError::CompletenessViolation {
+            code: FusionDiagnosticCode::CompletenessApproximateCannotClaimExhaustive,
+            ..
+        })
+    ));
+
+    assert!(FusionStageOutput::new(
+        profile(),
+        vec![dense_result(), exhaustive_result("authorized-snapshot")],
+        vec![exact_candidate()],
+        exact_scope("authorized-snapshot"),
+        &budget(),
+    )
+    .is_ok());
+}
+
+#[test]
+fn decode_rejects_tampered_stage_output_usage() {
+    let output = FusionStageOutput::new(
+        profile(),
+        vec![dense_result()],
+        vec![dense_candidate()],
+        CompletenessState::ApproximateTopK,
+        &budget(),
+    )
+    .expect("test stage output");
+    let encoded = encode_fusion_stage_output_json(&output).expect("test output encodes");
+    let mut tampered: serde_json::Value = serde_json::from_str(&encoded).expect("valid test json");
+    tampered["usage"]["fused_pool"] = serde_json::json!(0);
+
+    let error = decode_fusion_stage_output_json(
+        &serde_json::to_string(&tampered).expect("tampered json encodes"),
+    )
+    .expect_err("tampered usage must be rejected");
+    assert_eq!(
+        error.diagnostic_code(),
+        FusionDiagnosticCode::StageOutputUsageMismatch
+    );
+}
+
+#[test]
+fn weighted_score_rejects_empty_weights() {
+    assert!(matches!(
+        FusionProfile::new(FusionProfileFields {
+            version: 1,
+            strategy: FusionStrategy::WeightedScore,
+            weights: Vec::new(),
+            score_normalization: ScoreNormalizationKind::MinMax,
+            rrf_constant: 60,
+            candidate_limits: budget_fields(),
+            explainability: ExplainabilityLevel::Full,
+            accepts_reduced_explainability: false,
+        }),
+        Err(FusionError::Validation {
+            code: FusionDiagnosticCode::ProfileWeightsMustSumToUnit,
+        })
+    ));
+}

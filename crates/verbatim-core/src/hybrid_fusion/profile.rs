@@ -278,7 +278,7 @@ fn validate_fields(fields: &FusionProfileFields) -> HybridFusionResult<()> {
             HybridFusionDiagnosticCode::ProfileVersionInvalid,
         ));
     }
-    // Weights must be positive and, when present for WeightedScore, sum to ~1.0.
+    // Weights must be positive and sum to ~1.0 for WeightedScore.
     let mut sum = 0.0_f64;
     let mut seen = std::collections::BTreeSet::new();
     for weight in &fields.weights {
@@ -294,7 +294,7 @@ fn validate_fields(fields: &FusionProfileFields) -> HybridFusionResult<()> {
         }
         sum += weight.weight();
     }
-    if fields.strategy == FusionStrategy::WeightedScore && !fields.weights.is_empty() {
+    if fields.strategy == FusionStrategy::WeightedScore {
         let tolerance = 1e-6;
         if (sum - 1.0).abs() > tolerance {
             return Err(HybridFusionError::validation(

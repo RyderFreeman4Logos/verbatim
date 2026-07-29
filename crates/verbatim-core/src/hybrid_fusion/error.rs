@@ -1,9 +1,10 @@
 //! Typed, diagnostic-only errors for hybrid-fusion contracts.
 //!
-//! No variant retains a caller-controlled identifier, document text, backend
-//! response, filter expression, embedding, locator, or secret. The public
-//! `Debug` and `Display` renderings are therefore safe to expose in operational
-//! diagnostics and audit artifacts.
+//! `FusionError` is intentionally not serializable. A completeness violation
+//! retains typed state for in-process handling, but its `Debug` and `Display`
+//! renderings expose only stable diagnostic codes rather than caller-controlled
+//! scope identities, document text, backend responses, filter expressions,
+//! embeddings, locators, or secrets.
 
 use std::error::Error;
 use std::fmt;
@@ -71,7 +72,9 @@ pub enum FusionDiagnosticCode {
     StageOutputRequiresCandidates,
     StageOutputDuplicateCandidateHitId,
     StageOutputProvenanceRetrieverAbsent,
+    StageOutputProvenanceMismatch,
     StageOutputCandidateHitIdAbsentFromRetrievers,
+    StageOutputUsageMismatch,
     // Explainability
     ExplainabilityReportRequiresRows,
     ExplainabilityReportDuplicateRetriever,
@@ -139,9 +142,11 @@ impl FusionDiagnosticCode {
             Self::StageOutputProvenanceRetrieverAbsent => {
                 "stage_output_provenance_retriever_absent"
             }
+            Self::StageOutputProvenanceMismatch => "stage_output_provenance_mismatch",
             Self::StageOutputCandidateHitIdAbsentFromRetrievers => {
                 "stage_output_candidate_hit_id_absent_from_retrievers"
             }
+            Self::StageOutputUsageMismatch => "stage_output_usage_mismatch",
             Self::ExplainabilityReportRequiresRows => "explainability_report_requires_rows",
             Self::ExplainabilityReportDuplicateRetriever => {
                 "explainability_report_duplicate_retriever"
@@ -150,11 +155,11 @@ impl FusionDiagnosticCode {
     }
 }
 
-/// Errors intentionally retain only closed diagnostic codes, never arbitrary
-/// document text, embeddings, locators, credentials, or other secret-bearing
-/// values. `Debug` is redacted to the diagnostic code string only.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "class", rename_all = "snake_case")]
+/// Errors render stable diagnostic codes and intentionally do not implement
+/// serde serialization. Completeness-violation state remains available to
+/// in-process callers, while `Debug` is redacted to the diagnostic code string
+/// only.
+#[derive(Clone, PartialEq)]
 pub enum FusionError {
     Validation {
         code: FusionDiagnosticCode,
