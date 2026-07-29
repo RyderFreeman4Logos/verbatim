@@ -13,8 +13,18 @@ use super::{HybridFusionDiagnosticCode, HybridFusionError, HybridFusionResult};
 
 /// Stable identity for a declared exhaustive scope. Opaque to the contract:
 /// it is a presentation-free label such as a generation id or snapshot cursor.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct ExhaustiveScopeId(String);
+
+impl<'de> Deserialize<'de> for ExhaustiveScopeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl ExhaustiveScopeId {
     /// Builds a scope id, rejecting empty/whitespace input.

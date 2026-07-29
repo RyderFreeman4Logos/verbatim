@@ -537,3 +537,17 @@ fn output_coverage_must_match_qualifying_exhaustive_retriever() {
         FusionDiagnosticCode::CompletenessApproximateCannotClaimExhaustive
     );
 }
+
+#[test]
+fn direct_serde_deserialize_rejects_empty_scope_id() {
+    let json = serde_json::json!({
+        "kind": "exact_scope_enumerated",
+        "scope_id": "   ",
+        "coverage": { "enumerated": 2, "matched": 1 }
+    });
+    let result: Result<CompletenessState, _> = serde_json::from_value(json);
+    assert!(
+        result.is_err(),
+        "direct serde must reject empty/whitespace scope_id via custom deserializer"
+    );
+}
