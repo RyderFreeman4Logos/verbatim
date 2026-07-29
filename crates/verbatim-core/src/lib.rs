@@ -36,6 +36,7 @@ pub mod index_profile_delete;
 pub mod index_publication;
 pub mod ingest;
 pub mod ingest_security;
+pub mod lexical_engine;
 pub mod memory_budget;
 pub mod migration_framework;
 pub mod multi_hop_research;
