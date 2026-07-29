@@ -16,6 +16,7 @@ pub mod deletion;
 pub mod diskann3;
 pub mod diskann3_backend;
 pub mod durability;
+pub mod durable_updates;
 pub mod embed;
 pub mod enterprise_predicates;
 pub mod erasure;
