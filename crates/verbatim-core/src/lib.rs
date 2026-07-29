@@ -29,6 +29,7 @@ pub mod generation_publication;
 pub mod graph_extraction;
 pub mod graphrag;
 pub mod grounded_answer;
+pub mod hybrid_fusion;
 pub mod image_limits;
 pub mod index;
 pub mod index_gc;
