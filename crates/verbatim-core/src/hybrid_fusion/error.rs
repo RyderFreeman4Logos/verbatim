@@ -75,6 +75,7 @@ pub enum FusionDiagnosticCode {
     StageOutputProvenanceMismatch,
     StageOutputCandidateHitIdAbsentFromRetrievers,
     StageOutputUsageMismatch,
+    StageOutputDuplicateRetrieverId,
     // Explainability
     ExplainabilityReportRequiresRows,
     ExplainabilityReportDuplicateRetriever,
@@ -147,6 +148,7 @@ impl FusionDiagnosticCode {
                 "stage_output_candidate_hit_id_absent_from_retrievers"
             }
             Self::StageOutputUsageMismatch => "stage_output_usage_mismatch",
+            Self::StageOutputDuplicateRetrieverId => "stage_output_duplicate_retriever_id",
             Self::ExplainabilityReportRequiresRows => "explainability_report_requires_rows",
             Self::ExplainabilityReportDuplicateRetriever => {
                 "explainability_report_duplicate_retriever"

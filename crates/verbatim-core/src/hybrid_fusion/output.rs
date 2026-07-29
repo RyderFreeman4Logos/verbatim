@@ -106,6 +106,21 @@ fn validate_output_components(
     for result in retriever_results {
         result.validate()?;
     }
+    // Reject duplicate retriever_id values across the output so provenance
+    // binding and scope-contribution checks are unambiguous.
+    let mut seen_retriever_ids = BTreeSet::new();
+    for result in retriever_results {
+        if !seen_retriever_ids.insert(result.retriever_id()) {
+            return Err(FusionError::validation(
+                FusionDiagnosticCode::StageOutputDuplicateRetrieverId,
+            ));
+        }
+    }
+    // Structural revalidation of deserialized completeness coverage.
+    validate_completeness_coverage(completeness)?;
+    for result in retriever_results {
+        validate_completeness_coverage(result.completeness())?;
+    }
     if candidates.is_empty() {
         return Err(FusionError::validation(
             FusionDiagnosticCode::StageOutputRequiresCandidates,
@@ -167,6 +182,17 @@ fn validate_provenance_binding(
         {
             return Err(FusionError::validation(
                 FusionDiagnosticCode::StageOutputProvenanceMismatch,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_completeness_coverage(completeness: &CompletenessState) -> FusionResult<()> {
+    if let CompletenessState::ExactScopeEnumerated { coverage, .. } = completeness {
+        if coverage.enumerated() == 0 || coverage.matched() > coverage.enumerated() {
+            return Err(FusionError::validation(
+                FusionDiagnosticCode::CompletenessCoverageInvalid,
             ));
         }
     }

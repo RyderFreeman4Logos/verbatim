@@ -455,3 +455,43 @@ fn weighted_score_rejects_empty_weights() {
         })
     ));
 }
+
+#[test]
+fn stage_output_rejects_duplicate_retriever_id() {
+    let error = FusionStageOutput::new(
+        profile(),
+        vec![dense_result(), dense_result()],
+        vec![dense_candidate()],
+        CompletenessState::ApproximateTopK,
+        &budget(),
+    )
+    .expect_err("duplicate retriever_id must be rejected");
+    assert_eq!(
+        error.diagnostic_code(),
+        FusionDiagnosticCode::StageOutputDuplicateRetrieverId
+    );
+}
+
+#[test]
+fn decode_rejects_invalid_completeness_coverage() {
+    let output = FusionStageOutput::new(
+        profile(),
+        vec![dense_result(), exhaustive_result("authorized-snapshot")],
+        vec![exact_candidate()],
+        exact_scope("authorized-snapshot"),
+        &budget(),
+    )
+    .expect("valid test output");
+    let encoded = encode_fusion_stage_output_json(&output).expect("valid output encodes");
+    let mut tampered: serde_json::Value = serde_json::from_str(&encoded).expect("valid test json");
+    tampered["completeness"]["coverage"]["enumerated"] = serde_json::json!(0);
+
+    let error = decode_fusion_stage_output_json(
+        &serde_json::to_string(&tampered).expect("tampered json encodes"),
+    )
+    .expect_err("invalid coverage must be rejected");
+    assert_eq!(
+        error.diagnostic_code(),
+        FusionDiagnosticCode::CompletenessCoverageInvalid
+    );
+}
