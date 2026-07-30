@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use super::{
     GrpcPathRequirements, HydrationRequest, PayloadIndexPlan, QdrantBackendResult,
     QdrantCapabilities, QdrantCollectionSchema, QdrantFilterContract, QdrantLexicalPolicy,
-    QdrantOperationBudget, QdrantSearchPolicy,
+    QdrantOperationBudget, QdrantSearchOutcome, QdrantSearchPolicy,
 };
 
 mod sealed {
@@ -100,8 +100,9 @@ impl QdrantSearchRequest {
 
 /// Crate-owned walking-skeleton adapter contract for Qdrant reference backends.
 ///
-/// This trait is deliberately sealed and does not require live network I/O.
-/// Transitional REST lives in `crate::index::qdrant` until a gRPC cutover lands.
+/// This trait is deliberately sealed: its marker remains private to this module, so
+/// downstream crates cannot implement the adapter contract. It does not require live
+/// network I/O. Transitional REST lives in `crate::index::qdrant` until a gRPC cutover lands.
 #[async_trait]
 pub trait QdrantVectorSearch: sealed::Sealed {
     /// Validate collection schema, named vectors, and payload-index prerequisites.
@@ -111,8 +112,11 @@ pub trait QdrantVectorSearch: sealed::Sealed {
         payload_indexes: PayloadIndexPlan,
     ) -> QdrantBackendResult<()>;
 
-    /// Execute a Qdrant-primary, budget-bound search request (contract surface).
-    async fn search(&self, request: QdrantSearchRequest) -> QdrantBackendResult<()>;
+    /// Execute a Qdrant-primary, budget-bound search request and return its outcome.
+    async fn search(
+        &self,
+        request: QdrantSearchRequest,
+    ) -> QdrantBackendResult<QdrantSearchOutcome>;
 
     /// Hydrate authoritative evidence and reject stale/wrong-generation points.
     async fn hydrate(&self, request: HydrationRequest) -> QdrantBackendResult<()>;
@@ -129,6 +133,3 @@ pub trait QdrantVectorSearch: sealed::Sealed {
     /// Mutation hooks remain generation-bound and idempotent when enabled.
     fn mutation_hooks(&self) -> QdrantBackendResult<QdrantMutationHook>;
 }
-
-/// Re-export seal so crate-owned adapters can implement the trait.
-pub use sealed::Sealed as QdrantVectorSearchSealed;

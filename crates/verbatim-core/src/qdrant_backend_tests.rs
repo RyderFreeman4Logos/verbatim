@@ -1,4 +1,5 @@
 use crate::diskann3::PublicationGeneration;
+use crate::qdrant_backend::SkeletonQdrantPrimaryAttempt;
 use crate::qdrant_backend::{
     BackpressureMarker, CollectionName, ConfigDigest, FilterClause, FilterStrictness,
     ForbiddenLocalPreSearch, GrpcPathRequirements, HydrationRequest, LexicalConformanceFlag,
@@ -6,8 +7,9 @@ use crate::qdrant_backend::{
     PayloadIndexPlan, PayloadIndexRequirement, QdrantBackendDiagnosticCode, QdrantCapabilities,
     QdrantCapabilityFields, QdrantCollectionIdentity, QdrantCollectionSchema, QdrantFilterContract,
     QdrantLexicalPolicy, QdrantOperationBudget, QdrantPointRef, QdrantQuerySurface,
-    QdrantSchemaFields, QdrantSearchPolicy, QdrantSearchRequest, QdrantTransport,
-    QdrantVectorMetric, QdrantVectorNormalization, QuantizationProfile, TypedQdrantFailure,
+    QdrantSchemaFields, QdrantSearchOutcome, QdrantSearchPolicy, QdrantSearchRequest,
+    QdrantTransport, QdrantVectorMetric, QdrantVectorNormalization, QuantizationProfile,
+    TypedQdrantFailure,
 };
 use crate::search_planner::{SearchBudget, SearchBudgetFields};
 use crate::types::EmbeddingProfileId;
@@ -78,6 +80,38 @@ fn operation_budget(attempts: u16) -> QdrantOperationBudget {
         .expect("operation budget")
 }
 
+fn failed_primary_attempt(
+    policy: &QdrantSearchPolicy,
+    failure: TypedQdrantFailure,
+    remaining_budget: SearchBudget,
+) -> crate::qdrant_backend::QdrantFailureReceipt {
+    match SkeletonQdrantPrimaryAttempt::fail(policy, failure, remaining_budget)
+        .expect("crate-owned primary attempt")
+    {
+        QdrantSearchOutcome::Failed { receipt } => receipt,
+        QdrantSearchOutcome::Succeeded => panic!("the skeleton must return its requested failure"),
+    }
+}
+
+#[test]
+fn qdrant_backend_crate_owned_attempt_mints_a_receipt_only_in_failed_outcome() {
+    let primary = QdrantSearchPolicy::qdrant_primary_only(budget(2)).expect("primary policy");
+    let outcome = SkeletonQdrantPrimaryAttempt::fail(
+        &primary,
+        TypedQdrantFailure::TransportUnavailable,
+        budget(1),
+    )
+    .expect("crate-owned primary attempt");
+
+    match outcome {
+        QdrantSearchOutcome::Failed { receipt } => {
+            assert_eq!(receipt.failure(), TypedQdrantFailure::TransportUnavailable);
+            assert_eq!(receipt.remaining_budget(), budget(1));
+        }
+        QdrantSearchOutcome::Succeeded => panic!("the skeleton must return its requested failure"),
+    }
+}
+
 #[test]
 fn qdrant_backend_happy_path_constructs_named_vector_primary_request() {
     let policy = QdrantSearchPolicy::qdrant_primary_only(budget(1)).expect("primary policy");
@@ -123,9 +157,8 @@ fn qdrant_backend_unconditional_local_pre_search_is_rejected_and_not_compliant()
 #[test]
 fn qdrant_backend_primary_only_policy_cannot_authorize_fallback() {
     let policy = QdrantSearchPolicy::qdrant_primary_only(budget(2)).expect("primary policy");
-    let receipt = policy
-        .record_typed_qdrant_failure(TypedQdrantFailure::TransportUnavailable, budget(1))
-        .expect("only a primary policy can mint a receipt");
+    let receipt =
+        failed_primary_attempt(&policy, TypedQdrantFailure::TransportUnavailable, budget(1));
     let error = policy
         .authorize_local_fallback(&receipt)
         .expect_err("primary-only policy must not authorize fallback directly");
@@ -138,9 +171,11 @@ fn qdrant_backend_primary_only_policy_cannot_authorize_fallback() {
 #[test]
 fn qdrant_backend_fallback_requires_a_typed_failure_receipt_and_remaining_budget() {
     let primary = QdrantSearchPolicy::qdrant_primary_only(budget(2)).expect("primary policy");
-    let receipt = primary
-        .record_typed_qdrant_failure(TypedQdrantFailure::TransportUnavailable, budget(1))
-        .expect("typed failure mints a sealed receipt");
+    let receipt = failed_primary_attempt(
+        &primary,
+        TypedQdrantFailure::TransportUnavailable,
+        budget(1),
+    );
     let policy = primary
         .enable_fallback_after_receipt(&receipt)
         .expect("receipt authorizes the fallback policy");
@@ -157,9 +192,11 @@ fn qdrant_backend_fallback_requires_a_typed_failure_receipt_and_remaining_budget
 fn qdrant_backend_receipt_cannot_authorize_another_primary_policy() {
     let failed_primary =
         QdrantSearchPolicy::qdrant_primary_only(budget(2)).expect("failed primary policy");
-    let receipt = failed_primary
-        .record_typed_qdrant_failure(TypedQdrantFailure::TransportUnavailable, budget(1))
-        .expect("failed primary mints receipt");
+    let receipt = failed_primary_attempt(
+        &failed_primary,
+        TypedQdrantFailure::TransportUnavailable,
+        budget(1),
+    );
     let unrelated_primary =
         QdrantSearchPolicy::qdrant_primary_only(budget(2)).expect("unrelated primary policy");
     let error = unrelated_primary
@@ -174,9 +211,12 @@ fn qdrant_backend_receipt_cannot_authorize_another_primary_policy() {
 #[test]
 fn qdrant_backend_exhausted_fallback_budget_fails_closed() {
     let policy = QdrantSearchPolicy::qdrant_primary_only(budget(1)).expect("primary policy");
-    let error = policy
-        .record_typed_qdrant_failure(TypedQdrantFailure::DeadlineExceeded, budget(1))
-        .expect_err("one total attempt cannot include both primary and fallback");
+    let error = SkeletonQdrantPrimaryAttempt::fail(
+        &policy,
+        TypedQdrantFailure::DeadlineExceeded,
+        budget(1),
+    )
+    .expect_err("one total attempt cannot include both primary and fallback");
     assert_eq!(
         error.diagnostic_code(),
         QdrantBackendDiagnosticCode::FallbackBudgetExhausted

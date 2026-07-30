@@ -32,8 +32,11 @@ The typed boundary requires:
   strict filters fail with a typed diagnostic: the adapter may not execute global ANN
   and silently post-filter it;
 - Qdrant-primary selection for Qdrant profiles. Unconditional local dense pre-search
-  is explicitly forbidden and non-representable as a compliant policy. A local fallback
-  requires a typed Qdrant failure and a remaining, narrower `SearchBudget`;
+  is explicitly forbidden and non-representable as a compliant policy. Only a
+  crate-owned Qdrant-primary attempt can emit an opaque failure receipt in its typed
+  search outcome; a local fallback requires that receipt and a remaining, narrower
+  `SearchBudget`. The adapter trait is sealed by a non-public marker, so downstream
+  crates cannot implement an unreviewed Qdrant adapter;
 - authoritative-store hydration only after the point's profile and exact publication
   generation match; stale or wrong-generation points cannot hydrate;
 - bounded deadlines, retries, and backpressure markers; capability discovery for Query

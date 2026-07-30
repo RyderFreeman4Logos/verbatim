@@ -40,9 +40,9 @@ pub enum ForbiddenLocalPreSearch {
 
 /// Opaque proof that a Qdrant-primary attempt produced a typed failure.
 ///
-/// Callers cannot construct this value directly. It is emitted only by
-/// [`QdrantSearchPolicy::record_typed_qdrant_failure`] after a Qdrant-primary
-/// policy has validated the remaining budget for a potential fallback.
+/// Callers cannot construct this value directly. It is emitted only in a failed
+/// [`QdrantSearchOutcome`] by crate-owned Qdrant-primary execution after the
+/// remaining budget for a potential fallback has been validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QdrantFailureReceipt {
     failure: TypedQdrantFailure,
@@ -75,12 +75,46 @@ impl QdrantFailureReceipt {
     }
 }
 
+/// Outcome of one Qdrant-primary search attempt.
+///
+/// The failure receipt is opaque and can only be minted by crate-owned execution.
+/// This walking skeleton has no live Qdrant dependency; a future official-client
+/// adapter must return this outcome from its primary attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QdrantSearchOutcome {
+    Succeeded,
+    Failed { receipt: QdrantFailureReceipt },
+}
+
+/// Crate-owned primary-attempt double for the types-only walking skeleton.
+///
+/// This is intentionally crate-private: tests use it to model a completed Qdrant
+/// attempt, while external callers can only receive an opaque receipt in a public
+/// [`QdrantSearchOutcome`] from a crate-owned adapter.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SkeletonQdrantPrimaryAttempt;
+
+#[cfg(test)]
+impl SkeletonQdrantPrimaryAttempt {
+    /// Models a completed Qdrant-primary attempt that returned a typed failure.
+    pub(crate) fn fail(
+        policy: &QdrantSearchPolicy,
+        typed_failure: TypedQdrantFailure,
+        remaining_budget: SearchBudget,
+    ) -> QdrantBackendResult<QdrantSearchOutcome> {
+        policy
+            .receipt_after_primary_attempt(typed_failure, remaining_budget)
+            .map(|receipt| QdrantSearchOutcome::Failed { receipt })
+    }
+}
+
 /// Validated Qdrant-primary search policy.
 ///
 /// Local fallback cannot be pre-authorized. A caller starts with
-/// [`QdrantSearchPolicy::qdrant_primary_only`], records a typed Qdrant failure
-/// via [`Self::record_typed_qdrant_failure`] (which yields an opaque receipt),
-/// then authorizes fallback only with that receipt.
+/// [`QdrantSearchPolicy::qdrant_primary_only`]. After crate-owned Qdrant-primary
+/// execution returns a failed [`QdrantSearchOutcome`], the caller may authorize
+/// fallback only with that opaque receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QdrantSearchPolicy {
     local_dense: LocalDenseParticipation,
@@ -112,13 +146,13 @@ impl QdrantSearchPolicy {
         ))
     }
 
-    /// Records a typed failure from a Qdrant-primary attempt.
+    /// Mints a receipt after crate-owned Qdrant-primary execution has failed.
     ///
-    /// This is the only way to obtain a [`QdrantFailureReceipt`]. The policy must
-    /// still be Qdrant-primary (no local dense yet). The remaining budget must be
-    /// no wider than the policy budget and must still have capacity for one
-    /// fallback attempt.
-    pub fn record_typed_qdrant_failure(
+    /// This private transition is reachable only by the crate-owned executor. The
+    /// policy must still be Qdrant-primary (no local dense yet). The remaining budget
+    /// must be no wider than the policy budget and retain capacity for one fallback.
+    #[cfg(test)]
+    fn receipt_after_primary_attempt(
         &self,
         typed_failure: TypedQdrantFailure,
         remaining_budget: SearchBudget,
@@ -160,8 +194,8 @@ impl QdrantSearchPolicy {
 
     /// Transitions this policy into fallback-enabled state using a sealed receipt.
     ///
-    /// The receipt must have been produced from this policy's budget binding via
-    /// [`Self::record_typed_qdrant_failure`]. Callers cannot fabricate the receipt.
+    /// The receipt must have been produced by crate-owned execution from this policy's
+    /// budget binding. Callers cannot fabricate the receipt.
     pub fn enable_fallback_after_receipt(
         &self,
         receipt: &QdrantFailureReceipt,

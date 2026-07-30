@@ -20,9 +20,7 @@ mod search_policy;
 
 pub use budget::{BackpressureMarker, QdrantOperationBudget};
 pub use capability::{QdrantCapabilities, QdrantCapabilityFields};
-pub use contract::{
-    QdrantMutationHook, QdrantSearchRequest, QdrantVectorSearch, QdrantVectorSearchSealed,
-};
+pub use contract::{QdrantMutationHook, QdrantSearchRequest, QdrantVectorSearch};
 pub use error::{QdrantBackendDiagnosticCode, QdrantBackendError, QdrantBackendResult};
 pub use filter::{FilterClause, FilterStrictness, QdrantFilterContract};
 pub use grpc_path::{GrpcPathRequirements, QdrantQuerySurface, QdrantTransport};
@@ -34,9 +32,11 @@ pub use schema::{
     QdrantCollectionSchema, QdrantSchemaFields, QdrantVectorMetric, QdrantVectorNormalization,
     QuantizationProfile,
 };
+#[cfg(test)]
+pub(crate) use search_policy::SkeletonQdrantPrimaryAttempt;
 pub use search_policy::{
-    ForbiddenLocalPreSearch, LocalDenseParticipation, QdrantFailureReceipt, QdrantSearchPolicy,
-    TypedQdrantFailure,
+    ForbiddenLocalPreSearch, LocalDenseParticipation, QdrantFailureReceipt, QdrantSearchOutcome,
+    QdrantSearchPolicy, TypedQdrantFailure,
 };
 
 /// Contract schema version for the Qdrant reference adapter boundary.
