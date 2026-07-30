@@ -42,6 +42,7 @@ pub mod lexical_engine;
 pub mod memory_budget;
 pub mod migration_framework;
 pub mod multi_hop_research;
+pub mod named_vector_spaces;
 pub mod observability_contract;
 pub mod ocr;
 pub mod overfetch;
@@ -87,5 +88,8 @@ mod retrieval_telemetry_tests;
 #[cfg(test)]
 #[path = "ssd_vector_benchmark_tests.rs"]
 mod ssd_vector_benchmark_tests;
+
+#[cfg(test)]
+mod named_vector_spaces_tests;
 
 pub mod wire_schemas;
