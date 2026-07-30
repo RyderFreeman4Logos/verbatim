@@ -1,0 +1,166 @@
+# SSD-VECTOR-ADR-001 enterprise DiskANN3 profile.
+#
+# This is a checked-in, versioned contract example. The current walking-skeleton
+# modules do not load it as a live runtime configuration. A future adapter MUST
+# reject unknown schema versions and MUST NOT widen any bound encoded here.
+
+schema_version = 1
+kind = "diskann3-enterprise-profile"
+profile_id = "diskann3-enterprise-v1"
+contract = "SSD-VECTOR-ADR-001"
+status = "example_not_live_runtime_config"
+
+[identity]
+# These values identify one compatible derived-index generation, not a secret.
+vector_space_id = "enterprise-embedding-4096d-cosine-v1"
+embedding_profile_id = "enterprise-embedding-profile-v1"
+index_layout_version = 1
+publication_generation = "replace-at-publication"
+dimension = 4096
+metric = "cosine"
+
+[data_authority]
+# Derived vector and lexical artifacts never become the source of truth.
+catalog = "authoritative"
+evidence_blob_store = "authoritative"
+task_store = "authoritative"
+vector_artifacts = "derived_rebuildable"
+lexical_artifacts = "derived_rebuildable"
+
+[backend]
+primary_vector = "diskann3"
+primary_lexical = "tantivy"
+reference_backends = ["qdrant", "lancedb"]
+low_dram_experiment = "diskann3_aisaq_colocated_pages"
+legacy_backends = ["sqlite_scan", "instant_distance_hnsw"]
+
+[quality]
+# Candidate quantization may reduce candidate I/O. It does not reduce the
+# authoritative embedding dimension or replace exact final ranking.
+candidate_representation = "product_quantized"
+candidate_quantization_enabled = true
+embedding_dimension_reduction = false
+original_vector_storage = "ssd_full_f32"
+original_dimension = 4096
+exact_rescore_required = true
+full_precision_rescore_limit = 200
+
+[sharding]
+# A shard is bounded by both count and physical bytes; it is never keyed by one
+# source or tenant. Values are example ceilings and require benchmark calibration.
+max_vectors_per_shard = 5_000_000
+max_physical_bytes_per_shard = 120_000_000_000
+max_query_fan_out = 8
+page_size_bytes = 4096
+page_alignment_bytes = 4096
+graph_degree = 64
+candidate_code_bytes_per_vector = 64
+neighbor_id_bytes = 4
+metadata_bytes_per_vector_budget = 256
+manifest_checksum = "sha256"
+
+[page_layout]
+strategy = "aisaq_colocated_candidate_pages"
+checksum_required = true
+candidate_codes_colocated_with_graph = true
+original_vectors_separate_from_candidate_codes = true
+
+[filters]
+# Strict predicates are pushed into candidate generation. Unsupported strict
+# predicates fail closed instead of falling back to global ANN plus post-filter.
+pushdown_required = true
+unsupported_strict_predicate = "fail_closed"
+revalidate_at_authoritative_hydration = true
+supported = [
+  "source",
+  "collection",
+  "tenant",
+  "acl_principal",
+  "acl_deny",
+  "lifecycle",
+  "date_range",
+  "metadata_eq",
+]
+
+[planner]
+# Values are benchmark-derived crossover inputs and must be revised only with a
+# versioned benchmark/acceptance-gate review.
+exact_simd_scan_max_matches = 10_000
+predicate_aware_diskann3_min_matches = 50_000
+zero_authorized_candidates = "return_without_vector_io"
+small_authorized_scope = "exact_full_dimensional_scan"
+broad_authorized_scope = "predicate_aware_diskann3"
+
+[budget.candidate]
+max_candidates = 2_000
+max_rerank_candidates = 200
+max_hydration_candidates = 50
+max_stage_attempts = 2
+
+[budget.io]
+# Matches the conservative contract defaults. `max_read_amplification_milli =
+# 5000` means no more than 5.000 pages read per vector rescored.
+access_mode = "direct"
+max_pages = 4_096
+max_bytes = 16_777_216
+max_iops = 1_024
+max_queue_depth = 8
+max_await_micros = 100_000
+max_read_amplification_milli = 5_000
+
+[budget.deadline]
+max_wall_time_micros = 75_000
+max_cpu_micros = 50_000
+max_work_units = 100_000
+
+[budget.memory.online]
+# cgroup v2 totals include anonymous memory and file cache.
+memory_high_bytes = 201_326_592
+memory_max_bytes = 268_435_456
+read_buffers_bytes = 4_194_304
+predicate_bitmaps_bytes = 2_097_152
+graph_frontier_bytes = 1_048_576
+exact_rescore_candidates_bytes = 8_388_608
+arrow_batches_bytes = 4_194_304
+fusion_candidates_bytes = 4_194_304
+hydration_text_bytes = 4_194_304
+
+[budget.memory.build]
+# Build/compaction runs outside the serving cgroup with a separate cap.
+memory_high_bytes = 402_653_184
+memory_max_bytes = 536_870_912
+dedicated_workers_required = true
+io_priority = "idle"
+
+[budget.concurrency]
+max_active_queries = 32
+max_workers = 16
+retrieval = 8
+storage = 8
+model = 4
+background = 2
+
+[publication]
+immutable_shards = true
+manifest_required = true
+manifest_file_hash = "sha256"
+validate_before_promotion = true
+atomic_pointer_compare_and_swap = true
+query_bound_to_one_publication_generation = true
+retain_previous_generation_until_leases_expire = true
+mixed_generation = "fail_closed"
+
+[updates]
+mutation_batch_max_operations = 10_000
+tombstone_cap = 100_000
+compaction_dead_byte_ratio = 0.20
+compaction_read_amplification = 4.0
+compaction_mutations_since_last = 50_000
+compaction_p99_latency_micros = 50_000
+rebuild_source = "authoritative_original_vectors"
+
+[operations]
+cache_states_required = ["cold", "warm"]
+ssd_requirement = "local_nvme_with_declared_page_and_queue_characteristics"
+backup_includes = ["authoritative_stores", "manifests", "publication_pointers", "checksums"]
+disaster_recovery = "rebuild_or_restore_then_validate_before_publish"

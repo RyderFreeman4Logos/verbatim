@@ -1,0 +1,199 @@
+# SSD-VECTOR-ADR-001 reproducible benchmark matrix.
+#
+# This versioned example defines comparison dimensions and required evidence; it
+# is not an instruction to claim that a provider runner already exists. Record
+# the exact executable, argv, revision, config digest, and artifact paths in the
+# resulting report before any promotion decision.
+
+schema_version = 1
+kind = "ssd-vector-benchmark-matrix"
+matrix_id = "ssd-vector-backend-comparison-v1"
+contract = "SSD-VECTOR-ADR-001"
+status = "example_not_live_runtime_config"
+
+[identity]
+vector_space_id = "enterprise-embedding-4096d-cosine-v1"
+embedding_profile_id = "enterprise-embedding-profile-v1"
+dimension = 4096
+metric = "cosine"
+qrels_revision = "record-in-report"
+dataset_revision = "record-in-report"
+
+[reproducibility]
+require_git_revision = true
+require_config_digest = true
+require_dataset_digest = true
+require_qrels_digest = true
+require_hardware_profile = true
+require_kernel_and_filesystem_profile = true
+require_exact_argv = true
+require_cold_and_warm_runs = true
+require_raw_stage_telemetry = true
+report_format = "json_with_human_summary"
+
+[hardware_profile]
+# Replace these identifiers with the measured host description in the result.
+profile_id = "declare-before-run"
+ssd_class = "local_nvme"
+page_size_bytes = 4096
+queue_depths = [1, 4, 8]
+cgroup_memory_accounting = "v2_memory_current_high_max"
+
+[ground_truth]
+retriever = "exact_full_dimensional_scan"
+original_vector_precision = "f32"
+original_dimension = 4096
+filter_and_acl_conformance_required = true
+
+[[backend]]
+id = "diskann3_standard"
+role = "primary_candidate"
+provider = "diskann3"
+page_layout = "standard_ssd_pages"
+required = true
+
+[[backend]]
+id = "diskann3_aisaq"
+role = "primary_low_dram_experiment"
+provider = "diskann3"
+page_layout = "aisaq_colocated_candidate_pages"
+required = true
+
+[[backend]]
+id = "qdrant_reference"
+role = "reference_service"
+provider = "qdrant"
+page_layout = "provider_declared"
+required = true
+
+[[backend]]
+id = "lancedb_reference"
+role = "reference_embedded"
+provider = "lancedb"
+page_layout = "provider_declared"
+required = true
+
+[[backend]]
+id = "milvus_aisaq_control"
+role = "external_algorithmic_control"
+provider = "milvus_aisaq"
+page_layout = "aisaq"
+required = false
+skip_reason_required_when_unavailable = true
+
+[[backend]]
+id = "usearch_hnsw_control"
+role = "local_hnsw_control"
+provider = "usearch_hnsw"
+page_layout = "mmap_or_provider_declared"
+required = false
+skip_reason_required_when_unavailable = true
+
+[[backend]]
+id = "sqlite_exact_reference"
+role = "exact_reference"
+provider = "sqlite_scan"
+page_layout = "not_applicable"
+required = true
+
+[[backend]]
+id = "instant_distance_hnsw_legacy"
+role = "legacy_baseline"
+provider = "instant_distance_hnsw"
+page_layout = "resident_or_legacy"
+required = false
+skip_reason_required_when_unavailable = true
+
+[[scenario]]
+id = "broad_authorized_cold"
+cache_state = "cold"
+authorized_scope = "broad"
+predicate_case = "tenant_acl_lifecycle_metadata"
+expected_path = "predicate_aware_ann"
+query_count = 1_000
+
+[[scenario]]
+id = "broad_authorized_warm"
+cache_state = "warm"
+authorized_scope = "broad"
+predicate_case = "tenant_acl_lifecycle_metadata"
+expected_path = "predicate_aware_ann"
+query_count = 1_000
+
+[[scenario]]
+id = "small_authorized_cold"
+cache_state = "cold"
+authorized_scope = "small"
+predicate_case = "tenant_acl_lifecycle_metadata"
+expected_path = "exact_full_dimensional_scan"
+query_count = 1_000
+
+[[scenario]]
+id = "small_authorized_warm"
+cache_state = "warm"
+authorized_scope = "small"
+predicate_case = "tenant_acl_lifecycle_metadata"
+expected_path = "exact_full_dimensional_scan"
+query_count = 1_000
+
+[[scenario]]
+id = "unsupported_strict_predicate"
+cache_state = "warm"
+authorized_scope = "broad"
+predicate_case = "unsupported_strict"
+expected_path = "typed_fail_closed"
+query_count = 100
+
+[[scenario]]
+id = "update_compaction_recovery"
+cache_state = "mixed_documented"
+authorized_scope = "broad"
+predicate_case = "tenant_acl_lifecycle_metadata"
+expected_path = "validated_generation_publication_or_rollback"
+query_count = 1_000
+
+[measurements]
+quality = [
+  "recall_at_10_vs_exact",
+  "filtered_recall_at_10_vs_exact",
+  "ndcg_at_10",
+  "exact_rescore_coverage",
+  "acl_and_filter_conformance",
+]
+latency = ["p50_micros", "p95_micros", "p99_micros"]
+resources = [
+  "memory_current_bytes",
+  "memory_high_events",
+  "memory_max_events",
+  "ssd_pages",
+  "ssd_bytes",
+  "ssd_iops",
+  "queue_depth",
+  "await_micros",
+  "read_amplification",
+  "deadline_exhaustions",
+  "concurrency_saturation",
+]
+operations = [
+  "build_time",
+  "disk_bytes",
+  "publication_validation",
+  "rollback_result",
+  "recovery_result",
+]
+
+[report]
+# A result must identify an actual executable. Do not substitute this string for
+# a runner command; the current contract-only slices have no live DiskANN3 CLI.
+runner_state = "record_actual_provider_runner_or_mark_not_run"
+artifact_root = "artifacts/ssd-vector/<run-id>"
+required_files = [
+  "report.json",
+  "report.md",
+  "hardware.json",
+  "config.sha256",
+  "dataset.sha256",
+  "qrels.sha256",
+  "stage-telemetry.jsonl",
+]
+no_hardware_profile_no_performance_claim = true
