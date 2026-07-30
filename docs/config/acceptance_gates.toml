@@ -1,0 +1,107 @@
+# SSD-VECTOR-ADR-001 hard acceptance gates.
+#
+# Versioned example for a future benchmark/promotion adapter. Values are program
+# defaults derived from the current contract examples; change them only with a
+# reviewed benchmark record, a new schema/config version, and re-run evidence.
+
+schema_version = 1
+kind = "ssd-vector-acceptance-gates"
+gate_set_id = "ssd-vector-hard-gates-v1"
+contract = "SSD-VECTOR-ADR-001"
+status = "example_not_live_runtime_config"
+
+[promotion]
+all_required_backends_reported = true
+all_required_scenarios_reported = true
+exact_ground_truth_required = true
+hardware_profile_required = true
+cold_and_warm_required = true
+config_dataset_qrels_digests_required = true
+binary_revision_and_exact_argv_required = true
+unknown_or_missing_measurement = "fail"
+
+[quality]
+minimum_recall_at_10 = 0.95
+minimum_filtered_recall_at_10 = 0.95
+minimum_ndcg_at_10 = 0.90
+exact_rescore_coverage = 1.0
+original_vectors_on_ssd_required = true
+original_dimension = 4096
+embedding_dimension_reduction_allowed = false
+candidate_quantization_allowed_only_for_candidate_generation = true
+
+[conformance]
+tantivy_remains_primary_lexical = true
+bm25_vector_backend_substitution_without_conformance = "fail"
+strict_filter_pushdown_required = true
+post_filter_global_ann_fallback = "fail"
+unsupported_strict_predicate = "typed_fail_closed"
+# When exact_simd_scan_max_matches < predicate_aware_diskann3_min_matches, the
+# Medium band is required: cold/warm ACL/filter scenarios, planner-selected
+# provenance, exact-by-default only while the independent exact budget fits,
+# and fail-closed when that budget is exceeded.
+medium_band_required_when_thresholds_leave_gap = true
+medium_expected_path = "planner_selected_exact_or_predicate_aware_ann"
+medium_default_selection = "exact_full_dimensional_scan_when_exact_budget_fits"
+medium_exact_budget_exceeded = "typed_fail_closed"
+medium_global_ann_post_filter = "fail"
+acl_leak_count_max = 0
+lifecycle_or_tombstone_leak_count_max = 0
+mixed_publication_generation = "fail"
+exact_reference_graph_exhaustive_provenance_required = true
+
+[online_memory]
+# cgroup v2 values: page cache and anonymous memory are both included.
+memory_high_bytes = 201_326_592
+memory_max_bytes = 268_435_456
+memory_high_events_max = 0
+memory_max_events_max = 0
+
+[build_memory]
+memory_high_bytes = 402_653_184
+memory_max_bytes = 536_870_912
+must_run_in_isolated_cgroup = true
+
+[request_budget]
+max_candidates = 2_000
+max_pages = 4_096
+max_bytes = 16_777_216
+max_iops = 1_024
+max_queue_depth = 8
+max_await_micros = 100_000
+max_read_amplification_milli = 5_000
+max_wall_time_micros = 75_000
+max_full_precision_rescore_candidates = 200
+max_active_queries = 32
+max_workers = 16
+
+[latency]
+# Evaluate separately by declared cache state. These are hard program defaults,
+# not a claim about unmeasured hardware.
+warm_p99_max_micros = 75_000
+cold_p99_max_micros = 250_000
+deadline_exhaustions_max = 0
+concurrency_saturation_events_max = 0
+
+[storage]
+linear_growth_required = true
+manifest_checksum_required = true
+immutable_bounded_shards_required = true
+one_index_per_source = "fail"
+recovery_from_authoritative_original_vectors_required = true
+
+[publication_and_recovery]
+validation_before_promotion_required = true
+atomic_pointer_compare_and_swap_required = true
+query_generation_binding_required = true
+previous_generation_retained_until_leases_expire = true
+partial_or_mixed_generation_recovery = "fail"
+rollback_drill_required = true
+backup_restore_drill_required = true
+
+[reconsideration]
+# This is intentionally a complete-suite trigger, not a single benchmark win.
+trigger = "another_backend_wins_complete_hard_gated_benchmark_and_conformance_suite"
+requires_same_dataset_qrels_vector_space_profile_and_hardware = true
+requires_filter_acl_update_recovery_and_cold_warm_coverage = true
+lexical_change_requires_separate_tantivy_conformance_decision = true
