@@ -139,8 +139,77 @@ test_invalid_tokenizer_timeout() {
         run_checker "$repo" "$bin_dir" staged
 }
 
+# Local identity helpers for F4 only: reuse /proc starttime + pidfd pattern
+# already used by assert_no_live_identities / tokenizer_runner.ProcessIdentity.
+process_start_time() {
+    local pid="$1" stat rest
+    [ -r "/proc/$pid/stat" ] || return 1
+    stat="$(<"/proc/$pid/stat")" || return 1
+    rest="${stat##*) }"
+    set -- $rest
+    # Bash requires ${20}; $20 is $2 + "0".
+    [ -n "${20:-}" ] || return 1
+    printf '%s\n' "${20}"
+}
+
+same_process_identity() {
+    local pid="$1" start="$2" now
+    now="$(process_start_time "$pid")" || return 1
+    [ "$now" = "$start" ]
+}
+
+signal_process_identity() {
+    local pid="$1" start="$2" signum="$3"
+    python3 - "$pid" "$start" "$signum" <<'PY'
+import ctypes
+import os
+import signal
+import sys
+from pathlib import Path
+
+pid = int(sys.argv[1])
+start = int(sys.argv[2])
+signum = int(sys.argv[3])
+
+def start_time(target: int) -> int | None:
+    try:
+        raw = Path(f"/proc/{target}/stat").read_text(encoding="ascii")
+        return int(raw[raw.rfind(") ") + 2 :].split()[19])
+    except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+        return None
+
+if start_time(pid) != start:
+    raise SystemExit(0)
+libc = ctypes.CDLL(None, use_errno=True)
+descriptor = libc.pidfd_open(pid, 0)
+if descriptor < 0:
+    raise SystemExit(0)
+try:
+    if start_time(pid) == start:
+        libc.pidfd_send_signal(descriptor, signum, None, 0)
+finally:
+    os.close(descriptor)
+PY
+}
+
+await_process_identity_exit() {
+    local pid="$1" start="$2" attempt
+    for attempt in $(seq 1 50); do
+        # Own-shell children can be zombies still present in /proc; kill -0 is
+        # false once bash reaped them. Identity mismatch covers recycled PIDs.
+        if ! kill -0 "$pid" 2>/dev/null || ! same_process_identity "$pid" "$start"; then
+            return 0
+        fi
+        sleep 0.02
+    done
+    if ! kill -0 "$pid" 2>/dev/null || ! same_process_identity "$pid" "$start"; then
+        return 0
+    fi
+    return 1
+}
+
 test_tokenizer_timeout_cleans_process_tree() {
-    local repo bin_dir child_pid_file output status child_pid
+    local repo bin_dir child_pid_file output status prefix runner_pid runner_start
     repo="$(prepare_tokenizer_dependency_fixture tokenizer-timeout-process-tree)"
     bin_dir="$test_root/tokenizer-timeout-process-tree-bin"
     child_pid_file="$test_root/tokenizer-timeout-child.pid"
@@ -162,14 +231,35 @@ test_tokenizer_timeout_cleans_process_tree() {
         printf '%s\n' "$output" >&2
         die 'timeout failure did not report the timeout-specific diagnostic'
     }
-    [ -s "$child_pid_file" ] || die 'hanging tokenizer did not publish its child PID'
-    child_pid="$(<"$child_pid_file")"
-    case "$child_pid" in
-        ''|*[!0-9]*) die "invalid fake tokenizer child PID: $child_pid" ;;
-    esac
-    if kill -0 "$child_pid" 2>/dev/null; then
-        die "fake tokenizer descendant survived timeout cleanup: $child_pid"
+    [ -s "$child_pid_file" ] || die 'hanging tokenizer did not publish its child identity'
+    assert_no_live_identities "$child_pid_file" 'timeout-cleanup'
+
+    prefix="$test_root/tokenizer-interrupt"
+    child_pid_file="$prefix.child.pid"
+    TOKUIN_FAKE_MODE=timeout TOKUIN_FAKE_CHILD_PID_FILE="$child_pid_file" \
+        python3 -B "$tokenizer_runner" run \
+        --timeout-seconds 30 --max-output-bytes 1024 \
+        --stdout "$prefix.stdout" --stderr "$prefix.stderr" --receipt "$prefix.receipt.json" -- \
+        "$bin_dir/tokuin" estimate --model gpt-4o --format json "$repo/src/tokenizer.rs" &
+    runner_pid=$!
+    runner_start="$(process_start_time "$runner_pid")" \
+        || die "failed to capture tokenizer runner starttime for pid $runner_pid"
+    wait_for_pid_file "$child_pid_file"
+    signal_process_identity "$runner_pid" "$runner_start" 15
+    if ! await_process_identity_exit "$runner_pid" "$runner_start"; then
+        signal_process_identity "$runner_pid" "$runner_start" 9
+        if ! await_process_identity_exit "$runner_pid" "$runner_start"; then
+            # Still live after SIGKILL window: never call unbounded wait.
+            assert_no_live_identities "$child_pid_file" 'interrupt-emergency' || true
+            die 'interrupted tokenizer cleanup exceeded one second'
+        fi
+        # Identity gone => bash already reaped or pid is gone; wait is nonblocking.
+        wait "$runner_pid" || true
+        die 'interrupted tokenizer cleanup exceeded one second'
     fi
+    wait "$runner_pid"
+    assert_runner_receipt "$prefix" interrupted 143
+    assert_no_live_identities "$child_pid_file" 'interrupted-cleanup'
 }
 
 run_runner_fixture() {
