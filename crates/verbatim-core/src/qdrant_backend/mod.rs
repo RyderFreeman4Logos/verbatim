@@ -35,7 +35,8 @@ pub use schema::{
     QuantizationProfile,
 };
 pub use search_policy::{
-    ForbiddenLocalPreSearch, LocalDenseParticipation, QdrantSearchPolicy, TypedQdrantFailure,
+    ForbiddenLocalPreSearch, LocalDenseParticipation, QdrantFailureReceipt, QdrantSearchPolicy,
+    TypedQdrantFailure,
 };
 
 /// Contract schema version for the Qdrant reference adapter boundary.

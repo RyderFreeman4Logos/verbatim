@@ -83,11 +83,18 @@ fn qdrant_backend_happy_path_constructs_named_vector_primary_request() {
     let policy = QdrantSearchPolicy::qdrant_primary_only(budget(1)).expect("primary policy");
     let filter = QdrantFilterContract::new(
         FilterStrictness::StrictNativeOrFailClosed,
-        vec![FilterClause::Tenant {
-            value: "tenant-a".into(),
-        }],
+        vec![
+            FilterClause::Tenant {
+                value: "tenant-a".into(),
+            },
+            FilterClause::Acl {
+                value: "group-a".into(),
+            },
+            FilterClause::Lifecycle {
+                value: "active".into(),
+            },
+        ],
         payload_indexes(),
-        true,
     )
     .expect("native strict filter");
     let request = QdrantSearchRequest::new(schema(), policy, filter, operation_budget(1), 5)
@@ -98,6 +105,7 @@ fn qdrant_backend_happy_path_constructs_named_vector_primary_request() {
         "text_default"
     );
     assert!(request.policy().is_qdrant_primary());
+    assert!(request.filter().native_support());
 }
 
 #[test]
@@ -113,14 +121,31 @@ fn qdrant_backend_unconditional_local_pre_search_is_rejected_and_not_compliant()
 }
 
 #[test]
-fn qdrant_backend_fallback_requires_typed_failure_and_remaining_budget() {
-    let policy = QdrantSearchPolicy::fallback_after_typed_failure(
-        budget(2),
-        TypedQdrantFailure::TransportUnavailable,
-    )
-    .expect("typed failure authorizes fallback policy");
+fn qdrant_backend_primary_only_policy_cannot_authorize_fallback() {
+    let policy = QdrantSearchPolicy::qdrant_primary_only(budget(2)).expect("primary policy");
+    let receipt = policy
+        .record_typed_qdrant_failure(TypedQdrantFailure::TransportUnavailable, budget(1))
+        .expect("only a primary policy can mint a receipt");
+    let error = policy
+        .authorize_local_fallback(&receipt)
+        .expect_err("primary-only policy must not authorize fallback directly");
+    assert_eq!(
+        error.diagnostic_code(),
+        QdrantBackendDiagnosticCode::FallbackWithoutTypedFailure
+    );
+}
+
+#[test]
+fn qdrant_backend_fallback_requires_a_typed_failure_receipt_and_remaining_budget() {
+    let primary = QdrantSearchPolicy::qdrant_primary_only(budget(2)).expect("primary policy");
+    let receipt = primary
+        .record_typed_qdrant_failure(TypedQdrantFailure::TransportUnavailable, budget(1))
+        .expect("typed failure mints a sealed receipt");
+    let policy = primary
+        .enable_fallback_after_receipt(&receipt)
+        .expect("receipt authorizes the fallback policy");
     policy
-        .authorize_local_fallback(budget(1), TypedQdrantFailure::TransportUnavailable)
+        .authorize_local_fallback(&receipt)
         .expect("remaining bounded budget admits fallback");
     assert_eq!(
         policy.local_dense(),
@@ -129,12 +154,29 @@ fn qdrant_backend_fallback_requires_typed_failure_and_remaining_budget() {
 }
 
 #[test]
+fn qdrant_backend_receipt_cannot_authorize_another_primary_policy() {
+    let failed_primary =
+        QdrantSearchPolicy::qdrant_primary_only(budget(2)).expect("failed primary policy");
+    let receipt = failed_primary
+        .record_typed_qdrant_failure(TypedQdrantFailure::TransportUnavailable, budget(1))
+        .expect("failed primary mints receipt");
+    let unrelated_primary =
+        QdrantSearchPolicy::qdrant_primary_only(budget(2)).expect("unrelated primary policy");
+    let error = unrelated_primary
+        .enable_fallback_after_receipt(&receipt)
+        .expect_err("receipt is bound to the primary policy that recorded the failure");
+    assert_eq!(
+        error.diagnostic_code(),
+        QdrantBackendDiagnosticCode::FallbackWithoutTypedFailure
+    );
+}
+
+#[test]
 fn qdrant_backend_exhausted_fallback_budget_fails_closed() {
-    let error = QdrantSearchPolicy::fallback_after_typed_failure(
-        budget(1),
-        TypedQdrantFailure::DeadlineExceeded,
-    )
-    .expect_err("one attempt cannot include a fallback");
+    let policy = QdrantSearchPolicy::qdrant_primary_only(budget(1)).expect("primary policy");
+    let error = policy
+        .record_typed_qdrant_failure(TypedQdrantFailure::DeadlineExceeded, budget(1))
+        .expect_err("one total attempt cannot include both primary and fallback");
     assert_eq!(
         error.diagnostic_code(),
         QdrantBackendDiagnosticCode::FallbackBudgetExhausted
@@ -196,20 +238,86 @@ fn qdrant_backend_rejects_wrong_generation_or_profile_hydration() {
 }
 
 #[test]
-fn qdrant_backend_strict_filter_without_native_support_fails_closed() {
+fn qdrant_backend_strict_source_or_collection_requires_matching_index_field() {
+    for clause in [
+        FilterClause::Source {
+            value: "source-a".into(),
+        },
+        FilterClause::Collection {
+            value: "collection-a".into(),
+        },
+    ] {
+        let error = QdrantFilterContract::new(
+            FilterStrictness::StrictNativeOrFailClosed,
+            vec![clause],
+            payload_indexes(),
+        )
+        .expect_err("unrelated tenant, ACL, and lifecycle indexes do not cover the clause");
+        assert_eq!(
+            error.diagnostic_code(),
+            QdrantBackendDiagnosticCode::StrictFilterUnsupported
+        );
+    }
+}
+
+#[test]
+fn qdrant_backend_range_filter_requires_the_matching_range_index() {
+    let mismatched_indexes = PayloadIndexPlan::new(vec![
+        PayloadIndexRequirement::new("tenant", PayloadIndexKind::Keyword).expect("tenant"),
+        PayloadIndexRequirement::new("acl", PayloadIndexKind::Acl).expect("ACL"),
+        PayloadIndexRequirement::new("lifecycle", PayloadIndexKind::Lifecycle).expect("lifecycle"),
+        PayloadIndexRequirement::new("published_at", PayloadIndexKind::FloatRange)
+            .expect("mismatched range"),
+    ])
+    .expect("valid unrelated indexes");
+    let clause = FilterClause::IntegerRange {
+        field: "published_at".into(),
+        min: 1,
+        max: 2,
+    };
     let error = QdrantFilterContract::new(
         FilterStrictness::StrictNativeOrFailClosed,
-        vec![FilterClause::Acl {
-            value: "group-a".into(),
-        }],
-        payload_indexes(),
-        false,
+        vec![clause.clone()],
+        mismatched_indexes,
     )
-    .expect_err("strict filters cannot become global ANN post-filtering");
+    .expect_err("a float range index cannot cover an integer range clause");
     assert_eq!(
         error.diagnostic_code(),
         QdrantBackendDiagnosticCode::StrictFilterUnsupported
     );
+
+    let matching_indexes = PayloadIndexPlan::new(vec![
+        PayloadIndexRequirement::new("tenant", PayloadIndexKind::Keyword).expect("tenant"),
+        PayloadIndexRequirement::new("acl", PayloadIndexKind::Acl).expect("ACL"),
+        PayloadIndexRequirement::new("lifecycle", PayloadIndexKind::Lifecycle).expect("lifecycle"),
+        PayloadIndexRequirement::new("published_at", PayloadIndexKind::IntegerRange)
+            .expect("matching range"),
+    ])
+    .expect("valid matching indexes");
+    let contract = QdrantFilterContract::new(
+        FilterStrictness::StrictNativeOrFailClosed,
+        vec![clause],
+        matching_indexes,
+    )
+    .expect("matching range index supports strict native filtering");
+    assert!(contract.native_support());
+}
+
+#[test]
+fn qdrant_backend_filter_serde_recomputes_native_support_from_indexes() {
+    let contract = QdrantFilterContract::new(
+        FilterStrictness::BestEffort,
+        vec![FilterClause::Source {
+            value: "source-a".into(),
+        }],
+        payload_indexes(),
+    )
+    .expect("best-effort filter may be unsupported natively");
+    let mut encoded = serde_json::to_value(&contract).expect("serializes");
+    encoded["native_support"] = serde_json::Value::Bool(true);
+    let decoded: QdrantFilterContract =
+        serde_json::from_value(encoded).expect("revalidates through the constructor");
+    assert!(!decoded.native_support());
 }
 
 #[test]

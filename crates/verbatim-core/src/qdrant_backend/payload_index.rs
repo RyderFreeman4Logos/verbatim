@@ -120,6 +120,13 @@ impl PayloadIndexPlan {
     pub fn requirements(&self) -> &[PayloadIndexRequirement] {
         &self.requirements
     }
+
+    /// True when the plan contains an index for `field` with exactly `kind`.
+    pub fn covers(&self, field: &str, kind: PayloadIndexKind) -> bool {
+        self.requirements
+            .iter()
+            .any(|requirement| requirement.field() == field && requirement.kind() == kind)
+    }
 }
 
 fn is_valid_field_name(value: &str) -> bool {
