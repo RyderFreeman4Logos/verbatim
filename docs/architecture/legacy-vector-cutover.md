@@ -26,9 +26,14 @@ remain when useful.
 `verbatim_core::legacy_vector_cutover` is a pure, fail-closed contract surface.
 It has closed diagnostic codes; public `Display` and `Debug` output contains
 only those codes. Durable `PublicationGeneration` and `CutoverManifest` values
-deserialize through validating constructors. The module does **not** run a
-DiskANN3 build, contact a service, observe cgroups, delete SQLite/HNSW artifacts,
-re-embed vectors, or alter runtime routing.
+deserialize through validating constructors. `MigrationValidation` and
+`ReleasePolicyApproval` have private fields and can only be obtained through
+their validating constructors; the final retirement boundary requires the
+validation together with the exact reusable `AuthoritativeVectorSource`
+(including its concrete source generation) and concrete `CutoverManifest` it
+bound. The module does **not** run a DiskANN3 build, contact a service, observe
+cgroups, delete SQLite/HNSW artifacts, re-embed vectors, or alter runtime
+routing.
 
 A real operator/automation implementation must collect the evidence described
 here and invoke the typed boundary before it performs side effects. This design
@@ -51,7 +56,9 @@ measurements:
 
 `CutoverGates::compile_only()` is deliberately rejected with the distinct
 `diskann3_compile_only` diagnostic. Every missing gate class emits its own
-stable diagnostic code.
+stable diagnostic code. A passed shadow can bind a promotion only when the
+same `CutoverGates` aggregate is complete; there is no ungated public promotion
+binding.
 
 ## Migration and publication lifecycle
 
@@ -60,8 +67,8 @@ authoritative stored vector bytes + validated profile
   -> build a DiskANN3 candidate generation without re-embedding
   -> validate counts, hashes, dimensions, metric, normalization, IDs, filters,
      sampled exact recall, mutation/recovery artifacts, resources, and manifest
-  -> shadow incumbent and candidate generations with mirrored traffic
-  -> bind promotion to the exact shadowed candidate generation
+  -> shadow distinct incumbent and candidate generations with mirrored traffic
+  -> bind promotion to the exact shadowed candidate generation and complete gates
   -> publish under the generation-publication contract (Refs #379)
   -> retain incumbent through declared rollback window
   -> after the window and release policy, perform backup-aware maintenance
@@ -72,17 +79,22 @@ returns `ReembeddingRequired`; it rejects any attempt to proceed as a silent
 re-embedding. Target dimensionality must equal the authoritative dimension;
 there is no quality-loss or dimension-reduction path.
 
-Promotion is bound to the candidate generation observed by the passed shadow
-comparison. This aligns the cutover with the publication-generation guarantee:
+Promotion is bound to the candidate generation observed by the passed,
+**distinct-generation** shadow comparison and requires the complete aggregate
+of cutover gates. Final retirement additionally checks that the source and
+manifest are precisely those bound into the non-forgeable migration-validation
+artifact. This aligns the cutover with the publication-generation guarantee:
 queries must not mix an incumbent and candidate generation.
 
 ## Retention and destructive maintenance
 
 The previous generation remains readable for the declared rollback window.
-Legacy artifacts are not eligible for removal until that window expires and the
-release policy allows removal. Removal plans require verified backups and an
-explicit disposition for both serialized resident-HNSW artifacts and stale
-vector JSON copies.
+Legacy artifacts are not eligible for removal until that window expires and a
+validated `ReleasePolicyApproval` exists. Removal plans require verified backups
+and an explicit disposition for both serialized resident-HNSW artifacts and
+stale vector JSON copies. The policy token cannot be field-constructed outside
+the module, and a missing or denied policy returns the closed
+`release_policy_approval_required` diagnostic.
 
 Retirement must retain:
 

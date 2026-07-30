@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use super::{
-    LegacyRetirementDiagnosticCode, LegacyRetirementError, LegacyRetirementResult,
+    CutoverManifest, LegacyRetirementDiagnosticCode, LegacyRetirementError, LegacyRetirementResult,
     PublicationGeneration,
 };
 
@@ -124,23 +124,35 @@ pub enum VectorReuseDecision {
 }
 
 /// Authority evidence for the stored vector bytes used to build DiskANN3.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoritativeVectorSource {
+    source_generation: PublicationGeneration,
     profile_valid: bool,
     bytes_valid: bool,
 }
 
 impl AuthoritativeVectorSource {
-    /// Records validation of the profile metadata and canonical vector bytes.
-    pub const fn new(profile_valid: bool, bytes_valid: bool) -> Self {
+    /// Records the concrete authoritative vector generation and validation of
+    /// its profile metadata and canonical vector bytes.
+    pub const fn new(
+        source_generation: PublicationGeneration,
+        profile_valid: bool,
+        bytes_valid: bool,
+    ) -> Self {
         Self {
+            source_generation,
             profile_valid,
             bytes_valid,
         }
     }
 
+    /// Returns the concrete authoritative vector generation bound to validation.
+    pub const fn source_generation(&self) -> &PublicationGeneration {
+        &self.source_generation
+    }
+
     /// Returns the required explicit reuse/re-embedding branch.
-    pub const fn reuse_decision(self) -> VectorReuseDecision {
+    pub const fn reuse_decision(&self) -> VectorReuseDecision {
         if self.profile_valid && self.bytes_valid {
             VectorReuseDecision::ReuseValidatedAuthoritativeBytes
         } else {
@@ -149,7 +161,7 @@ impl AuthoritativeVectorSource {
     }
 
     /// Returns whether the source is invalid for direct byte reuse.
-    pub const fn requires_reembedding(self) -> bool {
+    pub const fn requires_reembedding(&self) -> bool {
         matches!(
             self.reuse_decision(),
             VectorReuseDecision::ReembeddingRequired
@@ -157,7 +169,7 @@ impl AuthoritativeVectorSource {
     }
 
     /// Rejects continuation that would silently re-embed or substitute vectors.
-    pub fn require_reusable_bytes(self) -> LegacyRetirementResult<()> {
+    pub fn require_reusable_bytes(&self) -> LegacyRetirementResult<()> {
         if self.requires_reembedding() {
             return Err(LegacyRetirementError::contract(
                 LegacyRetirementDiagnosticCode::SilentReembeddingForbidden,
@@ -191,12 +203,23 @@ pub struct MigrationValidationFields {
 }
 
 /// Complete migration validation artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MigrationValidation;
+///
+/// Its private binding prevents external construction and ties the evidence to
+/// the exact authoritative source and durable manifest checked at retirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationValidation {
+    source: AuthoritativeVectorSource,
+    manifest: CutoverManifest,
+}
 
 impl MigrationValidation {
-    /// Builds only after every migration artifact is valid and full dimension is preserved.
-    pub fn new(fields: MigrationValidationFields) -> LegacyRetirementResult<Self> {
+    /// Builds only after every migration artifact is valid, full dimension is
+    /// preserved, and reusable authoritative bytes are bound to a manifest.
+    pub fn new(
+        fields: MigrationValidationFields,
+        source: &AuthoritativeVectorSource,
+        manifest: &CutoverManifest,
+    ) -> LegacyRetirementResult<Self> {
         if !fields.full_dimension_preserved {
             return Err(LegacyRetirementError::contract(
                 LegacyRetirementDiagnosticCode::DimensionReductionForbidden,
@@ -215,7 +238,27 @@ impl MigrationValidation {
                 LegacyRetirementDiagnosticCode::MigrationValidationIncomplete,
             ));
         }
-        Ok(Self)
+        source.require_reusable_bytes()?;
+        Ok(Self {
+            source: source.clone(),
+            manifest: manifest.clone(),
+        })
+    }
+
+    /// Fails unless final authorization uses the source and manifest this
+    /// constructor validated.
+    fn require_binding(
+        &self,
+        source: &AuthoritativeVectorSource,
+        manifest: &CutoverManifest,
+    ) -> LegacyRetirementResult<()> {
+        source.require_reusable_bytes()?;
+        if self.source != *source || self.manifest != *manifest {
+            return Err(LegacyRetirementError::contract(
+                LegacyRetirementDiagnosticCode::MigrationValidationBindingMismatch,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -244,12 +287,17 @@ impl ShadowComparison {
         incumbent_generation: PublicationGeneration,
         candidate_generation: PublicationGeneration,
         state: ShadowComparisonState,
-    ) -> Self {
-        Self {
+    ) -> LegacyRetirementResult<Self> {
+        if incumbent_generation == candidate_generation {
+            return Err(LegacyRetirementError::contract(
+                LegacyRetirementDiagnosticCode::ShadowComparisonSameGeneration,
+            ));
+        }
+        Ok(Self {
             incumbent_generation,
             candidate_generation,
             state,
-        }
+        })
     }
 
     /// Rejects incomplete or failing shadow traffic.
@@ -268,8 +316,10 @@ impl ShadowComparison {
     /// Binds promotion to exactly the candidate that was shadowed.
     pub fn bind_promotion(
         &self,
+        gates: &CutoverGates,
         promoted_generation: &PublicationGeneration,
     ) -> LegacyRetirementResult<PublicationBinding> {
+        gates.require_complete()?;
         self.require_promotable()?;
         if &self.candidate_generation != promoted_generation {
             return Err(LegacyRetirementError::contract(
@@ -394,6 +444,29 @@ impl LegacyArtifactRemovalPlan {
     }
 }
 
+/// Non-forgeable approval that permits destructive legacy-artifact removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasePolicyApproval {
+    _approved: (),
+}
+
+impl ReleasePolicyApproval {
+    /// Constructs approval only after the authoritative release policy permits removal.
+    pub fn new(policy_allows_removal: bool) -> LegacyRetirementResult<Self> {
+        if !policy_allows_removal {
+            return Err(LegacyRetirementError::contract(
+                LegacyRetirementDiagnosticCode::ReleasePolicyApprovalRequired,
+            ));
+        }
+        Ok(Self { _approved: () })
+    }
+
+    /// Returns whether the validated policy permits artifact removal.
+    pub const fn allows_legacy_artifact_removal(&self) -> bool {
+        true
+    }
+}
+
 /// Serving capabilities that must remain after legacy retirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemainingServingCapabilities {
@@ -486,19 +559,54 @@ impl RetirementAuthorization {
     }
 }
 
-/// Authorizes retirement only after all gates, validation, shadow, rollback, and maintenance checks.
+/// Complete final-retirement boundary inputs.
+#[derive(Debug, Clone, Copy)]
+pub struct RetirementInputs<'a> {
+    /// The authoritative source bound into migration validation.
+    pub source: &'a AuthoritativeVectorSource,
+    /// The concrete durable cutover manifest.
+    pub manifest: &'a CutoverManifest,
+    /// Non-forgeable migration validation evidence.
+    pub validation: &'a MigrationValidation,
+    /// Passed dual-generation shadow evidence.
+    pub shadow: &'a ShadowComparison,
+    /// Declared rollback-retention window.
+    pub rollback_window: RollbackWindow,
+    /// Current logical authorization time.
+    pub now: u64,
+    /// Validated approval for destructive maintenance.
+    pub release_policy: &'a ReleasePolicyApproval,
+    /// Verified, explicit legacy-artifact disposition.
+    pub removal_plan: &'a LegacyArtifactRemovalPlan,
+    /// Capabilities retained after retirement.
+    pub remaining_capabilities: &'a RemainingServingCapabilities,
+}
+
+/// Authorizes retirement only after complete gates and every final boundary input.
 pub fn authorize_retirement(
     gates: &CutoverGates,
-    _validation: &MigrationValidation,
-    shadow: &ShadowComparison,
-    rollback_window: RollbackWindow,
-    now: u64,
-    _removal_plan: &LegacyArtifactRemovalPlan,
-    _remaining_capabilities: &RemainingServingCapabilities,
+    inputs: &RetirementInputs<'_>,
 ) -> LegacyRetirementResult<RetirementAuthorization> {
+    inputs
+        .validation
+        .require_binding(inputs.source, inputs.manifest)?;
     gates.require_complete()?;
-    let promotion = shadow.bind_promotion(shadow.candidate_generation())?;
-    rollback_window.require_elapsed(now)?;
+    let promotion = inputs
+        .shadow
+        .bind_promotion(gates, inputs.manifest.candidate_generation())?;
+    if promotion.incumbent_generation() != inputs.manifest.incumbent_generation()
+        || promotion.candidate_generation() != inputs.manifest.candidate_generation()
+    {
+        return Err(LegacyRetirementError::contract(
+            LegacyRetirementDiagnosticCode::MigrationValidationBindingMismatch,
+        ));
+    }
+    inputs.rollback_window.require_elapsed(inputs.now)?;
+    if !inputs.release_policy.allows_legacy_artifact_removal() {
+        return Err(LegacyRetirementError::contract(
+            LegacyRetirementDiagnosticCode::ReleasePolicyApprovalRequired,
+        ));
+    }
     Ok(RetirementAuthorization {
         candidate_generation: promotion.candidate_generation,
     })

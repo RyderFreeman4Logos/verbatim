@@ -49,6 +49,12 @@ pub enum LegacyRetirementDiagnosticCode {
     ShadowComparisonFailed,
     /// Promotion did not bind to the exact candidate shadow generation.
     PromotionGenerationMismatch,
+    /// A shadow comparison attempted to compare a generation with itself.
+    ShadowComparisonSameGeneration,
+    /// Final retirement inputs differ from the source and manifest migration validation bound.
+    MigrationValidationBindingMismatch,
+    /// Destructive legacy-artifact removal lacks an approved release policy.
+    ReleasePolicyApprovalRequired,
     /// The declared rollback retention window has not elapsed.
     RollbackWindowActive,
     /// Backup verification is absent before destructive maintenance.
@@ -83,6 +89,9 @@ impl LegacyRetirementDiagnosticCode {
             Self::ShadowComparisonIncomplete => "shadow_comparison_incomplete",
             Self::ShadowComparisonFailed => "shadow_comparison_failed",
             Self::PromotionGenerationMismatch => "promotion_generation_mismatch",
+            Self::ShadowComparisonSameGeneration => "shadow_comparison_same_generation",
+            Self::MigrationValidationBindingMismatch => "migration_validation_binding_mismatch",
+            Self::ReleasePolicyApprovalRequired => "release_policy_approval_required",
             Self::RollbackWindowActive => "rollback_window_active",
             Self::BackupRequired => "backup_required",
             Self::LegacyArtifactPlanIncomplete => "legacy_artifact_plan_incomplete",

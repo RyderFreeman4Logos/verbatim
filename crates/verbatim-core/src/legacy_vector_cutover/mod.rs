@@ -23,8 +23,9 @@ pub use identity::{
 pub use lifecycle::{
     authorize_retirement, AuthoritativeVectorSource, CutoverGates, GateClass, LegacyArtifact,
     LegacyArtifactRemovalPlan, LegacyPath, MigrationValidation, MigrationValidationFields,
-    PublicationBinding, RemainingServingCapabilities, RetirementAuthorization, RollbackWindow,
-    ShadowComparison, ShadowComparisonState, VectorReuseDecision,
+    PublicationBinding, ReleasePolicyApproval, RemainingServingCapabilities,
+    RetirementAuthorization, RetirementInputs, RollbackWindow, ShadowComparison,
+    ShadowComparisonState, VectorReuseDecision,
 };
 
 /// Contract schema version for the legacy-vector-cutover module surface.
