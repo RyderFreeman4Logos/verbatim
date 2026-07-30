@@ -15,6 +15,7 @@ pub mod context;
 pub mod deletion;
 pub mod diskann3;
 pub mod diskann3_backend;
+pub mod diskann3_service;
 pub mod durability;
 pub mod durable_updates;
 pub mod embed;
@@ -74,6 +75,9 @@ pub mod vision_caption;
 #[cfg(test)]
 #[path = "diskann3_backend/tests.rs"]
 mod diskann3_backend_tests;
+
+#[cfg(test)]
+mod diskann3_service_tests;
 
 #[cfg(test)]
 mod lancedb_backend_tests;
