@@ -70,11 +70,14 @@ authorization, lifecycle, or evidence payload state.
  query + tenant/ACL/source/lifecycle/date/typed-metadata constraints
                                         |
                                         v
- +--------------------- retrieval planner -----------------------+
- | zero/small authorized scope -> exact full-dimensional scan    |
- | broad authorized scope -> predicate-aware DiskANN3 traversal  |
- | unsupported strict predicate -> typed fail-closed result      |
- +------------------------------+--------------------------------+
+ +--------------------- retrieval planner ------------------------+
+ | zero authorized scope -> return without vector page I/O        |
+ | small authorized scope -> exact full-dimensional scan          |
+ | medium authorized scope -> PlannerSelected: exact by default   |
+ |   when independent exact budget fits; otherwise fail closed    |
+ | broad authorized scope -> predicate-aware DiskANN3 traversal   |
+ | unsupported strict predicate -> typed fail-closed result       |
+ +-------------------------------+--------------------------------+
                                 |
                                 v
  bounded candidates -> original 4096d float32 exact rescore -> fusion/rerank
@@ -127,12 +130,25 @@ hybrid score as lexical conformance.
 ### Filter and authorization behavior
 
 Authorization and strict metadata constraints participate before or during
-candidate generation. For a small authorized scope, the planner uses an exact
-full-dimensional scan; for a broad authorized scope, it uses
-predicate-aware DiskANN3 traversal. Global ANN followed by post-filtering is not
-an acceptable fallback. An unsupported strict predicate is a typed, fail-closed
-result. Returned candidates are revalidated against authoritative ACL, lifecycle,
-and tombstone state during hydration.
+candidate generation. The planner classifies the *authorized* cardinality:
+
+| Class | Authorized-cardinality band | Path |
+| --- | --- | --- |
+| Zero | `0` | Return without vector page I/O |
+| Small | `1..=exact_simd_scan_max_matches` | Exact full-dimensional scan |
+| Medium | `exact_simd_scan_max_matches+1 .. predicate_aware_diskann3_min_matches-1` | `PlannerSelected` |
+| Broad | `>= predicate_aware_diskann3_min_matches` | Predicate-aware DiskANN3 |
+
+The Medium band is intentional when the calibrated thresholds leave a gap. The
+predicate layer reports `PlannerSelected`; the search planner currently selects
+exact full-dimensional work for that gap only when the independent exact
+candidate budget still fits. If the Medium count exceeds that exact budget, the
+request fails closed rather than widening exact work, inventing an uncalibrated
+ANN path, or falling back to global ANN plus post-filter. Provenance must record
+the planner decision and the selectivity class. Global ANN followed by
+post-filtering is never an acceptable fallback. An unsupported strict predicate
+is a typed, fail-closed result. Returned candidates are revalidated against
+authoritative ACL, lifecycle, and tombstone state during hydration.
 
 ## Alternatives considered
 

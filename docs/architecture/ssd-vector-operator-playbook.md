@@ -228,10 +228,24 @@ access mode and cache protocol.
 
 ## 5. Filter, ACL, and hydration guarantees
 
-The planner classifies the *authorized* candidate count. Zero returns without
-vector page I/O; small scopes use exact full-dimensional scan; broad scopes use
-predicate-aware DiskANN3. The system must not issue global ANN then post-filter a
-Top-K as a correctness workaround.
+The planner classifies the *authorized* candidate count, not the raw corpus size:
+
+| Class | Band relative to calibrated thresholds | Required path |
+| --- | --- | --- |
+| Zero | `0` | Return without vector page I/O |
+| Small | `1..=exact_simd_scan_max_matches` | Exact full-dimensional scan |
+| Medium | `exact_simd_scan_max_matches+1 .. predicate_aware_diskann3_min_matches-1` | `PlannerSelected` |
+| Broad | `>= predicate_aware_diskann3_min_matches` | Predicate-aware DiskANN3 |
+
+When the configured thresholds leave a Medium gap (for example 10,001–49,999
+with the enterprise example profile), the predicate contract reports
+`PlannerSelected`. The search planner currently selects exact full-dimensional
+work for that gap only when the independent exact candidate budget still fits.
+If the Medium count exceeds that exact budget, planning fails closed. Do not
+widen the exact budget silently, invent an uncalibrated ANN path, or issue
+global ANN then post-filter a Top-K as a correctness workaround. Stage
+telemetry and fusion provenance must record the selectivity class and the
+planner choice.
 
 Supported strict predicate categories are source, collection, tenant,
 ACL-principal, ACL-deny, lifecycle, date range, and typed metadata equality.
@@ -417,7 +431,7 @@ Use the following triage order:
 | Stage / symptom | Check | Safe response |
 | --- | --- | --- |
 | **Admission**: saturation or rising queue | Active queries, shared workers, per-category limits, `memory.current` | Apply backpressure; do not add workers or caches beyond the profile. |
-| **Planning**: unexpected ANN for a narrow ACL scope | Authorized-cardinality estimate, generation/policy binding, exact threshold | Correct selector/calibration; narrow scopes must use exact scan. |
+| **Planning**: unexpected ANN for a narrow or medium ACL scope | Authorized-cardinality estimate, generation/policy binding, exact/medium thresholds, exact budget | Small scopes must use exact scan; Medium is `PlannerSelected` and currently exact only while the independent exact budget fits, otherwise fail closed. |
 | **Predicate**: unsupported or malformed strict filter | Capability declaration and typed diagnostic | Fail closed; implement/validate support before enabling the request. |
 | **Candidate traversal**: low filtered recall | Filter pushdown, candidate budget, graph/quantizer configuration, exact reference report | Compare against exact ground truth; do not hide the loss by post-filtering a global Top-K. |
 | **SSD read**: high pages/bytes/await/amplification | Access mode, page layout, queue depth, cache state, compaction metrics | Stop at bounds; investigate locality, graph/layout, and compaction rather than widening limits. |

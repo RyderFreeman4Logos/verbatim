@@ -85,10 +85,26 @@ supported = [
 [planner]
 # Values are benchmark-derived crossover inputs and must be revised only with a
 # versioned benchmark/acceptance-gate review.
+#
+# Selectivity ladder (authorized cardinality, not raw corpus size):
+#   Zero   = 0
+#   Small  = 1..=exact_simd_scan_max_matches
+#   Medium = exact_simd_scan_max_matches+1 .. predicate_aware_diskann3_min_matches-1
+#   Broad  = >= predicate_aware_diskann3_min_matches
+#
+# When the two thresholds leave a Medium gap, the predicate layer reports
+# PlannerSelected. The search planner currently conservatively selects exact
+# full-dimensional work for that gap only when the independent exact budget still
+# fits; otherwise planning fails closed rather than widening exact work or falling
+# back to global ANN plus post-filter. Provenance must record the planner choice.
 exact_simd_scan_max_matches = 10_000
 predicate_aware_diskann3_min_matches = 50_000
 zero_authorized_candidates = "return_without_vector_io"
 small_authorized_scope = "exact_full_dimensional_scan"
+medium_authorized_scope = "planner_selected_exact_or_predicate_aware_ann"
+medium_default_selection = "exact_full_dimensional_scan_when_exact_budget_fits"
+medium_exact_budget_exceeded = "fail_closed"
+medium_global_ann_post_filter = "forbidden"
 broad_authorized_scope = "predicate_aware_diskann3"
 
 [budget.candidate]

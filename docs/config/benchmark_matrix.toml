@@ -136,6 +136,37 @@ predicate_case = "tenant_acl_lifecycle_metadata"
 expected_path = "exact_full_dimensional_scan"
 query_count = 1_000
 
+# Medium covers the intentional gap between exact_simd_scan_max_matches and
+# predicate_aware_diskann3_min_matches (for example 10,001–49,999). The
+# expected path is planner-selected; the current planner defaults to exact when
+# the independent exact budget still fits and fails closed otherwise.
+[[scenario]]
+id = "medium_authorized_cold"
+cache_state = "cold"
+authorized_scope = "medium"
+predicate_case = "tenant_acl_lifecycle_metadata"
+expected_path = "planner_selected_exact_or_predicate_aware_ann"
+expected_default_path = "exact_full_dimensional_scan_when_exact_budget_fits"
+query_count = 1_000
+
+[[scenario]]
+id = "medium_authorized_warm"
+cache_state = "warm"
+authorized_scope = "medium"
+predicate_case = "tenant_acl_lifecycle_metadata"
+expected_path = "planner_selected_exact_or_predicate_aware_ann"
+expected_default_path = "exact_full_dimensional_scan_when_exact_budget_fits"
+query_count = 1_000
+
+[[scenario]]
+id = "medium_authorized_exact_budget_exceeded"
+cache_state = "warm"
+authorized_scope = "medium"
+predicate_case = "tenant_acl_lifecycle_metadata"
+expected_path = "typed_fail_closed"
+fail_reason = "exact_candidate_budget_exceeded"
+query_count = 100
+
 [[scenario]]
 id = "unsupported_strict_predicate"
 cache_state = "warm"
