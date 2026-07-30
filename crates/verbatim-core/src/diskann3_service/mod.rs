@@ -18,15 +18,23 @@ mod response;
 mod router;
 
 pub use adapter::{AdapterKind, InProcessAdapter, RemoteAdapter, VectorSearchAdapter};
-pub use backpressure::{BackpressureConfig, BackpressureGate, CircuitState, WorkerPool};
+pub use backpressure::{
+    AdmissionContext, BackpressureConfig, BackpressureGate, CircuitState, WorkerPool,
+};
 pub use capability::ServiceCapabilities;
 pub use error::{DiskAnn3ServiceDiagnosticCode, DiskAnn3ServiceError, DiskAnn3ServiceResult};
 pub use identity::{
     Generation, IdempotencyKey, ProfileId, RequestIdentity, ServiceIdentity, VectorSpaceId,
 };
 pub use protocol::{
-    ProtocolCapabilities, ProtocolOperation, ProtocolSearchRequest, ProtocolSearchResponse,
-    DISKANN3_SERVICE_PROTOCOL_VERSION,
+    ProtocolAcknowledgement, ProtocolCancelRequest, ProtocolCapabilities,
+    ProtocolCapabilitiesRequest, ProtocolCheckpointRequest, ProtocolControlRequest,
+    ProtocolExactRescoreRequest, ProtocolFailure, ProtocolGenerationDiscoveryRequest,
+    ProtocolGenerationResponse, ProtocolHealthRequest, ProtocolHealthResponse,
+    ProtocolMutationRequest, ProtocolOperation, ProtocolOperationRequest,
+    ProtocolOperationResponse, ProtocolRangeSearchRequest, ProtocolSearchRequest,
+    ProtocolSearchResponse, ProtocolServingState, ProtocolShardStatusRequest,
+    ProtocolShardStatusResponse, ProtocolValidateRequest, DISKANN3_SERVICE_PROTOCOL_VERSION,
 };
 pub use replica::{
     ActiveGenerationSet, DeltaRecoveryContract, ImmutableReplicaSet, ReplicaEndpoint,

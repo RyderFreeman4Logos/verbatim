@@ -1,4 +1,4 @@
-//! Fixed serving admission, bounded queue, retry budget preservation, and worker isolation types.
+//! Fixed serving admission, bounded queue deadlines, retry budget preservation, and worker isolation types.
 
 use crate::search_planner::SearchBudget;
 
@@ -24,6 +24,7 @@ pub enum WorkerPool {
 pub struct BackpressureConfig {
     max_active_queries: u32,
     max_queue_depth: u32,
+    queue_deadline_micros: u64,
     original_budget: SearchBudget,
     retry_budget: SearchBudget,
     max_tenant_work: u64,
@@ -33,11 +34,16 @@ impl BackpressureConfig {
     pub fn new(
         max_active_queries: u32,
         max_queue_depth: u32,
+        queue_deadline_micros: u64,
         original_budget: SearchBudget,
         retry_budget: SearchBudget,
         max_tenant_work: u64,
     ) -> DiskAnn3ServiceResult<Self> {
-        if max_active_queries == 0 || max_queue_depth == 0 || max_tenant_work == 0 {
+        if max_active_queries == 0
+            || max_queue_depth == 0
+            || queue_deadline_micros == 0
+            || max_tenant_work == 0
+        {
             return Err(DiskAnn3ServiceError::contract(
                 DiskAnn3ServiceDiagnosticCode::InvalidBackpressureConfig,
             ));
@@ -56,6 +62,7 @@ impl BackpressureConfig {
         Ok(Self {
             max_active_queries,
             max_queue_depth,
+            queue_deadline_micros,
             original_budget,
             retry_budget,
             max_tenant_work,
@@ -75,6 +82,52 @@ impl BackpressureConfig {
     pub const fn original_budget(&self) -> SearchBudget {
         self.original_budget
     }
+    pub const fn queue_deadline_micros(&self) -> u64 {
+        self.queue_deadline_micros
+    }
+    pub const fn max_tenant_work(&self) -> u64 {
+        self.max_tenant_work
+    }
+}
+
+/// Observed tenant work and queue wait at one pure admission decision.
+///
+/// The caller supplies the cumulative already-admitted tenant work plus the work
+/// it proposes to charge for this request. `queue_wait_micros` is measured by the
+/// runtime clock outside this types-only contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionContext<'a> {
+    tenant: &'a str,
+    active_queries: u32,
+    queued_queries: u32,
+    observed_tenant_work: u64,
+    charged_tenant_work: u64,
+    queue_wait_micros: u64,
+}
+
+impl<'a> AdmissionContext<'a> {
+    pub fn new(
+        tenant: &'a str,
+        active_queries: u32,
+        queued_queries: u32,
+        observed_tenant_work: u64,
+        charged_tenant_work: u64,
+        queue_wait_micros: u64,
+    ) -> DiskAnn3ServiceResult<Self> {
+        if tenant.is_empty() {
+            return Err(DiskAnn3ServiceError::contract(
+                DiskAnn3ServiceDiagnosticCode::InvalidBackpressureConfig,
+            ));
+        }
+        Ok(Self {
+            tenant,
+            active_queries,
+            queued_queries,
+            observed_tenant_work,
+            charged_tenant_work,
+            queue_wait_micros,
+        })
+    }
 }
 
 /// Pure admission evaluator. Callers must cancel outstanding disk work on rejection/cancellation.
@@ -89,30 +142,35 @@ impl BackpressureGate {
         Self { config, circuit }
     }
 
-    pub fn admit(
-        &self,
-        tenant: &str,
-        active_queries: u32,
-        queued_queries: u32,
-    ) -> DiskAnn3ServiceResult<()> {
-        if tenant.is_empty() {
-            return Err(DiskAnn3ServiceError::contract(
-                DiskAnn3ServiceDiagnosticCode::InvalidBackpressureConfig,
-            ));
-        }
+    /// Admits only work within the tenant cap and before the bounded queue deadline.
+    pub fn admit(&self, context: AdmissionContext<'_>) -> DiskAnn3ServiceResult<()> {
         if self.circuit == CircuitState::Open {
             return Err(DiskAnn3ServiceError::contract(
                 DiskAnn3ServiceDiagnosticCode::CircuitOpen,
             ));
         }
-        if active_queries >= self.config.max_active_queries {
+        if context.active_queries >= self.config.max_active_queries {
             return Err(DiskAnn3ServiceError::contract(
                 DiskAnn3ServiceDiagnosticCode::ActiveQueryExceeded,
             ));
         }
-        if queued_queries >= self.config.max_queue_depth {
+        if context.queued_queries >= self.config.max_queue_depth {
             return Err(DiskAnn3ServiceError::contract(
                 DiskAnn3ServiceDiagnosticCode::QueueExceeded,
+            ));
+        }
+        if context.queue_wait_micros >= self.config.queue_deadline_micros {
+            return Err(DiskAnn3ServiceError::contract(
+                DiskAnn3ServiceDiagnosticCode::QueueDeadlineExceeded,
+            ));
+        }
+        if context
+            .observed_tenant_work
+            .checked_add(context.charged_tenant_work)
+            .is_none_or(|work| work > self.config.max_tenant_work)
+        {
+            return Err(DiskAnn3ServiceError::contract(
+                DiskAnn3ServiceDiagnosticCode::TenantWorkExceeded,
             ));
         }
         Ok(())

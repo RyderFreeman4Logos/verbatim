@@ -23,12 +23,15 @@ runtime features exist.
 ## Semantic transport surface
 
 `VectorSearchAdapter` is deliberately sealed. `InProcessAdapter` and `RemoteAdapter`
-share the same identity-preserving semantic surface. `ProtocolSearchRequest` provides
-the version-1 wire-equivalent operation envelope for search; the versioned operation
-enum also reserves range search, exact rescore, staged mutations, checkpoint/validate,
-capability/generation discovery, health/readiness/shard status, and cancellation.
-A remote implementation must preserve generation, predicate, budget, deadline,
-idempotency, and completion semantics rather than re-plan or reset work.
+share the same typed `search`, range-search, and exact-rescore methods, returning
+identity-generation-bound `SearchResponse` values with explicit completion and work
+telemetry even in this I/O-free skeleton. `ProtocolOperationRequest` and
+`ProtocolOperationResponse` are version-1 tagged envelopes with typed payloads for
+search/range/rescore; stage/upsert/delete; checkpoint/validate; capability and
+generation discovery; health/readiness/shard status; and cancellation. Their closed
+`ProtocolFailure` alternative carries only a stable service diagnostic code. A remote
+implementation must preserve generation, predicate, budget, deadline, idempotency,
+and completion semantics rather than re-plan or reset work.
 
 ## Routing and failures
 
@@ -54,12 +57,17 @@ is rejected. This slice does not implement replication, recovery, or a mutable i
 
 ## Backpressure and isolation
 
-`BackpressureConfig` gives fixed active-query and queue bounds, per-tenant work caps,
-and an original/retry `SearchBudget` relation. Retry work must be narrower, so there is
-no budget reset or retry storm. `BackpressureGate` emits typed circuit, active-query,
-and queue overload codes. Build, update, and compaction have distinct worker-pool
-identities; live cgroup/process placement and deterministic cancellation of disk reads
-remain requirements for the later runtime implementation.
+`BackpressureConfig` gives fixed active-query and queue bounds, an explicit queue
+deadline, per-tenant work caps, and an original/retry `SearchBudget` relation.
+`AdmissionContext` supplies observed and newly charged tenant work plus elapsed queue
+wait; `BackpressureGate` rejects tenant-work cap breaches and queue waits at or past
+the deadline with distinct closed codes, before any runtime work is admitted. Retry
+work must be narrower, so there is no budget reset or retry storm. The same closed
+diagnostic taxonomy includes `shard_corruption` for a serving index/shard failure, and
+`ProtocolFailure` exposes it without request, tenant, shard, or endpoint data. Build,
+update, and compaction have distinct worker-pool identities; live cgroup/process
+placement and deterministic cancellation of disk reads remain requirements for the
+later runtime implementation.
 
 ## Follow-up runtime work
 

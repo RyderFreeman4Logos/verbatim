@@ -1,11 +1,18 @@
 use crate::diskann3_service::{
-    ActiveGenerationSet, AdapterKind, AuthorizationContext, BackpressureConfig, BackpressureGate,
-    CircuitState, CompletionState, DeltaRecoveryContract, DiskAnn3ServiceDiagnosticCode,
-    DiskAnn3ServiceError, Generation, IdempotencyKey, ImmutableReplicaSet, InProcessAdapter,
-    PredicatePlan, ProfileId, ProtocolSearchRequest, ProtocolSearchResponse, RemoteAdapter,
-    ReplicaEndpoint, RequestIdentity, SearchRequest, SearchResponse, ServiceCapabilities,
-    ServiceIdentity, ShardDescriptor, ShardHealth, ShardManifest, ShardRouteMetadata, ShardRouter,
-    ShardRouterConfig, TraceContext, VectorSearchAdapter, VectorSpaceId, WorkTelemetry,
+    ActiveGenerationSet, AdapterKind, AdmissionContext, AuthorizationContext, BackpressureConfig,
+    BackpressureGate, CircuitState, CompletionState, DeltaRecoveryContract,
+    DiskAnn3ServiceDiagnosticCode, DiskAnn3ServiceError, Generation, IdempotencyKey,
+    ImmutableReplicaSet, InProcessAdapter, PredicatePlan, ProfileId, ProtocolAcknowledgement,
+    ProtocolCancelRequest, ProtocolCapabilities, ProtocolCapabilitiesRequest,
+    ProtocolCheckpointRequest, ProtocolExactRescoreRequest, ProtocolGenerationDiscoveryRequest,
+    ProtocolGenerationResponse, ProtocolHealthRequest, ProtocolHealthResponse,
+    ProtocolMutationRequest, ProtocolOperationRequest, ProtocolOperationResponse,
+    ProtocolRangeSearchRequest, ProtocolSearchRequest, ProtocolSearchResponse,
+    ProtocolServingState, ProtocolShardStatusRequest, ProtocolShardStatusResponse,
+    ProtocolValidateRequest, RemoteAdapter, ReplicaEndpoint, RequestIdentity, SearchRequest,
+    SearchResponse, ServiceCapabilities, ServiceIdentity, ShardDescriptor, ShardHealth,
+    ShardManifest, ShardRouteMetadata, ShardRouter, ShardRouterConfig, TraceContext,
+    VectorSearchAdapter, VectorSpaceId, WorkTelemetry,
 };
 use crate::search_planner::{SearchBudget, SearchBudgetFields};
 
@@ -239,7 +246,7 @@ fn diskann3_service_deadline_and_budget_are_bound_and_exhaustion_is_typed() {
 
 #[test]
 fn diskann3_service_retry_cannot_reset_or_widen_budget() {
-    let error = BackpressureConfig::new(1, 1, budget(), budget(), 2)
+    let error = BackpressureConfig::new(1, 1, 10, budget(), budget(), 2)
         .expect_err("a retry must consume a narrower remaining budget");
     assert_eq!(
         error.diagnostic_code(),
@@ -265,6 +272,31 @@ fn diskann3_service_in_process_and_remote_share_one_semantic_surface() {
     assert_eq!(protocol.trace(), request.trace());
     assert_eq!(protocol.budget(), request.budget());
     assert_eq!(protocol.deadline_micros(), request.deadline_micros());
+
+    let local_response = local.search(&request).expect("local typed search outcome");
+    let remote_response = remote
+        .search(&request)
+        .expect("remote typed search outcome");
+    assert_eq!(local_response, remote_response);
+    assert_eq!(local_response.generation(), request.identity().generation());
+    assert_eq!(local_response.completion(), CompletionState::Complete);
+    assert!(local_response.telemetry().work_units() <= request.budget().fields().max_work_units);
+
+    let range_request = ProtocolRangeSearchRequest::new(&request, 0.5).expect("range request");
+    assert_eq!(
+        local.range_search(&range_request).expect("local range"),
+        remote.range_search(&range_request).expect("remote range"),
+    );
+    let rescore_request =
+        ProtocolExactRescoreRequest::new(&request, vec![7]).expect("rescore request");
+    assert_eq!(
+        local
+            .exact_rescore(&rescore_request)
+            .expect("local rescore"),
+        remote
+            .exact_rescore(&rescore_request)
+            .expect("remote rescore"),
+    );
 }
 
 #[test]
@@ -276,24 +308,159 @@ fn diskann3_service_durable_replica_serde_revalidates_and_rejects_network_storag
 #[test]
 fn diskann3_service_circuit_open_and_queue_overload_have_exact_codes() {
     let gate = BackpressureGate::new(
-        BackpressureConfig::new(1, 1, budget(), narrower_budget(), 2).expect("backpressure"),
+        BackpressureConfig::new(1, 1, 10, budget(), narrower_budget(), 2).expect("backpressure"),
         CircuitState::Open,
     );
-    let error = gate.admit("tenant-a", 0, 0).expect_err("open circuit");
+    let error = gate
+        .admit(admission(0, 0, 0, 0, 0))
+        .expect_err("open circuit");
     assert_eq!(
         error.diagnostic_code(),
         DiskAnn3ServiceDiagnosticCode::CircuitOpen
     );
 
     let gate = BackpressureGate::new(
-        BackpressureConfig::new(1, 1, budget(), narrower_budget(), 2).expect("backpressure"),
+        BackpressureConfig::new(1, 1, 10, budget(), narrower_budget(), 2).expect("backpressure"),
         CircuitState::Closed,
     );
-    let error = gate.admit("tenant-a", 0, 1).expect_err("bounded queue");
+    let error = gate
+        .admit(admission(0, 1, 0, 0, 0))
+        .expect_err("bounded queue");
     assert_eq!(
         error.diagnostic_code(),
         DiskAnn3ServiceDiagnosticCode::QueueExceeded
     );
+}
+
+#[test]
+fn diskann3_service_backpressure_rejects_tenant_work_and_expired_queue_deadline() {
+    let gate = BackpressureGate::new(
+        BackpressureConfig::new(2, 2, 10, budget(), narrower_budget(), 10).expect("backpressure"),
+        CircuitState::Closed,
+    );
+    let error = gate
+        .admit(admission(0, 0, 8, 3, 0))
+        .expect_err("charged tenant work exceeds the configured cap");
+    assert_eq!(
+        error.diagnostic_code(),
+        DiskAnn3ServiceDiagnosticCode::TenantWorkExceeded
+    );
+
+    let error = gate
+        .admit(admission(0, 0, 0, 0, 10))
+        .expect_err("queue wait at its deadline is expired");
+    assert_eq!(
+        error.diagnostic_code(),
+        DiskAnn3ServiceDiagnosticCode::QueueDeadlineExceeded
+    );
+}
+
+#[test]
+fn diskann3_service_non_search_protocol_envelopes_are_versioned_and_typed() {
+    let request = request(7);
+    let mutation = ProtocolMutationRequest::new(
+        request.identity().clone(),
+        request.deadline_micros(),
+        request.idempotency_key().clone(),
+        vec![7],
+    )
+    .expect("mutation request");
+    let envelopes = vec![
+        ProtocolOperationRequest::RangeSearch(
+            ProtocolRangeSearchRequest::new(&request, 0.5).expect("range request"),
+        ),
+        ProtocolOperationRequest::ExactRescore(
+            ProtocolExactRescoreRequest::new(&request, vec![7]).expect("rescore request"),
+        ),
+        ProtocolOperationRequest::Stage(mutation.clone()),
+        ProtocolOperationRequest::Upsert(mutation.clone()),
+        ProtocolOperationRequest::Delete(mutation),
+        ProtocolOperationRequest::Checkpoint(
+            ProtocolCheckpointRequest::new(
+                request.identity().clone(),
+                request.deadline_micros(),
+                request.idempotency_key().clone(),
+            )
+            .expect("checkpoint request"),
+        ),
+        ProtocolOperationRequest::Validate(
+            ProtocolValidateRequest::new(
+                request.identity().clone(),
+                request.deadline_micros(),
+                request.idempotency_key().clone(),
+            )
+            .expect("validate request"),
+        ),
+        ProtocolOperationRequest::DiscoverCapabilities(ProtocolCapabilitiesRequest::new()),
+        ProtocolOperationRequest::DiscoverGeneration(ProtocolGenerationDiscoveryRequest::new(
+            request.identity().clone(),
+        )),
+        ProtocolOperationRequest::Health(ProtocolHealthRequest::new()),
+        ProtocolOperationRequest::Readiness(ProtocolHealthRequest::new()),
+        ProtocolOperationRequest::ShardStatus(
+            ProtocolShardStatusRequest::new(request.identity().clone(), 1)
+                .expect("shard-status request"),
+        ),
+        ProtocolOperationRequest::Cancel(ProtocolCancelRequest::new(
+            request.identity().clone(),
+            request.idempotency_key().clone(),
+        )),
+    ];
+    assert!(envelopes.iter().all(|envelope| envelope.version() == 1));
+}
+
+#[test]
+fn diskann3_service_non_search_protocol_responses_are_versioned_and_typed() {
+    let request = request(7);
+    let search_response = ProtocolSearchResponse::from(
+        &SearchResponse::new(
+            vec![(7, 0.25)],
+            request.identity().generation(),
+            CompletionState::Complete,
+            WorkTelemetry::new(1, 1, 1, 1).expect("telemetry"),
+        )
+        .expect("search response"),
+    );
+    let acknowledgement = ProtocolAcknowledgement::new(CompletionState::Complete);
+    let capabilities = ProtocolCapabilities::new(
+        ServiceCapabilities::new(true, true, true, true, true).expect("capabilities"),
+    );
+    let health = ProtocolHealthResponse::new(ProtocolServingState::Healthy);
+    let shard_status =
+        ProtocolShardStatusResponse::new(request.identity().clone(), 1, ShardHealth::Ready)
+            .expect("shard status");
+    let responses = vec![
+        ProtocolOperationResponse::RangeSearch(search_response.clone()),
+        ProtocolOperationResponse::ExactRescore(search_response),
+        ProtocolOperationResponse::Stage(acknowledgement),
+        ProtocolOperationResponse::Upsert(acknowledgement),
+        ProtocolOperationResponse::Delete(acknowledgement),
+        ProtocolOperationResponse::Checkpoint(acknowledgement),
+        ProtocolOperationResponse::Validate(acknowledgement),
+        ProtocolOperationResponse::DiscoverCapabilities(capabilities),
+        ProtocolOperationResponse::DiscoverGeneration(ProtocolGenerationResponse::new(
+            request.identity().clone(),
+        )),
+        ProtocolOperationResponse::Health(health),
+        ProtocolOperationResponse::Readiness(health),
+        ProtocolOperationResponse::ShardStatus(shard_status),
+        ProtocolOperationResponse::Cancel(acknowledgement),
+    ];
+    assert!(responses.iter().all(|response| response.version() == 1));
+    assert!(responses
+        .iter()
+        .all(|response| response.operation().is_some()));
+}
+
+#[test]
+fn diskann3_service_protocol_corruption_diagnostic_has_exact_code() {
+    let response = ProtocolOperationResponse::shard_corruption();
+    let error = response.failure().expect("typed corruption failure");
+    assert_eq!(
+        error.diagnostic_code(),
+        DiskAnn3ServiceDiagnosticCode::ShardCorruption
+    );
+    assert_eq!(error.to_string(), "diskann3-service.shard_corruption");
 }
 
 #[test]
@@ -334,4 +501,22 @@ fn narrower_budget() -> SearchBudget {
     let mut fields = budget().fields();
     fields.max_stage_attempts = 1;
     SearchBudget::new(fields).expect("narrower budget")
+}
+
+fn admission(
+    active_queries: u32,
+    queued_queries: u32,
+    observed_tenant_work: u64,
+    charged_tenant_work: u64,
+    queue_wait_micros: u64,
+) -> AdmissionContext<'static> {
+    AdmissionContext::new(
+        "tenant-a",
+        active_queries,
+        queued_queries,
+        observed_tenant_work,
+        charged_tenant_work,
+        queue_wait_micros,
+    )
+    .expect("admission context")
 }
