@@ -41,8 +41,9 @@ pub enum Normalization {
     L2,
 }
 
-/// SSD encoding for candidate storage. Float32 retains original native vectors
-/// for exact scoring; no variant represents dimensional truncation.
+/// SSD encoding for candidate storage. Float32 preserves the original native
+/// vectors needed for exact late-interaction scoring; no variant represents
+/// dimensional truncation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageEncoding {
@@ -50,6 +51,13 @@ pub enum StorageEncoding {
     Float16,
     ProductQuantized,
     BinaryCandidateCode,
+}
+
+impl StorageEncoding {
+    /// Whether this encoding itself retains the original full-precision vectors.
+    pub const fn preserves_original_full_precision(self) -> bool {
+        matches!(self, Self::Float32)
+    }
 }
 
 /// Operation a named space may accept from a typed query plan.
@@ -112,6 +120,13 @@ impl NamedVectorSpaceSpec {
         if fields.native_dimension == 0 || fields.native_dimension > 1_000_000 {
             return Err(NamedVectorSpaceError::contract(
                 NamedVectorSpaceDiagnosticCode::InvalidNativeDimension,
+            ));
+        }
+        if fields.modality == EmbeddingModality::LateInteractionToken
+            && !fields.storage_encoding.preserves_original_full_precision()
+        {
+            return Err(NamedVectorSpaceError::contract(
+                NamedVectorSpaceDiagnosticCode::OriginalVectorsRequired,
             ));
         }
         if fields.supported_operations.is_empty()

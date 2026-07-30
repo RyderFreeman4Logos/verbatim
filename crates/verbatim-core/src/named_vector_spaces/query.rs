@@ -11,7 +11,7 @@ use super::{
 };
 
 /// Shape only: query vectors remain owned by a future execution implementation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum QueryVectorShape {
     Dense {
@@ -21,6 +21,33 @@ pub enum QueryVectorShape {
         native_dimension: u32,
         query_token_count: u32,
     },
+}
+
+impl<'de> Deserialize<'de> for QueryVectorShape {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case", tag = "kind")]
+        enum Wire {
+            Dense {
+                native_dimension: u32,
+            },
+            LateInteraction {
+                native_dimension: u32,
+                query_token_count: u32,
+            },
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Dense { native_dimension } => Self::dense(native_dimension),
+            Wire::LateInteraction {
+                native_dimension,
+                query_token_count,
+            } => Self::late_interaction(native_dimension, query_token_count),
+        }
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl QueryVectorShape {
@@ -91,9 +118,23 @@ impl NamedVectorClause {
 }
 
 /// One shared budget, consumed across all named spaces and modalities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SearchBudget {
     maximum_candidates: u32,
+}
+
+impl<'de> Deserialize<'de> for SearchBudget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            maximum_candidates: u32,
+        }
+        Self::new(Wire::deserialize(deserializer)?.maximum_candidates)
+            .map_err(serde::de::Error::custom)
+    }
 }
 impl SearchBudget {
     pub fn new(maximum_candidates: u32) -> NamedVectorSpaceResult<Self> {
@@ -154,11 +195,32 @@ impl FusionProfileIdentity {
 }
 
 /// Typed plan before capability selection or backend execution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NamedVectorQueryPlan {
     clauses: Vec<NamedVectorClause>,
     shared_budget: SearchBudget,
     fusion_profile: FusionProfileIdentity,
+}
+
+impl<'de> Deserialize<'de> for NamedVectorQueryPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            clauses: Vec<NamedVectorClause>,
+            shared_budget: SearchBudget,
+            fusion_profile: FusionProfileIdentity,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.clauses,
+            wire.shared_budget.maximum_candidates(),
+            wire.fusion_profile,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 impl NamedVectorQueryPlan {
     pub const MAX_CLAUSES: usize = 64;
@@ -187,6 +249,16 @@ impl NamedVectorQueryPlan {
             fusion_profile,
         })
     }
+
+    fn revalidate(&self) -> NamedVectorSpaceResult<()> {
+        Self::new(
+            self.clauses.clone(),
+            self.shared_budget.maximum_candidates(),
+            self.fusion_profile.clone(),
+        )
+        .map(|_| ())
+    }
+
     pub fn clauses(&self) -> &[NamedVectorClause] {
         &self.clauses
     }
@@ -205,6 +277,7 @@ impl NamedVectorQueryPlan {
         capabilities: BackendCapabilities,
         _degraded_profiles: &[DegradedProfile],
     ) -> NamedVectorSpaceResult<CompiledNamedVectorPlan> {
+        self.revalidate()?;
         if !capabilities.supports_named_vectors {
             return Err(NamedVectorSpaceError::contract(
                 NamedVectorSpaceDiagnosticCode::UnsupportedBackendCapability,
@@ -257,11 +330,37 @@ impl NamedVectorQueryPlan {
 }
 
 /// Compiled route contract, intentionally without client, I/O, or fusion code.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompiledNamedVectorPlan {
     clauses: Vec<NamedVectorClause>,
     shared_budget: SearchBudget,
     fusion_profile: FusionProfileIdentity,
+}
+
+impl<'de> Deserialize<'de> for CompiledNamedVectorPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            clauses: Vec<NamedVectorClause>,
+            shared_budget: SearchBudget,
+            fusion_profile: FusionProfileIdentity,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let plan = NamedVectorQueryPlan::new(
+            wire.clauses,
+            wire.shared_budget.maximum_candidates(),
+            wire.fusion_profile,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            clauses: plan.clauses,
+            shared_budget: plan.shared_budget,
+            fusion_profile: plan.fusion_profile,
+        })
+    }
 }
 impl CompiledNamedVectorPlan {
     pub fn clauses(&self) -> &[NamedVectorClause] {
@@ -298,10 +397,25 @@ impl BackendCapabilities {
 
 /// A separately selected degraded profile. Naming and allowed spaces are bounded,
 /// so a backend cannot silently substitute an arbitrary retrieval mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DegradedProfile {
     name: String,
     allowed_spaces: Vec<NamedVectorSpaceId>,
+}
+
+impl<'de> Deserialize<'de> for DegradedProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            name: String,
+            allowed_spaces: Vec<NamedVectorSpaceId>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.name, wire.allowed_spaces).map_err(serde::de::Error::custom)
+    }
 }
 impl DegradedProfile {
     pub fn new(
@@ -376,7 +490,7 @@ pub enum CandidateInclusionReason {
 }
 
 /// Raw result facts retained before fusion/hydration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SpaceCandidate {
     object: ObjectId,
     space: NamedVectorSpaceId,
@@ -384,6 +498,33 @@ pub struct SpaceCandidate {
     raw_rank: u32,
     raw_score: f64,
     inclusion_reason: CandidateInclusionReason,
+}
+
+impl<'de> Deserialize<'de> for SpaceCandidate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            object: ObjectId,
+            space: NamedVectorSpaceId,
+            profile: CandidateIndexProfileId,
+            raw_rank: u32,
+            raw_score: f64,
+            inclusion_reason: CandidateInclusionReason,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.object,
+            wire.space,
+            wire.profile,
+            wire.raw_rank,
+            wire.raw_score,
+            wire.inclusion_reason,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 impl SpaceCandidate {
     pub fn new(

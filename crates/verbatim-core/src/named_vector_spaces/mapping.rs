@@ -10,7 +10,7 @@ use super::{
 };
 
 /// One compact location in a single homogeneous physical space.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum VectorLocation {
     Dense {
@@ -21,6 +21,37 @@ pub enum VectorLocation {
         shard_ordinal: u32,
         range: VectorRange,
     },
+}
+
+impl<'de> Deserialize<'de> for VectorLocation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case", tag = "kind")]
+        enum Wire {
+            Dense {
+                shard_ordinal: u32,
+                vector_id: u64,
+            },
+            LateInteraction {
+                shard_ordinal: u32,
+                range: VectorRange,
+            },
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Dense {
+                shard_ordinal,
+                vector_id,
+            } => Self::dense(shard_ordinal, vector_id),
+            Wire::LateInteraction {
+                shard_ordinal,
+                range,
+            } => Self::late_interaction(shard_ordinal, range),
+        }
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl VectorLocation {
@@ -162,9 +193,22 @@ impl ObjectSpaceMapping {
 }
 
 /// Explicit linear physical-storage accounting across independent spaces.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StorageComplexityContract {
     terms: Vec<(u64, u32)>,
+}
+
+impl<'de> Deserialize<'de> for StorageComplexityContract {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            terms: Vec<(u64, u32)>,
+        }
+        Self::new(Wire::deserialize(deserializer)?.terms).map_err(serde::de::Error::custom)
+    }
 }
 
 impl StorageComplexityContract {

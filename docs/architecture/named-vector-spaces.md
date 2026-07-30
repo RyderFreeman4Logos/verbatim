@@ -47,8 +47,12 @@ O(sum(N_space * D_native))
 ```
 
 with original native vectors retained where exact interaction/audit requires
-them. The contract rejects invalid/overflowing storage terms rather than
-claiming a hidden quadratic arrangement.
+them. A `LateInteractionToken` space with `LateInteractionMaxSim` must declare
+`Float32`: this walking skeleton has no separate original-vector-store reference,
+so Float16, product-quantized, and binary candidate-only encodings are rejected
+rather than claiming an exact final score without original vectors. The contract
+rejects invalid/overflowing storage terms rather than claiming a hidden quadratic
+arrangement.
 
 ## Typed query routing and partial state
 
@@ -75,9 +79,10 @@ For ColBERT-style multivectors, the contract distinguishes two stages:
    candidate pool. It may be approximate and therefore its **candidate recall**
    is measured separately.
 2. `ExactInteraction::MaxSimFullPrecision` requires the original vectors and is
-   the declared final interaction. Its **final interaction quality** is a
-   separate measurement; exact rescoring of retrieved candidates does not make
-   an approximate candidate stage exact.
+   the declared final interaction. The contract's reference evaluator sums each
+   query token's maximum full-precision dot product over candidate tokens; its
+   **final interaction quality** is a separate measurement. Exact rescoring of
+   retrieved candidates does not make an approximate candidate stage exact.
 
 `VectorRange` records nonempty page-aligned contiguous token/region ranges,
 which is the required SSD-friendly layout for bounded online rescoring. Future
@@ -95,9 +100,12 @@ removal of every derived representation. Independent retention is allowed only
 when `SpaceRetentionRequest` proves no evidence remains referenced, preventing
 GC from deleting an active representation.
 
-All durable constructors are re-run during serde deserialization. Diagnostics
-are a closed code-only taxonomy; public error `Debug` and `Display` expose no
-caller-controlled object ID, model identifier, shard path, score, or receipt.
+All durable constructors are re-run during serde deserialization, including
+constructor-validated nested query, mapping, stage, storage, degradation, and
+candidate facts. `NamedVectorQueryPlan::compile` defensively revalidates the
+whole plan before capability selection. Diagnostics are a closed code-only
+taxonomy; public error `Debug` and `Display` expose no caller-controlled object
+ID, model identifier, shard path, score, or receipt.
 No sealed adapter marker is exported and the module exposes no free-form
 failure-receipt minting API.
 

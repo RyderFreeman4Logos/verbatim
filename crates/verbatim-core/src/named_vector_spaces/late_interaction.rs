@@ -66,11 +66,32 @@ impl VectorRange {
 }
 
 /// Strict caps for the approximate token/region candidate stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LateInteractionCandidateStage {
     maximum_query_token_frontier: u32,
     maximum_object_candidate_pool: u32,
     approximate_candidate_stage: bool,
+}
+
+impl<'de> Deserialize<'de> for LateInteractionCandidateStage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            maximum_query_token_frontier: u32,
+            maximum_object_candidate_pool: u32,
+            approximate_candidate_stage: bool,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.maximum_query_token_frontier,
+            wire.maximum_object_candidate_pool,
+            wire.approximate_candidate_stage,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl LateInteractionCandidateStage {
@@ -116,6 +137,58 @@ impl ExactInteraction {
     }
     pub const fn requires_original_vectors(self) -> bool {
         true
+    }
+
+    /// Scores original native-dimensional vectors with ColBERT-style MaxSim.
+    ///
+    /// Every query token contributes its largest dot product against the
+    /// candidate's original vectors. Candidate codes and quantized vectors are
+    /// intentionally not accepted by this pure final-scoring contract.
+    pub fn score_original_vectors(
+        self,
+        query_tokens: &[Vec<f32>],
+        candidate_tokens: &[Vec<f32>],
+    ) -> NamedVectorSpaceResult<f32> {
+        let _ = self;
+        validate_original_vectors(query_tokens, candidate_tokens)?;
+        Ok(query_tokens
+            .iter()
+            .map(|query_token| {
+                candidate_tokens
+                    .iter()
+                    .map(|candidate_token| {
+                        query_token
+                            .iter()
+                            .zip(candidate_token)
+                            .map(|(query, candidate)| query * candidate)
+                            .sum::<f32>()
+                    })
+                    .fold(f32::NEG_INFINITY, f32::max)
+            })
+            .sum())
+    }
+}
+
+fn validate_original_vectors(
+    query_tokens: &[Vec<f32>],
+    candidate_tokens: &[Vec<f32>],
+) -> NamedVectorSpaceResult<()> {
+    let Some(native_dimension) = query_tokens.first().map(Vec::len) else {
+        return Err(NamedVectorSpaceError::contract(
+            NamedVectorSpaceDiagnosticCode::InvalidExactInteractionVectors,
+        ));
+    };
+    let valid = native_dimension > 0
+        && !candidate_tokens.is_empty()
+        && query_tokens.iter().chain(candidate_tokens).all(|vector| {
+            vector.len() == native_dimension && vector.iter().all(|value| value.is_finite())
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(NamedVectorSpaceError::contract(
+            NamedVectorSpaceDiagnosticCode::InvalidExactInteractionVectors,
+        ))
     }
 }
 

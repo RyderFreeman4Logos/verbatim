@@ -3,11 +3,35 @@ use crate::named_vector_spaces::{
     CompiledNamedVectorPlan, DegradedProfile, EmbeddingModality, ExactInteraction,
     FusionProfileIdentity, LateInteractionCandidateStage, LateInteractionQualityMeasurements,
     ModelIdentity, NamedVectorClause, NamedVectorPublicationManifest, NamedVectorQueryPlan,
-    NamedVectorSpaceId, NamedVectorSpaceSpec, NamedVectorSpaceSpecFields, Normalization, ObjectId,
-    ObjectSpaceMapping, PublicationGeneration, QueryOperation, QueryVectorShape, SpaceAvailability,
+    NamedVectorSpaceDiagnosticCode, NamedVectorSpaceId, NamedVectorSpaceResult,
+    NamedVectorSpaceSpec, NamedVectorSpaceSpecFields, Normalization, ObjectId, ObjectSpaceMapping,
+    PublicationGeneration, QueryOperation, QueryVectorShape, SearchBudget, SpaceAvailability,
     SpaceCandidate, SpacePublicationState, SpaceRetentionRequest, StagedSpaceArtifact,
     StorageComplexityContract, StorageEncoding, VectorLocation, VectorMetric, VectorRange,
 };
+
+fn assert_diagnostic<T>(
+    result: NamedVectorSpaceResult<T>,
+    expected: NamedVectorSpaceDiagnosticCode,
+) {
+    match result {
+        Ok(_) => panic!("expected named-vector-spaces.{}", expected.as_str()),
+        Err(error) => assert_eq!(error.diagnostic_code(), expected),
+    }
+}
+
+fn assert_serde_diagnostic<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    expected: NamedVectorSpaceDiagnosticCode,
+) {
+    match serde_json::from_value::<T>(value) {
+        Ok(_) => panic!("expected named-vector-spaces.{}", expected.as_str()),
+        Err(error) => assert_eq!(
+            error.to_string(),
+            format!("named-vector-spaces.{}", expected.as_str())
+        ),
+    }
+}
 
 fn generation() -> PublicationGeneration {
     PublicationGeneration::new(7).expect("valid generation")
@@ -232,6 +256,25 @@ fn exact_maxsim_is_declared_separately_from_approximate_candidate_generation() {
 }
 
 #[test]
+fn exact_maxsim_scores_original_full_precision_multitoken_vectors() {
+    let query = vec![vec![1.0_f32, 0.0], vec![0.0, 1.0]];
+    let stronger_document = vec![vec![1.0_f32, 0.0], vec![0.0, 1.0]];
+    let weaker_document = vec![vec![0.5_f32, 0.5], vec![0.25, 0.75]];
+    let exact = ExactInteraction::max_sim_full_precision();
+
+    let stronger_score = exact
+        .score_original_vectors(&query, &stronger_document)
+        .expect("finite vectors with matching dimensions");
+    let weaker_score = exact
+        .score_original_vectors(&query, &weaker_document)
+        .expect("finite vectors with matching dimensions");
+
+    assert_eq!(stronger_score, 2.0);
+    assert_eq!(weaker_score, 1.25);
+    assert!(stronger_score > weaker_score);
+}
+
+#[test]
 fn late_interaction_space_requires_maxsim_operation() {
     let mut fields = late_spec().into_fields();
     fields.supported_operations = vec![QueryOperation::DenseNearestNeighbor];
@@ -239,19 +282,36 @@ fn late_interaction_space_requires_maxsim_operation() {
 }
 
 #[test]
+fn exact_maxsim_space_requires_float32_original_vector_storage() {
+    for storage_encoding in [
+        StorageEncoding::Float16,
+        StorageEncoding::ProductQuantized,
+        StorageEncoding::BinaryCandidateCode,
+    ] {
+        let mut fields = late_spec().into_fields();
+        fields.storage_encoding = storage_encoding;
+        assert_diagnostic(
+            NamedVectorSpaceSpec::new(fields),
+            NamedVectorSpaceDiagnosticCode::OriginalVectorsRequired,
+        );
+    }
+}
+
+#[test]
 fn missing_stale_and_wrong_generation_spaces_are_visible_typed_states() {
-    assert!(SpaceAvailability::missing()
-        .require_complete(generation())
-        .is_err());
-    assert!(
-        SpaceAvailability::stale(PublicationGeneration::new(6).expect("generation"))
-            .require_complete(generation())
-            .is_err()
+    assert_diagnostic(
+        SpaceAvailability::missing().require_complete(generation()),
+        NamedVectorSpaceDiagnosticCode::MissingVectorSpace,
     );
-    assert!(
+    assert_diagnostic(
+        SpaceAvailability::stale(PublicationGeneration::new(6).expect("generation"))
+            .require_complete(generation()),
+        NamedVectorSpaceDiagnosticCode::StaleVectorSpace,
+    );
+    assert_diagnostic(
         SpaceAvailability::complete(PublicationGeneration::new(8).expect("generation"))
-            .require_complete(generation())
-            .is_err()
+            .require_complete(generation()),
+        NamedVectorSpaceDiagnosticCode::WrongGeneration,
     );
 }
 
@@ -267,9 +327,10 @@ fn unsupported_capability_fails_without_silent_fallback() {
         FusionProfileIdentity::new("late-rrf", 1).expect("profile"),
     )
     .expect("plan");
-    assert!(plan
-        .compile(&[late_spec()], BackendCapabilities::named_dense_only(), &[])
-        .is_err());
+    assert_diagnostic(
+        plan.compile(&[late_spec()], BackendCapabilities::named_dense_only(), &[]),
+        NamedVectorSpaceDiagnosticCode::UnsupportedBackendCapability,
+    );
 }
 
 #[test]
@@ -310,6 +371,81 @@ fn serde_revalidates_durable_mapping_locations() {
     }"#;
     let decoded: Result<ObjectSpaceMapping, _> = serde_json::from_str(json);
     assert!(decoded.is_err());
+}
+
+#[test]
+fn serde_rejects_constructor_only_named_vector_invariants_with_closed_codes() {
+    assert_serde_diagnostic::<SearchBudget>(
+        serde_json::json!({"maximum_candidates": 0}),
+        NamedVectorSpaceDiagnosticCode::InvalidSearchBudget,
+    );
+    assert_serde_diagnostic::<NamedVectorQueryPlan>(
+        serde_json::json!({
+            "clauses": [],
+            "shared_budget": {"maximum_candidates": 1},
+            "fusion_profile": {"id": "body-rrf", "version": 1}
+        }),
+        NamedVectorSpaceDiagnosticCode::InvalidQueryPlan,
+    );
+    assert_serde_diagnostic::<NamedVectorQueryPlan>(
+        serde_json::json!({
+            "clauses": [{
+                "space": "body",
+                "operation": "dense_nearest_neighbor",
+                "shape": {"kind": "dense", "native_dimension": 128}
+            }],
+            "shared_budget": {"maximum_candidates": 0},
+            "fusion_profile": {"id": "body-rrf", "version": 1}
+        }),
+        NamedVectorSpaceDiagnosticCode::InvalidSearchBudget,
+    );
+    assert_serde_diagnostic::<QueryVectorShape>(
+        serde_json::json!({"kind": "late_interaction", "native_dimension": 128, "query_token_count": 0}),
+        NamedVectorSpaceDiagnosticCode::IncompatibleQueryShape,
+    );
+    assert_serde_diagnostic::<LateInteractionCandidateStage>(
+        serde_json::json!({
+            "maximum_query_token_frontier": 0,
+            "maximum_object_candidate_pool": 10,
+            "approximate_candidate_stage": true
+        }),
+        NamedVectorSpaceDiagnosticCode::InvalidLateInteractionLayout,
+    );
+    assert_serde_diagnostic::<LateInteractionCandidateStage>(
+        serde_json::json!({
+            "maximum_query_token_frontier": 10,
+            "maximum_object_candidate_pool": 0,
+            "approximate_candidate_stage": true
+        }),
+        NamedVectorSpaceDiagnosticCode::InvalidLateInteractionLayout,
+    );
+    assert_serde_diagnostic::<StorageComplexityContract>(
+        serde_json::json!({"terms": [[0, 128]]}),
+        NamedVectorSpaceDiagnosticCode::InvalidStorageComplexity,
+    );
+    assert_serde_diagnostic::<VectorLocation>(
+        serde_json::json!({"kind": "dense", "shard_ordinal": 0, "vector_id": 9}),
+        NamedVectorSpaceDiagnosticCode::InvalidVectorMapping,
+    );
+    assert_serde_diagnostic::<VectorLocation>(
+        serde_json::json!({"kind": "dense", "shard_ordinal": 1, "vector_id": 0}),
+        NamedVectorSpaceDiagnosticCode::InvalidVectorMapping,
+    );
+    assert_serde_diagnostic::<DegradedProfile>(
+        serde_json::json!({"name": "", "allowed_spaces": []}),
+        NamedVectorSpaceDiagnosticCode::InvalidQueryPlan,
+    );
+    assert_serde_diagnostic::<SpaceCandidate>(
+        serde_json::json!({
+            "object": "chunk-17",
+            "space": "body",
+            "profile": "diskann3-body-v1",
+            "raw_rank": 0,
+            "raw_score": 0.97,
+            "inclusion_reason": "requested_clause"
+        }),
+        NamedVectorSpaceDiagnosticCode::InvalidQueryPlan,
+    );
 }
 
 #[test]
