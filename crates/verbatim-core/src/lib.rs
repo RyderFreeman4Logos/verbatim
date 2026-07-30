@@ -53,6 +53,7 @@ pub mod remote_storage_client;
 pub mod resource;
 pub mod result_diversity;
 pub mod retrieval_budgets;
+pub mod retrieval_telemetry;
 pub mod retrieve;
 pub mod sdk;
 pub mod search_planner;
@@ -69,4 +70,9 @@ pub mod vision_caption;
 #[cfg(test)]
 #[path = "diskann3_backend/tests.rs"]
 mod diskann3_backend_tests;
+
+#[cfg(test)]
+#[path = "retrieval_telemetry_tests.rs"]
+mod retrieval_telemetry_tests;
+
 pub mod wire_schemas;
