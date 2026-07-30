@@ -90,6 +90,7 @@ fn lancedb_backend_happy_path_is_4096_dimensional_and_lancedb_primary() {
     .expect("filter");
     let request = LanceDbSearchRequest::new(
         schema(),
+        LanceDbIndexProfile::IvfRq,
         LanceDbSearchPolicy::lancedb_primary(identity(7), budget()).expect("policy"),
         filter,
         AdaptiveProbePlan::new(2, 16).expect("probes"),
@@ -99,6 +100,7 @@ fn lancedb_backend_happy_path_is_4096_dimensional_and_lancedb_primary() {
     )
     .expect("request");
     assert_eq!(request.schema().dimension(), 4_096);
+    assert_eq!(request.profile(), LanceDbIndexProfile::IvfRq);
     assert_eq!(
         request.policy().selection(),
         BackendSelection::LanceDbPrimary
@@ -172,6 +174,67 @@ fn lancedb_backend_profiles_keep_control_and_ground_truth_explicit() {
     assert!(LanceDbIndexProfile::IvfRq.is_quantized_candidate_generation());
     assert!(LanceDbIndexProfile::IvfHnswFlat.is_high_recall_control());
     assert!(LanceDbIndexProfile::BypassExactScan.is_exact_scan());
+}
+
+#[test]
+fn lancedb_backend_search_requests_bind_each_index_profile() {
+    for profile in [
+        LanceDbIndexProfile::IvfRq,
+        LanceDbIndexProfile::ivf_pq(64).expect("valid PQ profile"),
+        LanceDbIndexProfile::IvfHnswFlat,
+        LanceDbIndexProfile::IvfHnswSq,
+        LanceDbIndexProfile::BypassExactScan,
+    ] {
+        let filter = LanceDbFilterContract::new(
+            FilterStrictness::StrictNativeOrFailClosed,
+            vec![FilterClause::Tenant {
+                value: "tenant-a".into(),
+            }],
+            scalar_indexes(),
+            10_000,
+        )
+        .expect("filter");
+        let request = LanceDbSearchRequest::new(
+            schema(),
+            profile,
+            LanceDbSearchPolicy::lancedb_primary(identity(7), budget()).expect("policy"),
+            filter,
+            AdaptiveProbePlan::new(2, 16).expect("probes"),
+            LanceDbQualityPlan::new(2, true, true).expect("quality"),
+            operation_budget(),
+            5,
+        )
+        .expect("profile must remain bound to a valid request");
+        assert_eq!(request.profile(), profile);
+    }
+}
+
+#[test]
+fn lancedb_backend_search_request_revalidates_directly_constructed_pq_profile() {
+    let filter = LanceDbFilterContract::new(
+        FilterStrictness::StrictNativeOrFailClosed,
+        vec![FilterClause::Tenant {
+            value: "tenant-a".into(),
+        }],
+        scalar_indexes(),
+        10_000,
+    )
+    .expect("filter");
+    let error = LanceDbSearchRequest::new(
+        schema(),
+        LanceDbIndexProfile::IvfPq { num_sub_vectors: 0 },
+        LanceDbSearchPolicy::lancedb_primary(identity(7), budget()).expect("policy"),
+        filter,
+        AdaptiveProbePlan::new(2, 16).expect("probes"),
+        LanceDbQualityPlan::new(2, true, true).expect("quality"),
+        operation_budget(),
+        5,
+    )
+    .expect_err("request must reject a profile that bypassed its constructor");
+    assert_eq!(
+        error.diagnostic_code(),
+        LanceDbBackendDiagnosticCode::InvalidIndexProfile
+    );
 }
 
 #[test]
@@ -387,6 +450,56 @@ fn lancedb_backend_diagnostics_are_code_only() {
         format!("{error:?}"),
         "LanceDbBackendError(invalid_probe_plan)"
     );
+}
+
+#[test]
+fn lancedb_backend_serde_rejects_invalid_probe_quality_and_candidate_loss_contracts() {
+    for wire in [
+        serde_json::json!({ "minimum_nprobes": 0, "maximum_nprobes": 2 }),
+        serde_json::json!({ "minimum_nprobes": 4, "maximum_nprobes": 2 }),
+        serde_json::json!({ "minimum_nprobes": 2, "maximum_nprobes": 2 }),
+    ] {
+        let error = serde_json::from_value::<AdaptiveProbePlan>(wire)
+            .expect_err("invalid probe wire contract must fail closed");
+        assert_eq!(error.to_string(), "lancedb-backend.invalid_probe_plan");
+    }
+
+    for wire in [
+        serde_json::json!({
+            "refine_factor": 0,
+            "original_vectors_f32_retained": true,
+            "full_precision_rescore_required": true,
+        }),
+        serde_json::json!({
+            "refine_factor": 2,
+            "original_vectors_f32_retained": false,
+            "full_precision_rescore_required": true,
+        }),
+    ] {
+        let error = serde_json::from_value::<LanceDbQualityPlan>(wire)
+            .expect_err("invalid quality wire contract must fail closed");
+        assert_eq!(error.to_string(), "lancedb-backend.invalid_quality_plan");
+    }
+
+    for wire in [
+        serde_json::json!({
+            "generated_candidates": 0,
+            "rescored_candidates": 0,
+            "omitted_ground_truth_neighbors": 0,
+        }),
+        serde_json::json!({
+            "generated_candidates": 10,
+            "rescored_candidates": 11,
+            "omitted_ground_truth_neighbors": 0,
+        }),
+    ] {
+        let error = serde_json::from_value::<CandidateLossReport>(wire)
+            .expect_err("invalid candidate-loss wire contract must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "lancedb-backend.invalid_candidate_loss_report"
+        );
+    }
 }
 
 #[test]

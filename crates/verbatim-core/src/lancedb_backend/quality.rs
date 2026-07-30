@@ -5,11 +5,32 @@ use serde::{Deserialize, Serialize};
 use super::{LanceDbBackendDiagnosticCode, LanceDbBackendError, LanceDbBackendResult};
 
 /// Quality requirements for quantized IVF candidate generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LanceDbQualityPlan {
     refine_factor: u16,
     original_vectors_f32_retained: bool,
     full_precision_rescore_required: bool,
+}
+
+impl<'de> Deserialize<'de> for LanceDbQualityPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            refine_factor: u16,
+            original_vectors_f32_retained: bool,
+            full_precision_rescore_required: bool,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.refine_factor,
+            wire.original_vectors_f32_retained,
+            wire.full_precision_rescore_required,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl LanceDbQualityPlan {
@@ -50,11 +71,32 @@ impl LanceDbQualityPlan {
 }
 
 /// Candidate loss remains observable because refinement cannot recover omitted neighbors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CandidateLossReport {
     generated_candidates: u32,
     rescored_candidates: u32,
     omitted_ground_truth_neighbors: u32,
+}
+
+impl<'de> Deserialize<'de> for CandidateLossReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            generated_candidates: u32,
+            rescored_candidates: u32,
+            omitted_ground_truth_neighbors: u32,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.generated_candidates,
+            wire.rescored_candidates,
+            wire.omitted_ground_truth_neighbors,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl CandidateLossReport {

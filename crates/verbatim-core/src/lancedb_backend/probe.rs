@@ -5,10 +5,25 @@ use serde::{Deserialize, Serialize};
 use super::{LanceDbBackendDiagnosticCode, LanceDbBackendError, LanceDbBackendResult};
 
 /// Validated minimum/maximum IVF probe range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AdaptiveProbePlan {
     minimum_nprobes: u16,
     maximum_nprobes: u16,
+}
+
+impl<'de> Deserialize<'de> for AdaptiveProbePlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            minimum_nprobes: u16,
+            maximum_nprobes: u16,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.minimum_nprobes, wire.maximum_nprobes).map_err(serde::de::Error::custom)
+    }
 }
 
 impl AdaptiveProbePlan {

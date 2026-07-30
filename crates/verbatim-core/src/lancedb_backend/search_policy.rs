@@ -4,7 +4,7 @@ use crate::search_planner::SearchBudget;
 
 use super::{
     AdaptiveProbePlan, LanceDbBackendDiagnosticCode, LanceDbBackendError, LanceDbBackendResult,
-    LanceDbCollectionIdentity, LanceDbCollectionSchema, LanceDbFilterContract,
+    LanceDbCollectionIdentity, LanceDbCollectionSchema, LanceDbFilterContract, LanceDbIndexProfile,
     LanceDbOperationBudget, LanceDbQualityPlan,
 };
 
@@ -51,6 +51,7 @@ impl LanceDbSearchPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanceDbSearchRequest {
     schema: LanceDbCollectionSchema,
+    profile: LanceDbIndexProfile,
     policy: LanceDbSearchPolicy,
     filter: LanceDbFilterContract,
     probes: AdaptiveProbePlan,
@@ -63,6 +64,7 @@ impl LanceDbSearchRequest {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         schema: LanceDbCollectionSchema,
+        profile: LanceDbIndexProfile,
         policy: LanceDbSearchPolicy,
         filter: LanceDbFilterContract,
         probes: AdaptiveProbePlan,
@@ -70,6 +72,13 @@ impl LanceDbSearchRequest {
         budget: LanceDbOperationBudget,
         limit: u32,
     ) -> LanceDbBackendResult<Self> {
+        profile.validate()?;
+        let probes = AdaptiveProbePlan::new(probes.minimum_nprobes(), probes.maximum_nprobes())?;
+        let quality = LanceDbQualityPlan::new(
+            quality.refine_factor(),
+            quality.original_vectors_f32_retained(),
+            quality.full_precision_rescore_required(),
+        )?;
         if schema.identity() != policy.identity()
             || schema.identity().generation() != policy.identity().generation()
         {
@@ -84,6 +93,7 @@ impl LanceDbSearchRequest {
         }
         Ok(Self {
             schema,
+            profile,
             policy,
             filter,
             probes,
@@ -95,6 +105,11 @@ impl LanceDbSearchRequest {
 
     pub const fn schema(&self) -> &LanceDbCollectionSchema {
         &self.schema
+    }
+
+    /// Profile selected for this exact candidate-generation search; adapters must use it.
+    pub const fn profile(&self) -> LanceDbIndexProfile {
+        self.profile
     }
 
     pub const fn policy(&self) -> &LanceDbSearchPolicy {

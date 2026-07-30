@@ -57,6 +57,14 @@ impl LanceDbIndexProfile {
         Ok(Self::IvfPq { num_sub_vectors })
     }
 
+    /// Revalidates the profile when it crosses a durable request boundary.
+    pub fn validate(self) -> LanceDbBackendResult<()> {
+        match self {
+            Self::IvfPq { num_sub_vectors } => Self::ivf_pq(num_sub_vectors).map(|_| ()),
+            Self::IvfRq | Self::IvfHnswFlat | Self::IvfHnswSq | Self::BypassExactScan => Ok(()),
+        }
+    }
+
     pub const fn is_quantized_candidate_generation(self) -> bool {
         matches!(self, Self::IvfRq | Self::IvfPq { .. })
     }

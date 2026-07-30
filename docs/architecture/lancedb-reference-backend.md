@@ -37,6 +37,11 @@ to divide 4,096;
 The hypothesis that IVF_RQ or IVF_PQ is preferable for frequently filtered workloads
 remains a benchmark hypothesis, rather than an asserted production conclusion.
 
+Every `LanceDbSearchRequest` carries one validated `LanceDbIndexProfile`; adapters must
+use `request.profile()` for candidate generation rather than a detached schema-validation
+choice. Durable adaptive-probe, quality, candidate-loss, and profile values deserialize
+through their validated constructors, so malformed persisted contracts fail closed.
+
 ## Scalar prefilters and adaptive probes
 
 `LanceDbFilterContract` covers source, collection, tenant, ACL, lifecycle, and
