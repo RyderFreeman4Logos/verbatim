@@ -570,7 +570,7 @@ pub struct RetirementInputs<'a> {
     pub validation: &'a MigrationValidation,
     /// Passed dual-generation shadow evidence.
     pub shadow: &'a ShadowComparison,
-    /// Declared rollback-retention window.
+    /// Declared rollback-retention window, which must end at the manifest deadline.
     pub rollback_window: RollbackWindow,
     /// Current logical authorization time.
     pub now: u64,
@@ -599,6 +599,11 @@ pub fn authorize_retirement(
     {
         return Err(LegacyRetirementError::contract(
             LegacyRetirementDiagnosticCode::MigrationValidationBindingMismatch,
+        ));
+    }
+    if inputs.rollback_window.ends_at() != inputs.manifest.rollback_window_end() {
+        return Err(LegacyRetirementError::contract(
+            LegacyRetirementDiagnosticCode::RollbackWindowActive,
         ));
     }
     inputs.rollback_window.require_elapsed(inputs.now)?;

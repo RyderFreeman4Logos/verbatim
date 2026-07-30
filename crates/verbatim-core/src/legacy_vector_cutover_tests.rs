@@ -215,6 +215,56 @@ fn legacy_vector_cutover_rollback_window_blocks_artifact_removal() {
 }
 
 #[test]
+fn legacy_vector_cutover_retirement_requires_window_to_match_manifest_deadline() {
+    let source = reusable_source();
+    let manifest = CutoverManifest::new(CutoverManifestFields {
+        schema_version: 1,
+        incumbent_generation: "legacy-17".to_string(),
+        candidate_generation: "diskann3-18".to_string(),
+        rollback_window_end: 100,
+    })
+    .expect("valid manifest");
+    let validation = valid_validation(&source, &manifest);
+    let gates = CutoverGates::new(every_gate());
+    let error = authorize_retirement(
+        &gates,
+        &RetirementInputs {
+            source: &source,
+            manifest: &manifest,
+            validation: &validation,
+            shadow: &passing_shadow(),
+            rollback_window: RollbackWindow::new(1, 2).expect("short window"),
+            now: 2,
+            release_policy: &release_policy(),
+            removal_plan: &removal_plan(),
+            remaining_capabilities: &remaining_capabilities(),
+        },
+    )
+    .expect_err("a caller cannot shorten the manifest rollback deadline");
+    assert_eq!(
+        error.diagnostic_code(),
+        LegacyRetirementDiagnosticCode::RollbackWindowActive
+    );
+
+    let authorization = authorize_retirement(
+        &gates,
+        &RetirementInputs {
+            source: &source,
+            manifest: &manifest,
+            validation: &validation,
+            shadow: &passing_shadow(),
+            rollback_window: RollbackWindow::new(1, 100).expect("aligned window"),
+            now: 100,
+            release_policy: &release_policy(),
+            removal_plan: &removal_plan(),
+            remaining_capabilities: &remaining_capabilities(),
+        },
+    )
+    .expect("the aligned manifest deadline authorizes retirement once elapsed");
+    assert_eq!(authorization.candidate_generation().as_str(), "diskann3-18");
+}
+
+#[test]
 fn legacy_vector_cutover_expired_window_without_release_policy_cannot_remove() {
     let error = ReleasePolicyApproval::new(false)
         .expect_err("removal requires an explicit release-policy approval");
