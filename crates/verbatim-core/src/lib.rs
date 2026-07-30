@@ -39,6 +39,7 @@ pub mod index_publication;
 pub mod ingest;
 pub mod ingest_security;
 pub mod lancedb_backend;
+pub mod legacy_vector_cutover;
 pub mod lexical_engine;
 pub mod memory_budget;
 pub mod migration_framework;
