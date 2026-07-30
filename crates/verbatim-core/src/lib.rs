@@ -37,6 +37,7 @@ pub mod index_profile_delete;
 pub mod index_publication;
 pub mod ingest;
 pub mod ingest_security;
+pub mod lancedb_backend;
 pub mod lexical_engine;
 pub mod memory_budget;
 pub mod migration_framework;
@@ -72,6 +73,9 @@ pub mod vision_caption;
 #[cfg(test)]
 #[path = "diskann3_backend/tests.rs"]
 mod diskann3_backend_tests;
+
+#[cfg(test)]
+mod lancedb_backend_tests;
 
 #[cfg(test)]
 mod qdrant_backend_tests;
