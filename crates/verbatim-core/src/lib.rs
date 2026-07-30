@@ -49,6 +49,7 @@ pub mod pagination;
 pub mod parser;
 pub mod profiles;
 pub mod provider;
+pub mod qdrant_backend;
 pub mod remote_storage_client;
 pub mod resource;
 pub mod result_diversity;
@@ -71,6 +72,9 @@ pub mod vision_caption;
 #[cfg(test)]
 #[path = "diskann3_backend/tests.rs"]
 mod diskann3_backend_tests;
+
+#[cfg(test)]
+mod qdrant_backend_tests;
 
 #[cfg(test)]
 #[path = "retrieval_telemetry_tests.rs"]
