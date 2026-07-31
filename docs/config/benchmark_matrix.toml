@@ -45,6 +45,9 @@ original_vector_precision = "f32"
 original_dimension = 4096
 filter_and_acl_conformance_required = true
 
+# `BackendId` and `BackendRole` in
+# `crates/verbatim-core/src/ssd_vector_benchmark/system.rs` are the source of
+# truth for ids, roles, and required flags. This remains example-only data.
 [[backend]]
 id = "diskann3_standard"
 role = "primary_candidate"
@@ -53,54 +56,74 @@ page_layout = "standard_ssd_pages"
 required = true
 
 [[backend]]
-id = "diskann3_aisaq"
-role = "primary_low_dram_experiment"
+id = "diskann3_aisaq_colocated_performance"
+role = "primary_candidate"
 provider = "diskann3"
-page_layout = "aisaq_colocated_candidate_pages"
+page_layout = "aisaq_colocated_performance"
+required = true
+
+[[backend]]
+id = "diskann3_aisaq_colocated_scale"
+role = "primary_candidate"
+provider = "diskann3"
+page_layout = "aisaq_colocated_scale"
+required = true
+
+[[backend]]
+id = "exact_full_dimensional_flat_scan"
+role = "exact_baseline"
+provider = "exact_full_dimensional_flat_scan"
+page_layout = "not_applicable"
 required = true
 
 [[backend]]
 id = "qdrant_reference"
-role = "reference_service"
+role = "reference"
 provider = "qdrant"
 page_layout = "provider_declared"
 required = true
 
 [[backend]]
-id = "lancedb_reference"
-role = "reference_embedded"
+id = "lancedb_ivf_rq"
+role = "reference"
 provider = "lancedb"
-page_layout = "provider_declared"
+page_layout = "ivf_rq"
 required = true
 
 [[backend]]
-id = "milvus_aisaq_control"
-role = "external_algorithmic_control"
-provider = "milvus_aisaq"
-page_layout = "aisaq"
-required = false
-skip_reason_required_when_unavailable = true
+id = "lancedb_ivf_pq"
+role = "reference"
+provider = "lancedb"
+page_layout = "ivf_pq"
+required = true
+
+[[backend]]
+id = "sqlite_scan_regression"
+role = "regression_only"
+provider = "sqlite_scan"
+page_layout = "not_applicable"
+required = true
+
+[[backend]]
+id = "instant_distance_hnsw_regression"
+role = "regression_only"
+provider = "instant_distance_hnsw"
+page_layout = "resident_or_legacy"
+required = true
 
 [[backend]]
 id = "usearch_hnsw_control"
-role = "local_hnsw_control"
+role = "external_control"
 provider = "usearch_hnsw"
 page_layout = "mmap_or_provider_declared"
 required = false
 skip_reason_required_when_unavailable = true
 
 [[backend]]
-id = "sqlite_exact_reference"
-role = "exact_reference"
-provider = "sqlite_scan"
-page_layout = "not_applicable"
-required = true
-
-[[backend]]
-id = "instant_distance_hnsw_legacy"
-role = "legacy_baseline"
-provider = "instant_distance_hnsw"
-page_layout = "resident_or_legacy"
+id = "milvus_aisaq_control"
+role = "external_control"
+provider = "milvus_aisaq"
+page_layout = "aisaq"
 required = false
 skip_reason_required_when_unavailable = true
 
