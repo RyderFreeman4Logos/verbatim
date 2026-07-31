@@ -615,6 +615,8 @@ def run_command(
                 break
         if outcome is Outcome.EXITED and owned_descendants(child.identity):
             outcome = Outcome.ORPHANED_DESCENDANTS
+        if outcome is Outcome.INTERRUPTED:
+            term_deadline, absolute_deadline = min(term_deadline, (now := time.monotonic()) + 0.25), min(absolute_deadline, now + 0.5)
         cleanup_succeeded = terminate_owned_processes(
             child,
             selector,

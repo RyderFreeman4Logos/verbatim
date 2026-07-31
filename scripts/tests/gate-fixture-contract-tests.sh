@@ -79,7 +79,12 @@ case "${TOKUIN_FAKE_MODE:-normal}" in
         child_pid_file="${TOKUIN_FAKE_CHILD_PID_FILE:?}"
         (
             trap '' TERM
-            printf '%s\n' "$BASHPID" >"$child_pid_file"
+            # Publish pid+starttime so cleanup never signals a recycled PID.
+            # Bash requires ${20}; $20 is $2 + "0".
+            stat="$(</proc/self/stat)"
+            rest="${stat##*) }"
+            set -- $rest
+            printf '%s %s\n' "$BASHPID" "${20}" >"$child_pid_file"
             exec sleep 600
         ) &
         wait "$!"
