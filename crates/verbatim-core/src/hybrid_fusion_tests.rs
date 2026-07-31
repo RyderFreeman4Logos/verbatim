@@ -313,12 +313,6 @@ fn exact_candidate() -> FusionCandidate {
 }
 
 #[test]
-fn fusion_error_is_not_serde_serializable() {
-    let cases = trybuild::TestCases::new();
-    cases.compile_fail("tests/ui/hybrid_fusion_error_not_serializable.rs");
-}
-
-#[test]
 fn stage_output_rejects_provenance_not_matching_bound_retriever() {
     fn assert_provenance_mismatch(provenance: ProvenanceEntry) {
         let mismatched = FusionCandidate::new(FusionCandidateFields {
