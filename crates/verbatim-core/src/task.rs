@@ -13,8 +13,14 @@ use serde_json::{json, Map, Value};
 use crate::config::RerankStrategy;
 use crate::resource::{ResourceQueueSnapshot, TaskResourceProgress};
 use crate::types::{
-    hex_sha256, EmbeddingCacheStats, RetrievalDenseVectorPath, RetrievalRerankStatus,
-    VectorIndexResidency,
+    hex_sha256, EmbeddingCacheStats, RetrievalDenseVectorPath, VectorIndexResidency,
+};
+
+mod retrieve_profile;
+
+pub use retrieve_profile::{
+    RetrieveDenseStageProfile, RetrieveDisplayStageProfile, RetrieveEvidenceStageProfile,
+    RetrieveRerankStageProfile, RetrieveStageProfile, RetrieveTaskProfile,
 };
 
 static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -346,64 +352,6 @@ impl From<&ResourceQueueSnapshot> for TaskResourceQueueSummary {
             latest_service_ms: snapshot.last_service_ms,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetrieveTaskProfile {
-    pub dense: RetrieveDenseStageProfile,
-    pub bm25: RetrieveStageProfile,
-    pub fusion: RetrieveStageProfile,
-    pub rerank: RetrieveRerankStageProfile,
-    pub evidence: RetrieveEvidenceStageProfile,
-    pub display: RetrieveDisplayStageProfile,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetrieveDenseStageProfile {
-    pub path: RetrievalDenseVectorPath,
-    pub candidate_count: usize,
-    pub local_ms: u64,
-    pub query_embedding_ms: u64,
-    pub endpoint_latency_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetrieveStageProfile {
-    pub candidate_count: usize,
-    pub local_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetrieveRerankStageProfile {
-    pub status: RetrievalRerankStatus,
-    pub reason: Option<String>,
-    pub input_count: Option<usize>,
-    pub configured_top_n: usize,
-    pub effective_top_n: Option<usize>,
-    pub output_count: usize,
-    pub local_ms: u64,
-    pub endpoint_latency_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetrieveEvidenceStageProfile {
-    pub result_count: usize,
-    pub graph_expanded_count: usize,
-    pub final_count: usize,
-    pub display_count: usize,
-    pub result_hydration_ms: u64,
-    pub graph_expansion_ms: u64,
-    pub final_pack_ms: u64,
-    pub display_pack_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetrieveDisplayStageProfile {
-    pub returned_count: usize,
-    pub response_formatting_ms: u64,
-    pub canonical_support_embedding_ms: Option<u64>,
-    pub canonical_display_selection_ms: Option<u64>,
-    pub canonical_selected_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1100,6 +1048,7 @@ fn bounded_chars(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::RetrievalRerankStatus;
 
     #[test]
     fn ask_metadata_does_not_store_raw_question_or_answer() {
@@ -1250,6 +1199,7 @@ mod tests {
                 TaskEndpointSummary::single_call("reranker", 1_357),
             ],
             retrieve: Some(RetrieveTaskProfile {
+                candidate_counters: Default::default(),
                 dense: RetrieveDenseStageProfile {
                     path: RetrievalDenseVectorPath::LowMemorySqliteScan,
                     candidate_count: 20_000,
@@ -1441,6 +1391,7 @@ mod tests {
                 },
             ],
             retrieve: Some(RetrieveTaskProfile {
+                candidate_counters: Default::default(),
                 dense: RetrieveDenseStageProfile {
                     path: RetrievalDenseVectorPath::Bm25Only,
                     candidate_count: 0,

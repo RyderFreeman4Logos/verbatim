@@ -77,6 +77,7 @@ use verbatim_core::provider::ProviderError;
 use verbatim_core::resource::{
     global_resource_registry, ObservableResource, ResourceLimitConfig, ResourceQueueSnapshot,
 };
+use verbatim_core::retrieval_telemetry::SpanKind;
 use verbatim_core::retrieve::{
     refresh_evidence_pack_debug, RetrievalCanonicalSelectionBudget, RetrievalDebugOptions,
     RetrievalDisplayScope, RetrievalPipeline,
@@ -3064,19 +3065,24 @@ fn retrieve_task_profile_from_debug(
         .canonical_display_selection_ms
         .map(|_| debug.display_evidence_count);
     RetrieveTaskProfile {
+        candidate_counters: debug.candidate_counters,
         dense: RetrieveDenseStageProfile {
             path: debug.dense_vector_path,
-            candidate_count: debug.dense_hits.len(),
+            candidate_count: debug
+                .candidate_counters
+                .returned_k(SpanKind::DenseRetrieval) as usize,
             local_ms: spans.dense_vector_search_ms,
             query_embedding_ms: spans.query_embedding_ms,
             endpoint_latency_ms: debug.query_embedding_latency_ms,
         },
         bm25: RetrieveStageProfile {
-            candidate_count: debug.bm25_hits.len(),
+            candidate_count: debug
+                .candidate_counters
+                .returned_k(SpanKind::LexicalRetrieval) as usize,
             local_ms: spans.bm25_search_ms,
         },
         fusion: RetrieveStageProfile {
-            candidate_count: debug.rrf_fused_hits.len(),
+            candidate_count: debug.candidate_counters.fused() as usize,
             local_ms: spans.rrf_fusion_ms,
         },
         rerank: RetrieveRerankStageProfile {
@@ -4650,11 +4656,23 @@ async fn execute_retrieve_task_inner(
     .await?;
     let mut retrieval_progress = timing
         .progress_snapshot()
-        .with_counter("dense_candidates", debug.dense_hits.len() as u64, None)
-        .with_counter("bm25_candidates", debug.bm25_hits.len() as u64, None)
+        .with_counter(
+            "dense_candidates",
+            debug
+                .candidate_counters
+                .returned_k(SpanKind::DenseRetrieval),
+            None,
+        )
+        .with_counter(
+            "bm25_candidates",
+            debug
+                .candidate_counters
+                .returned_k(SpanKind::LexicalRetrieval),
+            None,
+        )
         .with_counter(
             "retrieval_candidates",
-            debug.rrf_fused_hits.len() as u64,
+            debug.candidate_counters.fused(),
             None,
         )
         .with_counter("evidence", debug.final_evidence_count as u64, None)
@@ -4854,11 +4872,23 @@ async fn execute_ask_task_inner(
         .with_recent_status(format!("retrieved {} result(s)", results.len()))
         .with_active_worker_kind(TaskKind::Ask.as_str());
     if let Some(debug) = &retrieval_debug {
-        retrieval_progress.set_counter("dense_candidates", debug.dense_hits.len() as u64, None);
-        retrieval_progress.set_counter("bm25_candidates", debug.bm25_hits.len() as u64, None);
+        retrieval_progress.set_counter(
+            "dense_candidates",
+            debug
+                .candidate_counters
+                .returned_k(SpanKind::DenseRetrieval),
+            None,
+        );
+        retrieval_progress.set_counter(
+            "bm25_candidates",
+            debug
+                .candidate_counters
+                .returned_k(SpanKind::LexicalRetrieval),
+            None,
+        );
         retrieval_progress.set_counter(
             "retrieval_candidates",
-            debug.rrf_fused_hits.len() as u64,
+            debug.candidate_counters.fused(),
             None,
         );
         if let Some(latency_ms) = debug.query_embedding_latency_ms {
@@ -7417,6 +7447,7 @@ fn empty_retrieval_debug() -> RetrievalDebug {
         dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
         query_embedding_latency_ms: None,
         local_spans_ms: RetrievalLocalSpansMs::default(),
+        candidate_counters: Default::default(),
         evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
         final_evidence_count: 0,
         display_evidence_count: 0,
@@ -12716,6 +12747,7 @@ mod tests {
                 dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
                 query_embedding_latency_ms: None,
                 local_spans_ms: RetrievalLocalSpansMs::default(),
+                candidate_counters: Default::default(),
                 evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
                 final_evidence_count: 0,
                 display_evidence_count: 0,
@@ -12755,6 +12787,7 @@ mod tests {
             dense_vector_path: RetrievalDenseVectorPath::ResidentHnsw,
             query_embedding_latency_ms: None,
             local_spans_ms: RetrievalLocalSpansMs::default(),
+            candidate_counters: Default::default(),
             evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
             final_evidence_count: 0,
             display_evidence_count: 0,
@@ -15859,6 +15892,7 @@ mod tests {
                 TaskEndpointSummary::single_call("reranker", 1_357),
             ],
             retrieve: Some(RetrieveTaskProfile {
+                candidate_counters: Default::default(),
                 dense: RetrieveDenseStageProfile {
                     path: RetrievalDenseVectorPath::LowMemorySqliteScan,
                     candidate_count: 20_000,

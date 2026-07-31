@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
+mod retrieval_debug;
+
+pub use retrieval_debug::RetrievalDebug;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourceId(pub String);
 
@@ -991,36 +995,6 @@ pub enum RetrievalDebugEvidencePackMode {
     Compact,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RetrievalDebug {
-    #[serde(default)]
-    pub dense_vector_path: RetrievalDenseVectorPath,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query_embedding_latency_ms: Option<u64>,
-    #[serde(default)]
-    pub local_spans_ms: RetrievalLocalSpansMs,
-    #[serde(default)]
-    pub evidence_pack_mode: RetrievalDebugEvidencePackMode,
-    #[serde(default)]
-    pub final_evidence_count: usize,
-    #[serde(default)]
-    pub display_evidence_count: usize,
-    pub bm25_hits: Vec<RetrievalStageHit>,
-    pub dense_hits: Vec<RetrievalStageHit>,
-    pub rrf_fused_hits: Vec<RetrievalFusedHit>,
-    pub graph_expanded_hits: Vec<RetrievalGraphExpansionDebug>,
-    pub reranker: RetrievalRerankDebug,
-    pub final_evidence_pack: Vec<RetrievalEvidencePackEntry>,
-    /// Evidence entries selected for compact no-passage display.
-    ///
-    /// For canonical multi-locator chunks this may contain a chunk-internal
-    /// support unit instead of the chunk's first unit. The score remains the
-    /// ranked chunk score; passage rendering uses ranked chunk membership and
-    /// structured locators directly.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub display_evidence_pack: Vec<RetrievalEvidencePackEntry>,
-}
-
 /// Local dense vector residency policy for the daemon.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1378,6 +1352,7 @@ mod tests {
                 canonical_support_embedding_ms: Some(13),
                 canonical_display_selection_ms: Some(14),
             },
+            candidate_counters: Default::default(),
             bm25_hits: vec![RetrievalStageHit {
                 rank: 1,
                 chunk_id: ChunkId("chunk-1".into()),

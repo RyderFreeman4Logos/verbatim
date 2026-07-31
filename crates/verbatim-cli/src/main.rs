@@ -5902,6 +5902,7 @@ mod tests {
             resources: Default::default(),
             endpoints: Vec::new(),
             retrieve: Some(verbatim_core::task::RetrieveTaskProfile {
+                candidate_counters: Default::default(),
                 dense: verbatim_core::task::RetrieveDenseStageProfile {
                     path: RetrievalDenseVectorPath::Bm25Only,
                     candidate_count: 0,

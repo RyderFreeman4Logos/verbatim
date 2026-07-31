@@ -5,11 +5,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
+mod source_filter;
+
 use crate::config::{GraphConfig, QdrantConfig, RerankConfig, RetrievalConfig};
 #[cfg(feature = "qdrant")]
 use crate::index::qdrant::{QdrantClient, QdrantHit};
 use crate::provider::ProviderError;
 use crate::resource::ObservableResource;
+use crate::retrieval_telemetry::{CandidateCounters, SpanKind};
 use crate::store::Store;
 use crate::traits::{
     EmbeddingClient, LexicalIndex, RerankCapabilityState, RerankDiagnostics, RerankError,
@@ -22,8 +25,11 @@ use crate::types::{
     RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalFusedHit,
     RetrievalGraphExpansionDebug, RetrievalLocalSpansMs, RetrievalLocatorDebug,
     RetrievalProvenance, RetrievalRerankCapabilityDebug, RetrievalRerankCapabilityState,
-    RetrievalRerankDebug, RetrievalRerankRequestDebug, RetrievalRerankScore, RetrievalResult,
-    RetrievalStageHit, SourceId, SourceLocator, VectorIndexResidency,
+    RetrievalRerankDebug, RetrievalRerankRequestDebug, RetrievalRerankScore, RetrievalRerankStatus,
+    RetrievalResult, RetrievalStageHit, SourceId, SourceLocator, VectorIndexResidency,
+};
+use source_filter::{
+    single_source_filter, source_filter_excludes, source_filter_ingest_hint, source_filter_scope,
 };
 
 const GRAPH_EXPANSION_SCORE_DECAY: f32 = 0.5;
@@ -419,6 +425,7 @@ impl<'a> RetrievalPipeline<'a> {
         let include_debug = debug_options.is_some();
         let debug_options = debug_options.unwrap_or_default();
         let mut local_spans_ms = RetrievalLocalSpansMs::default();
+        let mut candidate_counters = CandidateCounters::default();
         if source_filter.is_some_and(HashSet::is_empty) {
             return Ok(empty_search_output(include_debug));
         }
@@ -451,6 +458,8 @@ impl<'a> RetrievalPipeline<'a> {
         let bm25_top_k = source_filter
             .map(|_| all_child_count.max(self.config.bm25_top_k))
             .unwrap_or(self.config.bm25_top_k);
+        candidate_counters.add_requested_k(SpanKind::DenseRetrieval, dense_top_k as u64)?;
+        candidate_counters.add_requested_k(SpanKind::LexicalRetrieval, bm25_top_k as u64)?;
 
         let (dense_results, query_embedding_latency_ms, dense_vector_path, query_vector) =
             if self.embedding_enabled {
@@ -467,7 +476,12 @@ impl<'a> RetrievalPipeline<'a> {
                 local_spans_ms.query_embedding_ms = query_embedding_latency_ms;
                 let dense_started = Instant::now();
                 let (dense_results, dense_vector_path) = self
-                    .dense_search(&query_vec, dense_top_k, source_filter)
+                    .dense_search(
+                        &query_vec,
+                        dense_top_k,
+                        source_filter,
+                        &mut candidate_counters,
+                    )
                     .await?;
                 local_spans_ms.dense_vector_search_ms = elapsed_ms(dense_started);
                 (
@@ -479,6 +493,8 @@ impl<'a> RetrievalPipeline<'a> {
             } else {
                 (Vec::new(), None, RetrievalDenseVectorPath::Bm25Only, None)
             };
+        candidate_counters.add_returned_k(SpanKind::DenseRetrieval, dense_results.len() as u64)?;
+        candidate_counters.add_evaluated(dense_results.len() as u64)?;
 
         let (
             fused,
@@ -488,6 +504,8 @@ impl<'a> RetrievalPipeline<'a> {
             bm25_search_ms,
             rrf_fusion_ms,
             debug_candidate_pack_ms,
+            bm25_returned,
+            fused_count,
         ) = self.with_read_permit(|| {
             let bm25_started = Instant::now();
             let bm25_results = self.lexical_index.search(query, bm25_top_k)?;
@@ -495,16 +513,25 @@ impl<'a> RetrievalPipeline<'a> {
 
             let rrf_started = Instant::now();
             let mut fused = rrf_fusion(&dense_results, &bm25_results, self.config.rrf_k);
-            if let Some(source_ids) = source_filter {
-                fused.retain(|(chunk_id, _)| {
-                    self.store
-                        .get_chunk(chunk_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|chunk| source_ids.contains(&chunk.source_id))
-                });
+            if source_filter.is_some() {
+                let mut scoped_fused = Vec::with_capacity(fused.len());
+                for candidate in fused {
+                    let Some(chunk) = self.store.get_chunk(&candidate.0).ok().flatten() else {
+                        continue;
+                    };
+                    if !source_filter_excludes(
+                        source_filter,
+                        &chunk.source_id,
+                        &mut candidate_counters,
+                    )? {
+                        scoped_fused.push(candidate);
+                    }
+                }
+                fused = scoped_fused;
             }
             let rrf_fusion_ms = elapsed_ms(rrf_started);
+            let bm25_returned = bm25_results.len() as u64;
+            let fused_count = fused.len() as u64;
 
             let debug_pack_started = Instant::now();
             let bm25_hits = if include_debug {
@@ -531,8 +558,13 @@ impl<'a> RetrievalPipeline<'a> {
                 bm25_search_ms,
                 rrf_fusion_ms,
                 debug_candidate_pack_ms,
+                bm25_returned,
+                fused_count,
             ))
         })?;
+        candidate_counters.add_returned_k(SpanKind::LexicalRetrieval, bm25_returned)?;
+        candidate_counters.add_evaluated(bm25_returned)?;
+        candidate_counters.add_fused(fused_count)?;
         local_spans_ms.bm25_search_ms = bm25_search_ms;
         local_spans_ms.rrf_fusion_ms = rrf_fusion_ms;
         local_spans_ms.debug_candidate_pack_ms = debug_candidate_pack_ms;
@@ -542,10 +574,13 @@ impl<'a> RetrievalPipeline<'a> {
             fused,
             debug: reranker_debug,
         } = self.rerank_fused(query, fused).await?;
+        if matches!(reranker_debug.status, RetrievalRerankStatus::Succeeded) {
+            candidate_counters.add_reranked(fused.len() as u64)?;
+        }
         local_spans_ms.rerank_total_ms = elapsed_ms(rerank_started);
 
-        let (results, graph_expanded_hits, result_hydration_ms, graph_expansion_ms) = self
-            .with_read_permit(|| {
+        let (results, graph_expanded_hits, result_hydration_ms, graph_expansion_ms, hydrated_count) =
+            self.with_read_permit(|| {
                 let result_hydration_started = Instant::now();
                 let mut results = Vec::new();
                 for (rank, (chunk_id, score)) in fused.into_iter().enumerate() {
@@ -562,9 +597,10 @@ impl<'a> RetrievalPipeline<'a> {
                     results.push(self.result_for_chunk(chunk, score, provenance)?);
                 }
                 let result_hydration_ms = elapsed_ms(result_hydration_started);
+                let hydrated_count = results.len() as u64;
 
                 let graph_expansion_started = Instant::now();
-                self.expand_graph_results(&mut results, source_filter)?;
+                self.expand_graph_results(&mut results, source_filter, &mut candidate_counters)?;
                 let graph_expansion_ms = elapsed_ms(graph_expansion_started);
                 let graph_expanded_hits = if include_debug {
                     graph_expansion_debug_hits(&results)
@@ -576,8 +612,10 @@ impl<'a> RetrievalPipeline<'a> {
                     graph_expanded_hits,
                     result_hydration_ms,
                     graph_expansion_ms,
+                    hydrated_count,
                 ))
             })?;
+        candidate_counters.add_hydrated(hydrated_count)?;
         local_spans_ms.result_hydration_ms = result_hydration_ms;
         local_spans_ms.graph_expansion_ms = graph_expansion_ms;
 
@@ -625,6 +663,7 @@ impl<'a> RetrievalPipeline<'a> {
                 dense_vector_path,
                 query_embedding_latency_ms,
                 local_spans_ms,
+                candidate_counters,
                 evidence_pack_mode: debug_options.evidence_pack_mode,
                 final_evidence_count,
                 display_evidence_count,
@@ -677,6 +716,7 @@ impl<'a> RetrievalPipeline<'a> {
         query_vec: &[f32],
         top_k: usize,
         source_filter: Option<&HashSet<SourceId>>,
+        candidate_counters: &mut CandidateCounters,
     ) -> Result<(Vec<(ChunkId, f32)>, RetrievalDenseVectorPath)> {
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &self.qdrant {
@@ -703,12 +743,12 @@ impl<'a> RetrievalPipeline<'a> {
                 Ok(results) => self
                     .with_read_permit(|| {
                         self.merge_preferred_dense_hits(
-                            profile_id,
-                            profile_generation,
+                            (profile_id, profile_generation),
                             results,
                             local_results,
                             top_k,
                             source_filter,
+                            candidate_counters,
                         )
                     })
                     .map(|hits| (hits, RetrievalDenseVectorPath::Qdrant)),
@@ -718,12 +758,19 @@ impl<'a> RetrievalPipeline<'a> {
                         "qdrant search failed; falling back to local dense index"
                     );
                     self.with_read_permit(|| {
-                        self.valid_dense_hits(local_results, top_k, source_filter)
+                        self.valid_dense_hits(
+                            local_results,
+                            top_k,
+                            source_filter,
+                            candidate_counters,
+                        )
                     })
                     .map(|hits| (hits, self.dense_vector_path()))
                 }
             };
         }
+        #[cfg(not(feature = "qdrant"))]
+        let _ = candidate_counters;
         self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))
             .map(|hits| (hits, self.dense_vector_path()))
     }
@@ -773,6 +820,7 @@ impl<'a> RetrievalPipeline<'a> {
         hits: Vec<(ChunkId, f32)>,
         top_k: usize,
         source_filter: Option<&HashSet<SourceId>>,
+        candidate_counters: &mut CandidateCounters,
     ) -> Result<Vec<(ChunkId, f32)>> {
         let mut valid = Vec::new();
         let mut seen = HashSet::new();
@@ -784,6 +832,7 @@ impl<'a> RetrievalPipeline<'a> {
                 &mut hits,
                 source_filter,
                 None,
+                candidate_counters,
             )?
         {}
         Ok(valid)
@@ -792,12 +841,12 @@ impl<'a> RetrievalPipeline<'a> {
     #[cfg(feature = "qdrant")]
     fn merge_preferred_dense_hits(
         &self,
-        profile_id: &EmbeddingProfileId,
-        profile_generation: u64,
+        required_profile: (&EmbeddingProfileId, u64),
         preferred_hits: Vec<QdrantHit>,
         fallback_hits: Vec<(ChunkId, f32)>,
         top_k: usize,
         source_filter: Option<&HashSet<SourceId>>,
+        candidate_counters: &mut CandidateCounters,
     ) -> Result<Vec<(ChunkId, f32)>> {
         let mut merged = Vec::new();
         let mut seen = HashSet::new();
@@ -810,7 +859,8 @@ impl<'a> RetrievalPipeline<'a> {
                 &mut seen,
                 &mut preferred_hits,
                 source_filter,
-                Some((profile_id, profile_generation)),
+                Some(required_profile),
+                candidate_counters,
             )?;
             if merged.len() >= top_k {
                 break;
@@ -821,6 +871,7 @@ impl<'a> RetrievalPipeline<'a> {
                 &mut fallback_hits,
                 source_filter,
                 None,
+                candidate_counters,
             )?;
             if !preferred_added && !fallback_added {
                 break;
@@ -838,6 +889,7 @@ impl<'a> RetrievalPipeline<'a> {
         hits: &mut I,
         source_filter: Option<&HashSet<SourceId>>,
         required_profile: Option<(&EmbeddingProfileId, u64)>,
+        candidate_counters: &mut CandidateCounters,
     ) -> Result<bool>
     where
         I: Iterator,
@@ -851,7 +903,7 @@ impl<'a> RetrievalPipeline<'a> {
             let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
                 continue;
             };
-            if source_filter_excludes(source_filter, &chunk.source_id) {
+            if source_filter_excludes(source_filter, &chunk.source_id, candidate_counters)? {
                 continue;
             }
             if let Some((profile_id, profile_generation)) = required_profile {
@@ -1260,6 +1312,7 @@ impl<'a> RetrievalPipeline<'a> {
         &self,
         results: &mut Vec<RetrievalResult>,
         source_filter: Option<&HashSet<SourceId>>,
+        candidate_counters: &mut CandidateCounters,
     ) -> Result<()> {
         let Some(config) = self.graph_config else {
             return Ok(());
@@ -1301,6 +1354,7 @@ impl<'a> RetrievalPipeline<'a> {
                 expanded_count: &mut expanded_count,
                 seed_expanded_count: 0,
                 source_filter,
+                candidate_counters,
             };
 
             self.expand_page_images(seed, seed_rank, &mut state)?;
@@ -1620,7 +1674,11 @@ impl<'a> RetrievalPipeline<'a> {
         else {
             return Ok(());
         };
-        if source_filter_excludes(state.source_filter, &result.chunk.source_id) {
+        if source_filter_excludes(
+            state.source_filter,
+            &result.chunk.source_id,
+            state.candidate_counters,
+        )? {
             return Ok(());
         }
         if !state.seen_chunks.insert(result.chunk_id.0.clone()) {
@@ -1759,6 +1817,7 @@ struct GraphExpansionState<'a> {
     expanded_count: &'a mut usize,
     seed_expanded_count: usize,
     source_filter: Option<&'a HashSet<SourceId>>,
+    candidate_counters: &'a mut CandidateCounters,
 }
 
 impl GraphExpansionState<'_> {
@@ -1811,6 +1870,7 @@ fn empty_search_output(include_debug: bool) -> RetrievalSearchOutput {
             dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
             query_embedding_latency_ms: None,
             local_spans_ms: RetrievalLocalSpansMs::default(),
+            candidate_counters: CandidateCounters::default(),
             evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
             final_evidence_count: 0,
             display_evidence_count: 0,
@@ -1822,42 +1882,6 @@ fn empty_search_output(include_debug: bool) -> RetrievalSearchOutput {
             final_evidence_pack: Vec::new(),
             display_evidence_pack: Vec::new(),
         }),
-    }
-}
-
-fn single_source_filter(source_filter: Option<&HashSet<SourceId>>) -> Option<&SourceId> {
-    let source_ids = source_filter?;
-    if source_ids.len() == 1 {
-        source_ids.iter().next()
-    } else {
-        None
-    }
-}
-
-fn source_filter_excludes(source_filter: Option<&HashSet<SourceId>>, source_id: &SourceId) -> bool {
-    source_filter.is_some_and(|source_ids| !source_ids.contains(source_id))
-}
-
-fn source_filter_scope(source_filter: Option<&HashSet<SourceId>>) -> String {
-    match source_filter {
-        Some(source_ids) if source_ids.len() == 1 => source_ids
-            .iter()
-            .next()
-            .map(|source_id| format!(" for source '{}'", source_id.0))
-            .unwrap_or_default(),
-        Some(source_ids) => format!(" for {} selected sources", source_ids.len()),
-        None => String::new(),
-    }
-}
-
-fn source_filter_ingest_hint(source_filter: Option<&HashSet<SourceId>>) -> String {
-    match source_filter {
-        Some(source_ids) if source_ids.len() == 1 => source_ids
-            .iter()
-            .next()
-            .map(|source_id| format!(" {}", source_id.0))
-            .unwrap_or_default(),
-        _ => String::new(),
     }
 }
 
@@ -3471,45 +3495,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn retrieval_source_filter_applies_after_lexical_and_dense_search() {
-        let store = Store::in_memory().unwrap();
-        let first = source("src-1");
-        let second = source("src-2");
-        let alpha = insert_child(&store, &first, "chunk-alpha", "alpha content");
-        let beta = insert_child(&store, &second, "chunk-beta", "beta content");
-        store
-            .replace_all_vector_documents(&[
-                VectorDocument {
-                    chunk_id: alpha.id.clone(),
-                    source_id: first.id.clone(),
-                    vector: keyword_vector(&alpha.text),
-                },
-                VectorDocument {
-                    chunk_id: beta.id.clone(),
-                    source_id: second.id.clone(),
-                    vector: keyword_vector(&beta.text),
-                },
-            ])
-            .unwrap();
-        let mut hnsw = HnswIndex::new();
-        hnsw.rebuild_from_store(&store).unwrap();
-        let lexical_index = SqliteFtsIndex::new(&store);
-        let embed_client = KeywordEmbeddingClient;
-        let config = RetrievalConfig::default();
-        let pipeline =
-            RetrievalPipeline::new(&hnsw, &lexical_index, &store, &embed_client, &config);
-
-        let results = pipeline
-            .search_filtered("beta", Some(&second.id))
-            .await
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].chunk_id.0, "chunk-beta");
-        assert_eq!(results[0].chunk.source_id, second.id);
-        assert_eq!(results[0].evidence_units.len(), 1);
-    }
+    include!("retrieve/candidate_telemetry_tests.rs");
 
     #[tokio::test]
     async fn retrieval_source_set_filter_includes_union_and_excludes_non_members() {
