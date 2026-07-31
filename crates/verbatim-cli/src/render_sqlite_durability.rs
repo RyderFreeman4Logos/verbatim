@@ -75,14 +75,16 @@ mod tests {
     use verbatim_core::api::{HealthResponse, ReadinessHealth};
 
     #[test]
-    fn health_compact_shows_status_rss_and_idle_flags() {
+    fn health_compact_shows_memory_source_and_idle_flags() {
         use verbatim_core::api::{IdleExitHealth, IdleReclaimHealth};
-        use verbatim_core::memory_budget::MemoryBudgetSnapshot;
+        use verbatim_core::memory_budget::{MemoryBudgetSnapshot, MemoryUsageSource};
         let health = HealthResponse {
             status: "ok".into(),
             readiness: ReadinessHealth::ready(),
             memory_budget: MemoryBudgetSnapshot {
-                rss_mb: 282,
+                rss_mb: 123,
+                used_memory_mb: 282,
+                usage_source: MemoryUsageSource::CgroupV2,
                 ..Default::default()
             },
             resources: Vec::new(),
@@ -121,7 +123,7 @@ mod tests {
         let mut output = Vec::new();
         write_health_compact(&mut output, &health).unwrap();
         let out = String::from_utf8(output).unwrap();
-        assert!(out.contains("ok rss=282MB"));
+        assert!(out.contains("ok memory=282MB(cgroup_v2_memory_current) rss=123MB"));
         assert!(out.contains("idle_reclaim=enabled"));
         assert!(out.contains("idle_exit=enabled(1200s)"));
         assert!(out.contains("--details"));
@@ -129,12 +131,14 @@ mod tests {
 
     #[test]
     fn health_compact_minimal_when_no_idle_features() {
-        use verbatim_core::memory_budget::MemoryBudgetSnapshot;
+        use verbatim_core::memory_budget::{MemoryBudgetSnapshot, MemoryUsageSource};
         let health = HealthResponse {
             status: "ok".into(),
             readiness: ReadinessHealth::ready(),
             memory_budget: MemoryBudgetSnapshot {
                 rss_mb: 100,
+                used_memory_mb: 100,
+                usage_source: MemoryUsageSource::RssFallback,
                 ..Default::default()
             },
             resources: Vec::new(),
@@ -145,7 +149,7 @@ mod tests {
         let mut output = Vec::new();
         write_health_compact(&mut output, &health).unwrap();
         let out = String::from_utf8(output).unwrap();
-        assert!(out.contains("ok rss=100MB"));
+        assert!(out.contains("ok memory=100MB(rss_fallback) rss=100MB"));
         assert!(!out.contains("idle_reclaim"));
         assert!(!out.contains("idle_exit"));
     }
