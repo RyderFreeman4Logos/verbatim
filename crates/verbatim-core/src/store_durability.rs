@@ -40,6 +40,7 @@ impl Store {
             conn,
             durability_profile,
             database_path: Some(path.to_path_buf()),
+            sql_statement_counting_available: false,
         };
         store.ensure_write_capacity(SqliteWriteOperation::Migration)?;
         store
@@ -72,6 +73,7 @@ impl Store {
             conn,
             durability_profile,
             database_path: Some(path.to_path_buf()),
+            sql_statement_counting_available: true,
         })
     }
 
@@ -161,6 +163,7 @@ impl Store {
             conn,
             durability_profile,
             database_path: None,
+            sql_statement_counting_available: false,
         };
         store.migrate()?;
         Ok(store)
