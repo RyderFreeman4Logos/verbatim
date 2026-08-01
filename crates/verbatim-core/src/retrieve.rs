@@ -185,6 +185,12 @@ pub struct RetrievalCanonicalDetailDebug {
 trait DenseHit {
     fn chunk_id(&self) -> ChunkId;
     fn score(&self) -> f32;
+    fn profile_id(&self) -> Option<&EmbeddingProfileId> {
+        None
+    }
+    fn source_id(&self) -> Option<&SourceId> {
+        None
+    }
     fn profile_generation(&self) -> Option<u64> {
         None
     }
@@ -209,6 +215,14 @@ impl DenseHit for QdrantHit {
 
     fn score(&self) -> f32 {
         self.score
+    }
+
+    fn profile_id(&self) -> Option<&EmbeddingProfileId> {
+        Some(&self.profile_id)
+    }
+
+    fn source_id(&self) -> Option<&SourceId> {
+        Some(&self.source_id)
     }
 
     fn profile_generation(&self) -> Option<u64> {
@@ -811,7 +825,10 @@ impl<'a> RetrievalPipeline<'a> {
                 continue;
             }
             if let Some((profile_id, profile_generation)) = required_profile {
-                if hit.profile_generation() != Some(profile_generation) {
+                if hit.profile_id() != Some(profile_id)
+                    || hit.source_id() != Some(&chunk.source_id)
+                    || hit.profile_generation() != Some(profile_generation)
+                {
                     continue;
                 }
                 if !self.store.has_vector_document_for_profile(
@@ -2474,6 +2491,8 @@ mod tests {
 
     use crate::index::hnsw::HnswIndex;
     use crate::index::sqlite_fts::SqliteFtsIndex;
+    #[cfg(feature = "qdrant")]
+    use crate::store::EmbeddingProfileConfig;
     use crate::store::Store;
     use crate::traits::{LexicalIndex, VectorDocument, VectorIndex};
     use crate::types::{
@@ -4634,7 +4653,7 @@ mod tests {
     async fn qdrant_valid_success_prefers_remote_then_fills_from_local_dense_index() {
         let (qdrant_url, handle) = spawn_qdrant_search_response(
             200,
-            r#"{"status":"ok","result":[{"score":0.99,"payload":{"chunk_id":"chunk-remote-preferred","profile_generation":1}}]}"#,
+            r#"{"status":"ok","result":[{"id":"749ce13a-d809-57fe-a274-b32bec2735f0","score":0.99,"payload":{"chunk_id":"chunk-remote-preferred","profile_generation":1,"profile_id":"default","source_id":"src-qdrant-preferred"}}]}"#,
         );
         let store = Store::in_memory().unwrap();
         let source = source("src-qdrant-preferred");
@@ -4706,7 +4725,7 @@ mod tests {
     async fn qdrant_stale_generation_hits_fall_back_to_local_dense_evidence() {
         let (qdrant_url, handle) = spawn_qdrant_search_response(
             200,
-            r#"{"status":"ok","result":[{"score":0.99,"payload":{"chunk_id":"src-qdrant-stale-existing-child-0","profile_generation":0}},{"score":0.98,"payload":{"chunk_id":"src-qdrant-stale-existing-child-2","profile_generation":0}}]}"#,
+            r#"{"status":"ok","result":[{"id":"918fef15-a37d-57b3-99be-b55276fac69c","score":0.99,"payload":{"chunk_id":"src-qdrant-stale-existing-child-0","profile_generation":0,"profile_id":"default","source_id":"src-qdrant-stale-existing"}},{"id":"23bbeb3b-94ef-54a8-96bf-2706e020f9c4","score":0.98,"payload":{"chunk_id":"src-qdrant-stale-existing-child-2","profile_generation":0,"profile_id":"default","source_id":"src-qdrant-stale-existing"}}]}"#,
         );
         let store = Store::in_memory().unwrap();
         let source = source("src-qdrant-stale-existing");
@@ -4788,7 +4807,7 @@ mod tests {
     async fn qdrant_stale_generation_same_chunk_hit_does_not_block_local_fallback() {
         let (qdrant_url, handle) = spawn_qdrant_search_response(
             200,
-            r#"{"status":"ok","result":[{"score":0.99,"payload":{"chunk_id":"chunk-rebuilt-same-id","profile_generation":1}}]}"#,
+            r#"{"status":"ok","result":[{"id":"bf1f241d-a71d-51ec-a96e-a1919186382c","score":0.99,"payload":{"chunk_id":"chunk-rebuilt-same-id","profile_generation":1,"profile_id":"default","source_id":"src-qdrant-rebuilt-same-id"}}]}"#,
         );
         let store = Store::in_memory().unwrap();
         let source = source("src-qdrant-rebuilt-same-id");
