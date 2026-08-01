@@ -142,15 +142,6 @@ impl<'a> GraphRagService<'a> {
         Ok(search_community_reports(query, &reports, self.config))
     }
 
-    /// Ordinary retrieval cannot publish generated reports until derived artifacts are wired.
-    pub fn global_search_results(
-        &self,
-        _query: &str,
-        _source_filter: Option<&SourceId>,
-    ) -> Result<Vec<RetrievalResult>> {
-        Ok(Vec::new())
-    }
-
     pub fn local_search(&self, results: &[RetrievalResult]) -> Result<LocalGraphChunkSearch> {
         local_graph_chunk_search(self.store, results)
     }
@@ -1036,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_global_search_does_not_affect_local_grounded_search() {
+    fn local_grounded_search_preserves_stored_evidence() {
         let store = Store::in_memory().unwrap();
         let source = source("src");
         let chunk = insert_chunk(&store, &source, "chunk-a", "Grounded local text.");
@@ -1044,10 +1035,8 @@ mod tests {
         let disabled = GraphGlobalSearchConfig::default();
         let service = GraphRagService::new(&store, &disabled);
 
-        let global = service.global_search_results("overview", None).unwrap();
         let local = service.local_search(&[result]).unwrap();
 
-        assert!(global.is_empty());
         assert_eq!(local.hits.len(), 1);
         assert_eq!(local.hits[0].evidence_ids, chunk.evidence_unit_ids);
     }
@@ -1154,33 +1143,6 @@ mod tests {
 
         assert_eq!(hits.len(), reports.len());
         assert!(hits.iter().all(|hit| hit.score > 0.0));
-    }
-
-    #[test]
-    fn global_reports_are_not_published_as_ordinary_evidence() {
-        let store = Store::in_memory().unwrap();
-        let source = source("src");
-        insert_chunk(&store, &source, "chunk-a", "Alpha source text.");
-        let claim = generated_claim(
-            &source.id,
-            "Alpha is the primary concept.",
-            "Alpha",
-            "Concept",
-            "chunk-a:1-1",
-        );
-        store
-            .upsert_graph_nodes(std::slice::from_ref(&claim))
-            .unwrap();
-        let config = enabled_config();
-        let service = GraphRagService::new(&store, &config);
-
-        let reports = service.global_search("primary concept", None).unwrap();
-        let ordinary_evidence = service
-            .global_search_results("primary concept", None)
-            .unwrap();
-
-        assert_eq!(reports.len(), 1);
-        assert!(ordinary_evidence.is_empty());
     }
 
     fn source(id: &str) -> Source {

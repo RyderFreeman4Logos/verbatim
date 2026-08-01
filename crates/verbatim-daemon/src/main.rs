@@ -9668,9 +9668,10 @@ mod tests {
     use verbatim_core::retrieve::refresh_final_evidence_pack_debug;
     use verbatim_core::types::{
         CanonicalLocator, Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind,
-        EvidenceUnit, ReferenceComponent, RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath,
-        RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalProvenance,
-        RetrievalRerankStatus, Source, SourceLocator, VectorIndexResidency,
+        EvidenceUnit, GraphNode, GraphNodeId, GraphNodeKind, ReferenceComponent,
+        RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
+        RetrievalEvidenceRole, RetrievalProvenance, RetrievalRerankStatus, Source, SourceLocator,
+        VectorIndexResidency,
     };
 
     #[path = "../auth_middleware_daemon_tests.rs"]
@@ -15446,6 +15447,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_search_reports_do_not_reach_ordinary_ask_evidence() {
+        let model_server = MockModelServer::start_with_chat_responses(
+            3,
+            [
+                "Ordinary evidence remains Store grounded [E1]",
+                r#"{"verdict":"pass","unsupported_claims":[]}"#,
+            ],
+        )
+        .await;
+        let test_dir = TestDir::new("graphrag-global-search-ordinary-ask");
+        let source_path = test_dir.path().join("doc.md");
+        fs::write(
+            &source_path,
+            "Ordinary retrieval evidence remains Store grounded while GraphRAG global search is enabled.",
+        )
+        .unwrap();
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.embedding.enabled = false;
+        config.chat.enabled = true;
+        config.chat.base_url = model_server.base_url.clone();
+        config.chat.model = "test-chat".into();
+        config.rerank.enabled = false;
+        config.verifier.enabled = true;
+        config.graph.global_search.enabled = true;
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        let chunk = pipeline
+            .store()
+            .list_chunks_by_source(&source_id)
+            .unwrap()
+            .into_iter()
+            .find(|chunk| chunk.chunk_type == ChunkType::Child)
+            .expect("ingest creates a child chunk");
+        let external_id = "generated_claim:ordinary-ask";
+        let claim = GraphNode {
+            id: GraphNodeId::new(&source_id, GraphNodeKind::GeneratedClaim, external_id),
+            source_id: source_id.clone(),
+            kind: GraphNodeKind::GeneratedClaim,
+            external_id: external_id.into(),
+            label: Some("Ordinary evidence remains Store grounded.".into()),
+            locator: None,
+            ordinal: None,
+            metadata: Some(serde_json::json!({
+                "origin": "llm_generated",
+                "graph_data_kind": "claim",
+                "claim": "Ordinary evidence remains Store grounded.",
+                "subject": "ordinary evidence",
+                "predicate": "remains",
+                "object": "Store grounded",
+                "source_spans": [format!("{}:1-1", chunk.id.0)]
+            })),
+        };
+        pipeline
+            .store()
+            .upsert_graph_nodes(std::slice::from_ref(&claim))
+            .unwrap();
+        let global_hits = verbatim_core::graphrag::GraphRagService::new(
+            pipeline.store(),
+            &config.graph.global_search,
+        )
+        .global_search("Store grounded", None)
+        .unwrap();
+        assert_eq!(global_hits.len(), 1, "fixture must contain a global report");
+
+        let state = test_state(config, test_dir.path(), pipeline);
+        let retrieve_request = context_only_retrieve_request(AskRequest {
+            question: "What remains Store grounded with global search enabled?".into(),
+            source_id: None,
+            collection_filter: CollectionFilterRequest::default(),
+            embedding_profile_id: None,
+            show_retrieval: true,
+            context_only: true,
+            limit: None,
+            page_size: None,
+            page: None,
+        });
+        let Json(retrieve_response) = retrieve(State(Arc::clone(&state)), Json(retrieve_request))
+            .await
+            .unwrap();
+        assert!(!retrieve_response.results.is_empty());
+
+        let response = ask(
+            State(Arc::clone(&state)),
+            Json(AskRequest {
+                question: "What remains Store grounded with global search enabled?".into(),
+                source_id: None,
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                show_retrieval: true,
+                context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response.verified);
+        let retrieval = response
+            .retrieval
+            .as_ref()
+            .expect("retrieval debug is published");
+        assert!(!retrieval.final_evidence_pack.is_empty());
+        assert!(!response.citations.is_empty());
+        let published_ids = retrieval
+            .final_evidence_pack
+            .iter()
+            .map(|entry| entry.evidence_id.clone())
+            .chain(
+                retrieve_response
+                    .results
+                    .iter()
+                    .map(|result| EvidenceId(result.evidence_id.clone())),
+            )
+            .chain(
+                response
+                    .citations
+                    .iter()
+                    .map(|citation| EvidenceId(citation.evidence_id.clone())),
+            )
+            .collect::<Vec<_>>();
+        let pipeline = state.pipeline.lock().unwrap();
+        let store = pipeline
+            .as_ref()
+            .expect("query pipeline is restored")
+            .store();
+        for evidence_id in &published_ids {
+            assert!(!evidence_id.0.starts_with("graphrag:report:"));
+            assert!(
+                store.get_evidence(evidence_id).unwrap().is_some(),
+                "published evidence must resolve through Store: {}",
+                evidence_id.0
+            );
+        }
+        drop(pipeline);
+
+        let chat_payloads = model_server.chat_payloads();
+        assert_eq!(chat_payloads.len(), 2);
+        let source_pack_payload = serde_json::to_string(&chat_payloads[0]).unwrap();
+        let verifier_payload = serde_json::to_string(&chat_payloads[1]).unwrap();
+        assert!(source_pack_payload.contains("SOURCE PACK"));
+        assert!(source_pack_payload.contains("Ordinary retrieval evidence"));
+        assert!(verifier_payload.contains(&response.citations[0].evidence_id));
+        assert!(!source_pack_payload.contains("graphrag:"));
+        assert!(!verifier_payload.contains("graphrag:"));
+    }
+
+    #[tokio::test]
     async fn completed_retrieve_profile_query_uses_persisted_state_without_model_calls() {
         let model_server = MockModelServer::start(3).await;
         let test_dir = TestDir::new("completed-retrieve-profile-no-rerun");
@@ -18598,6 +18751,7 @@ mod tests {
         embedding_blocked: Arc<AtomicBool>,
         embedding_release: Arc<tokio::sync::Notify>,
         chat_requests: Arc<AtomicUsize>,
+        chat_payloads: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -18645,6 +18799,7 @@ mod tests {
                 embedding_blocked: Arc::new(AtomicBool::new(false)),
                 embedding_release: Arc::new(tokio::sync::Notify::new()),
                 chat_requests: Arc::new(AtomicUsize::new(0)),
+                chat_payloads: Arc::new(std::sync::Mutex::new(Vec::new())),
                 chat_responses: Arc::new(std::sync::Mutex::new(chat_responses)),
                 last_chat_response: Arc::new(std::sync::Mutex::new(None)),
             };
@@ -18669,6 +18824,7 @@ mod tests {
                 embedding_blocked: state.embedding_blocked,
                 embedding_release: state.embedding_release,
                 chat_requests: state.chat_requests,
+                chat_payloads: state.chat_payloads,
                 handle,
             }
         }
@@ -18702,6 +18858,10 @@ mod tests {
         fn chat_requests(&self) -> usize {
             self.chat_requests.load(Ordering::SeqCst)
         }
+
+        fn chat_payloads(&self) -> Vec<serde_json::Value> {
+            self.chat_payloads.lock().unwrap().clone()
+        }
     }
 
     impl Drop for MockModelServer {
@@ -18720,6 +18880,7 @@ mod tests {
         embedding_blocked: Arc<AtomicBool>,
         embedding_release: Arc<tokio::sync::Notify>,
         chat_requests: Arc<AtomicUsize>,
+        chat_payloads: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         chat_responses: Arc<std::sync::Mutex<VecDeque<String>>>,
         last_chat_response: Arc<std::sync::Mutex<Option<String>>>,
     }
@@ -18766,8 +18927,10 @@ mod tests {
 
     async fn mock_chat(
         State(state): State<MockModelState>,
+        Json(payload): Json<serde_json::Value>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         state.chat_requests.fetch_add(1, Ordering::SeqCst);
+        state.chat_payloads.lock().unwrap().push(payload);
         let content = {
             let mut responses = state.chat_responses.lock().unwrap();
             responses.pop_front()
