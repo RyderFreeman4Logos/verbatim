@@ -9429,7 +9429,7 @@ async fn run_daemon_with_config(config: Config) -> Result<()> {
         config_path,
         data_dir: data_dir.clone(),
     });
-    let _memory_budget_sampler = state.memory_budget.start_rss_sampler();
+    let _memory_budget_sampler = state.memory_budget.start_memory_sampler();
     let (idle_exit_shutdown_tx, idle_exit_shutdown_rx) = watch::channel(false);
     let app = daemon_router(Arc::clone(&state));
 

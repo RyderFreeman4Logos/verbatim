@@ -1,13 +1,18 @@
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
-use serde::{Deserialize, Serialize};
 
 use crate::config::{DaemonResourceConfig, MemoryBudgetEnforcement};
+
+mod health_snapshot;
+
+pub use health_snapshot::{MemoryBudgetSnapshot, MemoryReservationSnapshot, MemoryUsageSource};
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
@@ -23,6 +28,13 @@ struct MemoryBudgetInner {
     margin_percent: u8,
     reservations: HashMap<String, MemoryReservation>,
     current_rss_bytes: u64,
+    current_usage: MemoryUsage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryUsage {
+    bytes: u64,
+    source: MemoryUsageSource,
 }
 
 struct MemoryReservation {
@@ -37,37 +49,6 @@ pub struct MemoryReservationGuard {
     owner: String,
     estimated_mb: usize,
     degraded: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryBudgetSnapshot {
-    pub limit_mb: Option<usize>,
-    pub rss_mb: u64,
-    pub reserved_mb: usize,
-    pub available_mb: Option<usize>,
-    pub enforcement: MemoryBudgetEnforcement,
-    pub active_reservations: Vec<MemoryReservationSnapshot>,
-}
-
-impl Default for MemoryBudgetSnapshot {
-    fn default() -> Self {
-        Self {
-            limit_mb: None,
-            rss_mb: 0,
-            reserved_mb: 0,
-            available_mb: None,
-            enforcement: MemoryBudgetEnforcement::SlowWarn,
-            active_reservations: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryReservationSnapshot {
-    pub key: String,
-    pub owner: String,
-    pub estimated_mb: usize,
-    pub reserved_for_millis: u64,
 }
 
 impl MemoryBudget {
@@ -85,6 +66,10 @@ impl MemoryBudget {
                 margin_percent: margin_percent.min(100),
                 reservations: HashMap::new(),
                 current_rss_bytes: sample_current_rss_bytes().unwrap_or(0),
+                current_usage: sample_current_memory_usage().unwrap_or(MemoryUsage {
+                    bytes: 0,
+                    source: MemoryUsageSource::Unavailable,
+                }),
             })),
         }
     }
@@ -173,18 +158,20 @@ impl MemoryBudget {
             MemoryBudgetEnforcement::Defer => {
                 if over_admission_limit {
                     bail!(
-                        "memory budget unavailable; deferring {owner}: requested {estimated_mb} MB, projected {} MB, available {:?} MB",
+                        "memory budget unavailable; deferring {owner}: requested {estimated_mb} MB, projected {} MB, available {:?} MB, source {}",
                         bytes_to_mb(projected_bytes),
-                        inner.available_mb()
+                        inner.available_mb(),
+                        inner.current_usage.source.as_str()
                     );
                 }
             }
             MemoryBudgetEnforcement::Fail => {
                 if over_admission_limit {
                     bail!(
-                        "memory budget exceeded for {owner}: requested {estimated_mb} MB, projected {} MB, available {:?} MB",
+                        "memory budget exceeded for {owner}: requested {estimated_mb} MB, projected {} MB, available {:?} MB, source {}",
                         bytes_to_mb(projected_bytes),
-                        inner.available_mb()
+                        inner.available_mb(),
+                        inner.current_usage.source.as_str()
                     );
                 }
             }
@@ -232,6 +219,13 @@ impl MemoryBudget {
             .unwrap_or_default()
     }
 
+    pub fn used_memory_bytes(&self) -> u64 {
+        self.inner
+            .read()
+            .map(|inner| inner.current_usage.bytes)
+            .unwrap_or_default()
+    }
+
     pub fn rss_bytes(&self) -> u64 {
         self.inner
             .read()
@@ -262,10 +256,31 @@ impl MemoryBudget {
         MemoryBudgetSnapshot {
             limit_mb: inner.limit_mb,
             rss_mb: bytes_to_mb(inner.current_rss_bytes),
+            used_memory_mb: bytes_to_mb(inner.current_usage.bytes),
+            usage_source: inner.current_usage.source,
             reserved_mb: inner.reserved_mb(),
             available_mb: inner.available_mb(),
             enforcement: inner.enforcement,
             active_reservations,
+        }
+    }
+
+    pub fn refresh_memory_usage(&self) {
+        let usage = sample_current_memory_usage();
+        self.update_memory_usage(usage);
+    }
+
+    fn update_memory_usage(&self, usage: Option<MemoryUsage>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        match self.inner.write() {
+            Ok(mut inner) => {
+                inner.current_usage = usage;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to update memory budget usage sample");
+            }
         }
     }
 
@@ -290,6 +305,17 @@ impl MemoryBudget {
             .unwrap_or_else(|_| Duration::from_millis(500))
     }
 
+    pub fn start_memory_sampler(&self) -> tokio::task::JoinHandle<()> {
+        let budget = self.clone();
+        tokio::spawn(async move {
+            loop {
+                budget.refresh_memory_usage();
+                budget.refresh_rss();
+                tokio::time::sleep(budget.poll_interval()).await;
+            }
+        })
+    }
+
     pub fn start_rss_sampler(&self) -> tokio::task::JoinHandle<()> {
         let budget = self.clone();
         tokio::spawn(async move {
@@ -304,6 +330,12 @@ impl MemoryBudget {
     fn set_rss_bytes_for_test(&self, bytes: u64) {
         let mut inner = self.inner.write().expect("memory budget lock");
         inner.current_rss_bytes = bytes;
+    }
+
+    #[cfg(test)]
+    fn set_memory_usage_for_test(&self, usage: MemoryUsage) {
+        let mut inner = self.inner.write().expect("memory budget lock");
+        inner.current_usage = usage;
     }
 }
 
@@ -337,7 +369,8 @@ impl MemoryBudgetInner {
     }
 
     fn used_bytes(&self) -> u64 {
-        self.current_rss_bytes
+        self.current_usage
+            .bytes
             .saturating_add(mb_to_bytes(self.reserved_mb()))
     }
 
@@ -376,6 +409,7 @@ fn warn_memory_pressure(
         limit_mb = ?inner.limit_mb,
         available_mb = ?inner.available_mb(),
         enforcement = ?inner.enforcement,
+        usage_source = inner.current_usage.source.as_str(),
         "memory budget pressure detected"
     );
 }
@@ -391,25 +425,131 @@ fn bytes_to_mb(bytes: u64) -> u64 {
     bytes / BYTES_PER_MIB
 }
 
+fn sample_current_memory_usage() -> Option<MemoryUsage> {
+    sample_platform_memory_usage()
+}
+
 pub fn sample_current_rss_bytes() -> Option<u64> {
     sample_platform_rss_bytes()
 }
 
 #[cfg(target_os = "linux")]
+fn sample_platform_memory_usage() -> Option<MemoryUsage> {
+    sample_linux_memory_usage_with(|path| fs::read_to_string(path).ok())
+}
+
+#[cfg(target_os = "linux")]
 fn sample_platform_rss_bytes() -> Option<u64> {
-    read_proc_smaps_rollup_bytes().or_else(read_proc_status_rss_bytes)
+    read_proc_rss_bytes_with(&|path| fs::read_to_string(path).ok())
 }
 
 #[cfg(target_os = "linux")]
-fn read_proc_smaps_rollup_bytes() -> Option<u64> {
-    let contents = fs::read_to_string("/proc/self/smaps_rollup").ok()?;
-    parse_proc_kb_value(&contents, "Pss:").or_else(|| parse_proc_kb_value(&contents, "Rss:"))
+fn sample_linux_memory_usage_with(
+    read_to_string: impl Fn(&Path) -> Option<String>,
+) -> Option<MemoryUsage> {
+    let cgroup = read_to_string(Path::new("/proc/self/cgroup"));
+    let mountinfo = read_to_string(Path::new("/proc/self/mountinfo"));
+    if let (Some(cgroup), Some(mountinfo)) = (cgroup, mountinfo) {
+        if let Some(path) = resolve_cgroup_v2_memory_current_path(&cgroup, &mountinfo) {
+            if let Some(bytes) = read_to_string(&path).and_then(|value| parse_bytes(&value)) {
+                return Some(MemoryUsage {
+                    bytes,
+                    source: MemoryUsageSource::CgroupV2,
+                });
+            }
+        }
+    }
+
+    read_proc_rss_bytes_with(&read_to_string).map(|bytes| MemoryUsage {
+        bytes,
+        source: MemoryUsageSource::RssFallback,
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn read_proc_status_rss_bytes() -> Option<u64> {
-    let contents = fs::read_to_string("/proc/self/status").ok()?;
-    parse_proc_kb_value(&contents, "VmRSS:")
+fn resolve_cgroup_v2_memory_current_path(cgroup: &str, mountinfo: &str) -> Option<PathBuf> {
+    let cgroup_path = parse_unified_cgroup_path(cgroup)?;
+    mountinfo
+        .lines()
+        .filter_map(|line| parse_cgroup2_mount(line, &cgroup_path))
+        .max_by_key(|(root_depth, _)| *root_depth)
+        .map(|(_, path)| path.join("memory.current"))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_unified_cgroup_path(contents: &str) -> Option<PathBuf> {
+    let mut unified = contents.lines().filter_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("0"), Some(""), Some(path)) => decode_clean_absolute_path(path),
+            _ => None,
+        }
+    });
+    let path = unified.next()?;
+    if unified.next().is_some() {
+        return None;
+    }
+    Some(path)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cgroup2_mount(line: &str, cgroup_path: &Path) -> Option<(usize, PathBuf)> {
+    let (mount, filesystem) = line.split_once(" - ")?;
+    if filesystem.split_whitespace().next()? != "cgroup2" {
+        return None;
+    }
+    let fields = mount.split_whitespace().collect::<Vec<_>>();
+    let root = decode_clean_absolute_path(fields.get(3)?)?;
+    let mount_point = decode_clean_absolute_path(fields.get(4)?)?;
+    let relative = cgroup_path.strip_prefix(&root).ok()?;
+    Some((root.components().count(), mount_point.join(relative)))
+}
+
+#[cfg(target_os = "linux")]
+fn decode_clean_absolute_path(encoded: &str) -> Option<PathBuf> {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let digits = bytes.get(index + 1..index + 4)?;
+        if !digits.iter().all(u8::is_ascii_digit) || digits.iter().any(|digit| *digit > b'7') {
+            return None;
+        }
+        let value = u16::from(digits[0] - b'0') * 64
+            + u16::from(digits[1] - b'0') * 8
+            + u16::from(digits[2] - b'0');
+        decoded.push(u8::try_from(value).ok()?);
+        index += 4;
+    }
+    let path = PathBuf::from(String::from_utf8(decoded).ok()?);
+    let clean = path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        });
+    clean.then_some(path)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_bytes(contents: &str) -> Option<u64> {
+    contents.trim().parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_rss_bytes_with(read_to_string: &impl Fn(&Path) -> Option<String>) -> Option<u64> {
+    read_to_string(Path::new("/proc/self/smaps_rollup"))
+        .and_then(|contents| parse_proc_kb_value(&contents, "Rss:"))
+        .or_else(|| {
+            read_to_string(Path::new("/proc/self/status"))
+                .and_then(|contents| parse_proc_kb_value(&contents, "VmRSS:"))
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -417,20 +557,25 @@ fn parse_proc_kb_value(contents: &str, key: &str) -> Option<u64> {
     contents.lines().find_map(|line| {
         let value = line.strip_prefix(key)?.split_whitespace().next()?;
         let kb = value.parse::<u64>().ok()?;
-        Some(kb.saturating_mul(1024))
+        kb.checked_mul(1024)
     })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn sample_platform_rss_bytes() -> Option<u64> {
+fn sample_platform_memory_usage() -> Option<MemoryUsage> {
     use std::sync::Once;
 
     static WARN_ONCE: Once = Once::new();
     WARN_ONCE.call_once(|| {
         tracing::warn!(
-            "RSS sampling is not supported on this platform; memory budget uses reservations only"
+            "memory sampling is not supported on this platform; memory budget uses reservations only"
         );
     });
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sample_platform_rss_bytes() -> Option<u64> {
     None
 }
 
@@ -450,6 +595,10 @@ mod tests {
             margin_percent,
         );
         budget.set_rss_bytes_for_test(0);
+        budget.set_memory_usage_for_test(MemoryUsage {
+            bytes: 0,
+            source: MemoryUsageSource::RssFallback,
+        });
         budget
     }
 
@@ -560,5 +709,75 @@ mod tests {
 
         assert_eq!(parse_proc_kb_value(contents, "Pss:"), Some(123 * 1024));
         assert_eq!(parse_proc_kb_value(contents, "VmRSS:"), None);
+        assert_eq!(
+            read_proc_rss_bytes_with(&|path| {
+                (path == Path::new("/proc/self/smaps_rollup")).then(|| contents.to_string())
+            }),
+            Some(456 * 1024)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_current_preferred_for_admission() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let files = HashMap::from([
+            (
+                PathBuf::from("/proc/self/cgroup"),
+                "0::/workload.slice/tenant/group\n".to_string(),
+            ),
+            (
+                PathBuf::from("/proc/self/mountinfo"),
+                "29 23 0:26 /workload.slice /run/cgroup\\040v2 rw - cgroup2 cgroup rw\n"
+                    .to_string(),
+            ),
+            (
+                PathBuf::from("/run/cgroup v2/tenant/group/memory.current"),
+                (80 * BYTES_PER_MIB).to_string(),
+            ),
+            (
+                PathBuf::from("/proc/self/smaps_rollup"),
+                "Pss: 10 kB\n".to_string(),
+            ),
+        ]);
+        let sample =
+            sample_linux_memory_usage_with(|path| files.get(path).cloned()).expect("cgroup sample");
+        assert_eq!(sample.source, MemoryUsageSource::CgroupV2);
+        assert_eq!(sample.bytes, 80 * BYTES_PER_MIB);
+
+        let budget = budget(Some(100), MemoryBudgetEnforcement::Fail, 0);
+        budget.set_memory_usage_for_test(sample);
+        assert!(budget.try_reserve("over", "diskann3", 21).is_err());
+
+        for invalid in [
+            "29 23 0:26 /other.slice /run/cgroup rw - cgroup2 cgroup rw\n",
+            "29 23 0:26 /workload.slice /run/cgroup rw - cgroup2 cgroup rw\n",
+        ] {
+            let files = HashMap::from([
+                (
+                    PathBuf::from("/proc/self/cgroup"),
+                    "0::/workload.slice/tenant/group\n".to_string(),
+                ),
+                (PathBuf::from("/proc/self/mountinfo"), invalid.to_string()),
+                (
+                    PathBuf::from("/run/cgroup/tenant/group/memory.current"),
+                    "not-a-number\n".to_string(),
+                ),
+                (
+                    PathBuf::from("/proc/self/smaps_rollup"),
+                    "Rss: 10240 kB\n".to_string(),
+                ),
+            ]);
+            let sample = sample_linux_memory_usage_with(|path| files.get(path).cloned())
+                .expect("RSS fallback");
+            assert_eq!(sample.source, MemoryUsageSource::RssFallback);
+            assert_eq!(sample.bytes, 10 * BYTES_PER_MIB);
+        }
+
+        budget.update_memory_usage(None);
+        assert_eq!(budget.used_memory_bytes(), 80 * BYTES_PER_MIB);
+        assert_eq!(budget.snapshot().usage_source, MemoryUsageSource::CgroupV2);
     }
 }

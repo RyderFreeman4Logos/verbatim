@@ -1947,8 +1947,11 @@ where
 {
     write!(
         writer,
-        "{} rss={}MB",
-        health.status, health.memory_budget.rss_mb
+        "{} memory={}MB({}) rss={}MB",
+        health.status,
+        health.memory_budget.used_memory_mb,
+        health.memory_budget.usage_source.as_str(),
+        health.memory_budget.rss_mb
     )?;
     write!(
         writer,
@@ -2011,8 +2014,14 @@ where
         .unwrap_or_else(|| "unbounded".to_string());
     writeln!(
         writer,
-        "Memory budget: limit={} rss={} MB reserved={} MB available={} enforcement={:?}",
-        limit, budget.rss_mb, budget.reserved_mb, available, budget.enforcement
+        "Memory budget: limit={} used={} MB source={} rss={} MB reserved={} MB available={} enforcement={:?}",
+        limit,
+        budget.used_memory_mb,
+        budget.usage_source.as_str(),
+        budget.rss_mb,
+        budget.reserved_mb,
+        available,
+        budget.enforcement
     )?;
     render_sqlite_durability::write_verbose(writer, health)?;
     if !budget.active_reservations.is_empty() {
