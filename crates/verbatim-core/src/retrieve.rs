@@ -681,6 +681,7 @@ impl<'a> RetrievalPipeline<'a> {
             Some(RetrievalDebug {
                 dense_vector_path,
                 query_embedding_latency_ms,
+                retrieval_search_sql_statement_count: None,
                 local_spans_ms,
                 candidate_counters,
                 evidence_pack_mode: debug_options.evidence_pack_mode,
@@ -1790,6 +1791,7 @@ fn empty_search_output(include_debug: bool) -> RetrievalSearchOutput {
         debug: include_debug.then(|| RetrievalDebug {
             dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
             query_embedding_latency_ms: None,
+            retrieval_search_sql_statement_count: None,
             local_spans_ms: RetrievalLocalSpansMs::default(),
             candidate_counters: CandidateCounters::default(),
             evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,

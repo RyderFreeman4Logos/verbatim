@@ -1312,6 +1312,7 @@ mod tests {
         let debug = RetrievalDebug {
             dense_vector_path: RetrievalDenseVectorPath::ResidentHnsw,
             query_embedding_latency_ms: None,
+            retrieval_search_sql_statement_count: Some(0),
             local_spans_ms: RetrievalLocalSpansMs {
                 setup_ms: 1,
                 query_embedding_ms: 2,
@@ -1403,6 +1404,7 @@ mod tests {
         assert!(encoded.contains("vector_service_ms"));
         assert!(encoded.contains("response_formatting_ms"));
         assert!(encoded.contains("canonical_display_selection_ms"));
+        assert!(encoded.contains("\"retrieval_search_sql_statement_count\":0"));
         assert!(encoded.contains("evidence_pack_mode"));
         assert!(encoded.contains("final_evidence_count"));
         assert!(encoded.contains("display_evidence_count"));
@@ -1416,13 +1418,25 @@ mod tests {
         let decoded: RetrievalDebug = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, debug);
 
-        let mut legacy_payload = serde_json::to_value(debug).unwrap();
+        let mut legacy_payload = serde_json::to_value(&debug).unwrap();
+        legacy_payload
+            .as_object_mut()
+            .unwrap()
+            .remove("retrieval_search_sql_statement_count");
         let legacy_spans = legacy_payload["local_spans_ms"].as_object_mut().unwrap();
         legacy_spans.remove("vector_queue_wait_ms");
         legacy_spans.remove("vector_service_ms");
         let decoded_legacy: RetrievalDebug = serde_json::from_value(legacy_payload).unwrap();
         assert_eq!(decoded_legacy.local_spans_ms.vector_queue_wait_ms, None);
         assert_eq!(decoded_legacy.local_spans_ms.vector_service_ms, None);
+        assert_eq!(decoded_legacy.retrieval_search_sql_statement_count, None);
+
+        let mut unavailable = debug;
+        unavailable.retrieval_search_sql_statement_count = None;
+        let unavailable_payload = serde_json::to_value(unavailable).unwrap();
+        assert!(unavailable_payload
+            .get("retrieval_search_sql_statement_count")
+            .is_none());
     }
 
     #[test]

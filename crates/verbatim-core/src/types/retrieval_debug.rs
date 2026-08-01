@@ -43,6 +43,15 @@ pub struct RetrievalDebug {
     pub dense_vector_path: RetrievalDenseVectorPath,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_embedding_latency_ms: Option<u64>,
+    /// SQLite statements executed by the request-specific Store during core retrieval search,
+    /// candidate/debug hydration, result hydration, optional graph expansion, and local backend
+    /// fallback after pipeline/profile initialization.
+    ///
+    /// This excludes pipeline/profile initialization and post-search path, image, and formatting
+    /// work. `Some(0)` means tracing was active but SQLite did no work. `None` means attribution
+    /// was unavailable, invalid, or absent from a payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_search_sql_statement_count: Option<u64>,
     #[serde(default)]
     pub local_spans_ms: RetrievalLocalSpansMs,
     /// Fixed-cardinality work counts captured by the shared retrieval pipeline.

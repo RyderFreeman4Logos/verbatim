@@ -35,6 +35,8 @@ mod source_contents_replacement;
 mod store_cache;
 #[path = "store_deletion.rs"]
 mod store_deletion;
+#[path = "store_statement_count.rs"]
+mod store_statement_count;
 pub use source_contents_replacement::{
     SourceContentsReplacement, SourceContentsReplacementReport, SourceLexicalIndexUpdate,
 };
@@ -67,6 +69,7 @@ pub struct Store {
     conn: Connection,
     durability_profile: SqliteDurabilityProfile,
     database_path: Option<PathBuf>,
+    sql_statement_counting_available: bool,
 }
 
 /// Task list status filter used by bounded task overview queries.

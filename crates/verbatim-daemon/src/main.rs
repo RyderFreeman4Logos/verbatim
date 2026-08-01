@@ -4738,19 +4738,22 @@ async fn execute_retrieve_task_inner(
     } else {
         debug.display_evidence_count
     };
-    let retrieval_timing = timing.finish(serde_json::json!({
-        "result_count": results.len(),
-        "returned_results": page_len(
-            retrieval_response_total,
-            controls.limit,
-            controls.page_size,
-            controls.page,
-        ),
-        "rerank_enabled": controls.rerank_config.enabled,
-        "dense_top_k": controls.retrieval_config.dense_top_k,
-        "bm25_top_k": controls.retrieval_config.bm25_top_k,
-        "dense_vector_path": debug.dense_vector_path,
-    }));
+    let retrieval_timing = timing.finish(retrieval_span_metadata(
+        serde_json::json!({
+            "result_count": results.len(),
+            "returned_results": page_len(
+                retrieval_response_total,
+                controls.limit,
+                controls.page_size,
+                controls.page,
+            ),
+            "rerank_enabled": controls.rerank_config.enabled,
+            "dense_top_k": controls.retrieval_config.dense_top_k,
+            "bm25_top_k": controls.retrieval_config.bm25_top_k,
+            "dense_vector_path": debug.dense_vector_path,
+        }),
+        Some(&debug),
+    ));
     record_task_progress(&state, task_id, retrieval_progress).await;
     let retrieval_started_at = retrieval_timing.started_at.clone();
     record_task_span(&state, task_id, retrieval_timing.clone()).await?;
@@ -4926,11 +4929,14 @@ async fn execute_ask_task_inner(
     record_task_span(
         &state,
         task_id,
-        timing.finish(serde_json::json!({
-            "result_count": results.len(),
-            "retrieval_debug": retrieval_debug.is_some(),
-            "dense_vector_path": retrieval_debug.as_ref().map(|debug| debug.dense_vector_path),
-        })),
+        timing.finish(retrieval_span_metadata(
+            serde_json::json!({
+                "result_count": results.len(),
+                "retrieval_debug": retrieval_debug.is_some(),
+                "dense_vector_path": retrieval_debug.as_ref().map(|debug| debug.dense_vector_path),
+            }),
+            retrieval_debug.as_ref(),
+        )),
     )
     .await?;
     record_task_event(
@@ -5172,10 +5178,13 @@ async fn execute_ask_stream_task_inner(
     record_task_span(
         &state,
         task_id,
-        timing.finish(serde_json::json!({
-            "result_count": results.len(),
-            "retrieval_debug": retrieval_debug.is_some(),
-        })),
+        timing.finish(retrieval_span_metadata(
+            serde_json::json!({
+                "result_count": results.len(),
+                "retrieval_debug": retrieval_debug.is_some(),
+            }),
+            retrieval_debug.as_ref(),
+        )),
     )
     .await?;
 
@@ -7416,43 +7425,53 @@ async fn prepare_retrieve_context(
         .with_qdrant_search(&controls.config.qdrant);
         let source_filter_ref = source_filter.as_ref();
         let debug_options = retrieve_debug_options(&controls);
-        let (mut results, mut debug) = match (
-            controls.rerank_config.enabled,
-            controls.rerank_config.strategy,
-        ) {
-            (true, RerankStrategy::Endpoint) => {
-                let reranker = OpenAiCompatibleReranker::from_config(&controls.rerank_config);
-                let retrieval = retrieval.with_reranker(&controls.rerank_config, &reranker);
-                runtime.block_on(retrieval.search_source_set_with_debug_options(
-                    &question2,
-                    source_filter_ref,
-                    debug_options,
-                ))?
-            }
-            (true, RerankStrategy::Llm) => {
-                let reranker = OpenAiCompatibleLlmReranker::from_config(&controls.rerank_config);
-                let retrieval = retrieval.with_reranker(&controls.rerank_config, &reranker);
-                runtime.block_on(retrieval.search_source_set_with_debug_options(
-                    &question2,
-                    source_filter_ref,
-                    debug_options,
-                ))?
-            }
-            (false, _) => runtime.block_on(retrieval.search_source_set_with_debug_options(
-                &question2,
-                source_filter_ref,
-                debug_options,
-            ))?,
-        };
-        if controls.config.graph.global_search.enabled && source_filter_ref.is_none() {
-            let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
-                GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
-                    .global_search_results(&question2, None)
-            })?;
-            let mut debug_option = Some(debug);
-            prepend_global_results(&mut results, global_results, &mut debug_option);
-            debug = debug_option.unwrap_or_else(empty_retrieval_debug);
-        }
+        let (retrieval_result, retrieval_search_sql_statement_count) =
+            pipeline.store().count_sql_statements(|| {
+                let (mut results, mut debug) = match (
+                    controls.rerank_config.enabled,
+                    controls.rerank_config.strategy,
+                ) {
+                    (true, RerankStrategy::Endpoint) => {
+                        let reranker =
+                            OpenAiCompatibleReranker::from_config(&controls.rerank_config);
+                        let retrieval = retrieval.with_reranker(&controls.rerank_config, &reranker);
+                        runtime.block_on(retrieval.search_source_set_with_debug_options(
+                            &question2,
+                            source_filter_ref,
+                            debug_options,
+                        ))?
+                    }
+                    (true, RerankStrategy::Llm) => {
+                        let reranker =
+                            OpenAiCompatibleLlmReranker::from_config(&controls.rerank_config);
+                        let retrieval = retrieval.with_reranker(&controls.rerank_config, &reranker);
+                        runtime.block_on(retrieval.search_source_set_with_debug_options(
+                            &question2,
+                            source_filter_ref,
+                            debug_options,
+                        ))?
+                    }
+                    (false, _) => {
+                        runtime.block_on(retrieval.search_source_set_with_debug_options(
+                            &question2,
+                            source_filter_ref,
+                            debug_options,
+                        ))?
+                    }
+                };
+                if controls.config.graph.global_search.enabled && source_filter_ref.is_none() {
+                    let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
+                        GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
+                            .global_search_results(&question2, None)
+                    })?;
+                    let mut debug_option = Some(debug);
+                    prepend_global_results(&mut results, global_results, &mut debug_option);
+                    debug = debug_option.unwrap_or_else(empty_retrieval_debug);
+                }
+                Ok::<_, anyhow::Error>((results, debug))
+            });
+        let (results, mut debug) = retrieval_result?;
+        debug.retrieval_search_sql_statement_count = retrieval_search_sql_statement_count;
         let source_paths = with_sqlite_reader_permit(&sqlite_reader, || {
             source_paths_for_results(&results, pipeline.store())
         })?;
@@ -7470,6 +7489,7 @@ fn empty_retrieval_debug() -> RetrievalDebug {
     RetrievalDebug {
         dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
         query_embedding_latency_ms: None,
+        retrieval_search_sql_statement_count: None,
         local_spans_ms: RetrievalLocalSpansMs::default(),
         candidate_counters: Default::default(),
         evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
@@ -7540,20 +7560,28 @@ async fn prepare_generation_context(
             .with_vector_search_resource(vector_search)
             .with_qdrant_search(&config.qdrant);
             let source_filter_ref = source_filter.as_ref();
-            let (mut results, mut retrieval_debug) = run_generation_retrieval(
-                runtime,
-                retrieval,
-                &config.rerank,
-                &question2,
-                source_filter_ref,
-                show_retrieval,
-            )?;
-            if config.graph.global_search.enabled && source_filter_ref.is_none() {
-                let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
-                    GraphRagService::new(pipeline.store(), &config.graph.global_search)
-                        .global_search_results(&question2, None)
-                })?;
-                prepend_global_results(&mut results, global_results, &mut retrieval_debug);
+            let (retrieval_result, retrieval_search_sql_statement_count) =
+                pipeline.store().count_sql_statements(|| {
+                    let (mut results, mut retrieval_debug) = run_generation_retrieval(
+                        runtime,
+                        retrieval,
+                        &config.rerank,
+                        &question2,
+                        source_filter_ref,
+                        show_retrieval,
+                    )?;
+                    if config.graph.global_search.enabled && source_filter_ref.is_none() {
+                        let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
+                            GraphRagService::new(pipeline.store(), &config.graph.global_search)
+                                .global_search_results(&question2, None)
+                        })?;
+                        prepend_global_results(&mut results, global_results, &mut retrieval_debug);
+                    }
+                    Ok::<_, anyhow::Error>((results, retrieval_debug))
+                });
+            let (results, mut retrieval_debug) = retrieval_result?;
+            if let Some(debug) = retrieval_debug.as_mut() {
+                debug.retrieval_search_sql_statement_count = retrieval_search_sql_statement_count;
             }
             let image_artifacts = with_sqlite_reader_permit(&sqlite_reader, || {
                 collect_image_artifacts_for_results(&results, pipeline.store())
@@ -7613,6 +7641,19 @@ fn run_generation_retrieval(
             show_retrieval,
         ),
     }
+}
+
+fn retrieval_span_metadata(
+    mut metadata: serde_json::Value,
+    debug: Option<&RetrievalDebug>,
+) -> serde_json::Value {
+    if let (Some(count), Some(fields)) = (
+        debug.and_then(|debug| debug.retrieval_search_sql_statement_count),
+        metadata.as_object_mut(),
+    ) {
+        fields.insert("retrieval_search_sql_statement_count".into(), count.into());
+    }
+    metadata
 }
 
 fn run_generation_retrieval_once(
@@ -9673,6 +9714,8 @@ mod tests {
 
     #[path = "../auth_middleware_daemon_tests.rs"]
     mod auth_middleware_daemon_tests;
+    #[path = "sql_statement_telemetry_tests.rs"]
+    mod sql_statement_telemetry_tests;
     #[path = "sqlite_durability_tests.rs"]
     mod sqlite_durability_tests;
 
@@ -12794,6 +12837,7 @@ mod tests {
             retrieval: Some(RetrievalDebug {
                 dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
                 query_embedding_latency_ms: None,
+                retrieval_search_sql_statement_count: None,
                 local_spans_ms: RetrievalLocalSpansMs::default(),
                 candidate_counters: Default::default(),
                 evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
@@ -12834,6 +12878,7 @@ mod tests {
         let mut debug = Some(RetrievalDebug {
             dense_vector_path: RetrievalDenseVectorPath::ResidentHnsw,
             query_embedding_latency_ms: None,
+            retrieval_search_sql_statement_count: None,
             local_spans_ms: RetrievalLocalSpansMs::default(),
             candidate_counters: Default::default(),
             evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
@@ -14622,232 +14667,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn populated_db_retrieve_uses_bm25_after_startup() {
-        let test_dir = TestDir::new("populated-db-retrieve-bm25-startup");
-        let store = Store::new(&test_dir.path().join("verbatim.db")).unwrap();
-        let chunk_ids = insert_populated_bm25_startup_fixture(&store, test_dir.path());
-        let expected_child_rows = u64::try_from(chunk_ids.len()).unwrap();
-        assert_eq!(store.list_sources().unwrap().len(), 2);
-        assert_eq!(store.list_child_chunks().unwrap().len(), chunk_ids.len());
-        drop(store);
-
-        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
-        config.embedding.enabled = false;
-        config.rerank.enabled = false;
-
-        {
-            let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
-            let outcome = pipeline.fts_startup_maintenance();
-            assert_eq!(outcome.status, FtsMaintenanceStatus::Rebuilt);
-            assert_eq!(
-                outcome.reason,
-                FtsMaintenanceReason::MissingProjectionVersion
-            );
-            assert_eq!(outcome.counts.child_rows, expected_child_rows);
-            assert_eq!(outcome.counts.fts_rows, expected_child_rows);
-
-            let response =
-                retrieve_populated_bm25_startup_fixture(&config, test_dir.path(), pipeline).await;
-            assert_populated_bm25_startup_response(&response, chunk_ids.len());
-        }
-
-        {
-            let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
-            let outcome = pipeline.fts_startup_maintenance();
-            assert_eq!(outcome.status, FtsMaintenanceStatus::Skipped);
-            assert_eq!(outcome.reason, FtsMaintenanceReason::Current);
-            assert_eq!(outcome.counts.child_rows, expected_child_rows);
-            assert_eq!(outcome.counts.fts_rows, expected_child_rows);
-
-            let response =
-                retrieve_populated_bm25_startup_fixture(&config, test_dir.path(), pipeline).await;
-            assert_populated_bm25_startup_response(&response, chunk_ids.len());
-        }
-    }
-
-    fn insert_populated_bm25_startup_fixture(store: &Store, root: &FsPath) -> Vec<ChunkId> {
-        let first_path = root.join("startup-alpha.md");
-        let second_path = root.join("startup-beta.md");
-        fs::write(
-            &first_path,
-            "startupneedle alpha first chunk\nstartupneedle alpha second chunk\n",
-        )
-        .unwrap();
-        fs::write(&second_path, "startupneedle beta third chunk\n").unwrap();
-
-        let first_source = populated_bm25_source("startup-src-alpha", &first_path);
-        let second_source = populated_bm25_source("startup-src-beta", &second_path);
-        store.add_source(&first_source).unwrap();
-        store.add_source(&second_source).unwrap();
-
-        let evidence = vec![
-            populated_bm25_evidence(
-                &first_source.id,
-                "startup-ev-alpha-1",
-                &first_path,
-                "startupneedle alpha first chunk",
-                0,
-            ),
-            populated_bm25_evidence(
-                &first_source.id,
-                "startup-ev-alpha-2",
-                &first_path,
-                "startupneedle alpha second chunk",
-                1,
-            ),
-            populated_bm25_evidence(
-                &second_source.id,
-                "startup-ev-beta-1",
-                &second_path,
-                "startupneedle beta third chunk",
-                0,
-            ),
-        ];
-        store.bulk_insert_evidence(&evidence).unwrap();
-
-        let chunks = vec![
-            populated_bm25_child(
-                &first_source.id,
-                "startup-chunk-alpha-1",
-                &evidence[0].id,
-                "startupneedle alpha first chunk",
-            ),
-            populated_bm25_child(
-                &first_source.id,
-                "startup-chunk-alpha-2",
-                &evidence[1].id,
-                "startupneedle alpha second chunk",
-            ),
-            populated_bm25_child(
-                &second_source.id,
-                "startup-chunk-beta-1",
-                &evidence[2].id,
-                "startupneedle beta third chunk",
-            ),
-        ];
-        let chunk_ids = chunks
-            .iter()
-            .map(|chunk| chunk.id.clone())
-            .collect::<Vec<_>>();
-        let links = chunks
-            .iter()
-            .zip(evidence.iter())
-            .map(|(chunk, evidence)| (chunk.id.clone(), evidence.id.clone()))
-            .collect::<Vec<_>>();
-        store.bulk_insert_chunks(&chunks).unwrap();
-        store.link_chunk_evidence(&links).unwrap();
-
-        chunk_ids
-    }
-
-    fn populated_bm25_source(id: &str, path: &FsPath) -> Source {
-        Source {
-            id: SourceId(id.into()),
-            path: path.to_path_buf(),
-            hash: format!("hash-{id}"),
-            status: SourceStatus::Indexed,
-            parser_used: Some("plaintext".into()),
-            last_ingested_at: None,
-        }
-    }
-
-    fn populated_bm25_evidence(
-        source_id: &SourceId,
-        id: &str,
-        path: &FsPath,
-        text: &str,
-        position: u32,
-    ) -> EvidenceUnit {
-        EvidenceUnit {
-            id: EvidenceId(id.into()),
-            source_id: source_id.clone(),
-            kind: EvidenceKind::Text,
-            derived_from: None,
-            locator: SourceLocator::Document {
-                path_or_url: path.display().to_string(),
-                line_start: position.saturating_add(1),
-                line_end: None,
-            },
-            text: text.into(),
-            text_hash: format!("hash-{id}"),
-            heading_path: vec!["Startup".into()],
-            position,
-        }
-    }
-
-    fn populated_bm25_child(
-        source_id: &SourceId,
-        id: &str,
-        evidence_id: &EvidenceId,
-        text: &str,
-    ) -> Chunk {
-        Chunk {
-            id: ChunkId(id.into()),
-            source_id: source_id.clone(),
-            chunk_hash: format!("hash-{id}"),
-            embedding_input_hash: None,
-            text: text.into(),
-            context_text: None,
-            token_count: 4,
-            chunk_type: ChunkType::Child,
-            parent_chunk_id: None,
-            heading_path: vec!["Startup".into()],
-            evidence_unit_ids: vec![evidence_id.clone()],
-        }
-    }
-
-    async fn retrieve_populated_bm25_startup_fixture(
-        config: &Config,
-        data_dir: &FsPath,
-        pipeline: IngestPipeline,
-    ) -> RetrieveResponse {
-        let state = test_state(config.clone(), data_dir, pipeline);
-        retrieve(
-            State(state),
-            Json(RetrieveRequest {
-                question: "startupneedle".into(),
-                source_id: None,
-                collection_filter: CollectionFilterRequest::default(),
-                embedding_profile_id: None,
-                limit: Some(5),
-                page_size: Some(5),
-                page: Some(1),
-                fast: true,
-                rerank: Some(false),
-                dense_top_k: None,
-                bm25_top_k: Some(5),
-                rerank_top_n: None,
-                bypass_cache: false,
-                include_debug: true,
-                include_debug_packs: false,
-                include_locator: false,
-                passage: false,
-            }),
-        )
-        .await
-        .unwrap()
-        .0
-    }
-
-    fn assert_populated_bm25_startup_response(response: &RetrieveResponse, expected_hits: usize) {
-        assert_eq!(response.returned_results, expected_hits);
-        assert!(response
-            .results
-            .iter()
-            .all(|result| result.snippet.contains("startupneedle")));
-        let debug = response.debug.as_ref().expect("retrieval debug");
-        assert_eq!(debug.dense_vector_path, RetrievalDenseVectorPath::Bm25Only);
-        assert_eq!(debug.query_embedding_latency_ms, None);
-        assert_eq!(debug.local_spans_ms.query_embedding_ms, 0);
-        assert_eq!(debug.local_spans_ms.dense_vector_search_ms, 0);
-        let encoded_debug = serde_json::to_value(debug).unwrap();
-        assert!(encoded_debug["local_spans_ms"]["bm25_search_ms"].is_u64());
-        assert!(encoded_debug["local_spans_ms"]["response_formatting_ms"].is_u64());
-        assert!(debug.dense_hits.is_empty());
-        assert_eq!(debug.bm25_hits.len(), expected_hits);
-    }
-
-    #[tokio::test]
     async fn capability_refresh_direct_retrieve_rejects_reset_profile_vectors() {
         let (_test_dir, state, source_id, model_server) =
             reloaded_embedding_endpoint_state("capability-refresh-retrieve", false).await;
@@ -15481,57 +15300,6 @@ mod tests {
         assert!(context.results[0].structured_locator.is_some());
         assert!(model_server.embedding_requests() >= 2);
         assert_eq!(model_server.chat_requests(), 0);
-    }
-
-    #[tokio::test]
-    async fn ask_with_bm25_only_retrieval_uses_configured_chat_without_embedding_calls() {
-        let model_server =
-            MockModelServer::start_with_chat(3, "BM25 answer from evidence [E1]").await;
-        let test_dir = TestDir::new("ask-bm25-only-chat");
-        let source_path = test_dir.path().join("doc.md");
-        fs::write(
-            &source_path,
-            "Alpha BM25-only evidence answers the generated ask question.",
-        )
-        .unwrap();
-        let mut config = retrieve_test_config(&model_server.base_url);
-        config.embedding.enabled = false;
-        config.chat.enabled = true;
-        config.chat.base_url = model_server.base_url.clone();
-        config.chat.model = "test-chat".into();
-        config.rerank.enabled = false;
-
-        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
-        let source_id = pipeline.add_source(&source_path).unwrap();
-        pipeline.ingest_source(&source_id).await.unwrap();
-
-        let state = test_state(config, test_dir.path(), pipeline);
-        let response = ask(
-            State(state),
-            Json(AskRequest {
-                question: "What does Alpha evidence answer?".into(),
-                source_id: Some(source_id.0.clone()),
-                collection_filter: CollectionFilterRequest::default(),
-                embedding_profile_id: None,
-                show_retrieval: true,
-                context_only: false,
-                limit: None,
-                page_size: None,
-                page: None,
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-
-        assert!(response.answer.contains("BM25 answer"));
-        let debug = response.retrieval.expect("retrieval debug");
-        assert_eq!(debug.dense_vector_path, RetrievalDenseVectorPath::Bm25Only);
-        assert_eq!(debug.query_embedding_latency_ms, None);
-        assert!(debug.dense_hits.is_empty());
-        assert!(!debug.bm25_hits.is_empty());
-        assert_eq!(model_server.embedding_requests(), 0);
-        assert_eq!(model_server.chat_requests(), 1);
     }
 
     #[tokio::test]
