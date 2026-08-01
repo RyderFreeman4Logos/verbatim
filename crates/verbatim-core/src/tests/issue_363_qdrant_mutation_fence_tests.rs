@@ -106,10 +106,13 @@ impl QdrantMutationFenceServer {
                         request_index += 1;
                         let request = read_http_request(&mut stream);
                         let requests = Arc::clone(&requests);
+                        let is_upsert =
+                            request.line == "PUT /collections/verbatim/points?wait=true HTTP/1.1";
+                        let pause_upsert = is_upsert && upsert_started_tx.is_some();
                         let upsert_started =
-                            (current_index == 3).then(|| upsert_started_tx.take().unwrap());
+                            pause_upsert.then(|| upsert_started_tx.take().unwrap());
                         let release_upsert =
-                            (current_index == 3).then(|| release_upsert_rx.take().unwrap());
+                            pause_upsert.then(|| release_upsert_rx.take().unwrap());
                         let deletion_started =
                             (current_index == 7).then(|| deletion_started_tx.take().unwrap());
                         let release_deletion =
@@ -127,7 +130,7 @@ impl QdrantMutationFenceServer {
                             if let Some(release) = release_deletion {
                                 let _ = release.recv();
                             }
-                            let _ = write_http_response(&mut stream);
+                            let _ = write_http_response(&mut stream, &request);
                             requests.lock().unwrap().push((current_index, request));
                         }));
                     }
@@ -248,10 +251,17 @@ fn http_request_complete(buffer: &[u8]) -> bool {
 }
 
 #[cfg(feature = "qdrant")]
-fn write_http_response(stream: &mut TcpStream) -> std::io::Result<()> {
+fn write_http_response(stream: &mut TcpStream, request: &TestHttpRequest) -> std::io::Result<()> {
+    let body = if request.line == "GET /collections/verbatim HTTP/1.1" {
+        r#"{"status":"ok","result":{"config":{"params":{"vectors":{"size":2,"distance":"Cosine"}}},"payload_schema":{"profile_id":{"data_type":"keyword"},"source_id":{"data_type":"keyword"}}}}"#
+    } else {
+        r#"{"status":"ok","result":{}}"#
+    };
     write!(
         stream,
-        "HTTP/1.1 200 Test\r\nContent-Length: 27\r\nConnection: close\r\n\r\n{{\"status\":\"ok\",\"result\":{{}}}}"
+        "HTTP/1.1 200 Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
     )?;
     stream.flush()
 }

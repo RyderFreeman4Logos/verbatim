@@ -167,8 +167,10 @@ fn spawn_pausing_qdrant_upsert_server(
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let request_index = requests.len();
-                    requests.push(read_http_request(&mut stream));
-                    if request_index == 3 {
+                    let request = read_http_request(&mut stream);
+                    let is_upsert =
+                        request.line == "PUT /collections/verbatim/points?wait=true HTTP/1.1";
+                    if is_upsert && upsert_started_tx.is_some() {
                         upsert_started_tx.take().unwrap().send(()).unwrap();
                         release_rx.recv().unwrap();
                     }
@@ -177,7 +179,13 @@ fn spawn_pausing_qdrant_upsert_server(
                     } else {
                         200
                     };
-                    write_http_response(&mut stream, status, r#"{"status":"ok","result":{}}"#);
+                    let body = if request.line == "GET /collections/verbatim HTTP/1.1" {
+                        r#"{"status":"ok","result":{"config":{"params":{"vectors":{"size":2,"distance":"Cosine"}}},"payload_schema":{"profile_id":{"data_type":"keyword"},"source_id":{"data_type":"keyword"}}}}"#
+                    } else {
+                        r#"{"status":"ok","result":{}}"#
+                    };
+                    requests.push(request);
+                    write_http_response(&mut stream, status, body);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if stop_rx.try_recv().is_ok() {

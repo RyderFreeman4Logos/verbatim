@@ -8126,6 +8126,9 @@ mod tests {
     }
 
     #[cfg(feature = "qdrant")]
+    const QDRANT_COLLECTION_INFO: &str = r#"{"status":"ok","result":{"config":{"params":{"vectors":{"size":2,"distance":"Cosine"}}},"payload_schema":{"profile_id":{"data_type":"keyword"},"source_id":{"data_type":"keyword"}}}}"#;
+
+    #[cfg(feature = "qdrant")]
     fn qdrant_test_config(url: String) -> QdrantConfig {
         QdrantConfig {
             enabled: true,
@@ -10114,14 +10117,21 @@ model = "local-vision"
             (200, r#"{"status":"ok","result":true}"#),
             (
                 200,
-                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
+                r#"{"status":"ok","result":{"config":{"params":{"vectors":{"size":2,"distance":"Cosine"}}},"payload_schema":{}}}"#,
             ),
             (200, r#"{"status":"ok","result":true}"#),
+            (200, r#"{"status":"ok","result":true}"#),
+            (200, QDRANT_COLLECTION_INFO),
+            (
+                200,
+                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
+            ),
+            (200, QDRANT_COLLECTION_INFO),
             (
                 200,
                 r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
             ),
-            (200, r#"{"status":"ok","result":true}"#),
+            (200, QDRANT_COLLECTION_INFO),
             (
                 200,
                 r#"{"status":"ok","result":{"status":"acknowledged","operation_id":3}}"#,
@@ -10147,20 +10157,20 @@ model = "local-vision"
         assert_eq!(ingested.source_count, 1);
         let requests = handle.join().unwrap();
         assert_eq!(
-            requests[5].line,
+            requests[9].line,
             "POST /collections/verbatim/points/delete?wait=true HTTP/1.1"
         );
-        let delete_body: serde_json::Value = serde_json::from_str(&requests[5].body).unwrap();
+        let delete_body: serde_json::Value = serde_json::from_str(&requests[9].body).unwrap();
         assert_eq!(delete_body["filter"]["must"][0]["key"], "profile_id");
         assert_eq!(
             delete_body["filter"]["must"][0]["match"]["value"],
             "default"
         );
         assert_eq!(
-            requests[7].line,
+            requests[11].line,
             "PUT /collections/verbatim/points?wait=true HTTP/1.1"
         );
-        let body: serde_json::Value = serde_json::from_str(&requests[7].body).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&requests[11].body).unwrap();
         assert_eq!(body["points"][0]["payload"]["profile_id"], "default");
         assert_eq!(body["points"][0]["payload"]["source_id"], "src-force");
         assert!(body["points"][0]["payload"]["chunk_id"]
@@ -10173,12 +10183,12 @@ model = "local-vision"
     #[tokio::test]
     async fn vectors_only_profile_build_syncs_qdrant_with_profile_filter() {
         let (qdrant_url, handle) = spawn_qdrant_server(vec![
-            (200, r#"{"status":"ok","result":{}}"#),
+            (200, QDRANT_COLLECTION_INFO),
             (
                 200,
                 r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
             ),
-            (200, r#"{"status":"ok","result":{}}"#),
+            (200, QDRANT_COLLECTION_INFO),
             (
                 200,
                 r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
@@ -10225,12 +10235,12 @@ model = "local-vision"
     #[tokio::test]
     async fn source_scoped_profile_reset_full_syncs_qdrant_and_filters_stale_remote_hits() {
         let (qdrant_url, handle) = spawn_qdrant_server(vec![
-            (200, r#"{"status":"ok","result":{}}"#),
+            (200, QDRANT_COLLECTION_INFO),
             (
                 200,
                 r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
             ),
-            (200, r#"{"status":"ok","result":{}}"#),
+            (200, QDRANT_COLLECTION_INFO),
             (
                 200,
                 r#"{"status":"ok","result":{"status":"acknowledged","operation_id":2}}"#,
