@@ -48,14 +48,14 @@ impl QdrantVectorRecord {
     }
 }
 
-/// Remote dense hit plus the profile generation that produced the stored vector.
+/// Remote dense hit plus the stored point identity needed for authoritative validation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QdrantHit {
-    /// Chunk identifier returned by Qdrant payload.
+    pub point_id: String,
     pub chunk_id: ChunkId,
-    /// Qdrant similarity score.
+    pub profile_id: EmbeddingProfileId,
+    pub source_id: SourceId,
     pub score: f32,
-    /// SQLite profile index generation captured when the point was synced.
     pub profile_generation: u64,
 }
 
@@ -196,7 +196,7 @@ impl QdrantClient {
             vector: query,
             limit: top_k,
             filter: Some(profile_source_filter(profile_id, source_filter)),
-            with_payload: ["chunk_id", "profile_generation"],
+            with_payload: ["chunk_id", "profile_generation", "profile_id", "source_id"],
             with_vector: false,
         };
         let response: QdrantEnvelope<Vec<QdrantScoredPoint>> = self
@@ -210,7 +210,7 @@ impl QdrantClient {
         Ok(response
             .result
             .into_iter()
-            .filter_map(|point| hit_from_payload(point.payload, point.score))
+            .filter_map(|point| hit_from_payload(point.id, point.payload, point.score))
             .collect())
     }
 
@@ -447,7 +447,7 @@ struct QdrantSearchRequest<'a> {
     limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     filter: Option<QdrantFilter<'a>>,
-    with_payload: [&'static str; 2],
+    with_payload: [&'static str; 4],
     with_vector: bool,
 }
 
@@ -475,6 +475,7 @@ struct QdrantEnvelope<T> {
 
 #[derive(Debug, Deserialize)]
 struct QdrantScoredPoint {
+    id: Option<Value>,
     score: f32,
     payload: Option<Value>,
 }
@@ -511,15 +512,28 @@ fn profile_source_filter<'a>(
     QdrantFilter { must }
 }
 
-fn hit_from_payload(payload: Option<Value>, score: f32) -> Option<QdrantHit> {
+fn hit_from_payload(
+    point_id: Option<Value>,
+    payload: Option<Value>,
+    score: f32,
+) -> Option<QdrantHit> {
+    let point_id = point_id?.as_str()?.to_string();
     let payload = payload?;
-    let chunk_id = payload
-        .get("chunk_id")
-        .and_then(Value::as_str)
-        .map(|id| ChunkId(id.to_string()))?;
+    let chunk_id = ChunkId(payload.get("chunk_id")?.as_str()?.to_string());
+    let profile_id = EmbeddingProfileId::new(payload.get("profile_id")?.as_str()?).ok()?;
+    let source_id = SourceId(payload.get("source_id")?.as_str()?.to_string());
     let profile_generation = payload.get("profile_generation").and_then(Value::as_u64)?;
+    if chunk_id.0.is_empty()
+        || source_id.0.is_empty()
+        || point_id != point_id_for_profile_chunk(&profile_id, &chunk_id)
+    {
+        return None;
+    }
     Some(QdrantHit {
+        point_id,
         chunk_id,
+        profile_id,
+        source_id,
         score,
         profile_generation,
     })
@@ -555,25 +569,8 @@ fn point_id_for_profile_chunk(profile_id: &EmbeddingProfileId, chunk_id: &ChunkI
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15]
-    )
+    let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = bytes;
+    format!("{a:02x}{b:02x}{c:02x}{d:02x}-{e:02x}{f:02x}-{g:02x}{h:02x}-{i:02x}{j:02x}-{k:02x}{l:02x}{m:02x}{n:02x}{o:02x}{p:02x}")
 }
 
 fn qdrant_transport_error(
@@ -748,48 +745,7 @@ mod tests {
         assert_ne!(upsert["points"][0]["id"], "src-1-child-0");
     }
 
-    #[tokio::test]
-    async fn search_sends_source_filter_and_maps_payload_chunk_ids() {
-        let (url, handle) = spawn_server(vec![(
-            200,
-            r#"{"status":"ok","result":[{"id":"550e8400-e29b-41d4-a716-446655440000","score":0.75,"payload":{"chunk_id":"chunk-a","profile_generation":3}}]}"#,
-        )]);
-        let client = QdrantClient::new(qdrant_config(url));
-        let alt_profile = EmbeddingProfileId::new("alt").unwrap();
-
-        let hits = client
-            .search(
-                &alt_profile,
-                &[0.3, 0.4],
-                7,
-                Some(&SourceId("src-1".into())),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            hits,
-            vec![QdrantHit {
-                chunk_id: ChunkId("chunk-a".into()),
-                score: 0.75,
-                profile_generation: 3,
-            }]
-        );
-        let requests = handle.join().unwrap();
-        assert_eq!(
-            requests[0].line,
-            "POST /collections/verbatim/points/search HTTP/1.1"
-        );
-        let body: Value = serde_json::from_str(&requests[0].body).unwrap();
-        assert_eq!(body["limit"], 7);
-        assert_eq!(body["filter"]["must"][0]["key"], "profile_id");
-        assert_eq!(body["filter"]["must"][0]["match"]["value"], "alt");
-        assert_eq!(body["filter"]["must"][1]["key"], "source_id");
-        assert_eq!(body["filter"]["must"][1]["match"]["value"], "src-1");
-        assert_eq!(body["with_payload"][0], "chunk_id");
-        assert_eq!(body["with_payload"][1], "profile_generation");
-        assert_eq!(body["with_vector"], false);
-    }
+    include!("qdrant/search_identity_tests.rs");
 
     #[tokio::test]
     async fn search_invalid_json_error_exposes_upstream_diagnostic() {
