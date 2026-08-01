@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 mod retrieval_debug;
 
-pub use retrieval_debug::RetrievalDebug;
+pub use retrieval_debug::{RetrievalDebug, RetrievalLocalSpansMs};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SourceId(pub String);
@@ -960,30 +960,6 @@ impl Default for RetrievalProvenance {
     }
 }
 
-/// Retrieve diagnostic durations in milliseconds.
-///
-/// `canonical_*` values are nested in `display_evidence_pack_ms` when present;
-/// `response_formatting_ms` is measured by the daemon after core retrieval.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetrievalLocalSpansMs {
-    pub setup_ms: u64,
-    pub query_embedding_ms: u64,
-    pub dense_vector_search_ms: u64,
-    pub bm25_search_ms: u64,
-    pub rrf_fusion_ms: u64,
-    pub debug_candidate_pack_ms: u64,
-    pub rerank_total_ms: u64,
-    pub result_hydration_ms: u64,
-    pub graph_expansion_ms: u64,
-    pub final_evidence_pack_ms: u64,
-    pub display_evidence_pack_ms: u64,
-    pub response_formatting_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canonical_support_embedding_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canonical_display_selection_ms: Option<u64>,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalDebugEvidencePackMode {
@@ -1340,17 +1316,19 @@ mod tests {
                 setup_ms: 1,
                 query_embedding_ms: 2,
                 dense_vector_search_ms: 3,
-                bm25_search_ms: 4,
-                rrf_fusion_ms: 5,
-                debug_candidate_pack_ms: 6,
-                rerank_total_ms: 7,
-                result_hydration_ms: 8,
-                graph_expansion_ms: 9,
-                final_evidence_pack_ms: 10,
-                display_evidence_pack_ms: 11,
-                response_formatting_ms: 12,
-                canonical_support_embedding_ms: Some(13),
-                canonical_display_selection_ms: Some(14),
+                vector_queue_wait_ms: Some(4),
+                vector_service_ms: Some(5),
+                bm25_search_ms: 6,
+                rrf_fusion_ms: 7,
+                debug_candidate_pack_ms: 8,
+                rerank_total_ms: 9,
+                result_hydration_ms: 10,
+                graph_expansion_ms: 11,
+                final_evidence_pack_ms: 12,
+                display_evidence_pack_ms: 13,
+                response_formatting_ms: 14,
+                canonical_support_embedding_ms: Some(15),
+                canonical_display_selection_ms: Some(16),
             },
             candidate_counters: Default::default(),
             bm25_hits: vec![RetrievalStageHit {
@@ -1421,6 +1399,8 @@ mod tests {
         let encoded = serde_json::to_string(&debug).unwrap();
         assert!(encoded.contains("local_spans_ms"));
         assert!(encoded.contains("dense_vector_search_ms"));
+        assert!(encoded.contains("vector_queue_wait_ms"));
+        assert!(encoded.contains("vector_service_ms"));
         assert!(encoded.contains("response_formatting_ms"));
         assert!(encoded.contains("canonical_display_selection_ms"));
         assert!(encoded.contains("evidence_pack_mode"));
@@ -1435,6 +1415,14 @@ mod tests {
 
         let decoded: RetrievalDebug = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, debug);
+
+        let mut legacy_payload = serde_json::to_value(debug).unwrap();
+        let legacy_spans = legacy_payload["local_spans_ms"].as_object_mut().unwrap();
+        legacy_spans.remove("vector_queue_wait_ms");
+        legacy_spans.remove("vector_service_ms");
+        let decoded_legacy: RetrievalDebug = serde_json::from_value(legacy_payload).unwrap();
+        assert_eq!(decoded_legacy.local_spans_ms.vector_queue_wait_ms, None);
+        assert_eq!(decoded_legacy.local_spans_ms.vector_service_ms, None);
     }
 
     #[test]

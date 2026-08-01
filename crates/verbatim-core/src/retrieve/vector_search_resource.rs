@@ -7,8 +7,15 @@
 
 use anyhow::{Context, Result};
 
+#[cfg(feature = "qdrant")]
+use super::single_source_filter;
 use super::RetrievalPipeline;
 use crate::resource::{ObservableResource, ResourcePermit};
+use crate::retrieval_telemetry::CandidateCounters;
+#[cfg(feature = "qdrant")]
+use crate::types::EmbeddingProfileId;
+use crate::types::{ChunkId, RetrievalDenseVectorPath, RetrievalLocalSpansMs, SourceId};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 impl RetrievalPipeline<'_> {
@@ -31,5 +38,85 @@ impl RetrievalPipeline<'_> {
                 .map(Some),
             None => Ok(None),
         }
+    }
+
+    pub(super) async fn dense_search(
+        &self,
+        query_vec: &[f32],
+        top_k: usize,
+        source_filter: Option<&HashSet<SourceId>>,
+        candidate_counters: &mut CandidateCounters,
+        local_spans_ms: &mut RetrievalLocalSpansMs,
+    ) -> Result<(Vec<(ChunkId, f32)>, RetrievalDenseVectorPath)> {
+        local_spans_ms.vector_queue_wait_ms = None;
+        local_spans_ms.vector_service_ms = None;
+        let permit = self.acquire_vector_search_permit().await?;
+        #[cfg(feature = "qdrant")]
+        let result = if let Some(qdrant) = &self.qdrant {
+            let local_results =
+                self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))?;
+            if local_results.is_empty() {
+                Ok((local_results, self.dense_vector_path()))
+            } else {
+                let default_profile_id;
+                let profile_id = match &self.required_profile_id {
+                    Some(profile_id) => profile_id,
+                    None => {
+                        default_profile_id = EmbeddingProfileId::default_profile();
+                        &default_profile_id
+                    }
+                };
+                let qdrant_source_filter = single_source_filter(source_filter);
+                let profile_generation =
+                    self.with_read_permit(|| self.store.index_generation_for_profile(profile_id))?;
+                match qdrant
+                    .search(profile_id, query_vec, top_k, qdrant_source_filter)
+                    .await
+                {
+                    Ok(results) => self
+                        .with_read_permit(|| {
+                            self.merge_preferred_dense_hits(
+                                (profile_id, profile_generation),
+                                results,
+                                local_results,
+                                top_k,
+                                source_filter,
+                                candidate_counters,
+                            )
+                        })
+                        .map(|hits| (hits, RetrievalDenseVectorPath::Qdrant)),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "qdrant search failed; falling back to local dense index"
+                        );
+                        self.with_read_permit(|| {
+                            self.valid_dense_hits(
+                                local_results,
+                                top_k,
+                                source_filter,
+                                candidate_counters,
+                            )
+                        })
+                        .map(|hits| (hits, self.dense_vector_path()))
+                    }
+                }
+            }
+        } else {
+            self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))
+                .map(|hits| (hits, self.dense_vector_path()))
+        };
+        #[cfg(not(feature = "qdrant"))]
+        let result = {
+            let _ = candidate_counters;
+            self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))
+                .map(|hits| (hits, self.dense_vector_path()))
+        };
+        let output = result?;
+        if let Some(permit) = permit.as_ref() {
+            local_spans_ms.vector_queue_wait_ms = Some(permit.queue_wait_ms());
+            local_spans_ms.vector_service_ms = Some(permit.service_ms());
+        }
+        Ok(output)
     }
 }

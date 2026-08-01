@@ -485,6 +485,7 @@ impl<'a> RetrievalPipeline<'a> {
                         dense_top_k,
                         source_filter,
                         &mut candidate_counters,
+                        &mut local_spans_ms,
                     )
                     .await?;
                 local_spans_ms.dense_vector_search_ms = elapsed_ms(dense_started);
@@ -715,70 +716,6 @@ impl<'a> RetrievalPipeline<'a> {
         ))
     }
 
-    async fn dense_search(
-        &self,
-        query_vec: &[f32],
-        top_k: usize,
-        source_filter: Option<&HashSet<SourceId>>,
-        candidate_counters: &mut CandidateCounters,
-    ) -> Result<(Vec<(ChunkId, f32)>, RetrievalDenseVectorPath)> {
-        let _permit = self.acquire_vector_search_permit().await?;
-        #[cfg(feature = "qdrant")]
-        if let Some(qdrant) = &self.qdrant {
-            let local_results =
-                self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))?;
-            if local_results.is_empty() {
-                return Ok((local_results, self.dense_vector_path()));
-            }
-            let default_profile_id;
-            let profile_id = match &self.required_profile_id {
-                Some(profile_id) => profile_id,
-                None => {
-                    default_profile_id = EmbeddingProfileId::default_profile();
-                    &default_profile_id
-                }
-            };
-            let qdrant_source_filter = single_source_filter(source_filter);
-            let profile_generation =
-                self.with_read_permit(|| self.store.index_generation_for_profile(profile_id))?;
-            return match qdrant
-                .search(profile_id, query_vec, top_k, qdrant_source_filter)
-                .await
-            {
-                Ok(results) => self
-                    .with_read_permit(|| {
-                        self.merge_preferred_dense_hits(
-                            (profile_id, profile_generation),
-                            results,
-                            local_results,
-                            top_k,
-                            source_filter,
-                            candidate_counters,
-                        )
-                    })
-                    .map(|hits| (hits, RetrievalDenseVectorPath::Qdrant)),
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "qdrant search failed; falling back to local dense index"
-                    );
-                    self.with_read_permit(|| {
-                        self.valid_dense_hits(
-                            local_results,
-                            top_k,
-                            source_filter,
-                            candidate_counters,
-                        )
-                    })
-                    .map(|hits| (hits, self.dense_vector_path()))
-                }
-            };
-        }
-        #[cfg(not(feature = "qdrant"))]
-        let _ = candidate_counters;
-        self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))
-            .map(|hits| (hits, self.dense_vector_path()))
-    }
     fn local_dense_search(
         &self,
         query_vec: &[f32],
