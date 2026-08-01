@@ -757,13 +757,18 @@ impl<'a> RetrievalPipeline<'a> {
     }
 
     #[cfg(feature = "qdrant")]
-    fn valid_dense_hits(
+    fn valid_dense_hits<I>(
         &self,
-        hits: Vec<(ChunkId, f32)>,
+        hits: I,
         top_k: usize,
         source_filter: Option<&HashSet<SourceId>>,
+        required_profile: Option<(&EmbeddingProfileId, u64)>,
         candidate_counters: &mut CandidateCounters,
-    ) -> Result<Vec<(ChunkId, f32)>> {
+    ) -> Result<Vec<(ChunkId, f32)>>
+    where
+        I: IntoIterator,
+        I::Item: DenseHit,
+    {
         let mut valid = Vec::new();
         let mut seen = HashSet::new();
         let mut hits = hits.into_iter();
@@ -773,54 +778,11 @@ impl<'a> RetrievalPipeline<'a> {
                 &mut seen,
                 &mut hits,
                 source_filter,
-                None,
+                required_profile,
                 candidate_counters,
             )?
         {}
         Ok(valid)
-    }
-
-    #[cfg(feature = "qdrant")]
-    fn merge_preferred_dense_hits(
-        &self,
-        required_profile: (&EmbeddingProfileId, u64),
-        preferred_hits: Vec<QdrantHit>,
-        fallback_hits: Vec<(ChunkId, f32)>,
-        top_k: usize,
-        source_filter: Option<&HashSet<SourceId>>,
-        candidate_counters: &mut CandidateCounters,
-    ) -> Result<Vec<(ChunkId, f32)>> {
-        let mut merged = Vec::new();
-        let mut seen = HashSet::new();
-        let mut preferred_hits = preferred_hits.into_iter();
-        let mut fallback_hits = fallback_hits.into_iter();
-
-        while merged.len() < top_k {
-            let preferred_added = self.append_next_valid_dense_hit(
-                &mut merged,
-                &mut seen,
-                &mut preferred_hits,
-                source_filter,
-                Some(required_profile),
-                candidate_counters,
-            )?;
-            if merged.len() >= top_k {
-                break;
-            }
-            let fallback_added = self.append_next_valid_dense_hit(
-                &mut merged,
-                &mut seen,
-                &mut fallback_hits,
-                source_filter,
-                None,
-                candidate_counters,
-            )?;
-            if !preferred_added && !fallback_added {
-                break;
-            }
-        }
-
-        Ok(merged)
     }
 
     #[cfg(feature = "qdrant")]
@@ -4575,7 +4537,10 @@ mod tests {
             .unwrap();
 
         assert!(results.is_empty());
-        assert!(handle.join().unwrap().is_none());
+        assert_eq!(
+            handle.join().unwrap().as_deref(),
+            Some("POST /collections/verbatim/points/search HTTP/1.1")
+        );
     }
 
     #[cfg(feature = "qdrant")]
