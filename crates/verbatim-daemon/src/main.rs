@@ -62,7 +62,6 @@ use verbatim_core::generate::{
     image_artifact_evidence_id, select_image_attachments, GenerationCallTelemetry,
     GenerationContext, GenerationTelemetry, GenerationVerificationStatus, Generator,
 };
-use verbatim_core::graphrag::GraphRagService;
 use verbatim_core::index::sqlite_fts::FtsMaintenanceOutcome;
 use verbatim_core::index_gc::{apply_index_gc, plan_index_gc, IndexGcApplyReport};
 use verbatim_core::ingest::{
@@ -79,8 +78,8 @@ use verbatim_core::resource::{
 };
 use verbatim_core::retrieval_telemetry::SpanKind;
 use verbatim_core::retrieve::{
-    refresh_evidence_pack_debug, RetrievalCanonicalSelectionBudget, RetrievalDebugOptions,
-    RetrievalDisplayScope, RetrievalPipeline,
+    RetrievalCanonicalSelectionBudget, RetrievalDebugOptions, RetrievalDisplayScope,
+    RetrievalPipeline,
 };
 use verbatim_core::store::{Store, TaskListFilter};
 use verbatim_core::task::{
@@ -103,9 +102,9 @@ use verbatim_core::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 use verbatim_core::types::{
     CanonicalLocator, CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId,
     EvidenceKind, EvidenceUnit, ImageArtifact, ReferenceComponent, RetrievalDebug,
-    RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
-    RetrievalEvidenceRole, RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalResult, SourceId,
-    SourceLocator, SourceStatus,
+    RetrievalDenseVectorPath, RetrievalEvidencePackEntry, RetrievalEvidenceRole,
+    RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalResult, SourceId, SourceLocator,
+    SourceStatus,
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
@@ -7427,7 +7426,7 @@ async fn prepare_retrieve_context(
         let debug_options = retrieve_debug_options(&controls);
         let (retrieval_result, retrieval_search_sql_statement_count) =
             pipeline.store().count_sql_statements(|| {
-                let (mut results, mut debug) = match (
+                let (results, debug) = match (
                     controls.rerank_config.enabled,
                     controls.rerank_config.strategy,
                 ) {
@@ -7459,15 +7458,6 @@ async fn prepare_retrieve_context(
                         ))?
                     }
                 };
-                if controls.config.graph.global_search.enabled && source_filter_ref.is_none() {
-                    let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
-                        GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
-                            .global_search_results(&question2, None)
-                    })?;
-                    let mut debug_option = Some(debug);
-                    prepend_global_results(&mut results, global_results, &mut debug_option);
-                    debug = debug_option.unwrap_or_else(empty_retrieval_debug);
-                }
                 Ok::<_, anyhow::Error>((results, debug))
             });
         let (results, mut debug) = retrieval_result?;
@@ -7485,6 +7475,7 @@ async fn prepare_retrieve_context(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
+#[cfg(test)]
 fn empty_retrieval_debug() -> RetrievalDebug {
     RetrievalDebug {
         dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
@@ -7492,7 +7483,7 @@ fn empty_retrieval_debug() -> RetrievalDebug {
         retrieval_search_sql_statement_count: None,
         local_spans_ms: RetrievalLocalSpansMs::default(),
         candidate_counters: Default::default(),
-        evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
+        evidence_pack_mode: verbatim_core::types::RetrievalDebugEvidencePackMode::Full,
         final_evidence_count: 0,
         display_evidence_count: 0,
         bm25_hits: Vec::new(),
@@ -7562,7 +7553,7 @@ async fn prepare_generation_context(
             let source_filter_ref = source_filter.as_ref();
             let (retrieval_result, retrieval_search_sql_statement_count) =
                 pipeline.store().count_sql_statements(|| {
-                    let (mut results, mut retrieval_debug) = run_generation_retrieval(
+                    let (results, retrieval_debug) = run_generation_retrieval(
                         runtime,
                         retrieval,
                         &config.rerank,
@@ -7570,13 +7561,6 @@ async fn prepare_generation_context(
                         source_filter_ref,
                         show_retrieval,
                     )?;
-                    if config.graph.global_search.enabled && source_filter_ref.is_none() {
-                        let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
-                            GraphRagService::new(pipeline.store(), &config.graph.global_search)
-                                .global_search_results(&question2, None)
-                        })?;
-                        prepend_global_results(&mut results, global_results, &mut retrieval_debug);
-                    }
                     Ok::<_, anyhow::Error>((results, retrieval_debug))
                 });
             let (results, mut retrieval_debug) = retrieval_result?;
@@ -7674,29 +7658,6 @@ fn run_generation_retrieval_once(
         debug_options,
     ))?;
     Ok((results, Some(debug)))
-}
-
-fn prepend_global_results(
-    results: &mut Vec<RetrievalResult>,
-    mut global_results: Vec<RetrievalResult>,
-    retrieval_debug: &mut Option<RetrievalDebug>,
-) {
-    if global_results.is_empty() {
-        return;
-    }
-
-    global_results.extend(std::mem::take(results));
-    *results = global_results;
-    renumber_result_ranks(results);
-    if let Some(debug) = retrieval_debug.as_mut() {
-        refresh_evidence_pack_debug(debug, results);
-    }
-}
-
-fn renumber_result_ranks(results: &mut [RetrievalResult]) {
-    for (idx, result) in results.iter_mut().enumerate() {
-        result.provenance.result_rank = idx + 1;
-    }
 }
 
 fn collect_image_artifacts_for_results(
@@ -9707,9 +9668,9 @@ mod tests {
     use verbatim_core::retrieve::refresh_final_evidence_pack_debug;
     use verbatim_core::types::{
         CanonicalLocator, Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind,
-        EvidenceUnit, ReferenceComponent, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
-        RetrievalEvidenceRole, RetrievalProvenance, RetrievalRerankStatus, Source, SourceLocator,
-        VectorIndexResidency,
+        EvidenceUnit, ReferenceComponent, RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath,
+        RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalProvenance,
+        RetrievalRerankStatus, Source, SourceLocator, VectorIndexResidency,
     };
 
     #[path = "../auth_middleware_daemon_tests.rs"]
@@ -12863,58 +12824,6 @@ mod tests {
         assert!(encoded.contains("disabled"));
         assert!(!encoded.contains("api_key"));
         assert!(!encoded.contains("secret full raw source text"));
-    }
-
-    #[test]
-    fn prepended_global_results_refresh_retrieval_debug_final_pack() {
-        let local = test_retrieval_result(1, "local-chunk", "ev-local", EvidenceKind::Text);
-        let global = test_retrieval_result(
-            1,
-            "graphrag:report-chunk:community-test",
-            "graphrag:report:community-test",
-            EvidenceKind::Generated,
-        );
-        let mut results = vec![local];
-        let mut debug = Some(RetrievalDebug {
-            dense_vector_path: RetrievalDenseVectorPath::ResidentHnsw,
-            query_embedding_latency_ms: None,
-            retrieval_search_sql_statement_count: None,
-            local_spans_ms: RetrievalLocalSpansMs::default(),
-            candidate_counters: Default::default(),
-            evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
-            final_evidence_count: 0,
-            display_evidence_count: 0,
-            bm25_hits: Vec::new(),
-            dense_hits: Vec::new(),
-            rrf_fused_hits: Vec::new(),
-            graph_expanded_hits: Vec::new(),
-            reranker: verbatim_core::types::RetrievalRerankDebug::disabled(),
-            final_evidence_pack: Vec::new(),
-            display_evidence_pack: Vec::new(),
-        });
-
-        prepend_global_results(&mut results, vec![global], &mut debug);
-
-        assert_eq!(
-            results[0].chunk_id.0,
-            "graphrag:report-chunk:community-test"
-        );
-        assert_eq!(results[0].provenance.result_rank, 1);
-        assert_eq!(results[1].provenance.result_rank, 2);
-
-        let final_pack = debug.unwrap().final_evidence_pack;
-        assert_eq!(final_pack.len(), 2);
-        assert_eq!(final_pack[0].label, "E1");
-        assert_eq!(
-            final_pack[0].evidence_id.0,
-            "graphrag:report:community-test"
-        );
-        assert_eq!(final_pack[0].role, RetrievalEvidenceRole::Generated);
-        assert_eq!(final_pack[0].result_rank, 1);
-        assert_eq!(final_pack[1].label, "E2");
-        assert_eq!(final_pack[1].evidence_id.0, "ev-local");
-        assert_eq!(final_pack[1].role, RetrievalEvidenceRole::OriginalText);
-        assert_eq!(final_pack[1].result_rank, 2);
     }
 
     #[test]
