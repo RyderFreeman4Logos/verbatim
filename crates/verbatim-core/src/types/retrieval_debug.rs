@@ -2,10 +2,40 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
-    RetrievalFusedHit, RetrievalGraphExpansionDebug, RetrievalLocalSpansMs, RetrievalRerankDebug,
-    RetrievalStageHit,
+    RetrievalFusedHit, RetrievalGraphExpansionDebug, RetrievalRerankDebug, RetrievalStageHit,
 };
 use crate::retrieval_telemetry::CandidateCounters;
+
+/// Retrieve diagnostic durations in milliseconds.
+///
+/// `canonical_*` values are nested in `display_evidence_pack_ms` when present;
+/// `response_formatting_ms` is measured by the daemon after core retrieval.
+/// `dense_vector_search_ms` remains end-to-end and may include wrapper overhead,
+/// so it is not defined as the exact sum of the optional vector resource timings.
+/// Those timings are `None` when no vector resource is injected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalLocalSpansMs {
+    pub setup_ms: u64,
+    pub query_embedding_ms: u64,
+    pub dense_vector_search_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_queue_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_service_ms: Option<u64>,
+    pub bm25_search_ms: u64,
+    pub rrf_fusion_ms: u64,
+    pub debug_candidate_pack_ms: u64,
+    pub rerank_total_ms: u64,
+    pub result_hydration_ms: u64,
+    pub graph_expansion_ms: u64,
+    pub final_evidence_pack_ms: u64,
+    pub display_evidence_pack_ms: u64,
+    pub response_formatting_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_support_embedding_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_display_selection_ms: Option<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalDebug {

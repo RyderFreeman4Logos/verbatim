@@ -3033,6 +3033,12 @@ fn retrieve_local_span_entries(
             duration_ms,
         ));
     }
+    if let Some(duration_ms) = spans.vector_queue_wait_ms {
+        entries.push(("vector_queue_wait", "vector_queue_wait_ms", duration_ms));
+    }
+    if let Some(duration_ms) = spans.vector_service_ms {
+        entries.push(("vector_service", "vector_service_ms", duration_ms));
+    }
     if let Some(duration_ms) = spans.canonical_display_selection_ms {
         entries.push((
             "canonical_display_selection",
@@ -10289,9 +10295,10 @@ mod tests {
             &task_id,
             "1",
             &RetrievalLocalSpansMs {
-                setup_ms: 1,
                 query_embedding_ms: 2,
                 dense_vector_search_ms: 3,
+                vector_queue_wait_ms: Some(15),
+                vector_service_ms: Some(16),
                 bm25_search_ms: 4,
                 rrf_fusion_ms: 5,
                 debug_candidate_pack_ms: 6,
@@ -10303,11 +10310,16 @@ mod tests {
                 response_formatting_ms: 12,
                 canonical_support_embedding_ms: Some(13),
                 canonical_display_selection_ms: Some(14),
+                ..RetrievalLocalSpansMs::default()
             },
         )
         .await
         .unwrap();
 
+        let absent_entries = retrieve_local_span_entries(&RetrievalLocalSpansMs::default());
+        assert!(!absent_entries
+            .iter()
+            .any(|(phase, _, _)| phase.starts_with("vector_")));
         let response = task_summary_response(&state, task_id).await.unwrap();
         assert!(response
             .spans
@@ -10315,6 +10327,16 @@ mod tests {
             .any(|span| span.phase == "retrieve.local.dense_vector_search"
                 && span.duration_ms == 3
                 && span.metadata["debug_field"] == serde_json::json!("dense_vector_search_ms")));
+        assert!(response.spans.iter().any(|span| {
+            span.phase == "retrieve.local.vector_queue_wait"
+                && span.duration_ms == 15
+                && span.metadata["debug_field"] == serde_json::json!("vector_queue_wait_ms")
+        }));
+        assert!(response.spans.iter().any(|span| {
+            span.phase == "retrieve.local.vector_service"
+                && span.duration_ms == 16
+                && span.metadata["debug_field"] == serde_json::json!("vector_service_ms")
+        }));
         assert!(response
             .spans
             .iter()
