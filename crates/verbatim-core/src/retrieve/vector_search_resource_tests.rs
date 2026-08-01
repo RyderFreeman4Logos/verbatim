@@ -134,17 +134,25 @@ async fn qdrant_empty_and_zero_budget_inputs_use_local_dense_path() {
 
 #[cfg(feature = "qdrant")]
 #[tokio::test]
-async fn qdrant_complete_success_skips_local_dense_search() {
+async fn qdrant_multi_source_complete_success_skips_local_dense_search() {
     let store = Store::in_memory().unwrap();
-    let wanted_source = source("src-qdrant-remote-first");
+    let wanted_source_z = source("src-qdrant-z-authorized");
+    let wanted_source_a = source("src-qdrant-a-authorized");
     let other_source = source("src-qdrant-out-of-scope");
-    store.add_source(&wanted_source).unwrap();
+    store.add_source(&wanted_source_z).unwrap();
+    store.add_source(&wanted_source_a).unwrap();
     store.add_source(&other_source).unwrap();
-    let wanted_chunk = insert_text_chunk(
+    let wanted_chunk_z = insert_text_chunk(
         &store,
-        &wanted_source,
+        &wanted_source_z,
         "chunk-qdrant-remote-first",
-        "alpha wanted",
+        "alpha wanted z",
+    );
+    let wanted_chunk_a = insert_text_chunk(
+        &store,
+        &wanted_source_a,
+        "chunk-remote-preferred",
+        "alpha wanted a",
     );
     let other_chunk = insert_text_chunk(
         &store,
@@ -155,9 +163,14 @@ async fn qdrant_complete_success_skips_local_dense_search() {
     store
         .replace_all_vector_documents(&[
             VectorDocument {
-                chunk_id: wanted_chunk.id.clone(),
-                source_id: wanted_source.id.clone(),
-                vector: keyword_vector(&wanted_chunk.text),
+                chunk_id: wanted_chunk_z.id.clone(),
+                source_id: wanted_source_z.id.clone(),
+                vector: keyword_vector(&wanted_chunk_z.text),
+            },
+            VectorDocument {
+                chunk_id: wanted_chunk_a.id.clone(),
+                source_id: wanted_source_a.id.clone(),
+                vector: keyword_vector(&wanted_chunk_a.text),
             },
             VectorDocument {
                 chunk_id: other_chunk.id.clone(),
@@ -167,18 +180,21 @@ async fn qdrant_complete_success_skips_local_dense_search() {
         ])
         .unwrap();
     assert_eq!(store.index_generation().unwrap(), 1);
-    let (qdrant_url, handle) = spawn_qdrant_search_response(
+    let (qdrant_url, handle) = spawn_qdrant_search_response_with_body(
         200,
-        r#"{"status":"ok","result":[{"id":"2b2c1283-c2ff-5b12-a8ce-27bff2fff3a9","score":0.99,"payload":{"chunk_id":"chunk-qdrant-out-of-scope","profile_generation":1,"profile_id":"default","source_id":"src-qdrant-out-of-scope"}},{"id":"a5d8c7fa-ba7c-540c-95d4-31bdd9b12b99","score":0.98,"payload":{"chunk_id":"chunk-qdrant-remote-first","profile_generation":1,"profile_id":"default","source_id":"src-qdrant-remote-first"}}]}"#,
+        r#"{"status":"ok","result":[{"id":"2b2c1283-c2ff-5b12-a8ce-27bff2fff3a9","score":0.99,"payload":{"chunk_id":"chunk-qdrant-out-of-scope","profile_generation":1,"profile_id":"default","source_id":"src-qdrant-out-of-scope"}},{"id":"a5d8c7fa-ba7c-540c-95d4-31bdd9b12b99","score":0.98,"payload":{"chunk_id":"chunk-qdrant-remote-first","profile_generation":1,"profile_id":"default","source_id":"src-qdrant-z-authorized"}},{"id":"749ce13a-d809-57fe-a274-b32bec2735f0","score":0.97,"payload":{"chunk_id":"chunk-remote-preferred","profile_generation":1,"profile_id":"default","source_id":"src-qdrant-a-authorized"}}]}"#,
     );
     let vector_index = RecordingVectorIndex {
-        hits: vec![(wanted_chunk.id.clone(), 0.9)],
+        hits: vec![
+            (wanted_chunk_z.id.clone(), 0.9),
+            (wanted_chunk_a.id.clone(), 0.8),
+        ],
         search_count: AtomicUsize::new(0),
     };
     let lexical_index = StaticLexicalIndex::new(Vec::new());
     let embed_client = KeywordEmbeddingClient;
     let config = RetrievalConfig {
-        dense_top_k: 1,
+        dense_top_k: 2,
         bm25_top_k: 0,
         ..RetrievalConfig::default()
     };
@@ -201,34 +217,48 @@ async fn qdrant_complete_success_skips_local_dense_search() {
     .with_vector_search_resource(Arc::clone(&resource))
     .with_qdrant_search(&qdrant_config(qdrant_url));
     let mut source_filter = HashSet::new();
-    source_filter.insert(wanted_source.id.clone());
+    source_filter.insert(wanted_source_z.id.clone());
+    source_filter.insert(wanted_source_a.id.clone());
 
     let (results, debug) = pipeline
         .search_source_set_with_debug("alpha", Some(&source_filter))
         .await
         .unwrap();
 
-    assert_eq!(handle.join().unwrap(), "POST /collections/verbatim/points/search HTTP/1.1");
+    let (request_line, request_body) = handle.join().unwrap();
+    assert_eq!(request_line, "POST /collections/verbatim/points/search HTTP/1.1");
+    let request: serde_json::Value = serde_json::from_str(&request_body).unwrap();
+    assert_eq!(request["limit"], 2);
+    assert_eq!(request["filter"]["must"].as_array().unwrap().len(), 2);
+    assert_eq!(request["filter"]["must"][0]["key"], "profile_id");
+    assert_eq!(request["filter"]["must"][0]["match"]["value"], "default");
+    assert_eq!(request["filter"]["must"][1]["key"], "source_id");
+    assert_eq!(
+        request["filter"]["must"][1]["match"]["any"],
+        serde_json::json!(["src-qdrant-a-authorized", "src-qdrant-z-authorized"])
+    );
     assert_eq!(vector_index.search_count.load(Ordering::SeqCst), 0);
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].chunk_id, wanted_chunk.id);
-    assert_eq!(results[0].chunk.source_id, wanted_source.id);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].chunk_id, wanted_chunk_z.id);
+    assert_eq!(results[0].chunk.source_id, wanted_source_z.id);
+    assert_eq!(results[1].chunk_id, wanted_chunk_a.id);
+    assert_eq!(results[1].chunk.source_id, wanted_source_a.id);
     assert_eq!(debug.dense_vector_path, RetrievalDenseVectorPath::Qdrant);
     assert_eq!(
         debug
             .candidate_counters
             .requested_k(SpanKind::DenseRetrieval),
-        1
+        2
     );
     assert_eq!(
         debug
             .candidate_counters
             .returned_k(SpanKind::DenseRetrieval),
-        1
+        2
     );
-    assert_eq!(debug.candidate_counters.evaluated(), 1);
+    assert_eq!(debug.candidate_counters.evaluated(), 2);
     assert_eq!(debug.candidate_counters.filtered(), 1);
-    assert_eq!(debug.candidate_counters.hydrated(), 1);
+    assert_eq!(debug.candidate_counters.hydrated(), 2);
     assert!(debug.local_spans_ms.vector_queue_wait_ms.is_some());
     assert!(debug.local_spans_ms.vector_service_ms.is_some());
     assert_eq!(resource.snapshot().active, 0);

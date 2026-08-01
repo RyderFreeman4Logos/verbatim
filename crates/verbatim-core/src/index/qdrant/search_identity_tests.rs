@@ -6,14 +6,10 @@ async fn search_sends_filter_and_keeps_only_complete_matching_identity() {
     )]);
     let client = QdrantClient::new(qdrant_config(url));
     let alt_profile = EmbeddingProfileId::new("alt").unwrap();
+    let source_filter = HashSet::from([SourceId("src-1".into())]);
 
     let hits = client
-        .search(
-            &alt_profile,
-            &[0.3, 0.4],
-            7,
-            Some(&SourceId("src-1".into())),
-        )
+        .search(&alt_profile, &[0.3, 0.4], 7, Some(&source_filter))
         .await
         .unwrap();
 
@@ -44,6 +40,54 @@ async fn search_sends_filter_and_keeps_only_complete_matching_identity() {
         serde_json::json!(["chunk_id", "profile_generation", "profile_id", "source_id"])
     );
     assert_eq!(body["with_vector"], false);
+}
+
+#[tokio::test]
+async fn search_preserves_source_filter_shapes_and_sorts_multi_source_any() {
+    let (url, handle) = spawn_server(vec![
+        (200, r#"{"status":"ok","result":[]}"#),
+        (200, r#"{"status":"ok","result":[]}"#),
+        (200, r#"{"status":"ok","result":[]}"#),
+    ]);
+    let client = QdrantClient::new(qdrant_config(url));
+    let alt_profile = EmbeddingProfileId::new("alt").unwrap();
+    let empty_sources = HashSet::new();
+    let single_source = HashSet::from([SourceId("src-1".into())]);
+    let mut multiple_sources = HashSet::new();
+    multiple_sources.insert(SourceId("src-z".into()));
+    multiple_sources.insert(SourceId("src-a".into()));
+
+    assert!(client
+        .search(&alt_profile, &[0.3, 0.4], 7, Some(&empty_sources))
+        .await
+        .unwrap()
+        .is_empty());
+    client
+        .search(&alt_profile, &[0.3, 0.4], 7, None)
+        .await
+        .unwrap();
+    client
+        .search(&alt_profile, &[0.3, 0.4], 7, Some(&single_source))
+        .await
+        .unwrap();
+    client
+        .search(&alt_profile, &[0.3, 0.4], 7, Some(&multiple_sources))
+        .await
+        .unwrap();
+
+    let requests = handle.join().unwrap();
+    assert_eq!(
+        requests[0].body,
+        r#"{"vector":[0.3,0.4],"limit":7,"filter":{"must":[{"key":"profile_id","match":{"value":"alt"}}]},"with_payload":["chunk_id","profile_generation","profile_id","source_id"],"with_vector":false}"#
+    );
+    assert_eq!(
+        requests[1].body,
+        r#"{"vector":[0.3,0.4],"limit":7,"filter":{"must":[{"key":"profile_id","match":{"value":"alt"}},{"key":"source_id","match":{"value":"src-1"}}]},"with_payload":["chunk_id","profile_generation","profile_id","source_id"],"with_vector":false}"#
+    );
+    assert_eq!(
+        requests[2].body,
+        r#"{"vector":[0.3,0.4],"limit":7,"filter":{"must":[{"key":"profile_id","match":{"value":"alt"}},{"key":"source_id","match":{"any":["src-a","src-z"]}}]},"with_payload":["chunk_id","profile_generation","profile_id","source_id"],"with_vector":false}"#
+    );
 }
 
 #[test]

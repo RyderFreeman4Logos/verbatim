@@ -2653,6 +2653,22 @@ mod tests {
     }
 
     #[cfg(feature = "qdrant")]
+    fn spawn_qdrant_search_response_with_body(
+        status: u16,
+        body: &'static str,
+    ) -> (String, thread::JoinHandle<(String, String)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind qdrant search server");
+        let addr = listener.local_addr().expect("qdrant search server addr");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept qdrant search");
+            let request = read_qdrant_request(&mut stream);
+            write_http_response(&mut stream, status, body);
+            request
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[cfg(feature = "qdrant")]
     fn spawn_optional_qdrant_search_response(
         status: u16,
         body: &'static str,
@@ -2686,6 +2702,11 @@ mod tests {
 
     #[cfg(feature = "qdrant")]
     fn read_request_line(stream: &mut TcpStream) -> String {
+        read_qdrant_request(stream).0
+    }
+
+    #[cfg(feature = "qdrant")]
+    fn read_qdrant_request(stream: &mut TcpStream) -> (String, String) {
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 1024];
         loop {
@@ -2694,16 +2715,29 @@ mod tests {
                 break;
             }
             buffer.extend_from_slice(&chunk[..n]);
-            if String::from_utf8_lossy(&buffer).contains("\r\n\r\n") {
+            let text = String::from_utf8_lossy(&buffer);
+            let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                continue;
+            };
+            let content_len = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if body.len() >= content_len {
                 break;
             }
         }
-        String::from_utf8(buffer)
-            .expect("request utf8")
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string()
+        let text = String::from_utf8(buffer).expect("request utf8");
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        (
+            head.lines().next().unwrap_or_default().to_string(),
+            body.to_string(),
+        )
     }
 
     #[cfg(feature = "qdrant")]

@@ -1,5 +1,6 @@
 //! Optional Qdrant vector index integration.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -187,15 +188,15 @@ impl QdrantClient {
         profile_id: &EmbeddingProfileId,
         query: &[f32],
         top_k: usize,
-        source_filter: Option<&SourceId>,
+        source_filter: Option<&HashSet<SourceId>>,
     ) -> Result<Vec<QdrantHit>> {
-        if top_k == 0 || query.is_empty() {
+        if top_k == 0 || query.is_empty() || source_filter.is_some_and(HashSet::is_empty) {
             return Ok(Vec::new());
         }
         let body = QdrantSearchRequest {
             vector: query,
             limit: top_k,
-            filter: Some(profile_source_filter(profile_id, source_filter)),
+            filter: Some(profile_source_set_filter(profile_id, source_filter)),
             with_payload: ["chunk_id", "profile_generation", "profile_id", "source_id"],
             with_vector: false,
         };
@@ -460,12 +461,14 @@ struct QdrantFilter<'a> {
 struct QdrantFieldCondition<'a> {
     key: &'static str,
     #[serde(rename = "match")]
-    match_value: QdrantMatchValue<'a>,
+    match_value: QdrantMatch<'a>,
 }
 
 #[derive(Debug, Serialize)]
-struct QdrantMatchValue<'a> {
-    value: &'a str,
+#[serde(untagged)]
+enum QdrantMatch<'a> {
+    Value { value: &'a str },
+    Any { any: Vec<&'a str> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -484,7 +487,7 @@ fn source_id_filter(source_id: &SourceId) -> QdrantFilter<'_> {
     QdrantFilter {
         must: vec![QdrantFieldCondition {
             key: "source_id",
-            match_value: QdrantMatchValue {
+            match_value: QdrantMatch::Value {
                 value: &source_id.0,
             },
         }],
@@ -497,19 +500,49 @@ fn profile_source_filter<'a>(
 ) -> QdrantFilter<'a> {
     let mut must = vec![QdrantFieldCondition {
         key: "profile_id",
-        match_value: QdrantMatchValue {
+        match_value: QdrantMatch::Value {
             value: profile_id.as_str(),
         },
     }];
     if let Some(source_id) = source_id {
         must.push(QdrantFieldCondition {
             key: "source_id",
-            match_value: QdrantMatchValue {
+            match_value: QdrantMatch::Value {
                 value: &source_id.0,
             },
         });
     }
     QdrantFilter { must }
+}
+
+fn profile_source_set_filter<'a>(
+    profile_id: &'a EmbeddingProfileId,
+    source_ids: Option<&'a HashSet<SourceId>>,
+) -> QdrantFilter<'a> {
+    let mut filter = profile_source_filter(profile_id, None);
+    let Some(source_ids) = source_ids else {
+        return filter;
+    };
+    let Some(source_id) = source_ids.iter().next() else {
+        return filter;
+    };
+    let match_value = if source_ids.len() == 1 {
+        QdrantMatch::Value {
+            value: &source_id.0,
+        }
+    } else {
+        let mut any = source_ids
+            .iter()
+            .map(|source_id| source_id.0.as_str())
+            .collect::<Vec<_>>();
+        any.sort_unstable();
+        QdrantMatch::Any { any }
+    };
+    filter.must.push(QdrantFieldCondition {
+        key: "source_id",
+        match_value,
+    });
+    filter
 }
 
 fn hit_from_payload(
@@ -584,6 +617,7 @@ fn qdrant_transport_error(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;

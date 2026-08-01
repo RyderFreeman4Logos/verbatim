@@ -7,8 +7,6 @@
 
 use anyhow::{Context, Result};
 
-#[cfg(feature = "qdrant")]
-use super::single_source_filter;
 use super::RetrievalPipeline;
 use crate::resource::{ObservableResource, ResourcePermit};
 use crate::retrieval_telemetry::CandidateCounters;
@@ -64,11 +62,10 @@ impl RetrievalPipeline<'_> {
                     &default_profile_id
                 }
             };
-            let qdrant_source_filter = single_source_filter(source_filter);
             let profile_generation =
                 self.with_read_permit(|| self.store.index_generation_for_profile(profile_id))?;
             match qdrant
-                .search(profile_id, query_vec, top_k, qdrant_source_filter)
+                .search(profile_id, query_vec, top_k, source_filter)
                 .await
             {
                 Ok(results) => {
