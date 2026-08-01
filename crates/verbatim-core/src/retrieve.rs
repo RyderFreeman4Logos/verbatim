@@ -6,6 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 
 mod source_filter;
+mod vector_search_resource;
 
 use crate::config::{GraphConfig, QdrantConfig, RerankConfig, RetrievalConfig};
 #[cfg(feature = "qdrant")]
@@ -55,6 +56,7 @@ pub struct RetrievalPipeline<'a> {
     required_profile_id: Option<EmbeddingProfileId>,
     vector_residency: VectorIndexResidency,
     read_resource: Option<Arc<ObservableResource>>,
+    vector_search_resource: Option<Arc<ObservableResource>>,
     #[cfg(feature = "qdrant")]
     qdrant: Option<QdrantClient>,
 }
@@ -236,6 +238,7 @@ impl<'a> RetrievalPipeline<'a> {
             required_profile_id: None,
             vector_residency: VectorIndexResidency::ResidentHnsw,
             read_resource: None,
+            vector_search_resource: None,
             #[cfg(feature = "qdrant")]
             qdrant: None,
         }
@@ -263,6 +266,7 @@ impl<'a> RetrievalPipeline<'a> {
             required_profile_id: None,
             vector_residency: VectorIndexResidency::ResidentHnsw,
             read_resource: None,
+            vector_search_resource: None,
             #[cfg(feature = "qdrant")]
             qdrant: None,
         }
@@ -718,6 +722,7 @@ impl<'a> RetrievalPipeline<'a> {
         source_filter: Option<&HashSet<SourceId>>,
         candidate_counters: &mut CandidateCounters,
     ) -> Result<(Vec<(ChunkId, f32)>, RetrievalDenseVectorPath)> {
+        let _permit = self.acquire_vector_search_permit().await?;
         #[cfg(feature = "qdrant")]
         if let Some(qdrant) = &self.qdrant {
             let local_results =
@@ -2566,6 +2571,7 @@ mod tests {
     use std::sync::Mutex;
     #[cfg(feature = "qdrant")]
     use std::thread;
+    use std::time::Duration;
 
     use crate::index::hnsw::HnswIndex;
     use crate::index::sqlite_fts::SqliteFtsIndex;
@@ -4557,6 +4563,8 @@ mod tests {
         assert_eq!(debug.dense_hits[0].chunk_id, alpha.id);
         assert!(results.iter().any(|result| result.chunk_id == alpha.id));
     }
+
+    include!("retrieve/vector_search_resource_tests.rs");
 
     #[tokio::test]
     async fn requested_profile_without_vectors_fails_clearly_before_bm25_fallback() {

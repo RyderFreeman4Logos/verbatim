@@ -171,6 +171,7 @@ struct RuntimeConfigState {
 struct DaemonResources {
     sqlite_writer: Arc<ObservableResource>,
     sqlite_reader: Arc<ObservableResource>,
+    vector_search: Arc<ObservableResource>,
     cpu_worker: Arc<ObservableResource>,
     index_publish: Arc<ObservableResource>,
     qdrant_upsert: Arc<ObservableResource>,
@@ -1365,6 +1366,15 @@ fn daemon_resources(config: &DaemonResourceConfig) -> DaemonResources {
                 config.sqlite_reader_queue_timeout_seconds,
             ),
         ),
+        vector_search: registry.resource(
+            "vector_search",
+            "vector_search",
+            resource_limits(
+                config.vector_search_concurrency,
+                config.vector_search_queue_capacity,
+                config.vector_search_queue_timeout_seconds,
+            ),
+        ),
         cpu_worker: registry.resource(
             "cpu_worker",
             "cpu",
@@ -1406,6 +1416,11 @@ fn configure_daemon_resources(resources: &DaemonResources, config: &DaemonResour
         config.sqlite_reader_concurrency,
         config.sqlite_reader_queue_capacity,
         config.sqlite_reader_queue_timeout_seconds,
+    ));
+    resources.vector_search.configure(resource_limits(
+        config.vector_search_concurrency,
+        config.vector_search_queue_capacity,
+        config.vector_search_queue_timeout_seconds,
     ));
     resources.cpu_worker.configure(resource_limits(
         config.cpu_worker_concurrency,
@@ -1449,6 +1464,7 @@ fn daemon_resource_snapshots(state: &SharedState) -> Vec<ResourceQueueSnapshot> 
     let mut snapshots = vec![
         state.resources.sqlite_writer.snapshot(),
         state.resources.sqlite_reader.snapshot(),
+        state.resources.vector_search.snapshot(),
         state.resources.cpu_worker.snapshot(),
         state.resources.index_publish.snapshot(),
     ];
@@ -7365,6 +7381,7 @@ async fn prepare_retrieve_context(
     let embedding_profile_id = embedding_profile_id.clone();
     let controls = controls.clone();
     let sqlite_reader = Arc::clone(&state.resources.sqlite_reader);
+    let vector_search = Arc::clone(&state.resources.vector_search);
     let runtime = tokio::runtime::Handle::current();
     with_query_pipeline(&state, move |pipeline| {
         with_sqlite_reader_permit(&sqlite_reader, || {
@@ -7389,6 +7406,7 @@ async fn prepare_retrieve_context(
         .require_embedding_profile(&embedding_profile_id)
         .with_prefix_cache_bypass(controls.bypass_cache)
         .with_read_resource(Arc::clone(&sqlite_reader))
+        .with_vector_search_resource(vector_search)
         .with_qdrant_search(&controls.config.qdrant);
         let source_filter_ref = source_filter.as_ref();
         let debug_options = retrieve_debug_options(&controls);
@@ -7488,6 +7506,7 @@ async fn prepare_generation_context(
     let config = config.clone();
     let data_dir = state.data_dir.clone();
     let sqlite_reader = Arc::clone(&state.resources.sqlite_reader);
+    let vector_search = Arc::clone(&state.resources.vector_search);
     let runtime = tokio::runtime::Handle::current();
     let (results, generation_context, retrieval_debug) =
         with_query_pipeline(&state, move |pipeline| {
@@ -7512,6 +7531,7 @@ async fn prepare_generation_context(
             .with_vector_residency(config.vector_index.residency)
             .require_embedding_profile(&embedding_profile_id)
             .with_read_resource(Arc::clone(&sqlite_reader))
+            .with_vector_search_resource(vector_search)
             .with_qdrant_search(&config.qdrant);
             let source_filter_ref = source_filter.as_ref();
             let (mut results, mut retrieval_debug) = run_generation_retrieval(
@@ -10598,6 +10618,12 @@ mod tests {
             .find(|resource| resource.name == "sqlite_reader")
             .expect("sqlite reader resource is reported");
         assert!(reader.completed >= 1);
+        let vector_search = health
+            .resources
+            .iter()
+            .find(|resource| resource.name == "vector_search")
+            .expect("vector search resource is reported");
+        assert_eq!(vector_search.kind, "vector_search");
         drop(writer_permit);
     }
 

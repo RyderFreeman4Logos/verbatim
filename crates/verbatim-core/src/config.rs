@@ -1291,6 +1291,12 @@ pub struct DaemonResourceConfig {
     pub sqlite_reader_queue_capacity: usize,
     #[serde(default = "default_resource_queue_timeout_seconds")]
     pub sqlite_reader_queue_timeout_seconds: u64,
+    #[serde(default = "default_sqlite_reader_concurrency")]
+    pub vector_search_concurrency: usize,
+    #[serde(default = "default_sqlite_reader_queue_capacity")]
+    pub vector_search_queue_capacity: usize,
+    #[serde(default = "default_resource_queue_timeout_seconds")]
+    pub vector_search_queue_timeout_seconds: u64,
     #[serde(default = "default_cpu_worker_concurrency")]
     pub cpu_worker_concurrency: usize,
     #[serde(default = "default_cpu_worker_queue_capacity")]
@@ -1324,6 +1330,9 @@ impl Default for DaemonResourceConfig {
             sqlite_reader_concurrency: default_sqlite_reader_concurrency(),
             sqlite_reader_queue_capacity: default_sqlite_reader_queue_capacity(),
             sqlite_reader_queue_timeout_seconds: default_resource_queue_timeout_seconds(),
+            vector_search_concurrency: default_sqlite_reader_concurrency(),
+            vector_search_queue_capacity: default_sqlite_reader_queue_capacity(),
+            vector_search_queue_timeout_seconds: default_resource_queue_timeout_seconds(),
             cpu_worker_concurrency: default_cpu_worker_concurrency(),
             cpu_worker_queue_capacity: default_cpu_worker_queue_capacity(),
             cpu_worker_queue_timeout_seconds: default_resource_queue_timeout_seconds(),
@@ -1350,6 +1359,9 @@ impl DaemonResourceConfig {
             sqlite_reader_concurrency: self.sqlite_reader_concurrency.max(1),
             sqlite_reader_queue_capacity: self.sqlite_reader_queue_capacity.max(1),
             sqlite_reader_queue_timeout_seconds: self.sqlite_reader_queue_timeout_seconds.max(1),
+            vector_search_concurrency: self.vector_search_concurrency.max(1),
+            vector_search_queue_capacity: self.vector_search_queue_capacity.max(1),
+            vector_search_queue_timeout_seconds: self.vector_search_queue_timeout_seconds.max(1),
             cpu_worker_concurrency: self.cpu_worker_concurrency.max(1),
             cpu_worker_queue_capacity: self.cpu_worker_queue_capacity.max(1),
             cpu_worker_queue_timeout_seconds: self.cpu_worker_queue_timeout_seconds.max(1),
@@ -1889,6 +1901,18 @@ mod tests {
         assert_eq!(
             config.daemon.resources.memory_reservation_margin_percent,
             25
+        );
+        assert_eq!(
+            config.daemon.resources.vector_search_concurrency,
+            config.daemon.resources.sqlite_reader_concurrency
+        );
+        assert_eq!(
+            config.daemon.resources.vector_search_queue_capacity,
+            config.daemon.resources.sqlite_reader_queue_capacity
+        );
+        assert_eq!(
+            config.daemon.resources.vector_search_queue_timeout_seconds,
+            DEFAULT_RESOURCE_QUEUE_TIMEOUT_SECONDS
         );
         assert!(!config.daemon.idle_reclaim.enabled);
         assert_eq!(
