@@ -1,4 +1,6 @@
 //! Optional Qdrant vector index integration.
+//!
+//! Requires Qdrant server 1.1.0 or newer.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -18,6 +20,8 @@ use crate::upstream::{
     capture_full_response, capture_response_prefix, UpstreamFailureError, UpstreamRequestContext,
     DEFAULT_BODY_PREFIX_MAX_BYTES,
 };
+
+mod collection_preparation;
 
 const DISTANCE: &str = "Cosine";
 const MAX_QDRANT_TEXT_PREVIEW_CHARS: usize = 240;
@@ -213,13 +217,6 @@ impl QdrantClient {
             .into_iter()
             .filter_map(|point| hit_from_payload(point.id, point.payload, point.score))
             .collect())
-    }
-
-    async fn ensure_collection(&self, dimension: usize) -> Result<()> {
-        if self.collection_exists().await? {
-            return Ok(());
-        }
-        self.create_collection(dimension).await
     }
 
     async fn collection_exists(&self) -> Result<bool> {
@@ -739,46 +736,7 @@ mod tests {
         assert_eq!(first.as_bytes()[14], b'5');
     }
 
-    #[tokio::test]
-    async fn upsert_records_creates_collection_and_sends_payload() {
-        let (url, handle) = spawn_server(vec![
-            (404, r#"{"status":{"error":"missing"},"result":null}"#),
-            (200, r#"{"status":"ok","result":true}"#),
-            (
-                200,
-                r#"{"status":"ok","result":{"status":"acknowledged","operation_id":1}}"#,
-            ),
-        ]);
-        let client = QdrantClient::new(qdrant_config(url));
-
-        client
-            .upsert_records(&[record("src-1", "src-1-child-0", vec![0.1, 0.2])])
-            .await
-            .unwrap();
-
-        let requests = handle.join().unwrap();
-        assert_eq!(requests[0].line, "GET /collections/verbatim HTTP/1.1");
-        assert_eq!(requests[1].line, "PUT /collections/verbatim HTTP/1.1");
-        let create: Value = serde_json::from_str(&requests[1].body).unwrap();
-        assert_eq!(create["vectors"]["size"], 2);
-        assert_eq!(create["vectors"]["distance"], "Cosine");
-        assert_eq!(
-            requests[2].line,
-            "PUT /collections/verbatim/points?wait=true HTTP/1.1"
-        );
-        let upsert: Value = serde_json::from_str(&requests[2].body).unwrap();
-        assert_eq!(upsert["points"][0]["payload"]["profile_id"], "default");
-        assert_eq!(upsert["points"][0]["payload"]["profile_generation"], 7);
-        assert_eq!(upsert["points"][0]["payload"]["chunk_id"], "src-1-child-0");
-        assert_eq!(upsert["points"][0]["payload"]["source_id"], "src-1");
-        assert_eq!(upsert["points"][0]["payload"]["heading_path"][0], "Intro");
-        assert_eq!(
-            upsert["points"][0]["payload"]["text_preview"],
-            "preview text"
-        );
-        assert_ne!(upsert["points"][0]["id"], "src-1-child-0");
-    }
-
+    include!("qdrant/collection_preparation_tests.rs");
     include!("qdrant/search_identity_tests.rs");
 
     #[tokio::test]
