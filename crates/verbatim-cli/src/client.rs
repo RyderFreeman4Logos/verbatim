@@ -332,17 +332,11 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn get_source(&self, id: &str) -> CliResult<SourceResponse> {
-        let segment = encode_source_id_segment(id);
-        self.request_json::<SourceResponse, ()>(
-            Method::GET,
-            &format!("/api/sources/{segment}"),
-            None,
-        )
+        self.request_json::<SourceResponse, ()>(Method::GET, &format!("/api/sources/{id}"), None)
     }
 
     fn remove_source(&self, id: &str) -> CliResult<()> {
-        let segment = encode_source_id_segment(id);
-        let url = self.url(&format!("/api/sources/{segment}"))?;
+        let url = self.url(&format!("/api/sources/{id}"))?;
         let response = self
             .apply_timeout(
                 auth::authorize_request(self.client.delete(&url), &url, self.auth_token.as_deref()),
@@ -357,11 +351,11 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn relocate_source(&self, id: &str, new_path: &str) -> CliResult<SourceResponse> {
-        let segment = encode_source_id_segment(id);
         self.request_json(
             Method::POST,
-            &format!("/api/sources/{segment}/relocate"),
+            "/api/source-relocations",
             Some(&RelocateSourceRequest {
+                source_id: id.to_string(),
                 new_path: new_path.to_string(),
             }),
         )
@@ -734,7 +728,7 @@ fn is_long_running_mutation(method: &Method, path: &str) -> bool {
     if method == Method::POST {
         return path == "/api/sources"
             || path == "/api/sources/check"
-            || (path.starts_with("/api/sources/") && path.ends_with("/relocate"))
+            || path == "/api/source-relocations"
             || path == "/api/ingest"
             || path.starts_with("/api/ingest?")
             || path.starts_with("/api/ingest/")
@@ -836,10 +830,6 @@ fn encode_query_component(value: &str) -> String {
         }
     }
     encoded
-}
-
-fn encode_source_id_segment(value: &str) -> String {
-    format!("~{}", encode_query_component(value))
 }
 
 fn decode_response<T>(response: reqwest::blocking::Response) -> CliResult<T>
@@ -1009,7 +999,7 @@ mod tests {
             RequestTimeoutPolicy::LongRunning
         );
         assert_eq!(
-            json_timeout_policy(&Method::POST, "/api/sources/src-1/relocate"),
+            json_timeout_policy(&Method::POST, "/api/source-relocations"),
             RequestTimeoutPolicy::LongRunning
         );
         assert_eq!(
@@ -1630,7 +1620,7 @@ mod tests {
         assert!(!message.contains("Internal Server Error"));
         assert!(server
             .request()
-            .starts_with("DELETE /api/sources/~__missing_source_smoke_retest__ HTTP/1.1"));
+            .starts_with("DELETE /api/sources/__missing_source_smoke_retest__ HTTP/1.1"));
     }
 
     #[test]

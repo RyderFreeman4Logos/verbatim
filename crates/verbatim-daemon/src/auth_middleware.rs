@@ -166,11 +166,11 @@ pub(super) fn endpoint_required_role(method: &Method, path: &str) -> Option<Role
             Some(Role::Reader)
         }
         (&Method::POST, "/api/sources")
+        | (&Method::POST, "/api/source-relocations")
         | (&Method::POST, "/api/reindex")
         | (&Method::POST, "/api/collections") => Some(Role::Editor),
         (&Method::POST, path)
-            if (path.starts_with("/api/sources/") && path.ends_with("/relocate"))
-                || path.starts_with("/api/ingest")
+            if path.starts_with("/api/ingest")
                 || path.starts_with("/api/collections/")
                 || path.starts_with("/api/tasks/") =>
         {
@@ -439,7 +439,7 @@ mod tests {
             Some(Role::Editor)
         );
         assert_eq!(
-            endpoint_required_role(&Method::POST, "/api/sources/source-1/relocate"),
+            endpoint_required_role(&Method::POST, "/api/source-relocations"),
             Some(Role::Editor)
         );
         assert_eq!(

@@ -2222,10 +2222,8 @@ async fn list_sources(
 
 async fn get_source(
     State(state): State<SharedState>,
-    Path(segment): Path<String>,
+    Path(id): Path<String>,
 ) -> Result<Json<SourceResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let id = decode_source_id_path_segment(&segment)
-        .map_err(|error| err(StatusCode::BAD_REQUEST, error))?;
     let id_clone = id.clone();
     let current_ocr_profile = runtime_config_snapshot(&state)
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
@@ -2283,13 +2281,6 @@ fn source_remove_error(source_id: &str, error: anyhow::Error) -> (StatusCode, Js
         StatusCode::INTERNAL_SERVER_ERROR
     };
     err(status, error)
-}
-
-fn decode_source_id_path_segment(segment: &str) -> Result<String> {
-    segment
-        .strip_prefix('~')
-        .map(ToOwned::to_owned)
-        .context("source id path segment must start with '~'")
 }
 
 fn is_source_not_found_error(source_id: &str, error: &anyhow::Error) -> bool {
@@ -13151,7 +13142,7 @@ mod tests {
 
         let (status, Json(body)) = delete_source(
             State(state),
-            Path("~__missing_source_smoke_retest__".to_string()),
+            Path("__missing_source_smoke_retest__".to_string()),
         )
         .await
         .unwrap_err();
@@ -13204,7 +13195,7 @@ mod tests {
         let source_id = pipeline.add_source(&source_path).unwrap();
         let state = test_state(config, test_dir.path(), pipeline);
 
-        let response = delete_source(State(Arc::clone(&state)), Path(format!("~{}", source_id.0)))
+        let response = delete_source(State(Arc::clone(&state)), Path(source_id.0.clone()))
             .await
             .unwrap();
 
@@ -13234,11 +13225,7 @@ mod tests {
         let delete_state = Arc::clone(&state);
         let delete_source_id = source_id.clone();
         let delete_task = tokio::spawn(async move {
-            delete_source(
-                State(delete_state),
-                Path(format!("~{}", delete_source_id.0)),
-            )
-            .await
+            delete_source(State(delete_state), Path(delete_source_id.0)).await
         });
 
         let deadline = Instant::now() + Duration::from_secs(1);

@@ -2,7 +2,9 @@ use axum::body::{to_bytes, Body};
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::{header, Method, Request, StatusCode};
 use tower::ServiceExt;
-use verbatim_core::api::{EvidenceResponse, RetrieveRequest, RetrieveResponse, SourceResponse};
+use verbatim_core::api::{
+    ErrorResponse, EvidenceResponse, RetrieveRequest, RetrieveResponse, SourceResponse,
+};
 
 use super::*;
 
@@ -52,7 +54,50 @@ fn issue_332_retrieve_request(source_id: &SourceId) -> RetrieveRequest {
 }
 
 #[tokio::test]
-async fn issue_332_source_routes_decode_the_shared_opaque_segment_protocol() {
+async fn issue_332_existing_source_routes_keep_raw_id_semantics() {
+    let test_dir = TestDir::new("issue-332-route-raw-source-id");
+    let source_path = test_dir.path().join("legacy.md");
+    fs::write(&source_path, "legacy route source").unwrap();
+    let source_id = SourceId("legacy-source-id".into());
+    let config = retrieve_test_config("http://127.0.0.1:9/v1");
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    pipeline
+        .store()
+        .add_source(&verbatim_core::types::Source {
+            id: source_id.clone(),
+            path: fs::canonicalize(&source_path).unwrap(),
+            hash: "legacy-hash".into(),
+            status: SourceStatus::Pending,
+            parser_used: None,
+            last_ingested_at: None,
+        })
+        .unwrap();
+    let state = test_state(config, test_dir.path(), pipeline);
+    let app = daemon_router(Arc::clone(&state));
+
+    let response = issue_332_request(
+        &app,
+        Method::GET,
+        "/api/sources/legacy-source-id",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let source: SourceResponse = issue_332_body(response).await;
+    assert_eq!(source.id, source_id.0);
+
+    let response = issue_332_request(
+        &app,
+        Method::DELETE,
+        "/api/sources/legacy-source-id",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn issue_332_relocation_accepts_opaque_source_id_in_json_body() {
     let test_dir = TestDir::new("issue-332-route-opaque-source-id");
     let source_path = test_dir.path().join("opaque.md");
     fs::write(&source_path, "opaque route source").unwrap();
@@ -71,39 +116,41 @@ async fn issue_332_source_routes_decode_the_shared_opaque_segment_protocol() {
         })
         .unwrap();
     let state = test_state(config, test_dir.path(), pipeline);
-    let app = daemon_router(Arc::clone(&state));
-    let segment = "~._.._%25%E9%9B%AA%2F%3F%23~prefixed";
-
-    let response = issue_332_request(
-        &app,
-        Method::GET,
-        &format!("/api/sources/{segment}"),
-        serde_json::Value::Null,
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let source: SourceResponse = issue_332_body(response).await;
-    assert_eq!(source.id, source_id.0);
+    let app = daemon_router(state);
 
     let response = issue_332_request(
         &app,
         Method::POST,
-        &format!("/api/sources/{segment}/relocate"),
-        serde_json::json!({ "new_path": test_dir.path().join("unused.md") }),
+        "/api/source-relocations",
+        serde_json::json!({
+            "source_id": source_id.0,
+            "new_path": test_dir.path().join("unused.md"),
+        }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let error: serde_json::Value = issue_332_body(response).await;
-    assert!(error["error"].as_str().unwrap().contains("not indexed"));
 
-    let response = issue_332_request(
-        &app,
-        Method::DELETE,
-        &format!("/api/sources/{segment}"),
-        serde_json::Value::Null,
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: ErrorResponse = issue_332_body(response).await;
+    assert!(error.error.contains("not indexed"));
+}
+
+#[tokio::test]
+async fn issue_332_relocation_json_rejections_use_bad_request_error_response() {
+    let test_dir = TestDir::new("issue-332-route-json-rejection");
+    let config = retrieve_test_config("http://127.0.0.1:9/v1");
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let app = daemon_router(test_state(config, test_dir.path(), pipeline));
+
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({ "source_id": 7, "new_path": false }),
+    ] {
+        let response = issue_332_request(&app, Method::POST, "/api/source-relocations", body).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: ErrorResponse = issue_332_body(response).await;
+        assert!(!error.error.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -134,8 +181,8 @@ async fn issue_332_public_relocation_preserves_retrieval_and_citation_resolution
     let response = issue_332_request(
         &app,
         Method::POST,
-        &format!("/api/sources/~{}/relocate", source_id.0),
-        serde_json::json!({ "new_path": new_path }),
+        "/api/source-relocations",
+        serde_json::json!({ "source_id": source_id.0, "new_path": new_path }),
     )
     .await;
 
@@ -197,8 +244,8 @@ async fn issue_332_public_relocation_changed_bytes_preserves_catalog_snapshot() 
     let response = issue_332_request(
         &app,
         Method::POST,
-        &format!("/api/sources/~{}/relocate", source_id.0),
-        serde_json::json!({ "new_path": new_path }),
+        "/api/source-relocations",
+        serde_json::json!({ "source_id": source_id.0, "new_path": new_path }),
     )
     .await;
 
@@ -239,8 +286,11 @@ async fn issue_332_long_missing_source_id_returns_not_found() {
     let response = issue_332_request(
         &app,
         Method::POST,
-        &format!("/api/sources/~{source_id}/relocate"),
-        serde_json::json!({ "new_path": test_dir.path().join("missing.md") }),
+        "/api/source-relocations",
+        serde_json::json!({
+            "source_id": source_id,
+            "new_path": test_dir.path().join("missing.md"),
+        }),
     )
     .await;
 
@@ -285,8 +335,8 @@ async fn issue_332_public_relocation_sqlite_failpoint_returns_internal_server_er
     let response = issue_332_request(
         &app,
         Method::POST,
-        &format!("/api/sources/~{}/relocate", source_id.0),
-        serde_json::json!({ "new_path": new_path }),
+        "/api/source-relocations",
+        serde_json::json!({ "source_id": source_id.0, "new_path": new_path }),
     )
     .await;
 
@@ -296,6 +346,60 @@ async fn issue_332_public_relocation_sqlite_failpoint_returns_internal_server_er
         .as_str()
         .unwrap()
         .contains("issue-332 route relocation failpoint"));
+    let pipeline = state.pipeline.lock().unwrap();
+    let pipeline = pipeline.as_ref().unwrap();
+    let source_after = pipeline.store().get_source(&source_id).unwrap().unwrap();
+    let evidence_after = pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(source_after).unwrap(),
+        serde_json::to_value(source_before).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(evidence_after).unwrap(),
+        serde_json::to_value(evidence_before).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn issue_332_public_relocation_begin_immediate_contention_returns_unavailable() {
+    let model_server = MockModelServer::start(3).await;
+    let test_dir = TestDir::new("issue-332-route-sqlite-contention");
+    let old_path = test_dir.path().join("before.md");
+    let new_path = test_dir.path().join("after.md");
+    fs::write(&old_path, "The relocation writer must report contention.").unwrap();
+    let mut config = retrieve_test_config(&model_server.base_url);
+    config.store.durability = verbatim_core::store::SqliteDurabilityProfile::Ephemeral;
+    let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let source_id = pipeline.add_source(&old_path).unwrap();
+    pipeline.ingest_source(&source_id).await.unwrap();
+    let source_before = pipeline.store().get_source(&source_id).unwrap().unwrap();
+    let evidence_before = pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap();
+    let state = test_state(config, test_dir.path(), pipeline);
+    fs::rename(&old_path, &new_path).unwrap();
+    let app = daemon_router(Arc::clone(&state));
+    let blocker = rusqlite::Connection::open(test_dir.path().join("verbatim.db")).unwrap();
+    blocker
+        .execute_batch("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE;")
+        .unwrap();
+
+    let response = issue_332_request(
+        &app,
+        Method::POST,
+        "/api/source-relocations",
+        serde_json::json!({ "source_id": source_id.0, "new_path": new_path }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let error: ErrorResponse = issue_332_body(response).await;
+    assert!(error.error.contains("database is locked"));
+    blocker.execute_batch("ROLLBACK;").unwrap();
     let pipeline = state.pipeline.lock().unwrap();
     let pipeline = pipeline.as_ref().unwrap();
     let source_after = pipeline.store().get_source(&source_id).unwrap().unwrap();

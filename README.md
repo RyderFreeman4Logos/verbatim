@@ -326,7 +326,7 @@ verbatim task wait --help
 The high-level command shape is:
 
 ```sh
-verbatim source {add|list|inspect|remove|check}
+verbatim source {add|list|inspect|relocate|remove|check}
 verbatim collection {create|add-root|list|get|delete|sync|status}
 verbatim ingest [source-id] [--force] [--background]
 verbatim reindex {--source-id <id>|--all|--stale|--force|--vectors-only}

@@ -1,6 +1,7 @@
 //! Daemon boundary for explicit, identity-preserving source relocation.
 
 use super::*;
+use axum::extract::rejection::JsonRejection;
 use verbatim_core::api::RelocateSourceRequest;
 use verbatim_core::resource::ResourceQueueError;
 use verbatim_core::store::{
@@ -11,12 +12,10 @@ use verbatim_core::types::Source;
 
 pub(super) async fn relocate_source(
     State(state): State<SharedState>,
-    Path(segment): Path<String>,
-    Json(request): Json<RelocateSourceRequest>,
+    request: Result<Json<RelocateSourceRequest>, JsonRejection>,
 ) -> Result<Json<SourceResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let id = decode_source_id_path_segment(&segment)
-        .map_err(|error| err(StatusCode::BAD_REQUEST, error))?;
-    let source_id = SourceId(id.clone());
+    let Json(request) = request.map_err(relocation_json_rejection)?;
+    let source_id = SourceId(request.source_id);
     let new_path = PathBuf::from(request.new_path);
     let source = with_exclusive_pipeline(&state, move |pipeline| {
         Ok(pipeline.relocate_source(&source_id, &new_path))
@@ -26,6 +25,18 @@ pub(super) async fn relocate_source(
     .map_err(relocation_operation_error)?;
 
     Ok(Json(catalog_source_response(source)))
+}
+
+fn relocation_json_rejection(rejection: JsonRejection) -> (StatusCode, Json<ErrorResponse>) {
+    let status = if matches!(
+        &rejection,
+        JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_)
+    ) {
+        StatusCode::BAD_REQUEST
+    } else {
+        rejection.status()
+    };
+    err(status, anyhow::anyhow!(rejection.body_text()))
 }
 
 fn relocation_operation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
@@ -64,23 +75,6 @@ fn catalog_source_response(source: Source) -> SourceResponse {
 mod tests {
     use super::*;
     use verbatim_core::store::SqliteDurabilityError;
-
-    #[test]
-    fn issue_332_source_id_path_decoder_strips_exactly_one_prefix() {
-        for (segment, expected) in [
-            ("~.", "."),
-            ("~..", ".."),
-            ("~%", "%"),
-            ("~雪", "雪"),
-            ("~/", "/"),
-            ("~?", "?"),
-            ("~#", "#"),
-            ("~~prefixed", "~prefixed"),
-        ] {
-            assert_eq!(decode_source_id_path_segment(segment).unwrap(), expected);
-        }
-        assert!(decode_source_id_path_segment("unframed").is_err());
-    }
 
     #[test]
     fn issue_332_inner_writer_queue_failures_are_service_unavailable() {

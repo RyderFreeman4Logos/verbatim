@@ -161,6 +161,7 @@ pub struct AddSourceResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelocateSourceRequest {
+    pub source_id: String,
     pub new_path: String,
 }
 

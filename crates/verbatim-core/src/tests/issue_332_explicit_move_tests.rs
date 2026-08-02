@@ -759,3 +759,5 @@ async fn issue_332_source_path_uniqueness_fails_closed() {
         .unwrap()
         .is_empty());
 }
+
+include!("issue_332_fanout_repair_tests.rs");

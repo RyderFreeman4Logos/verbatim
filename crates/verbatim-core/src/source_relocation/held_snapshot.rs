@@ -1,6 +1,8 @@
+use std::ffi::CString;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -40,7 +42,7 @@ impl HeldInputSnapshot {
     }
 
     pub(super) fn validate_path_binding(&self, path: &Path) -> Result<()> {
-        let entry = open_relocation_target(path)?;
+        let entry = open_canonical_target_without_links(path)?;
         let held_metadata = self.file.metadata().map_err(|error| {
             relocation_target_io_error("inspect held relocation target", path, error)
         })?;
@@ -58,6 +60,39 @@ impl HeldInputSnapshot {
         }
         Ok(())
     }
+}
+
+fn open_canonical_target_without_links(path: &Path) -> Result<fs::File> {
+    let path_bytes = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| validation_message("relocation target contains an interior NUL byte"))?;
+    // SAFETY: `open_how` contains only integer fields and the kernel requires
+    // every field not explicitly set by the caller to be zero.
+    let mut how = unsafe { std::mem::zeroed::<libc::open_how>() };
+    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+    // SAFETY: `path_bytes` is NUL-terminated, `how` is initialized, and both
+    // pointers remain valid for the duration of the `openat2` syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            path_bytes.as_ptr(),
+            &how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if result < 0 {
+        return Err(relocation_target_io_error(
+            "open canonical relocation target without links",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let fd = RawFd::try_from(result).map_err(|_| {
+        validation_message("openat2 returned an invalid relocation target descriptor")
+    })?;
+    // SAFETY: a successful `openat2` returns one newly owned file descriptor.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
 pub(super) fn open_relocation_target(path: &Path) -> Result<fs::File> {

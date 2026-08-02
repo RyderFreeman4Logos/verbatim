@@ -12,7 +12,7 @@ async fn delete_source_returns_accepted_when_remote_erasure_is_pending() {
 
     let response = delete_source(
         State(Arc::clone(&state)),
-        Path(format!("~{}", source_id.0)),
+        Path(source_id.0.clone()),
     )
     .await
     .unwrap();
@@ -44,7 +44,7 @@ async fn delete_source_with_disabled_qdrant_persists_terminal_receipt_and_return
 
     let response = delete_source(
         State(Arc::clone(&state)),
-        Path(format!("~{}", source_id.0)),
+        Path(source_id.0.clone()),
     )
     .await
     .unwrap();

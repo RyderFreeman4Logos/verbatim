@@ -12,10 +12,8 @@ pub(super) const DELETION_RECONCILE_INTERVAL: Duration = if cfg!(test) {
 
 pub(super) async fn delete_source(
     State(state): State<SharedState>,
-    Path(segment): Path<String>,
+    Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
-    let id = decode_source_id_path_segment(&segment)
-        .map_err(|error| err(StatusCode::BAD_REQUEST, error))?;
     let state = Arc::clone(&state);
     let runtime = tokio::runtime::Handle::current();
     let source_id = SourceId(id.clone());

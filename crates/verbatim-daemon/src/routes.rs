@@ -26,7 +26,7 @@ const PATH_HEALTH: &str = "/api/health";
 const PATH_CONFIG: &str = "/api/config";
 const PATH_SOURCES: &str = "/api/sources";
 const PATH_SOURCE_BY_ID: &str = "/api/sources/{id}";
-const PATH_SOURCE_RELOCATE: &str = "/api/sources/{id}/relocate";
+const PATH_SOURCE_RELOCATIONS: &str = "/api/source-relocations";
 const PATH_DELETION_REPORTS: &str = "/api/deletions/reports";
 const PATH_SOURCES_CHECK: &str = "/api/sources/check";
 // Collection paths come from the core API contract; keep local aliases so the
@@ -74,7 +74,7 @@ pub(crate) const ROUTE_PATH_TEMPLATES: &[&str] = &[
     PATH_SOURCES,
     PATH_SOURCE_BY_ID,
     PATH_SOURCE_BY_ID,
-    PATH_SOURCE_RELOCATE,
+    PATH_SOURCE_RELOCATIONS,
     PATH_DELETION_REPORTS,
     PATH_SOURCES_CHECK,
     PATH_COLLECTIONS,
@@ -150,7 +150,7 @@ pub(crate) fn build_router(state: SharedState) -> Router {
         .route(PATH_SOURCES, get(super::list_sources))
         .route(PATH_SOURCE_BY_ID, get(super::get_source))
         .route(PATH_SOURCE_BY_ID, delete(super::delete_source))
-        .route(PATH_SOURCE_RELOCATE, post(super::relocate_source))
+        .route(PATH_SOURCE_RELOCATIONS, post(super::relocate_source))
         .route(PATH_DELETION_REPORTS, get(super::list_deletion_reports))
         .route(PATH_SOURCES_CHECK, post(super::check_stale))
         .route(PATH_COLLECTIONS, post(super::create_collection))
@@ -322,7 +322,7 @@ mod tests {
                 PATH_SOURCES,
                 PATH_SOURCE_BY_ID,
                 PATH_SOURCE_BY_ID,
-                PATH_SOURCE_RELOCATE,
+                PATH_SOURCE_RELOCATIONS,
                 PATH_DELETION_REPORTS,
                 PATH_SOURCES_CHECK,
                 PATH_COLLECTIONS,

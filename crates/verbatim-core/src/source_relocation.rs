@@ -27,9 +27,12 @@ use crate::types::{
     SourceLocator, SourceStatus,
 };
 
+#[path = "source_relocation/collection_boundary.rs"]
+mod collection_boundary;
 #[path = "source_relocation/held_snapshot.rs"]
 mod held_snapshot;
 
+use collection_boundary::collection_covering_path;
 use held_snapshot::{open_relocation_target, relocation_target_io_error, HeldInputSnapshot};
 
 /// Stable daemon-facing classification for expected source relocation failures.
@@ -116,12 +119,20 @@ where
                 }
             }
 
-            let parser = parser::parser_for_extension(&canonical_path).map_err(validation_error)?;
-            if parser.name() != parser_used {
+            let parser = parser::select_parser(parser_used).map_err(validation_error)?;
+            let extension = canonical_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default();
+            if !parser
+                .supported_extensions()
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(extension))
+            {
                 return Err(validation_message(format!(
-                    "relocation parser changed from {} to {}",
+                    "recorded relocation parser {} does not support extension .{}",
                     bounded_text(parser_used),
-                    bounded_text(parser.name())
+                    bounded_text(extension)
                 )));
             }
             if target.identity.content_sha256 != source.hash {
@@ -320,6 +331,13 @@ impl Store {
                     "source {} belongs to collection {}",
                     bounded_text(&expected_source.id.0),
                     bounded_text(&collection)
+                )));
+            }
+            if let Some(collection) = collection_covering_path(&tx, new_path)? {
+                return Err(validation_message(format!(
+                    "relocation target is covered by collection root for {}: {}",
+                    bounded_text(&collection),
+                    bounded_path(new_path)
                 )));
             }
             let actual_evidence = direct_text_evidence_tx(&tx, &expected_source.id)?;
