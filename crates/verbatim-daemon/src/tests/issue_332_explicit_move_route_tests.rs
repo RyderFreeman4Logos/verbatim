@@ -171,3 +171,64 @@ async fn issue_332_public_relocation_changed_bytes_preserves_catalog_snapshot() 
         serde_json::to_value(evidence_before).unwrap()
     );
 }
+
+#[tokio::test]
+async fn issue_332_public_relocation_sqlite_failpoint_returns_internal_server_error() {
+    let model_server = MockModelServer::start(3).await;
+    let test_dir = TestDir::new("issue-332-route-sqlite-failpoint");
+    let old_path = test_dir.path().join("before.md");
+    let new_path = test_dir.path().join("after.md");
+    fs::write(&old_path, "The relocation transaction must roll back.").unwrap();
+    let config = retrieve_test_config(&model_server.base_url);
+    let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let source_id = pipeline.add_source(&old_path).unwrap();
+    pipeline.ingest_source(&source_id).await.unwrap();
+    let source_before = pipeline.store().get_source(&source_id).unwrap().unwrap();
+    let evidence_before = pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap();
+    rusqlite::Connection::open(test_dir.path().join("verbatim.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER issue_332_route_relocation_failpoint
+             BEFORE UPDATE OF locator_json ON chunk_evidence_spans
+             BEGIN
+                 SELECT RAISE(ABORT, 'issue-332 route relocation failpoint');
+             END;",
+        )
+        .unwrap();
+    let state = test_state(config, test_dir.path(), pipeline);
+    fs::rename(&old_path, &new_path).unwrap();
+    let app = daemon_router(Arc::clone(&state));
+
+    let response = issue_332_request(
+        &app,
+        Method::POST,
+        &format!("/api/sources/{}/relocate", source_id.0),
+        serde_json::json!({ "new_path": new_path }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error: serde_json::Value = issue_332_body(response).await;
+    assert!(error["error"]
+        .as_str()
+        .unwrap()
+        .contains("issue-332 route relocation failpoint"));
+    let pipeline = state.pipeline.lock().unwrap();
+    let pipeline = pipeline.as_ref().unwrap();
+    let source_after = pipeline.store().get_source(&source_id).unwrap().unwrap();
+    let evidence_after = pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(source_after).unwrap(),
+        serde_json::to_value(source_before).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(evidence_after).unwrap(),
+        serde_json::to_value(evidence_before).unwrap()
+    );
+}

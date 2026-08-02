@@ -448,6 +448,14 @@ fn map_sqlite_error(operation: SqliteWriteOperation, error: SqliteError) -> anyh
     map_storage_error(operation, error.into())
 }
 
+/// Return whether an error chain contains a typed durability or raw SQLite failure.
+pub fn is_sqlite_storage_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<SqliteDurabilityError>().is_some()
+            || cause.downcast_ref::<SqliteError>().is_some()
+    })
+}
+
 /// Translate SQLite `SQLITE_FULL` and filesystem `ENOSPC` errors found in an
 /// error chain into the stable disk-full failure used by task/API boundaries.
 pub fn map_storage_error(operation: SqliteWriteOperation, error: anyhow::Error) -> anyhow::Error {

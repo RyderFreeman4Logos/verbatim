@@ -351,9 +351,10 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn relocate_source(&self, id: &str, new_path: &str) -> CliResult<SourceResponse> {
+        let encoded_id = encode_query_component(id);
         self.request_json(
             Method::POST,
-            &format!("/api/sources/{id}/relocate"),
+            &format!("/api/sources/{encoded_id}/relocate"),
             Some(&RelocateSourceRequest {
                 new_path: new_path.to_string(),
             }),
@@ -1108,20 +1109,22 @@ mod tests {
     }
 
     #[test]
-    fn issue_332_http_relocate_posts_daemon_path_and_decodes_source() {
+    fn issue_332_http_relocate_encodes_opaque_source_id_as_one_path_segment() {
         let server = TestServer::respond_once(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"src-1\",\"path\":\"/srv/verbatim/renamed.md\",\"status\":\"Indexed\",\"hash\":\"hash-1\",\"parser_used\":\"markdown\",\"last_ingested_at\":\"now\"}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"opaque?query#fragment/segment\",\"path\":\"/srv/verbatim/renamed.md\",\"status\":\"Indexed\",\"hash\":\"hash-1\",\"parser_used\":\"markdown\",\"last_ingested_at\":\"now\"}",
         );
         let client = HttpDaemonClient::with_base_url(server.base_url());
 
         let source = client
-            .relocate_source("src-1", "/srv/verbatim/renamed.md")
+            .relocate_source("opaque?query#fragment/segment", "/srv/verbatim/renamed.md")
             .unwrap();
 
-        assert_eq!(source.id, "src-1");
+        assert_eq!(source.id, "opaque?query#fragment/segment");
         assert_eq!(source.path, "/srv/verbatim/renamed.md");
         let request = server.request();
-        assert!(request.starts_with("POST /api/sources/src-1/relocate HTTP/1.1"));
+        assert!(request.starts_with(
+            "POST /api/sources/opaque%3Fquery%23fragment%2Fsegment/relocate HTTP/1.1"
+        ));
         assert!(request.contains("\"new_path\":\"/srv/verbatim/renamed.md\""));
     }
 

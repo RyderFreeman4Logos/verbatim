@@ -62,8 +62,8 @@ mod sqlite_durability;
 #[path = "store_durability.rs"]
 mod store_durability;
 pub use sqlite_durability::{
-    map_storage_error, SqliteCheckpointMode, SqliteCheckpointStatus, SqliteDiskSpaceStatus,
-    SqliteDurabilityError, SqliteDurabilityProfile, SqliteDurabilityStatus,
+    is_sqlite_storage_error, map_storage_error, SqliteCheckpointMode, SqliteCheckpointStatus,
+    SqliteDiskSpaceStatus, SqliteDurabilityError, SqliteDurabilityProfile, SqliteDurabilityStatus,
     SqliteEffectiveDurability, SqliteWriteOperation,
 };
 
