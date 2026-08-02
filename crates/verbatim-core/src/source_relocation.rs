@@ -526,6 +526,10 @@ fn path_entry_is_missing(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(false),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => Err(validation_error(
+            anyhow::Error::new(error)
+                .context(format!("check source path entry: {}", bounded_path(path))),
+        )),
         Err(error) => {
             Err(error).with_context(|| format!("check source path entry: {}", bounded_path(path)))
         }

@@ -164,6 +164,10 @@ fn io_failure_is_target_change(error: &std::io::Error) -> bool {
     error.kind() == ErrorKind::NotFound
         || matches!(
             error.raw_os_error(),
-            Some(code) if code == libc::ENXIO || code == libc::ELOOP || code == libc::EISDIR
+            Some(code)
+                if code == libc::ENXIO
+                    || code == libc::ELOOP
+                    || code == libc::EISDIR
+                    || code == libc::ENOTDIR
         )
 }

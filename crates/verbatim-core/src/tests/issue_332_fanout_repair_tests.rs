@@ -69,6 +69,56 @@ async fn issue_332_relocation_rejects_commit_front_ancestor_symlink_swap() {
     assert_eq!(catalog_snapshot(&pipeline, &source_id), before);
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn issue_332_relocation_classifies_enotdir_for_target_ancestor_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let (mut pipeline, source_id, old_path) =
+        indexed_fixture(tempdir.path(), "target-ancestor-file", false).await;
+    let ancestor = tempdir.path().join("ancestor");
+    fs::write(&ancestor, "not a directory").unwrap();
+    let target = ancestor.join("target.txt");
+    fs::remove_file(old_path).unwrap();
+    let before = catalog_snapshot(&pipeline, &source_id);
+
+    let error = pipeline.relocate_source(&source_id, &target).unwrap_err();
+
+    assert_eq!(
+        crate::store::source_relocation_error_kind(&error),
+        Some(crate::store::SourceRelocationErrorKind::Validation)
+    );
+    assert_eq!(catalog_snapshot(&pipeline, &source_id), before);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn issue_332_relocation_classifies_enotdir_for_stored_path_ancestor_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let live = tempdir.path().join("live");
+    let parked = tempdir.path().join("parked");
+    fs::create_dir(&live).unwrap();
+    let (mut pipeline, source_id, old_path) =
+        indexed_fixture(&live, "stored-path-ancestor-file", false).await;
+    let target = live.join("target.txt");
+    fs::rename(&old_path, &target).unwrap();
+    let before = catalog_snapshot(&pipeline, &source_id);
+    let live_for_hook = live.clone();
+    pipeline
+        .store()
+        .set_source_relocation_before_mutation_hook(move || {
+            fs::rename(live_for_hook, parked).unwrap();
+            fs::write(live, "not a directory").unwrap();
+        });
+
+    let error = pipeline.relocate_source(&source_id, &target).unwrap_err();
+
+    assert_eq!(
+        crate::store::source_relocation_error_kind(&error),
+        Some(crate::store::SourceRelocationErrorKind::Validation)
+    );
+    assert_eq!(catalog_snapshot(&pipeline, &source_id), before);
+}
+
 #[cfg(feature = "parser-pdfplumber")]
 #[tokio::test]
 async fn issue_332_relocation_replays_recorded_pdfplumber_through_held_snapshot() {
