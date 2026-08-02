@@ -4842,15 +4842,24 @@ async fn execute_ask_task_inner(
         return execute_context_only_ask_task_inner(state, task_id, req).await;
     }
 
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
+    execute_ask_task_inner_with_config(state, task_id, req, config).await
+}
+
+async fn execute_ask_task_inner_with_config(
+    state: SharedState,
+    task_id: &TaskId,
+    req: AskRequest,
+    config: Config,
+) -> Result<AskResponse, (StatusCode, Json<ErrorResponse>)> {
     let execution_started = Instant::now();
     ensure_task_started(&state, task_id).await?;
     let queue_wait_ms = task_queue_wait_ms(&state, task_id).await?;
     let question = req.question;
     let source_id = req.source_id.map(SourceId);
     let collection_filter = req.collection_filter;
-    let config = runtime_config_snapshot(&state)
-        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
-        .config;
     let embedding_profile_id = parse_embedding_profile_id(
         req.embedding_profile_id.as_deref(),
         &config.embedding.profile_id,
@@ -5118,13 +5127,20 @@ async fn execute_ask_stream_task_inner(
         return Ok(());
     }
 
+    let config = runtime_config_snapshot(&state)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .config;
+    if config.verifier.enabled {
+        let response =
+            execute_ask_task_inner_with_config(Arc::clone(&state), task_id, req, config).await?;
+        send_stream_event(&tx, sse_json_event("answer", &response)).await?;
+        return Ok(());
+    }
+
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
     let source_id = req.source_id.map(SourceId);
     let collection_filter = req.collection_filter;
-    let config = runtime_config_snapshot(&state)
-        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
-        .config;
     let embedding_profile_id = parse_embedding_profile_id(
         req.embedding_profile_id.as_deref(),
         &config.embedding.profile_id,
@@ -9708,6 +9724,8 @@ mod tests {
         VectorIndexResidency,
     };
 
+    #[path = "ask_stream_verification_tests.rs"]
+    mod ask_stream_verification_tests;
     #[path = "../auth_middleware_daemon_tests.rs"]
     mod auth_middleware_daemon_tests;
     #[path = "sql_statement_telemetry_tests.rs"]
@@ -18987,9 +19005,9 @@ mod tests {
     async fn mock_chat(
         State(state): State<MockModelState>,
         Json(payload): Json<serde_json::Value>,
-    ) -> (StatusCode, Json<serde_json::Value>) {
+    ) -> Response {
         state.chat_requests.fetch_add(1, Ordering::SeqCst);
-        state.chat_payloads.lock().unwrap().push(payload);
+        state.chat_payloads.lock().unwrap().push(payload.clone());
         let content = {
             let mut responses = state.chat_responses.lock().unwrap();
             responses.pop_front()
@@ -18997,6 +19015,17 @@ mod tests {
         .or_else(|| state.last_chat_response.lock().unwrap().clone());
         if let Some(content) = content {
             *state.last_chat_response.lock().unwrap() = Some(content.clone());
+            if payload["stream"].as_bool() == Some(true) {
+                let content = serde_json::to_string(&content).unwrap();
+                return (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":{content}}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+                    ),
+                )
+                    .into_response();
+            }
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -19007,12 +19036,14 @@ mod tests {
                         }
                     ]
                 })),
-            );
+            )
+                .into_response();
         }
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "chat must not be called by retrieve" })),
         )
+            .into_response()
     }
 
     pub(super) fn retrieve_test_config(model_base_url: &str) -> Config {
