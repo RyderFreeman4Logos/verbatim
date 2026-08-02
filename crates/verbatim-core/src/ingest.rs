@@ -52,8 +52,9 @@ use crate::resource::{
     TaskResourceProgress,
 };
 use crate::store::{
-    EmbeddingProfileConfig, SourceContentsReplacement, SourceEmbeddingCacheVector,
-    SqliteWriteOperation, Store, StoredEmbeddingProfileConfig,
+    source_relocation::remap_parser_evidence_identity, EmbeddingProfileConfig,
+    SourceContentsReplacement, SourceEmbeddingCacheVector, SqliteWriteOperation, Store,
+    StoredEmbeddingProfileConfig,
 };
 use crate::task::{
     FinishedPhaseTiming, IngestTaskStage, PhaseTiming, TaskEndpointSummary, TaskId,
@@ -120,6 +121,9 @@ type QdrantRequeueStoreObserver = Arc<dyn Fn(&Store) + Send + Sync>;
 mod ingest_deletion;
 #[path = "ingest_qdrant_sync.rs"]
 mod ingest_qdrant_sync;
+#[cfg(test)]
+#[path = "tests/issue_332_explicit_move_tests.rs"]
+mod issue_332_explicit_move_tests;
 #[cfg(test)]
 #[path = "tests/issue_362_tests.rs"]
 mod issue_362_tests;
@@ -1505,6 +1509,9 @@ where
     pub fn add_source(&self, path: &Path) -> Result<SourceId> {
         let abs_path = std::fs::canonicalize(path)
             .with_context(|| format!("resolve path: {}", path.display()))?;
+        if let Some(source) = self.store.get_source_by_path(&abs_path)? {
+            return Ok(source.id);
+        }
         let id = SourceId::from_path(&abs_path);
         if self.store.get_source(&id)?.is_some() {
             return Ok(id);
@@ -1959,8 +1966,11 @@ where
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
         let (mut evidence, prepared_image_artifacts, pdf_scan) = {
             let _cpu_permit = cpu_permit;
-            let mut evidence = parser.parse(&source.path)?;
-            normalize_evidence_source_ids(&mut evidence, source_id);
+            let evidence = remap_parser_evidence_identity(
+                parser.parse(&source.path)?,
+                &SourceId::from_path(&source.path),
+                source_id,
+            )?;
             let parsed_image_artifacts = extract_image_artifacts_for_ingest(
                 parser.as_ref(),
                 &source.path,
@@ -5904,15 +5914,6 @@ fn bounded_graph_extraction_error(error: &anyhow::Error, max_chars: usize) -> St
     error.to_string().chars().take(max_chars.min(512)).collect()
 }
 
-fn normalize_evidence_source_ids(
-    evidence: &mut [crate::types::EvidenceUnit],
-    source_id: &SourceId,
-) {
-    for unit in evidence {
-        unit.source_id = source_id.clone();
-    }
-}
-
 fn extract_image_artifacts_for_ingest(
     parser: &dyn Parser,
     path: &Path,
@@ -6339,7 +6340,7 @@ fn file_hash(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn source_path_is_missing(path: &Path) -> Result<bool> {
+pub(crate) fn source_path_is_missing(path: &Path) -> Result<bool> {
     match fs::metadata(path) {
         Ok(_) => Ok(false),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
