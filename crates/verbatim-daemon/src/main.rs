@@ -103,9 +103,9 @@ use verbatim_core::traits::{EmbeddingClient, EmbeddingEndpointCapabilities};
 use verbatim_core::types::{
     CanonicalLocator, CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId,
     EvidenceKind, EvidenceUnit, ImageArtifact, ReferenceComponent, RetrievalDebug,
-    RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
-    RetrievalEvidenceRole, RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalResult, SourceId,
-    SourceLocator, SourceStatus,
+    RetrievalDenseVectorPath, RetrievalEvidencePackEntry, RetrievalEvidenceRole,
+    RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalResult, SourceId, SourceLocator,
+    SourceStatus,
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
@@ -7459,15 +7459,11 @@ async fn prepare_retrieve_context(
                         ))?
                     }
                 };
-                if controls.config.graph.global_search.enabled && source_filter_ref.is_none() {
-                    let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
-                        GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
-                            .global_search_results(&question2, None)
-                    })?;
-                    let mut debug_option = Some(debug);
-                    prepend_global_results(&mut results, global_results, &mut debug_option);
-                    debug = debug_option.unwrap_or_else(empty_retrieval_debug);
-                }
+                let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
+                    GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
+                        .global_search_backing_results(&question2, source_filter_ref)
+                })?;
+                prepend_global_backing_results(&mut results, global_results, Some(&mut debug));
                 Ok::<_, anyhow::Error>((results, debug))
             });
         let (results, mut debug) = retrieval_result?;
@@ -7485,6 +7481,7 @@ async fn prepare_retrieve_context(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
+#[cfg(test)]
 fn empty_retrieval_debug() -> RetrievalDebug {
     RetrievalDebug {
         dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
@@ -7492,7 +7489,7 @@ fn empty_retrieval_debug() -> RetrievalDebug {
         retrieval_search_sql_statement_count: None,
         local_spans_ms: RetrievalLocalSpansMs::default(),
         candidate_counters: Default::default(),
-        evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
+        evidence_pack_mode: verbatim_core::types::RetrievalDebugEvidencePackMode::Full,
         final_evidence_count: 0,
         display_evidence_count: 0,
         bm25_hits: Vec::new(),
@@ -7570,13 +7567,15 @@ async fn prepare_generation_context(
                         source_filter_ref,
                         show_retrieval,
                     )?;
-                    if config.graph.global_search.enabled && source_filter_ref.is_none() {
-                        let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
-                            GraphRagService::new(pipeline.store(), &config.graph.global_search)
-                                .global_search_results(&question2, None)
-                        })?;
-                        prepend_global_results(&mut results, global_results, &mut retrieval_debug);
-                    }
+                    let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
+                        GraphRagService::new(pipeline.store(), &config.graph.global_search)
+                            .global_search_backing_results(&question2, source_filter_ref)
+                    })?;
+                    prepend_global_backing_results(
+                        &mut results,
+                        global_results,
+                        retrieval_debug.as_mut(),
+                    );
                     Ok::<_, anyhow::Error>((results, retrieval_debug))
                 });
             let (results, mut retrieval_debug) = retrieval_result?;
@@ -7676,10 +7675,10 @@ fn run_generation_retrieval_once(
     Ok((results, Some(debug)))
 }
 
-fn prepend_global_results(
+fn prepend_global_backing_results(
     results: &mut Vec<RetrievalResult>,
     mut global_results: Vec<RetrievalResult>,
-    retrieval_debug: &mut Option<RetrievalDebug>,
+    retrieval_debug: Option<&mut RetrievalDebug>,
 ) {
     if global_results.is_empty() {
         return;
@@ -7687,15 +7686,11 @@ fn prepend_global_results(
 
     global_results.extend(std::mem::take(results));
     *results = global_results;
-    renumber_result_ranks(results);
-    if let Some(debug) = retrieval_debug.as_mut() {
-        refresh_evidence_pack_debug(debug, results);
+    for (index, result) in results.iter_mut().enumerate() {
+        result.provenance.result_rank = index + 1;
     }
-}
-
-fn renumber_result_ranks(results: &mut [RetrievalResult]) {
-    for (idx, result) in results.iter_mut().enumerate() {
-        result.provenance.result_rank = idx + 1;
+    if let Some(debug) = retrieval_debug {
+        refresh_evidence_pack_debug(debug, results);
     }
 }
 
@@ -9707,7 +9702,8 @@ mod tests {
     use verbatim_core::retrieve::refresh_final_evidence_pack_debug;
     use verbatim_core::types::{
         CanonicalLocator, Chunk, ChunkId, ChunkType, EmbeddingCacheStats, EvidenceKind,
-        EvidenceUnit, ReferenceComponent, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
+        EvidenceUnit, GraphNode, GraphNodeId, GraphNodeKind, ReferenceComponent,
+        RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
         RetrievalEvidenceRole, RetrievalProvenance, RetrievalRerankStatus, Source, SourceLocator,
         VectorIndexResidency,
     };
@@ -12866,58 +12862,6 @@ mod tests {
     }
 
     #[test]
-    fn prepended_global_results_refresh_retrieval_debug_final_pack() {
-        let local = test_retrieval_result(1, "local-chunk", "ev-local", EvidenceKind::Text);
-        let global = test_retrieval_result(
-            1,
-            "graphrag:report-chunk:community-test",
-            "graphrag:report:community-test",
-            EvidenceKind::Generated,
-        );
-        let mut results = vec![local];
-        let mut debug = Some(RetrievalDebug {
-            dense_vector_path: RetrievalDenseVectorPath::ResidentHnsw,
-            query_embedding_latency_ms: None,
-            retrieval_search_sql_statement_count: None,
-            local_spans_ms: RetrievalLocalSpansMs::default(),
-            candidate_counters: Default::default(),
-            evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
-            final_evidence_count: 0,
-            display_evidence_count: 0,
-            bm25_hits: Vec::new(),
-            dense_hits: Vec::new(),
-            rrf_fused_hits: Vec::new(),
-            graph_expanded_hits: Vec::new(),
-            reranker: verbatim_core::types::RetrievalRerankDebug::disabled(),
-            final_evidence_pack: Vec::new(),
-            display_evidence_pack: Vec::new(),
-        });
-
-        prepend_global_results(&mut results, vec![global], &mut debug);
-
-        assert_eq!(
-            results[0].chunk_id.0,
-            "graphrag:report-chunk:community-test"
-        );
-        assert_eq!(results[0].provenance.result_rank, 1);
-        assert_eq!(results[1].provenance.result_rank, 2);
-
-        let final_pack = debug.unwrap().final_evidence_pack;
-        assert_eq!(final_pack.len(), 2);
-        assert_eq!(final_pack[0].label, "E1");
-        assert_eq!(
-            final_pack[0].evidence_id.0,
-            "graphrag:report:community-test"
-        );
-        assert_eq!(final_pack[0].role, RetrievalEvidenceRole::Generated);
-        assert_eq!(final_pack[0].result_rank, 1);
-        assert_eq!(final_pack[1].label, "E2");
-        assert_eq!(final_pack[1].evidence_id.0, "ev-local");
-        assert_eq!(final_pack[1].role, RetrievalEvidenceRole::OriginalText);
-        assert_eq!(final_pack[1].result_rank, 2);
-    }
-
-    #[test]
     fn retrieve_response_pages_context_pack_without_full_locator_by_default() {
         let results = vec![
             test_retrieval_result(1, "chunk-1", "ev-1", EvidenceKind::Text),
@@ -15534,6 +15478,183 @@ mod tests {
         assert_eq!(model_server.embedding_requests(), before_embedding);
         assert_eq!(model_server.chat_requests(), before_chat);
         assert_eq!(model_server.model_requests(), before_models);
+    }
+
+    #[tokio::test]
+    async fn global_search_surfaces_only_store_backing_evidence_to_retrieve_and_ask() {
+        let model_server = MockModelServer::start_with_chat_responses(
+            3,
+            [
+                "The cedar protocol is backed by stored evidence [E1]",
+                r#"{"verdict":"pass","unsupported_claims":[]}"#,
+            ],
+        )
+        .await;
+        let test_dir = TestDir::new("graphrag-global-search-ordinary-ask");
+        let source_path = test_dir.path().join("cedar.md");
+        fs::write(
+            &source_path,
+            "The cedar protocol is backed by this authoritative stored passage.",
+        )
+        .unwrap();
+        let distractor_path = test_dir.path().join("distractor.md");
+        fs::write(
+            &distractor_path,
+            "Zirconium provenance appears here as a lexical distractor only.",
+        )
+        .unwrap();
+        let mut config = retrieve_test_config(&model_server.base_url);
+        config.embedding.enabled = false;
+        config.chat.enabled = true;
+        config.chat.base_url = model_server.base_url.clone();
+        config.chat.model = "test-chat".into();
+        config.rerank.enabled = false;
+        config.verifier.enabled = true;
+        config.graph.global_search.enabled = true;
+
+        let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        pipeline.ingest_source(&source_id).await.unwrap();
+        let distractor_source_id = pipeline.add_source(&distractor_path).unwrap();
+        pipeline.ingest_source(&distractor_source_id).await.unwrap();
+        let chunk = pipeline
+            .store()
+            .list_chunks_by_source(&source_id)
+            .unwrap()
+            .into_iter()
+            .find(|chunk| chunk.chunk_type == ChunkType::Child)
+            .expect("ingest creates a child chunk");
+        let graph_report_prose =
+            "Generated graph claim selects the cedar passage for zirconium provenance.";
+        let external_id = "generated_claim:cedar-provenance";
+        let claim = GraphNode {
+            id: GraphNodeId::new(&source_id, GraphNodeKind::GeneratedClaim, external_id),
+            source_id: source_id.clone(),
+            kind: GraphNodeKind::GeneratedClaim,
+            external_id: external_id.into(),
+            label: Some(graph_report_prose.into()),
+            locator: None,
+            ordinal: None,
+            metadata: Some(serde_json::json!({
+                "origin": "llm_generated",
+                "graph_data_kind": "claim",
+                "claim": graph_report_prose,
+                "subject": "cedar passage",
+                "predicate": "supports",
+                "object": "zirconium provenance",
+                "source_spans": [format!("{}:1-1", chunk.id.0)]
+            })),
+        };
+        pipeline
+            .store()
+            .upsert_graph_nodes(std::slice::from_ref(&claim))
+            .unwrap();
+        let global_hits = verbatim_core::graphrag::GraphRagService::new(
+            pipeline.store(),
+            &config.graph.global_search,
+        )
+        .global_search("zirconium provenance", None)
+        .unwrap();
+        assert_eq!(global_hits.len(), 1, "fixture must contain a global report");
+        let graph_evidence_id = chunk.evidence_unit_ids[0].clone();
+
+        let state = test_state(config, test_dir.path(), pipeline);
+        let retrieve_request = context_only_retrieve_request(AskRequest {
+            question: "What supports zirconium provenance?".into(),
+            source_id: None,
+            collection_filter: CollectionFilterRequest::default(),
+            embedding_profile_id: None,
+            show_retrieval: true,
+            context_only: true,
+            limit: Some(3),
+            page_size: Some(3),
+            page: None,
+        });
+        let Json(retrieve_response) = retrieve(State(Arc::clone(&state)), Json(retrieve_request))
+            .await
+            .unwrap();
+        assert_eq!(
+            retrieve_response.results[0].evidence_id, graph_evidence_id.0,
+            "global search must reprioritize its Store-backed evidence"
+        );
+        assert!(retrieve_response
+            .results
+            .iter()
+            .any(|result| result.source_id == distractor_source_id.0));
+
+        let response = ask(
+            State(Arc::clone(&state)),
+            Json(AskRequest {
+                question: "What supports zirconium provenance?".into(),
+                source_id: None,
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                show_retrieval: true,
+                context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(response.verified);
+        let retrieval = response
+            .retrieval
+            .as_ref()
+            .expect("retrieval debug is published");
+        assert!(!retrieval.final_evidence_pack.is_empty());
+        assert!(!response.citations.is_empty());
+        assert_eq!(
+            retrieval.final_evidence_pack[0].evidence_id,
+            graph_evidence_id
+        );
+        assert_eq!(response.citations[0].evidence_id, graph_evidence_id.0);
+        let published_ids = retrieval
+            .final_evidence_pack
+            .iter()
+            .map(|entry| entry.evidence_id.clone())
+            .chain(
+                retrieve_response
+                    .results
+                    .iter()
+                    .map(|result| EvidenceId(result.evidence_id.clone())),
+            )
+            .chain(
+                response
+                    .citations
+                    .iter()
+                    .map(|citation| EvidenceId(citation.evidence_id.clone())),
+            )
+            .collect::<Vec<_>>();
+        let pipeline = state.pipeline.lock().unwrap();
+        let store = pipeline
+            .as_ref()
+            .expect("query pipeline is restored")
+            .store();
+        for evidence_id in &published_ids {
+            assert!(!evidence_id.0.starts_with("graphrag:"));
+            assert!(
+                store.get_evidence(evidence_id).unwrap().is_some(),
+                "published evidence must resolve through Store: {}",
+                evidence_id.0
+            );
+        }
+        drop(pipeline);
+
+        let chat_payloads = model_server.chat_payloads();
+        assert_eq!(chat_payloads.len(), 2);
+        let source_pack_payload = serde_json::to_string(&chat_payloads[0]).unwrap();
+        let verifier_payload = serde_json::to_string(&chat_payloads[1]).unwrap();
+        assert!(source_pack_payload.contains("SOURCE PACK"));
+        assert!(source_pack_payload.contains("authoritative stored passage"));
+        assert!(verifier_payload.contains(&response.citations[0].evidence_id));
+        assert!(!source_pack_payload.contains("graphrag:"));
+        assert!(!verifier_payload.contains("graphrag:"));
+        assert!(!source_pack_payload.contains(graph_report_prose));
+        assert!(!verifier_payload.contains(graph_report_prose));
     }
 
     #[tokio::test]
@@ -18689,6 +18810,7 @@ mod tests {
         embedding_blocked: Arc<AtomicBool>,
         embedding_release: Arc<tokio::sync::Notify>,
         chat_requests: Arc<AtomicUsize>,
+        chat_payloads: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -18736,6 +18858,7 @@ mod tests {
                 embedding_blocked: Arc::new(AtomicBool::new(false)),
                 embedding_release: Arc::new(tokio::sync::Notify::new()),
                 chat_requests: Arc::new(AtomicUsize::new(0)),
+                chat_payloads: Arc::new(std::sync::Mutex::new(Vec::new())),
                 chat_responses: Arc::new(std::sync::Mutex::new(chat_responses)),
                 last_chat_response: Arc::new(std::sync::Mutex::new(None)),
             };
@@ -18760,6 +18883,7 @@ mod tests {
                 embedding_blocked: state.embedding_blocked,
                 embedding_release: state.embedding_release,
                 chat_requests: state.chat_requests,
+                chat_payloads: state.chat_payloads,
                 handle,
             }
         }
@@ -18793,6 +18917,10 @@ mod tests {
         fn chat_requests(&self) -> usize {
             self.chat_requests.load(Ordering::SeqCst)
         }
+
+        fn chat_payloads(&self) -> Vec<serde_json::Value> {
+            self.chat_payloads.lock().unwrap().clone()
+        }
     }
 
     impl Drop for MockModelServer {
@@ -18811,6 +18939,7 @@ mod tests {
         embedding_blocked: Arc<AtomicBool>,
         embedding_release: Arc<tokio::sync::Notify>,
         chat_requests: Arc<AtomicUsize>,
+        chat_payloads: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         chat_responses: Arc<std::sync::Mutex<VecDeque<String>>>,
         last_chat_response: Arc<std::sync::Mutex<Option<String>>>,
     }
@@ -18857,8 +18986,10 @@ mod tests {
 
     async fn mock_chat(
         State(state): State<MockModelState>,
+        Json(payload): Json<serde_json::Value>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         state.chat_requests.fetch_add(1, Ordering::SeqCst);
+        state.chat_payloads.lock().unwrap().push(payload);
         let content = {
             let mut responses = state.chat_responses.lock().unwrap();
             responses.pop_front()

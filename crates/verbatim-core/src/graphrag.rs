@@ -2,11 +2,11 @@
 //!
 //! The module is deliberately deterministic. It canonicalizes generated
 //! entities, detects stable connected-component communities, builds community
-//! reports only from graph items that retain source-span evidence, and converts
-//! global report hits back into the existing citation/verifier pipeline.
+//! reports only from graph items that retain source-span evidence, and keeps
+//! generated report prose out of ordinary evidence.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -14,9 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::GraphGlobalSearchConfig;
 use crate::store::Store;
 use crate::types::{
-    hex_sha256, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, GraphEdge,
-    GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, RetrievalProvenance, RetrievalResult,
-    SourceId, SourceLocator,
+    hex_sha256, ChunkId, EvidenceId, EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
+    GraphNodeKind, RetrievalProvenance, RetrievalResult, SourceId,
 };
 
 const HARD_MAX_COMMUNITIES: usize = 256;
@@ -143,16 +142,31 @@ impl<'a> GraphRagService<'a> {
         Ok(search_community_reports(query, &reports, self.config))
     }
 
-    pub fn global_search_results(
+    /// Return only Store-backed evidence selected by structured global search.
+    pub fn global_search_backing_results(
         &self,
         query: &str,
-        source_filter: Option<&SourceId>,
+        source_filter: Option<&HashSet<SourceId>>,
     ) -> Result<Vec<RetrievalResult>> {
-        let hits = self.global_search(query, source_filter)?;
-        Ok(hits
-            .into_iter()
-            .filter_map(|hit| community_hit_to_retrieval_result(&hit))
-            .collect())
+        let max_results = bounded_nonzero(
+            self.config.max_search_results,
+            HARD_MAX_SEARCH_RESULTS,
+            GraphGlobalSearchConfig::default().max_search_results,
+        );
+        let mut hits = Vec::new();
+        match source_filter {
+            None => hits = self.global_search(query, None)?,
+            Some(source_ids) => {
+                let mut source_ids = source_ids.iter().collect::<Vec<_>>();
+                source_ids.sort();
+                for source_id in source_ids {
+                    hits.extend(self.global_search(query, Some(source_id))?);
+                    hits.sort_by(global_hit_order);
+                    hits.truncate(max_results);
+                }
+            }
+        }
+        backing_results_from_hits(self.store, hits, max_results)
     }
 
     pub fn local_search(&self, results: &[RetrievalResult]) -> Result<LocalGraphChunkSearch> {
@@ -441,6 +455,60 @@ pub fn search_community_reports(
         .collect()
 }
 
+fn backing_results_from_hits(
+    store: &Store,
+    mut hits: Vec<GlobalSearchHit>,
+    max_results: usize,
+) -> Result<Vec<RetrievalResult>> {
+    hits.sort_by(global_hit_order);
+
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+    for hit in hits {
+        for backing in hit.report.evidence {
+            if results.len() >= max_results {
+                return Ok(results);
+            }
+            if seen.contains(&backing.evidence.id) {
+                continue;
+            }
+            let Some(chunk) = store.get_chunk(&backing.source_span.chunk_id)? else {
+                continue;
+            };
+            let Some(evidence) = store.get_evidence(&backing.evidence.id)? else {
+                continue;
+            };
+            if chunk.source_id != evidence.source_id
+                || !chunk.evidence_unit_ids.contains(&evidence.id)
+            {
+                continue;
+            }
+            seen.insert(evidence.id.clone());
+            let result_rank = results.len() + 1;
+            results.push(RetrievalResult {
+                chunk_id: chunk.id.clone(),
+                score: hit.score,
+                provenance: RetrievalProvenance::seed(
+                    result_rank,
+                    chunk.id.clone(),
+                    chunk.source_id.clone(),
+                ),
+                chunk,
+                evidence_units: vec![evidence],
+            });
+        }
+    }
+    Ok(results)
+}
+
+fn global_hit_order(left: &GlobalSearchHit, right: &GlobalSearchHit) -> Ordering {
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| left.rank.cmp(&right.rank))
+        .then_with(|| left.report.id.cmp(&right.report.id))
+}
+
 /// Enrich local retrieval results with graph entity ids while preserving raw evidence ids.
 pub fn local_graph_chunk_search(
     store: &Store,
@@ -592,88 +660,6 @@ fn evidence_ids_for_spans(store: &Store, spans: &[GraphSourceSpan]) -> Result<Ve
         }
     }
     Ok(ids.into_iter().collect())
-}
-
-fn community_hit_to_retrieval_result(hit: &GlobalSearchHit) -> Option<RetrievalResult> {
-    let primary = hit.report.evidence.first()?;
-    let report_text = report_generation_text(&hit.report);
-    let report_evidence_id = EvidenceId(format!("graphrag:report:{}", hit.report.id));
-    let chunk_id = ChunkId(format!("graphrag:report-chunk:{}", hit.report.id));
-    let source_id = primary.evidence.source_id.clone();
-    let heading_path = vec![
-        "GraphRAG global search".to_string(),
-        hit.report.title.clone(),
-    ];
-    let generated_evidence = EvidenceUnit {
-        id: report_evidence_id.clone(),
-        source_id: source_id.clone(),
-        kind: EvidenceKind::Generated,
-        derived_from: None,
-        locator: SourceLocator::Document {
-            path_or_url: format!("graphrag://community/{}", hit.report.id),
-            line_start: 1,
-            line_end: None,
-        },
-        text_hash: hex_sha256(report_text.as_bytes()),
-        text: report_text.clone(),
-        heading_path: heading_path.clone(),
-        position: 0,
-    };
-
-    let mut evidence_units = vec![generated_evidence];
-    evidence_units.extend(
-        hit.report
-            .evidence
-            .iter()
-            .map(|entry| entry.evidence.clone()),
-    );
-    let evidence_unit_ids = evidence_units
-        .iter()
-        .map(|evidence| evidence.id.clone())
-        .collect::<Vec<_>>();
-    let token_count = report_text
-        .split_whitespace()
-        .count()
-        .min(u32::MAX as usize) as u32;
-    let chunk_hash = hex_sha256(report_text.as_bytes());
-    let chunk = Chunk {
-        id: chunk_id.clone(),
-        source_id: source_id.clone(),
-        chunk_hash,
-        embedding_input_hash: None,
-        text: report_text,
-        context_text: None,
-        token_count,
-        chunk_type: ChunkType::Child,
-        parent_chunk_id: None,
-        heading_path,
-        evidence_unit_ids,
-    };
-
-    Some(RetrievalResult {
-        chunk_id: chunk_id.clone(),
-        score: hit.score,
-        chunk,
-        evidence_units,
-        provenance: RetrievalProvenance::seed(hit.rank, chunk_id, source_id),
-    })
-}
-
-fn report_generation_text(report: &CommunityReport) -> String {
-    let mut text = format!(
-        "Community report: {}\nSummary: {}\nGrounded claims:\n",
-        report.title, report.summary
-    );
-    for claim in &report.claims {
-        let evidence = claim
-            .evidence_ids
-            .iter()
-            .map(|id| id.0.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        text.push_str(&format!("- {} Evidence: {evidence}\n", claim.text));
-    }
-    text
 }
 
 fn report_score(query: &str, report: &CommunityReport) -> f32 {
@@ -984,7 +970,13 @@ mod tests {
     use serde_json::json;
 
     use crate::store::Store;
-    use crate::types::{EdgeType, Source, SourceStatus};
+    use crate::types::{
+        Chunk, ChunkType, EdgeType, EvidenceKind, RetrievalProvenance, Source, SourceLocator,
+        SourceStatus,
+    };
+
+    #[path = "backing.rs"]
+    mod backing_tests;
 
     #[test]
     fn canonicalization_groups_entities_stably() {
@@ -1119,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_global_search_does_not_affect_local_grounded_search() {
+    fn local_grounded_search_preserves_stored_evidence() {
         let store = Store::in_memory().unwrap();
         let source = source("src");
         let chunk = insert_chunk(&store, &source, "chunk-a", "Grounded local text.");
@@ -1127,10 +1119,8 @@ mod tests {
         let disabled = GraphGlobalSearchConfig::default();
         let service = GraphRagService::new(&store, &disabled);
 
-        let global = service.global_search_results("overview", None).unwrap();
         let local = service.local_search(&[result]).unwrap();
 
-        assert!(global.is_empty());
         assert_eq!(local.hits.len(), 1);
         assert_eq!(local.hits[0].evidence_ids, chunk.evidence_unit_ids);
     }
@@ -1237,38 +1227,6 @@ mod tests {
 
         assert_eq!(hits.len(), reports.len());
         assert!(hits.iter().all(|hit| hit.score > 0.0));
-    }
-
-    #[test]
-    fn global_report_hits_convert_to_citation_grounded_retrieval_results() {
-        let store = Store::in_memory().unwrap();
-        let source = source("src");
-        let chunk = insert_chunk(&store, &source, "chunk-a", "Alpha source text.");
-        let claim = generated_claim(
-            &source.id,
-            "Alpha is the primary concept.",
-            "Alpha",
-            "Concept",
-            "chunk-a:1-1",
-        );
-        let community = GraphCommunity {
-            id: "community-test".into(),
-            node_ids: vec![claim.id.clone()],
-            edge_ids: Vec::new(),
-        };
-        let config = enabled_config();
-        let reports =
-            build_community_reports(&store, &[claim], &[], &[community], &config).unwrap();
-        let hits = search_community_reports("primary concept", &reports, &config);
-
-        let result = community_hit_to_retrieval_result(&hits[0]).unwrap();
-
-        assert_eq!(result.evidence_units[0].kind, EvidenceKind::Generated);
-        assert_eq!(result.evidence_units[0].derived_from, None);
-        assert!(result
-            .evidence_units
-            .iter()
-            .any(|evidence| evidence.id == chunk.evidence_unit_ids[0]));
     }
 
     fn source(id: &str) -> Source {
