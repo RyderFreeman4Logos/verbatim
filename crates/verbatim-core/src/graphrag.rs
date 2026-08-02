@@ -3,10 +3,10 @@
 //! The module is deliberately deterministic. It canonicalizes generated
 //! entities, detects stable connected-component communities, builds community
 //! reports only from graph items that retain source-span evidence, and keeps
-//! global report hits out of ordinary evidence until derived artifacts are wired.
+//! generated report prose out of ordinary evidence.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use crate::config::GraphGlobalSearchConfig;
 use crate::store::Store;
 use crate::types::{
     hex_sha256, ChunkId, EvidenceId, EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
-    GraphNodeKind, RetrievalResult, SourceId,
+    GraphNodeKind, RetrievalProvenance, RetrievalResult, SourceId,
 };
 
 const HARD_MAX_COMMUNITIES: usize = 256;
@@ -140,6 +140,33 @@ impl<'a> GraphRagService<'a> {
     ) -> Result<Vec<GlobalSearchHit>> {
         let reports = self.community_reports(source_filter)?;
         Ok(search_community_reports(query, &reports, self.config))
+    }
+
+    /// Return only Store-backed evidence selected by structured global search.
+    pub fn global_search_backing_results(
+        &self,
+        query: &str,
+        source_filter: Option<&HashSet<SourceId>>,
+    ) -> Result<Vec<RetrievalResult>> {
+        let max_results = bounded_nonzero(
+            self.config.max_search_results,
+            HARD_MAX_SEARCH_RESULTS,
+            GraphGlobalSearchConfig::default().max_search_results,
+        );
+        let mut hits = Vec::new();
+        match source_filter {
+            None => hits = self.global_search(query, None)?,
+            Some(source_ids) => {
+                let mut source_ids = source_ids.iter().collect::<Vec<_>>();
+                source_ids.sort();
+                for source_id in source_ids {
+                    hits.extend(self.global_search(query, Some(source_id))?);
+                    hits.sort_by(global_hit_order);
+                    hits.truncate(max_results);
+                }
+            }
+        }
+        backing_results_from_hits(self.store, hits, max_results)
     }
 
     pub fn local_search(&self, results: &[RetrievalResult]) -> Result<LocalGraphChunkSearch> {
@@ -426,6 +453,60 @@ pub fn search_community_reports(
             report,
         })
         .collect()
+}
+
+fn backing_results_from_hits(
+    store: &Store,
+    mut hits: Vec<GlobalSearchHit>,
+    max_results: usize,
+) -> Result<Vec<RetrievalResult>> {
+    hits.sort_by(global_hit_order);
+
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+    for hit in hits {
+        for backing in hit.report.evidence {
+            if results.len() >= max_results {
+                return Ok(results);
+            }
+            if seen.contains(&backing.evidence.id) {
+                continue;
+            }
+            let Some(chunk) = store.get_chunk(&backing.source_span.chunk_id)? else {
+                continue;
+            };
+            let Some(evidence) = store.get_evidence(&backing.evidence.id)? else {
+                continue;
+            };
+            if chunk.source_id != evidence.source_id
+                || !chunk.evidence_unit_ids.contains(&evidence.id)
+            {
+                continue;
+            }
+            seen.insert(evidence.id.clone());
+            let result_rank = results.len() + 1;
+            results.push(RetrievalResult {
+                chunk_id: chunk.id.clone(),
+                score: hit.score,
+                provenance: RetrievalProvenance::seed(
+                    result_rank,
+                    chunk.id.clone(),
+                    chunk.source_id.clone(),
+                ),
+                chunk,
+                evidence_units: vec![evidence],
+            });
+        }
+    }
+    Ok(results)
+}
+
+fn global_hit_order(left: &GlobalSearchHit, right: &GlobalSearchHit) -> Ordering {
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| left.rank.cmp(&right.rank))
+        .then_with(|| left.report.id.cmp(&right.report.id))
 }
 
 /// Enrich local retrieval results with graph entity ids while preserving raw evidence ids.
@@ -893,6 +974,9 @@ mod tests {
         Chunk, ChunkType, EdgeType, EvidenceKind, RetrievalProvenance, Source, SourceLocator,
         SourceStatus,
     };
+
+    #[path = "backing.rs"]
+    mod backing_tests;
 
     #[test]
     fn canonicalization_groups_entities_stably() {

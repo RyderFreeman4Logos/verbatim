@@ -62,6 +62,7 @@ use verbatim_core::generate::{
     image_artifact_evidence_id, select_image_attachments, GenerationCallTelemetry,
     GenerationContext, GenerationTelemetry, GenerationVerificationStatus, Generator,
 };
+use verbatim_core::graphrag::GraphRagService;
 use verbatim_core::index::sqlite_fts::FtsMaintenanceOutcome;
 use verbatim_core::index_gc::{apply_index_gc, plan_index_gc, IndexGcApplyReport};
 use verbatim_core::ingest::{
@@ -78,8 +79,8 @@ use verbatim_core::resource::{
 };
 use verbatim_core::retrieval_telemetry::SpanKind;
 use verbatim_core::retrieve::{
-    RetrievalCanonicalSelectionBudget, RetrievalDebugOptions, RetrievalDisplayScope,
-    RetrievalPipeline,
+    refresh_evidence_pack_debug, RetrievalCanonicalSelectionBudget, RetrievalDebugOptions,
+    RetrievalDisplayScope, RetrievalPipeline,
 };
 use verbatim_core::store::{Store, TaskListFilter};
 use verbatim_core::task::{
@@ -7426,7 +7427,7 @@ async fn prepare_retrieve_context(
         let debug_options = retrieve_debug_options(&controls);
         let (retrieval_result, retrieval_search_sql_statement_count) =
             pipeline.store().count_sql_statements(|| {
-                let (results, debug) = match (
+                let (mut results, mut debug) = match (
                     controls.rerank_config.enabled,
                     controls.rerank_config.strategy,
                 ) {
@@ -7458,6 +7459,11 @@ async fn prepare_retrieve_context(
                         ))?
                     }
                 };
+                let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
+                    GraphRagService::new(pipeline.store(), &controls.config.graph.global_search)
+                        .global_search_backing_results(&question2, source_filter_ref)
+                })?;
+                prepend_global_backing_results(&mut results, global_results, Some(&mut debug));
                 Ok::<_, anyhow::Error>((results, debug))
             });
         let (results, mut debug) = retrieval_result?;
@@ -7553,7 +7559,7 @@ async fn prepare_generation_context(
             let source_filter_ref = source_filter.as_ref();
             let (retrieval_result, retrieval_search_sql_statement_count) =
                 pipeline.store().count_sql_statements(|| {
-                    let (results, retrieval_debug) = run_generation_retrieval(
+                    let (mut results, mut retrieval_debug) = run_generation_retrieval(
                         runtime,
                         retrieval,
                         &config.rerank,
@@ -7561,6 +7567,15 @@ async fn prepare_generation_context(
                         source_filter_ref,
                         show_retrieval,
                     )?;
+                    let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
+                        GraphRagService::new(pipeline.store(), &config.graph.global_search)
+                            .global_search_backing_results(&question2, source_filter_ref)
+                    })?;
+                    prepend_global_backing_results(
+                        &mut results,
+                        global_results,
+                        retrieval_debug.as_mut(),
+                    );
                     Ok::<_, anyhow::Error>((results, retrieval_debug))
                 });
             let (results, mut retrieval_debug) = retrieval_result?;
@@ -7658,6 +7673,25 @@ fn run_generation_retrieval_once(
         debug_options,
     ))?;
     Ok((results, Some(debug)))
+}
+
+fn prepend_global_backing_results(
+    results: &mut Vec<RetrievalResult>,
+    mut global_results: Vec<RetrievalResult>,
+    retrieval_debug: Option<&mut RetrievalDebug>,
+) {
+    if global_results.is_empty() {
+        return;
+    }
+
+    global_results.extend(std::mem::take(results));
+    *results = global_results;
+    for (index, result) in results.iter_mut().enumerate() {
+        result.provenance.result_rank = index + 1;
+    }
+    if let Some(debug) = retrieval_debug {
+        refresh_evidence_pack_debug(debug, results);
+    }
 }
 
 fn collect_image_artifacts_for_results(
@@ -15447,20 +15481,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_search_reports_do_not_reach_ordinary_ask_evidence() {
+    async fn global_search_surfaces_only_store_backing_evidence_to_retrieve_and_ask() {
         let model_server = MockModelServer::start_with_chat_responses(
             3,
             [
-                "Ordinary evidence remains Store grounded [E1]",
+                "The cedar protocol is backed by stored evidence [E1]",
                 r#"{"verdict":"pass","unsupported_claims":[]}"#,
             ],
         )
         .await;
         let test_dir = TestDir::new("graphrag-global-search-ordinary-ask");
-        let source_path = test_dir.path().join("doc.md");
+        let source_path = test_dir.path().join("cedar.md");
         fs::write(
             &source_path,
-            "Ordinary retrieval evidence remains Store grounded while GraphRAG global search is enabled.",
+            "The cedar protocol is backed by this authoritative stored passage.",
+        )
+        .unwrap();
+        let distractor_path = test_dir.path().join("distractor.md");
+        fs::write(
+            &distractor_path,
+            "Zirconium provenance appears here as a lexical distractor only.",
         )
         .unwrap();
         let mut config = retrieve_test_config(&model_server.base_url);
@@ -15475,6 +15515,8 @@ mod tests {
         let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
         let source_id = pipeline.add_source(&source_path).unwrap();
         pipeline.ingest_source(&source_id).await.unwrap();
+        let distractor_source_id = pipeline.add_source(&distractor_path).unwrap();
+        pipeline.ingest_source(&distractor_source_id).await.unwrap();
         let chunk = pipeline
             .store()
             .list_chunks_by_source(&source_id)
@@ -15482,22 +15524,24 @@ mod tests {
             .into_iter()
             .find(|chunk| chunk.chunk_type == ChunkType::Child)
             .expect("ingest creates a child chunk");
-        let external_id = "generated_claim:ordinary-ask";
+        let graph_report_prose =
+            "Generated graph claim selects the cedar passage for zirconium provenance.";
+        let external_id = "generated_claim:cedar-provenance";
         let claim = GraphNode {
             id: GraphNodeId::new(&source_id, GraphNodeKind::GeneratedClaim, external_id),
             source_id: source_id.clone(),
             kind: GraphNodeKind::GeneratedClaim,
             external_id: external_id.into(),
-            label: Some("Ordinary evidence remains Store grounded.".into()),
+            label: Some(graph_report_prose.into()),
             locator: None,
             ordinal: None,
             metadata: Some(serde_json::json!({
                 "origin": "llm_generated",
                 "graph_data_kind": "claim",
-                "claim": "Ordinary evidence remains Store grounded.",
-                "subject": "ordinary evidence",
-                "predicate": "remains",
-                "object": "Store grounded",
+                "claim": graph_report_prose,
+                "subject": "cedar passage",
+                "predicate": "supports",
+                "object": "zirconium provenance",
                 "source_spans": [format!("{}:1-1", chunk.id.0)]
             })),
         };
@@ -15509,31 +15553,39 @@ mod tests {
             pipeline.store(),
             &config.graph.global_search,
         )
-        .global_search("Store grounded", None)
+        .global_search("zirconium provenance", None)
         .unwrap();
         assert_eq!(global_hits.len(), 1, "fixture must contain a global report");
+        let graph_evidence_id = chunk.evidence_unit_ids[0].clone();
 
         let state = test_state(config, test_dir.path(), pipeline);
         let retrieve_request = context_only_retrieve_request(AskRequest {
-            question: "What remains Store grounded with global search enabled?".into(),
+            question: "What supports zirconium provenance?".into(),
             source_id: None,
             collection_filter: CollectionFilterRequest::default(),
             embedding_profile_id: None,
             show_retrieval: true,
             context_only: true,
-            limit: None,
-            page_size: None,
+            limit: Some(3),
+            page_size: Some(3),
             page: None,
         });
         let Json(retrieve_response) = retrieve(State(Arc::clone(&state)), Json(retrieve_request))
             .await
             .unwrap();
-        assert!(!retrieve_response.results.is_empty());
+        assert_eq!(
+            retrieve_response.results[0].evidence_id, graph_evidence_id.0,
+            "global search must reprioritize its Store-backed evidence"
+        );
+        assert!(retrieve_response
+            .results
+            .iter()
+            .any(|result| result.source_id == distractor_source_id.0));
 
         let response = ask(
             State(Arc::clone(&state)),
             Json(AskRequest {
-                question: "What remains Store grounded with global search enabled?".into(),
+                question: "What supports zirconium provenance?".into(),
                 source_id: None,
                 collection_filter: CollectionFilterRequest::default(),
                 embedding_profile_id: None,
@@ -15555,6 +15607,11 @@ mod tests {
             .expect("retrieval debug is published");
         assert!(!retrieval.final_evidence_pack.is_empty());
         assert!(!response.citations.is_empty());
+        assert_eq!(
+            retrieval.final_evidence_pack[0].evidence_id,
+            graph_evidence_id
+        );
+        assert_eq!(response.citations[0].evidence_id, graph_evidence_id.0);
         let published_ids = retrieval
             .final_evidence_pack
             .iter()
@@ -15578,7 +15635,7 @@ mod tests {
             .expect("query pipeline is restored")
             .store();
         for evidence_id in &published_ids {
-            assert!(!evidence_id.0.starts_with("graphrag:report:"));
+            assert!(!evidence_id.0.starts_with("graphrag:"));
             assert!(
                 store.get_evidence(evidence_id).unwrap().is_some(),
                 "published evidence must resolve through Store: {}",
@@ -15592,10 +15649,12 @@ mod tests {
         let source_pack_payload = serde_json::to_string(&chat_payloads[0]).unwrap();
         let verifier_payload = serde_json::to_string(&chat_payloads[1]).unwrap();
         assert!(source_pack_payload.contains("SOURCE PACK"));
-        assert!(source_pack_payload.contains("Ordinary retrieval evidence"));
+        assert!(source_pack_payload.contains("authoritative stored passage"));
         assert!(verifier_payload.contains(&response.citations[0].evidence_id));
         assert!(!source_pack_payload.contains("graphrag:"));
         assert!(!verifier_payload.contains("graphrag:"));
+        assert!(!source_pack_payload.contains(graph_report_prose));
+        assert!(!verifier_payload.contains(graph_report_prose));
     }
 
     #[tokio::test]
