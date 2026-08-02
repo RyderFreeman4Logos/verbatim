@@ -1,0 +1,172 @@
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
+
+use super::*;
+
+async fn ask_stream_body(
+    name: &str,
+    verifier_enabled: bool,
+    chat_responses: &[&str],
+) -> (String, MockModelServer) {
+    let model_server =
+        MockModelServer::start_with_chat_responses(3, chat_responses.iter().copied()).await;
+    let test_dir = TestDir::new(name);
+    let source_path = test_dir.path().join("doc.md");
+    fs::write(
+        &source_path,
+        "The stored evidence says the safe answer is alpha.",
+    )
+    .unwrap();
+    let mut config = retrieve_test_config(&model_server.base_url);
+    config.embedding.enabled = false;
+    config.chat.enabled = true;
+    config.chat.base_url = model_server.base_url.clone();
+    config.chat.model = "test-chat".into();
+    config.rerank.enabled = false;
+    config.verifier.enabled = verifier_enabled;
+    let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let source_id = pipeline.add_source(&source_path).unwrap();
+    pipeline.ingest_source(&source_id).await.unwrap();
+    let state = test_state(config, test_dir.path(), pipeline);
+    let app = Router::new()
+        .route("/api/ask/stream", post(ask_stream))
+        .with_state(state);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/ask/stream")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&AskRequest {
+                question: "What does the stored evidence say?".into(),
+                source_id: Some(source_id.0),
+                collection_filter: CollectionFilterRequest::default(),
+                embedding_profile_id: None,
+                show_retrieval: false,
+                context_only: false,
+                limit: None,
+                page_size: None,
+                page: None,
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+
+    (String::from_utf8(body.to_vec()).unwrap(), model_server)
+}
+
+fn event_data<'a>(body: &'a str, event: &str) -> Vec<&'a str> {
+    body.split("\n\n")
+        .filter_map(|frame| {
+            let (event_line, data_line) = frame.split_once('\n')?;
+            (event_line.strip_prefix("event: ")? == event)
+                .then(|| data_line.strip_prefix("data: "))
+                .flatten()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn ask_stream_with_verifier_publishes_only_one_safe_answer() {
+    let raw_draft = "The safe answer is alpha [E1].";
+    let (body, model_server) = ask_stream_body(
+        "ask-stream-verifier-pass",
+        true,
+        &[raw_draft, r#"{"verdict":"pass","unsupported_claims":[]}"#],
+    )
+    .await;
+
+    assert!(event_data(&body, "token").is_empty(), "SSE: {body}");
+    let answers = event_data(&body, "answer");
+    assert_eq!(answers.len(), 1, "SSE: {body}");
+    let answer: AskResponse = serde_json::from_str(answers[0]).unwrap();
+    assert!(answer.answer.starts_with(raw_draft));
+    assert!(answer.verified);
+    assert_eq!(answer.citations.len(), 1);
+    assert_eq!(model_server.chat_requests(), 2);
+    assert!(model_server
+        .chat_payloads()
+        .iter()
+        .all(|payload| payload["stream"] == false));
+}
+
+#[tokio::test]
+async fn ask_stream_with_verifier_publishes_revision_without_superseded_draft() {
+    let raw_draft = "The unsafe draft says beta [E1].";
+    let revised = "The safe answer is alpha [E1].";
+    let (body, model_server) = ask_stream_body(
+        "ask-stream-verifier-revise",
+        true,
+        &[
+            raw_draft,
+            r#"{"verdict":"revise","unsupported_claims":["beta"]}"#,
+            revised,
+            r#"{"verdict":"pass","unsupported_claims":[]}"#,
+        ],
+    )
+    .await;
+
+    assert!(event_data(&body, "token").is_empty(), "SSE: {body}");
+    let answers = event_data(&body, "answer");
+    assert_eq!(answers.len(), 1, "SSE: {body}");
+    let answer: AskResponse = serde_json::from_str(answers[0]).unwrap();
+    assert!(answer.answer.starts_with(revised));
+    assert!(answer.verified);
+    assert_eq!(answer.citations.len(), 1);
+    assert!(!body.contains(raw_draft), "SSE leaked draft: {body}");
+    assert_eq!(model_server.chat_requests(), 4);
+    assert!(model_server
+        .chat_payloads()
+        .iter()
+        .all(|payload| payload["stream"] == false));
+}
+
+#[tokio::test]
+async fn ask_stream_with_invalid_verifier_publishes_only_safe_error() {
+    let raw_draft = "The private unsafe draft must never be published [E1].";
+    let (body, model_server) = ask_stream_body(
+        "ask-stream-verifier-invalid",
+        true,
+        &[raw_draft, "not valid verifier JSON"],
+    )
+    .await;
+
+    assert!(event_data(&body, "token").is_empty(), "SSE: {body}");
+    assert!(event_data(&body, "answer").is_empty(), "SSE: {body}");
+    let errors = event_data(&body, "error");
+    assert_eq!(errors.len(), 1, "SSE: {body}");
+    let error: AskErrorEvent = serde_json::from_str(errors[0]).unwrap();
+    assert_eq!(error.status, Some(500));
+    assert!(
+        error.error.starts_with("verifier returned invalid JSON:"),
+        "unexpected error: {}",
+        error.error
+    );
+    assert!(!body.contains(raw_draft), "SSE leaked draft: {body}");
+    assert_eq!(model_server.chat_requests(), 2);
+    assert!(model_server
+        .chat_payloads()
+        .iter()
+        .all(|payload| payload["stream"] == false));
+}
+
+#[tokio::test]
+async fn ask_stream_without_verifier_preserves_token_streaming() {
+    let raw_answer = "The unverified streamed answer is alpha [E1].";
+    let (body, model_server) =
+        ask_stream_body("ask-stream-verifier-disabled", false, &[raw_answer]).await;
+
+    let tokens = event_data(&body, "token");
+    assert_eq!(tokens.len(), 1, "SSE: {body}");
+    let token: AskTokenEvent = serde_json::from_str(tokens[0]).unwrap();
+    assert_eq!(token.text, raw_answer);
+    assert_eq!(event_data(&body, "citation").len(), 1, "SSE: {body}");
+    assert!(event_data(&body, "answer").is_empty(), "SSE: {body}");
+    assert_eq!(model_server.chat_requests(), 1);
+    assert_eq!(model_server.chat_payloads()[0]["stream"], true);
+}
