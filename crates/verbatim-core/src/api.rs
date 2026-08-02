@@ -159,6 +159,12 @@ pub struct AddSourceResponse {
     pub id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelocateSourceRequest {
+    pub source_id: String,
+    pub new_path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceResponse {
     pub id: String,

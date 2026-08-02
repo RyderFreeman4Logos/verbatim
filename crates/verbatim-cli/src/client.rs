@@ -14,9 +14,10 @@ use verbatim_core::api::{
     CollectionWatcherResponse, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
     ConfigResponse, CreateCollectionRequest, EvidenceResponse, HealthResponse, IndexGcRequest,
     IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse,
-    IngestResponse, ReindexRequest, ReindexResponse, RetrieveRequest, RetrieveResponse,
-    SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest, TaskListResponse,
-    TaskProfileResponse, TaskSummaryResponse, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
+    IngestResponse, ReindexRequest, ReindexResponse, RelocateSourceRequest, RetrieveRequest,
+    RetrieveResponse, SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest,
+    TaskListResponse, TaskProfileResponse, TaskSummaryResponse, VectorJsonCleanupRequest,
+    VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
@@ -82,6 +83,7 @@ pub trait DaemonClient {
     fn list_sources(&self) -> CliResult<Vec<SourceResponse>>;
     fn get_source(&self, id: &str) -> CliResult<SourceResponse>;
     fn remove_source(&self, id: &str) -> CliResult<()>;
+    fn relocate_source(&self, id: &str, new_path: &str) -> CliResult<SourceResponse>;
     fn check_sources(&self) -> CliResult<CheckStaleResponse>;
     fn create_collection(&self, request: &CreateCollectionRequest)
         -> CliResult<CollectionResponse>;
@@ -346,6 +348,17 @@ impl DaemonClient for HttpDaemonClient {
             return Ok(());
         }
         decode_response::<Value>(response).map(|_| ())
+    }
+
+    fn relocate_source(&self, id: &str, new_path: &str) -> CliResult<SourceResponse> {
+        self.request_json(
+            Method::POST,
+            "/api/source-relocations",
+            Some(&RelocateSourceRequest {
+                source_id: id.to_string(),
+                new_path: new_path.to_string(),
+            }),
+        )
     }
 
     fn check_sources(&self) -> CliResult<CheckStaleResponse> {
@@ -715,6 +728,7 @@ fn is_long_running_mutation(method: &Method, path: &str) -> bool {
     if method == Method::POST {
         return path == "/api/sources"
             || path == "/api/sources/check"
+            || path == "/api/source-relocations"
             || path == "/api/ingest"
             || path.starts_with("/api/ingest?")
             || path.starts_with("/api/ingest/")
@@ -935,6 +949,8 @@ mod tests {
 
     use super::*;
 
+    include!("tests/issue_332_client_route_tests.rs");
+
     #[test]
     fn bind_to_base_url_adds_http_scheme() {
         assert_eq!(
@@ -980,6 +996,10 @@ mod tests {
         );
         assert_eq!(
             json_timeout_policy(&Method::POST, "/api/sources/check"),
+            RequestTimeoutPolicy::LongRunning
+        );
+        assert_eq!(
+            json_timeout_policy(&Method::POST, "/api/source-relocations"),
             RequestTimeoutPolicy::LongRunning
         );
         assert_eq!(

@@ -88,7 +88,7 @@ pub(super) fn checkpoint_after_index<T>(
     Ok(outcome)
 }
 
-/// Map a storage failure from an indexing operation to the matching HTTP
+/// Map a SQLite storage failure from an operation to the matching HTTP
 /// status, preserving source-not-found and generic internal-error fallbacks.
 pub(super) fn indexing_operation_error(
     source_id: Option<&str>,

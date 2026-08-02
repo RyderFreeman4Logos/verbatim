@@ -26,6 +26,7 @@ const PATH_HEALTH: &str = "/api/health";
 const PATH_CONFIG: &str = "/api/config";
 const PATH_SOURCES: &str = "/api/sources";
 const PATH_SOURCE_BY_ID: &str = "/api/sources/{id}";
+const PATH_SOURCE_RELOCATIONS: &str = "/api/source-relocations";
 const PATH_DELETION_REPORTS: &str = "/api/deletions/reports";
 const PATH_SOURCES_CHECK: &str = "/api/sources/check";
 // Collection paths come from the core API contract; keep local aliases so the
@@ -73,6 +74,7 @@ pub(crate) const ROUTE_PATH_TEMPLATES: &[&str] = &[
     PATH_SOURCES,
     PATH_SOURCE_BY_ID,
     PATH_SOURCE_BY_ID,
+    PATH_SOURCE_RELOCATIONS,
     PATH_DELETION_REPORTS,
     PATH_SOURCES_CHECK,
     PATH_COLLECTIONS,
@@ -148,6 +150,7 @@ pub(crate) fn build_router(state: SharedState) -> Router {
         .route(PATH_SOURCES, get(super::list_sources))
         .route(PATH_SOURCE_BY_ID, get(super::get_source))
         .route(PATH_SOURCE_BY_ID, delete(super::delete_source))
+        .route(PATH_SOURCE_RELOCATIONS, post(super::relocate_source))
         .route(PATH_DELETION_REPORTS, get(super::list_deletion_reports))
         .route(PATH_SOURCES_CHECK, post(super::check_stale))
         .route(PATH_COLLECTIONS, post(super::create_collection))
@@ -282,8 +285,8 @@ mod tests {
             "registered_route_path_templates must report the same count build_router uses"
         );
         assert_eq!(
-            ROUTE_REGISTRATION_COUNT, 38,
-            "expected 38 daemon route registrations in the first #342 slice"
+            ROUTE_REGISTRATION_COUNT, 39,
+            "expected 39 daemon route registrations in the first #342 slice"
         );
     }
 
@@ -308,8 +311,8 @@ mod tests {
         );
         // Spot-check registrations use the shared path-constant values (same
         // literals build_router passes to `.route(...)`).
-        assert_eq!(registered_route_path_templates()[17], PATH_INGEST);
-        assert_eq!(registered_route_path_templates()[31], PATH_TASK_BY_ID);
+        assert_eq!(registered_route_path_templates()[18], PATH_INGEST);
+        assert_eq!(registered_route_path_templates()[32], PATH_TASK_BY_ID);
         assert_eq!(
             registered_route_path_templates(),
             [
@@ -319,6 +322,7 @@ mod tests {
                 PATH_SOURCES,
                 PATH_SOURCE_BY_ID,
                 PATH_SOURCE_BY_ID,
+                PATH_SOURCE_RELOCATIONS,
                 PATH_DELETION_REPORTS,
                 PATH_SOURCES_CHECK,
                 PATH_COLLECTIONS,
@@ -443,14 +447,14 @@ mod tests {
         );
 
         // And those shared values occupy the expected inventory slots.
-        assert_eq!(ROUTE_PATH_TEMPLATES[8], PATH_COLLECTIONS);
         assert_eq!(ROUTE_PATH_TEMPLATES[9], PATH_COLLECTIONS);
-        assert_eq!(ROUTE_PATH_TEMPLATES[10], PATH_COLLECTION_BY_NAME);
+        assert_eq!(ROUTE_PATH_TEMPLATES[10], PATH_COLLECTIONS);
         assert_eq!(ROUTE_PATH_TEMPLATES[11], PATH_COLLECTION_BY_NAME);
-        assert_eq!(ROUTE_PATH_TEMPLATES[12], PATH_COLLECTION_ROOTS);
-        assert_eq!(ROUTE_PATH_TEMPLATES[13], PATH_COLLECTION_SYNC);
-        assert_eq!(ROUTE_PATH_TEMPLATES[14], PATH_COLLECTION_STATUS);
-        assert_eq!(ROUTE_PATH_TEMPLATES[15], PATH_COLLECTION_WATCHERS_STATUS);
-        assert_eq!(ROUTE_PATH_TEMPLATES[16], PATH_COLLECTION_WATCHER);
+        assert_eq!(ROUTE_PATH_TEMPLATES[12], PATH_COLLECTION_BY_NAME);
+        assert_eq!(ROUTE_PATH_TEMPLATES[13], PATH_COLLECTION_ROOTS);
+        assert_eq!(ROUTE_PATH_TEMPLATES[14], PATH_COLLECTION_SYNC);
+        assert_eq!(ROUTE_PATH_TEMPLATES[15], PATH_COLLECTION_STATUS);
+        assert_eq!(ROUTE_PATH_TEMPLATES[16], PATH_COLLECTION_WATCHERS_STATUS);
+        assert_eq!(ROUTE_PATH_TEMPLATES[17], PATH_COLLECTION_WATCHER);
     }
 }

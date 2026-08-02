@@ -448,6 +448,22 @@ fn map_sqlite_error(operation: SqliteWriteOperation, error: SqliteError) -> anyh
     map_storage_error(operation, error.into())
 }
 
+/// Return whether an error chain contains a typed SQLite busy or locked failure.
+pub fn is_sqlite_busy_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<SqliteError>()
+            .and_then(SqliteError::sqlite_error)
+            .is_some_and(|sqlite| {
+                matches!(
+                    sqlite.code,
+                    rusqlite::ffi::ErrorCode::DatabaseBusy
+                        | rusqlite::ffi::ErrorCode::DatabaseLocked
+                )
+            })
+    })
+}
+
 /// Translate SQLite `SQLITE_FULL` and filesystem `ENOSPC` errors found in an
 /// error chain into the stable disk-full failure used by task/API boundaries.
 pub fn map_storage_error(operation: SqliteWriteOperation, error: anyhow::Error) -> anyhow::Error {

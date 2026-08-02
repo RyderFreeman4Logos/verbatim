@@ -31,6 +31,8 @@ use crate::vision_caption::{ImageCaption, ImageCaptionRecord, ImageCaptionStatus
 mod evidence_spans;
 #[path = "source_contents_replacement.rs"]
 mod source_contents_replacement;
+#[path = "source_relocation.rs"]
+pub(crate) mod source_relocation;
 #[path = "store_cache.rs"]
 mod store_cache;
 #[path = "store_deletion.rs"]
@@ -40,6 +42,7 @@ mod store_statement_count;
 pub use source_contents_replacement::{
     SourceContentsReplacement, SourceContentsReplacementReport, SourceLexicalIndexUpdate,
 };
+pub use source_relocation::{source_relocation_error_kind, SourceRelocationErrorKind};
 pub use store_cache::SourceEmbeddingCacheVector;
 
 #[cfg(test)]
@@ -60,8 +63,8 @@ mod sqlite_durability;
 #[path = "store_durability.rs"]
 mod store_durability;
 pub use sqlite_durability::{
-    map_storage_error, SqliteCheckpointMode, SqliteCheckpointStatus, SqliteDiskSpaceStatus,
-    SqliteDurabilityError, SqliteDurabilityProfile, SqliteDurabilityStatus,
+    is_sqlite_busy_error, map_storage_error, SqliteCheckpointMode, SqliteCheckpointStatus,
+    SqliteDiskSpaceStatus, SqliteDurabilityError, SqliteDurabilityProfile, SqliteDurabilityStatus,
     SqliteEffectiveDurability, SqliteWriteOperation,
 };
 
@@ -70,6 +73,12 @@ pub struct Store {
     durability_profile: SqliteDurabilityProfile,
     database_path: Option<PathBuf>,
     sql_statement_counting_available: bool,
+    #[cfg(test)]
+    source_relocation_before_mutation_hook: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    source_relocation_before_parse_hook: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    source_relocation_after_parse_hook: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Task list status filter used by bounded task overview queries.
@@ -445,6 +454,7 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         self.conn.execute_batch(SCHEMA)?;
+        source_relocation::ensure_unique_source_paths(&self.conn)?;
         self.conn.execute_batch(store_deletion::DELETION_SCHEMA)?;
         self.conn
             .execute_batch(store_deletion::PREVENT_RESURRECTED_SOURCES_TRIGGER)?;
@@ -584,35 +594,19 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare("SELECT id, path, hash, status, parser_used, last_ingested_at FROM sources")?;
-        let rows = stmt.query_map([], |row| {
-            Ok(Source {
-                id: SourceId(row.get(0)?),
-                path: std::path::PathBuf::from(row.get::<_, String>(1)?),
-                hash: row.get(2)?,
-                status: str_to_status(&row.get::<_, String>(3)?),
-                parser_used: row.get(4)?,
-                last_ingested_at: row.get(5)?,
-            })
-        })?;
+        let rows = stmt.query_map([], source_relocation::row_to_source)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     pub fn get_source(&self, id: &SourceId) -> Result<Option<Source>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, hash, status, parser_used, last_ingested_at FROM sources WHERE id = ?1")?;
-        let mut rows = stmt.query_map(params![id.0], |row| {
-            Ok(Source {
-                id: SourceId(row.get(0)?),
-                path: std::path::PathBuf::from(row.get::<_, String>(1)?),
-                hash: row.get(2)?,
-                status: str_to_status(&row.get::<_, String>(3)?),
-                parser_used: row.get(4)?,
-                last_ingested_at: row.get(5)?,
-            })
-        })?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
+        self.conn
+            .query_row(
+                "SELECT id, path, hash, status, parser_used, last_ingested_at FROM sources WHERE id = ?1",
+                params![id.0],
+                source_relocation::row_to_source,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     // --- Collections ---

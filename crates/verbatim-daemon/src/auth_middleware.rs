@@ -166,6 +166,7 @@ pub(super) fn endpoint_required_role(method: &Method, path: &str) -> Option<Role
             Some(Role::Reader)
         }
         (&Method::POST, "/api/sources")
+        | (&Method::POST, "/api/source-relocations")
         | (&Method::POST, "/api/reindex")
         | (&Method::POST, "/api/collections") => Some(Role::Editor),
         (&Method::POST, path)
@@ -435,6 +436,10 @@ mod tests {
         );
         assert_eq!(
             endpoint_required_role(&Method::POST, "/api/sources"),
+            Some(Role::Editor)
+        );
+        assert_eq!(
+            endpoint_required_role(&Method::POST, "/api/source-relocations"),
             Some(Role::Editor)
         );
         assert_eq!(

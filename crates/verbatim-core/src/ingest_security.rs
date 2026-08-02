@@ -10,15 +10,18 @@
 //! ingest entry point. See `docs/architecture/ingest-security-boundary.md`.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::image_limits::ImageArtifactLimits;
 use crate::types::hex_sha256;
+
+const INPUT_SNAPSHOT_HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Fail-closed defaults for untrusted ingest helpers and external tools.
 ///
@@ -202,22 +205,50 @@ pub struct InputSnapshotIdentity {
 }
 
 impl InputSnapshotIdentity {
-    /// Build an identity from path metadata plus a full content digest.
+    /// Build an identity from one opened file plus a full content digest.
     pub fn from_path(path: &Path) -> Result<Self> {
-        let metadata = fs::metadata(path)
-            .with_context(|| format!("stat input snapshot {}", path.display()))?;
-        if !metadata.is_file() {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let file = options
+            .open(path)
+            .with_context(|| format!("open input snapshot {}", path.display()))?;
+        Self::from_opened_file(path, &file)
+    }
+
+    /// Hash one already-opened file without resolving its path again.
+    pub(crate) fn from_opened_file(path: &Path, file: &fs::File) -> Result<Self> {
+        let before = file
+            .metadata()
+            .with_context(|| format!("stat opened input snapshot {}", path.display()))?;
+        if !before.is_file() {
             bail!("input snapshot is not a regular file: {}", path.display());
         }
-        let mut file = fs::File::open(path)
-            .with_context(|| format!("open input snapshot {}", path.display()))?;
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.read_to_end(&mut bytes)
+        let mut reader = file
+            .try_clone()
+            .with_context(|| format!("clone opened input snapshot {}", path.display()))?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .with_context(|| format!("rewind opened input snapshot {}", path.display()))?;
+        let content_sha256 = sha256_reader(&mut reader)
             .with_context(|| format!("read input snapshot {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("restat opened input snapshot {}", path.display()))?;
+        if before.len() != metadata.len()
+            || before.modified().ok() != metadata.modified().ok()
+            || file_inode(&before) != file_inode(&metadata)
+        {
+            bail!("input snapshot changed while reading: {}", path.display());
+        }
         Ok(Self {
             path: path.to_path_buf(),
             size_bytes: metadata.len(),
-            content_sha256: hex_sha256(&bytes),
+            content_sha256,
             modified: metadata.modified().ok(),
             inode: file_inode(&metadata),
         })
@@ -233,6 +264,19 @@ impl InputSnapshotIdentity {
             inode: None,
         }
     }
+}
+
+fn sha256_reader(reader: &mut impl Read) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; INPUT_SNAPSHOT_HASH_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(unix)]
@@ -536,6 +580,36 @@ mod tests {
 
         let from_bytes = InputSnapshotIdentity::from_bytes(&path, b"beta");
         assert_eq!(from_bytes.content_sha256, second.content_sha256);
+    }
+
+    #[test]
+    fn input_snapshot_hashing_streams_large_inputs_with_a_fixed_buffer() {
+        const INPUT_BYTES: usize = 8 * 1024 * 1024;
+
+        struct BoundedZeroReader {
+            remaining: usize,
+        }
+
+        impl Read for BoundedZeroReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert!(buffer.len() <= INPUT_SNAPSHOT_HASH_BUFFER_BYTES);
+                let read = self.remaining.min(buffer.len());
+                buffer[..read].fill(0);
+                self.remaining -= read;
+                Ok(read)
+            }
+        }
+
+        let actual = sha256_reader(&mut BoundedZeroReader {
+            remaining: INPUT_BYTES,
+        })
+        .unwrap();
+        let mut expected = Sha256::new();
+        let block = [0_u8; INPUT_SNAPSHOT_HASH_BUFFER_BYTES];
+        for _ in 0..(INPUT_BYTES / block.len()) {
+            expected.update(block);
+        }
+        assert_eq!(actual, format!("{:x}", expected.finalize()));
     }
 
     #[test]
