@@ -202,18 +202,36 @@ pub struct InputSnapshotIdentity {
 }
 
 impl InputSnapshotIdentity {
-    /// Build an identity from path metadata plus a full content digest.
+    /// Build an identity from one opened file plus a full content digest.
     pub fn from_path(path: &Path) -> Result<Self> {
-        let metadata = fs::metadata(path)
-            .with_context(|| format!("stat input snapshot {}", path.display()))?;
-        if !metadata.is_file() {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("open input snapshot {}", path.display()))?;
+        let before = file
+            .metadata()
+            .with_context(|| format!("stat opened input snapshot {}", path.display()))?;
+        if !before.is_file() {
             bail!("input snapshot is not a regular file: {}", path.display());
         }
-        let mut file = fs::File::open(path)
-            .with_context(|| format!("open input snapshot {}", path.display()))?;
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        let mut bytes = Vec::with_capacity(before.len() as usize);
         file.read_to_end(&mut bytes)
             .with_context(|| format!("read input snapshot {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("restat opened input snapshot {}", path.display()))?;
+        if before.len() != metadata.len()
+            || before.modified().ok() != metadata.modified().ok()
+            || file_inode(&before) != file_inode(&metadata)
+        {
+            bail!("input snapshot changed while reading: {}", path.display());
+        }
         Ok(Self {
             path: path.to_path_buf(),
             size_bytes: metadata.len(),

@@ -5,7 +5,9 @@
 //! transaction that updates location-bearing catalog fields.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,7 +18,7 @@ use super::{
     map_storage_error, row_to_evidence_unit, status_to_str, str_to_status, SqliteWriteOperation,
     Store,
 };
-use crate::ingest::{source_path_is_missing, IngestPipeline};
+use crate::ingest::IngestPipeline;
 use crate::ingest_security::InputSnapshotIdentity;
 use crate::parser;
 use crate::resource::{global_resource_registry, ResourceLimitConfig};
@@ -26,6 +28,42 @@ use crate::types::{
     SourceLocator, SourceStatus,
 };
 
+/// Stable daemon-facing classification for expected source relocation failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRelocationErrorKind {
+    /// The request conflicts with the catalog or accepted filesystem snapshot.
+    Validation,
+    /// The requested source identity is not present in the catalog.
+    NotFound,
+}
+
+#[derive(Debug)]
+struct SourceRelocationError {
+    kind: SourceRelocationErrorKind,
+    source: anyhow::Error,
+}
+
+impl fmt::Display for SourceRelocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SourceRelocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Return the typed client-actionable relocation category in an error chain.
+pub fn source_relocation_error_kind(error: &anyhow::Error) -> Option<SourceRelocationErrorKind> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<SourceRelocationError>()
+            .map(|typed| typed.kind)
+    })
+}
+
 impl<E> IngestPipeline<E>
 where
     E: EmbeddingClient,
@@ -33,66 +71,80 @@ where
     /// Record an external, content-identical file relocation without changing catalog identity.
     pub fn relocate_source(&mut self, source_id: &SourceId, new_path: &Path) -> Result<Source> {
         let operation = (|| {
-            let source = self
-                .store()
-                .get_source(source_id)?
-                .with_context(|| format!("source not found: {}", bounded_text(&source_id.0)))?;
-            if source.status != SourceStatus::Indexed {
-                bail!("source is not indexed");
-            }
-            let parser_used = source
-                .parser_used
-                .as_deref()
-                .context("source has no previous parser")?;
-            if !source_path_is_missing(&source.path)? {
-                bail!(
-                    "stored source path still exists: {}",
-                    bounded_path(&source.path)
-                );
-            }
-
-            let canonical_path = fs::canonicalize(new_path).with_context(|| {
-                format!("resolve relocation target: {}", bounded_path(new_path))
-            })?;
-            canonical_path.to_str().with_context(|| {
-                format!(
-                    "relocation target is not UTF-8: {}",
-                    bounded_path(&canonical_path)
+            let source = self.store().get_source(source_id)?.ok_or_else(|| {
+                relocation_error(
+                    SourceRelocationErrorKind::NotFound,
+                    anyhow::anyhow!("source not found: {}", bounded_text(&source_id.0)),
                 )
             })?;
+            if source.status != SourceStatus::Indexed {
+                return Err(validation_message("source is not indexed"));
+            }
+            let Some(parser_used) = source.parser_used.as_deref() else {
+                return Err(validation_message("source has no previous parser"));
+            };
+            if !path_entry_is_missing(&source.path)? {
+                return Err(validation_message(format!(
+                    "stored source path still exists: {}",
+                    bounded_path(&source.path)
+                )));
+            }
+
+            let opened_target = validated_target_snapshot(new_path)?;
+            let canonical_path = fs::canonicalize(new_path).map_err(|error| {
+                relocation_target_io_error("resolve relocation target", new_path, error)
+            })?;
+            if canonical_path.to_str().is_none() {
+                return Err(validation_message(format!(
+                    "relocation target is not UTF-8: {}",
+                    bounded_path(&canonical_path)
+                )));
+            }
+            let before = validated_target_snapshot(&canonical_path)?;
+            if !snapshots_identify_same_file(&opened_target, &before) {
+                return Err(validation_message(
+                    "relocation target changed while its canonical path was resolved",
+                ));
+            }
             if let Some(conflict) = self.store().get_source_by_path(&canonical_path)? {
                 if conflict.id != *source_id {
-                    bail!(
+                    return Err(validation_message(format!(
                         "relocation target belongs to source {}: {}",
                         bounded_text(&conflict.id.0),
                         bounded_path(&canonical_path)
-                    );
+                    )));
                 }
             }
 
-            let parser = parser::parser_for_extension(&canonical_path)?;
+            let parser = parser::parser_for_extension(&canonical_path).map_err(validation_error)?;
             if parser.name() != parser_used {
-                bail!(
+                return Err(validation_message(format!(
                     "relocation parser changed from {} to {}",
                     bounded_text(parser_used),
                     bounded_text(parser.name())
-                );
+                )));
             }
-            let before = InputSnapshotIdentity::from_path(&canonical_path)?;
             if before.content_sha256 != source.hash {
-                bail!("relocation target content hash differs from stored source hash");
+                return Err(validation_message(
+                    "relocation target content hash differs from stored source hash",
+                ));
             }
             let parsed = remap_parser_evidence_identity(
                 parser.parse(&canonical_path)?,
                 &SourceId::from_path(&canonical_path),
                 source_id,
-            )?;
-            let after = InputSnapshotIdentity::from_path(&canonical_path)?;
+            )
+            .map_err(validation_error)?;
+            let after = validated_target_snapshot(&canonical_path)?;
             if before != after {
-                bail!("relocation target changed while it was parsed");
+                return Err(validation_message(
+                    "relocation target changed while it was parsed",
+                ));
             }
             if after.content_sha256 != source.hash {
-                bail!("relocation target content hash changed from stored source hash");
+                return Err(validation_message(
+                    "relocation target content hash changed from stored source hash",
+                ));
             }
 
             let stored = self
@@ -101,9 +153,9 @@ where
                 .into_iter()
                 .filter(|unit| unit.kind == EvidenceKind::Text)
                 .collect::<Vec<_>>();
-            validate_relocation_evidence(&stored, &parsed)?;
+            validate_relocation_evidence(&stored, &parsed).map_err(validation_error)?;
             self.store()
-                .relocate_source(&source, &canonical_path, &stored, &parsed)
+                .relocate_source(&source, &canonical_path, &after, &stored, &parsed)
         })();
         operation.with_context(|| {
             format!(
@@ -135,6 +187,7 @@ impl Store {
         &self,
         expected_source: &Source,
         new_path: &Path,
+        expected_target: &InputSnapshotIdentity,
         expected_evidence: &[EvidenceUnit],
         relocated_evidence: &[EvidenceUnit],
     ) -> Result<Source> {
@@ -144,10 +197,10 @@ impl Store {
                 .zip(relocated_evidence)
                 .any(|(expected, relocated)| !evidence_matches_except_locator(expected, relocated))
         {
-            bail!(
+            return Err(validation_message(format!(
                 "relocation evidence changed for source {}",
                 bounded_text(&expected_source.id.0)
-            );
+            )));
         }
 
         let old_path = expected_source.path.to_str().with_context(|| {
@@ -212,6 +265,14 @@ impl Store {
         (|| {
             let tx =
                 Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
+            #[cfg(test)]
+            if let Some(hook) = self
+                .source_relocation_before_mutation_hook
+                .borrow_mut()
+                .take()
+            {
+                hook();
+            }
             let actual_source = tx
                 .query_row(
                     "SELECT id, path, hash, status, parser_used, last_ingested_at FROM sources WHERE id = ?1",
@@ -219,17 +280,17 @@ impl Store {
                     row_to_source,
                 )
                 .optional()?
-                .with_context(|| {
-                    format!(
+                .ok_or_else(|| {
+                    validation_message(format!(
                         "source disappeared during relocation: {}",
                         bounded_text(&expected_source.id.0)
-                    )
+                    ))
                 })?;
             if !sources_equal(&actual_source, expected_source) {
-                bail!(
+                return Err(validation_message(format!(
                     "source changed during relocation: {}",
                     bounded_text(&expected_source.id.0)
-                );
+                )));
             }
             if let Some(conflict) = tx
                 .query_row(
@@ -239,11 +300,11 @@ impl Store {
                 )
                 .optional()?
             {
-                bail!(
+                return Err(validation_message(format!(
                     "relocation path {} belongs to source {}",
                     bounded_path(new_path),
                     bounded_text(&conflict)
-                );
+                )));
             }
             if let Some(collection) = tx
                 .query_row(
@@ -253,18 +314,32 @@ impl Store {
                 )
                 .optional()?
             {
-                bail!(
+                return Err(validation_message(format!(
                     "source {} belongs to collection {}",
                     bounded_text(&expected_source.id.0),
                     bounded_text(&collection)
-                );
+                )));
             }
             let actual_evidence = direct_text_evidence_tx(&tx, &expected_source.id)?;
             if actual_evidence != expected_evidence {
-                bail!(
+                return Err(validation_message(format!(
                     "stored evidence changed during relocation for source {}",
                     bounded_text(&expected_source.id.0)
-                );
+                )));
+            }
+            if !path_entry_is_missing(&expected_source.path)? {
+                return Err(validation_message(format!(
+                    "stored source path reappeared during relocation: {}",
+                    bounded_path(&expected_source.path)
+                )));
+            }
+            let actual_target = validated_target_snapshot(new_path)?;
+            if actual_target != *expected_target
+                || actual_target.content_sha256 != expected_source.hash
+            {
+                return Err(validation_message(
+                    "relocation target changed before catalog mutation",
+                ));
             }
 
             require_changed_row(
@@ -309,10 +384,10 @@ impl Store {
                     |row| row.get(0),
                 )?;
                 if total_spans != matching_spans {
-                    bail!(
+                    return Err(validation_message(format!(
                         "span locator mismatch during relocation for evidence {}",
                         bounded_text(&evidence_id.0)
-                    );
+                    )));
                 }
                 let updated_spans = tx.execute(
                     "UPDATE chunk_evidence_spans SET locator_json = ?1
@@ -320,10 +395,10 @@ impl Store {
                     params![new_locator, &evidence_id.0, old_locator],
                 )?;
                 if updated_spans != total_spans {
-                    bail!(
+                    return Err(validation_message(format!(
                         "span locator update count changed for evidence {}",
                         bounded_text(&evidence_id.0)
-                    );
+                    )));
                 }
 
                 require_changed_row(
@@ -367,6 +442,104 @@ impl Store {
         })()
         .map_err(|error| map_storage_error(SqliteWriteOperation::Ingest, error))
     }
+}
+
+#[cfg(test)]
+impl Store {
+    pub(crate) fn set_source_relocation_before_mutation_hook(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        let previous = self
+            .source_relocation_before_mutation_hook
+            .borrow_mut()
+            .replace(Box::new(hook));
+        assert!(
+            previous.is_none(),
+            "source relocation test hook already set"
+        );
+    }
+}
+
+fn relocation_error(kind: SourceRelocationErrorKind, source: anyhow::Error) -> anyhow::Error {
+    SourceRelocationError { kind, source }.into()
+}
+
+fn validation_error(source: anyhow::Error) -> anyhow::Error {
+    relocation_error(SourceRelocationErrorKind::Validation, source)
+}
+
+fn validation_message(message: impl Into<String>) -> anyhow::Error {
+    validation_error(anyhow::anyhow!(message.into()))
+}
+
+fn path_entry_is_missing(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => {
+            Err(error).with_context(|| format!("check source path entry: {}", bounded_path(path)))
+        }
+    }
+}
+
+fn validated_target_snapshot(path: &Path) -> Result<InputSnapshotIdentity> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| relocation_target_io_error("inspect relocation target", path, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(validation_message(format!(
+            "relocation target must not be a symlink: {}",
+            bounded_path(path)
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(validation_message(format!(
+            "relocation target is not a regular file: {}",
+            bounded_path(path)
+        )));
+    }
+    InputSnapshotIdentity::from_path(path).map_err(|error| {
+        if snapshot_failure_is_validation(&error) {
+            validation_error(error)
+        } else {
+            error
+        }
+    })
+}
+
+fn relocation_target_io_error(action: &str, path: &Path, error: std::io::Error) -> anyhow::Error {
+    let validation = io_failure_is_target_change(&error);
+    let error = anyhow::Error::new(error).context(format!("{action}: {}", bounded_path(path)));
+    if validation {
+        validation_error(error)
+    } else {
+        error
+    }
+}
+
+fn snapshot_failure_is_validation(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .is_none_or(io_failure_is_target_change)
+}
+
+fn io_failure_is_target_change(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::NotFound
+        || matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::ELOOP || code == libc::EISDIR
+        )
+}
+
+fn snapshots_identify_same_file(
+    left: &InputSnapshotIdentity,
+    right: &InputSnapshotIdentity,
+) -> bool {
+    left.size_bytes == right.size_bytes
+        && left.content_sha256 == right.content_sha256
+        && left.modified == right.modified
+        && left.inode == right.inode
 }
 
 /// Remap a complete parser batch from temporary path identity to catalog identity.
@@ -578,10 +751,10 @@ fn source_graph_metadata(source: &Source, path: &Path) -> Result<String> {
 
 fn require_changed_row(changed: usize, row_kind: &str, identity: &str) -> Result<()> {
     if changed != 1 {
-        bail!(
+        return Err(validation_message(format!(
             "relocation guarded update matched {changed} {row_kind} rows for {}",
             bounded_text(identity)
-        );
+        )));
     }
     Ok(())
 }

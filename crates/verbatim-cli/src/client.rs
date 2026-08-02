@@ -332,11 +332,17 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn get_source(&self, id: &str) -> CliResult<SourceResponse> {
-        self.request_json::<SourceResponse, ()>(Method::GET, &format!("/api/sources/{id}"), None)
+        let segment = encode_source_id_segment(id);
+        self.request_json::<SourceResponse, ()>(
+            Method::GET,
+            &format!("/api/sources/{segment}"),
+            None,
+        )
     }
 
     fn remove_source(&self, id: &str) -> CliResult<()> {
-        let url = self.url(&format!("/api/sources/{id}"))?;
+        let segment = encode_source_id_segment(id);
+        let url = self.url(&format!("/api/sources/{segment}"))?;
         let response = self
             .apply_timeout(
                 auth::authorize_request(self.client.delete(&url), &url, self.auth_token.as_deref()),
@@ -351,10 +357,10 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn relocate_source(&self, id: &str, new_path: &str) -> CliResult<SourceResponse> {
-        let encoded_id = encode_query_component(id);
+        let segment = encode_source_id_segment(id);
         self.request_json(
             Method::POST,
-            &format!("/api/sources/{encoded_id}/relocate"),
+            &format!("/api/sources/{segment}/relocate"),
             Some(&RelocateSourceRequest {
                 new_path: new_path.to_string(),
             }),
@@ -832,6 +838,10 @@ fn encode_query_component(value: &str) -> String {
     encoded
 }
 
+fn encode_source_id_segment(value: &str) -> String {
+    format!("~{}", encode_query_component(value))
+}
+
 fn decode_response<T>(response: reqwest::blocking::Response) -> CliResult<T>
 where
     T: DeserializeOwned,
@@ -948,6 +958,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    include!("tests/issue_332_client_route_tests.rs");
 
     #[test]
     fn bind_to_base_url_adds_http_scheme() {
@@ -1106,26 +1118,6 @@ mod tests {
         let request = server.request();
         assert!(request.starts_with("POST /api/sources HTTP/1.1"));
         assert!(request.contains("\"path\":\"/tmp/doc.pdf\""));
-    }
-
-    #[test]
-    fn issue_332_http_relocate_encodes_opaque_source_id_as_one_path_segment() {
-        let server = TestServer::respond_once(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"opaque?query#fragment/segment\",\"path\":\"/srv/verbatim/renamed.md\",\"status\":\"Indexed\",\"hash\":\"hash-1\",\"parser_used\":\"markdown\",\"last_ingested_at\":\"now\"}",
-        );
-        let client = HttpDaemonClient::with_base_url(server.base_url());
-
-        let source = client
-            .relocate_source("opaque?query#fragment/segment", "/srv/verbatim/renamed.md")
-            .unwrap();
-
-        assert_eq!(source.id, "opaque?query#fragment/segment");
-        assert_eq!(source.path, "/srv/verbatim/renamed.md");
-        let request = server.request();
-        assert!(request.starts_with(
-            "POST /api/sources/opaque%3Fquery%23fragment%2Fsegment/relocate HTTP/1.1"
-        ));
-        assert!(request.contains("\"new_path\":\"/srv/verbatim/renamed.md\""));
     }
 
     #[test]
@@ -1638,7 +1630,7 @@ mod tests {
         assert!(!message.contains("Internal Server Error"));
         assert!(server
             .request()
-            .starts_with("DELETE /api/sources/__missing_source_smoke_retest__ HTTP/1.1"));
+            .starts_with("DELETE /api/sources/~__missing_source_smoke_retest__ HTTP/1.1"));
     }
 
     #[test]

@@ -41,6 +41,8 @@ impl Store {
             durability_profile,
             database_path: Some(path.to_path_buf()),
             sql_statement_counting_available: false,
+            #[cfg(test)]
+            source_relocation_before_mutation_hook: std::cell::RefCell::new(None),
         };
         store.ensure_write_capacity(SqliteWriteOperation::Migration)?;
         store
@@ -74,6 +76,8 @@ impl Store {
             durability_profile,
             database_path: Some(path.to_path_buf()),
             sql_statement_counting_available: true,
+            #[cfg(test)]
+            source_relocation_before_mutation_hook: std::cell::RefCell::new(None),
         })
     }
 
@@ -164,6 +168,8 @@ impl Store {
             durability_profile,
             database_path: None,
             sql_statement_counting_available: false,
+            #[cfg(test)]
+            source_relocation_before_mutation_hook: std::cell::RefCell::new(None),
         };
         store.migrate()?;
         Ok(store)

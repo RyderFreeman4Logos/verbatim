@@ -42,6 +42,7 @@ mod store_statement_count;
 pub use source_contents_replacement::{
     SourceContentsReplacement, SourceContentsReplacementReport, SourceLexicalIndexUpdate,
 };
+pub use source_relocation::{source_relocation_error_kind, SourceRelocationErrorKind};
 pub use store_cache::SourceEmbeddingCacheVector;
 
 #[cfg(test)]
@@ -72,6 +73,8 @@ pub struct Store {
     durability_profile: SqliteDurabilityProfile,
     database_path: Option<PathBuf>,
     sql_statement_counting_available: bool,
+    #[cfg(test)]
+    source_relocation_before_mutation_hook: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Task list status filter used by bounded task overview queries.

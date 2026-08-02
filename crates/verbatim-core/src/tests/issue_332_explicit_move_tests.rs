@@ -1,5 +1,5 @@
 use super::*;
-use crate::collection::{CollectionMemberCandidate, CollectionSyncReport};
+use crate::collection::{CollectionMemberCandidate, CollectionSyncPathInput, CollectionSyncReport};
 use crate::config::{ChatVisionAttachmentConfig, RetrievalConfig};
 use crate::generate::Generator;
 use crate::provider::{ChatModel, ChatRequest, ChatResponse, ChatStream, ProviderResult};
@@ -547,6 +547,90 @@ async fn issue_332_relocation_failures_preserve_original_snapshot() {
         .await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn issue_332_relocation_rejects_final_component_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let (mut pipeline, source_id, old_path) =
+        indexed_fixture(tempdir.path(), "symlink", false).await;
+    let real_target = tempdir.path().join("real.txt");
+    let symlink_target = tempdir.path().join("link.txt");
+    fs::rename(&old_path, &real_target).unwrap();
+    symlink(&real_target, &symlink_target).unwrap();
+    let before = catalog_snapshot(&pipeline, &source_id);
+
+    let error = pipeline
+        .relocate_source(&source_id, &symlink_target)
+        .unwrap_err();
+
+    assert_eq!(
+        crate::store::source_relocation_error_kind(&error),
+        Some(crate::store::SourceRelocationErrorKind::Validation)
+    );
+    assert!(format!("{error:#}").contains("must not be a symlink"));
+    assert_eq!(catalog_snapshot(&pipeline, &source_id), before);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn issue_332_relocation_revalidates_target_inside_transaction() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let (mut pipeline, source_id, old_path) =
+        indexed_fixture(tempdir.path(), "replace", false).await;
+    let target = tempdir.path().join("target.txt");
+    let replacement = tempdir.path().join("replacement.txt");
+    fs::rename(&old_path, &target).unwrap();
+    fs::write(
+        &replacement,
+        "replacement bytes accepted by no prior validation",
+    )
+    .unwrap();
+    let before = catalog_snapshot(&pipeline, &source_id);
+    let target_for_hook = target.clone();
+    pipeline
+        .store()
+        .set_source_relocation_before_mutation_hook(move || {
+            fs::rename(replacement, target_for_hook).unwrap();
+        });
+
+    let error = pipeline.relocate_source(&source_id, &target).unwrap_err();
+
+    assert_eq!(
+        crate::store::source_relocation_error_kind(&error),
+        Some(crate::store::SourceRelocationErrorKind::Validation)
+    );
+    assert!(format!("{error:#}").contains("changed before catalog mutation"));
+    assert_eq!(catalog_snapshot(&pipeline, &source_id), before);
+}
+
+#[tokio::test]
+async fn issue_332_relocation_revalidates_old_path_inside_transaction() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let (mut pipeline, source_id, old_path) =
+        indexed_fixture(tempdir.path(), "reappear", false).await;
+    let target = tempdir.path().join("target.txt");
+    fs::rename(&old_path, &target).unwrap();
+    let original_bytes = fs::read(&target).unwrap();
+    let before = catalog_snapshot(&pipeline, &source_id);
+    let old_path_for_hook = old_path.clone();
+    pipeline
+        .store()
+        .set_source_relocation_before_mutation_hook(move || {
+            fs::write(old_path_for_hook, original_bytes).unwrap();
+        });
+
+    let error = pipeline.relocate_source(&source_id, &target).unwrap_err();
+
+    assert_eq!(
+        crate::store::source_relocation_error_kind(&error),
+        Some(crate::store::SourceRelocationErrorKind::Validation)
+    );
+    assert!(format!("{error:#}").contains("reappeared during relocation"));
+    assert_eq!(catalog_snapshot(&pipeline, &source_id), before);
+}
+
 #[tokio::test]
 async fn issue_332_source_path_uniqueness_fails_closed() {
     let tempdir = tempfile::tempdir().unwrap();
@@ -603,4 +687,27 @@ async fn issue_332_source_path_uniqueness_fails_closed() {
     pipeline.relocate_source(&source_id, &new_path).unwrap();
     assert_eq!(pipeline.add_source(&new_path).unwrap(), source_id);
     assert_eq!(pipeline.store().list_sources().unwrap().len(), 1);
+
+    fs::write(&old_path, "unrelated bytes at the reused old path").unwrap();
+    let direct_error = pipeline.add_source(&old_path).unwrap_err();
+    assert!(format!("{direct_error:#}").contains("source identity conflict"));
+    assert_eq!(pipeline.store().list_sources().unwrap().len(), 1);
+
+    pipeline.store().create_collection("reused", &[]).unwrap();
+    let sync_error = pipeline
+        .sync_collection(
+            "reused",
+            &[CollectionSyncPathInput {
+                path: old_path,
+                logical_path: None,
+            }],
+            None,
+        )
+        .unwrap_err();
+    assert!(format!("{sync_error:#}").contains("source identity conflict"));
+    assert!(pipeline
+        .store()
+        .list_collection_members("reused")
+        .unwrap()
+        .is_empty());
 }

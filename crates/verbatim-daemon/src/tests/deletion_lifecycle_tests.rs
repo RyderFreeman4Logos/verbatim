@@ -10,9 +10,12 @@ async fn delete_source_returns_accepted_when_remote_erasure_is_pending() {
     let source_id = pipeline.add_source(&source_path).unwrap();
     let state = test_state(config, test_dir.path(), pipeline);
 
-    let response = delete_source(State(Arc::clone(&state)), Path(source_id.0.clone()))
-        .await
-        .unwrap();
+    let response = delete_source(
+        State(Arc::clone(&state)),
+        Path(format!("~{}", source_id.0)),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
@@ -39,9 +42,12 @@ async fn delete_source_with_disabled_qdrant_persists_terminal_receipt_and_return
     let source_id = pipeline.add_source(&source_path).unwrap();
     let state = test_state(config, test_dir.path(), pipeline);
 
-    let response = delete_source(State(Arc::clone(&state)), Path(source_id.0.clone()))
-        .await
-        .unwrap();
+    let response = delete_source(
+        State(Arc::clone(&state)),
+        Path(format!("~{}", source_id.0)),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let report = with_task_store_read(&state, move |store| store.latest_deletion_report(&source_id))

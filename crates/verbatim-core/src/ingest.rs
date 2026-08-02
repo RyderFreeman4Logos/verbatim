@@ -1513,8 +1513,13 @@ where
             return Ok(source.id);
         }
         let id = SourceId::from_path(&abs_path);
-        if self.store.get_source(&id)?.is_some() {
-            return Ok(id);
+        if let Some(existing) = self.store.get_source(&id)? {
+            bail!(
+                "source identity conflict: {} is already bound to {}, not {}",
+                id.0,
+                existing.path.display(),
+                abs_path.display()
+            );
         }
 
         let hash = file_hash(&abs_path)?;

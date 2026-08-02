@@ -52,6 +52,61 @@ fn issue_332_retrieve_request(source_id: &SourceId) -> RetrieveRequest {
 }
 
 #[tokio::test]
+async fn issue_332_source_routes_decode_the_shared_opaque_segment_protocol() {
+    let test_dir = TestDir::new("issue-332-route-opaque-source-id");
+    let source_path = test_dir.path().join("opaque.md");
+    fs::write(&source_path, "opaque route source").unwrap();
+    let source_id = SourceId("._.._%雪/?#~prefixed".into());
+    let config = retrieve_test_config("http://127.0.0.1:9/v1");
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    pipeline
+        .store()
+        .add_source(&verbatim_core::types::Source {
+            id: source_id.clone(),
+            path: fs::canonicalize(&source_path).unwrap(),
+            hash: "opaque-hash".into(),
+            status: SourceStatus::Pending,
+            parser_used: None,
+            last_ingested_at: None,
+        })
+        .unwrap();
+    let state = test_state(config, test_dir.path(), pipeline);
+    let app = daemon_router(Arc::clone(&state));
+    let segment = "~._.._%25%E9%9B%AA%2F%3F%23~prefixed";
+
+    let response = issue_332_request(
+        &app,
+        Method::GET,
+        &format!("/api/sources/{segment}"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let source: SourceResponse = issue_332_body(response).await;
+    assert_eq!(source.id, source_id.0);
+
+    let response = issue_332_request(
+        &app,
+        Method::POST,
+        &format!("/api/sources/{segment}/relocate"),
+        serde_json::json!({ "new_path": test_dir.path().join("unused.md") }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: serde_json::Value = issue_332_body(response).await;
+    assert!(error["error"].as_str().unwrap().contains("not indexed"));
+
+    let response = issue_332_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/sources/{segment}"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn issue_332_public_relocation_preserves_retrieval_and_citation_resolution() {
     let model_server = MockModelServer::start(3).await;
     let test_dir = TestDir::new("issue-332-route-success");
@@ -79,7 +134,7 @@ async fn issue_332_public_relocation_preserves_retrieval_and_citation_resolution
     let response = issue_332_request(
         &app,
         Method::POST,
-        &format!("/api/sources/{}/relocate", source_id.0),
+        &format!("/api/sources/~{}/relocate", source_id.0),
         serde_json::json!({ "new_path": new_path }),
     )
     .await;
@@ -142,7 +197,7 @@ async fn issue_332_public_relocation_changed_bytes_preserves_catalog_snapshot() 
     let response = issue_332_request(
         &app,
         Method::POST,
-        &format!("/api/sources/{}/relocate", source_id.0),
+        &format!("/api/sources/~{}/relocate", source_id.0),
         serde_json::json!({ "new_path": new_path }),
     )
     .await;
@@ -170,6 +225,31 @@ async fn issue_332_public_relocation_changed_bytes_preserves_catalog_snapshot() 
         serde_json::to_value(evidence_after).unwrap(),
         serde_json::to_value(evidence_before).unwrap()
     );
+}
+
+#[tokio::test]
+async fn issue_332_long_missing_source_id_returns_not_found() {
+    let test_dir = TestDir::new("issue-332-route-long-not-found");
+    let config = retrieve_test_config("http://127.0.0.1:9/v1");
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let state = test_state(config, test_dir.path(), pipeline);
+    let app = daemon_router(state);
+    let source_id = "x".repeat(300);
+
+    let response = issue_332_request(
+        &app,
+        Method::POST,
+        &format!("/api/sources/~{source_id}/relocate"),
+        serde_json::json!({ "new_path": test_dir.path().join("missing.md") }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: serde_json::Value = issue_332_body(response).await;
+    assert!(error["error"]
+        .as_str()
+        .unwrap()
+        .contains("source not found"));
 }
 
 #[tokio::test]
@@ -205,7 +285,7 @@ async fn issue_332_public_relocation_sqlite_failpoint_returns_internal_server_er
     let response = issue_332_request(
         &app,
         Method::POST,
-        &format!("/api/sources/{}/relocate", source_id.0),
+        &format!("/api/sources/~{}/relocate", source_id.0),
         serde_json::json!({ "new_path": new_path }),
     )
     .await;
