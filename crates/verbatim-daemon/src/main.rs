@@ -115,6 +115,8 @@ mod auth_middleware;
 mod deletion_api;
 #[path = "routes.rs"]
 mod routes;
+#[path = "source_relocation_api.rs"]
+mod source_relocation_api;
 #[path = "sqlite_durability_ops.rs"]
 mod sqlite_durability_ops;
 
@@ -122,6 +124,7 @@ use deletion_api::{
     delete_source, list_deletion_reports, reconcile_deletions_on_startup,
     start_deletion_reconcile_scheduler, STARTUP_DELETION_RECONCILE_BATCH_SIZE,
 };
+use source_relocation_api::relocate_source;
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -9728,6 +9731,8 @@ mod tests {
     mod ask_stream_verification_tests;
     #[path = "../auth_middleware_daemon_tests.rs"]
     mod auth_middleware_daemon_tests;
+    #[path = "issue_332_explicit_move_route_tests.rs"]
+    mod issue_332_explicit_move_route_tests;
     #[path = "sql_statement_telemetry_tests.rs"]
     mod sql_statement_telemetry_tests;
     #[path = "sqlite_durability_tests.rs"]

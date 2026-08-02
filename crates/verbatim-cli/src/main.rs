@@ -20,6 +20,7 @@ mod auth;
 mod client;
 mod local;
 mod render;
+mod source_cli;
 mod sse;
 
 use client::{CliError, DaemonClient, HttpDaemonClient, TaskWaitTimeout};
@@ -240,7 +241,7 @@ where
     L: LocalActions,
 {
     match cli.command {
-        Commands::Source { command } => run_source(command, stdout, client),
+        Commands::Source { command } => source_cli::run_source(command, stdout, client),
         Commands::Collection { command } => run_collection(command, stdout, client),
         Commands::Index { command } => run_index(command, stdout, client),
         Commands::Ingest {
@@ -522,59 +523,6 @@ where
     }
 
     Ok(())
-}
-
-fn run_source<W, C>(command: SourceCommand, stdout: &mut W, client: &C) -> Result<u8, CliError>
-where
-    W: Write,
-    C: DaemonClient,
-{
-    match command {
-        SourceCommand::Add { path } => {
-            let response = client.add_source(&path)?;
-            writeln!(stdout, "Added source: {}", response.id)?;
-        }
-        SourceCommand::List {
-            details,
-            limit,
-            status,
-        } => {
-            if limit == Some(0) {
-                return Err(CliError::Api("--limit must be >= 1".to_string()));
-            }
-            let sources = client.list_sources()?;
-            let filtered: Vec<_> = match &status {
-                Some(s) => sources
-                    .iter()
-                    .filter(|src| src.status == *s)
-                    .cloned()
-                    .collect(),
-                None => sources,
-            };
-            if details {
-                let limited: Vec<_> = match limit {
-                    Some(n) => filtered.iter().take(n).cloned().collect(),
-                    None => filtered.clone(),
-                };
-                render::write_sources(stdout, &limited)?;
-            } else {
-                render::write_source_summary(stdout, &filtered, limit)?;
-            }
-        }
-        SourceCommand::Inspect { id } => {
-            let source = client.get_source(&id)?;
-            render::write_source(stdout, &source)?;
-        }
-        SourceCommand::Remove { id } => {
-            client.remove_source(&id)?;
-            writeln!(stdout, "Removed source: {id}")?;
-        }
-        SourceCommand::Check => {
-            let response = client.check_sources()?;
-            render::write_check_stale(stdout, &response)?;
-        }
-    }
-    Ok(0)
 }
 
 fn run_collection<W, C>(
@@ -1033,6 +981,11 @@ const SOURCE_REMOVE_AFTER_HELP: &str = r#"Examples:
 
 Remove unregisters the source from the daemon catalog. It is not a shell rm for
 the original file path.
+"#;
+
+const SOURCE_RELOCATE_AFTER_HELP: &str = r#"Examples:
+  verbatim source relocate <source-id> /srv/verbatim/renamed.md
+NEW_PATH must be visible to the daemon host, and the file content must be unchanged.
 "#;
 
 const SOURCE_CHECK_AFTER_HELP: &str = r#"Examples:
@@ -1796,6 +1749,16 @@ enum SourceCommand {
         #[arg(value_name = "SOURCE_ID")]
         id: String,
     },
+    /// Relocate one externally renamed source without changing its identity.
+    #[command(after_help = SOURCE_RELOCATE_AFTER_HELP)]
+    Relocate {
+        /// Source id whose stored path no longer exists.
+        #[arg(value_name = "SOURCE_ID")]
+        id: String,
+        /// New content-identical file path visible to the daemon host.
+        #[arg(value_name = "NEW_PATH")]
+        new_path: String,
+    },
     /// Mark and list stale sources.
     #[command(
         about = "Check registered sources for stale hashes.",
@@ -2217,6 +2180,8 @@ mod tests {
 
     #[path = "config_template_tests.rs"]
     mod config_template_tests;
+    #[path = "issue_332_cli_relocation_tests.rs"]
+    mod issue_332_cli_relocation_tests;
 
     use serde_json::Value;
     use verbatim_core::api::{
@@ -4872,6 +4837,16 @@ mod tests {
         fn remove_source(&self, id: &str) -> client::CliResult<()> {
             self.calls.borrow_mut().push(format!("remove_source:{id}"));
             Ok(())
+        }
+
+        fn relocate_source(&self, id: &str, new_path: &str) -> client::CliResult<SourceResponse> {
+            self.calls
+                .borrow_mut()
+                .push(format!("relocate_source:{id}:{new_path}"));
+            let mut source = sample_source();
+            source.id = id.to_string();
+            source.path = new_path.to_string();
+            Ok(source)
         }
 
         fn check_sources(&self) -> client::CliResult<CheckStaleResponse> {
