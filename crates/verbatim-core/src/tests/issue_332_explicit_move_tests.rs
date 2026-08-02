@@ -653,6 +653,42 @@ async fn issue_332_relocation_revalidates_target_inside_transaction() {
     assert_eq!(catalog_snapshot(&pipeline, &source_id), before);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn issue_332_relocation_rejects_fifo_without_holding_writer() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, sync::mpsc, thread, time::Duration};
+    let tempdir = tempfile::tempdir().unwrap();
+    let (mut pipeline, source_id, old_path) = indexed_fixture(tempdir.path(), "fifo", false).await;
+    let target = tempdir.path().join("target.txt");
+    fs::rename(&old_path, &target).unwrap();
+    let before = catalog_snapshot(&pipeline, &source_id);
+    let target_for_hook = target.clone();
+    pipeline
+        .store()
+        .set_source_relocation_before_mutation_hook(move || {
+            fs::remove_file(&target_for_hook).unwrap();
+            let target_bytes = CString::new(target_for_hook.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `target_bytes` is NUL-terminated and remains valid for the call.
+            let result = unsafe { libc::mkfifo(target_bytes.as_ptr(), 0o600) };
+            assert_eq!(result, 0);
+        });
+    let source_id_for_relocation = source_id.clone();
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = pipeline.relocate_source(&source_id_for_relocation, &target);
+        result_tx.send((pipeline, result)).unwrap();
+    });
+    let (pipeline, result) = result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("FIFO replacement must not block relocation while holding the SQLite writer");
+    let error = result.unwrap_err();
+    assert_eq!(
+        crate::store::source_relocation_error_kind(&error),
+        Some(crate::store::SourceRelocationErrorKind::Validation)
+    );
+    assert_eq!(catalog_snapshot(&pipeline, &source_id), before);
+}
+
 #[tokio::test]
 async fn issue_332_relocation_revalidates_old_path_inside_transaction() {
     let tempdir = tempfile::tempdir().unwrap();

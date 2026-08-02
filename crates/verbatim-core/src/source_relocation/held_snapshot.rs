@@ -68,7 +68,7 @@ fn open_canonical_target_without_links(path: &Path) -> Result<fs::File> {
     // SAFETY: `open_how` contains only integer fields and the kernel requires
     // every field not explicitly set by the caller to be zero.
     let mut how = unsafe { std::mem::zeroed::<libc::open_how>() };
-    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+    how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
     how.resolve = libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
     // SAFETY: `path_bytes` is NUL-terminated, `how` is initialized, and both
     // pointers remain valid for the duration of the `openat2` syscall.
@@ -111,7 +111,9 @@ pub(super) fn open_relocation_target(path: &Path) -> Result<fs::File> {
         )));
     }
     let mut options = fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     let file = options
         .open(path)
         .map_err(|error| relocation_target_io_error("open relocation target", path, error))?;
@@ -162,6 +164,6 @@ fn io_failure_is_target_change(error: &std::io::Error) -> bool {
     error.kind() == ErrorKind::NotFound
         || matches!(
             error.raw_os_error(),
-            Some(code) if code == libc::ELOOP || code == libc::EISDIR
+            Some(code) if code == libc::ENXIO || code == libc::ELOOP || code == libc::EISDIR
         )
 }
