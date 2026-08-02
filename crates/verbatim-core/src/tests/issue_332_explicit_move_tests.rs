@@ -575,6 +575,54 @@ async fn issue_332_relocation_rejects_final_component_symlink() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn issue_332_relocation_parses_held_snapshot_across_path_aba() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let (mut pipeline, source_id, old_path) =
+        indexed_fixture(tempdir.path(), "parse-aba", false).await;
+    let target = tempdir.path().join("target.txt");
+    let held_backup = tempdir.path().join("held-backup.txt");
+    let replacement = tempdir.path().join("replacement.txt");
+    fs::rename(&old_path, &target).unwrap();
+    let original_bytes = fs::read(&target).unwrap();
+    let mut replacement_bytes = original_bytes.clone();
+    replacement_bytes.extend_from_slice(b"\r\n");
+    assert_ne!(replacement_bytes, original_bytes);
+    fs::write(&replacement, replacement_bytes).unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let target_before_parse = target.clone();
+    let replacement_target = target.clone();
+    let target_after_parse = target.clone();
+    let backup_before_parse = held_backup.clone();
+    let backup_after_parse = held_backup.clone();
+    pipeline.store().set_source_relocation_parse_hooks(
+        move || {
+            fs::rename(target_before_parse, backup_before_parse).unwrap();
+            fs::rename(replacement, replacement_target).unwrap();
+        },
+        move || {
+            fs::remove_file(&target_after_parse).unwrap();
+            fs::rename(backup_after_parse, target_after_parse).unwrap();
+        },
+    );
+
+    let relocated = pipeline.relocate_source(&source_id, &target).unwrap();
+
+    assert_eq!(relocated.path, fs::canonicalize(&target).unwrap());
+    assert_eq!(fs::read(&target).unwrap(), original_bytes);
+    for evidence in pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap()
+    {
+        assert_locator_path(&evidence.locator, &relocated.path);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn issue_332_relocation_revalidates_target_inside_transaction() {
     let tempdir = tempfile::tempdir().unwrap();
     let (mut pipeline, source_id, old_path) =
@@ -601,7 +649,7 @@ async fn issue_332_relocation_revalidates_target_inside_transaction() {
         crate::store::source_relocation_error_kind(&error),
         Some(crate::store::SourceRelocationErrorKind::Validation)
     );
-    assert!(format!("{error:#}").contains("changed before catalog mutation"));
+    assert!(format!("{error:#}").contains("no longer identifies the held snapshot"));
     assert_eq!(catalog_snapshot(&pipeline, &source_id), before);
 }
 
@@ -627,7 +675,7 @@ async fn issue_332_relocation_revalidates_old_path_inside_transaction() {
         crate::store::source_relocation_error_kind(&error),
         Some(crate::store::SourceRelocationErrorKind::Validation)
     );
-    assert!(format!("{error:#}").contains("reappeared during relocation"));
+    assert!(format!("{error:#}").contains("reappeared before relocation commit"));
     assert_eq!(catalog_snapshot(&pipeline, &source_id), before);
 }
 

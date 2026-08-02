@@ -63,9 +63,9 @@ mod sqlite_durability;
 #[path = "store_durability.rs"]
 mod store_durability;
 pub use sqlite_durability::{
-    is_sqlite_storage_error, map_storage_error, SqliteCheckpointMode, SqliteCheckpointStatus,
-    SqliteDiskSpaceStatus, SqliteDurabilityError, SqliteDurabilityProfile, SqliteDurabilityStatus,
-    SqliteEffectiveDurability, SqliteWriteOperation,
+    is_sqlite_busy_error, is_sqlite_storage_error, map_storage_error, SqliteCheckpointMode,
+    SqliteCheckpointStatus, SqliteDiskSpaceStatus, SqliteDurabilityError, SqliteDurabilityProfile,
+    SqliteDurabilityStatus, SqliteEffectiveDurability, SqliteWriteOperation,
 };
 
 pub struct Store {
@@ -75,6 +75,10 @@ pub struct Store {
     sql_statement_counting_available: bool,
     #[cfg(test)]
     source_relocation_before_mutation_hook: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    source_relocation_before_parse_hook: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    source_relocation_after_parse_hook: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Task list status filter used by bounded task overview queries.

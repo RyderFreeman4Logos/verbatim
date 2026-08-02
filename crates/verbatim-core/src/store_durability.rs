@@ -43,6 +43,10 @@ impl Store {
             sql_statement_counting_available: false,
             #[cfg(test)]
             source_relocation_before_mutation_hook: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            source_relocation_before_parse_hook: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            source_relocation_after_parse_hook: std::cell::RefCell::new(None),
         };
         store.ensure_write_capacity(SqliteWriteOperation::Migration)?;
         store
@@ -78,6 +82,10 @@ impl Store {
             sql_statement_counting_available: true,
             #[cfg(test)]
             source_relocation_before_mutation_hook: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            source_relocation_before_parse_hook: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            source_relocation_after_parse_hook: std::cell::RefCell::new(None),
         })
     }
 
@@ -170,6 +178,10 @@ impl Store {
             sql_statement_counting_available: false,
             #[cfg(test)]
             source_relocation_before_mutation_hook: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            source_relocation_before_parse_hook: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            source_relocation_after_parse_hook: std::cell::RefCell::new(None),
         };
         store.migrate()?;
         Ok(store)
@@ -265,6 +277,20 @@ mod tests {
                 operation: SqliteWriteOperation::IndexBuild
             })
         ));
+    }
+
+    #[test]
+    fn sqlite_busy_and_locked_are_detected_by_typed_error_code() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            assert!(is_sqlite_busy_error(&error.into()));
+        }
+
+        let full = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        );
+        assert!(!is_sqlite_busy_error(&full.into()));
     }
 
     #[test]

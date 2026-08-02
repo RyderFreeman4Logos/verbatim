@@ -19,7 +19,6 @@ use super::{
     Store,
 };
 use crate::ingest::IngestPipeline;
-use crate::ingest_security::InputSnapshotIdentity;
 use crate::parser;
 use crate::resource::{global_resource_registry, ResourceLimitConfig};
 use crate::traits::EmbeddingClient;
@@ -27,6 +26,11 @@ use crate::types::{
     EvidenceId, EvidenceKind, EvidenceUnit, GraphNodeId, GraphNodeKind, Source, SourceId,
     SourceLocator, SourceStatus,
 };
+
+#[path = "source_relocation/held_snapshot.rs"]
+mod held_snapshot;
+
+use held_snapshot::{open_relocation_target, relocation_target_io_error, HeldInputSnapshot};
 
 /// Stable daemon-facing classification for expected source relocation failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +94,7 @@ where
                 )));
             }
 
-            let opened_target = validated_target_snapshot(new_path)?;
+            let target_file = open_relocation_target(new_path)?;
             let canonical_path = fs::canonicalize(new_path).map_err(|error| {
                 relocation_target_io_error("resolve relocation target", new_path, error)
             })?;
@@ -100,12 +104,8 @@ where
                     bounded_path(&canonical_path)
                 )));
             }
-            let before = validated_target_snapshot(&canonical_path)?;
-            if !snapshots_identify_same_file(&opened_target, &before) {
-                return Err(validation_message(
-                    "relocation target changed while its canonical path was resolved",
-                ));
-            }
+            let target = HeldInputSnapshot::new(target_file, canonical_path.clone())?;
+            target.validate_path_binding(&canonical_path)?;
             if let Some(conflict) = self.store().get_source_by_path(&canonical_path)? {
                 if conflict.id != *source_id {
                     return Err(validation_message(format!(
@@ -124,28 +124,38 @@ where
                     bounded_text(parser.name())
                 )));
             }
-            if before.content_sha256 != source.hash {
+            if target.identity.content_sha256 != source.hash {
                 return Err(validation_message(
                     "relocation target content hash differs from stored source hash",
                 ));
             }
-            let parsed = remap_parser_evidence_identity(
-                parser.parse(&canonical_path)?,
-                &SourceId::from_path(&canonical_path),
-                source_id,
-            )
-            .map_err(validation_error)?;
-            let after = validated_target_snapshot(&canonical_path)?;
-            if before != after {
-                return Err(validation_message(
-                    "relocation target changed while it was parsed",
-                ));
+            let parser_path = target.parser_path();
+            #[cfg(test)]
+            if let Some(hook) = self
+                .store()
+                .source_relocation_before_parse_hook
+                .borrow_mut()
+                .take()
+            {
+                hook();
             }
-            if after.content_sha256 != source.hash {
-                return Err(validation_message(
-                    "relocation target content hash changed from stored source hash",
-                ));
+            let parser_source_id = SourceId::from_path(&parser_path);
+            let parsed = parser.parse(&parser_path);
+            #[cfg(test)]
+            if let Some(hook) = self
+                .store()
+                .source_relocation_after_parse_hook
+                .borrow_mut()
+                .take()
+            {
+                hook();
             }
+            let mut parsed = remap_parser_evidence_identity(parsed?, &parser_source_id, source_id)
+                .map_err(validation_error)?;
+            rewrite_relocation_locator_paths(&mut parsed, &parser_path, &canonical_path)
+                .map_err(validation_error)?;
+            target.validate_content_identity(&source.hash)?;
+            target.validate_path_binding(&canonical_path)?;
 
             let stored = self
                 .store()
@@ -155,7 +165,7 @@ where
                 .collect::<Vec<_>>();
             validate_relocation_evidence(&stored, &parsed).map_err(validation_error)?;
             self.store()
-                .relocate_source(&source, &canonical_path, &after, &stored, &parsed)
+                .relocate_source(&source, &canonical_path, &target, &stored, &parsed)
         })();
         operation.with_context(|| {
             format!(
@@ -183,11 +193,11 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub(crate) fn relocate_source(
+    fn relocate_source(
         &self,
         expected_source: &Source,
         new_path: &Path,
-        expected_target: &InputSnapshotIdentity,
+        expected_target: &HeldInputSnapshot,
         expected_evidence: &[EvidenceUnit],
         relocated_evidence: &[EvidenceUnit],
     ) -> Result<Source> {
@@ -265,14 +275,6 @@ impl Store {
         (|| {
             let tx =
                 Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
-            #[cfg(test)]
-            if let Some(hook) = self
-                .source_relocation_before_mutation_hook
-                .borrow_mut()
-                .take()
-            {
-                hook();
-            }
             let actual_source = tx
                 .query_row(
                     "SELECT id, path, hash, status, parser_used, last_ingested_at FROM sources WHERE id = ?1",
@@ -333,13 +335,15 @@ impl Store {
                     bounded_path(&expected_source.path)
                 )));
             }
-            let actual_target = validated_target_snapshot(new_path)?;
-            if actual_target != *expected_target
-                || actual_target.content_sha256 != expected_source.hash
+            expected_target.validate_content_identity(&expected_source.hash)?;
+            expected_target.validate_path_binding(new_path)?;
+            #[cfg(test)]
+            if let Some(hook) = self
+                .source_relocation_before_mutation_hook
+                .borrow_mut()
+                .take()
             {
-                return Err(validation_message(
-                    "relocation target changed before catalog mutation",
-                ));
+                hook();
             }
 
             require_changed_row(
@@ -437,6 +441,14 @@ impl Store {
                 "source graph node",
                 &source_node_id.0,
             )?;
+            if !path_entry_is_missing(&expected_source.path)? {
+                return Err(validation_message(format!(
+                    "stored source path reappeared before relocation commit: {}",
+                    bounded_path(&expected_source.path)
+                )));
+            }
+            expected_target.validate_content_identity(&expected_source.hash)?;
+            expected_target.validate_path_binding(new_path)?;
             tx.commit()?;
             Ok(relocated_source)
         })()
@@ -446,6 +458,25 @@ impl Store {
 
 #[cfg(test)]
 impl Store {
+    pub(crate) fn set_source_relocation_parse_hooks(
+        &self,
+        before_parse: impl FnOnce() + Send + 'static,
+        after_parse: impl FnOnce() + Send + 'static,
+    ) {
+        let previous_before = self
+            .source_relocation_before_parse_hook
+            .borrow_mut()
+            .replace(Box::new(before_parse));
+        let previous_after = self
+            .source_relocation_after_parse_hook
+            .borrow_mut()
+            .replace(Box::new(after_parse));
+        assert!(
+            previous_before.is_none() && previous_after.is_none(),
+            "source relocation parse test hook already set"
+        );
+    }
+
     pub(crate) fn set_source_relocation_before_mutation_hook(
         &self,
         hook: impl FnOnce() + Send + 'static,
@@ -481,65 +512,6 @@ fn path_entry_is_missing(path: &Path) -> Result<bool> {
             Err(error).with_context(|| format!("check source path entry: {}", bounded_path(path)))
         }
     }
-}
-
-fn validated_target_snapshot(path: &Path) -> Result<InputSnapshotIdentity> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| relocation_target_io_error("inspect relocation target", path, error))?;
-    if metadata.file_type().is_symlink() {
-        return Err(validation_message(format!(
-            "relocation target must not be a symlink: {}",
-            bounded_path(path)
-        )));
-    }
-    if !metadata.is_file() {
-        return Err(validation_message(format!(
-            "relocation target is not a regular file: {}",
-            bounded_path(path)
-        )));
-    }
-    InputSnapshotIdentity::from_path(path).map_err(|error| {
-        if snapshot_failure_is_validation(&error) {
-            validation_error(error)
-        } else {
-            error
-        }
-    })
-}
-
-fn relocation_target_io_error(action: &str, path: &Path, error: std::io::Error) -> anyhow::Error {
-    let validation = io_failure_is_target_change(&error);
-    let error = anyhow::Error::new(error).context(format!("{action}: {}", bounded_path(path)));
-    if validation {
-        validation_error(error)
-    } else {
-        error
-    }
-}
-
-fn snapshot_failure_is_validation(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .is_none_or(io_failure_is_target_change)
-}
-
-fn io_failure_is_target_change(error: &std::io::Error) -> bool {
-    error.kind() == ErrorKind::NotFound
-        || matches!(
-            error.raw_os_error(),
-            Some(code) if code == libc::ELOOP || code == libc::EISDIR
-        )
-}
-
-fn snapshots_identify_same_file(
-    left: &InputSnapshotIdentity,
-    right: &InputSnapshotIdentity,
-) -> bool {
-    left.size_bytes == right.size_bytes
-        && left.content_sha256 == right.content_sha256
-        && left.modified == right.modified
-        && left.inode == right.inode
 }
 
 /// Remap a complete parser batch from temporary path identity to catalog identity.
@@ -611,6 +583,36 @@ pub(crate) fn remap_parser_evidence_identity(
             Ok(unit)
         })
         .collect()
+}
+
+fn rewrite_relocation_locator_paths(
+    evidence: &mut [EvidenceUnit],
+    parser_path: &Path,
+    canonical_path: &Path,
+) -> Result<()> {
+    let parser_path = parser_path
+        .to_str()
+        .context("held relocation parser path is not UTF-8")?;
+    let canonical_path = canonical_path
+        .to_str()
+        .context("canonical relocation target is not UTF-8")?;
+    for unit in evidence {
+        let path = match &mut unit.locator {
+            SourceLocator::Document { path_or_url, .. } => Some(path_or_url),
+            SourceLocator::Markdown { path, .. } => Some(path),
+            _ => None,
+        };
+        if let Some(path) = path {
+            if path.as_str() != parser_path {
+                bail!(
+                    "parser evidence {} locator does not identify the held snapshot",
+                    bounded_text(&unit.id.0)
+                );
+            }
+            canonical_path.clone_into(path);
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn ensure_unique_source_paths(conn: &Connection) -> Result<()> {

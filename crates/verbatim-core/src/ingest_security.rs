@@ -10,7 +10,7 @@
 //! ingest entry point. See `docs/architecture/ingest-security-boundary.md`.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -211,17 +211,29 @@ impl InputSnapshotIdentity {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW);
         }
-        let mut file = options
+        let file = options
             .open(path)
             .with_context(|| format!("open input snapshot {}", path.display()))?;
+        Self::from_opened_file(path, &file)
+    }
+
+    /// Hash one already-opened file without resolving its path again.
+    pub(crate) fn from_opened_file(path: &Path, file: &fs::File) -> Result<Self> {
         let before = file
             .metadata()
             .with_context(|| format!("stat opened input snapshot {}", path.display()))?;
         if !before.is_file() {
             bail!("input snapshot is not a regular file: {}", path.display());
         }
+        let mut reader = file
+            .try_clone()
+            .with_context(|| format!("clone opened input snapshot {}", path.display()))?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .with_context(|| format!("rewind opened input snapshot {}", path.display()))?;
         let mut bytes = Vec::with_capacity(before.len() as usize);
-        file.read_to_end(&mut bytes)
+        reader
+            .read_to_end(&mut bytes)
             .with_context(|| format!("read input snapshot {}", path.display()))?;
         let metadata = file
             .metadata()

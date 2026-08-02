@@ -4,8 +4,8 @@ use super::*;
 use verbatim_core::api::RelocateSourceRequest;
 use verbatim_core::resource::ResourceQueueError;
 use verbatim_core::store::{
-    map_storage_error, source_relocation_error_kind, SourceRelocationErrorKind,
-    SqliteWriteOperation,
+    is_sqlite_busy_error, map_storage_error, source_relocation_error_kind,
+    SourceRelocationErrorKind, SqliteWriteOperation,
 };
 use verbatim_core::types::Source;
 
@@ -23,15 +23,12 @@ pub(super) async fn relocate_source(
     })
     .await
     .map_err(pipeline_access_error)?
-    .map_err(|error| relocation_operation_error(&id, error))?;
+    .map_err(relocation_operation_error)?;
 
     Ok(Json(catalog_source_response(source)))
 }
 
-fn relocation_operation_error(
-    source_id: &str,
-    error: anyhow::Error,
-) -> (StatusCode, Json<ErrorResponse>) {
+fn relocation_operation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
     let error = map_storage_error(SqliteWriteOperation::Ingest, error);
     match source_relocation_error_kind(&error) {
         Some(SourceRelocationErrorKind::NotFound) => err(StatusCode::NOT_FOUND, error),
@@ -42,8 +39,9 @@ fn relocation_operation_error(
         {
             err(StatusCode::SERVICE_UNAVAILABLE, error)
         }
+        None if is_sqlite_busy_error(&error) => err(StatusCode::SERVICE_UNAVAILABLE, error),
         None => sqlite_durability_ops::indexing_operation_error(
-            Some(source_id),
+            None,
             SqliteWriteOperation::Ingest,
             error,
         ),
@@ -98,19 +96,34 @@ mod tests {
                 timeout: Duration::from_millis(1),
             },
         ] {
-            let (status, _) = relocation_operation_error("source-1", error.into());
+            let (status, _) = relocation_operation_error(error.into());
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 
     #[test]
     fn issue_332_unknown_relocation_runtime_failure_is_internal() {
-        let (status, _) = relocation_operation_error(
-            "source-1",
-            anyhow::anyhow!("statvfs failed without a durability classification"),
-        );
+        let (status, _) = relocation_operation_error(anyhow::anyhow!(
+            "statvfs failed without a durability classification"
+        ));
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn issue_332_untyped_not_found_text_collision_is_internal() {
+        let (status, _) = relocation_operation_error(anyhow::anyhow!("source not found: source-1"));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn issue_332_native_sqlite_busy_and_locked_are_service_unavailable() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            let (status, _) = relocation_operation_error(error.into());
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
 
     #[test]
@@ -121,7 +134,7 @@ mod tests {
             }),
             std::io::Error::from_raw_os_error(libc::ENOSPC).into(),
         ] {
-            let (status, _) = relocation_operation_error("source-1", error);
+            let (status, _) = relocation_operation_error(error);
             assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
         }
     }
