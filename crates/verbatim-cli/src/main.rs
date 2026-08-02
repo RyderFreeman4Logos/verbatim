@@ -4643,6 +4643,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_rejects_ambiguous_chapter_references() {
+        for reference in ["John 3", "john 3", " John   3 ", "Jn 3", "John 3-5"] {
+            let (code, stdout, stderr, _, _) = run_mock(["resolve", reference]);
+            assert!(code.is_err(), "{reference}: {stdout}");
+            assert!(stdout.is_empty(), "{reference}: {stdout}");
+            assert!(
+                stderr.contains("could not parse") && stderr.contains(reference),
+                "{reference}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_rejects_invalid_reference() {
         let (code, stdout, _, _, _) = run_mock(["resolve", "not a reference"]);
         assert!(code.is_err());
