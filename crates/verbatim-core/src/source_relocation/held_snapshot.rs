@@ -96,6 +96,11 @@ fn open_canonical_target_without_links(path: &Path) -> Result<fs::File> {
 }
 
 pub(super) fn open_relocation_target(path: &Path) -> Result<fs::File> {
+    if path.as_os_str().as_bytes().contains(&b'\0') {
+        return Err(validation_message(
+            "relocation target contains an interior NUL byte",
+        ));
+    }
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| relocation_target_io_error("inspect relocation target", path, error))?;
     if metadata.file_type().is_symlink() {
@@ -161,7 +166,7 @@ fn snapshot_failure_is_validation(error: &anyhow::Error) -> bool {
 }
 
 fn io_failure_is_target_change(error: &std::io::Error) -> bool {
-    error.kind() == ErrorKind::NotFound
+    matches!(error.kind(), ErrorKind::NotFound | ErrorKind::InvalidInput)
         || matches!(
             error.raw_os_error(),
             Some(code)
@@ -169,5 +174,6 @@ fn io_failure_is_target_change(error: &std::io::Error) -> bool {
                     || code == libc::ELOOP
                     || code == libc::EISDIR
                     || code == libc::ENOTDIR
+                    || code == libc::ENAMETOOLONG
         )
 }

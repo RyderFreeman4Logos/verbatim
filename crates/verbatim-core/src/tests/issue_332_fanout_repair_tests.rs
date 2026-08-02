@@ -71,6 +71,40 @@ async fn issue_332_relocation_rejects_commit_front_ancestor_symlink_swap() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn issue_332_relocation_classifies_interior_nul_target_as_validation() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let (mut pipeline, source_id, old_path) =
+        indexed_fixture(tempdir.path(), "interior-nul-target", false).await;
+    fs::remove_file(old_path).unwrap();
+    let target = tempdir.path().join("target\0.txt");
+
+    let error = pipeline.relocate_source(&source_id, &target).unwrap_err();
+
+    assert_eq!(
+        crate::store::source_relocation_error_kind(&error),
+        Some(crate::store::SourceRelocationErrorKind::Validation)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn issue_332_relocation_classifies_overlong_target_as_validation() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let (mut pipeline, source_id, old_path) =
+        indexed_fixture(tempdir.path(), "overlong-target", false).await;
+    fs::remove_file(old_path).unwrap();
+    let target = tempdir.path().join("x".repeat(256));
+
+    let error = pipeline.relocate_source(&source_id, &target).unwrap_err();
+
+    assert_eq!(
+        crate::store::source_relocation_error_kind(&error),
+        Some(crate::store::SourceRelocationErrorKind::Validation)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn issue_332_relocation_classifies_enotdir_for_target_ancestor_file() {
     let tempdir = tempfile::tempdir().unwrap();
     let (mut pipeline, source_id, old_path) =
