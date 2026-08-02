@@ -125,7 +125,7 @@ pub fn parse_bible_reference(input: &str) -> Option<ParsedReference> {
 
     let (ordinal, book_name) = resolve_book(book_part)?;
 
-    // Parse the reference part: "3:16", "3:16-18", "3", "3:16-4:2"
+    // Parse the reference part: "3:16", "3:16-18", "3:16-4:2"
     let (chapter, verse_start, verse_end, cross_chapter) = parse_ref_part(ref_part)?;
 
     // Build components
@@ -189,7 +189,7 @@ pub fn parse_bible_reference(input: &str) -> Option<ParsedReference> {
     })
 }
 
-/// Parse "3:16", "3:16-18", "3", "3:16-4:2"
+/// Parse "3:16", "3:16-18", "3:16-4:2"
 /// Returns (chapter, verse_start, verse_end, cross_chapter_end)
 fn parse_ref_part(s: &str) -> Option<(u32, u32, Option<u32>, Option<u32>)> {
     let s = s.trim();
@@ -215,12 +215,7 @@ fn parse_ref_part(s: &str) -> Option<(u32, u32, Option<u32>, Option<u32>)> {
             Some((chapter, verse, None, None))
         }
     } else {
-        // Just a chapter number, no verse — "John 3"
-        let chapter: u32 = s.parse().ok()?;
-        // Chapter-only is lower confidence (too ambiguous)
-        // We return it but mark it so the caller can decide
-        // For now return verse 1 to have a complete reference
-        Some((chapter, 1, None, None))
+        None
     }
 }
 
@@ -317,6 +312,19 @@ mod tests {
     fn parse_gen_abbreviation() {
         let parsed = parse_bible_reference("Gen 1:1").unwrap();
         assert_eq!(parsed.display, "Genesis 1:1");
+    }
+
+    #[test]
+    fn reject_ambiguous_chapter_references_through_profile_and_registry() {
+        let profile = BibleProfile::new();
+        let registry = crate::profiles::ProfileRegistry::new();
+
+        for input in ["John 3", "john 3", " John   3 ", "Jn 3", "John 3-5"] {
+            let direct = profile.parse_reference(input);
+            let public = registry.try_parse(input);
+            assert!(direct.is_none(), "{input}: {direct:?}");
+            assert!(public.is_none(), "{input}: {public:?}");
+        }
     }
 
     #[test]
