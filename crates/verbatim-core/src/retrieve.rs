@@ -42,6 +42,19 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
+fn rerank_endpoint_is_local(base_url: &str) -> bool {
+    let Ok(endpoint) = url::Url::parse(base_url) else {
+        return false;
+    };
+
+    match endpoint.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
 pub struct RetrievalPipeline<'a> {
     vector_index: &'a dyn VectorIndex,
     lexical_index: &'a dyn LexicalIndex,
@@ -1006,6 +1019,12 @@ impl<'a> RetrievalPipeline<'a> {
             return Ok(RerankOutcome {
                 fused,
                 debug: RetrievalRerankDebug::disabled(),
+            });
+        }
+        if !config.allow_document_export && !rerank_endpoint_is_local(&config.base_url) {
+            return Ok(RerankOutcome {
+                fused,
+                debug: RetrievalRerankDebug::skipped("document_export_not_allowed"),
             });
         }
         if fused.is_empty() {
@@ -2483,6 +2502,8 @@ mod tests {
         ReferenceComponent, RetrievalDenseVectorPath, RetrievalEvidenceRole, RetrievalOrigin,
         RetrievalRerankStatus, Source, SourceLocator, SourceStatus, VectorIndexResidency,
     };
+
+    mod hosted_rerank_document_export_tests;
 
     #[test]
     fn rrf_merges_rankings() {
@@ -4937,62 +4958,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rerank_success_replaces_rrf_order_before_graph_expansion() {
-        let store = Store::in_memory().unwrap();
-        let source = source("src-rerank");
-        store.add_source(&source).unwrap();
-        let first = insert_text_chunk(&store, &source, "chunk-first", "alpha first");
-        let second = insert_text_chunk(&store, &source, "chunk-second", "alpha second");
-        let third = insert_text_chunk(&store, &source, "chunk-third", "alpha third");
-        let vector_index = StaticVectorIndex::new(vec![
-            (first.id.clone(), 0.9),
-            (second.id.clone(), 0.8),
-            (third.id.clone(), 0.7),
-        ]);
-        let lexical_index = StaticLexicalIndex::new(Vec::new());
-        let embed_client = KeywordEmbeddingClient;
-        let retrieval_config = RetrievalConfig {
-            dense_top_k: 3,
-            bm25_top_k: 0,
-            rrf_k: 60,
-            ..RetrievalConfig::default()
-        };
-        let rerank_config = RerankConfig {
-            enabled: true,
-            strategy: RerankStrategy::Endpoint,
-            provider: "vllm".into(),
-            model: "test-reranker".into(),
-            top_n: 2,
-            ..Default::default()
-        };
-        let reranker = RecordingReranker::hits(vec![(2, 0.99), (0, 0.7)]);
-
-        let (results, debug) = RetrievalPipeline::new(
-            &vector_index,
-            &lexical_index,
-            &store,
-            &embed_client,
-            &retrieval_config,
-        )
-        .with_reranker(&rerank_config, &reranker)
-        .search_filtered_with_debug("alpha", None)
-        .await
-        .unwrap();
-
-        assert_eq!(chunk_ids(&results), vec!["chunk-third", "chunk-first"]);
-        assert_eq!(reranker.call_count(), 1);
-        assert_eq!(reranker.recorded_top_ns(), vec![2]);
-        assert_eq!(reranker.recorded_docs()[0].len(), 3);
-        assert_eq!(debug.reranker.status, RetrievalRerankStatus::Succeeded);
-        assert_eq!(debug.reranker.provider.as_deref(), Some("vllm"));
-        assert_eq!(debug.reranker.model.as_deref(), Some("test-reranker"));
-        assert_eq!(debug.reranker.top_n, Some(2));
-        assert_eq!(debug.reranker.candidate_count, Some(3));
-        assert_eq!(debug.reranker.scores[0].chunk_id, third.id);
-        assert_eq!(debug.final_evidence_pack[0].chunk_id, third.id);
-    }
-
-    #[tokio::test]
     async fn rerank_documents_include_context_and_chunk_text() {
         let store = Store::in_memory().unwrap();
         let source = source("src-rerank-context");
@@ -5015,6 +4980,8 @@ mod tests {
         };
         let rerank_config = RerankConfig {
             enabled: true,
+            allow_document_export: false,
+            base_url: "http://localhost:8003/v1".into(),
             top_n: 1,
             ..Default::default()
         };

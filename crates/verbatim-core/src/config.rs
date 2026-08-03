@@ -636,6 +636,9 @@ pub enum RerankStrategy {
 pub struct RerankConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Permit sending candidate document text to non-loopback rerank endpoints.
+    #[serde(default)]
+    pub allow_document_export: bool,
     #[serde(default)]
     pub strategy: RerankStrategy,
     #[serde(default = "default_rerank_provider")]
@@ -660,6 +663,7 @@ impl Default for RerankConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_document_export: false,
             strategy: RerankStrategy::Endpoint,
             provider: default_rerank_provider(),
             base_url: default_rerank_base_url(),
@@ -682,6 +686,8 @@ impl<'de> Deserialize<'de> for RerankConfig {
         struct RawRerankConfig {
             #[serde(default)]
             enabled: Option<bool>,
+            #[serde(default)]
+            allow_document_export: bool,
             #[serde(default)]
             strategy: Option<RerankStrategy>,
             #[serde(default)]
@@ -716,6 +722,7 @@ impl<'de> Deserialize<'de> for RerankConfig {
 
         Ok(Self {
             enabled: raw.enabled.unwrap_or(endpoint_or_model_configured),
+            allow_document_export: raw.allow_document_export,
             strategy,
             provider: raw.provider.unwrap_or_else(default_rerank_provider),
             base_url: raw.base_url.unwrap_or_else(default_rerank_base_url),
@@ -1998,6 +2005,7 @@ mod tests {
         assert!(!config.graph.global_search.drift.enabled);
         assert_eq!(config.graph.global_search.drift.max_subqueries, 4);
         assert!(!config.rerank.enabled);
+        assert!(!config.rerank.allow_document_export);
         assert_eq!(config.rerank.strategy, RerankStrategy::Endpoint);
         assert_eq!(config.rerank.provider, "vllm");
         assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");

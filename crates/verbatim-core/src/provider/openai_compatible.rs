@@ -2650,9 +2650,8 @@ mod tests {
             model: "rerank-model".into(),
             top_n: 2,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
 
@@ -2713,9 +2712,8 @@ mod tests {
             model: "cohere-rerank".into(),
             top_n: 1,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
 
@@ -2769,9 +2767,8 @@ mod tests {
             model: "hint-model".into(),
             top_n: 4,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
         let docs = vec![
@@ -2846,9 +2843,8 @@ mod tests {
             model: "cache-model".into(),
             top_n: 1,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
 
@@ -2917,9 +2913,8 @@ mod tests {
             model: "ctx-model".into(),
             top_n: 6,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
         let docs = vec!["x".repeat(8_000); 6];
@@ -3005,9 +3000,8 @@ mod tests {
             model: "payload-model".into(),
             top_n: 4,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
         let docs = vec!["payload".repeat(1_000); 4];
@@ -3076,9 +3070,8 @@ mod tests {
             model: "exhaust-model".into(),
             top_n: 2,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
         let docs = vec!["doc".repeat(2_000); 2];
@@ -3139,9 +3132,8 @@ mod tests {
             model: "refresh-fail-model".into(),
             top_n: 2,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
         let docs = vec!["doc".repeat(2_000); 2];
@@ -3199,9 +3191,8 @@ mod tests {
             model: "bad-request-model".into(),
             top_n: 1,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
 
@@ -3255,9 +3246,8 @@ mod tests {
             model: "unsupported-models".into(),
             top_n: 1,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
         let docs = vec!["doc".to_string()];
@@ -3306,9 +3296,8 @@ mod tests {
             model: "fieldless-model".into(),
             top_n: 1,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
         let docs = vec!["doc".to_string()];
@@ -3347,9 +3336,8 @@ mod tests {
             model: "llm-reranker".into(),
             top_n: 1,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleLlmReranker::from_config(&config);
         let docs = vec!["alpha document".to_string()];
@@ -3494,9 +3482,8 @@ mod tests {
             model: "rerank-model".into(),
             top_n: 1,
             timeout_seconds: 5,
-            api_key: String::new(),
             capability_cache_ttl_seconds: 60,
-            endpoint_runtime: ModelEndpointRuntimeConfig::default(),
+            ..Default::default()
         };
         let reranker = OpenAiCompatibleReranker::from_config(&config);
 
