@@ -31,18 +31,30 @@ fn make_evidence(n: usize, heading: &str) -> Vec<EvidenceUnit> {
 fn conservative_token_estimator_covers_cjk_and_is_deterministic() {
     let cjk = "中文测试";
     let previous_bytes_per_four = cjk.len() / 4;
+    let letters = "abcdefghijkl";
+    let punctuation = ":/?#[]{}!@&=";
+    let code = "fn main(){x+=1;}";
+    let url = "https://x.test/a?b=c";
 
     assert_eq!(estimate_tokens(cjk), 4);
     assert!(estimate_tokens(cjk) as usize > previous_bytes_per_four);
     assert_eq!(estimate_tokens("a"), 1);
     assert_eq!(estimate_tokens(" "), 1);
-    assert_eq!(
-        estimate_tokens("abcdefghijkl"),
-        estimate_tokens(":/?#[]{}!@&=")
-    );
-    let url = "https://x.test/a?b=c";
-    assert!(estimate_tokens(url) >= estimate_tokens(&"a".repeat(url.len())));
-    assert_eq!(estimate_tokens(cjk), estimate_tokens(cjk));
+    assert!(estimate_tokens(punctuation) > estimate_tokens(letters));
+    assert!(estimate_tokens(code) > estimate_tokens(&"a".repeat(code.len())));
+    assert!(estimate_tokens(url) > estimate_tokens(&"a".repeat(url.len())));
+    assert_eq!(estimate_tokens(url), estimate_tokens(url));
+}
+
+#[test]
+fn conservative_token_estimator_punctuation_dense_code_exceeds_default_target() {
+    let punctuation = ":/?#[]{}!@&=".repeat(120);
+    let letters = "a".repeat(punctuation.len());
+    let punctuation_tokens = estimate_tokens(&punctuation);
+
+    assert!(punctuation_tokens >= punctuation.len() as u32 / 2);
+    assert!(punctuation_tokens >= 2 * estimate_tokens(&letters));
+    assert!(punctuation_tokens > ChunkerConfig::default().child_target_tokens as u32);
 }
 
 #[test]

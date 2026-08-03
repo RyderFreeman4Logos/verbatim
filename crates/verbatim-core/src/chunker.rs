@@ -6,8 +6,8 @@ use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceUnit, SourceId, SourceLocator,
 };
 
-/// Chunking identity; v4 declares the conservative-v1 token estimator.
-pub const CHUNKER_VERSION: &str = "parent-child-v4";
+/// Chunking identity; v5 declares the conservative-v2 token estimator.
+pub const CHUNKER_VERSION: &str = "parent-child-v5";
 const DEFAULT_CHILD_TARGET: usize = 300;
 const DEFAULT_CHILD_OVERLAP: usize = 80;
 const DEFAULT_PARENT_CHILDREN: usize = 5;
@@ -38,8 +38,9 @@ pub struct ChunkOutput {
 
 /// Estimates tokens without model-specific tokenizer artifacts.
 ///
-/// ASCII scalars cost one quarter-token unit while non-ASCII scalars cost one
-/// token. This keeps Latin text near chars/4 while conservatively counting CJK.
+/// ASCII alphanumerics cost one quarter-token unit while all other scalars cost
+/// one token. This keeps plain Latin text near chars/4 while conservatively
+/// counting code, URLs, punctuation, whitespace, and CJK.
 pub(crate) fn estimate_tokens(text: &str) -> u32 {
     estimate_spaced_tokens(std::iter::once(text)).min(u32::MAX as usize) as u32
 }
@@ -65,7 +66,7 @@ pub(crate) fn estimate_spaced_tokens<'a>(texts: impl IntoIterator<Item = &'a str
 
 fn estimator_units(text: &str) -> usize {
     text.chars().fold(0usize, |units, character| {
-        units.saturating_add(if character.is_ascii() {
+        units.saturating_add(if character.is_ascii_alphanumeric() {
             1
         } else {
             ESTIMATOR_UNITS_PER_TOKEN
