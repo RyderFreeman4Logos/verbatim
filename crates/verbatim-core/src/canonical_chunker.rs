@@ -58,7 +58,7 @@ pub fn chunk_canonical_units(
         });
     }
 
-    // Split into groups by hard boundary (book ordinal).
+    // Split into groups by hard boundary (book identity).
     let groups = split_by_hard_boundary(evidence);
 
     let mut all_chunks = Vec::new();
@@ -119,23 +119,24 @@ pub fn chunk_canonical_units(
 }
 
 /// Split evidence into groups that must never be in the same chunk.
-/// Hard boundary: different book ordinal (top-level work).
+/// Hard boundary: different book value or ordinal (top-level work).
 fn split_by_hard_boundary(evidence: &[EvidenceUnit]) -> Vec<Vec<EvidenceUnit>> {
     if evidence.is_empty() {
         return Vec::new();
     }
 
     let mut groups: Vec<Vec<EvidenceUnit>> = vec![Vec::new()];
-    let mut current_book: Option<u32> = None;
+    let mut current_book_key = None;
 
     for unit in evidence {
-        let book_ord = book_ordinal(unit);
-        // Start a new group when the book ordinal changes (and we already have units).
-        if book_ord != current_book && current_book.is_some() {
+        let book_key = book_boundary_key(unit);
+        if groups.last().is_some_and(|group| !group.is_empty())
+            && (book_key.is_none() || book_key != current_book_key)
+        {
             groups.push(Vec::new());
         }
         groups.last_mut().unwrap().push(unit.clone());
-        current_book = book_ord;
+        current_book_key = book_key;
     }
     groups
 }
@@ -299,9 +300,9 @@ fn build_canonical_parent(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// Extract book ordinal from a canonical locator (level == "book").
-fn book_ordinal(unit: &EvidenceUnit) -> Option<u32> {
-    canonical_component(unit, "book").and_then(|c| c.ordinal)
+/// Extract the normalized book hard-boundary key from a canonical locator.
+fn book_boundary_key(unit: &EvidenceUnit) -> Option<(&str, Option<u32>)> {
+    canonical_component(unit, "book").map(|component| (component.value.trim(), component.ordinal))
 }
 
 /// Extract chapter ordinal from a canonical locator (level == "chapter").
@@ -351,7 +352,7 @@ mod tests {
         source_id: &SourceId,
         position: u32,
         book: &str,
-        book_ord: u32,
+        book_ord: impl Into<Option<u32>>,
         chapter: u32,
         verse: u32,
         text: &str,
@@ -361,7 +362,7 @@ mod tests {
             crate::types::ReferenceComponent {
                 level: "book".into(),
                 value: book.into(),
-                ordinal: Some(book_ord),
+                ordinal: book_ord.into(),
             },
             crate::types::ReferenceComponent {
                 level: "chapter".into(),
@@ -705,6 +706,40 @@ mod tests {
                 "chunk {:?} spans multiple books: {:?}",
                 chunk.id,
                 books
+            );
+        }
+    }
+
+    #[test]
+    fn missing_book_ordinals_do_not_cross_book_boundary() {
+        let sid = SourceId("test-source".into());
+        let john = make_verse(&sid, 1, "John", None, 1, 1, "John 1:1 text.", Some("Jn"));
+        let romans = make_verse(
+            &sid,
+            2,
+            "Romans",
+            None,
+            1,
+            1,
+            "Romans 1:1 text.",
+            Some("Rom"),
+        );
+        let john_id = john.id.clone();
+        let romans_id = romans.id.clone();
+        let output =
+            chunk_canonical_units(&sid, &[john, romans], &CanonicalChunkerConfig::default())
+                .expect("canonical provenance must resolve");
+
+        for chunk in output
+            .chunks
+            .iter()
+            .filter(|chunk| matches!(chunk.chunk_type, ChunkType::Child | ChunkType::Parent))
+        {
+            assert!(
+                !(chunk.evidence_unit_ids.contains(&john_id)
+                    && chunk.evidence_unit_ids.contains(&romans_id)),
+                "chunk {:?} spans books whose ordinals are missing",
+                chunk.id
             );
         }
     }
