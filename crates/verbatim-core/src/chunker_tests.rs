@@ -28,6 +28,60 @@ fn make_evidence(n: usize, heading: &str) -> Vec<EvidenceUnit> {
 }
 
 #[test]
+fn conservative_token_estimator_covers_cjk_and_is_deterministic() {
+    let cjk = "中文测试";
+    let previous_bytes_per_four = cjk.len() / 4;
+
+    assert_eq!(estimate_tokens(cjk), 4);
+    assert!(estimate_tokens(cjk) as usize > previous_bytes_per_four);
+    assert_eq!(estimate_tokens("a"), 1);
+    assert_eq!(estimate_tokens(" "), 1);
+    assert_eq!(
+        estimate_tokens("abcdefghijkl"),
+        estimate_tokens(":/?#[]{}!@&=")
+    );
+    let url = "https://x.test/a?b=c";
+    assert!(estimate_tokens(url) >= estimate_tokens(&"a".repeat(url.len())));
+    assert_eq!(estimate_tokens(cjk), estimate_tokens(cjk));
+}
+
+#[test]
+fn cjk_units_exceed_child_target_before_equivalent_ascii_units() {
+    let mut cjk = make_evidence(2, "中文章节");
+    cjk[0].text = "中文测试".into();
+    cjk[1].text = "保守估算".into();
+    let config = ChunkerConfig {
+        child_target_tokens: 6,
+        child_overlap_tokens: 0,
+        parent_children_count: 2,
+    };
+
+    let cjk_output = chunk_evidence(&SourceId("cjk".into()), &cjk, &config);
+    let cjk_children = cjk_output
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.chunk_type == ChunkType::Child)
+        .collect::<Vec<_>>();
+
+    assert_eq!(cjk_children.len(), 2);
+    assert!(cjk_children.iter().all(|chunk| chunk.token_count == 4));
+
+    let mut ascii = make_evidence(2, "English");
+    ascii[0].text = "abcdefghijkl".into();
+    ascii[1].text = "mnopqrstuvwx".into();
+    let ascii_output = chunk_evidence(&SourceId("ascii".into()), &ascii, &config);
+    assert_eq!(
+        ascii_output
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.chunk_type == ChunkType::Child)
+            .count(),
+        1,
+        "the existing English-sized fixture should keep its child structure"
+    );
+}
+
+#[test]
 fn utf8_overlap_retains_resolvable_evidence_spans() {
     let mut evidence = make_evidence(2, "中文章节");
     evidence[0].text = format!("{}[链接](https://example.test/路径)", "前".repeat(160));

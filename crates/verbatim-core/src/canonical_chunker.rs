@@ -1,7 +1,7 @@
 //! Unit-aligned chunker for canonical-reference sources.
 //!
-//! Unlike the generic [`chunk_evidence`] which splits by approximate token
-//! targets with character-based overlap, this chunker groups whole canonical
+//! Unlike the generic [`chunk_evidence`] which splits by estimated token
+//! targets with token-budget overlap, this chunker groups whole canonical
 //! units (e.g., Bible verses) into chunks and overlaps by whole units.
 //!
 //! Hard boundary: never cross top-level work boundaries (e.g., Bible books).
@@ -11,8 +11,8 @@ use anyhow::Result;
 use std::collections::HashMap;
 
 use crate::chunker::{
-    deterministic_chunk_hash, estimate_tokens, persist_spans_checked, unique_chunk_id, ChunkOutput,
-    ChunkWithSpans, TextWithSpans,
+    deterministic_chunk_hash, estimate_spaced_tokens, estimate_tokens, persist_spans_checked,
+    unique_chunk_id, ChunkOutput, ChunkWithSpans, TextWithSpans,
 };
 use crate::types::{
     CanonicalLocator, Chunk, ChunkType, EvidenceId, EvidenceUnit, SourceId, SourceLocator,
@@ -157,7 +157,8 @@ fn split_by_soft_boundary(
         // Split on chapter boundary, max units, or token overflow.
         let crosses_chapter = chapter != current_chapter && current_chapter.is_some();
         let too_many_units = current.len() >= config.max_units_per_child;
-        let token_overflow = current_tokens + unit_tokens > config.target_tokens * 2;
+        let token_overflow =
+            current_tokens.saturating_add(unit_tokens) > config.target_tokens.saturating_mul(2);
 
         if !current.is_empty() && (crosses_chapter || too_many_units || token_overflow) {
             sub_groups.push(std::mem::take(&mut current));
@@ -181,14 +182,20 @@ fn build_canonical_children(
     config: &CanonicalChunkerConfig,
     id_counts: &mut HashMap<String, usize>,
 ) -> Vec<ChunkWithSpans> {
-    let target_chars = config.target_tokens * 4; // CHARS_PER_TOKEN
+    let target_tokens = config
+        .target_tokens
+        .saturating_add(config.target_tokens / 5);
     let mut children = Vec::new();
     let mut current_units: Vec<&EvidenceUnit> = Vec::new();
-    let mut current_len = 0usize;
 
     for unit in units {
-        let would_exceed = current_len + unit.text.len() > target_chars + target_chars / 5
-            && !current_units.is_empty();
+        let candidate_tokens = estimate_spaced_tokens(
+            current_units
+                .iter()
+                .map(|current| current.text.as_str())
+                .chain(std::iter::once(unit.text.as_str())),
+        );
+        let would_exceed = candidate_tokens > target_tokens && !current_units.is_empty();
         let too_many = current_units.len() >= config.max_units_per_child;
 
         if would_exceed || too_many {
@@ -198,11 +205,9 @@ fn build_canonical_children(
                 .overlap_units
                 .min(current_units.len().saturating_sub(1));
             current_units = current_units[current_units.len() - overlap..].to_vec();
-            current_len = current_units.iter().map(|u| u.text.len() + 1).sum();
         }
 
         current_units.push(unit);
-        current_len += unit.text.len() + 1; // +1 for space
     }
 
     if !current_units.is_empty() {
@@ -524,6 +529,34 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not resolve to identical text"));
+    }
+
+    #[test]
+    fn cjk_units_use_token_budget_for_canonical_children() {
+        let source_id = SourceId("canonical-cjk".into());
+        let evidence = vec![
+            make_verse(&source_id, 0, "John", 43, 1, 1, "中文测试", Some("John 1")),
+            make_verse(&source_id, 1, "John", 43, 1, 2, "保守估算", Some("John 1")),
+        ];
+        let output = chunk_canonical_units(
+            &source_id,
+            &evidence,
+            &CanonicalChunkerConfig {
+                target_tokens: 6,
+                overlap_units: 0,
+                max_units_per_child: 20,
+            },
+        )
+        .expect("canonical CJK chunks must preserve provenance");
+
+        assert_eq!(
+            output
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.chunk_type == ChunkType::Child)
+                .count(),
+            2
+        );
     }
 
     fn repeated_unicode_text() -> impl Strategy<Value = String> {

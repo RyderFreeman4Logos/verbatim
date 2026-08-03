@@ -6,11 +6,12 @@ use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceUnit, SourceId, SourceLocator,
 };
 
-pub const CHUNKER_VERSION: &str = "parent-child-v3";
+/// Chunking identity; v4 declares the conservative-v1 token estimator.
+pub const CHUNKER_VERSION: &str = "parent-child-v4";
 const DEFAULT_CHILD_TARGET: usize = 300;
 const DEFAULT_CHILD_OVERLAP: usize = 80;
 const DEFAULT_PARENT_CHILDREN: usize = 5;
-const CHARS_PER_TOKEN: usize = 4;
+const ESTIMATOR_UNITS_PER_TOKEN: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkerConfig {
@@ -35,8 +36,62 @@ pub struct ChunkOutput {
     pub evidence_spans: Vec<ChunkEvidenceSpan>,
 }
 
+/// Estimates tokens without model-specific tokenizer artifacts.
+///
+/// ASCII scalars cost one quarter-token unit while non-ASCII scalars cost one
+/// token. This keeps Latin text near chars/4 while conservatively counting CJK.
 pub(crate) fn estimate_tokens(text: &str) -> u32 {
-    (text.len() / CHARS_PER_TOKEN) as u32
+    estimate_spaced_tokens(std::iter::once(text)).min(u32::MAX as usize) as u32
+}
+
+pub(crate) fn estimate_spaced_tokens<'a>(texts: impl IntoIterator<Item = &'a str>) -> usize {
+    let mut units = 0usize;
+    let mut has_text = false;
+
+    for text in texts.into_iter().filter(|text| !text.is_empty()) {
+        if has_text {
+            units = units.saturating_add(1);
+        }
+        units = units.saturating_add(estimator_units(text));
+        has_text = true;
+    }
+
+    if units == 0 {
+        0
+    } else {
+        1 + (units - 1) / ESTIMATOR_UNITS_PER_TOKEN
+    }
+}
+
+fn estimator_units(text: &str) -> usize {
+    text.chars().fold(0usize, |units, character| {
+        units.saturating_add(if character.is_ascii() {
+            1
+        } else {
+            ESTIMATOR_UNITS_PER_TOKEN
+        })
+    })
+}
+
+fn overlap_start_for_token_budget(text: &str, budget_tokens: usize) -> usize {
+    let budget_units = budget_tokens.saturating_mul(ESTIMATOR_UNITS_PER_TOKEN);
+    let mut retained_units = 0usize;
+    let mut start = text.len();
+
+    for (index, character) in text.char_indices().rev() {
+        let character_units = if character.is_ascii() {
+            1
+        } else {
+            ESTIMATOR_UNITS_PER_TOKEN
+        };
+        if retained_units.saturating_add(character_units) > budget_units {
+            break;
+        }
+        retained_units = retained_units.saturating_add(character_units);
+        start = index;
+    }
+
+    start
 }
 
 pub fn chunk_evidence(
@@ -159,14 +214,16 @@ fn build_children(
     config: &ChunkerConfig,
     id_counts: &mut HashMap<String, usize>,
 ) -> Vec<ChunkWithSpans> {
-    let target_chars = config.child_target_tokens * CHARS_PER_TOKEN;
-    let overlap_chars = config.child_overlap_tokens * CHARS_PER_TOKEN;
+    let target_tokens = config
+        .child_target_tokens
+        .saturating_add(config.child_target_tokens / 5);
     let mut children = Vec::new();
     let mut current = TextWithSpans::default();
     let mut current_heading: Vec<String> = Vec::new();
 
     for unit in section {
-        let would_exceed = current.text.len() + unit.text.len() > target_chars + target_chars / 5;
+        let would_exceed =
+            estimate_spaced_tokens([current.text.as_str(), unit.text.as_str()]) > target_tokens;
 
         if would_exceed && !current.text.trim().is_empty() {
             let (text, spans) = current.trimmed();
@@ -178,10 +235,8 @@ fn build_children(
                 &current_heading,
             ));
 
-            let overlap_start = floor_char_boundary(
-                &current.text,
-                current.text.len().saturating_sub(overlap_chars),
-            );
+            let overlap_start =
+                overlap_start_for_token_budget(&current.text, config.child_overlap_tokens);
             current.retain_from(overlap_start);
         }
 
@@ -203,14 +258,6 @@ fn build_children(
     }
 
     children
-}
-
-fn floor_char_boundary(text: &str, index: usize) -> usize {
-    let mut boundary = index.min(text.len());
-    while boundary > 0 && !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
 }
 
 fn make_child(
