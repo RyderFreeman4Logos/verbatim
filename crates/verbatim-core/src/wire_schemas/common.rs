@@ -16,6 +16,7 @@ pub const WIRE_SCHEMA_VERSION: WireSchemaVersion = WireSchemaVersion::new(1, 0, 
 /// artifact envelopes exchanged among clients, coordinator, storage, and
 /// workflows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireSchemaVersion {
     pub major: u32,
     pub minor: u32,

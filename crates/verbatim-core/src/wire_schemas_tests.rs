@@ -61,6 +61,14 @@ fn sample_workflow(plan_hash: &str) -> WorkflowEnvelope {
     .unwrap()
 }
 
+fn with_unknown_field<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    let mut json = serde_json::to_value(value).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .insert("unexpected".into(), serde_json::json!(true));
+    serde_json::to_vec(&json).unwrap()
+}
+
 #[test]
 fn wire_schema_version_current_is_supported() {
     assert!(WIRE_SCHEMA_VERSION.is_supported());
@@ -166,6 +174,102 @@ fn unknown_schema_version_fails_closed_on_decode() {
     let wf_bytes = encode_wire_document(&wf).unwrap();
     let err = decode_workflow_envelope_json(&wf_bytes).expect_err("must fail closed");
     assert!(err.to_string().contains("unsupported"), "{err}");
+}
+
+#[test]
+fn unknown_top_level_fields_fail_closed_on_all_envelope_decoders() {
+    let plan = sample_query_plan();
+    decode_query_plan_envelope_json(&with_unknown_field(&plan))
+        .expect_err("query plan must reject unknown fields");
+
+    let evidence = sample_evidence_pack(plan.header.identity.content_hash.as_str());
+    decode_evidence_pack_envelope_json(&with_unknown_field(&evidence))
+        .expect_err("evidence pack must reject unknown fields");
+
+    let context = sample_context_pack(evidence.header.identity.content_hash.as_str());
+    decode_context_pack_envelope_json(&with_unknown_field(&context))
+        .expect_err("context pack must reject unknown fields");
+
+    let derived = sample_derived(context.header.identity.content_hash.as_str());
+    decode_derived_artifact_envelope_json(&with_unknown_field(&derived))
+        .expect_err("derived artifact must reject unknown fields");
+
+    let workflow = sample_workflow(plan.header.identity.content_hash.as_str());
+    decode_workflow_envelope_json(&with_unknown_field(&workflow))
+        .expect_err("workflow must reject unknown fields");
+}
+
+#[test]
+fn unknown_nested_wire_fields_fail_closed() {
+    let plan = sample_query_plan();
+
+    let mut header_json = serde_json::to_value(&plan).unwrap();
+    header_json["header"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpected".into(), serde_json::json!(true));
+    decode_query_plan_envelope_json(&serde_json::to_vec(&header_json).unwrap())
+        .expect_err("header must reject unknown fields");
+
+    let mut identity_json = serde_json::to_value(&plan).unwrap();
+    identity_json["header"]["identity"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpected".into(), serde_json::json!(true));
+    decode_query_plan_envelope_json(&serde_json::to_vec(&identity_json).unwrap())
+        .expect_err("identity must reject unknown fields");
+
+    let mut version_json = serde_json::to_value(&plan).unwrap();
+    version_json["header"]["schema_version"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpected".into(), serde_json::json!(true));
+    decode_query_plan_envelope_json(&serde_json::to_vec(&version_json).unwrap())
+        .expect_err("schema version must reject unknown fields");
+}
+
+#[test]
+fn namespaced_header_extensions_round_trip_without_changing_body_hash() {
+    let mut plan = sample_query_plan();
+    let body_hash = plan.header.identity.content_hash.clone();
+    assert!(
+        serde_json::to_value(&plan).unwrap()["header"]
+            .get("extensions")
+            .is_none(),
+        "empty extensions must be omitted"
+    );
+
+    plan.header.extensions.insert(
+        "vendor.example/foo".into(),
+        serde_json::json!({"enabled": true, "weight": 2}),
+    );
+    let bytes = encode_wire_document(&plan).unwrap();
+    let decoded = decode_query_plan_envelope_json(&bytes).unwrap();
+
+    assert_eq!(decoded, plan);
+    assert_eq!(decoded.header.identity.content_hash, body_hash);
+    decoded.validate().unwrap();
+}
+
+#[test]
+fn invalid_extension_keys_fail_closed() {
+    for key in [
+        "",
+        "bare",
+        "/name",
+        "namespace/",
+        "namespace/name/extra",
+        "vendor.example/foo bar",
+    ] {
+        let mut plan = sample_query_plan();
+        plan.header
+            .extensions
+            .insert(key.into(), serde_json::json!(true));
+        let bytes = encode_wire_document(&plan).unwrap();
+        let err = decode_query_plan_envelope_json(&bytes)
+            .expect_err("invalid extension key must fail closed");
+        assert!(err.to_string().contains("extension key"), "{key:?}: {err}");
+    }
 }
 
 #[test]
