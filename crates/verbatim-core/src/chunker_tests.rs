@@ -28,6 +28,103 @@ fn make_evidence(n: usize, heading: &str) -> Vec<EvidenceUnit> {
 }
 
 #[test]
+fn conservative_token_estimator_covers_cjk_and_is_deterministic() {
+    let cjk = "中文测试";
+    let previous_bytes_per_four = cjk.len() / 4;
+    let letters = "abcdefghijkl";
+    let punctuation = ":/?#[]{}!@&=";
+    let code = "fn main(){x+=1;}";
+    let url = "https://x.test/a?b=c";
+
+    assert_eq!(estimate_tokens(cjk), 4);
+    assert!(estimate_tokens(cjk) as usize > previous_bytes_per_four);
+    assert_eq!(estimate_tokens("a"), 1);
+    assert_eq!(estimate_tokens(" "), 1);
+    assert!(estimate_tokens(punctuation) > estimate_tokens(letters));
+    assert!(estimate_tokens(code) > estimate_tokens(&"a".repeat(code.len())));
+    assert!(estimate_tokens(url) > estimate_tokens(&"a".repeat(url.len())));
+    assert_eq!(estimate_tokens(url), estimate_tokens(url));
+}
+
+#[test]
+fn conservative_token_estimator_covers_long_hex_runs() {
+    let hex = "0123456789abcdef";
+
+    assert!(estimate_tokens(&hex.repeat(4)) >= 45);
+    assert!(estimate_tokens(&hex.repeat(24)) >= 265);
+}
+
+#[test]
+fn conservative_token_estimator_punctuation_dense_code_exceeds_default_target() {
+    let punctuation = ":/?#[]{}!@&=".repeat(120);
+    let letters = "abc ".repeat(punctuation.len() / 4);
+    let punctuation_tokens = estimate_tokens(&punctuation);
+
+    assert!(punctuation_tokens >= punctuation.len() as u32 / 2);
+    assert!(punctuation_tokens >= 2 * estimate_tokens(&letters));
+    assert!(punctuation_tokens > ChunkerConfig::default().child_target_tokens as u32);
+}
+
+#[test]
+fn conservative_token_estimator_spaced_composition_matches_joined_text() {
+    let parts = ["a", "b", "c", "d"];
+
+    assert_eq!(
+        estimate_spaced_tokens(parts),
+        estimate_tokens(&parts.join(" ")) as usize
+    );
+}
+
+#[test]
+fn conservative_token_estimator_punctuation_overlap_stays_within_budget() {
+    let text = ":/?#[]{}!@&=";
+    let budget_tokens = 4;
+    let overlap_start = overlap_start_for_token_budget(text, budget_tokens);
+
+    assert!(estimate_tokens(&text[overlap_start..]) as usize <= budget_tokens);
+
+    let long_run = "0123456789abcdef".repeat(4);
+    let overlap_start = overlap_start_for_token_budget(&long_run, 45);
+    assert!(estimate_tokens(&long_run[overlap_start..]) <= 45);
+}
+
+#[test]
+fn cjk_units_exceed_child_target_before_equivalent_ascii_units() {
+    let mut cjk = make_evidence(2, "中文章节");
+    cjk[0].text = "中文测试".into();
+    cjk[1].text = "保守估算".into();
+    let config = ChunkerConfig {
+        child_target_tokens: 6,
+        child_overlap_tokens: 0,
+        parent_children_count: 2,
+    };
+
+    let cjk_output = chunk_evidence(&SourceId("cjk".into()), &cjk, &config);
+    let cjk_children = cjk_output
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.chunk_type == ChunkType::Child)
+        .collect::<Vec<_>>();
+
+    assert_eq!(cjk_children.len(), 2);
+    assert!(cjk_children.iter().all(|chunk| chunk.token_count == 4));
+
+    let mut ascii = make_evidence(2, "English");
+    ascii[0].text = "abcdefghijkl".into();
+    ascii[1].text = "mnopqrstuvwx".into();
+    let ascii_output = chunk_evidence(&SourceId("ascii".into()), &ascii, &config);
+    assert_eq!(
+        ascii_output
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.chunk_type == ChunkType::Child)
+            .count(),
+        1,
+        "the existing English-sized fixture should keep its child structure"
+    );
+}
+
+#[test]
 fn utf8_overlap_retains_resolvable_evidence_spans() {
     let mut evidence = make_evidence(2, "中文章节");
     evidence[0].text = format!("{}[链接](https://example.test/路径)", "前".repeat(160));
