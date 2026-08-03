@@ -2,6 +2,34 @@
 
 use super::*;
 
+/// ASCII fourcc `VBTM`, stored in SQLite's 32-bit application identifier.
+pub(crate) const STORE_APPLICATION_ID: u32 = u32::from_be_bytes(*b"VBTM");
+pub(crate) const STORE_USER_VERSION: u32 = 1;
+
+fn validate_store_identity(conn: &Connection) -> Result<()> {
+    let application_id: i64 = conn.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+    if application_id != 0 && application_id != i64::from(STORE_APPLICATION_ID) {
+        bail!(
+            "SQLite application_id {application_id} does not identify a Verbatim store (expected {})",
+            STORE_APPLICATION_ID
+        );
+    }
+    if user_version > i64::from(STORE_USER_VERSION) {
+        bail!(
+            "SQLite user_version {user_version} is newer than this Verbatim binary supports ({STORE_USER_VERSION})"
+        );
+    }
+    Ok(())
+}
+
+fn stamp_store_identity(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "application_id", STORE_APPLICATION_ID)?;
+    conn.pragma_update(None, "user_version", STORE_USER_VERSION)?;
+    Ok(())
+}
+
 impl Store {
     /// Return the on-disk database path, if this store is not in-memory.
     #[allow(dead_code)]
@@ -36,6 +64,7 @@ impl Store {
             SQLITE_MMAP_SIZE,
             SQLITE_CACHE_SIZE_KB,
         )?;
+        validate_store_identity(&conn)?;
         let store = Self {
             conn,
             durability_profile,
@@ -51,6 +80,8 @@ impl Store {
         store.ensure_write_capacity(SqliteWriteOperation::Migration)?;
         store
             .migrate()
+            .map_err(|error| map_storage_error(SqliteWriteOperation::Migration, error))?;
+        stamp_store_identity(&store.conn)
             .map_err(|error| map_storage_error(SqliteWriteOperation::Migration, error))?;
         // SQLite handles WAL recovery during open. Checking every writable
         // open makes the recovery policy fail closed instead of allowing a
@@ -75,6 +106,7 @@ impl Store {
             durability_profile.policy().busy_timeout_millis,
         ))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA query_only = ON;")?;
+        validate_store_identity(&conn)?;
         Ok(Self {
             conn,
             durability_profile,
@@ -171,6 +203,7 @@ impl Store {
             SQLITE_MMAP_SIZE,
             SQLITE_CACHE_SIZE_KB,
         )?;
+        validate_store_identity(&conn)?;
         let store = Self {
             conn,
             durability_profile,
@@ -184,6 +217,7 @@ impl Store {
             source_relocation_after_parse_hook: std::cell::RefCell::new(None),
         };
         store.migrate()?;
+        stamp_store_identity(&store.conn)?;
         Ok(store)
     }
 }
@@ -192,6 +226,105 @@ impl Store {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn database_identity(path: &Path) -> (u32, u32) {
+        let conn = Connection::open(path).unwrap();
+        let application_id = conn
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        let user_version = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        (application_id, user_version)
+    }
+
+    #[test]
+    fn store_identity_fresh_database_is_stamped_and_reopens() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("fresh.db");
+
+        drop(Store::new(&path).unwrap());
+        assert_eq!(
+            database_identity(&path),
+            (STORE_APPLICATION_ID, STORE_USER_VERSION)
+        );
+
+        Store::open_existing_readonly(&path).unwrap();
+        Store::new(&path).unwrap();
+    }
+
+    #[test]
+    fn store_identity_wrong_application_id_fails_writable_and_readonly() {
+        for readonly in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("wrong-product.db");
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "application_id", u32::from_be_bytes(*b"NOPE"))
+                .unwrap();
+            drop(conn);
+
+            let result = if readonly {
+                Store::open_existing_readonly(&path)
+            } else {
+                Store::new(&path)
+            };
+            let error = result
+                .err()
+                .expect("wrong-product database must fail closed");
+            assert!(error.to_string().contains("application_id"));
+        }
+    }
+
+    #[test]
+    fn store_identity_newer_user_version_fails_writable_and_readonly() {
+        for readonly in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("newer.db");
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", STORE_USER_VERSION + 1)
+                .unwrap();
+            drop(conn);
+
+            let result = if readonly {
+                Store::open_existing_readonly(&path)
+            } else {
+                Store::new(&path)
+            };
+            let error = result.err().expect("newer database must fail closed");
+            assert!(error.to_string().contains("user_version"));
+        }
+    }
+
+    #[test]
+    fn store_identity_legacy_unstamped_database_migrates_and_is_stamped() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                request_json TEXT NOT NULL,
+                result_json TEXT,
+                error TEXT
+            );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::new(&path).unwrap();
+        assert!(table_has_column(store.connection(), "tasks", "progress_json").unwrap());
+        drop(store);
+        assert_eq!(
+            database_identity(&path),
+            (STORE_APPLICATION_ID, STORE_USER_VERSION)
+        );
+    }
 
     #[test]
     fn durability_profiles_apply_and_report_effective_pragmas() {

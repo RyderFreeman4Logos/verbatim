@@ -92,6 +92,11 @@ hatch; immutable packs are never in-place mutated by migrations.
 - Pure in-memory planner/apply/recover loop for contract tests
 - Preflight disk + backup hook + window checks
 - Artifact version classification with read-only adapter
+- Live SQLite open paths validate `application_id` / `user_version`, fail
+  closed on wrong-product and newer stores, and stamp successful writable
+  migrations with the `VBTM` application id and user version `1`
+- Read-only opens do not migrate or stamp; legacy unstamped stores remain
+  readable until historical production databases can be proven fully stamped
 - Unit tests: idempotent re-apply, forward-version fail-closed, checksum
   mismatch, disk space, compatibility window, read-only escape hatch,
   interrupted migration recovery, serde/unknown-schema rejection,
@@ -100,7 +105,8 @@ hatch; immutable packs are never in-place mutated by migrations.
 
 ## What this slice does **not** do (residual)
 
-- Wire live SQLite `application_id` / `user_version` or real SQL migrations
+- Replace the existing ad-hoc SQLite `migrate()` upgrades with ordered,
+  transactional `MigrationFramework` SQL steps and persisted history
 - Auto-migrate on-disk configs beyond the contract types
 - Golden databases/configs/artifacts from every historical release
 - Adjacent service rolling-upgrade matrix in CI
