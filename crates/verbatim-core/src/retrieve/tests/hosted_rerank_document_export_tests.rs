@@ -60,15 +60,13 @@ async fn hosted_rerank_with_document_export_opt_in_replaces_rrf_order() {
 
 #[test]
 fn rerank_endpoint_locality_fails_closed() {
-    assert!(rerank_endpoint_is_local("http://127.0.0.1:8003"));
-    assert!(rerank_endpoint_is_local("http://[::1]:8003/v1"));
-    assert!(rerank_endpoint_is_local("http://LOCALHOST:8003"));
-    assert!(!rerank_endpoint_is_local(""));
-    assert!(!rerank_endpoint_is_local("not a URL"));
-    assert!(!rerank_endpoint_is_local("https://rerank.example.test/v1"));
-    assert!(!rerank_endpoint_is_local(
-        "http://localhost.attacker.example/v1"
-    ));
+    assert!(endpoint_is_local("http://127.0.0.1:8003"));
+    assert!(endpoint_is_local("http://[::1]:8003/v1"));
+    assert!(endpoint_is_local("http://LOCALHOST:8003"));
+    assert!(!endpoint_is_local(""));
+    assert!(!endpoint_is_local("not a URL"));
+    assert!(!endpoint_is_local("https://rerank.example.test/v1"));
+    assert!(!endpoint_is_local("http://localhost.attacker.example/v1"));
 }
 
 #[tokio::test]

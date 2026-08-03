@@ -80,6 +80,23 @@ fn endpoint_resource_name_uses_stable_redacted_fingerprint() {
     assert!(!name.contains("secret-embedding-model"));
 }
 
+#[test]
+fn document_export_opt_in_keeps_remote_base_url_on_normal_transport() {
+    let config = RerankConfig {
+        allow_document_export: true,
+        base_url: "https://rerank.example.test/v1".into(),
+        ..Default::default()
+    };
+    let endpoint = OpenAiEndpoint::new_for_rerank(&config);
+
+    assert!(!endpoint.local_only);
+    assert_eq!(
+        endpoint_url(&endpoint.base_url, "rerank", endpoint.local_only, "rerank")
+            .expect("Normal transport permits a remote base_url"),
+        "https://rerank.example.test/v1/rerank"
+    );
+}
+
 #[tokio::test]
 async fn local_only_llm_rerank_does_not_follow_cross_host_redirect() {
     let target = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
@@ -124,4 +141,79 @@ async fn local_only_llm_rerank_does_not_follow_cross_host_redirect() {
         remote_request.is_none(),
         "cross-host target received rerank query or documents"
     );
+}
+
+fn assert_local_only_remote_endpoint_rejected(error: anyhow::Error, operation: &'static str) {
+    let rerank_error = error
+        .downcast_ref::<RerankError>()
+        .expect("error carries rerank diagnostics");
+    let provider_error = rerank_error
+        .source_error()
+        .downcast_ref::<ProviderError>()
+        .expect("rerank error preserves provider error");
+
+    assert!(matches!(
+        provider_error,
+        ProviderError::Configuration {
+            operation: actual_operation,
+            message,
+        } if *actual_operation == operation
+            && message == "LocalOnly transport requires a loopback or localhost base_url"
+    ));
+}
+
+#[tokio::test]
+async fn local_only_endpoint_reranker_rejects_remote_base_url_before_send() {
+    let config = RerankConfig {
+        enabled: true,
+        allow_document_export: false,
+        strategy: RerankStrategy::Endpoint,
+        provider: "openai_compatible".into(),
+        base_url: "https://rerank.example.test/v1".into(),
+        model: "endpoint-reranker".into(),
+        top_n: 1,
+        timeout_seconds: 1,
+        ..Default::default()
+    };
+    let reranker = OpenAiCompatibleReranker::from_config(&config);
+    let docs = vec!["candidate document must not leave the host".to_string()];
+
+    let error = <OpenAiCompatibleReranker as crate::traits::Reranker>::rerank_with_diagnostics(
+        &reranker,
+        "private query",
+        &docs,
+        1,
+    )
+    .await
+    .expect_err("LocalOnly endpoint rerank rejects a remote base_url");
+
+    assert_local_only_remote_endpoint_rejected(error, "rerank");
+}
+
+#[tokio::test]
+async fn local_only_llm_reranker_rejects_remote_base_url_before_send() {
+    let config = RerankConfig {
+        enabled: true,
+        allow_document_export: false,
+        strategy: RerankStrategy::Llm,
+        provider: "openai_compatible".into(),
+        base_url: "https://rerank.example.test/v1".into(),
+        model: "llm-reranker".into(),
+        top_n: 1,
+        timeout_seconds: 1,
+        ..Default::default()
+    };
+    let reranker = OpenAiCompatibleLlmReranker::from_config(&config);
+    let docs = vec!["candidate document must not leave the host".to_string()];
+
+    let error = <OpenAiCompatibleLlmReranker as crate::traits::Reranker>::rerank_with_diagnostics(
+        &reranker,
+        "private query",
+        &docs,
+        1,
+    )
+    .await
+    .expect_err("LocalOnly LLM rerank rejects a remote base_url");
+
+    assert_local_only_remote_endpoint_rejected(error, "llm rerank");
 }

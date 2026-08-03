@@ -35,7 +35,7 @@ use super::endpoint_capability::{
     EndpointCapabilityLookup, EndpointCapabilityRole, EndpointCapabilityState,
 };
 use super::{
-    ChatContentPart, ChatMessage, ChatModel, ChatRequest, ChatResponse, ChatStream,
+    endpoint_url, ChatContentPart, ChatMessage, ChatModel, ChatRequest, ChatResponse, ChatStream,
     ChatStreamEvent, EmbeddingModel, EmbeddingPurpose, ImageDescribeRequest, ImageDescription,
     ImageUrl, ProviderError, ProviderResult, RerankDoc, RerankHit, Reranker as ProviderReranker,
     TokenUsage, VisionModel,
@@ -1054,6 +1054,7 @@ fn strip_json_fence(content: &str) -> &str {
 struct OpenAiEndpoint {
     runtime: Arc<ModelEndpointRuntime>,
     base_url: String,
+    local_only: bool,
     model: String,
     api_key: String,
     timeout: Duration,
@@ -1124,6 +1125,7 @@ impl OpenAiEndpoint {
         Self {
             runtime,
             base_url,
+            local_only: transport_policy == EndpointTransportPolicy::LocalOnly,
             model: model.to_string(),
             api_key: api_key.to_string(),
             timeout: Duration::from_secs(timeout_seconds.max(1)),
@@ -1300,14 +1302,11 @@ impl OpenAiEndpoint {
         operation: &'static str,
         client_kind: &'static str,
     ) -> ProviderResult<(reqwest::Response, UpstreamRequestContext, EndpointPermit)> {
-        if self.base_url.is_empty() {
-            return Err(ProviderError::configuration(operation, "base_url is empty"));
-        }
         if self.model.is_empty() {
             return Err(ProviderError::configuration(operation, "model is empty"));
         }
 
-        let url = format!("{}/{}", self.base_url, path);
+        let url = endpoint_url(&self.base_url, path, self.local_only, operation)?;
         let context = UpstreamRequestContext::new(
             operation,
             client_kind,
@@ -1343,11 +1342,7 @@ impl OpenAiEndpoint {
         operation: &'static str,
         client_kind: &'static str,
     ) -> ProviderResult<(reqwest::Response, UpstreamRequestContext, EndpointPermit)> {
-        if self.base_url.is_empty() {
-            return Err(ProviderError::configuration(operation, "base_url is empty"));
-        }
-
-        let url = format!("{}/{}", self.base_url, path);
+        let url = endpoint_url(&self.base_url, path, self.local_only, operation)?;
         let context = UpstreamRequestContext::new(
             operation,
             client_kind,

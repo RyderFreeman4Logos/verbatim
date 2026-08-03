@@ -11,7 +11,7 @@ mod vector_search_resource;
 use crate::config::{GraphConfig, QdrantConfig, RerankConfig, RetrievalConfig};
 #[cfg(feature = "qdrant")]
 use crate::index::qdrant::{QdrantClient, QdrantHit};
-use crate::provider::ProviderError;
+use crate::provider::{endpoint_is_local, ProviderError};
 use crate::resource::ObservableResource;
 use crate::retrieval_telemetry::{CandidateCounters, SpanKind};
 use crate::store::Store;
@@ -40,19 +40,6 @@ static PREFIX_CACHE_BYPASS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
-}
-
-fn rerank_endpoint_is_local(base_url: &str) -> bool {
-    let Ok(endpoint) = url::Url::parse(base_url) else {
-        return false;
-    };
-
-    match endpoint.host() {
-        Some(url::Host::Ipv4(address)) => address.is_loopback(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        None => false,
-    }
 }
 
 pub struct RetrievalPipeline<'a> {
@@ -1021,7 +1008,7 @@ impl<'a> RetrievalPipeline<'a> {
                 debug: RetrievalRerankDebug::disabled(),
             });
         }
-        if !config.allow_document_export && !rerank_endpoint_is_local(&config.base_url) {
+        if !config.allow_document_export && !endpoint_is_local(&config.base_url) {
             return Ok(RerankOutcome {
                 fused,
                 debug: RetrievalRerankDebug::skipped("document_export_not_allowed"),
