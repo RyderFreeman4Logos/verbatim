@@ -6932,7 +6932,8 @@ mod tests {
     fn hnsw_with_chunks(chunks: &[Chunk]) -> HnswIndex {
         let mut hnsw = HnswIndex::new();
         for (idx, chunk) in chunks.iter().enumerate() {
-            hnsw.add(&chunk.id, vec![idx as f32, 1.0]);
+            // Unit-L2 so HNSW cosine fail-closed accepts the fixture.
+            hnsw.add(&chunk.id, unit_l2_test_vector(vec![idx as f32, 1.0]));
         }
         hnsw.build().unwrap();
         hnsw
@@ -6945,7 +6946,7 @@ mod tests {
             .map(|(idx, chunk)| VectorDocument {
                 chunk_id: chunk.id.clone(),
                 source_id: chunk.source_id.clone(),
-                vector: vec![idx as f32, 1.0],
+                vector: unit_l2_test_vector(vec![idx as f32, 1.0]),
             })
             .collect::<Vec<_>>();
         store.replace_all_vector_documents(&vectors).unwrap();
