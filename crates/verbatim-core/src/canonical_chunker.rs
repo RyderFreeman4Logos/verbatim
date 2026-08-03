@@ -18,6 +18,9 @@ use crate::types::{
     CanonicalLocator, Chunk, ChunkType, EvidenceId, EvidenceUnit, SourceId, SourceLocator,
 };
 
+/// Stable identity for the canonical unit chunking algorithm.
+pub const CANONICAL_CHUNKER_VERSION: &str = "canonical-unit-v1";
+
 /// Configuration for unit-aligned chunking.
 #[derive(Clone, Debug)]
 pub struct CanonicalChunkerConfig {

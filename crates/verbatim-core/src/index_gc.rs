@@ -744,28 +744,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::store::{EmbeddingProfileConfig, Store};
+    use crate::store::{
+        tests::test_profile_config as shared_test_profile_config, EmbeddingProfileConfig, Store,
+    };
 
     fn test_profile_config() -> EmbeddingProfileConfig<'static> {
         EmbeddingProfileConfig {
-            provider: "test",
-            model: "test-model",
-            dimension: 2,
-            normalize: true,
-            endpoint_identity: None,
-            requested_model: None,
-            served_model: None,
-            max_context_tokens: None,
-            dtype: None,
-            quantization: None,
-            weight_identity: None,
             chunker_version: "parent-child-v2",
-            child_target_tokens: 300,
-            child_overlap_tokens: 80,
-            parent_children_count: 5,
-            embedding_input_budget_tokens: None,
-            query_instruction: "",
-            document_instruction: "",
+            ..shared_test_profile_config("test", "test-model", 2, true, "", "")
         }
     }
 
