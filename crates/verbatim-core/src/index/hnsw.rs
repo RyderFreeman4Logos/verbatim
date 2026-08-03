@@ -1,12 +1,38 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use instant_distance::{Builder, HnswMap, Point, Search};
 use serde::{Deserialize, Serialize};
 
+use crate::exact_scan::COSINE_UNIT_LENGTH_TOLERANCE;
 use crate::store::Store;
 use crate::traits::{VectorDocument, VectorIndex};
 use crate::types::{ChunkId, EmbeddingProfileId, SourceId};
+
+fn validate_cosine_vector(vector: &[f32], expected_dimension: Option<usize>) -> Result<()> {
+    if let Some(expected_dimension) = expected_dimension {
+        ensure!(
+            vector.len() == expected_dimension,
+            "HNSW vector dimension mismatch"
+        );
+    }
+    ensure!(!vector.is_empty(), "HNSW vectors must not be empty");
+    ensure!(
+        vector.iter().all(|value| value.is_finite()),
+        "HNSW vectors must contain only finite values"
+    );
+
+    let squared_norm = vector
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>();
+    ensure!(squared_norm > 0.0, "HNSW vectors must not be zero");
+    ensure!(
+        (squared_norm.sqrt() - 1.0).abs() <= COSINE_UNIT_LENGTH_TOLERANCE,
+        "HNSW cosine vectors must have unit L2 length"
+    );
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct VecPoint(Vec<f32>);
@@ -22,6 +48,11 @@ impl Point for VecPoint {
     }
 }
 
+/// Local cosine index implemented by Euclidean HNSW over unit-L2 vectors.
+///
+/// Unit normalization makes Euclidean and cosine ranking orders equivalent.
+/// Invalid writes are ignored, invalid searches return no matches, and bulk
+/// builds return an error.
 pub struct HnswIndex {
     points: Vec<VectorDocument>,
     map: Option<HnswMap<VecPoint, ChunkId>>,
@@ -57,9 +88,14 @@ impl HnswIndex {
     }
 
     pub fn build(&mut self) -> Result<()> {
+        self.map = None;
         if self.points.is_empty() {
-            self.map = None;
             return Ok(());
+        }
+
+        let dimension = self.points[0].vector.len();
+        for document in &self.points {
+            validate_cosine_vector(&document.vector, Some(dimension))?;
         }
 
         let mut values = Vec::with_capacity(self.points.len());
@@ -79,6 +115,12 @@ impl HnswIndex {
             Some(m) => m,
             None => return Vec::new(),
         };
+        let Some(document) = self.points.first() else {
+            return Vec::new();
+        };
+        if validate_cosine_vector(query, Some(document.vector.len())).is_err() {
+            return Vec::new();
+        }
 
         let query_point = VecPoint(query.to_vec());
         let mut search = Search::default();
@@ -164,6 +206,10 @@ impl Default for HnswIndex {
 
 impl VectorIndex for HnswIndex {
     fn upsert(&mut self, document: VectorDocument) {
+        let expected_dimension = self.points.first().map(|point| point.vector.len());
+        if validate_cosine_vector(&document.vector, expected_dimension).is_err() {
+            return;
+        }
         self.points
             .retain(|point| point.chunk_id != document.chunk_id);
         self.points.push(document);
@@ -192,10 +238,21 @@ impl VectorIndex for HnswIndex {
 mod tests {
     use super::*;
 
+    fn vector_document(chunk_id: &str, vector: Vec<f32>) -> VectorDocument {
+        VectorDocument {
+            chunk_id: ChunkId(chunk_id.into()),
+            source_id: SourceId(String::new()),
+            vector,
+        }
+    }
+
     fn seeded_vec(dim: usize, seed: u64) -> Vec<f32> {
-        (0..dim)
+        let mut vector = (0..dim)
             .map(|i| (seed as f32 * 0.1 + i as f32 * 0.01).sin())
-            .collect()
+            .collect::<Vec<_>>();
+        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        vector.iter_mut().for_each(|value| *value /= norm);
+        vector
     }
 
     #[test]
@@ -217,6 +274,62 @@ mod tests {
         let index = HnswIndex::new();
         let results = index.search(&[0.0, 0.0, 0.0], 5);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn unit_vectors_follow_cosine_rank_order() {
+        let mut index = HnswIndex::new();
+        index.add(&ChunkId("same".into()), vec![1.0, 0.0]);
+        index.add(&ChunkId("near".into()), vec![0.8, 0.6]);
+        index.add(&ChunkId("far".into()), vec![0.0, 1.0]);
+        index.build().unwrap();
+
+        let ranked_ids = index
+            .search(&[1.0, 0.0], 3)
+            .into_iter()
+            .map(|(chunk_id, _)| chunk_id.0)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ranked_ids, ["same", "near", "far"]);
+    }
+
+    #[test]
+    fn invalid_adds_do_not_mutate_index() {
+        let mut index = HnswIndex::new();
+        index.add(&ChunkId("non-unit".into()), vec![2.0, 0.0]);
+        index.add(&ChunkId("non-finite".into()), vec![f32::NAN, 0.0]);
+        index.add(&ChunkId("zero".into()), vec![0.0, 0.0]);
+
+        assert!(index.is_empty());
+
+        index.add(&ChunkId("valid".into()), vec![1.0, 0.0]);
+        index.build().unwrap();
+        for query in [vec![2.0, 0.0], vec![f32::NAN, 0.0], vec![0.0, 0.0]] {
+            assert!(index.search(&query, 1).is_empty());
+        }
+    }
+
+    #[test]
+    fn dimension_mismatch_fails_closed() {
+        let mut index = HnswIndex::new();
+        index.add(&ChunkId("valid".into()), vec![1.0, 0.0]);
+        index.add(&ChunkId("wrong-dimension".into()), vec![1.0]);
+        index.build().unwrap();
+
+        assert_eq!(index.len(), 1);
+        assert!(index.search(&[1.0], 1).is_empty());
+    }
+
+    #[test]
+    fn build_rejects_invalid_bulk_vectors() {
+        let mut index = HnswIndex::new();
+        index.replace_all(vec![
+            vector_document("valid", vec![1.0, 0.0]),
+            vector_document("wrong-dimension", vec![0.0, 0.0, 1.0]),
+        ]);
+
+        assert!(index.build().is_err());
+        assert!(index.search(&[1.0, 0.0], 1).is_empty());
     }
 
     #[test]
