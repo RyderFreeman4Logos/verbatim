@@ -58,6 +58,25 @@ fn conservative_token_estimator_punctuation_dense_code_exceeds_default_target() 
 }
 
 #[test]
+fn conservative_token_estimator_spaced_composition_matches_joined_text() {
+    let parts = ["a", "b", "c", "d"];
+
+    assert_eq!(
+        estimate_spaced_tokens(parts),
+        estimate_tokens(&parts.join(" ")) as usize
+    );
+}
+
+#[test]
+fn conservative_token_estimator_punctuation_overlap_stays_within_budget() {
+    let text = ":/?#[]{}!@&=";
+    let budget_tokens = 4;
+    let overlap_start = overlap_start_for_token_budget(text, budget_tokens);
+
+    assert!(estimate_tokens(&text[overlap_start..]) as usize <= budget_tokens);
+}
+
+#[test]
 fn cjk_units_exceed_child_target_before_equivalent_ascii_units() {
     let mut cjk = make_evidence(2, "中文章节");
     cjk[0].text = "中文测试".into();

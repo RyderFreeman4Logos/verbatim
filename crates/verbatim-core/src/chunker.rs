@@ -6,8 +6,8 @@ use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceUnit, SourceId, SourceLocator,
 };
 
-/// Chunking identity; v5 declares the conservative-v2 token estimator.
-pub const CHUNKER_VERSION: &str = "parent-child-v5";
+/// Chunking identity; v6 declares the conservative-v3 token estimator.
+pub const CHUNKER_VERSION: &str = "parent-child-v6";
 const DEFAULT_CHILD_TARGET: usize = 300;
 const DEFAULT_CHILD_OVERLAP: usize = 80;
 const DEFAULT_PARENT_CHILDREN: usize = 5;
@@ -51,7 +51,7 @@ pub(crate) fn estimate_spaced_tokens<'a>(texts: impl IntoIterator<Item = &'a str
 
     for text in texts.into_iter().filter(|text| !text.is_empty()) {
         if has_text {
-            units = units.saturating_add(1);
+            units = units.saturating_add(scalar_estimator_units(' '));
         }
         units = units.saturating_add(estimator_units(text));
         has_text = true;
@@ -66,12 +66,16 @@ pub(crate) fn estimate_spaced_tokens<'a>(texts: impl IntoIterator<Item = &'a str
 
 fn estimator_units(text: &str) -> usize {
     text.chars().fold(0usize, |units, character| {
-        units.saturating_add(if character.is_ascii_alphanumeric() {
-            1
-        } else {
-            ESTIMATOR_UNITS_PER_TOKEN
-        })
+        units.saturating_add(scalar_estimator_units(character))
     })
+}
+
+fn scalar_estimator_units(character: char) -> usize {
+    if character.is_ascii_alphanumeric() {
+        1
+    } else {
+        ESTIMATOR_UNITS_PER_TOKEN
+    }
 }
 
 fn overlap_start_for_token_budget(text: &str, budget_tokens: usize) -> usize {
@@ -80,11 +84,7 @@ fn overlap_start_for_token_budget(text: &str, budget_tokens: usize) -> usize {
     let mut start = text.len();
 
     for (index, character) in text.char_indices().rev() {
-        let character_units = if character.is_ascii() {
-            1
-        } else {
-            ESTIMATOR_UNITS_PER_TOKEN
-        };
+        let character_units = scalar_estimator_units(character);
         if retained_units.saturating_add(character_units) > budget_units {
             break;
         }
