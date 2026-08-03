@@ -112,6 +112,8 @@ max_subqueries = 4
 [rerank]
 # Endpoint/model settings point at the optional reranker service.
 enabled = false
+# Non-local rerank endpoints require explicit document-export consent.
+allow_document_export = false
 # strategy selects endpoint or local LLM reranking.
 strategy = "endpoint"          # endpoint | llm
 # Keep provider/base_url/model aligned with the rerank endpoint you run.

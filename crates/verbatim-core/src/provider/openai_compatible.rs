@@ -1,14 +1,13 @@
 //! OpenAI-compatible provider adapters for local model servers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
-use reqwest::{Client, Method, RequestBuilder, StatusCode};
+use reqwest::{redirect, Client, Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
@@ -349,14 +348,7 @@ impl OpenAiCompatibleLlmReranker {
     pub fn from_config(config: &RerankConfig) -> Self {
         Self {
             chat: OpenAiCompatibleChatModel {
-                endpoint: OpenAiEndpoint::new_with_options(
-                    &config.base_url,
-                    &config.model,
-                    &config.api_key,
-                    config.timeout_seconds,
-                    &config.endpoint_runtime,
-                    "rerank",
-                ),
+                endpoint: OpenAiEndpoint::new_for_rerank(config),
                 temperature: 0.0,
             },
         }
@@ -366,14 +358,7 @@ impl OpenAiCompatibleLlmReranker {
 impl OpenAiCompatibleReranker {
     pub fn from_config(config: &RerankConfig) -> Self {
         Self {
-            endpoint: OpenAiEndpoint::new_with_options(
-                &config.base_url,
-                &config.model,
-                &config.api_key,
-                config.timeout_seconds,
-                &config.endpoint_runtime,
-                "rerank",
-            ),
+            endpoint: OpenAiEndpoint::new_for_rerank(config),
             provider: RerankProviderKind::from_provider(&config.provider),
             default_top_n: config.top_n,
             capability_cache_ttl: Duration::from_secs(config.capability_cache_ttl_seconds.max(1)),
@@ -1090,10 +1075,52 @@ impl OpenAiEndpoint {
         config: &ModelEndpointRuntimeConfig,
         capability: &'static str,
     ) -> Self {
+        Self::new_with_transport_policy(
+            base_url,
+            model,
+            api_key,
+            timeout_seconds,
+            config,
+            capability,
+            EndpointTransportPolicy::Normal,
+        )
+    }
+
+    fn new_for_rerank(config: &RerankConfig) -> Self {
+        let transport_policy = if config.allow_document_export {
+            EndpointTransportPolicy::Normal
+        } else {
+            EndpointTransportPolicy::LocalOnly
+        };
+        Self::new_with_transport_policy(
+            &config.base_url,
+            &config.model,
+            &config.api_key,
+            config.timeout_seconds,
+            &config.endpoint_runtime,
+            "rerank",
+            transport_policy,
+        )
+    }
+
+    fn new_with_transport_policy(
+        base_url: &str,
+        model: &str,
+        api_key: &str,
+        timeout_seconds: u64,
+        config: &ModelEndpointRuntimeConfig,
+        capability: &'static str,
+        transport_policy: EndpointTransportPolicy,
+    ) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         let config = config.bounded();
-        let runtime =
-            endpoint_runtime_registry().runtime_for(&base_url, model, capability, &config);
+        let runtime = endpoint_runtime_registry().runtime_for(
+            &base_url,
+            model,
+            capability,
+            transport_policy,
+            &config,
+        );
         Self {
             runtime,
             base_url,
@@ -1292,7 +1319,7 @@ impl OpenAiEndpoint {
         let permit = self.runtime.acquire(operation).await?;
         self.auth(
             self.runtime
-                .client
+                .client(operation)?
                 .post(url)
                 .timeout(self.timeout)
                 .json(body),
@@ -1330,18 +1357,23 @@ impl OpenAiEndpoint {
             &url,
         );
         let permit = self.runtime.acquire(operation).await?;
-        self.auth(self.runtime.client.get(url).timeout(self.timeout))
-            .send()
-            .await
-            .map(|response| (response, context.clone(), permit))
-            .map_err(|source| {
-                let diagnostic = context.transport_failure(&source);
-                ProviderError::Transport {
-                    operation,
-                    source,
-                    diagnostic: Box::new(diagnostic),
-                }
-            })
+        self.auth(
+            self.runtime
+                .client(operation)?
+                .get(url)
+                .timeout(self.timeout),
+        )
+        .send()
+        .await
+        .map(|response| (response, context.clone(), permit))
+        .map_err(|source| {
+            let diagnostic = context.transport_failure(&source);
+            ProviderError::Transport {
+                operation,
+                source,
+                diagnostic: Box::new(diagnostic),
+            }
+        })
     }
 
     fn auth(&self, req: RequestBuilder) -> RequestBuilder {
@@ -1355,11 +1387,17 @@ impl OpenAiEndpoint {
 
 #[derive(Clone, Debug)]
 struct ModelEndpointRuntime {
-    client: Client,
+    client: Result<Client, String>,
     resource: Arc<ObservableResource>,
 }
 
 impl ModelEndpointRuntime {
+    fn client(&self, operation: &'static str) -> ProviderResult<&Client> {
+        self.client
+            .as_ref()
+            .map_err(|message| ProviderError::configuration(operation, message.clone()))
+    }
+
     async fn acquire(&self, operation: &'static str) -> ProviderResult<EndpointPermit> {
         self.resource
             .acquire()
@@ -1384,9 +1422,10 @@ impl EndpointResourceRegistry {
         base_url: &str,
         model: &str,
         capability: &'static str,
+        transport_policy: EndpointTransportPolicy,
         config: &ModelEndpointRuntimeConfig,
     ) -> Arc<ModelEndpointRuntime> {
-        let key = EndpointKey::new(base_url, model, capability);
+        let key = EndpointKey::new(base_url, model, capability, transport_policy);
         let mut runtimes = lock_unpoisoned(&self.runtimes);
         let runtime = runtimes
             .entry(key)
@@ -1397,7 +1436,7 @@ impl EndpointResourceRegistry {
                     endpoint_resource_config(config),
                 );
                 Arc::new(ModelEndpointRuntime {
-                    client: Client::new(),
+                    client: endpoint_client(transport_policy),
                     resource,
                 })
             })
@@ -1407,6 +1446,18 @@ impl EndpointResourceRegistry {
     }
 }
 
+fn endpoint_client(policy: EndpointTransportPolicy) -> Result<Client, String> {
+    let builder = match policy {
+        EndpointTransportPolicy::Normal => Client::builder(),
+        EndpointTransportPolicy::LocalOnly => Client::builder()
+            .redirect(redirect::Policy::none())
+            .no_proxy(),
+    };
+    builder
+        .build()
+        .map_err(|error| format!("failed to build endpoint HTTP client: {error}"))
+}
+
 fn endpoint_runtime_registry() -> &'static EndpointResourceRegistry {
     static REGISTRY: OnceLock<EndpointResourceRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| EndpointResourceRegistry {
@@ -1414,37 +1465,34 @@ fn endpoint_runtime_registry() -> &'static EndpointResourceRegistry {
     })
 }
 
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct EndpointKey {
     endpoint: String,
     model: String,
     capability: &'static str,
+    transport_policy: EndpointTransportPolicy,
 }
 
 impl EndpointKey {
-    fn new(base_url: &str, model: &str, capability: &'static str) -> Self {
+    fn new(
+        base_url: &str,
+        model: &str,
+        capability: &'static str,
+        transport_policy: EndpointTransportPolicy,
+    ) -> Self {
         Self {
             endpoint: normalized_endpoint_key(base_url),
             model: model.to_ascii_lowercase(),
             capability,
+            transport_policy,
         }
     }
 }
 
-impl PartialEq for EndpointKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.endpoint == other.endpoint
-            && self.model == other.model
-            && self.capability == other.capability
-    }
-}
-
-impl Hash for EndpointKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.endpoint.hash(state);
-        self.model.hash(state);
-        self.capability.hash(state);
-    }
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum EndpointTransportPolicy {
+    Normal,
+    LocalOnly,
 }
 
 #[derive(Debug)]
@@ -1905,6 +1953,8 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    mod transport_policy_tests;
+
     #[derive(Debug)]
     struct RecordedRequest {
         method: String,
@@ -2109,43 +2159,6 @@ mod tests {
                 max_backoff_millis: initial_backoff_millis,
             },
         }
-    }
-
-    #[test]
-    fn endpoint_key_normalizes_endpoint_model_and_separates_capability() {
-        let left = EndpointKey::new("HTTP://LOCALHOST:8080/v1/", "Embedding-Model", "embedding");
-        let same = EndpointKey::new("http://localhost:8080/v1", "embedding-model", "embedding");
-        let other_model = EndpointKey::new("http://localhost:8080/v1", "chat-model", "embedding");
-        let other_capability =
-            EndpointKey::new("http://localhost:8080/v1", "embedding-model", "rerank");
-
-        assert_eq!(left, same);
-        assert_ne!(left, other_model);
-        assert_ne!(left, other_capability);
-    }
-
-    #[test]
-    fn endpoint_resource_name_uses_stable_redacted_fingerprint() {
-        let name = endpoint_resource_name(
-            "HTTP://LOCALHOST:8080/v1/",
-            "Secret-Embedding-Model",
-            "embedding",
-        );
-        let same = endpoint_resource_name(
-            "http://localhost:8080/v1",
-            "secret-embedding-model",
-            "embedding",
-        );
-        let other_model =
-            endpoint_resource_name("http://localhost:8080/v1", "other-model", "embedding");
-
-        assert_eq!(name, same);
-        assert_ne!(name, other_model);
-        assert!(name.starts_with("model_endpoint:embedding:"));
-        assert!(!name.contains("localhost"));
-        assert!(!name.contains("8080"));
-        assert!(!name.contains("Secret-Embedding-Model"));
-        assert!(!name.contains("secret-embedding-model"));
     }
 
     fn embedding_model_with_runtime(

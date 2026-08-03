@@ -2602,7 +2602,7 @@ timeout_seconds = 0
     }
 
     #[test]
-    fn default_template_places_capability_cache_ttl_under_model_tables() {
+    fn default_template_places_model_keys_under_model_tables() {
         let template: toml::Value = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
 
         assert_eq!(
@@ -2618,6 +2618,13 @@ timeout_seconds = 0
                 .and_then(|rerank| rerank.get("capability_cache_ttl_seconds"))
                 .and_then(toml::Value::as_integer),
             Some(DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS as i64)
+        );
+        assert_eq!(
+            template
+                .get("rerank")
+                .and_then(|rerank| rerank.get("allow_document_export"))
+                .and_then(toml::Value::as_bool),
+            Some(false)
         );
     }
 
