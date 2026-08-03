@@ -111,6 +111,9 @@ queries the lexical BM25 index without probing a default embedding endpoint. If
 `embedding.enabled = true`, the configured embedding endpoint is required and
 endpoint errors fail clearly. If `[rerank]` is absent, rerank stays disabled;
 `rerank.enabled = false` always overrides rerank endpoint or model fields.
+Rerank document export is off by default: loopback endpoints work without an
+opt-in, while non-local endpoints require `allow_document_export = true` and
+receive the query and candidate document text.
 By default `[vector_index] residency = "low_memory"` keeps dense vectors in
 SQLite and scans them at query time; set `resident_hnsw` to load the published
 local HNSW index into the daemon for lower query latency on machines with enough

@@ -426,7 +426,10 @@ provider = "vllm"
 base_url = "http://gb10:18003"
 model = "Qwen/Qwen3-Reranker-4B"
 top_n = 12
+allow_document_export = true
 ```
+
+This opt-in sends the query and candidate document text to the non-local reranker.
 
 Use `verbatim retrieve --show-debug ...` or
 `verbatim ask --show-retrieval ...` to confirm whether rerank was skipped,

@@ -636,6 +636,9 @@ pub enum RerankStrategy {
 pub struct RerankConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Permit sending candidate document text to non-loopback rerank endpoints.
+    #[serde(default)]
+    pub allow_document_export: bool,
     #[serde(default)]
     pub strategy: RerankStrategy,
     #[serde(default = "default_rerank_provider")]
@@ -660,6 +663,7 @@ impl Default for RerankConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_document_export: false,
             strategy: RerankStrategy::Endpoint,
             provider: default_rerank_provider(),
             base_url: default_rerank_base_url(),
@@ -682,6 +686,8 @@ impl<'de> Deserialize<'de> for RerankConfig {
         struct RawRerankConfig {
             #[serde(default)]
             enabled: Option<bool>,
+            #[serde(default)]
+            allow_document_export: bool,
             #[serde(default)]
             strategy: Option<RerankStrategy>,
             #[serde(default)]
@@ -716,6 +722,7 @@ impl<'de> Deserialize<'de> for RerankConfig {
 
         Ok(Self {
             enabled: raw.enabled.unwrap_or(endpoint_or_model_configured),
+            allow_document_export: raw.allow_document_export,
             strategy,
             provider: raw.provider.unwrap_or_else(default_rerank_provider),
             base_url: raw.base_url.unwrap_or_else(default_rerank_base_url),
@@ -1748,6 +1755,7 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "graph.global_search.max_search_results"
             | "graph.global_search.drift.enabled"
             | "graph.global_search.drift.max_subqueries"
+            | "rerank.allow_document_export"
             | "rerank.enabled"
             | "rerank.strategy"
             | "rerank.provider"
@@ -1998,6 +2006,7 @@ mod tests {
         assert!(!config.graph.global_search.drift.enabled);
         assert_eq!(config.graph.global_search.drift.max_subqueries, 4);
         assert!(!config.rerank.enabled);
+        assert!(!config.rerank.allow_document_export);
         assert_eq!(config.rerank.strategy, RerankStrategy::Endpoint);
         assert_eq!(config.rerank.provider, "vllm");
         assert_eq!(config.rerank.base_url, "http://127.0.0.1:8003");
@@ -2593,7 +2602,7 @@ timeout_seconds = 0
     }
 
     #[test]
-    fn default_template_places_capability_cache_ttl_under_model_tables() {
+    fn default_template_places_model_keys_under_model_tables() {
         let template: toml::Value = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
 
         assert_eq!(
@@ -2609,6 +2618,13 @@ timeout_seconds = 0
                 .and_then(|rerank| rerank.get("capability_cache_ttl_seconds"))
                 .and_then(toml::Value::as_integer),
             Some(DEFAULT_RERANK_CAPABILITY_CACHE_TTL_SECONDS as i64)
+        );
+        assert_eq!(
+            template
+                .get("rerank")
+                .and_then(|rerank| rerank.get("allow_document_export"))
+                .and_then(toml::Value::as_bool),
+            Some(false)
         );
     }
 
@@ -2706,6 +2722,21 @@ timeout_seconds = 0
             applied.daemon.resources.memory_budget_enforcement,
             MemoryBudgetEnforcement::Fail
         );
+    }
+
+    #[test]
+    fn reload_plan_applies_document_export_as_runtime_safe() {
+        let current: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        let mut candidate = current.clone();
+        candidate.rerank.allow_document_export = true;
+
+        assert!(!current.rerank.allow_document_export);
+        let plan = current.reload_plan(&candidate).unwrap();
+        assert_eq!(plan.reload_safe_keys, vec!["rerank.allow_document_export"]);
+        assert!(plan.restart_required_keys.is_empty());
+
+        let applied = current.apply_reload_safe_changes(&candidate);
+        assert!(applied.rerank.allow_document_export);
     }
 
     #[test]

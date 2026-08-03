@@ -15,6 +15,40 @@ pub mod openai_compatible;
 
 mod endpoint_capability;
 
+/// Returns whether an endpoint URL names a loopback address or `localhost`.
+pub(crate) fn endpoint_is_local(base_url: &str) -> bool {
+    let Ok(endpoint) = url::Url::parse(base_url) else {
+        return false;
+    };
+
+    match endpoint.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// Builds an endpoint URL, rejecting non-local bases when local-only transport is required.
+pub(crate) fn endpoint_url(
+    base_url: &str,
+    path: &str,
+    local_only: bool,
+    operation: &'static str,
+) -> ProviderResult<String> {
+    if base_url.is_empty() {
+        return Err(ProviderError::configuration(operation, "base_url is empty"));
+    }
+    if local_only && !endpoint_is_local(base_url) {
+        return Err(ProviderError::configuration(
+            operation,
+            "LocalOnly transport requires a loopback or localhost base_url",
+        ));
+    }
+
+    Ok(format!("{base_url}/{path}"))
+}
+
 /// Result type used by model providers.
 pub type ProviderResult<T> = std::result::Result<T, ProviderError>;
 
