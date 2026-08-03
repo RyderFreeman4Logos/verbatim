@@ -301,7 +301,6 @@ fn approximate_dir_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunker::CHUNKER_VERSION;
     use crate::store::{EmbeddingCacheEntry, EmbeddingProfileConfig, SourceContentsReplacement};
     use crate::traits::VectorDocument;
     use crate::types::{
@@ -315,26 +314,7 @@ mod tests {
     }
 
     fn config<'a>(model: &'a str) -> EmbeddingProfileConfig<'a> {
-        EmbeddingProfileConfig {
-            provider: "test",
-            model,
-            dimension: 2,
-            normalize: true,
-            endpoint_identity: None,
-            requested_model: None,
-            served_model: None,
-            max_context_tokens: None,
-            dtype: None,
-            quantization: None,
-            weight_identity: None,
-            chunker_version: CHUNKER_VERSION,
-            child_target_tokens: 300,
-            child_overlap_tokens: 80,
-            parent_children_count: 5,
-            embedding_input_budget_tokens: None,
-            query_instruction: "",
-            document_instruction: "",
-        }
+        crate::store::tests::test_profile_config("test", model, 2, true, "", "")
     }
 
     fn source() -> Source {

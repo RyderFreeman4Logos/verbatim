@@ -16695,6 +16695,11 @@ mod tests {
                     child_target_tokens: 300,
                     child_overlap_tokens: 80,
                     parent_children_count: 5,
+                    canonical_chunker_version:
+                        verbatim_core::canonical_chunker::CANONICAL_CHUNKER_VERSION,
+                    canonical_target_tokens: 300,
+                    canonical_overlap_units: 2,
+                    canonical_max_units_per_child: 20,
                     embedding_input_budget_tokens: None,
                     query_instruction: "",
                     document_instruction: "",

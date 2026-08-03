@@ -11,6 +11,7 @@ use rusqlite::{
 };
 use serde::de::DeserializeOwned;
 
+use crate::canonical_chunker::CANONICAL_CHUNKER_VERSION;
 use crate::collection::{
     resolve_collection_root, validate_collection_name, CollectionMember, CollectionMemberCandidate,
     CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus, CollectionSyncReport,
@@ -152,6 +153,10 @@ pub struct EmbeddingProfileConfig<'a> {
     pub child_target_tokens: usize,
     pub child_overlap_tokens: usize,
     pub parent_children_count: usize,
+    pub canonical_chunker_version: &'a str,
+    pub canonical_target_tokens: usize,
+    pub canonical_overlap_units: usize,
+    pub canonical_max_units_per_child: usize,
     pub embedding_input_budget_tokens: Option<usize>,
     pub query_instruction: &'a str,
     pub document_instruction: &'a str,
@@ -174,6 +179,10 @@ pub(crate) struct StoredEmbeddingProfileConfig {
     pub(crate) child_target_tokens: usize,
     pub(crate) child_overlap_tokens: usize,
     pub(crate) parent_children_count: usize,
+    pub(crate) canonical_chunker_version: String,
+    pub(crate) canonical_target_tokens: usize,
+    pub(crate) canonical_overlap_units: usize,
+    pub(crate) canonical_max_units_per_child: usize,
     pub(crate) embedding_input_budget_tokens: Option<usize>,
     query_instruction_hash: String,
     document_instruction_hash: String,
@@ -232,6 +241,10 @@ impl StoredEmbeddingProfileConfig {
         }
         if self.chunker_version != next.chunker_version
             || self.parent_children_count != next.parent_children_count
+            || self.canonical_chunker_version != next.canonical_chunker_version
+            || self.canonical_target_tokens != next.canonical_target_tokens
+            || self.canonical_overlap_units != next.canonical_overlap_units
+            || self.canonical_max_units_per_child != next.canonical_max_units_per_child
         {
             return true;
         }
@@ -277,6 +290,10 @@ impl StoredEmbeddingProfileConfig {
             } else {
                 next.parent_children_count
             },
+            canonical_chunker_version: next.canonical_chunker_version,
+            canonical_target_tokens: next.canonical_target_tokens,
+            canonical_overlap_units: next.canonical_overlap_units,
+            canonical_max_units_per_child: next.canonical_max_units_per_child,
             embedding_input_budget_tokens: if preserve_stored_chunking {
                 self.embedding_input_budget_tokens
             } else {
@@ -1536,8 +1553,8 @@ impl Store {
         let config_hash = config.config_hash();
         self.conn.execute(
             "INSERT INTO embedding_profiles
-                (id, provider, model, dimension, normalize, endpoint_identity, requested_model, served_model, max_context_tokens, dtype, quantization, weight_identity, chunker_version, child_target_tokens, child_overlap_tokens, parent_children_count, embedding_input_budget_tokens, query_instruction_hash, document_instruction_hash, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, NULL, NULL, ?21, ?21)
+                (id, provider, model, dimension, normalize, endpoint_identity, requested_model, served_model, max_context_tokens, dtype, quantization, weight_identity, chunker_version, child_target_tokens, child_overlap_tokens, parent_children_count, canonical_chunker_version, canonical_target_tokens, canonical_overlap_units, canonical_max_units_per_child, embedding_input_budget_tokens, query_instruction_hash, document_instruction_hash, config_hash, qdrant_collection, qdrant_vector_name, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, NULL, NULL, ?25, ?25)
              ON CONFLICT(id) DO NOTHING",
             params![
                 profile_id.as_str(),
@@ -1556,6 +1573,10 @@ impl Store {
                 sql_usize(config.child_target_tokens),
                 sql_usize(config.child_overlap_tokens),
                 sql_usize(config.parent_children_count),
+                config.canonical_chunker_version,
+                sql_usize(config.canonical_target_tokens),
+                sql_usize(config.canonical_overlap_units),
+                sql_usize(config.canonical_max_units_per_child),
                 sql_opt_usize(config.embedding_input_budget_tokens),
                 &query_instruction_hash,
                 &document_instruction_hash,
@@ -1614,7 +1635,9 @@ impl Store {
                 "SELECT provider, model, dimension, normalize, endpoint_identity, requested_model,
                         served_model, max_context_tokens, dtype, quantization, weight_identity,
                         chunker_version, child_target_tokens, child_overlap_tokens,
-                        parent_children_count, embedding_input_budget_tokens, query_instruction_hash,
+                        parent_children_count, canonical_chunker_version, canonical_target_tokens,
+                        canonical_overlap_units, canonical_max_units_per_child,
+                        embedding_input_budget_tokens, query_instruction_hash,
                         document_instruction_hash, config_hash
                  FROM embedding_profiles
                  WHERE id = ?1",
@@ -1636,10 +1659,14 @@ impl Store {
                         child_target_tokens: row_usize(row, 12)?,
                         child_overlap_tokens: row_usize(row, 13)?,
                         parent_children_count: row_usize(row, 14)?,
-                        embedding_input_budget_tokens: row_opt_usize(row, 15)?,
-                        query_instruction_hash: row.get(16)?,
-                        document_instruction_hash: row.get(17)?,
-                        config_hash: row.get(18)?,
+                        canonical_chunker_version: row.get(15)?,
+                        canonical_target_tokens: row_usize(row, 16)?,
+                        canonical_overlap_units: row_usize(row, 17)?,
+                        canonical_max_units_per_child: row_usize(row, 18)?,
+                        embedding_input_budget_tokens: row_opt_usize(row, 19)?,
+                        query_instruction_hash: row.get(20)?,
+                        document_instruction_hash: row.get(21)?,
+                        config_hash: row.get(22)?,
                     })
                 },
             )
@@ -2993,6 +3020,30 @@ fn migrate_embedding_profile_tables(conn: &Connection) -> Result<()> {
     ensure_column(
         conn,
         "embedding_profiles",
+        "canonical_chunker_version",
+        "ALTER TABLE embedding_profiles ADD COLUMN canonical_chunker_version TEXT NOT NULL DEFAULT 'canonical-unit-v1'",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "canonical_target_tokens",
+        "ALTER TABLE embedding_profiles ADD COLUMN canonical_target_tokens INTEGER NOT NULL DEFAULT 300",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "canonical_overlap_units",
+        "ALTER TABLE embedding_profiles ADD COLUMN canonical_overlap_units INTEGER NOT NULL DEFAULT 2",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
+        "canonical_max_units_per_child",
+        "ALTER TABLE embedding_profiles ADD COLUMN canonical_max_units_per_child INTEGER NOT NULL DEFAULT 20",
+    )?;
+    ensure_column(
+        conn,
+        "embedding_profiles",
         "embedding_input_budget_tokens",
         "ALTER TABLE embedding_profiles ADD COLUMN embedding_input_budget_tokens INTEGER",
     )?;
@@ -3187,6 +3238,10 @@ fn backfill_embedding_profile_instruction_hashes(conn: &Connection) -> Result<()
             child_target_tokens: 300,
             child_overlap_tokens: 80,
             parent_children_count: 5,
+            canonical_chunker_version: CANONICAL_CHUNKER_VERSION,
+            canonical_target_tokens: 300,
+            canonical_overlap_units: 2,
+            canonical_max_units_per_child: 20,
             embedding_input_budget_tokens: None,
             query_instruction: "",
             document_instruction: "",
@@ -3566,7 +3621,7 @@ fn embedding_profile_config_hash(config: &EmbeddingProfileConfig<'_>) -> String 
     let document_instruction_hash = config.document_instruction_hash();
     hex_sha256(
         format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             config.provider,
             config.model,
             config.dimension,
@@ -3585,6 +3640,10 @@ fn embedding_profile_config_hash(config: &EmbeddingProfileConfig<'_>) -> String 
             config.child_target_tokens,
             config.child_overlap_tokens,
             config.parent_children_count,
+            config.canonical_chunker_version,
+            config.canonical_target_tokens,
+            config.canonical_overlap_units,
+            config.canonical_max_units_per_child,
             config
                 .embedding_input_budget_tokens
                 .map(|value| value.to_string())
@@ -3622,11 +3681,15 @@ fn update_embedding_profile_config_tx(
              child_target_tokens = ?14,
              child_overlap_tokens = ?15,
              parent_children_count = ?16,
-             embedding_input_budget_tokens = ?17,
-             query_instruction_hash = ?18,
-             document_instruction_hash = ?19,
-             config_hash = ?20,
-             updated_at = ?21
+             canonical_chunker_version = ?17,
+             canonical_target_tokens = ?18,
+             canonical_overlap_units = ?19,
+             canonical_max_units_per_child = ?20,
+             embedding_input_budget_tokens = ?21,
+             query_instruction_hash = ?22,
+             document_instruction_hash = ?23,
+             config_hash = ?24,
+             updated_at = ?25
          WHERE id = ?1",
         params![
             profile_id.as_str(),
@@ -3645,6 +3708,10 @@ fn update_embedding_profile_config_tx(
             sql_usize(config.child_target_tokens),
             sql_usize(config.child_overlap_tokens),
             sql_usize(config.parent_children_count),
+            config.canonical_chunker_version,
+            sql_usize(config.canonical_target_tokens),
+            sql_usize(config.canonical_overlap_units),
+            sql_usize(config.canonical_max_units_per_child),
             sql_opt_usize(config.embedding_input_budget_tokens),
             query_instruction_hash,
             document_instruction_hash,
@@ -4560,6 +4627,10 @@ CREATE TABLE IF NOT EXISTS embedding_profiles (
     child_target_tokens INTEGER NOT NULL DEFAULT 300,
     child_overlap_tokens INTEGER NOT NULL DEFAULT 80,
     parent_children_count INTEGER NOT NULL DEFAULT 5,
+    canonical_chunker_version TEXT NOT NULL DEFAULT 'canonical-unit-v1',
+    canonical_target_tokens INTEGER NOT NULL DEFAULT 300,
+    canonical_overlap_units INTEGER NOT NULL DEFAULT 2,
+    canonical_max_units_per_child INTEGER NOT NULL DEFAULT 20,
     embedding_input_budget_tokens INTEGER,
     query_instruction_hash TEXT NOT NULL DEFAULT '',
     document_instruction_hash TEXT NOT NULL DEFAULT '',
@@ -4742,7 +4813,7 @@ END;
 "#;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::chunker::CHUNKER_VERSION;
     use crate::task::{
@@ -5625,7 +5696,7 @@ mod tests {
         EmbeddingProfileId::new(id).unwrap()
     }
 
-    pub(super) fn test_profile_config<'a>(
+    pub(crate) fn test_profile_config<'a>(
         provider: &'a str,
         model: &'a str,
         dimension: usize,
@@ -5649,6 +5720,10 @@ mod tests {
             child_target_tokens: 300,
             child_overlap_tokens: 80,
             parent_children_count: 5,
+            canonical_chunker_version: CANONICAL_CHUNKER_VERSION,
+            canonical_target_tokens: 300,
+            canonical_overlap_units: 2,
+            canonical_max_units_per_child: 20,
             embedding_input_budget_tokens: None,
             query_instruction,
             document_instruction,
@@ -6056,6 +6131,14 @@ mod tests {
 
         let store = Store::new(&db_path).unwrap();
         let profile = profile_id("custom");
+        let stored = store
+            .load_embedding_profile_config(&profile)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.canonical_chunker_version, "canonical-unit-v1");
+        assert_eq!(stored.canonical_target_tokens, 300);
+        assert_eq!(stored.canonical_overlap_units, 2);
+        assert_eq!(stored.canonical_max_units_per_child, 20);
         let err = store
             .ensure_embedding_profile(
                 &profile,
@@ -6072,6 +6155,20 @@ mod tests {
                 test_profile_config("provider-a", "model-a", 2, true, "", ""),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn canonical_chunker_change_requires_vector_reset() {
+        let store = Store::in_memory().unwrap();
+        let profile = profile_id("canonical-chunker-reset");
+        let first = test_profile_config("test", "model", 2, true, "", "");
+        let second = EmbeddingProfileConfig {
+            canonical_overlap_units: first.canonical_overlap_units + 1,
+            ..first
+        };
+
+        assert!(!store.ensure_embedding_profile(&profile, first).unwrap());
+        assert!(store.ensure_embedding_profile(&profile, second).unwrap());
     }
 
     #[test]

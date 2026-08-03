@@ -2479,8 +2479,6 @@ mod tests {
 
     use crate::index::hnsw::HnswIndex;
     use crate::index::sqlite_fts::SqliteFtsIndex;
-    #[cfg(feature = "qdrant")]
-    use crate::store::EmbeddingProfileConfig;
     use crate::store::Store;
     use crate::traits::{LexicalIndex, VectorDocument, VectorIndex};
     use crate::types::{

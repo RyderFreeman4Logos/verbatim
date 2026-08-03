@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
 
+use crate::canonical_chunker::{chunk_canonical_units, CanonicalChunkerConfig};
 use crate::chunker::{chunk_evidence, ChunkOutput, ChunkerConfig};
 use crate::types::{EvidenceUnit, SourceId, SourceLocator};
 
@@ -18,6 +19,7 @@ pub(super) fn chunk_searchable_evidence_by_locator(
     source_id: &SourceId,
     evidence: &[EvidenceUnit],
     config: &ChunkerConfig,
+    canonical_config: &CanonicalChunkerConfig,
 ) -> Result<PartitionedChunkOutput> {
     let canonical_evidence_count = evidence
         .iter()
@@ -38,15 +40,11 @@ pub(super) fn chunk_searchable_evidence_by_locator(
             vec!["chunk_evidence"],
         ),
         (_, 0) => (
-            crate::canonical_chunker::chunk_canonical_units(
-                source_id,
-                evidence,
-                &crate::canonical_chunker::CanonicalChunkerConfig::default(),
-            )?,
+            chunk_canonical_units(source_id, evidence, canonical_config)?,
             vec!["chunk_canonical_units"],
         ),
         _ => (
-            chunk_mixed_evidence(source_id, evidence, config)?,
+            chunk_mixed_evidence(source_id, evidence, config, canonical_config)?,
             vec!["chunk_canonical_units", "chunk_evidence"],
         ),
     };
@@ -71,16 +69,13 @@ fn chunk_mixed_evidence(
     source_id: &SourceId,
     evidence: &[EvidenceUnit],
     config: &ChunkerConfig,
+    canonical_config: &CanonicalChunkerConfig,
 ) -> Result<ChunkOutput> {
     let (canonical, noncanonical): (Vec<_>, Vec<_>) = evidence
         .iter()
         .cloned()
         .partition(|unit| matches!(unit.locator, SourceLocator::Canonical { .. }));
-    let canonical_output = crate::canonical_chunker::chunk_canonical_units(
-        source_id,
-        &canonical,
-        &crate::canonical_chunker::CanonicalChunkerConfig::default(),
-    )?;
+    let canonical_output = chunk_canonical_units(source_id, &canonical, canonical_config)?;
     let noncanonical_output = chunk_evidence(source_id, &noncanonical, config);
     let [mut output, other] = if evidence
         .first()
@@ -195,9 +190,13 @@ mod tests {
             ),
             canonical_evidence(&source_id, "verse-3", "Canonical verse three", 3),
         ];
-        let partitioned =
-            chunk_searchable_evidence_by_locator(&source_id, &evidence, &ChunkerConfig::default())
-                .unwrap();
+        let partitioned = chunk_searchable_evidence_by_locator(
+            &source_id,
+            &evidence,
+            &ChunkerConfig::default(),
+            &CanonicalChunkerConfig::default(),
+        )
+        .unwrap();
 
         assert_eq!(partitioned.canonical_evidence_count, 2);
         assert_eq!(partitioned.noncanonical_evidence_count, 1);
@@ -233,6 +232,7 @@ mod tests {
                 text_evidence(&source_id, "text-3", "Trailing plain text", 3),
             ],
             &ChunkerConfig::default(),
+            &CanonicalChunkerConfig::default(),
         )
         .unwrap();
         assert!(noncanonical_first.output.chunks[0]
@@ -269,9 +269,13 @@ mod tests {
             21,
         ));
         evidence.push(canonical_evidence(&source_id, "verse-22", "Verse 22", 22));
-        let ordered =
-            chunk_searchable_evidence_by_locator(&source_id, &evidence, &ChunkerConfig::default())
-                .unwrap();
+        let ordered = chunk_searchable_evidence_by_locator(
+            &source_id,
+            &evidence,
+            &ChunkerConfig::default(),
+            &CanonicalChunkerConfig::default(),
+        )
+        .unwrap();
 
         let middle_chunk = ordered
             .output
@@ -318,6 +322,43 @@ mod tests {
     }
 
     #[test]
+    fn canonical_partition_uses_provided_chunker_config() {
+        let source_id = SourceId("configured-canonical-partition".into());
+        let evidence = (1..=4)
+            .map(|position| {
+                canonical_evidence(
+                    &source_id,
+                    &format!("verse-{position}"),
+                    &format!("Verse {position}"),
+                    position,
+                )
+            })
+            .collect::<Vec<_>>();
+        let canonical_config = CanonicalChunkerConfig {
+            target_tokens: usize::MAX,
+            overlap_units: 0,
+            max_units_per_child: 1,
+        };
+
+        let partitioned = chunk_searchable_evidence_by_locator(
+            &source_id,
+            &evidence,
+            &ChunkerConfig::default(),
+            &canonical_config,
+        )
+        .unwrap();
+        let child_sizes = partitioned
+            .output
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.chunk_type == ChunkType::Child)
+            .map(|chunk| chunk.evidence_unit_ids.len())
+            .collect::<Vec<_>>();
+
+        assert_eq!(child_sizes, [1, 1, 1, 1]);
+    }
+
+    #[test]
     fn pure_and_empty_locator_partitions_use_only_the_needed_strategy() {
         let source_id = SourceId("single-locator-partition".into());
         let canonical = vec![canonical_evidence(
@@ -342,6 +383,7 @@ mod tests {
                 &source_id,
                 evidence,
                 &ChunkerConfig::default(),
+                &CanonicalChunkerConfig::default(),
             )
             .unwrap();
             assert_eq!(

@@ -282,26 +282,7 @@ async fn qdrant_wrong_profile_hit_fills_once_from_requested_profile() {
     store
         .ensure_embedding_profile(
             &wrong_profile,
-            EmbeddingProfileConfig {
-                provider: "test",
-                model: "wrong",
-                dimension: 2,
-                normalize: true,
-                endpoint_identity: None,
-                requested_model: None,
-                served_model: None,
-                max_context_tokens: None,
-                dtype: None,
-                quantization: None,
-                weight_identity: None,
-                chunker_version: crate::chunker::CHUNKER_VERSION,
-                child_target_tokens: 300,
-                child_overlap_tokens: 80,
-                parent_children_count: 5,
-                embedding_input_budget_tokens: None,
-                query_instruction: "",
-                document_instruction: "",
-            },
+            crate::store::tests::test_profile_config("test", "wrong", 2, true, "", ""),
         )
         .unwrap();
     let document = VectorDocument {

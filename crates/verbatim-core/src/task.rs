@@ -994,7 +994,9 @@ fn sanitize_value(value: Value) -> Value {
 fn sanitize_object(map: Map<String, Value>) -> Value {
     let mut output = Map::new();
     for (key, value) in map.into_iter().take(TASK_OBJECT_MAX_KEYS) {
-        let sanitized = if is_sensitive_metadata_key(&key) {
+        let sanitized = if key == "canonical_target_tokens" && value.is_number() {
+            value
+        } else if is_sensitive_metadata_key(&key) {
             Value::String("<redacted>".into())
         } else if key == "response_body_prefix" {
             match value {
@@ -1078,6 +1080,18 @@ mod tests {
         assert!(!encoded.contains("should-not-print"));
         assert!(encoded.contains("<redacted>"));
         assert!(encoded.len() <= TASK_METADATA_MAX_BYTES);
+    }
+
+    #[test]
+    fn bounded_json_only_exposes_numeric_canonical_target_tokens() {
+        assert_eq!(
+            bounded_json(json!({ "canonical_target_tokens": 300 }))["canonical_target_tokens"],
+            300
+        );
+        assert_eq!(
+            bounded_json(json!({ "canonical_target_tokens": "secret" }))["canonical_target_tokens"],
+            "<redacted>"
+        );
     }
 
     #[test]
