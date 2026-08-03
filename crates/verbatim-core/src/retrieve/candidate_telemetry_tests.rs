@@ -1,5 +1,5 @@
 #[tokio::test]
-async fn retrieval_source_filter_applies_after_lexical_and_dense_search() {
+async fn scoped_retrieval_keeps_configured_candidate_limits() {
     let store = Store::in_memory().unwrap();
     let first = source("src-1");
     let second = source("src-2");
@@ -49,19 +49,19 @@ async fn retrieval_source_filter_applies_after_lexical_and_dense_search() {
         debug
             .candidate_counters
             .requested_k(SpanKind::DenseRetrieval),
-        2
+        1
     );
     assert_eq!(
         debug
             .candidate_counters
             .requested_k(SpanKind::LexicalRetrieval),
-        2
+        1
     );
     assert_eq!(
         debug
             .candidate_counters
             .returned_k(SpanKind::DenseRetrieval),
-        2
+        1
     );
     assert_eq!(
         debug
@@ -69,9 +69,54 @@ async fn retrieval_source_filter_applies_after_lexical_and_dense_search() {
             .returned_k(SpanKind::LexicalRetrieval),
         1
     );
-    assert_eq!(debug.candidate_counters.evaluated(), 3);
-    assert_eq!(debug.candidate_counters.filtered(), 1);
+    assert_eq!(debug.candidate_counters.evaluated(), 2);
+    assert_eq!(debug.candidate_counters.filtered(), 0);
     assert_eq!(debug.candidate_counters.fused(), 1);
     assert_eq!(debug.candidate_counters.reranked(), 0);
     assert_eq!(debug.candidate_counters.hydrated(), 1);
+}
+
+#[tokio::test]
+async fn source_filter_does_not_expand_local_dense_top_k() {
+    let store = Store::in_memory().unwrap();
+    let wanted = source("src-wanted");
+    let other = source("src-other");
+    let wanted_chunk = insert_child(&store, &wanted, "chunk-wanted", "wanted content");
+    let other_chunk = insert_child(&store, &other, "chunk-other", "other content");
+    let vector_index = StaticVectorIndex::new(vec![
+        (other_chunk.id, 1.0),
+        (wanted_chunk.id, 0.5),
+    ]);
+    let lexical_index = StaticLexicalIndex::new(Vec::new());
+    let embed_client = KeywordEmbeddingClient;
+    let config = RetrievalConfig {
+        dense_top_k: 1,
+        bm25_top_k: 0,
+        ..RetrievalConfig::default()
+    };
+    let pipeline = RetrievalPipeline::new(
+        &vector_index,
+        &lexical_index,
+        &store,
+        &embed_client,
+        &config,
+    );
+
+    let (results, debug) = pipeline
+        .search_filtered_with_debug("wanted", Some(&wanted.id))
+        .await
+        .unwrap();
+
+    assert!(results.is_empty());
+    assert_eq!(
+        debug
+            .candidate_counters
+            .requested_k(SpanKind::DenseRetrieval),
+        1
+    );
+}
+
+#[test]
+fn scoped_search_setup_does_not_materialize_child_chunks() {
+    assert!(!include_str!("../retrieve.rs").contains(&concat!("list_child_", "chunks()")));
 }
