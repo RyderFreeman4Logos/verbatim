@@ -17,7 +17,7 @@ use crate::api::{
     ChunkingProfileStatusResponse, EmbeddingCapabilityStatusResponse, IndexStatusResponse,
 };
 use crate::caption_chunker::chunk_caption_evidence;
-use crate::chunker::{chunk_evidence, ChunkerConfig, CHUNKER_VERSION};
+use crate::chunker::{ChunkerConfig, CHUNKER_VERSION};
 use crate::collection::{
     discover_collection_members, CollectionSyncPathInput, CollectionSyncReport,
     CollectionSyncSettings, DEFAULT_COLLECTION_SYNC_MAX_DEPTH,
@@ -117,6 +117,8 @@ type SourceCommitObserver = Box<dyn Fn(&Store, &SourceId) + Send + Sync>;
 #[cfg(all(test, feature = "qdrant"))]
 type QdrantRequeueStoreObserver = Arc<dyn Fn(&Store) + Send + Sync>;
 
+#[path = "ingest_chunk_partition.rs"]
+mod chunk_partition;
 #[path = "ingest_deletion.rs"]
 mod ingest_deletion;
 #[path = "ingest_qdrant_sync.rs"]
@@ -2072,23 +2074,15 @@ where
                 .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
-        let output = {
+        let partitioned = {
             let _cpu_permit = cpu_permit;
-            // Use unit-aligned chunker for canonical sources (Bible verses, etc.)
-            // to avoid splitting individual units and overlap by whole units.
-            let has_canonical = searchable_evidence
-                .iter()
-                .any(|e| matches!(e.locator, SourceLocator::Canonical { .. }));
-            if has_canonical {
-                crate::canonical_chunker::chunk_canonical_units(
-                    source_id,
-                    &searchable_evidence,
-                    &crate::canonical_chunker::CanonicalChunkerConfig::default(),
-                )?
-            } else {
-                chunk_evidence(source_id, &searchable_evidence, &chunker_config)
-            }
+            chunk_partition::chunk_searchable_evidence_by_locator(
+                source_id,
+                &searchable_evidence,
+                &chunker_config,
+            )?
         };
+        let output = partitioned.output;
         tracing::info!(chunk_count = output.chunks.len(), "chunked");
         self.record_task_phase(
             task_id,
@@ -2097,6 +2091,9 @@ where
                 "source_id": source_id.0,
                 "chunk_count": output.chunks.len(),
                 "chunker_version": CHUNKER_VERSION,
+                "canonical_evidence_count": partitioned.canonical_evidence_count,
+                "noncanonical_evidence_count": partitioned.noncanonical_evidence_count,
+                "chunking_strategies": partitioned.strategies_used,
                 "child_target_tokens": chunker_config.child_target_tokens,
                 "child_overlap_tokens": chunker_config.child_overlap_tokens,
                 "parent_children_count": chunker_config.parent_children_count,
@@ -6370,6 +6367,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use crate::chunker::chunk_evidence;
     #[cfg(feature = "qdrant")]
     use crate::config::QdrantConfig;
     use crate::config::{Config, GraphConfig, RetrievalConfig};
@@ -7507,6 +7505,19 @@ mod tests {
         assert!(span_phases
             .iter()
             .all(|phase| crate::task::INGEST_TASK_STAGE_NAMES.contains(phase)));
+        let chunk_metadata = &spans
+            .iter()
+            .find(|span| span.phase == IngestTaskStage::Chunk.as_str())
+            .expect("chunk phase telemetry should exist")
+            .metadata;
+        assert_eq!(chunk_metadata["canonical_evidence_count"], 0);
+        assert!(chunk_metadata["noncanonical_evidence_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+        assert_eq!(
+            chunk_metadata["chunking_strategies"],
+            serde_json::json!(["chunk_evidence"])
+        );
 
         let progress_phases = events
             .iter()
