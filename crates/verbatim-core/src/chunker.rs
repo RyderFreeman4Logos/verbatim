@@ -6,12 +6,13 @@ use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EvidenceId, EvidenceUnit, SourceId, SourceLocator,
 };
 
-/// Chunking identity; v6 declares the conservative-v3 token estimator.
-pub const CHUNKER_VERSION: &str = "parent-child-v6";
+/// Chunking identity; v7 declares the conservative-v4 token estimator.
+pub const CHUNKER_VERSION: &str = "parent-child-v7";
 const DEFAULT_CHILD_TARGET: usize = 300;
 const DEFAULT_CHILD_OVERLAP: usize = 80;
 const DEFAULT_PARENT_CHILDREN: usize = 5;
 const ESTIMATOR_UNITS_PER_TOKEN: usize = 4;
+const CHEAP_ALPHANUMERIC_RUN_LENGTH: usize = 24;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkerConfig {
@@ -38,9 +39,10 @@ pub struct ChunkOutput {
 
 /// Estimates tokens without model-specific tokenizer artifacts.
 ///
-/// ASCII alphanumerics cost one quarter-token unit while all other scalars cost
-/// one token. This keeps plain Latin text near chars/4 while conservatively
-/// counting code, URLs, punctuation, whitespace, and CJK.
+/// The first 24 scalars in an ASCII alphanumeric run cost one quarter-token unit
+/// each; subsequent scalars and all other scalars cost one token each. This
+/// keeps plain Latin text near chars/4 while conservatively counting opaque
+/// identifiers, code, URLs, punctuation, whitespace, and CJK.
 pub(crate) fn estimate_tokens(text: &str) -> u32 {
     estimate_spaced_tokens(std::iter::once(text)).min(u32::MAX as usize) as u32
 }
@@ -48,12 +50,13 @@ pub(crate) fn estimate_tokens(text: &str) -> u32 {
 pub(crate) fn estimate_spaced_tokens<'a>(texts: impl IntoIterator<Item = &'a str>) -> usize {
     let mut units = 0usize;
     let mut has_text = false;
+    let mut alphanumeric_run_length = 0usize;
 
     for text in texts.into_iter().filter(|text| !text.is_empty()) {
         if has_text {
-            units = units.saturating_add(scalar_estimator_units(' '));
+            units = units.saturating_add(scalar_estimator_units(' ', &mut alphanumeric_run_length));
         }
-        units = units.saturating_add(estimator_units(text));
+        units = units.saturating_add(estimator_units(text, &mut alphanumeric_run_length));
         has_text = true;
     }
 
@@ -64,16 +67,22 @@ pub(crate) fn estimate_spaced_tokens<'a>(texts: impl IntoIterator<Item = &'a str
     }
 }
 
-fn estimator_units(text: &str) -> usize {
+fn estimator_units(text: &str, alphanumeric_run_length: &mut usize) -> usize {
     text.chars().fold(0usize, |units, character| {
-        units.saturating_add(scalar_estimator_units(character))
+        units.saturating_add(scalar_estimator_units(character, alphanumeric_run_length))
     })
 }
 
-fn scalar_estimator_units(character: char) -> usize {
+fn scalar_estimator_units(character: char, alphanumeric_run_length: &mut usize) -> usize {
     if character.is_ascii_alphanumeric() {
-        1
+        *alphanumeric_run_length = alphanumeric_run_length.saturating_add(1);
+        if *alphanumeric_run_length <= CHEAP_ALPHANUMERIC_RUN_LENGTH {
+            1
+        } else {
+            ESTIMATOR_UNITS_PER_TOKEN
+        }
     } else {
+        *alphanumeric_run_length = 0;
         ESTIMATOR_UNITS_PER_TOKEN
     }
 }
@@ -82,9 +91,10 @@ fn overlap_start_for_token_budget(text: &str, budget_tokens: usize) -> usize {
     let budget_units = budget_tokens.saturating_mul(ESTIMATOR_UNITS_PER_TOKEN);
     let mut retained_units = 0usize;
     let mut start = text.len();
+    let mut alphanumeric_run_length = 0usize;
 
     for (index, character) in text.char_indices().rev() {
-        let character_units = scalar_estimator_units(character);
+        let character_units = scalar_estimator_units(character, &mut alphanumeric_run_length);
         if retained_units.saturating_add(character_units) > budget_units {
             break;
         }

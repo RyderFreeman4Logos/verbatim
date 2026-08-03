@@ -47,9 +47,17 @@ fn conservative_token_estimator_covers_cjk_and_is_deterministic() {
 }
 
 #[test]
+fn conservative_token_estimator_covers_long_hex_runs() {
+    let hex = "0123456789abcdef";
+
+    assert!(estimate_tokens(&hex.repeat(4)) >= 45);
+    assert!(estimate_tokens(&hex.repeat(24)) >= 265);
+}
+
+#[test]
 fn conservative_token_estimator_punctuation_dense_code_exceeds_default_target() {
     let punctuation = ":/?#[]{}!@&=".repeat(120);
-    let letters = "a".repeat(punctuation.len());
+    let letters = "abc ".repeat(punctuation.len() / 4);
     let punctuation_tokens = estimate_tokens(&punctuation);
 
     assert!(punctuation_tokens >= punctuation.len() as u32 / 2);
@@ -74,6 +82,10 @@ fn conservative_token_estimator_punctuation_overlap_stays_within_budget() {
     let overlap_start = overlap_start_for_token_budget(text, budget_tokens);
 
     assert!(estimate_tokens(&text[overlap_start..]) as usize <= budget_tokens);
+
+    let long_run = "0123456789abcdef".repeat(4);
+    let overlap_start = overlap_start_for_token_budget(&long_run, 45);
+    assert!(estimate_tokens(&long_run[overlap_start..]) <= 45);
 }
 
 #[test]
