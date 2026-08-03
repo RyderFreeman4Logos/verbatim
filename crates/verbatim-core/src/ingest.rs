@@ -6459,7 +6459,10 @@ mod tests {
     #[async_trait]
     impl EmbeddingClient for SentinelEmbeddingClient {
         async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-            Ok(texts.iter().map(|_| vec![98765.0, 43210.0]).collect())
+            Ok(texts
+                .iter()
+                .map(|_| unit_l2_test_vector(vec![98765.0, 43210.0]))
+                .collect())
         }
 
         fn dimension(&self) -> usize {
@@ -6498,7 +6501,7 @@ mod tests {
                 .iter()
                 .map(|text| {
                     let sum = text.bytes().fold(0_u32, |acc, byte| acc + u32::from(byte));
-                    vec![sum as f32, 1.0]
+                    unit_l2_test_vector(vec![sum as f32, 1.0])
                 })
                 .collect())
         }
@@ -6506,6 +6509,16 @@ mod tests {
         fn dimension(&self) -> usize {
             2
         }
+    }
+
+    fn unit_l2_test_vector(mut vector: Vec<f32>) -> Vec<f32> {
+        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in &mut vector {
+                *value /= norm;
+            }
+        }
+        vector
     }
 
     #[derive(Clone)]
@@ -8054,7 +8067,8 @@ mod tests {
                         VectorDocument {
                             chunk_id: second_chunk.id,
                             source_id: second.id,
-                            vector: vec![0.5, 0.5],
+                            // Unit-L2 so HNSW Euclidean ranking stays cosine-equivalent.
+                            vector: unit_l2_test_vector(vec![0.5, 0.5]),
                         },
                     ],
                 )

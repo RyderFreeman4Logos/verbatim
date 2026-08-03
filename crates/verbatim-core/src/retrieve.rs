@@ -2609,7 +2609,9 @@ mod tests {
         } else if lower.contains("beta") {
             vec![0.0, 1.0]
         } else {
-            vec![0.5, 0.5]
+            // Unit-L2 so HNSW Euclidean ranking stays cosine-equivalent.
+            let scale = 0.5_f32.sqrt();
+            vec![scale, scale]
         }
     }
 
