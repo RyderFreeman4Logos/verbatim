@@ -1755,6 +1755,7 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "graph.global_search.max_search_results"
             | "graph.global_search.drift.enabled"
             | "graph.global_search.drift.max_subqueries"
+            | "rerank.allow_document_export"
             | "rerank.enabled"
             | "rerank.strategy"
             | "rerank.provider"
@@ -2714,6 +2715,21 @@ timeout_seconds = 0
             applied.daemon.resources.memory_budget_enforcement,
             MemoryBudgetEnforcement::Fail
         );
+    }
+
+    #[test]
+    fn reload_plan_applies_document_export_as_runtime_safe() {
+        let current: Config = toml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        let mut candidate = current.clone();
+        candidate.rerank.allow_document_export = true;
+
+        assert!(!current.rerank.allow_document_export);
+        let plan = current.reload_plan(&candidate).unwrap();
+        assert_eq!(plan.reload_safe_keys, vec!["rerank.allow_document_export"]);
+        assert!(plan.restart_required_keys.is_empty());
+
+        let applied = current.apply_reload_safe_changes(&candidate);
+        assert!(applied.rerank.allow_document_export);
     }
 
     #[test]
