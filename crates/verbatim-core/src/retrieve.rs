@@ -448,34 +448,19 @@ impl<'a> RetrievalPipeline<'a> {
             return Ok(empty_search_output(include_debug));
         }
         let setup_started = Instant::now();
-        let all_child_count = self.with_read_permit(|| {
+        self.with_read_permit(|| {
             if self.embedding_enabled {
                 self.ensure_required_profile_vectors(source_filter)?;
             }
-            if source_filter.is_some() {
-                Ok(self.store.list_child_chunks()?.len())
-            } else {
-                Ok(0)
-            }
+            Ok(())
         })?;
         local_spans_ms.setup_ms = elapsed_ms(setup_started);
-        #[cfg(feature = "qdrant")]
-        let qdrant_can_filter = self.qdrant.is_some();
-        #[cfg(not(feature = "qdrant"))]
-        let qdrant_can_filter = false;
         let dense_top_k = if !self.embedding_enabled {
             0
-        } else if source_filter.is_some()
-            && !qdrant_can_filter
-            && !self.vector_index.supports_source_filter()
-        {
-            self.vector_index.len().max(self.config.dense_top_k)
         } else {
             self.config.dense_top_k
         };
-        let bm25_top_k = source_filter
-            .map(|_| all_child_count.max(self.config.bm25_top_k))
-            .unwrap_or(self.config.bm25_top_k);
+        let bm25_top_k = self.config.bm25_top_k;
         candidate_counters.add_requested_k(SpanKind::DenseRetrieval, dense_top_k as u64)?;
         candidate_counters.add_requested_k(SpanKind::LexicalRetrieval, bm25_top_k as u64)?;
 
@@ -753,15 +738,10 @@ impl<'a> RetrievalPipeline<'a> {
                 source_filter,
             );
         }
-        let fallback_top_k = if source_filter.is_some() {
-            self.vector_index.len().max(top_k)
-        } else {
-            top_k
-        };
         let index_source_filter = single_source_filter(source_filter);
         Ok(self
             .vector_index
-            .search_filtered(query_vec, fallback_top_k, index_source_filter))
+            .search_filtered(query_vec, top_k, index_source_filter))
     }
 
     fn dense_vector_path(&self) -> RetrievalDenseVectorPath {
@@ -4640,7 +4620,7 @@ mod tests {
 
     #[cfg(feature = "qdrant")]
     #[tokio::test]
-    async fn qdrant_empty_success_fills_from_local_dense_index_with_source_filter() {
+    async fn qdrant_empty_success_keeps_local_fallback_bounded_before_source_filter() {
         let (qdrant_url, handle) =
             spawn_qdrant_search_response(200, r#"{"status":"ok","result":[]}"#);
         let store = Store::in_memory().unwrap();
@@ -4675,9 +4655,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].chunk_id, wanted_chunk.id);
-        assert_eq!(results[0].chunk.source_id, wanted_source.id);
+        assert!(results.is_empty());
         assert_eq!(
             handle.join().unwrap(),
             "POST /collections/verbatim/points/search HTTP/1.1"
