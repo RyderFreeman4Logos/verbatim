@@ -3,12 +3,14 @@
 //! Walking skeleton: shared schema version, canonical identity / content-hash
 //! hooks, and minimal typed envelopes for QueryPlan, EvidencePack, ContextPack,
 //! DerivedArtifact, and WorkflowEnvelope. Decode fails closed on unknown
-//! schema versions and invalid identity/hash fields. Byte-stable JSON helpers
-//! support golden round-trips.
+//! schema versions, fields, and invalid identity/hash fields. Namespaced header
+//! extensions provide optional data without changing body content identity.
+//! Byte-stable JSON helpers support golden round-trips.
 //!
-//! Residual: full production field sets, multi-version dual-shape decode,
-//! OpenAPI/JSON Schema generators, daemon/CLI/SDK adoption, dual audit/redacted
-//! views, closing #353. See `docs/architecture/versioned-wire-schemas.md`.
+//! Residual: full production field sets, multi-version dual-shape or permissive
+//! decode, OpenAPI/JSON Schema generators, daemon/CLI/SDK adoption, dual
+//! audit/redacted views, closing #353. See
+//! `docs/architecture/versioned-wire-schemas.md`.
 
 mod common;
 mod derived;

@@ -17,8 +17,9 @@ are brittle.
 
 Define explicit schema versions, canonical identity (kind + id + content hash),
 deterministic JSON serialization helpers, and fail-closed decode for unknown
-versions. Optional extensions and multi-version dual-shape decode remain
-residual; this slice freezes the **contract shape** only.
+versions and fields. Namespaced header extensions are the only
+forward-compatible optional data; multi-version dual-shape and permissive
+decode modes remain residual.
 
 ## Contract summary
 
@@ -29,7 +30,7 @@ residual; this slice freezes the **contract shape** only.
 | `WireArtifactKind` | `query_plan` / `evidence_pack` / `context_pack` / `derived_artifact` / `workflow_envelope` |
 | `ContentHash` | Non-empty, whitespace-free content digest |
 | `CanonicalIdentity` | Kind + schema + artifact id + content hash |
-| `WireEnvelopeHeader` | Shared header: schema, identity, optional generation / profile |
+| `WireEnvelopeHeader` | Shared header: schema, identity, optional generation / profile, namespaced extensions |
 | `QueryPlanEnvelope` | Minimal plan: query text + ordered steps |
 | `EvidencePackEnvelope` | Direct evidence unit ids bound to a QueryPlan hash |
 | `ContextPackEnvelope` | Selected units + EvidencePack hash (+ optional model fingerprint) |
@@ -46,14 +47,23 @@ residual; this slice freezes the **contract shape** only.
 4. Decode re-validates schema version, structural fields, and that the declared
    content hash matches a re-encoded body.
 
+Header extensions are outside the body and therefore do not participate in
+`content_hash`. Adding or changing an extension does not change the content
+identity of the body contract.
+
 Query text alone is never a valid cache key; adapters must use identity /
 content hashes (see also `cache_identity`).
 
 ### Fail-closed rules
 
 - Schema version must equal `WIRE_SCHEMA_VERSION` (`1.0.0`).
+- Unknown top-level, header, identity, schema-version, or body fields are
+  rejected by the current strict decode helpers.
 - Empty or whitespace-only artifact ids, digests, optional generation/profile
   refs, and required body fields are rejected.
+- Optional extension keys must contain exactly one `/` with a non-empty,
+  whitespace-free namespace and name, for example `vendor.example/foo`.
+  Arbitrary JSON values are allowed. Empty extension objects are not encoded.
 - Envelope identity `kind` must match the concrete envelope type.
 - Tampered content hashes fail `validate` / decode.
 
@@ -74,13 +84,14 @@ boundaries rather than leaking internal structs across the wire.
 - Module export from `verbatim-core` (`pub mod wire_schemas`)
 - Pure contract types and deterministic encode/hash helpers
 - Unit tests: construction, byte-stable round-trip for all five envelopes,
-  unknown-schema fail-closed, invalid identity/hash reject, tampered hash reject
+  strict unknown-field and unknown-schema rejection, namespaced extensions,
+  invalid identity/hash reject, tampered hash reject
 
 ## What this slice does **not** do (residual)
 
 - Full production field sets (locators, policy decisions, timings, warnings,
   omission reasons, dual redacted/full-audit views)
-- Multi-version dual-shape decode matrix beyond fail-closed unknown
+- Multi-version dual-shape decode and an explicit permissive decode mode
 - JSON Schema / OpenAPI generation and SDK/CLI/daemon adoption
 - Live retrieve/ask/generate path migration onto these envelopes
 - Closing epic #353

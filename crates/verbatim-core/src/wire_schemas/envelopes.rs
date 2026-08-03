@@ -12,6 +12,7 @@ use super::ser::{encode_wire_document, wire_content_hash};
 /// Full plan IR, profile refs, and policy decisions are residual; this slice
 /// only freezes identity, schema version, and a small body for round-trips.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryPlanEnvelope {
     pub header: WireEnvelopeHeader,
     /// Human/debug query text (not alone sufficient as a cache key).
@@ -91,6 +92,7 @@ impl QueryPlanEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QueryPlanBody {
     query_text: String,
     steps: Vec<String>,
@@ -101,6 +103,7 @@ struct QueryPlanBody {
 /// Distinguishes direct evidence units from expanded/generated material via
 /// explicit unit ids only in this skeleton; richer locators are residual.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidencePackEnvelope {
     pub header: WireEnvelopeHeader,
     /// Ordered direct evidence unit ids (non-empty pack).
@@ -191,6 +194,7 @@ impl EvidencePackEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EvidencePackBody {
     evidence_unit_ids: Vec<String>,
     query_plan_hash: String,
@@ -198,6 +202,7 @@ struct EvidencePackBody {
 
 /// Minimal ContextPack wire envelope (grounding input, not a final answer).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextPackEnvelope {
     pub header: WireEnvelopeHeader,
     /// EvidencePack content hash this pack was built from.
@@ -305,6 +310,7 @@ impl ContextPackEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ContextPackBody {
     evidence_pack_hash: String,
     selected_unit_ids: Vec<String>,
@@ -341,6 +347,7 @@ impl WorkflowPhase {
 
 /// Minimal WorkflowRun / workflow envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowEnvelope {
     pub header: WireEnvelopeHeader,
     pub phase: WorkflowPhase,
@@ -432,6 +439,7 @@ impl WorkflowEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkflowBody {
     phase: WorkflowPhase,
     query_plan_hash: String,

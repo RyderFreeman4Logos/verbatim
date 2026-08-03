@@ -2,6 +2,8 @@
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 use super::common::{
     validate_wire_schema_version, WireArtifactKind, WireSchemaVersion, WIRE_SCHEMA_VERSION,
@@ -57,6 +59,7 @@ fn validate_content_hash(digest: &str) -> Result<()> {
 /// values produce the same identity; adapters must not key caches or signatures
 /// on ad-hoc Rust struct layout.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanonicalIdentity {
     pub kind: WireArtifactKind,
     pub schema_version: WireSchemaVersion,
@@ -118,6 +121,7 @@ impl CanonicalIdentity {
 
 /// Shared header present on every wire envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireEnvelopeHeader {
     /// Envelope document schema version (must equal [`WIRE_SCHEMA_VERSION`]).
     pub schema_version: WireSchemaVersion,
@@ -128,6 +132,9 @@ pub struct WireEnvelopeHeader {
     /// Optional retrieval/embed profile reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_ref: Option<String>,
+    /// Optional namespaced data outside the body content hash.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 /// Field bundle for [`WireEnvelopeHeader::new`].
@@ -163,6 +170,7 @@ impl WireEnvelopeHeader {
             identity: fields.identity,
             generation: fields.generation,
             profile_ref: fields.profile_ref,
+            extensions: BTreeMap::new(),
         })
     }
 
@@ -186,6 +194,23 @@ impl WireEnvelopeHeader {
                 bail!("profile_ref must not be empty when present");
             }
         }
+        validate_extensions(&self.extensions)?;
         Ok(())
     }
+}
+
+fn validate_extensions(extensions: &BTreeMap<String, Value>) -> Result<()> {
+    for key in extensions.keys() {
+        let Some((namespace, name)) = key.split_once('/') else {
+            bail!("extension key must contain exactly one '/': {key}");
+        };
+        if namespace.is_empty()
+            || name.is_empty()
+            || name.contains('/')
+            || key.chars().any(char::is_whitespace)
+        {
+            bail!("extension key must be a whitespace-free namespace/name pair: {key}");
+        }
+    }
+    Ok(())
 }

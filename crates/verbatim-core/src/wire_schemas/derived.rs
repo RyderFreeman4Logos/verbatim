@@ -36,6 +36,7 @@ impl DerivedArtifactKind {
 
 /// Minimal DerivedArtifact wire envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DerivedArtifactEnvelope {
     pub header: WireEnvelopeHeader,
     pub kind: DerivedArtifactKind,
@@ -127,6 +128,7 @@ impl DerivedArtifactEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DerivedBody {
     kind: DerivedArtifactKind,
     source_pack_hash: String,
