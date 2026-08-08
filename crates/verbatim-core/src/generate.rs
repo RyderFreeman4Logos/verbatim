@@ -1002,6 +1002,9 @@ where
         };
 
         let bytes = load_image_bytes(artifact)?;
+        if crate::types::hex_sha256(&bytes) != artifact.content_hash {
+            anyhow::bail!("image attachment content hash mismatch");
+        }
         if total_bytes.saturating_add(bytes.len()) > config.max_total_bytes {
             continue;
         }
@@ -1480,7 +1483,7 @@ mod tests {
             source_id: SourceId("src".into()),
             evidence_id: EvidenceId("img-1".into()),
             relative_path: PathBuf::from("image-artifacts/src/img-1.png"),
-            content_hash: "hash-1".into(),
+            content_hash: crate::types::hex_sha256(b"sample-image"),
             mime_type: "image/png".into(),
             width: 640,
             height: 480,
@@ -2179,6 +2182,29 @@ mod tests {
     }
 
     #[test]
+    fn image_attachment_selection_rejects_content_hash_mismatch() {
+        let mut artifact = sample_image_artifact();
+        artifact.content_hash = crate::types::hex_sha256(b"complete");
+
+        let error = select_image_attachments(
+            &sample_image_caption_results(),
+            &[artifact],
+            &ChatVisionAttachmentConfig {
+                enabled: true,
+                model_supports_vision: true,
+                ..ChatVisionAttachmentConfig::default()
+            },
+            |_| Ok(b"truncated".to_vec()),
+        )
+        .expect_err("mismatched artifact bytes must be rejected");
+
+        assert!(
+            error.to_string().contains("content hash mismatch"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn image_attachment_selection_respects_max_images_budget() {
         let mut artifact_two = sample_image_artifact();
         artifact_two.image_id = ImageId("img-2".into());
@@ -2212,12 +2238,13 @@ mod tests {
                 max_total_bytes: 32,
                 detail: "auto".into(),
             },
-            |artifact| Ok(format!("bytes-{}", artifact.evidence_id.0.as_str()).into_bytes()),
+            |_| Ok(b"sample-image".to_vec()),
         )
         .unwrap();
 
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].evidence_id, EvidenceId("img-1".into()));
+        assert_eq!(attachments[0].bytes.as_slice(), b"sample-image");
     }
 
     #[test]
