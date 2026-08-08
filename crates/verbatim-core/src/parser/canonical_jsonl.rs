@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -11,6 +12,8 @@ use crate::types::{
 };
 
 pub struct CanonicalJsonlParser;
+
+const GENERATED_EVIDENCE_ID_PREFIX: &str = "cjson:v1:";
 
 impl Parser for CanonicalJsonlParser {
     fn name(&self) -> &str {
@@ -26,6 +29,7 @@ impl Parser for CanonicalJsonlParser {
             .with_context(|| format!("failed to read JSONL: {}", path.display()))?;
         let source_id = SourceId::from_path(path);
         let mut units = Vec::new();
+        let mut identity_lines = HashMap::new();
 
         for (index, raw_line) in content.lines().enumerate() {
             let line_no = (index as u32) + 1; // 1-based
@@ -68,6 +72,19 @@ impl Parser for CanonicalJsonlParser {
 
             let normalized = build_normalized(&components);
             let display = entry.display_citation.unwrap_or_else(|| normalized.clone());
+            let id = generated_evidence_id(
+                &entry.source_profile,
+                &entry.work_id,
+                entry.version_id.as_deref(),
+                &normalized,
+            );
+            if let Some(first_line) = identity_lines.insert(id.0.clone(), line_no) {
+                bail!(
+                    "duplicate canonical JSONL logical identity on lines {first_line} and {line_no} of {}: {}",
+                    path.display(),
+                    id.0
+                );
+            }
 
             let heading_path = entry
                 .metadata
@@ -93,7 +110,7 @@ impl Parser for CanonicalJsonlParser {
             };
 
             units.push(EvidenceUnit {
-                id: EvidenceId(format!("{}:cjson:n{}", source_id.0, index)),
+                id,
                 source_id: source_id.clone(),
                 kind: EvidenceKind::Text,
                 derived_from: None,
@@ -107,6 +124,51 @@ impl Parser for CanonicalJsonlParser {
 
         Ok(units)
     }
+}
+
+/// Derive a path- and position-independent ID from canonical logical identity.
+///
+/// The v1 payload is SHA-256 over unsigned 64-bit big-endian length-prefixed
+/// fields in this order: domain, source profile, work, optional-version tag and
+/// value, normalized locator, and content kind.
+fn generated_evidence_id(
+    source_profile: &str,
+    work_id: &str,
+    version_id: Option<&str>,
+    normalized: &str,
+) -> EvidenceId {
+    let mut payload = Vec::with_capacity(128);
+    append_identity_field(&mut payload, b"canonical-jsonl-evidence-id-v1");
+    append_identity_field(&mut payload, source_profile.as_bytes());
+    append_identity_field(&mut payload, work_id.as_bytes());
+    match version_id {
+        Some(version_id) => {
+            payload.push(1);
+            append_identity_field(&mut payload, version_id.as_bytes());
+        }
+        None => payload.push(0),
+    }
+    append_identity_field(&mut payload, normalized.as_bytes());
+    append_identity_field(&mut payload, b"text");
+    EvidenceId(format!(
+        "{GENERATED_EVIDENCE_ID_PREFIX}{}",
+        hex_sha256(&payload)
+    ))
+}
+
+pub(crate) fn is_generated_evidence_id(id: &EvidenceId) -> bool {
+    id.0.strip_prefix(GENERATED_EVIDENCE_ID_PREFIX)
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+fn append_identity_field(payload: &mut Vec<u8>, field: &[u8]) {
+    payload.extend_from_slice(&(field.len() as u64).to_be_bytes());
+    payload.extend_from_slice(field);
 }
 
 /// Build a normalized key from reference components.
@@ -161,6 +223,7 @@ struct JsonlMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -171,6 +234,106 @@ mod tests {
         }
         f.flush().unwrap();
         f
+    }
+
+    fn ids_by_locator(units: &[EvidenceUnit]) -> BTreeMap<String, String> {
+        units
+            .iter()
+            .map(|unit| match &unit.locator {
+                SourceLocator::Canonical { locator } => {
+                    (locator.normalized.clone(), unit.id.0.clone())
+                }
+                _ => panic!("expected Canonical locator"),
+            })
+            .collect()
+    }
+
+    const JOHN_316: &str = r#"{"source_profile":"bible","work_id":"CSB","version_id":"digital-edition-2017","components":[{"level":"book","value":"John","ordinal":43},{"level":"chapter","value":"3","ordinal":3},{"level":"verse","value":"16","ordinal":16}],"display_citation":"John 3:16","text":"For God loved the world..."}"#;
+    const JOHN_317: &str = r#"{"source_profile":"bible","work_id":"CSB","version_id":"digital-edition-2017","components":[{"level":"book","value":"John","ordinal":43},{"level":"chapter","value":"3","ordinal":3},{"level":"verse","value":"17","ordinal":17}],"display_citation":"John 3:17","text":"For God did not send his Son..."}"#;
+
+    #[test]
+    fn generated_identity_survives_inserting_an_unrelated_record() {
+        let f = write_jsonl(&[JOHN_316]);
+        let original = CanonicalJsonlParser.parse(f.path()).unwrap();
+
+        std::fs::write(f.path(), format!("{JOHN_317}\n{JOHN_316}\n")).unwrap();
+        let inserted = CanonicalJsonlParser.parse(f.path()).unwrap();
+
+        assert_eq!(
+            ids_by_locator(&original)["john:3:16"],
+            ids_by_locator(&inserted)["john:3:16"]
+        );
+    }
+
+    #[test]
+    fn generated_identity_survives_record_reordering() {
+        let f = write_jsonl(&[JOHN_316, JOHN_317]);
+        let original = CanonicalJsonlParser.parse(f.path()).unwrap();
+
+        std::fs::write(f.path(), format!("{JOHN_317}\n{JOHN_316}\n")).unwrap();
+        let reordered = CanonicalJsonlParser.parse(f.path()).unwrap();
+
+        assert_eq!(ids_by_locator(&original), ids_by_locator(&reordered));
+    }
+
+    #[test]
+    fn generated_identity_ignores_text_but_text_hash_tracks_it() {
+        let f = write_jsonl(&[JOHN_316]);
+        let original = CanonicalJsonlParser.parse(f.path()).unwrap();
+        let edited_line = JOHN_316.replace(
+            "For God loved the world...",
+            "For God so loved the world...",
+        );
+
+        std::fs::write(f.path(), format!("{edited_line}\n")).unwrap();
+        let edited = CanonicalJsonlParser.parse(f.path()).unwrap();
+
+        assert_eq!(original[0].id, edited[0].id);
+        assert_ne!(original[0].text_hash, edited[0].text_hash);
+    }
+
+    #[test]
+    fn generated_identity_includes_every_available_identity_component() {
+        let f = write_jsonl(&[
+            JOHN_316,
+            &JOHN_316.replace("\"bible\"", "\"scripture\""),
+            &JOHN_316.replace("\"CSB\"", "\"NRSV\""),
+            &JOHN_316.replace("digital-edition-2017", "digital-edition-2020"),
+            &JOHN_316.replace("\"16\"", "\"18\""),
+        ]);
+
+        let units = CanonicalJsonlParser.parse(f.path()).unwrap();
+        for changed in &units[1..] {
+            assert_ne!(units[0].id, changed.id);
+        }
+    }
+
+    #[test]
+    fn generated_identity_rejects_duplicates() {
+        let duplicate = JOHN_316
+            .replace("John 3:16", "Jn 3.16")
+            .replace("For God loved the world...", "Edited text");
+        let f = write_jsonl(&[JOHN_316, &duplicate]);
+
+        let error = CanonicalJsonlParser
+            .parse(f.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("duplicate canonical JSONL logical identity"));
+        assert!(error.contains("lines 1 and 2"));
+    }
+
+    #[test]
+    fn generated_identity_has_a_golden_encoding() {
+        let f = write_jsonl(&[JOHN_316]);
+
+        let units = CanonicalJsonlParser.parse(f.path()).unwrap();
+
+        assert_eq!(
+            units[0].id.0,
+            "cjson:v1:a71ce2432af61a12f9ea7cdd5535b1ef95b7adc9fbf218572e24c5d4b6d31d80"
+        );
     }
 
     #[test]
