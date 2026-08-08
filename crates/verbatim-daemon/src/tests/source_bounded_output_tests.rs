@@ -7,13 +7,6 @@ fn source_bounded_output_rehydrates_compact_evidence_from_store() {
     let valid = final_retrieve_response(&store, retrieve_output_input(persisted.clone(), false))
         .expect("persisted evidence should resolve");
     assert_source_bounded_result(&valid, &persisted.evidence_units[0]);
-
-    let mut tampered = persisted.clone();
-    tamper_evidence(&mut tampered.evidence_units[0]);
-    let response = final_retrieve_response(&store, retrieve_output_input(tampered, false))
-        .expect("known evidence should be rehydrated");
-
-    assert_source_bounded_result(&response, &persisted.evidence_units[0]);
 }
 
 #[test]
@@ -23,13 +16,18 @@ fn source_bounded_output_rehydrates_passage_evidence_from_store() {
     let valid = final_retrieve_response(&store, retrieve_output_input(persisted.clone(), true))
         .expect("persisted evidence should resolve");
     assert_source_bounded_result(&valid, &persisted.evidence_units[0]);
+}
 
-    let mut tampered = persisted.clone();
-    tamper_evidence(&mut tampered.evidence_units[0]);
-    let response = final_retrieve_response(&store, retrieve_output_input(tampered, true))
-        .expect("known evidence should be rehydrated");
+#[test]
+fn source_bounded_output_rejects_reindexed_evidence_after_retrieval_snapshot() {
+    assert_reindexed_evidence_is_rejected(false);
+    assert_reindexed_evidence_is_rejected(true);
+}
 
-    assert_source_bounded_result(&response, &persisted.evidence_units[0]);
+#[test]
+fn source_bounded_output_rejects_relocated_evidence_after_retrieval_snapshot() {
+    assert_relocated_evidence_is_rejected(false);
+    assert_relocated_evidence_is_rejected(true);
 }
 
 #[test]
@@ -70,21 +68,20 @@ fn final_retrieve_response(
     retrieve_response(store, input)
 }
 
-pub(super) fn persisted_retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
+pub(super) fn persisted_retrieve_response(mut input: RetrieveResponseInput) -> RetrieveResponse {
     let store = Store::in_memory().unwrap();
     let mut source_ids = HashSet::new();
     let mut evidence_ids = HashSet::new();
     let mut evidence_units = Vec::new();
     for evidence in input
         .results
-        .iter()
-        .flat_map(|result| &result.evidence_units)
+        .iter_mut()
+        .flat_map(|result| &mut result.evidence_units)
     {
+        evidence.text_hash = verbatim_core::types::hex_sha256(evidence.text.as_bytes());
         source_ids.insert(evidence.source_id.0.clone());
         if evidence_ids.insert(evidence.id.0.clone()) {
-            let mut persisted = evidence.clone();
-            persisted.text_hash = verbatim_core::types::hex_sha256(persisted.text.as_bytes());
-            evidence_units.push(persisted);
+            evidence_units.push(evidence.clone());
         }
     }
     for source_id in source_ids {
@@ -170,11 +167,64 @@ fn retrieve_output_input(result: RetrievalResult, passage: bool) -> RetrieveResp
     }
 }
 
-fn tamper_evidence(evidence: &mut EvidenceUnit) {
-    evidence.text = "x".into();
-    evidence.locator = SourceLocator::Document {
-        path_or_url: "tampered.md".into(),
-        line_start: 99,
-        line_end: None,
+fn assert_reindexed_evidence_is_rejected(passage: bool) {
+    let (_dir, store, captured) = persisted_output_fixture("reindexed", None);
+    let mut reindexed = captured.evidence_units[0].clone();
+    reindexed.text = "Reindexed E1 text.".into();
+    reindexed.text_hash = verbatim_core::types::hex_sha256(reindexed.text.as_bytes());
+    reindexed.locator = SourceLocator::Document {
+        path_or_url: "reindexed.md".into(),
+        line_start: 21,
+        line_end: Some(22),
     };
+
+    replace_persisted_evidence(&store, &reindexed);
+
+    let error = final_retrieve_response(&store, retrieve_output_input(captured, passage))
+        .expect_err("reindexed evidence must not be paired with a retrieval snapshot");
+
+    assert!(
+        error.to_string().contains("changed since retrieval"),
+        "{error}"
+    );
+}
+
+fn assert_relocated_evidence_is_rejected(passage: bool) {
+    let (_dir, store, captured) = persisted_output_fixture("relocated", None);
+    let mut relocated = captured.evidence_units[0].clone();
+    relocated.locator = SourceLocator::Document {
+        path_or_url: "relocated.md".into(),
+        line_start: 31,
+        line_end: Some(32),
+    };
+    replace_persisted_evidence(&store, &relocated);
+
+    let error = final_retrieve_response(&store, retrieve_output_input(captured, passage))
+        .expect_err("relocated evidence must not be paired with a retrieval snapshot");
+
+    assert!(
+        error
+            .to_string()
+            .contains("identity changed since retrieval"),
+        "{error}"
+    );
+}
+
+fn replace_persisted_evidence(store: &Store, evidence: &EvidenceUnit) {
+    store
+        .remove_source_for_housekeeping(&evidence.source_id)
+        .unwrap();
+    store
+        .add_source(&Source {
+            id: evidence.source_id.clone(),
+            path: PathBuf::from("reindexed.md"),
+            hash: "reindexed-source-hash".into(),
+            status: SourceStatus::Indexed,
+            parser_used: Some("markdown".into()),
+            last_ingested_at: None,
+        })
+        .unwrap();
+    store
+        .bulk_insert_evidence(std::slice::from_ref(evidence))
+        .unwrap();
 }

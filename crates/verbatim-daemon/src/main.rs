@@ -7989,7 +7989,7 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> Result<Retrie
         .result
         .evidence_units
         .iter()
-        .map(|evidence| store.resolve_source_bounded_evidence(&evidence.id))
+        .map(|evidence| store.resolve_source_bounded_evidence(evidence))
         .collect::<Result<Vec<_>>>()?;
     let first = evidence_units
         .first()
@@ -8167,7 +8167,7 @@ struct RetrieveResultPageInput<'a> {
 fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<RetrieveResultResponse>> {
     let RetrieveResultPageInput {
         store,
-        results: _,
+        results,
         debug,
         source_paths,
         collection_provenance,
@@ -8190,7 +8190,8 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
         .take(end - start)
         .take(page_size)
         .map(|(index, entry)| {
-            let evidence = store.resolve_source_bounded_evidence(&entry.evidence_id)?;
+            let expected = selected_retrieval_evidence(results, entry)?;
+            let evidence = store.resolve_source_bounded_evidence(expected)?;
             Ok(RetrieveResultResponse {
                 index,
                 rank: index + 1,
@@ -8215,6 +8216,28 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
             })
         })
         .collect()
+}
+
+fn selected_retrieval_evidence<'a>(
+    results: &'a [RetrievalResult],
+    entry: &RetrievalEvidencePackEntry,
+) -> Result<&'a EvidenceUnit> {
+    results
+        .iter()
+        .flat_map(|result| &result.evidence_units)
+        .find(|evidence| {
+            evidence.id == entry.evidence_id
+                && evidence.source_id == entry.source_id
+                && evidence.kind == entry.kind
+                && evidence.derived_from == entry.derived_from
+                && evidence.locator == entry.locator.structured
+        })
+        .with_context(|| {
+            format!(
+                "source-bounded evidence not found in retrieval snapshot: {}",
+                entry.evidence_id.0
+            )
+        })
 }
 
 fn page_start(page: usize, page_size: usize) -> usize {
