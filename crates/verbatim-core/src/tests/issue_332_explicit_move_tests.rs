@@ -796,4 +796,5 @@ async fn issue_332_source_path_uniqueness_fails_closed() {
         .is_empty());
 }
 
+include!("issue_246_remap_tests.rs");
 include!("issue_332_fanout_repair_tests.rs");

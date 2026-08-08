@@ -536,7 +536,7 @@ fn path_entry_is_missing(path: &Path) -> Result<bool> {
     }
 }
 
-/// Remap a complete parser batch from temporary path identity to catalog identity.
+/// Remap path-keyed IDs while retaining strict self-contained canonical JSONL IDs.
 pub(crate) fn remap_parser_evidence_identity(
     evidence: Vec<EvidenceUnit>,
     parser_source_id: &SourceId,
@@ -553,19 +553,17 @@ pub(crate) fn remap_parser_evidence_identity(
                 bounded_text(&parser_source_id.0)
             );
         }
-        let suffix = unit
-            .id
-            .0
-            .strip_prefix(&parser_source_id.0)
-            .filter(|suffix| suffix.starts_with(':'))
-            .with_context(|| {
-                format!(
-                    "parser evidence id is empty or lacks source prefix {}: {}",
-                    bounded_text(&parser_source_id.0),
-                    bounded_text(&unit.id.0)
-                )
-            })?;
-        let remapped = EvidenceId(format!("{}{suffix}", catalog_source_id.0));
+        let remapped = match unit.id.0.strip_prefix(&parser_source_id.0) {
+            Some(suffix) if suffix.starts_with(':') => {
+                EvidenceId(format!("{}{suffix}", catalog_source_id.0))
+            }
+            _ if parser::canonical_jsonl::is_generated_evidence_id(&unit.id) => unit.id.clone(),
+            _ => bail!(
+                "parser evidence id is neither source-prefixed by {} nor a valid self-contained canonical JSONL id: {}",
+                bounded_text(&parser_source_id.0),
+                bounded_text(&unit.id.0)
+            ),
+        };
         if remapped_ids
             .insert(unit.id.clone(), remapped.clone())
             .is_some()
