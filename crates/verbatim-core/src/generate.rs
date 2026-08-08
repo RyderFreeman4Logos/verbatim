@@ -1002,11 +1002,11 @@ where
         };
 
         let bytes = load_image_bytes(artifact)?;
-        if crate::types::hex_sha256(&bytes) != artifact.content_hash {
-            anyhow::bail!("image attachment content hash mismatch");
-        }
         if total_bytes.saturating_add(bytes.len()) > config.max_total_bytes {
             continue;
+        }
+        if crate::types::hex_sha256(&bytes) != artifact.content_hash {
+            anyhow::bail!("image attachment content hash mismatch");
         }
 
         total_bytes += bytes.len();
@@ -2205,7 +2205,7 @@ mod tests {
     }
 
     #[test]
-    fn image_attachment_selection_respects_max_images_budget() {
+    fn image_attachment_selection_respects_image_and_byte_budgets() {
         let mut artifact_two = sample_image_artifact();
         artifact_two.image_id = ImageId("img-2".into());
         artifact_two.evidence_id = EvidenceId("img-2".into());
@@ -2227,10 +2227,11 @@ mod tests {
             heading_path: vec![],
             position: 11,
         });
+        let artifacts = [sample_image_artifact(), artifact_two];
 
         let attachments = select_image_attachments(
             &results,
-            &[sample_image_artifact(), artifact_two],
+            &artifacts,
             &ChatVisionAttachmentConfig {
                 enabled: true,
                 model_supports_vision: true,
@@ -2244,6 +2245,30 @@ mod tests {
 
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].evidence_id, EvidenceId("img-1".into()));
+        assert_eq!(attachments[0].bytes.as_slice(), b"sample-image");
+
+        let attachments = select_image_attachments(
+            &results,
+            &artifacts,
+            &ChatVisionAttachmentConfig {
+                enabled: true,
+                model_supports_vision: true,
+                max_images: 2,
+                max_total_bytes: b"sample-image".len(),
+                detail: "auto".into(),
+            },
+            |artifact| {
+                if artifact.evidence_id == EvidenceId("img-1".into()) {
+                    Ok(b"oversized-corrupt-image".to_vec())
+                } else {
+                    Ok(b"sample-image".to_vec())
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].evidence_id, EvidenceId("img-2".into()));
         assert_eq!(attachments[0].bytes.as_slice(), b"sample-image");
     }
 
