@@ -4783,7 +4783,7 @@ async fn execute_retrieve_task_inner(
     );
     let mut task_local_spans = debug.local_spans_ms.clone();
     let response_started = Instant::now();
-    let mut response = retrieve_response(RetrieveResponseInput {
+    let response_input = RetrieveResponseInput {
         task_id: task_id.clone(),
         query: question,
         source_filter: query_scope.source_id,
@@ -4795,7 +4795,12 @@ async fn execute_retrieve_task_inner(
         debug,
         source_paths,
         retrieval_ms: retrieval_timing.duration_ms,
-    });
+    };
+    let mut response = with_task_store_read(&state, move |store| {
+        retrieve_response(store, response_input)
+    })
+    .await
+    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let response_formatting_ms = elapsed_ms(response_started);
     task_local_spans.response_formatting_ms = response_formatting_ms;
     profile_debug.local_spans_ms.response_formatting_ms = response_formatting_ms;
@@ -7790,7 +7795,7 @@ fn source_paths_for_results(
     Ok(paths)
 }
 
-fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
+fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<RetrieveResponse> {
     let RetrieveResponseInput {
         task_id,
         query,
@@ -7806,6 +7811,7 @@ fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
     } = input;
     let (total_results, results_page) = if controls.passage {
         retrieve_passage_result_page(RetrieveResultPageInput {
+            store,
             results: &results,
             debug: &debug,
             source_paths: &source_paths,
@@ -7814,11 +7820,12 @@ fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
             page_size: controls.page_size,
             page: controls.page,
             include_locator: controls.include_locator,
-        })
+        })?
     } else {
         let display_pack = retrieve_display_evidence_pack(&debug);
         let total_results = retrieve_display_evidence_count(&debug, display_pack);
         let results_page = retrieve_result_page(RetrieveResultPageInput {
+            store,
             results: &results,
             debug: &debug,
             source_paths: &source_paths,
@@ -7827,13 +7834,13 @@ fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
             page_size: controls.page_size,
             page: controls.page,
             include_locator: controls.include_locator,
-        });
+        })?;
         (total_results, results_page)
     };
     let returned_results = results_page.len();
     let debug = controls.include_debug.then_some(debug);
 
-    RetrieveResponse {
+    Ok(RetrieveResponse {
         task_id: task_id.0,
         query,
         source_id: source_filter.map(|source_id| source_id.0),
@@ -7844,6 +7851,7 @@ fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
         page: controls.page,
         total_results,
         returned_results,
+        source_bounded: true,
         controls: RetrieveControlsResponse {
             fast: controls.fast,
             rerank_enabled: controls.rerank_config.enabled,
@@ -7858,13 +7866,14 @@ fn retrieve_response(input: RetrieveResponseInput) -> RetrieveResponse {
         }],
         results: results_page,
         debug,
-    }
+    })
 }
 
 fn retrieve_passage_result_page(
     input: RetrieveResultPageInput<'_>,
-) -> (usize, Vec<RetrieveResultResponse>) {
+) -> Result<(usize, Vec<RetrieveResultResponse>)> {
     let RetrieveResultPageInput {
+        store,
         results,
         debug: _,
         source_paths,
@@ -7879,7 +7888,7 @@ fn retrieve_passage_result_page(
     let end = total_results.min(limit);
     let start = page_start(page, page_size);
     if start >= end {
-        return (total_results, Vec::new());
+        return Ok((total_results, Vec::new()));
     }
 
     let page = groups
@@ -7890,6 +7899,7 @@ fn retrieve_passage_result_page(
         .take(page_size)
         .map(|(page_index, group)| {
             passage_group_response(PassageGroupResponseInput {
+                store,
                 group_index: page_index,
                 group,
                 source_paths,
@@ -7897,12 +7907,15 @@ fn retrieve_passage_result_page(
                 include_locator,
             })
         })
-        .collect();
-    (total_results, page)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((total_results, page))
 }
 
 fn retrieve_display_evidence_pack(debug: &RetrievalDebug) -> &[RetrievalEvidencePackEntry] {
-    if debug.display_evidence_pack.is_empty() {
+    if debug.display_evidence_pack.is_empty()
+        || (!debug.final_evidence_pack.is_empty()
+            && debug.display_evidence_pack.len() >= debug.final_evidence_pack.len())
+    {
         &debug.final_evidence_pack
     } else {
         &debug.display_evidence_pack
@@ -7955,6 +7968,7 @@ fn retrieve_passage_groups(results: &[RetrievalResult]) -> Vec<PassageGroup<'_>>
 }
 
 struct PassageGroupResponseInput<'a> {
+    store: &'a Store,
     group_index: usize,
     group: &'a PassageGroup<'a>,
     source_paths: &'a HashMap<String, String>,
@@ -7962,31 +7976,35 @@ struct PassageGroupResponseInput<'a> {
     include_locator: bool,
 }
 
-fn passage_group_response(input: PassageGroupResponseInput<'_>) -> RetrieveResultResponse {
+fn passage_group_response(input: PassageGroupResponseInput<'_>) -> Result<RetrieveResultResponse> {
     let PassageGroupResponseInput {
+        store,
         group_index,
         group,
         source_paths,
         collection_provenance,
         include_locator,
     } = input;
-    let first = group
+    let evidence_units = group
         .result
         .evidence_units
+        .iter()
+        .map(|evidence| store.resolve_source_bounded_evidence(evidence))
+        .collect::<Result<Vec<_>>>()?;
+    let first = evidence_units
         .first()
         .expect("passage groups are never empty");
-    let last = group
-        .result
-        .evidence_units
+    let last = evidence_units
         .last()
         .expect("passage groups are never empty");
     let (locator, structured_locator) = passage_locator(first, last, include_locator);
 
-    RetrieveResultResponse {
+    Ok(RetrieveResultResponse {
         index: group_index,
         rank: group_index + 1,
         label: format!("E{}", group.first_evidence_ordinal),
         evidence_id: first.id.0.clone(),
+        text_hash: first.text_hash.clone(),
         source_id: first.source_id.0.clone(),
         source_path: source_paths.get(&first.source_id.0).cloned(),
         collections: collection_provenance
@@ -8001,8 +8019,8 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> RetrieveResul
         structured_locator,
         provenance: include_locator.then(|| group.result.provenance.clone()),
         derived_from: first.derived_from.as_ref().map(|id| id.0.clone()),
-        snippet: passage_snippet(group),
-    }
+        snippet: passage_snippet(&evidence_units),
+    })
 }
 
 fn passage_locator(
@@ -8114,10 +8132,8 @@ fn reference_component_value<'a>(
         .map(|component| component.value.as_str())
 }
 
-fn passage_snippet(group: &PassageGroup<'_>) -> String {
-    group
-        .result
-        .evidence_units
+fn passage_snippet(evidence_units: &[EvidenceUnit]) -> String {
+    evidence_units
         .iter()
         .map(|evidence| evidence.text.as_str())
         .map(normalize_inline_text)
@@ -8137,6 +8153,7 @@ fn page_len(total_results: usize, limit: usize, page_size: usize, page: usize) -
 }
 
 struct RetrieveResultPageInput<'a> {
+    store: &'a Store,
     results: &'a [RetrievalResult],
     debug: &'a RetrievalDebug,
     source_paths: &'a HashMap<String, String>,
@@ -8147,8 +8164,9 @@ struct RetrieveResultPageInput<'a> {
     include_locator: bool,
 }
 
-fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Vec<RetrieveResultResponse> {
+fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<RetrieveResultResponse>> {
     let RetrieveResultPageInput {
+        store,
         results,
         debug,
         source_paths,
@@ -8162,7 +8180,7 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Vec<RetrieveResul
     let start = page_start(page, page_size);
     let end = display_pack.len().min(limit);
     if start >= end {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     display_pack
@@ -8171,45 +8189,59 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Vec<RetrieveResul
         .skip(start)
         .take(end - start)
         .take(page_size)
-        .map(|(index, entry)| RetrieveResultResponse {
-            index,
-            rank: index + 1,
-            label: entry.label.clone(),
-            evidence_id: entry.evidence_id.0.clone(),
-            source_id: entry.source_id.0.clone(),
-            source_path: source_paths.get(&entry.source_id.0).cloned(),
-            collections: collection_provenance
-                .get(&entry.source_id.0)
-                .cloned()
-                .unwrap_or_default(),
-            chunk_id: entry.chunk_id.0.clone(),
-            kind: evidence_kind_name(entry.kind).to_string(),
-            role: retrieval_role_name(entry.role).to_string(),
-            score: entry.score,
-            locator: entry.locator.display.clone(),
-            structured_locator: include_locator.then(|| entry.locator.structured.clone()),
-            provenance: include_locator.then(|| entry.provenance.clone()),
-            derived_from: entry.derived_from.as_ref().map(|id| id.0.clone()),
-            snippet: evidence_snippet(results, &entry.evidence_id.0),
+        .map(|(index, entry)| {
+            let expected = selected_retrieval_evidence(results, entry)?;
+            let evidence = store.resolve_source_bounded_evidence(expected)?;
+            Ok(RetrieveResultResponse {
+                index,
+                rank: index + 1,
+                label: entry.label.clone(),
+                evidence_id: evidence.id.0.clone(),
+                text_hash: evidence.text_hash.clone(),
+                source_id: evidence.source_id.0.clone(),
+                source_path: source_paths.get(&evidence.source_id.0).cloned(),
+                collections: collection_provenance
+                    .get(&evidence.source_id.0)
+                    .cloned()
+                    .unwrap_or_default(),
+                chunk_id: entry.chunk_id.0.clone(),
+                kind: evidence_kind_name(evidence.kind).to_string(),
+                role: retrieval_role_name(retrieval_evidence_role(&evidence)).to_string(),
+                score: entry.score,
+                locator: evidence.locator.to_string(),
+                structured_locator: include_locator.then(|| evidence.locator.clone()),
+                provenance: include_locator.then(|| entry.provenance.clone()),
+                derived_from: evidence.derived_from.as_ref().map(|id| id.0.clone()),
+                snippet: compact_snippet(&evidence.text, DEFAULT_SNIPPET_CHARS),
+            })
         })
         .collect()
 }
 
-fn page_start(page: usize, page_size: usize) -> usize {
-    page.saturating_sub(1).saturating_mul(page_size)
-}
-
-fn evidence_snippet(results: &[RetrievalResult], evidence_id: &str) -> String {
-    let text = evidence_text(results, evidence_id).unwrap_or_default();
-    compact_snippet(text, DEFAULT_SNIPPET_CHARS)
-}
-
-fn evidence_text<'a>(results: &'a [RetrievalResult], evidence_id: &str) -> Option<&'a str> {
+fn selected_retrieval_evidence<'a>(
+    results: &'a [RetrievalResult],
+    entry: &RetrievalEvidencePackEntry,
+) -> Result<&'a EvidenceUnit> {
     results
         .iter()
         .flat_map(|result| &result.evidence_units)
-        .find(|evidence| evidence.id.0 == evidence_id)
-        .map(|evidence| evidence.text.as_str())
+        .find(|evidence| {
+            evidence.id == entry.evidence_id
+                && evidence.source_id == entry.source_id
+                && evidence.kind == entry.kind
+                && evidence.derived_from == entry.derived_from
+                && evidence.locator == entry.locator.structured
+        })
+        .with_context(|| {
+            format!(
+                "source-bounded evidence not found in retrieval snapshot: {}",
+                entry.evidence_id.0
+            )
+        })
+}
+
+fn page_start(page: usize, page_size: usize) -> usize {
+    page.saturating_sub(1).saturating_mul(page_size)
 }
 
 fn normalize_inline_text(text: &str) -> String {
@@ -9733,10 +9765,14 @@ mod tests {
     mod auth_middleware_daemon_tests;
     #[path = "issue_332_explicit_move_route_tests.rs"]
     mod issue_332_explicit_move_route_tests;
+    #[path = "source_bounded_output_tests.rs"]
+    mod source_bounded_output_tests;
     #[path = "sql_statement_telemetry_tests.rs"]
     mod sql_statement_telemetry_tests;
     #[path = "sqlite_durability_tests.rs"]
     mod sqlite_durability_tests;
+
+    use source_bounded_output_tests::persisted_retrieve_response;
 
     fn has_task_terminalize_span(spans: &[verbatim_core::task::TaskSpan]) -> bool {
         spans
@@ -12893,7 +12929,7 @@ mod tests {
         let mut debug = empty_retrieval_debug();
         refresh_final_evidence_pack_debug(&mut debug, &results);
 
-        let response = retrieve_response(RetrieveResponseInput {
+        let response = persisted_retrieve_response(RetrieveResponseInput {
             task_id: TaskId("task-1".into()),
             query: "What is cited?".into(),
             source_filter: Some(SourceId("src".into())),
@@ -12944,7 +12980,7 @@ mod tests {
         }];
         debug.display_evidence_count = debug.display_evidence_pack.len();
 
-        let response = retrieve_response(RetrieveResponseInput {
+        let response = persisted_retrieve_response(RetrieveResponseInput {
             task_id: TaskId("task-1".into()),
             query: "crown of righteousness".into(),
             source_filter: Some(SourceId("src".into())),
@@ -13000,7 +13036,7 @@ mod tests {
         }];
         debug.display_evidence_count = debug.display_evidence_pack.len();
 
-        let response = retrieve_response(RetrieveResponseInput {
+        let response = persisted_retrieve_response(RetrieveResponseInput {
             task_id: TaskId("task-1".into()),
             query: "crown of righteousness".into(),
             source_filter: Some(SourceId("src".into())),
@@ -13060,7 +13096,7 @@ mod tests {
         debug.final_evidence_pack.clear();
         debug.display_evidence_pack.clear();
 
-        let response = retrieve_response(RetrieveResponseInput {
+        let response = persisted_retrieve_response(RetrieveResponseInput {
             task_id: TaskId("task-1".into()),
             query: "crown of righteousness".into(),
             source_filter: Some(SourceId("src".into())),

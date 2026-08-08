@@ -154,7 +154,7 @@ fn populated_bm25_evidence(
             line_end: None,
         },
         text: text.into(),
-        text_hash: format!("hash-{id}"),
+        text_hash: verbatim_core::types::hex_sha256(text.as_bytes()),
         heading_path: vec!["Startup".into()],
         position,
     }
