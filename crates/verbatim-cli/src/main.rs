@@ -5615,6 +5615,7 @@ mod tests {
             page: request.page.unwrap_or(1),
             total_results: 1,
             returned_results: 1,
+            source_bounded: true,
             controls: RetrieveControlsResponse {
                 fast: request.fast,
                 rerank_enabled: request.rerank.unwrap_or(false),
@@ -5632,6 +5633,7 @@ mod tests {
                 rank: 1,
                 label: "E1".into(),
                 evidence_id: "ev-1".into(),
+                text_hash: "verified-text-hash".into(),
                 source_id: "src-1".into(),
                 source_path: Some("/tmp/doc.md".into()),
                 collections: Vec::new(),

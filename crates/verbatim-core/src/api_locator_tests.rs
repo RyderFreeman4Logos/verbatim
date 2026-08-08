@@ -46,6 +46,7 @@ fn markdown_locator_serializes_in_evidence_and_retrieve_responses() {
         rank: 1,
         label: "E1".into(),
         evidence_id: "ev-md".into(),
+        text_hash: "verified-text-hash".into(),
         source_id: "src-1".into(),
         source_path: Some("/tmp/doc.md".into()),
         collections: Vec::new(),

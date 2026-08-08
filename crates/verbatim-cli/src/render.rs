@@ -3383,6 +3383,7 @@ mod tests {
             page: 1,
             total_results: 1,
             returned_results: 1,
+            source_bounded: true,
             controls: RetrieveControlsResponse {
                 fast: false,
                 rerank_enabled: false,
@@ -3397,6 +3398,7 @@ mod tests {
                 rank: 1,
                 label: "E1".into(),
                 evidence_id: "ev-md".into(),
+                text_hash: "verified-text-hash".into(),
                 source_id: "src-1".into(),
                 source_path: Some("/tmp/doc.md".into()),
                 collections: Vec::new(),
@@ -3551,6 +3553,7 @@ mod tests {
             page: 1,
             total_results: 1,
             returned_results: 1,
+            source_bounded: true,
             controls: RetrieveControlsResponse {
                 fast: true,
                 rerank_enabled: true,
@@ -3568,6 +3571,7 @@ mod tests {
                 rank: 3,
                 label: "E3".into(),
                 evidence_id: "internal-ev-abc123".into(),
+                text_hash: "verified-text-hash".into(),
                 source_id: "src-internal-123".into(),
                 source_path: Some("/home/obj/private/docs/doc.md".into()),
                 collections: vec![CollectionResultProvenance {

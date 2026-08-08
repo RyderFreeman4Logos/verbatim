@@ -62,6 +62,7 @@ pub mod retrieval_telemetry;
 pub mod retrieve;
 pub mod sdk;
 pub mod search_planner;
+mod source_bounded_output;
 pub mod source_metadata;
 pub mod ssd_vector_benchmark;
 pub mod storage_ports;
