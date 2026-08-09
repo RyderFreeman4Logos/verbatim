@@ -337,6 +337,10 @@ impl Generator {
     ) -> Result<GenerationResult> {
         match verification.verdict {
             VerificationVerdict::Pass => {
+                if !has_fully_resolved_citations(raw_answer, &citations) {
+                    telemetry.verification.status = GenerationVerificationStatus::Failed;
+                    return Ok(insufficient_generation_with_telemetry(telemetry));
+                }
                 telemetry.verification.status = GenerationVerificationStatus::Passed;
                 Ok(GenerationResult {
                     answer: render_answer(raw_answer, &citations),
@@ -361,6 +365,10 @@ impl Generator {
                     return Ok(insufficient_generation_with_telemetry(telemetry));
                 }
                 let revised_citations = filter_citations_for_answer(&revised, &citations);
+                if !has_fully_resolved_citations(&revised, &revised_citations) {
+                    telemetry.verification.status = GenerationVerificationStatus::Failed;
+                    return Ok(insufficient_generation_with_telemetry(telemetry));
+                }
                 let revised_attachments =
                     relevant_attachments_for_citations(&revised_citations, attachments);
                 let second_pass = self
@@ -809,6 +817,16 @@ fn filter_citations_for_answer(answer: &str, citations: &[CitationRef]) -> Vec<C
         .filter(|citation| cited_labels.contains(&citation.label))
         .cloned()
         .collect()
+}
+
+fn has_fully_resolved_citations(answer: &str, citations: &[CitationRef]) -> bool {
+    let answer_labels = cited_labels(answer);
+    !answer_labels.is_empty()
+        && answer_labels
+            == citations
+                .iter()
+                .map(|citation| citation.label.clone())
+                .collect::<HashSet<_>>()
 }
 
 fn verifier_source_inputs(
@@ -1875,6 +1893,31 @@ mod tests {
         );
         assert!(failed.citations.is_empty());
         assert!(!failed.verified);
+    }
+
+    async fn assert_unpublishable(responses: &[&str], expected_requests: usize) {
+        let model = Arc::new(RecordingChatModel::with_responses(
+            responses.iter().copied(),
+        ));
+        let generator = Generator::with_chat_model(model.clone(), true, Default::default());
+        let result = generator
+            .generate("What is defined?", &sample_results())
+            .await
+            .unwrap();
+        assert_eq!(result.answer, insufficient_generation().answer);
+        assert!(result.citations.is_empty());
+        assert!(!result.verified);
+        assert_eq!(model.requests().len(), expected_requests);
+    }
+
+    #[tokio::test]
+    async fn verifier_rejects_answers_with_unresolved_evidence_labels() {
+        const PASS: &str = r#"{"verdict":"pass","unsupported_claims":[]}"#;
+        const REVISE: &str = r#"{"verdict":"revise","unsupported_claims":["tighten"]}"#;
+        assert_unpublishable(&["Unsupported [E999].", PASS], 2).await;
+        assert_unpublishable(&["Known [E1] and unknown [E999].", PASS], 2).await;
+        assert_unpublishable(&["No evidence label.", PASS], 2).await;
+        assert_unpublishable(&["Known [E1].", REVISE, "Unsupported [E999].", PASS], 3).await;
     }
 
     #[tokio::test]
