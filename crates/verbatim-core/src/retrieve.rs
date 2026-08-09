@@ -1071,15 +1071,29 @@ impl<'a> RetrievalPipeline<'a> {
         };
 
         let candidates = self.with_read_permit(|| {
-            let mut candidates = Vec::new();
-            for (chunk_id, _) in fused.iter().take(MAX_RERANK_CANDIDATE_CHUNKS) {
-                let Some(chunk) = self.store.get_chunk(chunk_id)? else {
+            let candidate_ids = fused
+                .iter()
+                .take(MAX_RERANK_CANDIDATE_CHUNKS)
+                .map(|(chunk_id, _)| chunk_id.clone())
+                .collect::<Vec<_>>();
+            let mut chunks = self.store.get_chunks(&candidate_ids)?;
+            let mut hydrated_texts: HashMap<ChunkId, String> = HashMap::with_capacity(chunks.len());
+            let mut candidates = Vec::with_capacity(candidate_ids.len());
+            for chunk_id in candidate_ids {
+                if let Some(text) = hydrated_texts.get(&chunk_id) {
+                    candidates.push(RerankCandidate {
+                        chunk_id,
+                        text: text.clone(),
+                    });
+                    continue;
+                }
+                let Some(chunk) = chunks.remove(&chunk_id) else {
                     continue;
                 };
-                candidates.push(RerankCandidate {
-                    chunk_id: chunk_id.clone(),
-                    text: rerank_document_text(&chunk),
-                });
+                let chunk = chunk?;
+                let text = rerank_document_text(&chunk);
+                hydrated_texts.insert(chunk_id.clone(), text.clone());
+                candidates.push(RerankCandidate { chunk_id, text });
             }
             Ok(candidates)
         })?;
