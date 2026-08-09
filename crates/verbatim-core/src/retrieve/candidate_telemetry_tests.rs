@@ -520,3 +520,52 @@ fn rerank_candidate_hydration_keeps_sql_statement_count_constant_across_candidat
         "rerank hydration must use exactly one chunk batch read"
     );
 }
+
+#[tokio::test]
+async fn rerank_duplicate_candidate_ids_preserve_document_positions() {
+    let store = Store::in_memory().expect("rerank store");
+    let source = source("source-rerank-duplicates");
+    store.add_source(&source).expect("rerank source");
+    let first = insert_text_chunk(&store, &source, "candidate-a", "candidate text A");
+    let second = insert_text_chunk(&store, &source, "candidate-b", "candidate text B");
+    let vector_index = StaticVectorIndex::new(Vec::new());
+    let lexical_index = StaticLexicalIndex::new(Vec::new());
+    let embed_client = KeywordEmbeddingClient;
+    let retrieval_config = RetrievalConfig::default();
+    let rerank_config = RerankConfig {
+        enabled: true,
+        allow_document_export: false,
+        base_url: "http://localhost:8003/v1".into(),
+        top_n: 2,
+        ..Default::default()
+    };
+    let reranker = RecordingReranker::hits(vec![(1, 1.0), (2, 0.9)]);
+    let outcome = RetrievalPipeline::new(
+        &vector_index,
+        &lexical_index,
+        &store,
+        &embed_client,
+        &retrieval_config,
+    )
+    .with_reranker(&rerank_config, &reranker)
+    .rerank_fused(
+        "candidate",
+        vec![
+            (first.id.clone(), 0.9),
+            (first.id.clone(), 0.8),
+            (second.id.clone(), 0.7),
+        ],
+    )
+    .await
+    .expect("duplicate rerank succeeds");
+
+    assert_eq!(
+        reranker.recorded_docs(),
+        vec![vec![
+            "candidate text A".to_string(),
+            "candidate text A".to_string(),
+            "candidate text B".to_string(),
+        ]]
+    );
+    assert_eq!(outcome.fused, vec![(first.id, 1.0), (second.id, 0.9)]);
+}
