@@ -522,10 +522,10 @@ impl<'a> RetrievalPipeline<'a> {
                     .iter()
                     .map(|(chunk_id, _)| chunk_id.clone())
                     .collect::<Vec<_>>();
-                let chunks = self.store.get_chunks(&candidate_ids).unwrap_or_default();
+                let chunks = self.store.get_chunks(&candidate_ids)?;
                 let mut scoped_fused = Vec::with_capacity(fused.len());
                 for candidate in fused {
-                    let Some(chunk) = chunks.get(&candidate.0) else {
+                    let Some(Ok(chunk)) = chunks.get(&candidate.0) else {
                         continue;
                     };
                     if !source_filter_excludes(
@@ -599,13 +599,19 @@ impl<'a> RetrievalPipeline<'a> {
                 let chunks = self.store.get_chunks(&chunk_ids)?;
                 let parent_ids = chunks
                     .values()
-                    .filter_map(|chunk| chunk.parent_chunk_id.clone())
+                    .filter_map(|chunk| {
+                        chunk
+                            .as_ref()
+                            .ok()
+                            .and_then(|chunk| chunk.parent_chunk_id.clone())
+                    })
                     .collect::<Vec<_>>();
                 let parents = self.store.get_chunks(&parent_ids)?;
                 for (rank, (chunk_id, score)) in fused.into_iter().enumerate() {
-                    let Some(chunk) = chunks.get(&chunk_id).cloned() else {
+                    let Some(Ok(chunk)) = chunks.get(&chunk_id) else {
                         continue;
                     };
+                    let chunk = chunk.clone();
                     let result_rank = rank + 1;
                     let provenance = RetrievalProvenance::seed(
                         result_rank,
@@ -617,6 +623,7 @@ impl<'a> RetrievalPipeline<'a> {
                         .parent_chunk_id
                         .as_ref()
                         .and_then(|parent_id| parents.get(parent_id))
+                        .and_then(|parent| parent.as_ref().ok())
                         .cloned();
                     results.push(self.result_for_chunk_with_parent(
                         chunk,

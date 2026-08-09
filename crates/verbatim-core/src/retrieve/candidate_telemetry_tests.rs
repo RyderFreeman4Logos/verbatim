@@ -123,6 +123,160 @@ fn scoped_search_setup_does_not_materialize_child_chunks() {
     assert!(!include_str!("../retrieve.rs").contains(&concat!("list_child_", "chunks()")));
 }
 
+fn corrupt_chunk_evidence_link(store: &Store, chunk_id: &ChunkId) {
+    store
+        .connection()
+        .execute_batch("PRAGMA foreign_keys = OFF;")
+        .expect("allow malformed fixture link");
+    store
+        .connection()
+        .execute(
+            "UPDATE chunk_evidence SET evidence_unit_id = X'00' WHERE chunk_id = ?1",
+            [&chunk_id.0],
+        )
+        .expect("corrupt candidate evidence link");
+}
+
+#[tokio::test]
+async fn source_filter_keeps_valid_candidates_when_a_batch_peer_is_corrupt() {
+    let store = Store::in_memory().unwrap();
+    let wanted = source("src-wanted");
+    store.add_source(&wanted).unwrap();
+    let corrupt = insert_text_chunk(&store, &wanted, "chunk-corrupt", "corrupt content");
+    let valid = insert_text_chunk(&store, &wanted, "chunk-valid", "valid content");
+    corrupt_chunk_evidence_link(&store, &corrupt.id);
+
+    let vector_index = StaticVectorIndex::new(vec![
+        (corrupt.id, 1.0),
+        (ChunkId("chunk-missing".into()), 0.75),
+        (valid.id.clone(), 0.5),
+    ]);
+    let lexical_index = StaticLexicalIndex::new(Vec::new());
+    let embed_client = KeywordEmbeddingClient;
+    let config = RetrievalConfig {
+        dense_top_k: 3,
+        bm25_top_k: 0,
+        ..RetrievalConfig::default()
+    };
+    let pipeline = RetrievalPipeline::new(
+        &vector_index,
+        &lexical_index,
+        &store,
+        &embed_client,
+        &config,
+    );
+
+    let results = pipeline
+        .search_filtered("valid", Some(&wanted.id))
+        .await
+        .expect("source-filtered retrieval succeeds");
+
+    assert_eq!(chunk_ids(&results), vec![valid.id.0]);
+}
+
+#[tokio::test]
+async fn final_hydration_keeps_valid_candidates_when_a_batch_peer_is_corrupt() {
+    let store = Store::in_memory().unwrap();
+    let wanted = source("src-wanted");
+    store.add_source(&wanted).unwrap();
+    let corrupt = insert_text_chunk(&store, &wanted, "chunk-corrupt", "corrupt content");
+    let valid = insert_text_chunk(&store, &wanted, "chunk-valid", "valid content");
+    corrupt_chunk_evidence_link(&store, &corrupt.id);
+
+    let vector_index = StaticVectorIndex::new(vec![
+        (corrupt.id, 1.0),
+        (ChunkId("chunk-missing".into()), 0.75),
+        (valid.id.clone(), 0.5),
+    ]);
+    let lexical_index = StaticLexicalIndex::new(Vec::new());
+    let embed_client = KeywordEmbeddingClient;
+    let config = RetrievalConfig {
+        dense_top_k: 3,
+        bm25_top_k: 0,
+        ..RetrievalConfig::default()
+    };
+    let pipeline = RetrievalPipeline::new(
+        &vector_index,
+        &lexical_index,
+        &store,
+        &embed_client,
+        &config,
+    );
+
+    let results = pipeline
+        .search_filtered("valid", None)
+        .await
+        .expect("unfiltered retrieval succeeds");
+
+    assert_eq!(chunk_ids(&results), vec![valid.id.0]);
+}
+
+#[test]
+fn batch_chunk_loading_isolates_bad_links_but_propagates_query_failures() {
+    let store = Store::in_memory().unwrap();
+    let wanted = source("src-wanted");
+    store.add_source(&wanted).unwrap();
+    let corrupt = insert_text_chunk(&store, &wanted, "chunk-corrupt", "corrupt content");
+    let valid = insert_text_chunk(&store, &wanted, "chunk-valid", "valid content");
+    corrupt_chunk_evidence_link(&store, &corrupt.id);
+
+    let chunks = store
+        .get_chunks(&[corrupt.id.clone(), valid.id.clone()])
+        .expect("batch query succeeds");
+    assert!(chunks
+        .get(&corrupt.id)
+        .expect("corrupt candidate is represented")
+        .is_err());
+    assert_eq!(
+        chunks
+            .get(&valid.id)
+            .expect("valid candidate is represented")
+            .as_ref()
+            .expect("valid candidate loads")
+            .id,
+        valid.id
+    );
+
+    let unavailable_store = Store::in_memory().unwrap();
+    unavailable_store
+        .connection()
+        .execute_batch("DROP TABLE chunks;")
+        .expect("remove chunks table");
+    assert!(unavailable_store
+        .get_chunks(&[ChunkId("chunk-valid".into())])
+        .is_err());
+}
+
+#[tokio::test]
+async fn source_filter_propagates_batch_query_failures() {
+    let store = Store::in_memory().unwrap();
+    store
+        .connection()
+        .execute_batch("DROP TABLE chunks;")
+        .expect("remove chunks table");
+    let wanted = source("src-wanted");
+    let vector_index = StaticVectorIndex::new(vec![(ChunkId("chunk-missing".into()), 1.0)]);
+    let lexical_index = StaticLexicalIndex::new(Vec::new());
+    let embed_client = KeywordEmbeddingClient;
+    let config = RetrievalConfig {
+        dense_top_k: 1,
+        bm25_top_k: 0,
+        ..RetrievalConfig::default()
+    };
+    let pipeline = RetrievalPipeline::new(
+        &vector_index,
+        &lexical_index,
+        &store,
+        &embed_client,
+        &config,
+    );
+
+    assert!(pipeline
+        .search_filtered("missing", Some(&wanted.id))
+        .await
+        .is_err());
+}
+
 #[test]
 fn batch_hydration_keeps_sql_statement_count_constant_across_fused_candidate_pools() {
     const FINAL_RESULT_COUNT: usize = 10;
