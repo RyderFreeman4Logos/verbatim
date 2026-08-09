@@ -4989,7 +4989,30 @@ fn load_published_vector_index(
         if hnsw_path.exists() {
             let mut hnsw = HnswIndex::new();
             match hnsw.load(&hnsw_path) {
-                Ok(()) => return Ok(hnsw),
+                Ok(()) => {
+                    let sqlite_points = store.list_vector_documents_for_profile(profile_id)?;
+                    let point_sets_match = {
+                        let published_by_chunk = hnsw
+                            .points()
+                            .iter()
+                            .map(|point| (&point.chunk_id, point))
+                            .collect::<HashMap<_, _>>();
+                        published_by_chunk.len() == hnsw.len()
+                            && hnsw.len() == sqlite_points.len()
+                            && sqlite_points.iter().all(|point| {
+                                published_by_chunk.get(&point.chunk_id).copied() == Some(point)
+                            })
+                    };
+                    if point_sets_match {
+                        return Ok(hnsw);
+                    }
+                    tracing::warn!(
+                        path = %hnsw_path.display(),
+                        published_point_count = hnsw.len(),
+                        sqlite_point_count = sqlite_points.len(),
+                        "published vector index point set differs from SQLite; rebuilding from SQLite"
+                    );
+                }
                 Err(err) => {
                     tracing::warn!(
                         error = %err,

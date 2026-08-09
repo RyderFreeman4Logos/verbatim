@@ -235,3 +235,154 @@ async fn source_batch_enospc_with_failed_sqlite_compensation_restarts_from_commi
     assert_eq!(reloaded.points(), committed_vectors);
     assert_eq!(reloaded.points(), rebuilt.points());
 }
+
+#[tokio::test]
+async fn published_hnsw_is_revalidated_against_sqlite_point_set() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let store = Store::new(&data_dir.path().join("verbatim.db")).unwrap();
+    let mut pipeline = IngestPipeline::from_parts(
+        store,
+        HnswIndex::new(),
+        ContentEmbeddingClient,
+        data_dir.path().to_path_buf(),
+    );
+    let first_path = data_dir.path().join("a.md");
+    let second_path = data_dir.path().join("b.md");
+    fs::write(&first_path, "first-vector").unwrap();
+    fs::write(&second_path, "new-vector").unwrap();
+    let first_source = pipeline.add_source(&first_path).unwrap();
+    let second_source = pipeline.add_source(&second_path).unwrap();
+    pipeline.ingest_source(&first_source).await.unwrap();
+    pipeline.ingest_source(&second_source).await.unwrap();
+
+    let profile = EmbeddingProfileId::default_profile();
+    let sqlite_points = pipeline
+        .store()
+        .list_vector_documents_for_profile(&profile)
+        .unwrap();
+    assert_eq!(sqlite_points.len(), 2);
+    let first_point = sqlite_points
+        .iter()
+        .find(|point| point.source_id == first_source)
+        .unwrap()
+        .clone();
+    let second_point = sqlite_points
+        .iter()
+        .find(|point| point.source_id == second_source)
+        .unwrap()
+        .clone();
+    assert_eq!(first_point.vector, vec![1.0, 0.0]);
+    assert_eq!(second_point.vector, vec![0.0, 1.0]);
+    let generation = pipeline
+        .store()
+        .index_generation_for_profile(&profile)
+        .unwrap();
+    let hnsw_path =
+        index_generation_dir(data_dir.path(), &profile, generation).join("vectors.hnsw");
+
+    let mut published = HnswIndex::new();
+    published.load(&hnsw_path).unwrap();
+    let untouched =
+        load_published_vector_index(data_dir.path(), pipeline.store(), &profile).unwrap();
+    assert_eq!(untouched.points(), published.points());
+    assert_eq!(
+        untouched
+            .search(&[1.0, 0.0], 1)
+            .first()
+            .map(|(chunk_id, _)| chunk_id),
+        Some(&first_point.chunk_id)
+    );
+
+    // A semantically equal point set must be accepted regardless of publication order.
+    let reordered_points = sqlite_points.iter().rev().cloned().collect::<Vec<_>>();
+    let mut reordered = HnswIndex::new();
+    reordered.replace_all(reordered_points.clone());
+    reordered.save(&hnsw_path).unwrap();
+    let reordered =
+        load_published_vector_index(data_dir.path(), pipeline.store(), &profile).unwrap();
+    assert_eq!(reordered.points(), reordered_points);
+
+    let tampered_point_sets = [
+        (
+            "count-preserving vector swap",
+            vec![
+                VectorDocument {
+                    vector: sqlite_points[1].vector.clone(),
+                    ..sqlite_points[0].clone()
+                },
+                VectorDocument {
+                    vector: sqlite_points[0].vector.clone(),
+                    ..sqlite_points[1].clone()
+                },
+            ],
+        ),
+        (
+            "duplicate chunk IDs",
+            vec![
+                sqlite_points[0].clone(),
+                VectorDocument {
+                    vector: sqlite_points[1].vector.clone(),
+                    ..sqlite_points[0].clone()
+                },
+            ],
+        ),
+        (
+            "wrong source IDs",
+            vec![
+                VectorDocument {
+                    source_id: sqlite_points[1].source_id.clone(),
+                    ..sqlite_points[0].clone()
+                },
+                VectorDocument {
+                    source_id: sqlite_points[0].source_id.clone(),
+                    ..sqlite_points[1].clone()
+                },
+            ],
+        ),
+        ("missing point", vec![sqlite_points[1].clone()]),
+        (
+            "extra point",
+            vec![
+                sqlite_points[0].clone(),
+                sqlite_points[1].clone(),
+                VectorDocument {
+                    chunk_id: ChunkId("chunk-extra".into()),
+                    source_id: SourceId("source-extra".into()),
+                    vector: vec![-1.0, 0.0],
+                },
+            ],
+        ),
+        (
+            "altered vector",
+            vec![
+                VectorDocument {
+                    vector: vec![0.6, 0.8],
+                    ..sqlite_points[0].clone()
+                },
+                sqlite_points[1].clone(),
+            ],
+        ),
+    ];
+
+    for (case, points) in tampered_point_sets {
+        let mut tampered = HnswIndex::new();
+        tampered.replace_all(points);
+        tampered.save(&hnsw_path).unwrap();
+
+        let loaded =
+            load_published_vector_index(data_dir.path(), pipeline.store(), &profile).unwrap();
+        assert_eq!(
+            loaded
+                .search(&[1.0, 0.0], 1)
+                .first()
+                .map(|(chunk_id, _)| chunk_id),
+            Some(&first_point.chunk_id),
+            "{case} must rebuild before serving"
+        );
+        assert_eq!(
+            loaded.points(),
+            sqlite_points,
+            "{case} must restore SQLite's exact point set"
+        );
+    }
+}
