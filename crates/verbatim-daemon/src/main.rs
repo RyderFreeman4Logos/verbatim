@@ -8290,7 +8290,10 @@ async fn get_evidence(
 ) -> Result<Json<EvidenceResponse>, (StatusCode, Json<ErrorResponse>)> {
     let eid_clone = eid.clone();
     let (evidence, image_artifact) = with_task_store_read(&state, move |store| {
-        let evidence = store.get_evidence(&EvidenceId(eid_clone))?;
+        let evidence = store
+            .get_evidence(&EvidenceId(eid_clone))?
+            .map(|evidence| store.resolve_source_bounded_evidence(&evidence))
+            .transpose()?;
         let image_artifact = match &evidence {
             Some(eu) => {
                 let direct = store.get_image_artifact_by_evidence(&eu.id)?;
