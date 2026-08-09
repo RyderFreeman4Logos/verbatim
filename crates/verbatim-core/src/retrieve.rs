@@ -518,9 +518,14 @@ impl<'a> RetrievalPipeline<'a> {
             let rrf_started = Instant::now();
             let mut fused = rrf_fusion(&dense_results, &bm25_results, self.config.rrf_k);
             if source_filter.is_some() {
+                let candidate_ids = fused
+                    .iter()
+                    .map(|(chunk_id, _)| chunk_id.clone())
+                    .collect::<Vec<_>>();
+                let chunks = self.store.get_chunks(&candidate_ids)?;
                 let mut scoped_fused = Vec::with_capacity(fused.len());
                 for candidate in fused {
-                    let Some(chunk) = self.store.get_chunk(&candidate.0).ok().flatten() else {
+                    let Some(Ok(chunk)) = chunks.get(&candidate.0) else {
                         continue;
                     };
                     if !source_filter_excludes(
@@ -587,10 +592,26 @@ impl<'a> RetrievalPipeline<'a> {
             self.with_read_permit(|| {
                 let result_hydration_started = Instant::now();
                 let mut results = Vec::new();
+                let chunk_ids = fused
+                    .iter()
+                    .map(|(chunk_id, _)| chunk_id.clone())
+                    .collect::<Vec<_>>();
+                let chunks = self.store.get_chunks(&chunk_ids)?;
+                let parent_ids = chunks
+                    .values()
+                    .filter_map(|chunk| {
+                        chunk
+                            .as_ref()
+                            .ok()
+                            .and_then(|chunk| chunk.parent_chunk_id.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let parents = self.store.get_chunks(&parent_ids)?;
                 for (rank, (chunk_id, score)) in fused.into_iter().enumerate() {
-                    let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
+                    let Some(Ok(chunk)) = chunks.get(&chunk_id) else {
                         continue;
                     };
+                    let chunk = chunk.clone();
                     let result_rank = rank + 1;
                     let provenance = RetrievalProvenance::seed(
                         result_rank,
@@ -598,7 +619,18 @@ impl<'a> RetrievalPipeline<'a> {
                         chunk.source_id.clone(),
                     );
 
-                    results.push(self.result_for_chunk(chunk, score, provenance)?);
+                    let parent_chunk = chunk
+                        .parent_chunk_id
+                        .as_ref()
+                        .and_then(|parent_id| parents.get(parent_id))
+                        .and_then(|parent| parent.as_ref().ok())
+                        .cloned();
+                    results.push(self.result_for_chunk_with_parent(
+                        chunk,
+                        parent_chunk,
+                        score,
+                        provenance,
+                    )?);
                 }
                 let result_hydration_ms = elapsed_ms(result_hydration_started);
                 let hydrated_count = results.len() as u64;
@@ -844,6 +876,16 @@ impl<'a> RetrievalPipeline<'a> {
             None
         };
 
+        self.result_for_chunk_with_parent(chunk, parent_chunk, score, provenance)
+    }
+
+    fn result_for_chunk_with_parent(
+        &self,
+        chunk: Chunk,
+        parent_chunk: Option<Chunk>,
+        score: f32,
+        provenance: RetrievalProvenance,
+    ) -> Result<RetrievalResult> {
         let display_chunk = parent_chunk.unwrap_or_else(|| chunk.clone());
         let evidence_units = self.evidence_units_for_chunk(&chunk)?;
 
