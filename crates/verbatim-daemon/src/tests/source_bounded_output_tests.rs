@@ -1,4 +1,71 @@
+use axum::body::{to_bytes, Body};
+use axum::extract::connect_info::ConnectInfo;
+use axum::http::{Method, Request, StatusCode};
+use tower::ServiceExt;
+
 use super::*;
+
+const CORRUPTED_EVIDENCE_TEXT: &str = "Mutated persisted evidence must not escape.";
+
+#[tokio::test]
+async fn public_evidence_endpoint_revalidates_persisted_text() {
+    let (test_dir, store, persisted) = persisted_output_fixture("public-endpoint", None);
+    let expected = persisted.evidence_units[0].clone();
+    drop(store);
+    let config = retrieve_test_config("http://127.0.0.1:9/v1");
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let app = daemon_router(test_state(config, test_dir.path(), pipeline));
+
+    let response = evidence_route_get(&app, &expected.id.0).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned: EvidenceResponse = serde_json::from_slice(&evidence_route_body(response).await)
+        .expect("valid evidence response");
+    assert_eq!(returned.id, expected.id.0);
+    assert_eq!(returned.source_id, expected.source_id.0);
+    assert_eq!(returned.locator, expected.locator.to_string());
+    assert_eq!(returned.structured_locator, expected.locator);
+    assert_eq!(returned.text, expected.text);
+    assert_eq!(returned.heading_path, expected.heading_path);
+    assert_eq!(returned.position, expected.position);
+
+    rusqlite::Connection::open(test_dir.path().join("verbatim.db"))
+        .unwrap()
+        .execute(
+            "UPDATE evidence_units SET text = ?1 WHERE id = ?2",
+            rusqlite::params![CORRUPTED_EVIDENCE_TEXT, &returned.id],
+        )
+        .unwrap();
+    let response = evidence_route_get(&app, &returned.id).await;
+    let status = response.status();
+    let body = evidence_route_body(response).await;
+    let body_text = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body_text}");
+    assert!(!body_text.contains(CORRUPTED_EVIDENCE_TEXT), "{body_text}");
+    let error: ErrorResponse = serde_json::from_slice(&body).expect("safe evidence error response");
+    assert!(error.error.contains("text hash mismatch"), "{error:?}");
+
+    let response = evidence_route_get(&app, "missing-evidence").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+async fn evidence_route_get(app: &Router, evidence_id: &str) -> Response {
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/evidence/{evidence_id}"))
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),
+    ));
+    app.clone().oneshot(request).await.unwrap()
+}
+
+async fn evidence_route_body(response: Response) -> Vec<u8> {
+    to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap()
+        .to_vec()
+}
 
 #[test]
 fn source_bounded_output_rehydrates_compact_evidence_from_store() {
