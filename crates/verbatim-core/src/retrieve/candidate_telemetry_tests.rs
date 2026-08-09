@@ -440,3 +440,83 @@ fn batch_hydration_keeps_sql_statement_count_constant_across_fused_candidate_poo
         "bounded final results must not make SQL grow with the fused candidate pool"
     );
 }
+
+#[test]
+fn rerank_candidate_hydration_keeps_sql_statement_count_constant_across_candidate_pools() {
+    const SMALL_CANDIDATE_POOL: usize = 10;
+    const LARGE_CANDIDATE_POOL: usize = MAX_RERANK_CANDIDATE_CHUNKS;
+
+    let directory = tempdir().expect("temporary rerank database");
+    let database_path = directory.path().join("rerank.db");
+    let writer = Store::new(&database_path).expect("writable rerank store");
+    let source = source("source-rerank");
+    writer.add_source(&source).expect("rerank source");
+    let candidate_ids = (0..LARGE_CANDIDATE_POOL)
+        .map(|index| {
+            insert_text_chunk(
+                &writer,
+                &source,
+                &format!("candidate-{index:02}"),
+                &format!("candidate text {index:02}"),
+            )
+            .id
+        })
+        .collect::<Vec<_>>();
+    drop(writer);
+
+    let store = Store::open_existing_readonly(&database_path).expect("readonly rerank store");
+    let vector_index = StaticVectorIndex::new(Vec::new());
+    let lexical_index = StaticLexicalIndex::new(Vec::new());
+    let embed_client = KeywordEmbeddingClient;
+    let retrieval_config = RetrievalConfig::default();
+    let rerank_config = RerankConfig {
+        enabled: true,
+        allow_document_export: false,
+        base_url: "http://localhost:8003/v1".into(),
+        top_n: 2,
+        ..Default::default()
+    };
+    let reranker = RecordingReranker::hits(vec![(9, 1.0), (0, 0.9)]);
+    let pipeline = RetrievalPipeline::new(
+        &vector_index,
+        &lexical_index,
+        &store,
+        &embed_client,
+        &retrieval_config,
+    )
+    .with_reranker(&rerank_config, &reranker);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let fused = candidate_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.clone(), 1.0 - index as f32 / LARGE_CANDIDATE_POOL as f32))
+        .collect::<Vec<_>>();
+
+    let (small_result, small_count) = store.count_sql_statements(|| {
+        runtime.block_on(pipeline.rerank_fused(
+            "candidate",
+            fused[..SMALL_CANDIDATE_POOL].to_vec(),
+        ))
+    });
+    let (large_result, large_count) = store.count_sql_statements(|| {
+        runtime.block_on(pipeline.rerank_fused("candidate", fused.clone()))
+    });
+    let small = small_result.expect("small rerank succeeds");
+    let large = large_result.expect("large rerank succeeds");
+
+    assert_eq!(small.fused, large.fused, "rerank selection stays stable");
+    let documents = reranker.recorded_docs();
+    assert_eq!(documents.len(), 2);
+    assert_eq!(documents[0], documents[1][..SMALL_CANDIDATE_POOL]);
+    assert_eq!(documents[1].len(), LARGE_CANDIDATE_POOL);
+    let small_count = small_count.expect("small readonly statement count");
+    let large_count = large_count.expect("large readonly statement count");
+    assert_eq!(small_count, large_count);
+    assert_eq!(
+        small_count, 2,
+        "rerank hydration must use exactly one chunk batch read"
+    );
+}
