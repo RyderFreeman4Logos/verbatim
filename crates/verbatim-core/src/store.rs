@@ -36,6 +36,8 @@ mod source_contents_replacement;
 pub(crate) mod source_relocation;
 #[path = "store_cache.rs"]
 mod store_cache;
+#[path = "store_chunk_batch.rs"]
+mod store_chunk_batch;
 #[path = "store_deletion.rs"]
 mod store_deletion;
 #[path = "store_statement_count.rs"]
@@ -3818,6 +3820,14 @@ fn row_to_chunk_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkTuple> {
 }
 
 fn tuple_to_chunk(t: ChunkTuple, conn: &Connection) -> Result<Chunk> {
+    let evidence_unit_ids = get_evidence_ids_for_chunk(conn, &t.0)?;
+    tuple_to_chunk_with_evidence_ids(t, evidence_unit_ids)
+}
+
+fn tuple_to_chunk_with_evidence_ids(
+    t: ChunkTuple,
+    evidence_unit_ids: Vec<EvidenceId>,
+) -> Result<Chunk> {
     let (
         id,
         source_id,
@@ -3830,7 +3840,6 @@ fn tuple_to_chunk(t: ChunkTuple, conn: &Connection) -> Result<Chunk> {
         parent_id,
         heading_json,
     ) = t;
-    let evidence_unit_ids = get_evidence_ids_for_chunk(conn, &id)?;
     Ok(Chunk {
         id: ChunkId(id),
         source_id: SourceId(source_id),

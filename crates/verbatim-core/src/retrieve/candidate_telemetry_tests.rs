@@ -1,3 +1,5 @@
+use tempfile::tempdir;
+
 #[tokio::test]
 async fn scoped_retrieval_keeps_configured_candidate_limits() {
     let store = Store::in_memory().unwrap();
@@ -119,4 +121,168 @@ async fn source_filter_does_not_expand_local_dense_top_k() {
 #[test]
 fn scoped_search_setup_does_not_materialize_child_chunks() {
     assert!(!include_str!("../retrieve.rs").contains(&concat!("list_child_", "chunks()")));
+}
+
+#[test]
+fn batch_hydration_keeps_sql_statement_count_constant_across_fused_candidate_pools() {
+    const FINAL_RESULT_COUNT: usize = 10;
+    const LARGE_FUSED_CANDIDATE_POOL: usize = 10_000;
+
+    fn batch_fixture_chunk(
+        source: &Source,
+        id: String,
+        text: String,
+        parent_chunk_id: Option<ChunkId>,
+        chunk_type: ChunkType,
+    ) -> (Chunk, EvidenceUnit) {
+        let evidence = EvidenceUnit {
+            id: EvidenceId(format!("evidence-{id}")),
+            source_id: source.id.clone(),
+            kind: EvidenceKind::Text,
+            derived_from: None,
+            locator: SourceLocator::Document {
+                path_or_url: source.path.to_string_lossy().into_owned(),
+                line_start: 1,
+                line_end: None,
+            },
+            text: text.clone(),
+            text_hash: format!("hash-evidence-{id}"),
+            heading_path: vec!["batch".into()],
+            position: 0,
+        };
+        let chunk = Chunk {
+            id: ChunkId(id.clone()),
+            source_id: source.id.clone(),
+            chunk_hash: format!("hash-{id}"),
+            embedding_input_hash: None,
+            text,
+            context_text: None,
+            token_count: 4,
+            chunk_type,
+            parent_chunk_id,
+            heading_path: vec!["batch".into()],
+            evidence_unit_ids: vec![evidence.id.clone()],
+        };
+        (chunk, evidence)
+    }
+
+    let directory = tempdir().expect("temporary retrieval database");
+    let database_path = directory.path().join("retrieval.db");
+    let writer = Store::new(&database_path).expect("writable retrieval store");
+    let wanted = source("source-wanted");
+    let excluded = source("source-excluded");
+    writer.add_source(&wanted).expect("wanted source");
+    writer.add_source(&excluded).expect("excluded source");
+
+    let mut chunks = Vec::with_capacity(LARGE_FUSED_CANDIDATE_POOL + FINAL_RESULT_COUNT);
+    let mut evidence = Vec::with_capacity(LARGE_FUSED_CANDIDATE_POOL + FINAL_RESULT_COUNT);
+    let mut links = Vec::with_capacity(LARGE_FUSED_CANDIDATE_POOL + FINAL_RESULT_COUNT);
+    let mut small_hits = Vec::with_capacity(FINAL_RESULT_COUNT);
+    let mut large_hits = Vec::with_capacity(LARGE_FUSED_CANDIDATE_POOL);
+
+    for index in 0..FINAL_RESULT_COUNT {
+        let parent_id = ChunkId(format!("parent-{index:05}"));
+        let (parent, parent_evidence) = batch_fixture_chunk(
+            &wanted,
+            parent_id.0.clone(),
+            format!("parent result {index}"),
+            None,
+            ChunkType::Parent,
+        );
+        links.push((parent.id.clone(), parent_evidence.id.clone()));
+        chunks.push(parent);
+        evidence.push(parent_evidence);
+
+        let (child, child_evidence) = batch_fixture_chunk(
+            &wanted,
+            format!("wanted-{index:05}"),
+            format!("wanted result {index}"),
+            Some(parent_id),
+            ChunkType::Child,
+        );
+        let hit = (child.id.clone(), 1.0 - index as f32 / FINAL_RESULT_COUNT as f32);
+        links.push((child.id.clone(), child_evidence.id.clone()));
+        chunks.push(child);
+        evidence.push(child_evidence);
+        small_hits.push(hit.clone());
+        large_hits.push(hit);
+    }
+
+    for index in FINAL_RESULT_COUNT..LARGE_FUSED_CANDIDATE_POOL {
+        let (chunk, unit) = batch_fixture_chunk(
+            &excluded,
+            format!("excluded-{index:05}"),
+            format!("excluded result {index}"),
+            None,
+            ChunkType::Child,
+        );
+        large_hits.push((chunk.id.clone(), 0.5 - index as f32 / LARGE_FUSED_CANDIDATE_POOL as f32));
+        links.push((chunk.id.clone(), unit.id.clone()));
+        chunks.push(chunk);
+        evidence.push(unit);
+    }
+    writer
+        .bulk_insert_evidence(&evidence)
+        .expect("fixture evidence");
+    writer.bulk_insert_chunks(&chunks).expect("fixture chunks");
+    writer.link_chunk_evidence(&links).expect("fixture links");
+    drop(writer);
+
+    let store = Store::open_existing_readonly(&database_path).expect("readonly retrieval store");
+    let config = RetrievalConfig {
+        dense_top_k: LARGE_FUSED_CANDIDATE_POOL,
+        bm25_top_k: 0,
+        ..RetrievalConfig::default()
+    };
+    let embed_client = KeywordEmbeddingClient;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    let small_vector_index = StaticVectorIndex::new(small_hits);
+    let small_lexical_index = StaticLexicalIndex::new(Vec::new());
+    let small_pipeline = RetrievalPipeline::new(
+        &small_vector_index,
+        &small_lexical_index,
+        &store,
+        &embed_client,
+        &config,
+    );
+    let (small_result, small_count) = store.count_sql_statements(|| {
+        runtime.block_on(small_pipeline.search_filtered("batch", Some(&wanted.id)))
+    });
+    let small_results = small_result.expect("small retrieval succeeds");
+
+    let large_vector_index = StaticVectorIndex::new(large_hits);
+    let large_lexical_index = StaticLexicalIndex::new(Vec::new());
+    let large_pipeline = RetrievalPipeline::new(
+        &large_vector_index,
+        &large_lexical_index,
+        &store,
+        &embed_client,
+        &config,
+    );
+    let (large_result, large_count) = store.count_sql_statements(|| {
+        runtime.block_on(large_pipeline.search_filtered("batch", Some(&wanted.id)))
+    });
+    let large_results = large_result.expect("large retrieval succeeds");
+
+    assert_eq!(small_results.len(), FINAL_RESULT_COUNT);
+    assert_eq!(
+        chunk_ids(&small_results),
+        chunk_ids(&large_results),
+        "source filtering keeps the bounded final result set stable"
+    );
+    assert!(large_results
+        .iter()
+        .all(|result| result.chunk.chunk_type == ChunkType::Parent));
+    assert!(large_results
+        .iter()
+        .all(|result| result.evidence_units.len() == 1));
+    assert_eq!(
+        small_count.expect("small readonly statement count"),
+        large_count.expect("large readonly statement count"),
+        "bounded final results must not make SQL grow with the fused candidate pool"
+    );
 }
