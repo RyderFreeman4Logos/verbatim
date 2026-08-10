@@ -2190,7 +2190,12 @@ where
         return write_retrieve_response(writer, context);
     }
 
-    writeln!(writer, "{}", response.answer)?;
+    if let Some(interpretation) = &response.generated_interpretation {
+        writeln!(writer, "Generated interpretation:")?;
+        writeln!(writer, "{}", interpretation.text)?;
+    } else {
+        writeln!(writer, "{}", response.answer)?;
+    }
     write_citations(writer, &response.citations)?;
     if let Some(collection_filter) = &response.collection_filter {
         write_collection_filter_summary(writer, collection_filter)?;
@@ -3215,6 +3220,29 @@ mod tests {
     use verbatim_core::types::{
         MarkdownBlockKind, MarkdownHeadingLocator, OcrLocatorMetadata, OcrProfile,
     };
+
+    #[test]
+    fn ask_response_labels_generated_interpretation() {
+        let response = AskResponse {
+            answer: "Legacy generated answer.".into(),
+            generated_interpretation: Some(verbatim_core::api::GeneratedInterpretationResponse {
+                text: "Generated interpretation.".into(),
+            }),
+            citations: Vec::new(),
+            verified: false,
+            retrieval: None,
+            context: None,
+            collection_filter: None,
+        };
+        let mut output = Vec::new();
+
+        write_ask_response(&mut output, &response).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Generated interpretation:\nGenerated interpretation.\n"
+        );
+    }
 
     #[test]
     fn task_summary_renders_embedding_cache_stats_from_result_metadata() {
