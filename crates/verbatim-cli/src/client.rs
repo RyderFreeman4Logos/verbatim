@@ -1570,7 +1570,7 @@ mod tests {
     #[test]
     fn http_evidence_config_and_status_parse_json() {
         let server = TestServer::respond_many([
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"ev-1\",\"source_id\":\"src-1\",\"kind\":\"text\",\"derived_from\":null,\"locator\":\"PDF p.1 para.1\",\"structured_locator\":{\"type\":\"Pdf\",\"page\":1,\"paragraph\":1,\"bbox\":null},\"text\":\"quoted\",\"heading_path\":[],\"position\":0,\"image_artifact\":null}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"ev-1\",\"source_id\":\"src-1\",\"source_bounded\":true,\"text_hash\":\"receipt-text-hash\",\"kind\":\"text\",\"derived_from\":null,\"locator\":\"PDF p.1 para.1\",\"structured_locator\":{\"type\":\"Pdf\",\"page\":1,\"paragraph\":1,\"bbox\":null},\"text\":\"quoted\",\"heading_path\":[],\"position\":0,\"image_artifact\":null}",
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"config\":{\"daemon\":{\"bind\":\"x\"}},\"reload\":{\"active_config_path\":\"/tmp/config.toml\",\"loaded_at\":\"1\",\"last_applied_reload_safe_keys\":[],\"last_restart_required_keys\":[]}}",
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}",
         ]);
