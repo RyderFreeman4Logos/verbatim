@@ -7595,7 +7595,7 @@ async fn prepare_generation_context(
                 let (mut results, mut retrieval_debug) = run_generation_retrieval(
                     runtime,
                     retrieval,
-                    &config.rerank,
+                    &config,
                     &question2,
                     source_filter_ref,
                     show_retrieval,
@@ -7637,14 +7637,29 @@ async fn prepare_generation_context(
     Ok((results, generation_context, retrieval_debug))
 }
 
+fn ask_debug_options(config: &Config, show_retrieval: bool) -> RetrievalDebugOptions {
+    let canonical_budget =
+        RetrievalCanonicalSelectionBudget::scoped(RetrievalDisplayScope::Window {
+            start: 0,
+            len: config.retrieval.default_limit,
+        });
+    if show_retrieval {
+        RetrievalDebugOptions::full(canonical_budget)
+    } else {
+        RetrievalDebugOptions::compact(canonical_budget)
+    }
+}
+
 fn run_generation_retrieval(
     runtime: tokio::runtime::Handle,
     retrieval: RetrievalPipeline<'_>,
-    rerank_config: &RerankConfig,
+    config: &Config,
     question: &str,
     source_filter: Option<&HashSet<SourceId>>,
     show_retrieval: bool,
 ) -> Result<(Vec<RetrievalResult>, Option<RetrievalDebug>)> {
+    let rerank_config = &config.rerank;
+    let debug_options = ask_debug_options(config, show_retrieval);
     match (rerank_config.enabled, rerank_config.strategy) {
         (true, RerankStrategy::Endpoint) => {
             let reranker = OpenAiCompatibleReranker::from_config(rerank_config);
@@ -7653,7 +7668,7 @@ fn run_generation_retrieval(
                 retrieval.with_reranker(rerank_config, &reranker),
                 question,
                 source_filter,
-                show_retrieval,
+                debug_options,
             )
         }
         (true, RerankStrategy::Llm) => {
@@ -7663,7 +7678,7 @@ fn run_generation_retrieval(
                 retrieval.with_reranker(rerank_config, &reranker),
                 question,
                 source_filter,
-                show_retrieval,
+                debug_options,
             )
         }
         (false, _) => run_generation_retrieval_once(
@@ -7671,7 +7686,7 @@ fn run_generation_retrieval(
             retrieval,
             question,
             source_filter,
-            show_retrieval,
+            debug_options,
         ),
     }
 }
@@ -7703,13 +7718,8 @@ fn run_generation_retrieval_once(
     retrieval: RetrievalPipeline<'_>,
     question: &str,
     source_filter: Option<&HashSet<SourceId>>,
-    show_retrieval: bool,
+    debug_options: RetrievalDebugOptions,
 ) -> Result<(Vec<RetrievalResult>, Option<RetrievalDebug>)> {
-    let debug_options = if show_retrieval {
-        RetrievalDebugOptions::full(RetrievalCanonicalSelectionBudget::all())
-    } else {
-        RetrievalDebugOptions::compact(RetrievalCanonicalSelectionBudget::all())
-    };
     let (results, debug) = runtime.block_on(retrieval.search_source_set_with_debug_options(
         question,
         source_filter,
@@ -13131,6 +13141,26 @@ mod tests {
         assert_eq!(
             options.canonical_budget.display,
             RetrievalDisplayScope::Window { start: 0, len: 0 }
+        );
+    }
+
+    #[test]
+    fn ask_debug_options_limit_canonical_selection_to_configured_retrieval_scope() {
+        let mut config = Config::default();
+        config.retrieval.default_limit = 2;
+
+        let options = ask_debug_options(&config, true);
+
+        assert_eq!(
+            options.canonical_budget,
+            RetrievalCanonicalSelectionBudget::scoped(RetrievalDisplayScope::Window {
+                start: 0,
+                len: 2,
+            })
+        );
+        assert_eq!(
+            options.evidence_pack_mode,
+            RetrievalDebugEvidencePackMode::Full
         );
     }
 
