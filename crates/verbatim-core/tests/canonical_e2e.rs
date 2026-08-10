@@ -1,26 +1,24 @@
+use verbatim_core::canonical_chunker::{chunk_canonical_units, CanonicalChunkerConfig};
 use verbatim_core::parser::canonical_jsonl::CanonicalJsonlParser;
 use verbatim_core::traits::Parser;
 use verbatim_core::types::{EvidenceKind, SourceLocator};
 
 #[test]
-fn parse_csb_bible_jsonl_end_to_end() {
-    let path = std::path::Path::new("/tmp/csb_bible.jsonl");
-    if !path.exists() {
-        eprintln!("skipping: /tmp/csb_bible.jsonl not found");
-        return;
-    }
-
-    let parser = CanonicalJsonlParser;
-    let units = parser.parse(path).unwrap();
-
-    // Should have ~31K verses
+fn parse_repository_canonical_bible_fixture_end_to_end() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/canonical_bible.jsonl");
     assert!(
-        units.len() > 30000,
-        "expected 30K+ units, got {}",
-        units.len()
+        path.is_file(),
+        "required canonical Bible fixture is missing or unreadable: {}",
+        path.display()
     );
 
-    // First verse should be Genesis 1:1
+    let parser = CanonicalJsonlParser;
+    let units = parser.parse(&path).unwrap();
+
+    assert_eq!(units.len(), 7, "fixture records must all be parsed");
+
+    // First verse should be Genesis 1:1.
     let first = &units[0];
     assert_eq!(first.kind, EvidenceKind::Text);
     match &first.locator {
@@ -33,7 +31,7 @@ fn parse_csb_bible_jsonl_end_to_end() {
         _ => panic!("expected Canonical locator for first unit"),
     }
 
-    // Find John 3:16
+    // Find John 3:16.
     let jn316 = units.iter().find(|u| match &u.locator {
         SourceLocator::Canonical { locator } => locator.display == "John 3:16",
         _ => false,
@@ -46,7 +44,42 @@ fn parse_csb_bible_jsonl_end_to_end() {
         unit.text
     );
 
-    // Count unique books
+    let range = units
+        .iter()
+        .find(|unit| {
+            matches!(
+                &unit.locator,
+                SourceLocator::Canonical { locator } if locator.display == "2 Timothy 4:7-8"
+            )
+        })
+        .expect("the fixture must include a canonical range");
+    assert!(range.text.contains("crown of righteousness"));
+
+    assert!(units.iter().any(|unit| unit.text.contains("ἰδοὺ")));
+
+    let reparsed = parser.parse(&path).unwrap();
+    assert_eq!(
+        units.iter().map(|unit| &unit.id).collect::<Vec<_>>(),
+        reparsed.iter().map(|unit| &unit.id).collect::<Vec<_>>(),
+        "canonical evidence IDs must be stable"
+    );
+
+    let chunks = chunk_canonical_units(
+        &units[0].source_id,
+        &units,
+        &CanonicalChunkerConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        chunks.chunks.len() > units.len(),
+        "expected parent and child chunks"
+    );
+    assert!(chunks
+        .chunks
+        .iter()
+        .any(|chunk| chunk.text.contains("crown of righteousness")));
+
+    // The fixture crosses multiple books.
     let mut books = std::collections::HashSet::new();
     for u in &units {
         if let SourceLocator::Canonical { locator } = &u.locator {
@@ -57,5 +90,9 @@ fn parse_csb_bible_jsonl_end_to_end() {
             }
         }
     }
-    assert_eq!(books.len(), 66, "expected 66 books, got {}", books.len());
+    assert!(
+        books.len() >= 3,
+        "expected multiple books, got {}",
+        books.len()
+    );
 }
