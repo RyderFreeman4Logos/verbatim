@@ -5573,6 +5573,8 @@ mod tests {
         EvidenceResponse {
             id: "ev-1".into(),
             source_id: "src-1".into(),
+            source_bounded: true,
+            text_hash: "receipt-text-hash".into(),
             kind: "text".into(),
             derived_from: None,
             locator: "PDF p.1 para.1".into(),
