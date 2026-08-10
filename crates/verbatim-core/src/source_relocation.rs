@@ -96,7 +96,6 @@ where
                     bounded_path(&source.path)
                 )));
             }
-
             let target_file = open_relocation_target(new_path)?;
             let canonical_path = fs::canonicalize(new_path).map_err(|error| {
                 relocation_target_io_error("resolve relocation target", new_path, error)
@@ -118,7 +117,6 @@ where
                     )));
                 }
             }
-
             let parser = parser::select_parser(parser_used).map_err(validation_error)?;
             let extension = canonical_path
                 .extension()
@@ -161,7 +159,9 @@ where
             {
                 hook();
             }
-            let mut parsed = remap_parser_evidence_identity(parsed?, &parser_source_id, source_id)
+            let mut parsed = parsed?;
+            crate::pdf_selector::attach_pdf_selectors(&mut parsed, &source.hash, parser_used);
+            let mut parsed = remap_parser_evidence_identity(parsed, &parser_source_id, source_id)
                 .map_err(validation_error)?;
             rewrite_relocation_locator_paths(&mut parsed, &parser_path, &canonical_path)
                 .map_err(validation_error)?;
@@ -174,7 +174,9 @@ where
                 .into_iter()
                 .filter(|unit| unit.kind == EvidenceKind::Text)
                 .collect::<Vec<_>>();
-            validate_relocation_evidence(&stored, &parsed).map_err(validation_error)?;
+            let mut expected = stored.clone();
+            crate::pdf_selector::attach_pdf_selectors(&mut expected, &source.hash, parser_used);
+            validate_relocation_evidence(&expected, &parsed).map_err(validation_error)?;
             self.store()
                 .relocate_source(&source, &canonical_path, &target, &stored, &parsed)
         })();

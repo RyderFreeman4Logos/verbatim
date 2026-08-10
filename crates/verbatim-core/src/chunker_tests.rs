@@ -10,11 +10,7 @@ fn make_evidence(n: usize, heading: &str) -> Vec<EvidenceUnit> {
             source_id: SourceId("test".into()),
             kind: EvidenceKind::Text,
             derived_from: None,
-            locator: SourceLocator::Pdf {
-                page: 1,
-                paragraph: i as u32,
-                bbox: None,
-            },
+            locator: SourceLocator::legacy_pdf(1, i as u32, None),
             text: format!("Word{i} ").repeat(80),
             text_hash: format!("hash-{i}"),
             heading_path: if heading.is_empty() {
@@ -221,11 +217,7 @@ proptest! {
             unit.id = EvidenceId(format!("repeated-{index}"));
             unit.text = format!("{leading}{repeated}{trailing}");
             unit.text_hash = crate::types::hex_sha256(unit.text.as_bytes());
-            unit.locator = SourceLocator::Pdf {
-                page: index as u32 + 1,
-                paragraph: index as u32,
-                bbox: None,
-            };
+            unit.locator = SourceLocator::legacy_pdf(index as u32 + 1, index as u32, None);
             unit.position = index as u32;
         }
         evidence.extend(second_group);

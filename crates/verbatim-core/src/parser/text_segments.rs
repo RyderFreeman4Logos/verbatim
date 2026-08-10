@@ -36,11 +36,7 @@ pub(crate) fn pdf_page_evidence_units(
                 source_id: source_id.clone(),
                 kind: EvidenceKind::Text,
                 derived_from: None,
-                locator: SourceLocator::Pdf {
-                    page: page_num,
-                    paragraph: para_idx as u32,
-                    bbox: None,
-                },
+                locator: SourceLocator::legacy_pdf(page_num, para_idx as u32, None),
                 text,
                 text_hash,
                 heading_path: Vec::new(),
@@ -261,7 +257,8 @@ mod tests {
             SourceLocator::Pdf {
                 page: 3,
                 paragraph: 0,
-                bbox: None
+                bbox: None,
+                ..
             }
         ));
         assert!(matches!(
@@ -269,7 +266,8 @@ mod tests {
             SourceLocator::Pdf {
                 page: 3,
                 paragraph: 1,
-                bbox: None
+                bbox: None,
+                ..
             }
         ));
     }

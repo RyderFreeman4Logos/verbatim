@@ -1986,8 +1986,14 @@ where
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
         let (mut evidence, prepared_image_artifacts, pdf_scan) = {
             let _cpu_permit = cpu_permit;
+            let mut parsed_evidence = parser.parse(&source.path)?;
+            crate::pdf_selector::attach_pdf_selectors(
+                &mut parsed_evidence,
+                &new_source.hash,
+                parser.name(),
+            );
             let evidence = remap_parser_evidence_identity(
-                parser.parse(&source.path)?,
+                parsed_evidence,
                 &SourceId::from_path(&source.path),
                 source_id,
             )?;
@@ -8351,9 +8357,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn born_digital_pdf_ingest_keeps_text_evidence_without_ocr() {
+    async fn born_digital_pdf_ingest_persists_versioned_selector_without_ocr() {
         let tempdir = tempfile::tempdir().unwrap();
-        let store = Store::in_memory().unwrap();
+        let db_path = tempdir.path().join("verbatim.db");
+        let store = Store::new(&db_path).unwrap();
         let mut pipeline = IngestPipeline::from_parts(
             store,
             HnswIndex::new(),
@@ -8365,21 +8372,24 @@ mod tests {
         let source_id = pipeline.add_source(&path).unwrap();
 
         pipeline.ingest_source(&source_id).await.unwrap();
+        drop(pipeline);
 
-        let evidence = pipeline
-            .store()
-            .list_evidence_by_source(&source_id)
-            .unwrap();
+        let reopened = Store::new(&db_path).unwrap();
+        let evidence = reopened.list_evidence_by_source(&source_id).unwrap();
         assert!(evidence.iter().any(|unit| {
             unit.kind == EvidenceKind::Text
                 && unit.text == "Born digital alpha evidence"
-                && matches!(unit.locator, SourceLocator::Pdf { page: 1, .. })
+                && matches!(
+                    &unit.locator,
+                    SourceLocator::Pdf {
+                        page: 1,
+                        selector: Some(selector),
+                        ..
+                    } if selector.version == crate::pdf_selector::PDF_SELECTOR_VERSION
+                )
         }));
         assert!(evidence.iter().all(|unit| unit.kind != EvidenceKind::Ocr));
-        let artifacts = pipeline
-            .store()
-            .list_image_artifacts_by_source(&source_id)
-            .unwrap();
+        let artifacts = reopened.list_image_artifacts_by_source(&source_id).unwrap();
         let diagnostics = source_ingest_diagnostics(&path, &evidence, &artifacts, None);
         assert_eq!(diagnostics.ocr.status, OcrSourceStatus::NotRequired);
         assert_eq!(diagnostics.pdf.as_ref().unwrap().image_only_page_count, 0);
@@ -9107,11 +9117,7 @@ model = "local-vision"
             source_id: source.id.clone(),
             kind: EvidenceKind::Text,
             derived_from: None,
-            locator: SourceLocator::Pdf {
-                page: 1,
-                paragraph: 0,
-                bbox: None,
-            },
+            locator: SourceLocator::legacy_pdf(1, 0, None),
             text: text.into(),
             text_hash: "hash-text-1".into(),
             heading_path: Vec::new(),
