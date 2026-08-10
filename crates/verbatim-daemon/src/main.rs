@@ -7449,8 +7449,8 @@ async fn prepare_retrieve_context(
         .with_qdrant_search(&controls.config.qdrant);
         let source_filter_ref = source_filter.as_ref();
         let debug_options = retrieve_debug_options(&controls);
-        let (retrieval_result, retrieval_search_sql_statement_count) =
-            pipeline.store().count_sql_statements(|| {
+        let (retrieval_result, retrieval_search_sql_statement_count, retrieval_resource_counters) =
+            pipeline.store().measure_retrieval(|| {
                 let (mut results, mut debug) = match (
                     controls.rerank_config.enabled,
                     controls.rerank_config.strategy,
@@ -7492,6 +7492,7 @@ async fn prepare_retrieve_context(
             });
         let (results, mut debug) = retrieval_result?;
         debug.retrieval_search_sql_statement_count = retrieval_search_sql_statement_count;
+        debug.retrieval_resource_counters = retrieval_resource_counters;
         let source_paths = with_sqlite_reader_permit(&sqlite_reader, || {
             source_paths_for_results(&results, pipeline.store())
         })?;
@@ -7511,6 +7512,7 @@ fn empty_retrieval_debug() -> RetrievalDebug {
         dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
         query_embedding_latency_ms: None,
         retrieval_search_sql_statement_count: None,
+        retrieval_resource_counters: None,
         local_spans_ms: RetrievalLocalSpansMs::default(),
         candidate_counters: Default::default(),
         evidence_pack_mode: verbatim_core::types::RetrievalDebugEvidencePackMode::Full,
@@ -7581,30 +7583,34 @@ async fn prepare_generation_context(
             .with_vector_search_resource(vector_search)
             .with_qdrant_search(&config.qdrant);
             let source_filter_ref = source_filter.as_ref();
-            let (retrieval_result, retrieval_search_sql_statement_count) =
-                pipeline.store().count_sql_statements(|| {
-                    let (mut results, mut retrieval_debug) = run_generation_retrieval(
-                        runtime,
-                        retrieval,
-                        &config.rerank,
-                        &question2,
-                        source_filter_ref,
-                        show_retrieval,
-                    )?;
-                    let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
-                        GraphRagService::new(pipeline.store(), &config.graph.global_search)
-                            .global_search_backing_results(&question2, source_filter_ref)
-                    })?;
-                    prepend_global_backing_results(
-                        &mut results,
-                        global_results,
-                        retrieval_debug.as_mut(),
-                    );
-                    Ok::<_, anyhow::Error>((results, retrieval_debug))
-                });
+            let (
+                retrieval_result,
+                retrieval_search_sql_statement_count,
+                retrieval_resource_counters,
+            ) = pipeline.store().measure_retrieval(|| {
+                let (mut results, mut retrieval_debug) = run_generation_retrieval(
+                    runtime,
+                    retrieval,
+                    &config.rerank,
+                    &question2,
+                    source_filter_ref,
+                    show_retrieval,
+                )?;
+                let global_results = with_sqlite_reader_permit(&sqlite_reader, || {
+                    GraphRagService::new(pipeline.store(), &config.graph.global_search)
+                        .global_search_backing_results(&question2, source_filter_ref)
+                })?;
+                prepend_global_backing_results(
+                    &mut results,
+                    global_results,
+                    retrieval_debug.as_mut(),
+                );
+                Ok::<_, anyhow::Error>((results, retrieval_debug))
+            });
             let (results, mut retrieval_debug) = retrieval_result?;
             if let Some(debug) = retrieval_debug.as_mut() {
                 debug.retrieval_search_sql_statement_count = retrieval_search_sql_statement_count;
+                debug.retrieval_resource_counters = retrieval_resource_counters;
             }
             let image_artifacts = with_sqlite_reader_permit(&sqlite_reader, || {
                 collect_image_artifacts_for_results(&results, pipeline.store())
@@ -7675,6 +7681,15 @@ fn retrieval_span_metadata(
         metadata.as_object_mut(),
     ) {
         fields.insert("retrieval_search_sql_statement_count".into(), count.into());
+    }
+    if let (Some(counters), Some(fields)) = (
+        debug.and_then(|debug| debug.retrieval_resource_counters.as_ref()),
+        metadata.as_object_mut(),
+    ) {
+        fields.insert(
+            "retrieval_resource_counters".into(),
+            serde_json::json!(counters),
+        );
     }
     metadata
 }
@@ -12898,6 +12913,7 @@ mod tests {
                 dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
                 query_embedding_latency_ms: None,
                 retrieval_search_sql_statement_count: None,
+                retrieval_resource_counters: None,
                 local_spans_ms: RetrievalLocalSpansMs::default(),
                 candidate_counters: Default::default(),
                 evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,

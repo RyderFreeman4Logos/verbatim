@@ -19,7 +19,8 @@ pub use attribute::{
     LanceDbIndexType, QdrantQuantization, MAX_BACKEND_ATTRIBUTE_NUMERIC_VALUE,
 };
 pub use counter::{
-    CandidateCounters, ResourceCounters, StageCandidateCounters, StorageAccessMode, StorageCounters,
+    CandidateCounters, ResourceCounters, RetrievalResourceCounters, StageCandidateCounters,
+    StorageAccessMode, StorageCounters,
 };
 pub use error::{TelemetryDiagnosticCode, TelemetryError, TelemetryResult};
 pub use memory::{

@@ -1,11 +1,18 @@
-//! Request-local SQLite statement counting for retrieval telemetry.
+//! Request-local SQLite and operating-system counters for retrieval telemetry.
 
 use std::cell::Cell;
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::mem::MaybeUninit;
 
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::Connection;
 
 use super::Store;
+use crate::retrieval_telemetry::RetrievalResourceCounters;
 
 #[derive(Clone, Copy)]
 struct SqlStatementCountState {
@@ -94,6 +101,73 @@ impl Drop for SqlStatementCountGuard<'_> {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct ThreadResourceSnapshot {
+    major_page_faults: u64,
+    minor_page_faults: u64,
+    block_input_operations: u64,
+    storage_read_bytes: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl ThreadResourceSnapshot {
+    fn capture() -> Option<Self> {
+        let mut usage = MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: `getrusage` initializes the pointed-to `rusage` on a zero return code.
+        if unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: the successful call above initialized every field in `usage`.
+        let usage = unsafe { usage.assume_init() };
+        Some(Self {
+            major_page_faults: u64::try_from(usage.ru_majflt).ok()?,
+            minor_page_faults: u64::try_from(usage.ru_minflt).ok()?,
+            block_input_operations: u64::try_from(usage.ru_inblock).ok()?,
+            storage_read_bytes: thread_storage_read_bytes(),
+        })
+    }
+
+    fn delta(self, end: Self) -> RetrievalResourceCounters {
+        RetrievalResourceCounters::observed(
+            end.major_page_faults.checked_sub(self.major_page_faults),
+            end.minor_page_faults.checked_sub(self.minor_page_faults),
+            end.block_input_operations
+                .checked_sub(self.block_input_operations),
+            self.storage_read_bytes
+                .zip(end.storage_read_bytes)
+                .and_then(|(start, end)| end.checked_sub(start)),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn thread_storage_read_bytes() -> Option<u64> {
+    let mut contents = String::new();
+    let mut reader = File::open("/proc/thread-self/io").ok()?.take(4_096);
+    reader.read_to_string(&mut contents).ok()?;
+    contents.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        (name == "read_bytes")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+struct ThreadResourceSnapshot;
+
+#[cfg(not(target_os = "linux"))]
+impl ThreadResourceSnapshot {
+    fn capture() -> Option<Self> {
+        None
+    }
+
+    fn delta(self, _end: Self) -> RetrievalResourceCounters {
+        RetrievalResourceCounters::default()
+    }
+}
+
 impl Store {
     /// Run one request-local operation and return its actual SQLite statement count.
     ///
@@ -106,6 +180,27 @@ impl Store {
         let guard = SqlStatementCountGuard::start(&self.conn);
         let output = operation();
         (output, guard.finish())
+    }
+
+    /// Measure one live retrieval window using the existing Store boundary.
+    ///
+    /// Resource attribution is enabled only for the same read-only file-backed
+    /// Stores that support request-local statement counting. Sampling is constant
+    /// work: two thread `getrusage` calls and two procfs reads capped at 4 KiB,
+    /// never one syscall per SQL row or retrieval candidate.
+    pub fn measure_retrieval<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> (T, Option<u64>, Option<RetrievalResourceCounters>) {
+        let start = self
+            .sql_statement_counting_available
+            .then(ThreadResourceSnapshot::capture)
+            .flatten();
+        let (output, sql_statements) = self.count_sql_statements(operation);
+        let resources = start
+            .and_then(|start| ThreadResourceSnapshot::capture().map(|end| start.delta(end)))
+            .filter(RetrievalResourceCounters::is_available);
+        (output, sql_statements, resources)
     }
 }
 
@@ -261,6 +356,17 @@ mod tests {
                 .1,
             Some(0)
         );
+    }
+
+    #[test]
+    fn in_memory_store_reports_retrieval_resources_unavailable() {
+        let store = Store::in_memory().unwrap();
+
+        let (value, sql_statements, resources) = store.measure_retrieval(|| 42);
+
+        assert_eq!(value, 42);
+        assert_eq!(sql_statements, None);
+        assert_eq!(resources, None);
     }
 
     #[test]

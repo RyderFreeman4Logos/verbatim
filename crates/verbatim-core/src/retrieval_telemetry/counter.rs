@@ -472,3 +472,59 @@ impl ResourceCounters {
         Ok(())
     }
 }
+
+/// Request-local counters exposed by the operating system for one retrieval window.
+///
+/// Each field is independently optional because a platform may expose thread page
+/// faults while withholding procfs storage accounting. Zero is an observed delta;
+/// `None` is unavailable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalResourceCounters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    major_page_faults: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minor_page_faults: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    block_input_operations: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    storage_read_bytes: Option<u64>,
+}
+
+impl RetrievalResourceCounters {
+    pub(crate) const fn observed(
+        major_page_faults: Option<u64>,
+        minor_page_faults: Option<u64>,
+        block_input_operations: Option<u64>,
+        storage_read_bytes: Option<u64>,
+    ) -> Self {
+        Self {
+            major_page_faults,
+            minor_page_faults,
+            block_input_operations,
+            storage_read_bytes,
+        }
+    }
+
+    pub const fn major_page_faults(&self) -> Option<u64> {
+        self.major_page_faults
+    }
+
+    pub const fn minor_page_faults(&self) -> Option<u64> {
+        self.minor_page_faults
+    }
+
+    pub const fn block_input_operations(&self) -> Option<u64> {
+        self.block_input_operations
+    }
+
+    pub const fn storage_read_bytes(&self) -> Option<u64> {
+        self.storage_read_bytes
+    }
+
+    pub const fn is_available(&self) -> bool {
+        self.major_page_faults.is_some()
+            || self.minor_page_faults.is_some()
+            || self.block_input_operations.is_some()
+            || self.storage_read_bytes.is_some()
+    }
+}
