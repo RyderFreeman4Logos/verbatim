@@ -4,7 +4,7 @@ use super::{
     RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath, RetrievalEvidencePackEntry,
     RetrievalFusedHit, RetrievalGraphExpansionDebug, RetrievalRerankDebug, RetrievalStageHit,
 };
-use crate::retrieval_telemetry::CandidateCounters;
+use crate::retrieval_telemetry::{CandidateCounters, RetrievalResourceCounters};
 
 /// Retrieve diagnostic durations in milliseconds.
 ///
@@ -52,6 +52,12 @@ pub struct RetrievalDebug {
     /// was unavailable, invalid, or absent from a payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval_search_sql_statement_count: Option<u64>,
+    /// Thread-local page-fault and storage-read deltas for the same retrieval window.
+    ///
+    /// `None` means the Store was not a supported read-only file backend or the
+    /// platform exposed no counters. Individual fields may also be unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_resource_counters: Option<RetrievalResourceCounters>,
     #[serde(default)]
     pub local_spans_ms: RetrievalLocalSpansMs,
     /// Fixed-cardinality work counts captured by the shared retrieval pipeline.

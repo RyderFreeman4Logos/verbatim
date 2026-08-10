@@ -1262,6 +1262,7 @@ pub fn hex_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retrieval_telemetry::RetrievalResourceCounters;
 
     #[test]
     fn mvp_regression_source_ids_include_path_hash_to_avoid_stem_collisions() {
@@ -1322,10 +1323,12 @@ mod tests {
 
     #[test]
     fn retrieval_debug_serializes_without_raw_text_or_secrets() {
+        let resources = RetrievalResourceCounters::observed(Some(0), Some(3), Some(0), Some(4_096));
         let debug = RetrievalDebug {
             dense_vector_path: RetrievalDenseVectorPath::ResidentHnsw,
             query_embedding_latency_ms: None,
             retrieval_search_sql_statement_count: Some(0),
+            retrieval_resource_counters: Some(resources),
             local_spans_ms: RetrievalLocalSpansMs {
                 setup_ms: 1,
                 query_embedding_ms: 2,
@@ -1418,6 +1421,7 @@ mod tests {
         assert!(encoded.contains("response_formatting_ms"));
         assert!(encoded.contains("canonical_display_selection_ms"));
         assert!(encoded.contains("\"retrieval_search_sql_statement_count\":0"));
+        assert!(encoded.contains("\"storage_read_bytes\":4096"));
         assert!(encoded.contains("evidence_pack_mode"));
         assert!(encoded.contains("final_evidence_count"));
         assert!(encoded.contains("display_evidence_count"));
@@ -1432,10 +1436,9 @@ mod tests {
         assert_eq!(decoded, debug);
 
         let mut legacy_payload = serde_json::to_value(&debug).unwrap();
-        legacy_payload
-            .as_object_mut()
-            .unwrap()
-            .remove("retrieval_search_sql_statement_count");
+        let legacy_fields = legacy_payload.as_object_mut().unwrap();
+        legacy_fields.remove("retrieval_search_sql_statement_count");
+        legacy_fields.remove("retrieval_resource_counters");
         let legacy_spans = legacy_payload["local_spans_ms"].as_object_mut().unwrap();
         legacy_spans.remove("vector_queue_wait_ms");
         legacy_spans.remove("vector_service_ms");
@@ -1443,13 +1446,15 @@ mod tests {
         assert_eq!(decoded_legacy.local_spans_ms.vector_queue_wait_ms, None);
         assert_eq!(decoded_legacy.local_spans_ms.vector_service_ms, None);
         assert_eq!(decoded_legacy.retrieval_search_sql_statement_count, None);
+        assert_eq!(decoded_legacy.retrieval_resource_counters, None);
 
         let mut unavailable = debug;
         unavailable.retrieval_search_sql_statement_count = None;
+        unavailable.retrieval_resource_counters = None;
         let unavailable_payload = serde_json::to_value(unavailable).unwrap();
-        assert!(unavailable_payload
-            .get("retrieval_search_sql_statement_count")
-            .is_none());
+        let unavailable_fields = unavailable_payload.as_object().unwrap();
+        assert!(!unavailable_fields.contains_key("retrieval_search_sql_statement_count"));
+        assert!(!unavailable_fields.contains_key("retrieval_resource_counters"));
     }
 
     #[test]

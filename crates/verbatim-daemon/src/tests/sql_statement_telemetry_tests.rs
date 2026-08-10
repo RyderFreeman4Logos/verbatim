@@ -239,6 +239,14 @@ fn assert_populated_bm25_startup_response(
         .retrieval_search_sql_statement_count
         .expect("retrieval search statement count");
     assert!(count > 0);
+    let resource_counters = debug
+        .retrieval_resource_counters
+        .as_ref()
+        .expect("file-backed retrieval resource counters");
+    assert!(resource_counters.major_page_faults().is_some());
+    assert!(resource_counters.minor_page_faults().is_some());
+    assert!(resource_counters.block_input_operations().is_some());
+    assert!(resource_counters.storage_read_bytes().is_some());
     let retrieval_span = summary
         .spans
         .iter()
@@ -247,6 +255,10 @@ fn assert_populated_bm25_startup_response(
     assert_eq!(
         retrieval_span.metadata["retrieval_search_sql_statement_count"],
         serde_json::json!(count)
+    );
+    assert_eq!(
+        retrieval_span.metadata["retrieval_resource_counters"],
+        serde_json::to_value(resource_counters).unwrap()
     );
     let telemetry = serde_json::to_string(&retrieval_span.metadata).unwrap();
     for forbidden in [
