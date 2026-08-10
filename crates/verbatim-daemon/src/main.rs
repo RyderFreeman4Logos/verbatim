@@ -4667,11 +4667,7 @@ async fn execute_retrieve_task_inner(
             .with_active_worker_kind(TaskKind::Retrieve.as_str()),
     )
     .await;
-    let RetrievedContext {
-        results,
-        debug,
-        source_paths,
-    } = prepare_retrieve_context(
+    let mut retrieved_context = prepare_retrieve_context(
         Arc::clone(&state),
         &question,
         query_scope.source_filter.clone(),
@@ -4679,6 +4675,15 @@ async fn execute_retrieve_task_inner(
         &controls,
     )
     .await?;
+    filter_generated_retrieval_evidence(
+        &mut retrieved_context.results,
+        &mut retrieved_context.debug,
+    );
+    let RetrievedContext {
+        results,
+        debug,
+        source_paths,
+    } = retrieved_context;
     let mut retrieval_progress = timing
         .progress_snapshot()
         .with_counter(
@@ -7824,6 +7829,30 @@ fn source_paths_for_results(
     Ok(paths)
 }
 
+fn filter_generated_retrieval_evidence(
+    results: &mut Vec<RetrievalResult>,
+    debug: &mut RetrievalDebug,
+) {
+    if !results.iter().any(|result| {
+        result
+            .evidence_units
+            .iter()
+            .any(|evidence| evidence.kind == EvidenceKind::Generated)
+    }) {
+        return;
+    }
+    for result in results.iter_mut() {
+        result
+            .evidence_units
+            .retain(|evidence| evidence.kind != EvidenceKind::Generated);
+    }
+    results.retain(|result| !result.evidence_units.is_empty());
+    for (index, result) in results.iter_mut().enumerate() {
+        result.provenance.result_rank = index + 1;
+    }
+    refresh_evidence_pack_debug(debug, results);
+}
+
 fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<RetrieveResponse> {
     let RetrieveResponseInput {
         task_id,
@@ -8346,7 +8375,7 @@ async fn get_evidence(
             kind: evidence_kind_name(eu.kind).to_string(),
             id: eu.id.0,
             source_id: eu.source_id.0,
-            source_bounded: true,
+            source_bounded: eu.kind != EvidenceKind::Generated,
             text_hash: eu.text_hash,
             derived_from: eu.derived_from.map(|id| id.0),
             locator: eu.locator.to_string(),
