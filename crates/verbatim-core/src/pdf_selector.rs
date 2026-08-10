@@ -13,6 +13,11 @@ const NORMALIZATION_PROFILE: &str = "unicode_whitespace_v1";
 const MAX_QUOTE_BYTES: usize = 1_024;
 const CONTEXT_CHARS: usize = 64;
 
+#[cfg(test)]
+std::thread_local! {
+    static PDF_TEXT_NORMALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Strength available from a PDF evidence locator before resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +123,23 @@ impl PdfSelector {
         range: Range<usize>,
     ) -> Option<Self> {
         let page_text = normalize_pdf_text(page_text);
+        let page_text_hash = hex_sha256(page_text.as_bytes());
+        Self::from_normalized_page_range(
+            &source_hash,
+            parser_profile_id,
+            &page_text,
+            &page_text_hash,
+            range,
+        )
+    }
+
+    fn from_normalized_page_range(
+        source_hash: &str,
+        parser_profile_id: &str,
+        page_text: &str,
+        page_text_hash: &str,
+        range: Range<usize>,
+    ) -> Option<Self> {
         if range.start >= range.end
             || range.end > page_text.len()
             || !page_text.is_char_boundary(range.start)
@@ -126,6 +148,9 @@ impl PdfSelector {
             return None;
         }
         let selected = &page_text[range.clone()];
+        if !is_normalized_exact(selected) {
+            return None;
+        }
         let start = u32::try_from(range.start).ok()?;
         let end = u32::try_from(range.end).ok()?;
         let quote = (selected.len() <= MAX_QUOTE_BYTES).then(|| PdfTextQuote {
@@ -137,9 +162,9 @@ impl PdfSelector {
         Some(Self {
             version: PDF_SELECTOR_VERSION,
             normalization_profile: NORMALIZATION_PROFILE.to_string(),
-            source_hash,
+            source_hash: source_hash.to_string(),
             parser_profile_id: parser_profile_id.to_string(),
-            page_text_hash: hex_sha256(page_text.as_bytes()),
+            page_text_hash: page_text_hash.to_string(),
             position: Some(PdfTextPosition { start, end }),
             quote,
             selected_text_hash: hex_sha256(selected.as_bytes()),
@@ -176,30 +201,42 @@ impl PdfSelector {
 
     /// Resolve against the supplied source bytes and current page text.
     pub fn resolve(&self, source_bytes: &[u8], page_text: &str) -> PdfResolutionOutcome {
+        if !self.has_valid_v1_schema() {
+            return PdfResolutionOutcome::Unsupported;
+        }
         if hex_sha256(source_bytes) != self.source_hash {
             return PdfResolutionOutcome::SourceMismatch;
-        }
-        if self.version != PDF_SELECTOR_VERSION
-            || self.normalization_profile != NORMALIZATION_PROFILE
-        {
-            return PdfResolutionOutcome::Unsupported;
         }
 
         let page_text = normalize_pdf_text(page_text);
         let page_hash_matches = hex_sha256(page_text.as_bytes()) == self.page_text_hash;
-        if page_hash_matches {
-            if let Some(position) = self.position {
-                let range = position.start as usize..position.end as usize;
-                if page_text
-                    .get(range)
-                    .is_some_and(|text| hex_sha256(text.as_bytes()) == self.selected_text_hash)
-                {
+        if let Some(position) = self.position {
+            let range = position.start as usize..position.end as usize;
+            let position_text = page_text
+                .get(range)
+                .filter(|text| hex_sha256(text.as_bytes()) == self.selected_text_hash);
+            if let Some(text) = position_text {
+                if self.quote.as_ref().is_some_and(|quote| {
+                    quote.exact != text
+                        || quote.prefix.as_ref().is_some_and(|prefix| {
+                            !page_text[..position.start as usize].ends_with(prefix)
+                        })
+                        || quote.suffix.as_ref().is_some_and(|suffix| {
+                            !page_text[position.end as usize..].starts_with(suffix)
+                        })
+                }) {
+                    return PdfResolutionOutcome::Unsupported;
+                }
+                if page_hash_matches {
                     return PdfResolutionOutcome::Exact {
                         start: position.start,
                         end: position.end,
                         basis: PdfResolutionBasis::TextPosition,
                     };
                 }
+            }
+            if page_hash_matches {
+                return PdfResolutionOutcome::Unsupported;
             }
         }
 
@@ -255,6 +292,30 @@ impl PdfSelector {
             _ => PdfResolutionOutcome::Ambiguous { matches },
         }
     }
+
+    fn has_valid_v1_schema(&self) -> bool {
+        if self.version != PDF_SELECTOR_VERSION
+            || self.normalization_profile != NORMALIZATION_PROFILE
+            || self.parser_profile_id.is_empty()
+            || !is_sha256_hex(&self.source_hash)
+            || !is_sha256_hex(&self.page_text_hash)
+            || !is_sha256_hex(&self.selected_text_hash)
+            || self
+                .position
+                .is_some_and(|position| position.start >= position.end)
+        {
+            return false;
+        }
+
+        let quote_is_valid = self.quote.as_ref().is_none_or(|quote| {
+            quote.exact.len() <= MAX_QUOTE_BYTES
+                && is_normalized_exact(&quote.exact)
+                && hex_sha256(quote.exact.as_bytes()) == self.selected_text_hash
+                && quote.prefix.as_deref().is_none_or(is_bounded_context)
+                && quote.suffix.as_deref().is_none_or(is_bounded_context)
+        });
+        quote_is_valid && (self.position.is_some() || self.quote.is_some())
+    }
 }
 
 /// Populate selectors on new born-digital PDF evidence before persistence.
@@ -278,25 +339,21 @@ pub(crate) fn attach_pdf_selectors(
     }
 
     for indices in pages.values() {
+        record_pdf_text_normalization();
         let mut page_text = String::new();
         let mut ranges = Vec::with_capacity(indices.len());
         for &index in indices {
-            let selected = normalize_pdf_text(&evidence[index].text);
-            if selected.is_empty() {
-                continue;
+            if let Some(range) = append_normalized_pdf_text(&mut page_text, &evidence[index].text) {
+                ranges.push((index, range));
             }
-            if !page_text.is_empty() {
-                page_text.push(' ');
-            }
-            let start = page_text.len();
-            page_text.push_str(&selected);
-            ranges.push((index, start..page_text.len()));
         }
+        let page_text_hash = hex_sha256(page_text.as_bytes());
         for (index, range) in ranges {
-            let Some(selector) = PdfSelector::from_page_range(
-                source_hash.to_string(),
+            let Some(selector) = PdfSelector::from_normalized_page_range(
+                source_hash,
                 parser_profile_id,
                 &page_text,
+                &page_text_hash,
                 range,
             ) else {
                 continue;
@@ -309,7 +366,69 @@ pub(crate) fn attach_pdf_selectors(
 }
 
 fn normalize_pdf_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    record_pdf_text_normalization();
+    let mut normalized = String::with_capacity(text.len());
+    let _ = append_normalized_pdf_text(&mut normalized, text);
+    normalized
+}
+
+fn append_normalized_pdf_text(output: &mut String, text: &str) -> Option<Range<usize>> {
+    let mut words = text.split_whitespace();
+    let first = words.next()?;
+    if !output.is_empty() {
+        output.push(' ');
+    }
+    let start = output.len();
+    output.push_str(first);
+    for word in words {
+        output.push(' ');
+        output.push_str(word);
+    }
+    Some(start..output.len())
+}
+
+fn record_pdf_text_normalization() {
+    #[cfg(test)]
+    PDF_TEXT_NORMALIZATIONS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_pdf_text_normalization_count() {
+    PDF_TEXT_NORMALIZATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn pdf_text_normalization_count() -> usize {
+    PDF_TEXT_NORMALIZATIONS.with(std::cell::Cell::get)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_normalized_exact(value: &str) -> bool {
+    !value.starts_with(' ') && !value.ends_with(' ') && is_normalized_fragment(value)
+}
+
+fn is_bounded_context(value: &str) -> bool {
+    value.chars().count() <= CONTEXT_CHARS && is_normalized_fragment(value)
+}
+
+fn is_normalized_fragment(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .try_fold(false, |previous_space, ch| {
+                if ch.is_whitespace() {
+                    (ch == ' ' && !previous_space).then_some(true)
+                } else {
+                    Some(false)
+                }
+            })
+            .is_some()
 }
 
 fn bounded_prefix(text: &str) -> Option<String> {
@@ -327,8 +446,8 @@ fn bounded_suffix(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_pdf_selectors, PdfAnchorStrength, PdfResolutionBasis, PdfResolutionOutcome,
-        PdfSelector,
+        attach_pdf_selectors, pdf_text_normalization_count, reset_pdf_text_normalization_count,
+        PdfAnchorStrength, PdfResolutionBasis, PdfResolutionOutcome, PdfSelector, PdfTextPosition,
     };
     use crate::types::{
         hex_sha256, EvidenceId, EvidenceKind, EvidenceUnit, SourceId, SourceLocator,
@@ -369,6 +488,85 @@ mod tests {
                 basis: PdfResolutionBasis::TextPosition,
             }
         );
+    }
+
+    #[test]
+    fn issue_288_malformed_v1_selectors_fail_closed() {
+        let bytes = b"original-pdf";
+        let page_text = "alpha unique quote omega";
+        let valid =
+            PdfSelector::from_page_range(hex_sha256(bytes), "pdf_oxide", page_text, 6..18).unwrap();
+
+        let mut zero_length_position = valid.clone();
+        zero_length_position.position = Some(PdfTextPosition { start: 6, end: 6 });
+        zero_length_position.quote = None;
+        zero_length_position.selected_text_hash = hex_sha256(b"");
+
+        let mut empty_quote = valid.clone();
+        empty_quote.position = None;
+        let quote = empty_quote.quote.as_mut().unwrap();
+        quote.exact.clear();
+        quote.prefix = None;
+        quote.suffix = None;
+        empty_quote.selected_text_hash = hex_sha256(b"");
+
+        let mut oversized_quote = valid.clone();
+        oversized_quote.position = None;
+        let quote = oversized_quote.quote.as_mut().unwrap();
+        quote.exact = "x".repeat(1_025);
+        quote.prefix = None;
+        quote.suffix = None;
+        oversized_quote.selected_text_hash = hex_sha256(quote.exact.as_bytes());
+
+        let mut oversized_context = valid.clone();
+        oversized_context.position = None;
+        oversized_context.quote.as_mut().unwrap().prefix = Some("x".repeat(65));
+
+        let mut non_normalized_quote = valid.clone();
+        non_normalized_quote.position = None;
+        let quote = non_normalized_quote.quote.as_mut().unwrap();
+        quote.exact = "unique\tquote".into();
+        non_normalized_quote.selected_text_hash = hex_sha256(quote.exact.as_bytes());
+
+        let mut conflicting_quote = valid.clone();
+        conflicting_quote.quote.as_mut().unwrap().exact = "omega".into();
+
+        let mut conflicting_context = valid.clone();
+        conflicting_context.quote.as_mut().unwrap().prefix = Some("wrong ".into());
+
+        let mut non_normalized_context = valid.clone();
+        non_normalized_context.position = None;
+        non_normalized_context.quote.as_mut().unwrap().prefix = Some("alpha\t".into());
+
+        let mut invalid_page_hash = valid.clone();
+        invalid_page_hash.page_text_hash = "not-a-sha256".into();
+
+        let mut empty_parser_profile = valid.clone();
+        empty_parser_profile.parser_profile_id.clear();
+
+        let mut missing_anchor = valid.clone();
+        missing_anchor.position = None;
+        missing_anchor.quote = None;
+
+        for (name, selector) in [
+            ("zero-length position", zero_length_position),
+            ("empty quote", empty_quote),
+            ("oversized quote", oversized_quote),
+            ("oversized context", oversized_context),
+            ("non-normalized quote", non_normalized_quote),
+            ("conflicting quote", conflicting_quote),
+            ("conflicting context", conflicting_context),
+            ("non-normalized context", non_normalized_context),
+            ("invalid page hash", invalid_page_hash),
+            ("empty parser profile", empty_parser_profile),
+            ("missing anchor", missing_anchor),
+        ] {
+            assert_eq!(
+                selector.resolve(bytes, page_text),
+                PdfResolutionOutcome::Unsupported,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -417,6 +615,43 @@ mod tests {
             evidence[0].locator.pdf_anchor_strength(),
             Some(PdfAnchorStrength::VersionedSelector)
         );
+    }
+
+    #[test]
+    fn issue_288_many_paragraphs_prepare_page_once() {
+        let mut evidence = (0..128)
+            .map(|index| {
+                let text = format!("paragraph {index}");
+                EvidenceUnit {
+                    id: EvidenceId(format!("ev-{index}")),
+                    source_id: SourceId("source-1".into()),
+                    kind: EvidenceKind::Text,
+                    derived_from: None,
+                    locator: SourceLocator::Pdf {
+                        page: 1,
+                        paragraph: index,
+                        bbox: None,
+                        selector: None,
+                    },
+                    text_hash: hex_sha256(text.as_bytes()),
+                    text,
+                    heading_path: Vec::new(),
+                    position: index,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        reset_pdf_text_normalization_count();
+        attach_pdf_selectors(&mut evidence, &hex_sha256(b"original-pdf"), "pdf_oxide");
+
+        assert_eq!(pdf_text_normalization_count(), 1);
+        assert!(evidence.iter().all(|unit| matches!(
+            unit.locator,
+            SourceLocator::Pdf {
+                selector: Some(_),
+                ..
+            }
+        )));
     }
 
     #[test]
