@@ -247,6 +247,18 @@ async fn issue_332_relocation_replays_recorded_pdfplumber_through_held_snapshot(
     assert_eq!(relocated.id, source_id);
     assert_eq!(relocated.parser_used.as_deref(), Some("pdfplumber"));
     assert_eq!(relocated.path, fs::canonicalize(&new_path).unwrap());
+    assert!(pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap()
+        .iter()
+        .all(|unit| matches!(
+            &unit.locator,
+            crate::types::SourceLocator::Pdf {
+                selector: Some(selector),
+                ..
+            } if selector.source_hash == relocated.hash && selector.parser_profile_id == "pdfplumber"
+        )));
 }
 
 #[tokio::test]
