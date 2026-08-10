@@ -20,6 +20,9 @@ use verbatim_core::types::{
     RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalStageHit, SourceLocator,
 };
 
+#[cfg(test)]
+#[path = "render_pdf_selector_tests.rs"]
+mod render_pdf_selector_tests;
 #[path = "render_sqlite_durability.rs"]
 mod render_sqlite_durability;
 
@@ -1791,6 +1794,14 @@ where
     W: Write,
 {
     match locator {
+        SourceLocator::Pdf {
+            selector: Some(selector),
+            ..
+        } => writeln!(
+            writer,
+            "{indent}pdf_selector: {}",
+            serde_json::to_string(selector).map_err(io::Error::other)?
+        )?,
         SourceLocator::PdfOcr {
             page_label,
             line_index,

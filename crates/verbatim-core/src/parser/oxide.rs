@@ -66,7 +66,10 @@ fn source_id_from_path(path: &Path) -> SourceId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::image_limits::ImageArtifactLimitStage;
+    use crate::ingest::IngestPipeline;
+    use crate::store::Store;
     use crate::types::SourceLocator;
 
     #[test]
@@ -112,6 +115,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn issue_288_relocation_preserves_ingested_selector_after_reload() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("verbatim.db");
+        let mut config = Config::default();
+        config.embedding.enabled = false;
+        let mut pipeline = IngestPipeline::new(&config, tempdir.path()).unwrap();
+        let old_path = tempdir.path().join("before.pdf");
+        let new_path = tempdir.path().join("after.pdf");
+        write_pdf_with_text(&old_path, "Relocated born digital evidence");
+        let source_id = pipeline.add_source(&old_path).unwrap();
+
+        pipeline.ingest_source(&source_id).await.unwrap();
+        let before = pipeline
+            .store()
+            .list_evidence_by_source(&source_id)
+            .unwrap();
+        let selector = before
+            .iter()
+            .find_map(|unit| match &unit.locator {
+                SourceLocator::Pdf {
+                    selector: Some(selector),
+                    ..
+                } => Some(selector.clone()),
+                _ => None,
+            })
+            .expect("ingest should attach a PDF selector");
+        std::fs::rename(&old_path, &new_path).unwrap();
+
+        pipeline.relocate_source(&source_id, &new_path).unwrap();
+        drop(pipeline);
+
+        let reopened = Store::new(&db_path).unwrap();
+        let source = reopened.get_source(&source_id).unwrap().unwrap();
+        assert_eq!(source.path, std::fs::canonicalize(&new_path).unwrap());
+        assert_eq!(selector.source_hash, source.hash);
+        assert_eq!(
+            selector.parser_profile_id,
+            source.parser_used.as_deref().unwrap()
+        );
+        let reloaded = reopened.list_evidence_by_source(&source_id).unwrap();
+        assert!(reloaded.iter().any(|unit| matches!(
+            &unit.locator,
+            SourceLocator::Pdf {
+                selector: Some(reloaded),
+                ..
+            } if reloaded == &selector
+        )));
     }
 
     #[test]

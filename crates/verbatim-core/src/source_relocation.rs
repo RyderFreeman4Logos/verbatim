@@ -161,7 +161,9 @@ where
             {
                 hook();
             }
-            let mut parsed = remap_parser_evidence_identity(parsed?, &parser_source_id, source_id)
+            let mut parsed = parsed?;
+            crate::pdf_selector::attach_pdf_selectors(&mut parsed, &source.hash, parser_used);
+            let mut parsed = remap_parser_evidence_identity(parsed, &parser_source_id, source_id)
                 .map_err(validation_error)?;
             rewrite_relocation_locator_paths(&mut parsed, &parser_path, &canonical_path)
                 .map_err(validation_error)?;
