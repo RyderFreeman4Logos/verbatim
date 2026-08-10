@@ -36,8 +36,8 @@ use verbatim_core::api::{
     CollectionStatusResponse, CollectionSyncPathRequest, CollectionSyncRequest,
     CollectionSyncResponse, CollectionWatcherResponse, CollectionWatcherStatus,
     CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
-    CreateCollectionRequest, ErrorResponse, EvidenceResponse, HealthResponse,
-    IdleExitActivitySnapshot, IdleExitHealth, IdleReclaimActivitySnapshot,
+    CreateCollectionRequest, ErrorResponse, EvidenceResponse, GeneratedInterpretationResponse,
+    HealthResponse, IdleExitActivitySnapshot, IdleExitHealth, IdleReclaimActivitySnapshot,
     IdleReclaimBackendResult, IdleReclaimCycleResult, IdleReclaimHealth, ImageArtifactResponse,
     IndexGcRequest, IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse,
     IndexStatusResponse, IngestResponse, ReadinessHealth, ReindexRequest, ReindexResponse,
@@ -5053,7 +5053,10 @@ async fn execute_ask_task_inner_with_config(
     );
     let response_started = Instant::now();
     let response = AskResponse {
-        answer: gen_result.answer,
+        answer: gen_result.answer.clone(),
+        generated_interpretation: Some(GeneratedInterpretationResponse {
+            text: gen_result.answer,
+        }),
         citations: gen_result
             .citations
             .into_iter()
@@ -5397,6 +5400,7 @@ async fn execute_context_only_ask_task_inner(
     let collection_filter = context.collection_filter.clone();
     Ok(AskResponse {
         answer: String::new(),
+        generated_interpretation: None,
         citations: Vec::new(),
         verified: false,
         retrieval: None,
@@ -12879,67 +12883,7 @@ mod tests {
         assert!(error.1.error.contains("context_only"));
     }
 
-    #[test]
-    fn ask_response_omits_retrieval_when_debug_is_off() {
-        let response = AskResponse {
-            answer: "Answer [E1].".into(),
-            citations: Vec::new(),
-            verified: false,
-            retrieval: None,
-            context: None,
-            collection_filter: None,
-        };
-
-        let encoded = serde_json::to_value(response).unwrap();
-
-        assert_eq!(
-            encoded,
-            serde_json::json!({
-                "answer": "Answer [E1].",
-                "citations": [],
-                "verified": false,
-            })
-        );
-        assert!(encoded.get("collection_filter").is_none());
-    }
-
-    #[test]
-    fn ask_response_includes_structured_retrieval_when_requested() {
-        let response = AskResponse {
-            answer: "Answer [E1].".into(),
-            citations: Vec::new(),
-            verified: false,
-            retrieval: Some(RetrievalDebug {
-                dense_vector_path: RetrievalDenseVectorPath::Bm25Only,
-                query_embedding_latency_ms: None,
-                retrieval_search_sql_statement_count: None,
-                retrieval_resource_counters: None,
-                local_spans_ms: RetrievalLocalSpansMs::default(),
-                candidate_counters: Default::default(),
-                evidence_pack_mode: RetrievalDebugEvidencePackMode::Full,
-                final_evidence_count: 0,
-                display_evidence_count: 0,
-                bm25_hits: Vec::new(),
-                dense_hits: Vec::new(),
-                rrf_fused_hits: Vec::new(),
-                graph_expanded_hits: Vec::new(),
-                reranker: verbatim_core::types::RetrievalRerankDebug::disabled(),
-                final_evidence_pack: Vec::new(),
-                display_evidence_pack: Vec::new(),
-            }),
-            context: None,
-            collection_filter: None,
-        };
-
-        let encoded = serde_json::to_string(&response).unwrap();
-
-        assert!(encoded.contains("retrieval"));
-        assert!(encoded.contains("bm25_hits"));
-        assert!(encoded.contains("final_evidence_pack"));
-        assert!(encoded.contains("disabled"));
-        assert!(!encoded.contains("api_key"));
-        assert!(!encoded.contains("secret full raw source text"));
-    }
+    include!("tests/ask_response_serialization_tests.rs");
 
     #[test]
     fn retrieve_response_pages_context_pack_without_full_locator_by_default() {
@@ -15311,13 +15255,16 @@ mod tests {
         .0;
 
         assert!(response.answer.is_empty());
+        assert!(response.generated_interpretation.is_none());
         assert!(response.citations.is_empty());
         assert!(!response.verified);
         assert!(response.retrieval.is_none());
         let context = response.context.expect("context pack");
         assert_eq!(context.source_id.as_deref(), Some(source_id.0.as_str()));
         assert_eq!(context.returned_results, 1);
+        assert!(context.source_bounded);
         assert_eq!(context.results[0].label, "E1");
+        assert!(!context.results[0].text_hash.is_empty());
         assert!(context.results[0]
             .snippet
             .contains("Beta retrieval evidence"));
@@ -15327,7 +15274,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_ask_profile_query_uses_persisted_state_without_chat_or_verifier_rerun() {
+    async fn completed_generated_interpretation_ask_uses_persisted_state_without_chat_or_verifier_rerun(
+    ) {
         let model_server =
             MockModelServer::start_with_chat(3, "BM25 answer from evidence [E1]").await;
         let test_dir = TestDir::new("completed-ask-profile-no-rerun");
@@ -15372,6 +15320,10 @@ mod tests {
         .0;
 
         assert!(response.answer.contains("BM25 answer"));
+        assert_eq!(
+            response.generated_interpretation.unwrap().text,
+            response.answer
+        );
         assert!(response.retrieval.is_none());
         assert_eq!(model_server.embedding_requests(), 0);
         assert_eq!(model_server.chat_requests(), 1);

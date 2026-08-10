@@ -72,7 +72,7 @@ fn event_data<'a>(body: &'a str, event: &str) -> Vec<&'a str> {
 }
 
 #[tokio::test]
-async fn ask_stream_with_verifier_publishes_only_one_safe_answer() {
+async fn ask_stream_with_verifier_publishes_only_one_generated_interpretation_answer() {
     let raw_draft = "The safe answer is alpha [E1].";
     let (body, model_server) = ask_stream_body(
         "ask-stream-verifier-pass",
@@ -86,6 +86,11 @@ async fn ask_stream_with_verifier_publishes_only_one_safe_answer() {
     assert_eq!(answers.len(), 1, "SSE: {body}");
     let answer: AskResponse = serde_json::from_str(answers[0]).unwrap();
     assert!(answer.answer.starts_with(raw_draft));
+    assert_eq!(
+        answer.generated_interpretation.unwrap().text,
+        answer.answer,
+        "SSE answer must classify model text as generated interpretation"
+    );
     assert!(answer.verified);
     assert_eq!(answer.citations.len(), 1);
     assert_eq!(model_server.chat_requests(), 2);

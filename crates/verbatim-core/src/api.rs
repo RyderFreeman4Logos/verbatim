@@ -576,9 +576,17 @@ pub struct AskRequest {
     pub page: Option<usize>,
 }
 
+/// Model-authored text that must remain distinct from persisted evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedInterpretationResponse {
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AskResponse {
     pub answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_interpretation: Option<GeneratedInterpretationResponse>,
     #[serde(default)]
     pub citations: Vec<CitationResponse>,
     pub verified: bool,
@@ -1042,6 +1050,31 @@ mod tests {
 
         assert!(request.context_only);
         assert!(!request.show_retrieval);
+    }
+
+    #[test]
+    fn ask_response_serializes_generated_interpretation_separately_from_evidence() {
+        let response = AskResponse {
+            answer: "Legacy generated answer.".into(),
+            generated_interpretation: Some(GeneratedInterpretationResponse {
+                text: "Generated interpretation.".into(),
+            }),
+            citations: Vec::new(),
+            verified: false,
+            retrieval: None,
+            context: None,
+            collection_filter: None,
+        };
+
+        let encoded = serde_json::to_value(response).unwrap();
+
+        assert_eq!(encoded["answer"], "Legacy generated answer.");
+        assert_eq!(
+            encoded["generated_interpretation"],
+            serde_json::json!({"text": "Generated interpretation."})
+        );
+        assert!(encoded.get("source_bounded").is_none());
+        assert!(encoded.get("context").is_none());
     }
 
     #[test]
