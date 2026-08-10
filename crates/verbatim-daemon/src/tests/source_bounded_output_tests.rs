@@ -208,6 +208,131 @@ fn source_bounded_retrieval_omits_generated_captions_from_all_response_forms() {
     }
 }
 
+#[tokio::test]
+async fn source_bounded_retrieval_task_telemetry_uses_filtered_evidence_snapshot() {
+    let test_dir = TestDir::new("source-bounded-task-telemetry");
+    let mut source =
+        test_retrieval_result(1, "source-chunk", "source-evidence", EvidenceKind::Text);
+    source.evidence_units[0].text = "source-boundary-needle source evidence".into();
+    source.evidence_units[0].text_hash =
+        verbatim_core::types::hex_sha256(source.evidence_units[0].text.as_bytes());
+    source.chunk.text.clone_from(&source.evidence_units[0].text);
+    let derived = generated_caption_result(
+        2,
+        "derived-chunk",
+        "derived-caption",
+        "source-boundary-needle generated caption derived from source",
+        Some(source.evidence_units[0].id.clone()),
+    );
+    let standalone = generated_caption_result(
+        3,
+        "standalone-chunk",
+        "standalone-caption",
+        "source-boundary-needle generated standalone caption",
+        None,
+    );
+    let results = vec![source, derived, standalone];
+    let store = Store::new(&test_dir.path().join("verbatim.db")).unwrap();
+    store
+        .add_source(&Source {
+            id: SourceId("src".into()),
+            path: test_dir.path().join("source.md"),
+            hash: "source-hash".into(),
+            status: SourceStatus::Indexed,
+            parser_used: Some("plaintext".into()),
+            last_ingested_at: None,
+        })
+        .unwrap();
+    let evidence = results
+        .iter()
+        .flat_map(|result| result.evidence_units.clone())
+        .collect::<Vec<_>>();
+    let chunks = results
+        .iter()
+        .map(|result| result.chunk.clone())
+        .collect::<Vec<_>>();
+    let links = chunks
+        .iter()
+        .zip(&evidence)
+        .map(|(chunk, evidence)| (chunk.id.clone(), evidence.id.clone()))
+        .collect::<Vec<_>>();
+    store.bulk_insert_evidence(&evidence).unwrap();
+    store.bulk_insert_chunks(&chunks).unwrap();
+    store.link_chunk_evidence(&links).unwrap();
+    drop(store);
+
+    let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+    config.embedding.enabled = false;
+    config.rerank.enabled = false;
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    pipeline.fts_startup_maintenance();
+    let state = test_state(config, test_dir.path(), pipeline);
+    let response = retrieve(
+        State(Arc::clone(&state)),
+        Json(RetrieveRequest {
+            question: "source-boundary-needle".into(),
+            source_id: None,
+            collection_filter: CollectionFilterRequest::default(),
+            embedding_profile_id: None,
+            limit: Some(3),
+            page_size: Some(3),
+            page: Some(1),
+            fast: true,
+            rerank: Some(false),
+            dense_top_k: None,
+            bm25_top_k: Some(3),
+            rerank_top_n: None,
+            bypass_cache: false,
+            include_debug: true,
+            include_debug_packs: true,
+            include_locator: false,
+            passage: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+
+    assert_eq!(response.total_results, 1);
+    assert_eq!(response.returned_results, 1);
+    let debug = response.debug.expect("retrieval debug");
+    assert_eq!(debug.final_evidence_count, 1);
+    assert_eq!(debug.display_evidence_count, 1);
+
+    let task_id = TaskId(response.task_id);
+    let summary = task_summary_response(&state, task_id.clone())
+        .await
+        .unwrap();
+    let progress = summary.task.progress.as_ref().expect("retrieval progress");
+    assert_eq!(
+        progress
+            .counters
+            .iter()
+            .find(|counter| counter.name == "evidence")
+            .expect("evidence progress counter")
+            .completed,
+        1
+    );
+    let retrieval_span = summary
+        .spans
+        .iter()
+        .find(|span| span.phase == "retrieval")
+        .expect("retrieval task span");
+    assert_eq!(retrieval_span.metadata["result_count"], 2);
+    assert_eq!(retrieval_span.metadata["returned_results"], 1);
+
+    let profile = task_profile_response(&state, task_id)
+        .await
+        .unwrap()
+        .profile
+        .retrieve
+        .expect("retrieve task profile");
+    assert_eq!(profile.evidence.result_count, 1);
+    assert_eq!(profile.evidence.final_count, 1);
+    assert_eq!(profile.evidence.display_count, 1);
+    assert_eq!(profile.display.returned_count, 1);
+}
+
 #[test]
 fn source_bounded_output_rejects_reindexed_evidence_after_retrieval_snapshot() {
     assert_reindexed_evidence_is_rejected(false);
@@ -253,8 +378,9 @@ fn assert_source_bounded_result(response: &RetrieveResponse, evidence: &Evidence
 
 fn final_retrieve_response(
     store: &Store,
-    input: RetrieveResponseInput,
+    mut input: RetrieveResponseInput,
 ) -> Result<RetrieveResponse> {
+    filter_generated_retrieval_evidence(&mut input.results, &mut input.debug);
     retrieve_response(store, input)
 }
 
