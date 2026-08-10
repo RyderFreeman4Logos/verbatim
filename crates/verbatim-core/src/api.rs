@@ -713,6 +713,8 @@ pub struct CitationResponse {
 pub struct EvidenceResponse {
     pub id: String,
     pub source_id: String,
+    pub source_bounded: bool,
+    pub text_hash: String,
     pub kind: String,
     pub derived_from: Option<String>,
     pub locator: String,

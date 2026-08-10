@@ -1737,6 +1737,8 @@ where
     writeln!(writer, "Evidence:")?;
     writeln!(writer, "  id: {}", evidence.id)?;
     writeln!(writer, "  source_id: {}", evidence.source_id)?;
+    writeln!(writer, "  source_bounded: {}", evidence.source_bounded)?;
+    writeln!(writer, "  text_hash: {}", evidence.text_hash)?;
     writeln!(writer, "  kind: {}", evidence.kind)?;
     if let Some(derived_from) = &evidence.derived_from {
         writeln!(writer, "  derived_from: {derived_from}")?;
@@ -3286,6 +3288,8 @@ mod tests {
         let response = EvidenceResponse {
             id: "ev-ocr".into(),
             source_id: "src-1".into(),
+            source_bounded: true,
+            text_hash: "receipt-text-hash".into(),
             kind: "ocr".into(),
             derived_from: None,
             locator: "PDF p.1, OCR line 1, conf=0.97".into(),
@@ -3330,6 +3334,8 @@ mod tests {
         let response = EvidenceResponse {
             id: "ev-md".into(),
             source_id: "src-1".into(),
+            source_bounded: true,
+            text_hash: "receipt-text-hash".into(),
             kind: "text".into(),
             derived_from: None,
             locator: "/tmp/doc.md L3 markdown:paragraph #intro".into(),
@@ -3361,6 +3367,8 @@ mod tests {
         write_evidence(&mut output, &response).unwrap();
         let output = String::from_utf8(output).unwrap();
 
+        assert!(output.contains("  source_bounded: true"));
+        assert!(output.contains("  text_hash: receipt-text-hash"));
         assert!(output.contains("markdown_locator:"));
         assert!(output.contains("block_kind: paragraph"));
         assert!(output.contains("line_range: 3-4"));

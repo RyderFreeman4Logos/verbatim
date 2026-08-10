@@ -8317,6 +8317,8 @@ async fn get_evidence(
             kind: evidence_kind_name(eu.kind).to_string(),
             id: eu.id.0,
             source_id: eu.source_id.0,
+            source_bounded: true,
+            text_hash: eu.text_hash,
             derived_from: eu.derived_from.map(|id| id.0),
             locator: eu.locator.to_string(),
             structured_locator: eu.locator,

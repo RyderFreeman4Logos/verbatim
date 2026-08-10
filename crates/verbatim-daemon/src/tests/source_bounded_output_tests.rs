@@ -22,6 +22,12 @@ async fn public_evidence_endpoint_revalidates_persisted_text() {
         .expect("valid evidence response");
     assert_eq!(returned.id, expected.id.0);
     assert_eq!(returned.source_id, expected.source_id.0);
+    assert!(returned.source_bounded);
+    assert_eq!(returned.text_hash, expected.text_hash);
+    assert_eq!(
+        returned.text_hash,
+        verbatim_core::types::hex_sha256(returned.text.as_bytes())
+    );
     assert_eq!(returned.locator, expected.locator.to_string());
     assert_eq!(returned.structured_locator, expected.locator);
     assert_eq!(returned.text, expected.text);
