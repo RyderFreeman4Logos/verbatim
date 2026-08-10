@@ -54,6 +54,49 @@ async fn public_evidence_endpoint_revalidates_persisted_text() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn public_generated_evidence_is_not_source_bounded() {
+    let (test_dir, store, persisted) = persisted_output_fixture("public-generated", None);
+    let source = persisted.evidence_units[0].clone();
+    let mut generated = source.clone();
+    generated.id = EvidenceId("generated-caption".into());
+    generated.kind = EvidenceKind::Generated;
+    generated.derived_from = Some(source.id.clone());
+    generated.text = "Generated caption from image.".into();
+    generated.text_hash = verbatim_core::types::hex_sha256(generated.text.as_bytes());
+    let mut ocr = source.clone();
+    ocr.id = EvidenceId("ocr-control".into());
+    ocr.kind = EvidenceKind::Ocr;
+    ocr.text = "OCR control text.".into();
+    ocr.text_hash = verbatim_core::types::hex_sha256(ocr.text.as_bytes());
+    store
+        .bulk_insert_evidence(&[generated.clone(), ocr.clone()])
+        .expect("generated and OCR evidence persist");
+    drop(store);
+
+    let config = retrieve_test_config("http://127.0.0.1:9/v1");
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let app = daemon_router(test_state(config, test_dir.path(), pipeline));
+
+    let returned: EvidenceResponse = serde_json::from_slice(
+        &evidence_route_body(evidence_route_get(&app, &generated.id.0).await).await,
+    )
+    .expect("generated evidence response");
+    assert_eq!(returned.id, generated.id.0);
+    assert!(!returned.source_bounded);
+    assert_eq!(returned.text_hash, generated.text_hash);
+    assert_eq!(returned.text, generated.text);
+
+    let returned: EvidenceResponse = serde_json::from_slice(
+        &evidence_route_body(evidence_route_get(&app, &ocr.id.0).await).await,
+    )
+    .expect("OCR evidence response");
+    assert_eq!(returned.id, ocr.id.0);
+    assert!(returned.source_bounded);
+    assert_eq!(returned.text_hash, ocr.text_hash);
+    assert_eq!(returned.text, ocr.text);
+}
+
 async fn evidence_route_get(app: &Router, evidence_id: &str) -> Response {
     let mut request = Request::builder()
         .method(Method::GET)
@@ -89,6 +132,80 @@ fn source_bounded_output_rehydrates_passage_evidence_from_store() {
     let valid = final_retrieve_response(&store, retrieve_output_input(persisted.clone(), true))
         .expect("persisted evidence should resolve");
     assert_source_bounded_result(&valid, &persisted.evidence_units[0]);
+}
+
+#[test]
+fn source_bounded_retrieval_omits_generated_captions_from_all_response_forms() {
+    for passage in [false, true] {
+        for include_debug in [false, true] {
+            let (_dir, store, source) = persisted_output_fixture("generated-captions", None);
+            let derived = generated_caption_result(
+                2,
+                "caption-derived",
+                "caption-derived-id",
+                "generated caption derived from an image",
+                Some(source.evidence_units[0].id.clone()),
+            );
+            let standalone = generated_caption_result(
+                3,
+                "caption-standalone",
+                "caption-standalone-id",
+                "standalone generated caption",
+                None,
+            );
+            store
+                .bulk_insert_evidence(&derived.evidence_units)
+                .expect("derived caption persists");
+            store
+                .bulk_insert_evidence(&standalone.evidence_units)
+                .expect("standalone caption persists");
+
+            let mut input = retrieve_output_input(source.clone(), passage);
+            input.controls.limit = 3;
+            input.controls.page_size = 3;
+            input.controls.include_debug = include_debug;
+            input.controls.include_debug_packs = include_debug;
+            input.results.extend([derived, standalone]);
+            refresh_final_evidence_pack_debug(&mut input.debug, &input.results);
+
+            let response = final_retrieve_response(&store, input).expect("source output resolves");
+            let serialized = serde_json::to_string(&response).expect("response serializes");
+
+            assert_eq!(
+                response.total_results, 1,
+                "passage={passage}, debug={include_debug}"
+            );
+            assert_eq!(
+                response.returned_results, 1,
+                "passage={passage}, debug={include_debug}"
+            );
+            assert_eq!(
+                response.results[0].index, 0,
+                "passage={passage}, debug={include_debug}"
+            );
+            assert_eq!(
+                response.results[0].rank, 1,
+                "passage={passage}, debug={include_debug}"
+            );
+            assert_eq!(
+                response.results[0].label, "E1",
+                "passage={passage}, debug={include_debug}"
+            );
+            for generated in [
+                "caption-derived-id",
+                "caption-standalone-id",
+                "generated caption derived from an image",
+                "standalone generated caption",
+                "image_caption_generated",
+                "generated",
+            ] {
+                assert!(
+                    !serialized.contains(generated),
+                    "generated retrieval data leaked for passage={passage}, debug={include_debug}: {generated}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -206,6 +323,22 @@ fn persisted_output_fixture(
         .bulk_insert_evidence(std::slice::from_ref(evidence))
         .unwrap();
     (dir, store, result)
+}
+
+fn generated_caption_result(
+    rank: usize,
+    chunk_id: &str,
+    evidence_id: &str,
+    text: &str,
+    derived_from: Option<EvidenceId>,
+) -> RetrievalResult {
+    let mut result = test_retrieval_result(rank, chunk_id, evidence_id, EvidenceKind::Generated);
+    let evidence = &mut result.evidence_units[0];
+    evidence.text = text.into();
+    evidence.text_hash = verbatim_core::types::hex_sha256(evidence.text.as_bytes());
+    evidence.derived_from = derived_from;
+    result.chunk.text.clone_from(&evidence.text);
+    result
 }
 
 fn retrieve_output_input(result: RetrievalResult, passage: bool) -> RetrieveResponseInput {

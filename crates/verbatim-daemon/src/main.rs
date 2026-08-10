@@ -7833,11 +7833,28 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
         collection_provenance,
         embedding_profile_id,
         controls,
-        results,
-        debug,
+        mut results,
+        mut debug,
         source_paths,
         retrieval_ms,
     } = input;
+    if results.iter().any(|result| {
+        result
+            .evidence_units
+            .iter()
+            .any(|evidence| evidence.kind == EvidenceKind::Generated)
+    }) {
+        for result in &mut results {
+            result
+                .evidence_units
+                .retain(|evidence| evidence.kind != EvidenceKind::Generated);
+        }
+        results.retain(|result| !result.evidence_units.is_empty());
+        for (index, result) in results.iter_mut().enumerate() {
+            result.provenance.result_rank = index + 1;
+        }
+        refresh_evidence_pack_debug(&mut debug, &results);
+    }
     let (total_results, results_page) = if controls.passage {
         retrieve_passage_result_page(RetrieveResultPageInput {
             store,
@@ -8346,7 +8363,7 @@ async fn get_evidence(
             kind: evidence_kind_name(eu.kind).to_string(),
             id: eu.id.0,
             source_id: eu.source_id.0,
-            source_bounded: true,
+            source_bounded: eu.kind != EvidenceKind::Generated,
             text_hash: eu.text_hash,
             derived_from: eu.derived_from.map(|id| id.0),
             locator: eu.locator.to_string(),
