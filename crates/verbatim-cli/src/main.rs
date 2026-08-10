@@ -5578,11 +5578,7 @@ mod tests {
             kind: "text".into(),
             derived_from: None,
             locator: "PDF p.1 para.1".into(),
-            structured_locator: SourceLocator::Pdf {
-                page: 1,
-                paragraph: 1,
-                bbox: None,
-            },
+            structured_locator: SourceLocator::legacy_pdf(1, 1, None),
             text: "quoted".into(),
             heading_path: Vec::new(),
             position: 0,

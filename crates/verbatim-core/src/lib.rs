@@ -51,6 +51,7 @@ pub mod overfetch;
 pub mod page_layout;
 pub mod pagination;
 pub mod parser;
+pub mod pdf_selector;
 pub mod profiles;
 pub mod provider;
 pub mod qdrant_backend;

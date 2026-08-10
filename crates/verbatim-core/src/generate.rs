@@ -1456,11 +1456,7 @@ mod tests {
                     source_id: SourceId("src".into()),
                     kind: EvidenceKind::Text,
                     derived_from: None,
-                    locator: SourceLocator::Pdf {
-                        page: 42,
-                        paragraph: 3,
-                        bbox: None,
-                    },
+                    locator: SourceLocator::legacy_pdf(42, 3, None),
                     text: "Freedom is defined as...".into(),
                     text_hash: "h1".into(),
                     heading_path: vec!["Chapter 2".into()],
@@ -1772,11 +1768,7 @@ mod tests {
             source_id: SourceId("src".into()),
             kind: EvidenceKind::Text,
             derived_from: None,
-            locator: SourceLocator::Pdf {
-                page: 42,
-                paragraph: 3,
-                bbox: None,
-            },
+            locator: SourceLocator::legacy_pdf(42, 3, None),
             text_preview: "Freedom...".into(),
         }];
         let rendered = render_answer("Answer text [E1].", &citations);

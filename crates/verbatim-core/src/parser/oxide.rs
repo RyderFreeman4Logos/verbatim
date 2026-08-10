@@ -108,7 +108,8 @@ mod tests {
             SourceLocator::Pdf {
                 page: 1,
                 paragraph: 0,
-                bbox: None
+                bbox: None,
+                ..
             }
         ));
     }

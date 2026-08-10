@@ -471,6 +471,8 @@ pub enum SourceLocator {
         page: u32,
         paragraph: u32,
         bbox: Option<BBox>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<crate::pdf_selector::PdfSelector>,
     },
     PdfOcr {
         page: u32,
@@ -521,8 +523,19 @@ impl fmt::Display for SourceLocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Pdf {
-                page, paragraph, ..
-            } => write!(f, "PDF p.{page}, para {paragraph}"),
+                page,
+                paragraph,
+                selector,
+                ..
+            } => write!(
+                f,
+                "PDF p.{page}, para {paragraph}{}",
+                if selector.is_none() {
+                    " (legacy anchor)"
+                } else {
+                    ""
+                }
+            ),
             Self::PdfOcr {
                 page,
                 line_index,

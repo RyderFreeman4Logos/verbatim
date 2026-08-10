@@ -1986,8 +1986,14 @@ where
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
         let (mut evidence, prepared_image_artifacts, pdf_scan) = {
             let _cpu_permit = cpu_permit;
+            let mut parsed_evidence = parser.parse(&source.path)?;
+            crate::pdf_selector::attach_pdf_selectors(
+                &mut parsed_evidence,
+                &new_source.hash,
+                parser.name(),
+            );
             let evidence = remap_parser_evidence_identity(
-                parser.parse(&source.path)?,
+                parsed_evidence,
                 &SourceId::from_path(&source.path),
                 source_id,
             )?;
@@ -9107,11 +9113,7 @@ model = "local-vision"
             source_id: source.id.clone(),
             kind: EvidenceKind::Text,
             derived_from: None,
-            locator: SourceLocator::Pdf {
-                page: 1,
-                paragraph: 0,
-                bbox: None,
-            },
+            locator: SourceLocator::legacy_pdf(1, 0, None),
             text: text.into(),
             text_hash: "hash-text-1".into(),
             heading_path: Vec::new(),

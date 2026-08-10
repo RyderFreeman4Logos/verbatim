@@ -3035,11 +3035,7 @@ mod tests {
         page: u32,
     ) -> Chunk {
         TextChunkFixture::new(store, source, chunk_id, text)
-            .with_locator(SourceLocator::Pdf {
-                page,
-                paragraph: 1,
-                bbox: None,
-            })
+            .with_locator(SourceLocator::legacy_pdf(page, 1, None))
             .insert()
     }
 
