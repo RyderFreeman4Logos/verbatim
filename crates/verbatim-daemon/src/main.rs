@@ -13144,25 +13144,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ask_debug_options_limit_canonical_selection_to_configured_retrieval_scope() {
-        let mut config = Config::default();
-        config.retrieval.default_limit = 2;
-
-        let options = ask_debug_options(&config, true);
-
-        assert_eq!(
-            options.canonical_budget,
-            RetrievalCanonicalSelectionBudget::scoped(RetrievalDisplayScope::Window {
-                start: 0,
-                len: 2,
-            })
-        );
-        assert_eq!(
-            options.evidence_pack_mode,
-            RetrievalDebugEvidencePackMode::Full
-        );
-    }
+    include!("ask_debug_selection_tests.rs");
 
     #[tokio::test]
     async fn delete_source_missing_returns_not_found() {
