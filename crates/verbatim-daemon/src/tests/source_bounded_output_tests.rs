@@ -7,13 +7,14 @@ use super::*;
 
 const CORRUPTED_EVIDENCE_TEXT: &str = "Mutated persisted evidence must not escape.";
 
-fn write_pdf_with_image(path: &std::path::Path) {
+fn write_pdf_with_text_and_image(path: &std::path::Path) {
     let image = vec![255_u8; 8 * 8 * 3];
-    let content = b"q\n36 0 0 36 72 72 cm\n/Im1 Do\nQ\n";
+    let content = b"BT\n/F1 12 Tf\n72 120 Td\n(Source-backed predecessor text.) Tj\nET\nq\n36 0 0 36 72 72 cm\n/Im1 Do\nQ\n";
     let objects = vec![
         b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 5 0 R >> >> /Contents 6 0 R >>".to_vec(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
         pdf_stream_object(
             b"<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8",
             &image,
@@ -399,7 +400,7 @@ async fn source_bounded_retrieval_debug_omits_production_caption_chunk_identitie
     .await;
     let test_dir = TestDir::new("source-bounded-production-caption-debug");
     let pdf_path = test_dir.path().join("caption.pdf");
-    write_pdf_with_image(&pdf_path);
+    write_pdf_with_text_and_image(&pdf_path);
 
     let mut config = retrieve_test_config(&model_server.base_url);
     config.vision.enabled = true;
@@ -458,6 +459,84 @@ async fn source_bounded_retrieval_debug_omits_production_caption_chunk_identitie
     let serialized = serde_json::to_string(&response).expect("response serializes");
     assert!(!serialized.contains(&generated.id.0), "{serialized}");
     assert!(!serialized.contains(&caption_chunk.id.0), "{serialized}");
+}
+
+#[tokio::test]
+async fn source_bounded_retrieval_no_debug_omits_production_caption_seed_identity() {
+    let model_server = MockModelServer::start_with_chat(
+        3,
+        r#"{
+  "type": "diagram",
+  "short_caption": "A captionseedneedle indexing diagram.",
+  "detailed_description": "An input flows into an index.",
+  "visible_text": ["Input", "Index"],
+  "key_entities": ["Input", "Index"],
+  "relationships": [{"from": "Input", "to": "Index", "label": "feeds"}],
+  "answerable_questions": ["What feeds the index?"],
+  "uncertainties": []
+}"#,
+    )
+    .await;
+    let test_dir = TestDir::new("source-bounded-production-caption-seed");
+    let pdf_path = test_dir.path().join("caption.pdf");
+    write_pdf_with_text_and_image(&pdf_path);
+
+    let mut config = retrieve_test_config(&model_server.base_url);
+    config.embedding.enabled = false;
+    config.rerank.enabled = false;
+    config.vision.enabled = true;
+    config.vision.base_url.clone_from(&model_server.base_url);
+    config.vision.model = "test-vision".into();
+    let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let source_id = pipeline.add_source(&pdf_path).unwrap();
+    pipeline.ingest_source(&source_id).await.unwrap();
+
+    let generated = pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap()
+        .into_iter()
+        .find(|evidence| evidence.kind == EvidenceKind::Generated)
+        .expect("production caption evidence persists");
+    let caption_chunk = pipeline
+        .store()
+        .list_chunks_by_source(&source_id)
+        .unwrap()
+        .into_iter()
+        .find(|chunk| chunk.evidence_unit_ids == vec![generated.id.clone()])
+        .expect("production caption owns a dedicated chunk");
+
+    let state = test_state(config, test_dir.path(), pipeline);
+    let response = retrieve(
+        State(Arc::clone(&state)),
+        Json(RetrieveRequest {
+            question: "captionseedneedle".into(),
+            source_id: Some(source_id.0.clone()),
+            collection_filter: CollectionFilterRequest::default(),
+            embedding_profile_id: None,
+            limit: Some(3),
+            page_size: Some(3),
+            page: Some(1),
+            fast: true,
+            rerank: Some(false),
+            dense_top_k: None,
+            bm25_top_k: Some(3),
+            rerank_top_n: None,
+            bypass_cache: false,
+            include_debug: false,
+            include_debug_packs: false,
+            include_locator: true,
+            passage: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+
+    assert!(response.debug.is_none());
+    let serialized = serde_json::to_string(&response).expect("response serializes");
+    assert!(!serialized.contains(&caption_chunk.id.0), "{serialized}");
+    assert!(!serialized.contains(&generated.id.0), "{serialized}");
 }
 
 #[test]
@@ -580,6 +659,12 @@ fn persisted_output_fixture(
     store
         .bulk_insert_evidence(std::slice::from_ref(evidence))
         .unwrap();
+    store
+        .bulk_insert_chunks(std::slice::from_ref(&result.chunk))
+        .unwrap();
+    store
+        .link_chunk_evidence(&[(result.chunk.id.clone(), result.evidence_units[0].id.clone())])
+        .unwrap();
     (dir, store, result)
 }
 
@@ -642,7 +727,7 @@ fn assert_reindexed_evidence_is_rejected(passage: bool) {
         line_end: Some(22),
     };
 
-    replace_persisted_evidence(&store, &reindexed);
+    replace_persisted_evidence(&store, &reindexed, &captured.chunk);
 
     let error = final_retrieve_response(&store, retrieve_output_input(captured, passage))
         .expect_err("reindexed evidence must not be paired with a retrieval snapshot");
@@ -661,7 +746,7 @@ fn assert_relocated_evidence_is_rejected(passage: bool) {
         line_start: 31,
         line_end: Some(32),
     };
-    replace_persisted_evidence(&store, &relocated);
+    replace_persisted_evidence(&store, &relocated, &captured.chunk);
 
     let error = final_retrieve_response(&store, retrieve_output_input(captured, passage))
         .expect_err("relocated evidence must not be paired with a retrieval snapshot");
@@ -674,7 +759,7 @@ fn assert_relocated_evidence_is_rejected(passage: bool) {
     );
 }
 
-fn replace_persisted_evidence(store: &Store, evidence: &EvidenceUnit) {
+fn replace_persisted_evidence(store: &Store, evidence: &EvidenceUnit, chunk: &Chunk) {
     store
         .remove_source_for_housekeeping(&evidence.source_id)
         .unwrap();
@@ -690,5 +775,11 @@ fn replace_persisted_evidence(store: &Store, evidence: &EvidenceUnit) {
         .unwrap();
     store
         .bulk_insert_evidence(std::slice::from_ref(evidence))
+        .unwrap();
+    store
+        .bulk_insert_chunks(std::slice::from_ref(chunk))
+        .unwrap();
+    store
+        .link_chunk_evidence(&[(chunk.id.clone(), evidence.id.clone())])
         .unwrap();
 }

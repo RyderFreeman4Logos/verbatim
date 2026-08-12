@@ -11,35 +11,29 @@ pub(super) fn filter_generated_retrieval_evidence(
     debug: &mut RetrievalDebug,
     include_debug: bool,
 ) -> Result<()> {
-    let has_generated_result = results.iter().any(|result| {
-        result
-            .evidence_units
-            .iter()
-            .any(|evidence| evidence.kind == EvidenceKind::Generated)
-    });
     let has_debug_identities = include_debug && retrieval_debug_has_chunk_identities(debug);
-    if !has_generated_result && !has_debug_identities {
+    if results.is_empty() && !has_debug_identities {
         return Ok(());
     }
 
-    let source_bounded_chunk_ids = has_debug_identities
-        .then(|| source_bounded_retrieval_chunk_ids(store, results, debug))
-        .transpose()?;
+    let source_bounded_chunk_ids = source_bounded_retrieval_chunk_ids(
+        store,
+        results,
+        has_debug_identities.then_some(&*debug),
+    )?;
     let result_count = results.len();
     results.retain(|result| {
         let directly_source_bounded = result
             .evidence_units
             .iter()
             .all(|evidence| evidence.kind != EvidenceKind::Generated);
-        let debug_source_bounded = source_bounded_chunk_ids.as_ref().is_none_or(|chunk_ids| {
-            chunk_ids.contains(&result.chunk_id)
-                && result
-                    .provenance
-                    .seed_chunk_id
-                    .as_ref()
-                    .is_none_or(|seed_chunk_id| chunk_ids.contains(seed_chunk_id))
-        });
-        directly_source_bounded && debug_source_bounded
+        let persisted_source_bounded = source_bounded_chunk_ids.contains(&result.chunk_id)
+            && result
+                .provenance
+                .seed_chunk_id
+                .as_ref()
+                .is_none_or(|seed_chunk_id| source_bounded_chunk_ids.contains(seed_chunk_id));
+        directly_source_bounded && persisted_source_bounded
     });
     let results_changed = results.len() != result_count;
     if results_changed {
@@ -49,8 +43,13 @@ pub(super) fn filter_generated_retrieval_evidence(
         refresh_evidence_pack_debug(debug, results);
     }
 
-    if let Some(chunk_ids) = source_bounded_chunk_ids.as_ref() {
-        filter_retrieval_debug_chunk_identities(debug, chunk_ids, results_changed, results);
+    if has_debug_identities {
+        filter_retrieval_debug_chunk_identities(
+            debug,
+            &source_bounded_chunk_ids,
+            results_changed,
+            results,
+        );
     }
     Ok(())
 }
@@ -66,7 +65,7 @@ fn retrieval_debug_has_chunk_identities(debug: &RetrievalDebug) -> bool {
 fn source_bounded_retrieval_chunk_ids(
     store: &Store,
     results: &[RetrievalResult],
-    debug: &RetrievalDebug,
+    debug: Option<&RetrievalDebug>,
 ) -> Result<HashSet<ChunkId>> {
     let mut candidate_ids = HashSet::new();
     for result in results {
@@ -75,20 +74,22 @@ fn source_bounded_retrieval_chunk_ids(
             candidate_ids.insert(seed_chunk_id.clone());
         }
     }
-    candidate_ids.extend(debug.bm25_hits.iter().map(|hit| hit.chunk_id.clone()));
-    candidate_ids.extend(debug.dense_hits.iter().map(|hit| hit.chunk_id.clone()));
-    candidate_ids.extend(debug.rrf_fused_hits.iter().map(|hit| hit.chunk_id.clone()));
-    for hit in &debug.graph_expanded_hits {
-        candidate_ids.insert(hit.seed_chunk_id.clone());
-        candidate_ids.insert(hit.expanded_chunk_id.clone());
+    if let Some(debug) = debug {
+        candidate_ids.extend(debug.bm25_hits.iter().map(|hit| hit.chunk_id.clone()));
+        candidate_ids.extend(debug.dense_hits.iter().map(|hit| hit.chunk_id.clone()));
+        candidate_ids.extend(debug.rrf_fused_hits.iter().map(|hit| hit.chunk_id.clone()));
+        for hit in &debug.graph_expanded_hits {
+            candidate_ids.insert(hit.seed_chunk_id.clone());
+            candidate_ids.insert(hit.expanded_chunk_id.clone());
+        }
+        candidate_ids.extend(
+            debug
+                .reranker
+                .scores
+                .iter()
+                .map(|score| score.chunk_id.clone()),
+        );
     }
-    candidate_ids.extend(
-        debug
-            .reranker
-            .scores
-            .iter()
-            .map(|score| score.chunk_id.clone()),
-    );
 
     let candidate_ids = candidate_ids.into_iter().collect::<Vec<_>>();
     let chunks = store.get_chunks(&candidate_ids)?;
