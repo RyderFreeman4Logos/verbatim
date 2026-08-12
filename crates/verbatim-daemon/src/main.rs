@@ -148,6 +148,8 @@ struct AppState {
     resources: DaemonResources,
     memory_budget: MemoryBudget,
     ingest_queue_active: AtomicBool,
+    #[cfg(test)]
+    ingest_queue_drain_receipt: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Actual indexing worker occupancy, independent from persisted task status.
     ingest_worker_active: AtomicBool,
     collection_watcher: CollectionWatcherRuntime,
@@ -5885,6 +5887,10 @@ fn schedule_ingest_queue(state: SharedState) {
     tokio::spawn(async move {
         drain_ingest_queue(Arc::clone(&state)).await;
         state.ingest_queue_active.store(false, Ordering::Release);
+        #[cfg(test)]
+        if let Some(receipt) = state.ingest_queue_drain_receipt.lock().unwrap().take() {
+            let _ = receipt.send(());
+        }
         match ingest_queue_ready_to_drain(&state).await {
             Ok(true) => schedule_ingest_queue(state),
             Ok(false) => {}
@@ -9590,6 +9596,8 @@ async fn run_daemon_with_config(config: Config) -> Result<()> {
         resources: daemon_resources(&config.daemon.resources),
         memory_budget,
         ingest_queue_active: AtomicBool::new(false),
+        #[cfg(test)]
+        ingest_queue_drain_receipt: std::sync::Mutex::new(None),
         ingest_worker_active: AtomicBool::new(false),
         collection_watcher: CollectionWatcherRuntime::default(),
         idle_reclaim: Arc::new(IdleReclaimRuntime::new(now_unix_millis())),
@@ -16840,7 +16848,6 @@ mod tests {
         .await
         .unwrap();
         let task_id = TaskId(created.task_id);
-        wait_for_ingest_queue_idle(&state).await;
 
         let queued = task_summary_response(&state, task_id.clone())
             .await
@@ -16888,7 +16895,6 @@ mod tests {
         .await
         .unwrap();
         let task_id = TaskId(created.task_id);
-        wait_for_ingest_queue_idle(&state).await;
 
         let queued = task_summary_response(&state, task_id).await.unwrap().task;
         assert_eq!(queued.status, TaskStatus::Queued);
@@ -17041,7 +17047,6 @@ mod tests {
             .unwrap();
 
         assert!(!created.task_id.is_empty());
-        wait_for_ingest_queue_idle(&state).await;
     }
 
     #[tokio::test]
@@ -17281,7 +17286,6 @@ mod tests {
         );
 
         schedule_ingest_queue(Arc::clone(&state));
-        wait_for_ingest_queue_idle(&state).await;
         wait_for_task_status(&state, &parent_id, TaskStatus::Succeeded).await;
 
         let parent = task_summary_response(&state, parent_id).await.unwrap().task;
@@ -17442,7 +17446,6 @@ mod tests {
         assert!(children[0].request.get("source_hash").is_none());
 
         schedule_ingest_queue(Arc::clone(&state));
-        wait_for_ingest_queue_idle(&state).await;
         wait_for_task_status(&state, &parent_id, TaskStatus::Succeeded).await;
 
         let parent = task_summary_response(&state, parent_id).await.unwrap().task;
@@ -17659,8 +17662,6 @@ mod tests {
         let state = test_state(config, test_dir.path(), pipeline);
         let (running_id, queued_id) = blocked_ingest_pair(&state).await;
         assert_queued_ingest_waits_for_running(&state, &queued_id).await;
-        schedule_ingest_queue(Arc::clone(&state));
-        wait_for_ingest_queue_idle(&state).await;
 
         finish_task_success(
             &state,
@@ -17687,8 +17688,6 @@ mod tests {
         let state = test_state(config, test_dir.path(), pipeline);
         let (running_id, queued_id) = blocked_ingest_pair(&state).await;
         assert_queued_ingest_waits_for_running(&state, &queued_id).await;
-        schedule_ingest_queue(Arc::clone(&state));
-        wait_for_ingest_queue_idle(&state).await;
 
         finish_task_failed(&state, &running_id, "foreground ingest failed")
             .await
@@ -17838,8 +17837,10 @@ mod tests {
         .await
         .unwrap();
 
+        let (sender, receipt) = tokio::sync::oneshot::channel();
+        *state.ingest_queue_drain_receipt.lock().unwrap() = Some(sender);
         schedule_ingest_queue(Arc::clone(&state));
-        wait_for_ingest_queue_idle(&state).await;
+        wait_for_ingest_queue_drain(receipt).await;
 
         let foreground = task_summary_response(&state, foreground_id.clone())
             .await
@@ -18291,10 +18292,23 @@ mod tests {
         )
         .await
         .unwrap();
-
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let state_for_lock = Arc::clone(&state);
+        let lock_handle = tokio::task::spawn_blocking(move || {
+            let _pipeline = state_for_lock.pipeline.lock().unwrap();
+            let _ = locked_tx.send(());
+            release_rx.recv().unwrap();
+        });
+        locked_rx.await.unwrap();
         schedule_ingest_queue(Arc::clone(&state));
-        wait_for_ingest_queue_idle(&state).await;
-
+        wait_for_task_status(&state, &parent_id, TaskStatus::Failed).await;
+        wait_for_task_status(&state, &followup_id, TaskStatus::Running).await;
+        let running_after_parent_failed = running_ingest_count(&state).await;
+        release_tx.send(()).unwrap();
+        lock_handle.await.unwrap();
+        wait_for_task_status(&state, &followup_id, TaskStatus::Succeeded).await;
+        assert_eq!(running_after_parent_failed, 1);
         assert_eq!(running_ingest_count(&state).await, 0);
         for child_id in child_ids {
             let child_response = task_summary_response(&state, child_id).await.unwrap();
@@ -18308,10 +18322,8 @@ mod tests {
                 .contains("abandoned running source-batch ingest task"));
             assert_eq!(child.result.as_ref().unwrap()["resumable"], true);
         }
-        wait_for_task_status(&state, &parent_id, TaskStatus::Failed).await;
         let parent_response = task_summary_response(&state, parent_id).await.unwrap();
         assert!(has_task_terminalize_span(&parent_response.spans));
-        wait_for_task_status(&state, &followup_id, TaskStatus::Succeeded).await;
     }
 
     #[tokio::test]
@@ -18671,6 +18683,7 @@ mod tests {
             resources: daemon_resources(&config.daemon.resources),
             memory_budget,
             ingest_queue_active: AtomicBool::new(false),
+            ingest_queue_drain_receipt: std::sync::Mutex::new(None),
             ingest_worker_active: AtomicBool::new(false),
             collection_watcher: CollectionWatcherRuntime::default(),
             idle_reclaim: Arc::new(IdleReclaimRuntime::new(now_unix_millis())),
@@ -18766,14 +18779,11 @@ mod tests {
         })
     }
 
-    async fn wait_for_ingest_queue_idle(state: &SharedState) {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while state.ingest_queue_active.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+    async fn wait_for_ingest_queue_drain(receipt: tokio::sync::oneshot::Receiver<()>) {
+        tokio::time::timeout(Duration::from_secs(2), receipt)
+            .await
+            .expect("ingest queue drain receipt must complete")
+            .expect("ingest queue drain receipt sender must remain available");
     }
 
     async fn wait_for_task_status(state: &SharedState, task_id: &TaskId, status: TaskStatus) {
