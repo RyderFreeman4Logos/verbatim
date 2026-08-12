@@ -18292,10 +18292,23 @@ mod tests {
         )
         .await
         .unwrap();
-
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let state_for_lock = Arc::clone(&state);
+        let lock_handle = tokio::task::spawn_blocking(move || {
+            let _pipeline = state_for_lock.pipeline.lock().unwrap();
+            let _ = locked_tx.send(());
+            release_rx.recv().unwrap();
+        });
+        locked_rx.await.unwrap();
         schedule_ingest_queue(Arc::clone(&state));
         wait_for_task_status(&state, &parent_id, TaskStatus::Failed).await;
-
+        wait_for_task_status(&state, &followup_id, TaskStatus::Running).await;
+        let running_after_parent_failed = running_ingest_count(&state).await;
+        release_tx.send(()).unwrap();
+        lock_handle.await.unwrap();
+        wait_for_task_status(&state, &followup_id, TaskStatus::Succeeded).await;
+        assert_eq!(running_after_parent_failed, 1);
         assert_eq!(running_ingest_count(&state).await, 0);
         for child_id in child_ids {
             let child_response = task_summary_response(&state, child_id).await.unwrap();
@@ -18311,7 +18324,6 @@ mod tests {
         }
         let parent_response = task_summary_response(&state, parent_id).await.unwrap();
         assert!(has_task_terminalize_span(&parent_response.spans));
-        wait_for_task_status(&state, &followup_id, TaskStatus::Succeeded).await;
     }
 
     #[tokio::test]
