@@ -115,6 +115,8 @@ mod auth_middleware;
 mod deletion_api;
 #[path = "routes.rs"]
 mod routes;
+#[path = "source_bounded_retrieval.rs"]
+mod source_bounded_retrieval;
 #[path = "source_relocation_api.rs"]
 mod source_relocation_api;
 #[path = "sqlite_durability_ops.rs"]
@@ -124,6 +126,7 @@ use deletion_api::{
     delete_source, list_deletion_reports, reconcile_deletions_on_startup,
     start_deletion_reconcile_scheduler, STARTUP_DELETION_RECONCILE_BATCH_SIZE,
 };
+use source_bounded_retrieval::filter_generated_retrieval_evidence;
 use source_relocation_api::relocate_source;
 
 // ---------------------------------------------------------------------------
@@ -4669,7 +4672,7 @@ async fn execute_retrieve_task_inner(
             .with_active_worker_kind(TaskKind::Retrieve.as_str()),
     )
     .await;
-    let mut retrieved_context = prepare_retrieve_context(
+    let retrieved_context = prepare_retrieve_context(
         Arc::clone(&state),
         &question,
         query_scope.source_filter.clone(),
@@ -4677,10 +4680,6 @@ async fn execute_retrieve_task_inner(
         &controls,
     )
     .await?;
-    filter_generated_retrieval_evidence(
-        &mut retrieved_context.results,
-        &mut retrieved_context.debug,
-    );
     let RetrievedContext {
         results,
         debug,
@@ -7505,9 +7504,17 @@ async fn prepare_retrieve_context(
                 prepend_global_backing_results(&mut results, global_results, Some(&mut debug));
                 Ok::<_, anyhow::Error>((results, debug))
             });
-        let (results, mut debug) = retrieval_result?;
+        let (mut results, mut debug) = retrieval_result?;
         debug.retrieval_search_sql_statement_count = retrieval_search_sql_statement_count;
         debug.retrieval_resource_counters = retrieval_resource_counters;
+        with_sqlite_reader_permit(&sqlite_reader, || {
+            filter_generated_retrieval_evidence(
+                pipeline.store(),
+                &mut results,
+                &mut debug,
+                controls.include_debug,
+            )
+        })?;
         let source_paths = with_sqlite_reader_permit(&sqlite_reader, || {
             source_paths_for_results(&results, pipeline.store())
         })?;
@@ -7833,30 +7840,6 @@ fn source_paths_for_results(
         }
     }
     Ok(paths)
-}
-
-fn filter_generated_retrieval_evidence(
-    results: &mut Vec<RetrievalResult>,
-    debug: &mut RetrievalDebug,
-) {
-    if !results.iter().any(|result| {
-        result
-            .evidence_units
-            .iter()
-            .any(|evidence| evidence.kind == EvidenceKind::Generated)
-    }) {
-        return;
-    }
-    for result in results.iter_mut() {
-        result
-            .evidence_units
-            .retain(|evidence| evidence.kind != EvidenceKind::Generated);
-    }
-    results.retain(|result| !result.evidence_units.is_empty());
-    for (index, result) in results.iter_mut().enumerate() {
-        result.provenance.result_rank = index + 1;
-    }
-    refresh_evidence_pack_debug(debug, results);
 }
 
 fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<RetrieveResponse> {
