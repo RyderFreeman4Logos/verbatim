@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -14,6 +15,7 @@ use crate::types::{
 pub struct CanonicalJsonlParser;
 
 const GENERATED_EVIDENCE_ID_PREFIX: &str = "cjson:v1:";
+const MAX_JSONL_RECORD_BYTES: usize = 1_048_576;
 
 impl Parser for CanonicalJsonlParser {
     fn name(&self) -> &str {
@@ -25,14 +27,37 @@ impl Parser for CanonicalJsonlParser {
     }
 
     fn parse(&self, path: &Path) -> Result<Vec<EvidenceUnit>> {
-        let content = fs::read_to_string(path)
+        let file = File::open(path)
             .with_context(|| format!("failed to read JSONL: {}", path.display()))?;
+        let mut reader = BufReader::new(file);
         let source_id = SourceId::from_path(path);
         let mut units = Vec::new();
         let mut identity_lines = HashMap::new();
+        let mut raw_line = Vec::new();
+        let mut index = 0;
 
-        for (index, raw_line) in content.lines().enumerate() {
+        loop {
+            raw_line.clear();
+            let bytes_read = reader
+                .by_ref()
+                .take((MAX_JSONL_RECORD_BYTES + 2) as u64)
+                .read_until(b'\n', &mut raw_line)
+                .with_context(|| format!("failed to read JSONL: {}", path.display()))?;
+            if bytes_read == 0 {
+                break;
+            }
             let line_no = (index as u32) + 1; // 1-based
+            index += 1;
+            let raw_line = raw_line.strip_suffix(b"\n").unwrap_or(&raw_line);
+            let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            if raw_line.len() > MAX_JSONL_RECORD_BYTES {
+                bail!(
+                    "canonical JSONL record exceeds maximum size ({MAX_JSONL_RECORD_BYTES} bytes) on line {line_no} of {}",
+                    path.display()
+                );
+            }
+            let raw_line = std::str::from_utf8(raw_line)
+                .with_context(|| format!("failed to read JSONL: {}", path.display()))?;
             let trimmed = raw_line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -118,7 +143,7 @@ impl Parser for CanonicalJsonlParser {
                 text: entry.text.clone(),
                 text_hash,
                 heading_path,
-                position: index as u32,
+                position: (index - 1) as u32,
             });
         }
 
@@ -349,6 +374,52 @@ mod tests {
         assert_eq!(units[0].text, "For God loved the world...");
         assert_eq!(units[1].position, 1);
         assert_eq!(units[2].position, 2);
+        assert_eq!(
+            units.iter().map(|unit| &unit.id.0).collect::<Vec<_>>(),
+            vec![
+                "cjson:v1:96a9ca1fd9a5a7fc7b39a0a278f2069cb2cc3962f25325c5dfb6943375f6e0d1",
+                "cjson:v1:4442202871d7f5b827c94bfd68a7072937a803e5f68f89fb3817235b3b4192c7",
+                "cjson:v1:362d1bfb80ceca7a2509bd56d56a852bea977cd94e69f642887bf4993c1efe92",
+            ]
+        );
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| match &unit.locator {
+                    SourceLocator::Canonical { locator } => locator.backing_selectors.clone(),
+                    _ => panic!("expected Canonical locator"),
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                vec![BackingSelector::LineRange { start: 1, end: 1 }],
+                vec![BackingSelector::LineRange { start: 2, end: 2 }],
+                vec![BackingSelector::LineRange { start: 3, end: 3 }],
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_record_with_path_and_line() {
+        let oversized = format!(
+            r#"{{"source_profile":"bible","work_id":"CSB","components":[{{"level":"book","value":"John"}}],"text":"{}"}}"#,
+            "x".repeat(1_048_576)
+        );
+        let f = write_jsonl(&[&oversized]);
+
+        let error = CanonicalJsonlParser
+            .parse(f.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("record exceeds maximum size"),
+            "error was: {error}"
+        );
+        assert!(error.contains("line 1"), "error was: {error}");
+        assert!(
+            error.contains(&f.path().display().to_string()),
+            "error was: {error}"
+        );
     }
 
     #[test]
