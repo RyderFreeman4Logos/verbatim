@@ -101,6 +101,7 @@ impl RetrievalPipeline<'_> {
 
         let support = StrictFilterSupport::Adaptive(policy);
         let corpus_size = u64::try_from(self.vector_index.len()).unwrap_or(u64::MAX);
+        let mut validated_ids = HashSet::new();
         let mut previous_candidate_k = None;
         for attempt in 0..policy.max_attempts {
             let Ok(candidate_k) = support.candidate_k_for_attempt(
@@ -119,6 +120,10 @@ impl RetrievalPipeline<'_> {
             let candidates = self.with_read_permit(|| {
                 self.local_dense_search(query_vec, candidate_k as usize, source_filter)
             })?;
+            let candidates = candidates
+                .into_iter()
+                .filter(|(chunk_id, _)| validated_ids.insert(chunk_id.clone()))
+                .collect::<Vec<_>>();
             let hits = self.with_read_permit(|| {
                 self.valid_dense_hits(candidates, top_k, source_filter, None, candidate_counters)
             })?;
@@ -140,6 +145,28 @@ impl RetrievalPipeline<'_> {
         local_spans_ms.vector_queue_wait_ms = None;
         local_spans_ms.vector_service_ms = None;
         let permit = self.acquire_vector_search_permit().await?;
+        #[cfg(feature = "qdrant")]
+        let local_results_are_adaptively_validated = matches!(
+            self.local_strict_filter_support(top_k, source_filter),
+            StrictFilterSupport::Adaptive(_)
+        );
+        #[cfg(feature = "qdrant")]
+        let validate_local_results =
+            |local_results: Vec<(ChunkId, f32)>, candidate_counters: &mut CandidateCounters| {
+                if local_results_are_adaptively_validated {
+                    Ok(local_results)
+                } else {
+                    self.with_read_permit(|| {
+                        self.valid_dense_hits(
+                            local_results,
+                            top_k,
+                            source_filter,
+                            None,
+                            candidate_counters,
+                        )
+                    })
+                }
+            };
         #[cfg(feature = "qdrant")]
         let result = if top_k == 0 || query_vec.is_empty() {
             self.with_read_permit(|| self.local_dense_search(query_vec, top_k, source_filter))
@@ -176,15 +203,7 @@ impl RetrievalPipeline<'_> {
                             source_filter,
                             candidate_counters,
                         )?;
-                        let local_hits = self.with_read_permit(|| {
-                            self.valid_dense_hits(
-                                local_results,
-                                top_k,
-                                source_filter,
-                                None,
-                                candidate_counters,
-                            )
-                        })?;
+                        let local_hits = validate_local_results(local_results, candidate_counters)?;
                         let missing = top_k - hits.len();
                         let mut seen = hits
                             .iter()
@@ -210,16 +229,8 @@ impl RetrievalPipeline<'_> {
                         source_filter,
                         candidate_counters,
                     )?;
-                    self.with_read_permit(|| {
-                        self.valid_dense_hits(
-                            local_results,
-                            top_k,
-                            source_filter,
-                            None,
-                            candidate_counters,
-                        )
-                    })
-                    .map(|hits| (hits, self.dense_vector_path()))
+                    let local_hits = validate_local_results(local_results, candidate_counters)?;
+                    Ok((local_hits, self.dense_vector_path()))
                 }
             }
         } else {

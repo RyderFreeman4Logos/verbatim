@@ -794,41 +794,23 @@ impl<'a> RetrievalPipeline<'a> {
         I: IntoIterator,
         I::Item: DenseHit,
     {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let hits = hits.into_iter().collect::<Vec<_>>();
+        let chunk_ids = hits.iter().map(DenseHit::chunk_id).collect::<Vec<_>>();
+        let chunks = self.store.get_chunks(&chunk_ids)?;
         let mut valid = Vec::new();
         let mut seen = HashSet::new();
-        let mut hits = hits.into_iter();
-        while valid.len() < top_k
-            && self.append_next_valid_dense_hit(
-                &mut valid,
-                &mut seen,
-                &mut hits,
-                source_filter,
-                required_profile,
-                candidate_counters,
-            )?
-        {}
-        Ok(valid)
-    }
-
-    fn append_next_valid_dense_hit<I>(
-        &self,
-        target: &mut Vec<(ChunkId, f32)>,
-        seen: &mut HashSet<ChunkId>,
-        hits: &mut I,
-        source_filter: Option<&HashSet<SourceId>>,
-        required_profile: Option<(&EmbeddingProfileId, u64)>,
-        candidate_counters: &mut CandidateCounters,
-    ) -> Result<bool>
-    where
-        I: Iterator,
-        I::Item: DenseHit,
-    {
         for hit in hits {
+            if valid.len() == top_k {
+                break;
+            }
             let chunk_id = hit.chunk_id();
             if seen.contains(&chunk_id) {
                 continue;
             }
-            let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
+            let Some(Ok(chunk)) = chunks.get(&chunk_id) else {
                 continue;
             };
             if source_filter_excludes(source_filter, &chunk.source_id, candidate_counters)? {
@@ -850,12 +832,9 @@ impl<'a> RetrievalPipeline<'a> {
                 }
             }
             seen.insert(chunk_id.clone());
-            let score = hit.score();
-            target.push((chunk_id, score));
-            return Ok(true);
+            valid.push((chunk_id, hit.score()));
         }
-
-        Ok(false)
+        Ok(valid)
     }
 
     fn result_for_chunk(

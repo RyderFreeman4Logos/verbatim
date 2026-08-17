@@ -127,6 +127,145 @@ async fn source_filter_adaptively_overfetches_local_dense_top_k() {
     );
 }
 
+#[cfg(feature = "qdrant")]
+#[test]
+fn adaptive_scoped_validation_batches_small_and_cap_sized_foreign_prefixes() {
+    const CAP_SIZED_FOREIGN_PREFIX: usize = 256;
+
+    let directory = tempdir().expect("temporary adaptive retrieval database");
+    let database_path = directory.path().join("adaptive-validation.db");
+    let writer = Store::new(&database_path).expect("writable adaptive retrieval store");
+    let wanted = source("source-adaptive-wanted");
+    let foreign = source("source-adaptive-foreign");
+    writer.add_source(&wanted).expect("wanted source");
+    writer.add_source(&foreign).expect("foreign source");
+    let foreign_ids = (0..CAP_SIZED_FOREIGN_PREFIX)
+        .map(|rank| {
+            insert_text_chunk(
+                &writer,
+                &foreign,
+                &format!("chunk-foreign-{rank:03}"),
+                &format!("foreign content {rank:03}"),
+            )
+            .id
+        })
+        .collect::<Vec<_>>();
+    let wanted_chunk = insert_text_chunk(
+        &writer,
+        &wanted,
+        "chunk-adaptive-wanted",
+        "wanted content",
+    );
+    drop(writer);
+
+    let store = Store::open_existing_readonly(&database_path)
+        .expect("readonly adaptive retrieval store");
+    let small_hits = vec![
+        (foreign_ids[0].clone(), 1.0),
+        (wanted_chunk.id.clone(), 0.5),
+        (foreign_ids[1].clone(), 0.25),
+    ];
+    let mut cap_hits = foreign_ids
+        .iter()
+        .enumerate()
+        .map(|(rank, id)| {
+            (
+                id.clone(),
+                (CAP_SIZED_FOREIGN_PREFIX - rank) as f32,
+            )
+        })
+        .collect::<Vec<_>>();
+    cap_hits.push((wanted_chunk.id.clone(), 0.0));
+    let lexical_index = StaticLexicalIndex::new(Vec::new());
+    let embed_client = KeywordEmbeddingClient;
+    let config = RetrievalConfig::default();
+    let source_filter = HashSet::from([wanted.id]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let measure = |hits| {
+        let (qdrant_url, handle) =
+            spawn_qdrant_search_response(200, r#"{"status":"ok","result":[]}"#);
+        let vector_index = StaticVectorIndex::new(hits);
+        let pipeline = RetrievalPipeline::new(
+            &vector_index,
+            &lexical_index,
+            &store,
+            &embed_client,
+            &config,
+        )
+        .with_qdrant_search(&qdrant_config(qdrant_url));
+        let mut counters = CandidateCounters::default();
+        let mut spans = RetrievalLocalSpansMs::default();
+        let measured = store.count_sql_statements(|| {
+            runtime.block_on(pipeline.dense_search(
+                &[1.0, 0.0],
+                1,
+                Some(&source_filter),
+                &mut counters,
+                &mut spans,
+            ))
+        });
+        assert_eq!(
+            handle.join().unwrap(),
+            "POST /collections/verbatim/points/search HTTP/1.1"
+        );
+        measured
+    };
+    let (small_result, small_count) = measure(small_hits);
+    let (cap_result, cap_count) = measure(cap_hits);
+
+    assert_eq!(
+        small_result.expect("small adaptive search succeeds").0,
+        vec![(wanted_chunk.id, 0.5)]
+    );
+    assert_eq!(
+        cap_result
+            .expect_err("cap-sized foreign prefix exhausts strict filtering")
+            .downcast_ref::<crate::overfetch::OverfetchError>(),
+        Some(&crate::overfetch::OverfetchError::UnsupportedStrictFilter)
+    );
+    assert_eq!(small_count, Some(5));
+    assert_eq!(cap_count, Some(19));
+}
+
+#[tokio::test]
+async fn adaptive_source_filter_keeps_valid_hit_when_prior_peer_is_corrupt() {
+    let store = Store::in_memory().unwrap();
+    let wanted = source("src-adaptive-corrupt-peer");
+    store.add_source(&wanted).unwrap();
+    let corrupt = insert_text_chunk(&store, &wanted, "chunk-corrupt", "corrupt content");
+    let valid = insert_text_chunk(&store, &wanted, "chunk-valid", "valid content");
+    corrupt_chunk_evidence_link(&store, &corrupt.id);
+    let vector_index = StaticVectorIndex::new(vec![
+        (corrupt.id, 1.0),
+        (valid.id.clone(), 0.5),
+        (ChunkId("chunk-trailing".into()), 0.25),
+    ]);
+    let lexical_index = StaticLexicalIndex::new(Vec::new());
+    let embed_client = KeywordEmbeddingClient;
+    let config = RetrievalConfig {
+        dense_top_k: 1,
+        bm25_top_k: 0,
+        ..RetrievalConfig::default()
+    };
+    let pipeline = RetrievalPipeline::new(
+        &vector_index,
+        &lexical_index,
+        &store,
+        &embed_client,
+        &config,
+    );
+
+    let results = pipeline
+        .search_filtered("valid", Some(&wanted.id))
+        .await
+        .expect("adaptive source filtering isolates a corrupt candidate");
+
+    assert_eq!(chunk_ids(&results), vec![valid.id.0]);
+}
+
 #[test]
 fn scoped_search_setup_does_not_materialize_child_chunks() {
     assert!(!include_str!("../retrieve.rs").contains(&concat!("list_child_", "chunks()")));
