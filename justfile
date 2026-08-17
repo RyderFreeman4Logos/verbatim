@@ -214,6 +214,29 @@ test-core-no-qdrant-f pattern:
 test-f pattern:
     {{_cargo_io_prefix}} cargo nextest run --workspace --all-features -E 'test({{pattern}})' --no-tests=warn
 
+# Run licensed full-corpus canonical checks when a hash-pinned local corpus is available.
+test-private-canonical-corpus:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    corpus="${VERBATIM_PRIVATE_CANONICAL_CORPUS:-}"
+    if [[ -z "$corpus" || ! -f "$corpus" ]]; then
+        printf 'SKIPPED: private canonical corpus not configured\n'
+        exit 0
+    fi
+    corpus="$(realpath -- "$corpus")"
+    export VERBATIM_PRIVATE_CANONICAL_CORPUS="$corpus"
+    expected_hash="${VERBATIM_PRIVATE_CANONICAL_CORPUS_SHA256:-}"
+    if [[ ! "$expected_hash" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+        printf 'ERROR: VERBATIM_PRIVATE_CANONICAL_CORPUS_SHA256 must be a SHA-256 digest\n' >&2
+        exit 2
+    fi
+    actual_hash="$(sha256sum -- "$corpus" | cut -d ' ' -f1)"
+    if [[ "$actual_hash" != "${expected_hash,,}" ]]; then
+        printf 'ERROR: private canonical corpus SHA-256 mismatch\n' >&2
+        exit 1
+    fi
+    {{_cargo_io_prefix}} cargo nextest run -p verbatim-core --test private_canonical_corpus --run-ignored all --no-tests=warn
+
 # ==============================================================================
 # Build & Install
 # ==============================================================================
