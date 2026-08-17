@@ -3231,6 +3231,7 @@ mod tests {
     fn ask_response_labels_generated_interpretation() {
         let response = AskResponse {
             answer: "Legacy generated answer.".into(),
+            answer_kind: verbatim_core::api::AnswerKind::GeneratedInterpretation,
             generated_interpretation: Some(verbatim_core::api::GeneratedInterpretationResponse {
                 text: "Generated interpretation.".into(),
             }),

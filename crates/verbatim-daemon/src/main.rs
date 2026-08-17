@@ -30,8 +30,8 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use verbatim_core::api::{
     AddCollectionRootRequest, AddCollectionRootResponse, AddSourceRequest, AddSourceResponse,
-    AppliedCollectionFilterResponse, AskCitationEvent, AskErrorEvent, AskRequest, AskResponse,
-    AskTokenEvent, CheckStaleResponse, CitationResponse, CollectionFilterRequest,
+    AnswerKind, AppliedCollectionFilterResponse, AskCitationEvent, AskErrorEvent, AskRequest,
+    AskResponse, AskTokenEvent, CheckStaleResponse, CitationResponse, CollectionFilterRequest,
     CollectionFilterResponse, CollectionResponse, CollectionResultProvenance,
     CollectionStatusResponse, CollectionSyncPathRequest, CollectionSyncRequest,
     CollectionSyncResponse, CollectionWatcherResponse, CollectionWatcherStatus,
@@ -5060,6 +5060,7 @@ async fn execute_ask_task_inner_with_config(
     let response_started = Instant::now();
     let response = AskResponse {
         answer: gen_result.answer.clone(),
+        answer_kind: AnswerKind::GeneratedInterpretation,
         generated_interpretation: Some(GeneratedInterpretationResponse {
             text: gen_result.answer,
         }),
@@ -5403,15 +5404,15 @@ async fn execute_context_only_ask_task_inner(
     let controls = resolve_retrieve_controls(&retrieve_req, &config)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let context = execute_retrieve_task_inner(state, task_id, retrieve_req, controls).await?;
-    let collection_filter = context.collection_filter.clone();
     Ok(AskResponse {
         answer: String::new(),
+        answer_kind: AnswerKind::EvidenceOnly,
         generated_interpretation: None,
         citations: Vec::new(),
         verified: false,
         retrieval: None,
+        collection_filter: context.collection_filter.clone(),
         context: Some(context),
-        collection_filter,
     })
 }
 

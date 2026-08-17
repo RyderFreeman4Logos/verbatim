@@ -2,6 +2,7 @@
 fn ask_response_omits_retrieval_when_debug_is_off() {
     let response = AskResponse {
         answer: "Answer [E1].".into(),
+        answer_kind: AnswerKind::EvidenceOnly,
         generated_interpretation: None,
         citations: Vec::new(),
         verified: false,
@@ -16,6 +17,7 @@ fn ask_response_omits_retrieval_when_debug_is_off() {
         encoded,
         serde_json::json!({
             "answer": "Answer [E1].",
+            "answer_kind": "evidence_only",
             "citations": [],
             "verified": false,
         })
@@ -27,6 +29,7 @@ fn ask_response_omits_retrieval_when_debug_is_off() {
 fn ask_response_includes_structured_retrieval_when_requested() {
     let response = AskResponse {
         answer: "Answer [E1].".into(),
+        answer_kind: AnswerKind::EvidenceOnly,
         generated_interpretation: None,
         citations: Vec::new(),
         verified: false,

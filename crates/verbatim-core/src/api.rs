@@ -582,9 +582,17 @@ pub struct GeneratedInterpretationResponse {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerKind {
+    GeneratedInterpretation,
+    EvidenceOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AskResponse {
     pub answer: String,
+    pub answer_kind: AnswerKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_interpretation: Option<GeneratedInterpretationResponse>,
     #[serde(default)]
@@ -1055,30 +1063,7 @@ mod tests {
         assert!(!request.show_retrieval);
     }
 
-    #[test]
-    fn ask_response_serializes_generated_interpretation_separately_from_evidence() {
-        let response = AskResponse {
-            answer: "Legacy generated answer.".into(),
-            generated_interpretation: Some(GeneratedInterpretationResponse {
-                text: "Generated interpretation.".into(),
-            }),
-            citations: Vec::new(),
-            verified: false,
-            retrieval: None,
-            context: None,
-            collection_filter: None,
-        };
-
-        let encoded = serde_json::to_value(response).unwrap();
-
-        assert_eq!(encoded["answer"], "Legacy generated answer.");
-        assert_eq!(
-            encoded["generated_interpretation"],
-            serde_json::json!({"text": "Generated interpretation."})
-        );
-        assert!(encoded.get("source_bounded").is_none());
-        assert!(encoded.get("context").is_none());
-    }
+    include!("api_answer_kind_tests.rs");
 
     #[test]
     fn collection_cli_api_parity_inventory_is_daemon_backed() {
