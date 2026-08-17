@@ -181,7 +181,6 @@ pub struct RetrievalCanonicalDetailDebug {
     pub support_evidence_pack: Vec<RetrievalEvidencePackEntry>,
 }
 
-#[cfg(feature = "qdrant")]
 trait DenseHit {
     fn chunk_id(&self) -> ChunkId;
     fn score(&self) -> f32;
@@ -196,7 +195,6 @@ trait DenseHit {
     }
 }
 
-#[cfg(feature = "qdrant")]
 impl DenseHit for (ChunkId, f32) {
     fn chunk_id(&self) -> ChunkId {
         self.0.clone()
@@ -784,7 +782,6 @@ impl<'a> RetrievalPipeline<'a> {
         }
     }
 
-    #[cfg(feature = "qdrant")]
     fn valid_dense_hits<I>(
         &self,
         hits: I,
@@ -797,42 +794,23 @@ impl<'a> RetrievalPipeline<'a> {
         I: IntoIterator,
         I::Item: DenseHit,
     {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let hits = hits.into_iter().collect::<Vec<_>>();
+        let chunk_ids = hits.iter().map(DenseHit::chunk_id).collect::<Vec<_>>();
+        let chunks = self.store.get_chunks(&chunk_ids)?;
         let mut valid = Vec::new();
         let mut seen = HashSet::new();
-        let mut hits = hits.into_iter();
-        while valid.len() < top_k
-            && self.append_next_valid_dense_hit(
-                &mut valid,
-                &mut seen,
-                &mut hits,
-                source_filter,
-                required_profile,
-                candidate_counters,
-            )?
-        {}
-        Ok(valid)
-    }
-
-    #[cfg(feature = "qdrant")]
-    fn append_next_valid_dense_hit<I>(
-        &self,
-        target: &mut Vec<(ChunkId, f32)>,
-        seen: &mut HashSet<ChunkId>,
-        hits: &mut I,
-        source_filter: Option<&HashSet<SourceId>>,
-        required_profile: Option<(&EmbeddingProfileId, u64)>,
-        candidate_counters: &mut CandidateCounters,
-    ) -> Result<bool>
-    where
-        I: Iterator,
-        I::Item: DenseHit,
-    {
         for hit in hits {
+            if valid.len() == top_k {
+                break;
+            }
             let chunk_id = hit.chunk_id();
             if seen.contains(&chunk_id) {
                 continue;
             }
-            let Some(chunk) = self.store.get_chunk(&chunk_id)? else {
+            let Some(Ok(chunk)) = chunks.get(&chunk_id) else {
                 continue;
             };
             if source_filter_excludes(source_filter, &chunk.source_id, candidate_counters)? {
@@ -854,12 +832,9 @@ impl<'a> RetrievalPipeline<'a> {
                 }
             }
             seen.insert(chunk_id.clone());
-            let score = hit.score();
-            target.push((chunk_id, score));
-            return Ok(true);
+            valid.push((chunk_id, hit.score()));
         }
-
-        Ok(false)
+        Ok(valid)
     }
 
     fn result_for_chunk(
@@ -4688,11 +4663,15 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let wanted_source = source("src-qdrant-empty");
         let other_source = source("src-qdrant-other");
+        let trailing_source = source("src-qdrant-trailing");
         let wanted_chunk = insert_child(&store, &wanted_source, "chunk-wanted", "alpha wanted");
         let other_chunk = insert_child(&store, &other_source, "chunk-other", "alpha other");
+        let trailing_chunk =
+            insert_child(&store, &trailing_source, "chunk-trailing", "alpha trailing");
         let vector_index = StaticVectorIndex::new(vec![
             (other_chunk.id.clone(), 0.95),
             (wanted_chunk.id.clone(), 0.9),
+            (trailing_chunk.id.clone(), 0.8),
         ]);
         let lexical_index = StaticLexicalIndex::new(Vec::new());
         let embed_client = KeywordEmbeddingClient;
@@ -4717,7 +4696,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_id, wanted_chunk.id);
+        assert_eq!(results[0].chunk.source_id, wanted_source.id);
         assert_eq!(
             handle.join().unwrap(),
             "POST /collections/verbatim/points/search HTTP/1.1"
