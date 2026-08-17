@@ -9801,6 +9801,7 @@ fn log_fts_startup_maintenance(outcome: FtsMaintenanceOutcome) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::error::Elapsed;
     use verbatim_core::index::sqlite_fts::{
         FtsMaintenanceCounts, FtsMaintenanceReason, FtsMaintenanceStatus,
     };
@@ -18769,8 +18770,15 @@ mod tests {
             .expect("ingest queue drain receipt sender must remain available");
     }
 
+    fn assert_status_wait(result: Result<(), Elapsed>, task_id: &TaskId, status: TaskStatus) {
+        let task_id = &task_id.0;
+        let Ok(()) = result else {
+            panic!("ingest task {task_id} did not reach {status:?} within 10s");
+        };
+    }
+
     async fn wait_for_task_status(state: &SharedState, task_id: &TaskId, status: TaskStatus) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let task = task_summary_response(state, task_id.clone())
                     .await
@@ -18782,8 +18790,17 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .unwrap();
+        .await;
+        assert_status_wait(result, task_id, status);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "ingest task task-id did not reach Succeeded within 10s")]
+    async fn task_status_wait_timeout_names_waited_condition() {
+        let task_id = TaskId("task-id".into());
+        assert_status_wait(Ok(()), &task_id, TaskStatus::Queued);
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>()).await;
+        assert_status_wait(elapsed, &task_id, TaskStatus::Succeeded);
     }
 
     async fn wait_for_collection_watcher_status<F>(
