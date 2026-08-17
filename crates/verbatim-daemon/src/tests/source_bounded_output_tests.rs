@@ -7,6 +7,9 @@ use super::*;
 
 const CORRUPTED_EVIDENCE_TEXT: &str = "Mutated persisted evidence must not escape.";
 
+#[path = "source_bounded_batch_tests.rs"]
+mod source_bounded_batch_tests;
+
 fn write_pdf_with_text_and_image(path: &std::path::Path) {
     let image = vec![255_u8; 8 * 8 * 3];
     let content = b"BT\n/F1 12 Tf\n72 120 Td\n(Source-backed predecessor text.) Tj\nET\nq\n36 0 0 36 72 72 cm\n/Im1 Do\nQ\n";
