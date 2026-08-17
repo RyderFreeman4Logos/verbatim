@@ -7,6 +7,8 @@ use super::*;
 
 const CORRUPTED_EVIDENCE_TEXT: &str = "Mutated persisted evidence must not escape.";
 
+#[path = "audit_receipt_tests.rs"]
+mod audit_receipt_tests;
 #[path = "canonical_fixture_passage_tests.rs"]
 mod canonical_fixture_passage_tests;
 #[path = "source_bounded_batch_tests.rs"]

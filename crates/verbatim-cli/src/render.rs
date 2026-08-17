@@ -3217,8 +3217,9 @@ fn value_string_list(value: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use verbatim_core::api::{
-        CollectionResultProvenance, ConfigResponse, EvidenceResponse, RetrieveControlsResponse,
-        RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
+        AuditReceipt, AuditReceiptResult, CollectionResultProvenance, ConfigResponse,
+        EvidenceResponse, RetrieveControlsResponse, RetrieveResponse, RetrieveResultResponse,
+        RetrieveTimingResponse, SourceResponse, AUDIT_RECEIPT_VERSION,
     };
     use verbatim_core::task::{TaskId, TaskKind, TaskStatus};
     use verbatim_core::types::{
@@ -3496,6 +3497,24 @@ mod tests {
                 bm25_top_k: 50,
                 rrf_k: 60,
                 rerank_top_n: 12,
+            },
+            audit_receipt: AuditReceipt {
+                version: AUDIT_RECEIPT_VERSION,
+                embedding_profile_id: "default".into(),
+                source_bounded: true,
+                controls: RetrieveControlsResponse {
+                    fast: true,
+                    rerank_enabled: true,
+                    dense_top_k: 80,
+                    bm25_top_k: 50,
+                    rrf_k: 60,
+                    rerank_top_n: 12,
+                },
+                results: vec![AuditReceiptResult {
+                    evidence_id: "internal-ev-abc123".into(),
+                    text_hash: "verified-text-hash".into(),
+                    source_hash: "persisted-source-hash".into(),
+                }],
             },
             timings: vec![RetrieveTimingResponse {
                 phase: "retrieval".into(),
