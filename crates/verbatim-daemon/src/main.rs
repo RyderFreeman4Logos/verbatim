@@ -104,7 +104,7 @@ use verbatim_core::types::{
     CanonicalLocator, CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId,
     EvidenceKind, EvidenceUnit, ImageArtifact, ReferenceComponent, RetrievalDebug,
     RetrievalDenseVectorPath, RetrievalEvidencePackEntry, RetrievalEvidenceRole,
-    RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalResult, SourceId, SourceLocator,
+    RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalResult, Source, SourceId, SourceLocator,
     SourceStatus,
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
@@ -4683,7 +4683,7 @@ async fn execute_retrieve_task_inner(
     let RetrievedContext {
         results,
         debug,
-        source_paths,
+        sources,
     } = retrieved_context;
     let mut retrieval_progress = timing
         .progress_snapshot()
@@ -4799,7 +4799,7 @@ async fn execute_retrieve_task_inner(
         controls,
         results,
         debug,
-        source_paths,
+        sources,
         retrieval_ms: retrieval_timing.duration_ms,
     };
     let mut response = with_task_store_read(&state, move |store| {
@@ -5475,7 +5475,7 @@ struct EffectiveRetrieveControls {
 struct RetrievedContext {
     results: Vec<RetrievalResult>,
     debug: RetrievalDebug,
-    source_paths: HashMap<String, String>,
+    sources: HashMap<String, Source>,
 }
 
 fn retrieve_debug_display_scope(controls: &EffectiveRetrieveControls) -> RetrievalDisplayScope {
@@ -5524,7 +5524,7 @@ struct RetrieveResponseInput {
     controls: EffectiveRetrieveControls,
     results: Vec<RetrievalResult>,
     debug: RetrievalDebug,
-    source_paths: HashMap<String, String>,
+    sources: HashMap<String, Source>,
     retrieval_ms: u64,
 }
 
@@ -7515,13 +7515,13 @@ async fn prepare_retrieve_context(
                 controls.include_debug,
             )
         })?;
-        let source_paths = with_sqlite_reader_permit(&sqlite_reader, || {
-            source_paths_for_results(&results, pipeline.store())
+        let sources = with_sqlite_reader_permit(&sqlite_reader, || {
+            sources_for_results(&results, pipeline.store())
         })?;
         Ok::<_, anyhow::Error>(RetrievedContext {
             results,
             debug,
-            source_paths,
+            sources,
         })
     })
     .await
@@ -7821,25 +7821,20 @@ fn checked_image_artifact_absolute_path(
     Ok(absolute_path)
 }
 
-fn source_paths_for_results(
+fn sources_for_results(
     results: &[RetrievalResult],
     store: &Store,
-) -> Result<HashMap<String, String>> {
-    let mut paths = HashMap::new();
-    for result in results {
-        for evidence in &result.evidence_units {
-            if paths.contains_key(&evidence.source_id.0) {
-                continue;
-            }
-            if let Some(source) = store.get_source(&evidence.source_id)? {
-                paths.insert(
-                    evidence.source_id.0.clone(),
-                    source.path.display().to_string(),
-                );
-            }
+) -> Result<HashMap<String, Source>> {
+    let mut sources = HashMap::new();
+    for evidence in results.iter().flat_map(|result| &result.evidence_units) {
+        if sources.contains_key(&evidence.source_id.0) {
+            continue;
+        }
+        if let Some(source) = store.get_source(&evidence.source_id)? {
+            sources.insert(evidence.source_id.0.clone(), source);
         }
     }
-    Ok(paths)
+    Ok(sources)
 }
 
 fn persisted_source_hash(store: &Store, source_id: &SourceId) -> Result<String> {
@@ -7854,6 +7849,16 @@ fn persisted_source_hash(store: &Store, source_id: &SourceId) -> Result<String> 
         })
 }
 
+fn prefetched_source<'a>(
+    sources: &'a HashMap<String, Source>,
+    source_id: &SourceId,
+) -> Result<&'a Source> {
+    let Some(source) = sources.get(&source_id.0) else {
+        bail!("persisted source not found: {}", source_id.0);
+    };
+    Ok(source)
+}
+
 fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<RetrieveResponse> {
     let RetrieveResponseInput {
         task_id,
@@ -7865,7 +7870,7 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
         controls,
         results,
         debug,
-        source_paths,
+        sources,
         retrieval_ms,
     } = input;
     let (total_results, results_page) = if controls.passage {
@@ -7873,7 +7878,7 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
             store,
             results: &results,
             debug: &debug,
-            source_paths: &source_paths,
+            sources: &sources,
             collection_provenance: &collection_provenance,
             limit: controls.limit,
             page_size: controls.page_size,
@@ -7887,7 +7892,7 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
             store,
             results: &results,
             debug: &debug,
-            source_paths: &source_paths,
+            sources: &sources,
             collection_provenance: &collection_provenance,
             limit: controls.limit,
             page_size: controls.page_size,
@@ -7935,7 +7940,7 @@ fn retrieve_passage_result_page(
         store,
         results,
         debug: _,
-        source_paths,
+        sources,
         collection_provenance,
         limit,
         page_size,
@@ -7961,7 +7966,7 @@ fn retrieve_passage_result_page(
                 store,
                 group_index: page_index,
                 group,
-                source_paths,
+                sources,
                 collection_provenance,
                 include_locator,
             })
@@ -8030,7 +8035,7 @@ struct PassageGroupResponseInput<'a> {
     store: &'a Store,
     group_index: usize,
     group: &'a PassageGroup<'a>,
-    source_paths: &'a HashMap<String, String>,
+    sources: &'a HashMap<String, Source>,
     collection_provenance: &'a HashMap<String, Vec<CollectionResultProvenance>>,
     include_locator: bool,
 }
@@ -8040,7 +8045,7 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> Result<Retrie
         store,
         group_index,
         group,
-        source_paths,
+        sources,
         collection_provenance,
         include_locator,
     } = input;
@@ -8056,7 +8061,7 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> Result<Retrie
     let last = evidence_units
         .last()
         .expect("passage groups are never empty");
-    let source_hash = persisted_source_hash(store, &first.source_id)?;
+    let source = prefetched_source(sources, &first.source_id)?;
     let (locator, structured_locator) = passage_locator(first, last, include_locator);
 
     Ok(RetrieveResultResponse {
@@ -8066,8 +8071,8 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> Result<Retrie
         evidence_id: first.id.0.clone(),
         text_hash: first.text_hash.clone(),
         source_id: first.source_id.0.clone(),
-        source_hash,
-        source_path: source_paths.get(&first.source_id.0).cloned(),
+        source_hash: source.hash.clone(),
+        source_path: Some(source.path.display().to_string()),
         collections: collection_provenance
             .get(&first.source_id.0)
             .cloned()
@@ -8217,7 +8222,7 @@ struct RetrieveResultPageInput<'a> {
     store: &'a Store,
     results: &'a [RetrievalResult],
     debug: &'a RetrievalDebug,
-    source_paths: &'a HashMap<String, String>,
+    sources: &'a HashMap<String, Source>,
     collection_provenance: &'a HashMap<String, Vec<CollectionResultProvenance>>,
     limit: usize,
     page_size: usize,
@@ -8230,7 +8235,7 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
         store,
         results,
         debug,
-        source_paths,
+        sources,
         collection_provenance,
         limit,
         page_size,
@@ -8253,7 +8258,7 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
         .map(|(index, entry)| {
             let expected = selected_retrieval_evidence(results, entry)?;
             let evidence = store.resolve_source_bounded_evidence(expected)?;
-            let source_hash = persisted_source_hash(store, &evidence.source_id)?;
+            let source = prefetched_source(sources, &evidence.source_id)?;
             Ok(RetrieveResultResponse {
                 index,
                 rank: index + 1,
@@ -8261,8 +8266,8 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
                 evidence_id: evidence.id.0.clone(),
                 text_hash: evidence.text_hash.clone(),
                 source_id: evidence.source_id.0.clone(),
-                source_hash,
-                source_path: source_paths.get(&evidence.source_id.0).cloned(),
+                source_hash: source.hash.clone(),
+                source_path: Some(source.path.display().to_string()),
                 collections: collection_provenance
                     .get(&evidence.source_id.0)
                     .cloned()
@@ -12974,7 +12979,7 @@ mod tests {
             },
             results,
             debug,
-            source_paths: HashMap::new(),
+            sources: HashMap::new(),
             retrieval_ms: 7,
         });
 
@@ -13025,7 +13030,7 @@ mod tests {
             },
             results,
             debug,
-            source_paths: HashMap::new(),
+            sources: HashMap::new(),
             retrieval_ms: 7,
         });
 
@@ -13081,7 +13086,7 @@ mod tests {
             },
             results,
             debug,
-            source_paths: HashMap::new(),
+            sources: HashMap::new(),
             retrieval_ms: 7,
         });
 
@@ -13141,7 +13146,7 @@ mod tests {
             },
             results,
             debug,
-            source_paths: HashMap::new(),
+            sources: HashMap::new(),
             retrieval_ms: 7,
         });
 

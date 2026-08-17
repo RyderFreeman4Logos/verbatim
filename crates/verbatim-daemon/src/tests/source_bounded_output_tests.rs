@@ -194,7 +194,7 @@ fn source_bounded_output_rehydrates_passage_evidence_from_store() {
 fn source_bounded_retrieval_omits_generated_captions_from_all_response_forms() {
     for passage in [false, true] {
         for include_debug in [false, true] {
-            let (_dir, store, source) = persisted_output_fixture("generated-captions", None);
+            let (_dir, store, source) = persisted_output_fixture("captions", None);
             let derived = generated_caption_result(
                 2,
                 "caption-derived",
@@ -599,6 +599,7 @@ fn final_retrieve_response(
         &mut input.debug,
         input.controls.include_debug,
     )?;
+    input.sources = sources_for_results(&input.results, store)?;
     retrieve_response(store, input)
 }
 
@@ -631,6 +632,7 @@ pub(super) fn persisted_retrieve_response(mut input: RetrieveResponseInput) -> R
             .unwrap();
     }
     store.bulk_insert_evidence(&evidence_units).unwrap();
+    input.sources = sources_for_results(&input.results, &store).unwrap();
     retrieve_response(&store, input).unwrap()
 }
 
@@ -718,7 +720,7 @@ fn retrieve_output_input(result: RetrievalResult, passage: bool) -> RetrieveResp
         },
         results,
         debug,
-        source_paths: HashMap::new(),
+        sources: HashMap::new(),
         retrieval_ms: 1,
     }
 }
