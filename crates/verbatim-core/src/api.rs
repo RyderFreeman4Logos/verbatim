@@ -663,6 +663,7 @@ pub struct RetrieveResponse {
     pub returned_results: usize,
     pub source_bounded: bool,
     pub controls: RetrieveControlsResponse,
+    pub audit_receipt: AuditReceipt,
     #[serde(default)]
     pub timings: Vec<RetrieveTimingResponse>,
     #[serde(default)]
@@ -712,6 +713,24 @@ pub struct RetrieveResultResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_from: Option<String>,
     pub snippet: String,
+}
+
+pub const AUDIT_RECEIPT_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditReceipt {
+    pub version: u8,
+    pub embedding_profile_id: String,
+    pub source_bounded: bool,
+    pub controls: RetrieveControlsResponse,
+    pub results: Vec<AuditReceiptResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditReceiptResult {
+    pub evidence_id: String,
+    pub text_hash: String,
+    pub source_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1191,65 +1210,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retrieve_result_omits_structured_locator_until_requested() {
-        let response = RetrieveResponse {
-            task_id: "task-1".into(),
-            query: "What is cited?".into(),
-            source_id: None,
-            collection_filter: None,
-            embedding_profile_id: "default".into(),
-            limit: 12,
-            page_size: 1,
-            page: 1,
-            total_results: 1,
-            returned_results: 1,
-            source_bounded: true,
-            controls: RetrieveControlsResponse {
-                fast: false,
-                rerank_enabled: false,
-                dense_top_k: 80,
-                bm25_top_k: 50,
-                rrf_k: 60,
-                rerank_top_n: 12,
-            },
-            timings: vec![RetrieveTimingResponse {
-                phase: "retrieval".into(),
-                duration_ms: 7,
-            }],
-            results: vec![RetrieveResultResponse {
-                index: 0,
-                rank: 1,
-                label: "E1".into(),
-                evidence_id: "ev-1".into(),
-                text_hash: "verified-text-hash".into(),
-                source_id: "src-1".into(),
-                source_hash: "persisted-source-hash".into(),
-                source_path: Some("/tmp/doc.md".into()),
-                collections: Vec::new(),
-                chunk_id: "chunk-1".into(),
-                kind: "text".into(),
-                role: "original_text".into(),
-                score: 0.03,
-                locator: "/tmp/doc.md L1".into(),
-                structured_locator: None,
-                provenance: None,
-                derived_from: None,
-                snippet: "compact cited text".into(),
-            }],
-            debug: None,
-        };
-
-        let encoded = serde_json::to_string(&response).unwrap();
-
-        assert!(encoded.contains("\"locator\""));
-        assert!(encoded.contains("\"source_bounded\":true"));
-        assert!(encoded.contains("\"text_hash\":\"verified-text-hash\""));
-        assert!(encoded.contains("\"source_hash\":\"persisted-source-hash\""));
-        assert!(!encoded.contains("structured_locator"));
-        assert!(!encoded.contains("provenance"));
-        assert!(!encoded.contains("debug"));
-    }
+    include!("api_retrieve_serialization_tests.rs");
 }
 
 #[cfg(test)]

@@ -71,6 +71,24 @@ fn retrieve_debug_output_renders_markdown_structured_locator_when_present() {
             rrf_k: 60,
             rerank_top_n: 1,
         },
+        audit_receipt: AuditReceipt {
+            version: AUDIT_RECEIPT_VERSION,
+            embedding_profile_id: "default".into(),
+            source_bounded: true,
+            controls: RetrieveControlsResponse {
+                fast: false,
+                rerank_enabled: false,
+                dense_top_k: 10,
+                bm25_top_k: 10,
+                rrf_k: 60,
+                rerank_top_n: 1,
+            },
+            results: vec![AuditReceiptResult {
+                evidence_id: "ev-md".into(),
+                text_hash: "verified-text-hash".into(),
+                source_hash: "persisted-source-hash".into(),
+            }],
+        },
         timings: Vec::new(),
         results: vec![RetrieveResultResponse {
             index: 0,

@@ -2185,18 +2185,19 @@ mod tests {
 
     use serde_json::Value;
     use verbatim_core::api::{
-        AddCollectionRootRequest, AddCollectionRootResponse, AddSourceResponse, CheckStaleResponse,
-        CitationResponse, CollectionResponse, CollectionStatusResponse, CollectionSyncRequest,
-        CollectionSyncResponse, CollectionWatcherResponse, CollectionWatcherStatus,
-        CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
-        CreateCollectionRequest, EvidenceResponse, HealthResponse, IdleExitActivitySnapshot,
-        IdleExitHealth, IdleReclaimActivitySnapshot, IdleReclaimBackendResult,
-        IdleReclaimCycleResult, IdleReclaimHealth, IngestResponse, ReadinessHealth, ReindexRequest,
-        ReindexResponse, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
-        RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
-        TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskListAggregate, TaskListResponse,
-        TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
-        TaskStaleRunningAggregate, TaskSummaryResponse, COLLECTION_CLI_API_PARITY,
+        AddCollectionRootRequest, AddCollectionRootResponse, AddSourceResponse, AuditReceipt,
+        AuditReceiptResult, CheckStaleResponse, CitationResponse, CollectionResponse,
+        CollectionStatusResponse, CollectionSyncRequest, CollectionSyncResponse,
+        CollectionWatcherResponse, CollectionWatcherStatus, CollectionWatcherUpdateRequest,
+        CollectionWatchersStatusResponse, ConfigResponse, CreateCollectionRequest,
+        EvidenceResponse, HealthResponse, IdleExitActivitySnapshot, IdleExitHealth,
+        IdleReclaimActivitySnapshot, IdleReclaimBackendResult, IdleReclaimCycleResult,
+        IdleReclaimHealth, IngestResponse, ReadinessHealth, ReindexRequest, ReindexResponse,
+        RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+        RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
+        TaskEventsResponse, TaskListAggregate, TaskListResponse, TaskProfileResponse,
+        TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate,
+        TaskSummaryResponse, AUDIT_RECEIPT_VERSION, COLLECTION_CLI_API_PARITY,
     };
     use verbatim_core::collection::{
         CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
@@ -5622,6 +5623,27 @@ mod tests {
                 bm25_top_k: request.bm25_top_k.unwrap_or(20),
                 rrf_k: 60,
                 rerank_top_n: request.rerank_top_n.unwrap_or(0),
+            },
+            audit_receipt: AuditReceipt {
+                version: AUDIT_RECEIPT_VERSION,
+                embedding_profile_id: request
+                    .embedding_profile_id
+                    .clone()
+                    .unwrap_or_else(|| "default".into()),
+                source_bounded: true,
+                controls: RetrieveControlsResponse {
+                    fast: request.fast,
+                    rerank_enabled: request.rerank.unwrap_or(false),
+                    dense_top_k: request.dense_top_k.unwrap_or(20),
+                    bm25_top_k: request.bm25_top_k.unwrap_or(20),
+                    rrf_k: 60,
+                    rerank_top_n: request.rerank_top_n.unwrap_or(0),
+                },
+                results: vec![AuditReceiptResult {
+                    evidence_id: "ev-1".into(),
+                    text_hash: "verified-text-hash".into(),
+                    source_hash: "persisted-source-hash".into(),
+                }],
             },
             timings: vec![RetrieveTimingResponse {
                 phase: "retrieval".into(),

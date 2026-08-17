@@ -41,12 +41,11 @@ use verbatim_core::api::{
     IdleReclaimBackendResult, IdleReclaimCycleResult, IdleReclaimHealth, ImageArtifactResponse,
     IndexGcRequest, IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse,
     IndexStatusResponse, IngestResponse, ReadinessHealth, ReindexRequest, ReindexResponse,
-    RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
-    RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
-    TaskEventsResponse, TaskIngestRequest, TaskListAggregate, TaskListResponse,
-    TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
-    TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent, VectorJsonCleanupRequest,
-    VectorJsonCleanupResponse,
+    RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
+    SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate, TaskEventsResponse,
+    TaskIngestRequest, TaskListAggregate, TaskListResponse, TaskProfileResponse, TaskQueueTurnover,
+    TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse,
+    TaskWaitEvent, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -109,6 +108,7 @@ use verbatim_core::types::{
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
+mod audit_receipt;
 #[path = "auth_middleware.rs"]
 mod auth_middleware;
 #[path = "deletion_api.rs"]
@@ -7902,8 +7902,8 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
         })?;
         (total_results, results_page)
     };
-    let returned_results = results_page.len();
-    let debug = controls.include_debug.then_some(debug);
+    let (controls_response, audit_receipt) =
+        audit_receipt::snapshot(embedding_profile_id.as_str(), &controls, &results_page);
 
     Ok(RetrieveResponse {
         task_id: task_id.0,
@@ -7915,22 +7915,16 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
         page_size: controls.page_size,
         page: controls.page,
         total_results,
-        returned_results,
+        returned_results: results_page.len(),
         source_bounded: true,
-        controls: RetrieveControlsResponse {
-            fast: controls.fast,
-            rerank_enabled: controls.rerank_config.enabled,
-            dense_top_k: controls.retrieval_config.dense_top_k,
-            bm25_top_k: controls.retrieval_config.bm25_top_k,
-            rrf_k: controls.retrieval_config.rrf_k,
-            rerank_top_n: controls.rerank_config.top_n,
-        },
+        controls: controls_response,
+        audit_receipt,
         timings: vec![RetrieveTimingResponse {
             phase: "retrieval".into(),
             duration_ms: retrieval_ms,
         }],
         results: results_page,
-        debug,
+        debug: controls.include_debug.then_some(debug),
     })
 }
 
