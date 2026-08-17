@@ -79,15 +79,23 @@ async fn scoped_retrieval_keeps_configured_candidate_limits() {
 }
 
 #[tokio::test]
-async fn source_filter_does_not_expand_local_dense_top_k() {
+async fn source_filter_adaptively_overfetches_local_dense_top_k() {
     let store = Store::in_memory().unwrap();
     let wanted = source("src-wanted");
     let other = source("src-other");
+    let trailing = source("src-trailing");
     let wanted_chunk = insert_child(&store, &wanted, "chunk-wanted", "wanted content");
     let other_chunk = insert_child(&store, &other, "chunk-other", "other content");
+    let trailing_chunk = insert_child(
+        &store,
+        &trailing,
+        "chunk-trailing",
+        "trailing content",
+    );
     let vector_index = StaticVectorIndex::new(vec![
         (other_chunk.id, 1.0),
-        (wanted_chunk.id, 0.5),
+        (wanted_chunk.id.clone(), 0.5),
+        (trailing_chunk.id, 0.25),
     ]);
     let lexical_index = StaticLexicalIndex::new(Vec::new());
     let embed_client = KeywordEmbeddingClient;
@@ -109,7 +117,8 @@ async fn source_filter_does_not_expand_local_dense_top_k() {
         .await
         .unwrap();
 
-    assert!(results.is_empty());
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].chunk_id, wanted_chunk.id);
     assert_eq!(
         debug
             .candidate_counters

@@ -45,6 +45,42 @@ impl VectorIndex for RecordingVectorIndex {
     }
 }
 
+#[tokio::test]
+async fn zero_budget_scoped_dense_search_stays_empty() {
+    let store = Store::in_memory().unwrap();
+    let vector_index = RecordingVectorIndex {
+        hits: vec![(ChunkId("chunk-not-requested".into()), 0.9)],
+        search_count: AtomicUsize::new(0),
+    };
+    let lexical_index = StaticLexicalIndex::new(Vec::new());
+    let embed_client = KeywordEmbeddingClient;
+    let config = RetrievalConfig::default();
+    let pipeline = RetrievalPipeline::new(
+        &vector_index,
+        &lexical_index,
+        &store,
+        &embed_client,
+        &config,
+    );
+    let source_filter = HashSet::from([SourceId("src-wanted".into())]);
+    let mut counters = CandidateCounters::default();
+    let mut spans = RetrievalLocalSpansMs::default();
+
+    let (hits, _) = pipeline
+        .dense_search(
+            &[1.0, 0.0],
+            0,
+            Some(&source_filter),
+            &mut counters,
+            &mut spans,
+        )
+        .await
+        .unwrap();
+
+    assert!(hits.is_empty());
+    assert_eq!(vector_index.search_count.load(Ordering::SeqCst), 1);
+}
+
 #[cfg(feature = "qdrant")]
 #[tokio::test]
 async fn qdrant_empty_and_zero_budget_inputs_use_local_dense_path() {
@@ -130,6 +166,62 @@ async fn qdrant_empty_and_zero_budget_inputs_use_local_dense_path() {
     assert!(handle.join().unwrap().is_none());
     assert_eq!(resource.snapshot().active, 0);
     assert_eq!(resource.snapshot().queued, 0);
+}
+
+#[cfg(feature = "qdrant")]
+#[tokio::test]
+async fn qdrant_empty_scoped_fallback_cap_exhaustion_is_typed() {
+    const FOREIGN_HIT_COUNT: usize = 256;
+
+    let (qdrant_url, handle) =
+        spawn_qdrant_search_response(200, r#"{"status":"ok","result":[]}"#);
+    let store = Store::in_memory().unwrap();
+    let wanted_source = source("src-qdrant-cap-exhausted");
+    let wanted_chunk = insert_child(
+        &store,
+        &wanted_source,
+        "chunk-beyond-overfetch-cap",
+        "alpha wanted beyond cap",
+    );
+    let mut local_hits = (0..FOREIGN_HIT_COUNT)
+        .map(|rank| {
+            (
+                ChunkId(format!("chunk-foreign-{rank}")),
+                (FOREIGN_HIT_COUNT - rank) as f32,
+            )
+        })
+        .collect::<Vec<_>>();
+    local_hits.push((wanted_chunk.id, 0.0));
+    let vector_index = StaticVectorIndex::new(local_hits);
+    let lexical_index = StaticLexicalIndex::new(Vec::new());
+    let embed_client = KeywordEmbeddingClient;
+    let config = RetrievalConfig {
+        dense_top_k: 1,
+        bm25_top_k: 0,
+        ..RetrievalConfig::default()
+    };
+    let pipeline = RetrievalPipeline::new(
+        &vector_index,
+        &lexical_index,
+        &store,
+        &embed_client,
+        &config,
+    )
+    .with_qdrant_search(&qdrant_config(qdrant_url));
+
+    let error = pipeline
+        .search_filtered("alpha", Some(&wanted_source.id))
+        .await
+        .expect_err("strict source filter must fail closed at the overfetch cap");
+
+    assert_eq!(
+        error.downcast_ref::<crate::overfetch::OverfetchError>(),
+        Some(&crate::overfetch::OverfetchError::UnsupportedStrictFilter)
+    );
+    assert_eq!(
+        handle.join().unwrap(),
+        "POST /collections/verbatim/points/search HTTP/1.1"
+    );
 }
 
 #[cfg(feature = "qdrant")]
