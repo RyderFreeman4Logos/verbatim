@@ -9801,7 +9801,6 @@ fn log_fts_startup_maintenance(outcome: FtsMaintenanceOutcome) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::time::error::Elapsed;
     use verbatim_core::index::sqlite_fts::{
         FtsMaintenanceCounts, FtsMaintenanceReason, FtsMaintenanceStatus,
     };
@@ -9826,8 +9825,13 @@ mod tests {
     mod sql_statement_telemetry_tests;
     #[path = "sqlite_durability_tests.rs"]
     mod sqlite_durability_tests;
+    #[path = "task_status_wait_tests.rs"]
+    mod task_status_wait_tests;
 
     use source_bounded_output_tests::persisted_retrieve_response;
+    use task_status_wait_tests::{
+        task_status_wait_deadline, wait_for_task_status, wait_for_task_status_until,
+    };
 
     fn has_task_terminalize_span(spans: &[verbatim_core::task::TaskSpan]) -> bool {
         spans
@@ -18285,13 +18289,14 @@ mod tests {
             release_rx.recv().unwrap();
         });
         locked_rx.await.unwrap();
+        let deadline = task_status_wait_deadline();
         schedule_ingest_queue(Arc::clone(&state));
-        wait_for_task_status(&state, &parent_id, TaskStatus::Failed).await;
-        wait_for_task_status(&state, &followup_id, TaskStatus::Running).await;
+        wait_for_task_status_until(&state, &parent_id, TaskStatus::Failed, deadline).await;
+        wait_for_task_status_until(&state, &followup_id, TaskStatus::Running, deadline).await;
         let running_after_parent_failed = running_ingest_count(&state).await;
         release_tx.send(()).unwrap();
         lock_handle.await.unwrap();
-        wait_for_task_status(&state, &followup_id, TaskStatus::Succeeded).await;
+        wait_for_task_status_until(&state, &followup_id, TaskStatus::Succeeded, deadline).await;
         assert_eq!(running_after_parent_failed, 1);
         assert_eq!(running_ingest_count(&state).await, 0);
         for child_id in child_ids {
@@ -18768,39 +18773,6 @@ mod tests {
             .await
             .expect("ingest queue drain receipt must complete")
             .expect("ingest queue drain receipt sender must remain available");
-    }
-
-    fn assert_status_wait(result: Result<(), Elapsed>, task_id: &TaskId, status: TaskStatus) {
-        let task_id = &task_id.0;
-        let Ok(()) = result else {
-            panic!("ingest task {task_id} did not reach {status:?} within 10s");
-        };
-    }
-
-    async fn wait_for_task_status(state: &SharedState, task_id: &TaskId, status: TaskStatus) {
-        let result = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let task = task_summary_response(state, task_id.clone())
-                    .await
-                    .unwrap()
-                    .task;
-                if task.status == status {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        assert_status_wait(result, task_id, status);
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "ingest task task-id did not reach Succeeded within 10s")]
-    async fn task_status_wait_timeout_names_waited_condition() {
-        let task_id = TaskId("task-id".into());
-        assert_status_wait(Ok(()), &task_id, TaskStatus::Queued);
-        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>()).await;
-        assert_status_wait(elapsed, &task_id, TaskStatus::Succeeded);
     }
 
     async fn wait_for_collection_watcher_status<F>(
