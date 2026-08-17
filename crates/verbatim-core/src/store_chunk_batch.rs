@@ -4,7 +4,8 @@ use anyhow::Result;
 use rusqlite::params_from_iter;
 
 use super::{
-    row_to_chunk_tuple, tuple_to_chunk_with_evidence_ids, Chunk, ChunkId, EvidenceId, Store,
+    row_to_chunk_tuple, row_to_evidence_unit, tuple_to_chunk_with_evidence_ids, Chunk, ChunkId,
+    EvidenceId, EvidenceUnit, Store,
 };
 
 const SQLITE_VARIABLE_LIMIT: usize = 32_766;
@@ -54,6 +55,32 @@ impl Store {
                 (id, chunk)
             })
             .collect())
+    }
+
+    /// Load evidence in bounded batches, omitting missing IDs and retaining row-local errors.
+    pub fn get_evidence_batch(
+        &self,
+        ids: &[EvidenceId],
+    ) -> Result<HashMap<EvidenceId, Result<EvidenceUnit>>> {
+        let mut seen = HashSet::with_capacity(ids.len());
+        let ids = ids
+            .iter()
+            .filter(|id| seen.insert(&id.0))
+            .collect::<Vec<_>>();
+        let mut evidence = HashMap::with_capacity(ids.len());
+        for batch in ids.chunks(SQLITE_VARIABLE_LIMIT) {
+            let placeholders = vec!["?"; batch.len()].join(", ");
+            let sql = format!(
+                "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, position, derived_from_evidence_id FROM evidence_units WHERE id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params_from_iter(batch.iter().map(|id| &id.0)))?;
+            while let Some(row) = rows.next()? {
+                let id = EvidenceId(row.get(0)?);
+                evidence.insert(id, row_to_evidence_unit(row).map_err(Into::into));
+            }
+        }
+        Ok(evidence)
     }
 }
 

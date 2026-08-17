@@ -93,30 +93,26 @@ fn source_bounded_retrieval_chunk_ids(
 
     let candidate_ids = candidate_ids.into_iter().collect::<Vec<_>>();
     let chunks = store.get_chunks(&candidate_ids)?;
-    let mut evidence_is_source_bounded = HashMap::new();
+    let evidence_ids = chunks
+        .values()
+        .filter_map(|chunk| chunk.as_ref().ok())
+        .flat_map(|chunk| chunk.evidence_unit_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    let evidence = store.get_evidence_batch(&evidence_ids)?;
     let mut source_bounded_chunk_ids = HashSet::new();
     for (chunk_id, chunk) in chunks {
-        let chunk = chunk?;
+        let Ok(chunk) = chunk else {
+            continue;
+        };
         if chunk.evidence_unit_ids.is_empty() {
             continue;
         }
-        let source_bounded =
-            chunk
-                .evidence_unit_ids
-                .iter()
-                .try_fold(true, |all, evidence_id| {
-                    let source_bounded = match evidence_is_source_bounded.get(evidence_id) {
-                        Some(source_bounded) => *source_bounded,
-                        None => {
-                            let source_bounded = store
-                                .get_evidence(evidence_id)?
-                                .is_some_and(|evidence| evidence.kind != EvidenceKind::Generated);
-                            evidence_is_source_bounded.insert(evidence_id.clone(), source_bounded);
-                            source_bounded
-                        }
-                    };
-                    Ok::<_, anyhow::Error>(all && source_bounded)
-                })?;
+        let source_bounded = chunk.evidence_unit_ids.iter().all(|evidence_id| {
+            matches!(
+                evidence.get(evidence_id),
+                Some(Ok(evidence)) if evidence.kind != EvidenceKind::Generated
+            )
+        });
         if source_bounded {
             source_bounded_chunk_ids.insert(chunk_id);
         }
