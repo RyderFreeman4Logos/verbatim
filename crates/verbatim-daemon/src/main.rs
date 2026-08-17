@@ -7842,6 +7842,18 @@ fn source_paths_for_results(
     Ok(paths)
 }
 
+fn persisted_source_hash(store: &Store, source_id: &SourceId) -> Result<String> {
+    store
+        .get_source(source_id)?
+        .map(|source| source.hash)
+        .with_context(|| {
+            format!(
+                "persisted source not found for source_hash receipt: {}",
+                source_id.0
+            )
+        })
+}
+
 fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<RetrieveResponse> {
     let RetrieveResponseInput {
         task_id,
@@ -8044,6 +8056,7 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> Result<Retrie
     let last = evidence_units
         .last()
         .expect("passage groups are never empty");
+    let source_hash = persisted_source_hash(store, &first.source_id)?;
     let (locator, structured_locator) = passage_locator(first, last, include_locator);
 
     Ok(RetrieveResultResponse {
@@ -8053,6 +8066,7 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> Result<Retrie
         evidence_id: first.id.0.clone(),
         text_hash: first.text_hash.clone(),
         source_id: first.source_id.0.clone(),
+        source_hash,
         source_path: source_paths.get(&first.source_id.0).cloned(),
         collections: collection_provenance
             .get(&first.source_id.0)
@@ -8239,6 +8253,7 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
         .map(|(index, entry)| {
             let expected = selected_retrieval_evidence(results, entry)?;
             let evidence = store.resolve_source_bounded_evidence(expected)?;
+            let source_hash = persisted_source_hash(store, &evidence.source_id)?;
             Ok(RetrieveResultResponse {
                 index,
                 rank: index + 1,
@@ -8246,6 +8261,7 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
                 evidence_id: evidence.id.0.clone(),
                 text_hash: evidence.text_hash.clone(),
                 source_id: evidence.source_id.0.clone(),
+                source_hash,
                 source_path: source_paths.get(&evidence.source_id.0).cloned(),
                 collections: collection_provenance
                     .get(&evidence.source_id.0)
@@ -8336,10 +8352,15 @@ async fn get_evidence(
     Path(eid): Path<String>,
 ) -> Result<Json<EvidenceResponse>, (StatusCode, Json<ErrorResponse>)> {
     let eid_clone = eid.clone();
-    let (evidence, image_artifact) = with_task_store_read(&state, move |store| {
+    let (evidence, source_hash, image_artifact) = with_task_store_read(&state, move |store| {
         let evidence = store
             .get_evidence(&EvidenceId(eid_clone))?
             .map(|evidence| store.resolve_source_bounded_evidence(&evidence))
+            .transpose()?;
+        let source_hash = evidence
+            .as_ref()
+            .filter(|evidence| evidence.kind != EvidenceKind::Generated)
+            .map(|evidence| persisted_source_hash(store, &evidence.source_id))
             .transpose()?;
         let image_artifact = match &evidence {
             Some(eu) => {
@@ -8354,7 +8375,7 @@ async fn get_evidence(
             }
             None => None,
         };
-        Ok::<_, anyhow::Error>((evidence, image_artifact))
+        Ok::<_, anyhow::Error>((evidence, source_hash, image_artifact))
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -8364,6 +8385,7 @@ async fn get_evidence(
             kind: evidence_kind_name(eu.kind).to_string(),
             id: eu.id.0,
             source_id: eu.source_id.0,
+            source_hash,
             source_bounded: eu.kind != EvidenceKind::Generated,
             text_hash: eu.text_hash,
             derived_from: eu.derived_from.map(|id| id.0),

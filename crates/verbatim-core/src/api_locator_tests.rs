@@ -32,6 +32,7 @@ fn markdown_locator_serializes_in_evidence_and_retrieve_responses() {
     let evidence = EvidenceResponse {
         id: "ev-md".into(),
         source_id: "src-1".into(),
+        source_hash: Some("persisted-source-hash".into()),
         source_bounded: true,
         text_hash: "verified-text-hash".into(),
         kind: "text".into(),
@@ -50,6 +51,7 @@ fn markdown_locator_serializes_in_evidence_and_retrieve_responses() {
         evidence_id: "ev-md".into(),
         text_hash: "verified-text-hash".into(),
         source_id: "src-1".into(),
+        source_hash: "persisted-source-hash".into(),
         source_path: Some("/tmp/doc.md".into()),
         collections: Vec::new(),
         chunk_id: "chunk-1".into(),

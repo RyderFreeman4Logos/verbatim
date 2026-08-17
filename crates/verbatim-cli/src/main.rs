@@ -5573,6 +5573,7 @@ mod tests {
         EvidenceResponse {
             id: "ev-1".into(),
             source_id: "src-1".into(),
+            source_hash: Some("persisted-source-hash".into()),
             source_bounded: true,
             text_hash: "receipt-text-hash".into(),
             kind: "text".into(),
@@ -5633,6 +5634,7 @@ mod tests {
                 evidence_id: "ev-1".into(),
                 text_hash: "verified-text-hash".into(),
                 source_id: "src-1".into(),
+                source_hash: "persisted-source-hash".into(),
                 source_path: Some("/tmp/doc.md".into()),
                 collections: Vec::new(),
                 chunk_id: "chunk-1".into(),

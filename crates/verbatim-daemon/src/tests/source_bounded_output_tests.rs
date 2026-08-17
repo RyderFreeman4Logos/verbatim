@@ -11,6 +11,8 @@ const CORRUPTED_EVIDENCE_TEXT: &str = "Mutated persisted evidence must not escap
 mod canonical_fixture_passage_tests;
 #[path = "source_bounded_batch_tests.rs"]
 mod source_bounded_batch_tests;
+#[path = "source_hash_receipt_tests.rs"]
+mod source_hash_receipt_tests;
 
 fn write_pdf_with_text_and_image(path: &std::path::Path) {
     let image = vec![255_u8; 8 * 8 * 3];

@@ -687,6 +687,7 @@ pub struct RetrieveResultResponse {
     pub evidence_id: String,
     pub text_hash: String,
     pub source_id: String,
+    pub source_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -721,6 +722,8 @@ pub struct CitationResponse {
 pub struct EvidenceResponse {
     pub id: String,
     pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<String>,
     pub source_bounded: bool,
     pub text_hash: String,
     pub kind: String,
@@ -1236,6 +1239,7 @@ mod tests {
                 evidence_id: "ev-1".into(),
                 text_hash: "verified-text-hash".into(),
                 source_id: "src-1".into(),
+                source_hash: "persisted-source-hash".into(),
                 source_path: Some("/tmp/doc.md".into()),
                 collections: Vec::new(),
                 chunk_id: "chunk-1".into(),
@@ -1256,6 +1260,7 @@ mod tests {
         assert!(encoded.contains("\"locator\""));
         assert!(encoded.contains("\"source_bounded\":true"));
         assert!(encoded.contains("\"text_hash\":\"verified-text-hash\""));
+        assert!(encoded.contains("\"source_hash\":\"persisted-source-hash\""));
         assert!(!encoded.contains("structured_locator"));
         assert!(!encoded.contains("provenance"));
         assert!(!encoded.contains("debug"));
