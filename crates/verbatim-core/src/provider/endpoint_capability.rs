@@ -35,6 +35,7 @@ const WEIGHT_IDENTITY_FIELDS: &[&str] = &[
     "weight_hash",
     "checkpoint",
 ];
+const SUPPORT_OUTPUT_DIMENSIONS_FIELDS: &[&str] = &["support_dimensions", "supports_dimensions"];
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(super) enum EndpointCapabilityRole {
@@ -57,6 +58,8 @@ pub(super) struct EndpointCapability {
     pub dtype: Option<String>,
     pub quantization: Option<String>,
     pub weight_identity: Option<String>,
+    /// Whether the provider advertises accepting an output `dimensions` field on embedding requests.
+    pub supports_output_dimensions: Option<bool>,
     pub request_limits: EndpointRequestLimits,
 }
 
@@ -67,6 +70,7 @@ impl EndpointCapability {
             && self.dtype.is_none()
             && self.quantization.is_none()
             && self.weight_identity.is_none()
+            && self.supports_output_dimensions.is_none()
             && self.request_limits.is_empty()
     }
 }
@@ -110,6 +114,7 @@ pub(super) struct EndpointCapabilityDiagnostics {
     pub dtype: Option<String>,
     pub quantization: Option<String>,
     pub weight_identity: Option<String>,
+    pub supports_output_dimensions: Option<bool>,
     pub max_batch_size: Option<usize>,
     pub max_inputs: Option<usize>,
     pub max_input_chars: Option<usize>,
@@ -134,6 +139,8 @@ impl EndpointCapabilityDiagnostics {
             dtype: value.and_then(|capability| capability.dtype.clone()),
             quantization: value.and_then(|capability| capability.quantization.clone()),
             weight_identity: value.and_then(|capability| capability.weight_identity.clone()),
+            supports_output_dimensions: value
+                .and_then(|capability| capability.supports_output_dimensions),
             max_batch_size: limits.and_then(|limits| limits.max_batch_size),
             max_inputs: limits.and_then(|limits| limits.max_inputs),
             max_input_chars: limits.and_then(|limits| limits.max_input_chars),
@@ -308,6 +315,10 @@ pub(super) fn parse_endpoint_capability(
         dtype: find_metadata_string(search_root, DTYPE_FIELDS),
         quantization: find_metadata_string(search_root, QUANTIZATION_FIELDS),
         weight_identity: find_metadata_string(search_root, WEIGHT_IDENTITY_FIELDS),
+        supports_output_dimensions: find_optional_bool(
+            search_root,
+            SUPPORT_OUTPUT_DIMENSIONS_FIELDS,
+        ),
         request_limits: find_request_limits(search_root),
     };
     (!capability.is_empty()).then_some(capability)
@@ -427,6 +438,36 @@ fn find_metadata_string(value: &serde_json::Value, fields: &[&str]) -> Option<St
     let mut values = Vec::new();
     collect_metadata_strings(value, fields, &mut values);
     values.into_iter().next()
+}
+
+fn find_optional_bool(value: &serde_json::Value, fields: &[&str]) -> Option<bool> {
+    let mut values = Vec::new();
+    collect_optional_bools(value, fields, &mut values);
+    values.into_iter().next()
+}
+
+fn collect_optional_bools(value: &serde_json::Value, fields: &[&str], values: &mut Vec<bool>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if fields.iter().any(|field| key.eq_ignore_ascii_case(field)) {
+                    if let Some(value) = value.as_bool() {
+                        values.push(value);
+                    }
+                }
+                collect_optional_bools(value, fields, values);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_optional_bools(item, fields, values);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
 }
 
 fn collect_metadata_strings(value: &serde_json::Value, fields: &[&str], values: &mut Vec<String>) {
@@ -656,145 +697,5 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_context_fields_from_common_metadata_shapes() {
-        for field in [
-            "max_model_len",
-            "max_context_length",
-            "context_length",
-            "max_sequence_length",
-            "max_seq_len",
-            "max_position_embeddings",
-            "model_max_length",
-            "n_ctx",
-        ] {
-            let response = serde_json::json!({
-                "data": [
-                    {
-                        "id": "target-model",
-                        "model_extra": {
-                            field: "4096"
-                        }
-                    }
-                ]
-            });
-
-            let capability =
-                parse_endpoint_capability(&response, "target-model").expect("capability parsed");
-
-            assert_eq!(capability.max_context_tokens, Some(4096), "{field}");
-        }
-    }
-
-    #[test]
-    fn missing_or_invalid_capability_fields_return_unavailable() {
-        for value in [
-            serde_json::json!({"data": [{"id": "target-model"}]}),
-            serde_json::json!({"data": [{"id": "target-model", "max_model_len": 0}]}),
-            serde_json::json!({"data": [{"id": "target-model", "max_model_len": "invalid"}]}),
-            serde_json::json!({"data": [{"id": "other-model", "max_model_len": 4096}, {"id": "second-model", "max_model_len": 2048}]}),
-        ] {
-            assert!(
-                parse_endpoint_capability(&value, "target-model").is_none(),
-                "{value}"
-            );
-        }
-    }
-
-    #[test]
-    fn parses_safe_request_shaping_hints() {
-        let response = serde_json::json!({
-            "data": [{
-                "id": "target-model",
-                "limits": {
-                    "max_batch_size": 8,
-                    "max_inputs": "4",
-                    "max_input_chars": 2000,
-                    "max_payload_chars": 10000,
-                    "max_candidates": 12,
-                    "max_documents": 10,
-                    "max_document_chars": 1500
-                }
-            }]
-        });
-
-        let capability =
-            parse_endpoint_capability(&response, "target-model").expect("capability parsed");
-
-        assert_eq!(capability.request_limits.embedding_batch_size(), Some(4));
-        assert_eq!(capability.request_limits.rerank_candidate_count(), Some(10));
-        assert_eq!(capability.request_limits.max_input_chars, Some(2000));
-        assert_eq!(capability.request_limits.max_payload_chars, Some(10000));
-        assert_eq!(capability.request_limits.max_document_chars, Some(1500));
-    }
-
-    #[test]
-    fn cache_key_strips_query_tokens_and_distinguishes_role_provider_model() {
-        let rerank_key = EndpointCapabilityCacheKey::new(
-            "HTTP://LOCALHOST:8003/v1?token=fixture-secret#frag",
-            EndpointCapabilityRole::Rerank,
-            "VLLM",
-            "model-a",
-        );
-        let embedding_key = EndpointCapabilityCacheKey::new(
-            "http://localhost:8003/v1?token=other",
-            EndpointCapabilityRole::Embedding,
-            "openai_compatible",
-            "model-a",
-        );
-        let other_model_key = EndpointCapabilityCacheKey::new(
-            "http://localhost:8003/v1",
-            EndpointCapabilityRole::Rerank,
-            "vllm",
-            "model-b",
-        );
-
-        assert_eq!(rerank_key.base_url(), "http://localhost:8003/v1");
-        assert_ne!(rerank_key, embedding_key);
-        assert_ne!(rerank_key, other_model_key);
-    }
-
-    #[test]
-    fn cache_respects_ttl_and_forced_refresh_path() {
-        let cache = EndpointCapabilityCache::new();
-        let key = EndpointCapabilityCacheKey::new(
-            "http://localhost:8003/v1",
-            EndpointCapabilityRole::Rerank,
-            "vllm",
-            "cache-model",
-        );
-        cache.insert(
-            key.clone(),
-            EndpointCapabilityLookup::refreshed(EndpointCapability {
-                max_context_tokens: Some(4096),
-                served_model: None,
-                dtype: None,
-                quantization: None,
-                weight_identity: None,
-                request_limits: EndpointRequestLimits::default(),
-            }),
-        );
-
-        let fresh = cache
-            .get_fresh(&key, Duration::from_secs(60))
-            .expect("fresh cache entry");
-        assert_eq!(fresh.diagnostics.state, EndpointCapabilityState::Cached);
-        assert_eq!(fresh.diagnostics.max_context_tokens, Some(4096));
-
-        cache.age_entry(&key, Duration::from_secs(120));
-        assert!(cache.get_fresh(&key, Duration::from_secs(60)).is_none());
-    }
-
-    #[test]
-    fn model_discovery_paths_support_v1_and_bare_host_base_urls() {
-        assert_eq!(
-            model_discovery_paths("http://127.0.0.1:8003/v1"),
-            vec!["models"]
-        );
-        assert_eq!(
-            model_discovery_paths("http://127.0.0.1:8003"),
-            vec!["v1/models", "models"]
-        );
-    }
+    include!("endpoint_capability_tests.rs");
 }

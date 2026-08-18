@@ -214,10 +214,21 @@ impl OpenAiCompatibleEmbeddingModel {
     }
 
     async fn post_embedding_batch(&self, batch: &[String]) -> ProviderResult<Vec<Vec<f32>>> {
+        let capability = self.cached_endpoint_capability();
         let body = OpenAiEmbeddingRequest {
             model: self.endpoint.model.clone(),
             input: batch.to_vec(),
             encoding_format: "float",
+            dimensions: self.requested_output_dimensions(capability.value.as_ref()),
+            // Server-side normalize is omitted: the client already owns normalization
+            // (`self.normalize` below), so sending it would claim a provider-side semantic
+            // we do not verify and could double-normalize.
+            normalize: None,
+            // Custom instruction is omitted: the prepared `input` (via `prepare_query` /
+            // `prepare_document`) already owns instruction text. One owner, no duplication.
+            instruction: None,
+            // Served/deployment version is omitted until a provider advertises accepting it.
+            model_version: None,
         };
 
         let response: OpenAiEmbeddingResponse = self
@@ -319,6 +330,17 @@ impl OpenAiCompatibleEmbeddingModel {
             .and_then(|capability| capability.request_limits.embedding_batch_size())
             .map_or(self.batch_size, |limit| self.batch_size.min(limit.max(1)))
             .max(1)
+    }
+
+    /// Output `dimensions` to request only when the endpoint capability explicitly advertises
+    /// accepting it. Without that evidence we omit the field rather than silently claim
+    /// provider-side semantics.
+    fn requested_output_dimensions(
+        &self,
+        capability: Option<&EndpointCapability>,
+    ) -> Option<usize> {
+        (self.dimension > 0 && capability?.supports_output_dimensions == Some(true))
+            .then_some(self.dimension)
     }
 
     fn prepare_for_purpose(&self, text: &str, purpose: EmbeddingPurpose) -> String {
@@ -1625,6 +1647,14 @@ struct OpenAiEmbeddingRequest {
     model: String,
     input: Vec<String>,
     encoding_format: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normalize: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instruction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1948,6 +1978,7 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    mod embedding_request_caps_tests;
     mod transport_policy_tests;
 
     #[derive(Debug)]
@@ -2505,56 +2536,6 @@ mod tests {
         assert_eq!(first_body["input"].as_array().unwrap().len(), 2);
         assert_eq!(retry_body["input"].as_array().unwrap().len(), 1);
         assert_eq!(retry_body["input"][0], "first");
-    }
-
-    #[test]
-    fn serializes_text_chat_request_shape() {
-        let model = OpenAiCompatibleChatModel {
-            endpoint: OpenAiEndpoint::new("http://127.0.0.1:8000/v1", "model", "", 120),
-            temperature: 0.2,
-        };
-        let body = model.chat_body(
-            ChatRequest::new(vec![
-                ChatMessage::system("system prompt"),
-                ChatMessage::user("user prompt"),
-            ])
-            .with_max_tokens(42),
-            false,
-        );
-
-        let value = serde_json::to_value(body).expect("serialize chat request");
-
-        assert_eq!(value["model"], "model");
-        assert_eq!(value["stream"], false);
-        assert_eq!(value["max_tokens"], 42);
-        assert_eq!(value["messages"][0]["role"], "system");
-        assert_eq!(value["messages"][1]["content"], "user prompt");
-    }
-
-    #[test]
-    fn serializes_vision_message_with_data_uri() {
-        let message = ChatMessage::user_parts(vec![
-            ChatContentPart::Text {
-                text: "Describe".into(),
-            },
-            ChatContentPart::ImageUrl {
-                image_url: ImageUrl {
-                    url: ImageInput::data_uri("data:image/png;base64,abc").to_openai_url(),
-                    detail: Some("high".into()),
-                },
-            },
-        ]);
-
-        let value = serde_json::to_value(message).expect("serialize vision message");
-
-        assert_eq!(value["role"], "user");
-        assert_eq!(value["content"][0]["type"], "text");
-        assert_eq!(value["content"][1]["type"], "image_url");
-        assert_eq!(
-            value["content"][1]["image_url"]["url"],
-            "data:image/png;base64,abc"
-        );
-        assert_eq!(value["content"][1]["image_url"]["detail"], "high");
     }
 
     #[test]
