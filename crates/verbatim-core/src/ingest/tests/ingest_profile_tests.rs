@@ -37,12 +37,14 @@ fn capability_refresh_preserves_mixed_case_embedding_identities() {
 
 #[test]
 fn canonical_chunker_config_changes_profile_hash() {
-    let config = embedding_context_config(8192);
-    let first = EmbeddingProfileSpec::from_config(&config.embedding);
-    let mut second = first.clone();
-    second.canonical_chunker_config.overlap_units += 1;
+    let default_config = embedding_context_config(8192);
+    let default_spec = EmbeddingProfileSpec::from_config(&default_config.embedding);
 
-    assert_ne!(first.config_hash(), second.config_hash());
+    let mut custom_config = embedding_context_config(8192);
+    custom_config.embedding.canonical_overlap_units = 4;
+    let custom_spec = EmbeddingProfileSpec::from_config(&custom_config.embedding);
+
+    assert_ne!(default_spec.config_hash(), custom_spec.config_hash());
 }
 
 #[test]

@@ -603,7 +603,11 @@ impl EmbeddingProfileSpec {
             quantization: lowercase_optional_string(config.quantization.as_deref()),
             weight_identity: trimmed_optional_string(config.weight_identity.as_deref()),
             chunker_config: ChunkerConfig::default(),
-            canonical_chunker_config: CanonicalChunkerConfig::default(),
+            canonical_chunker_config: CanonicalChunkerConfig {
+                target_tokens: config.canonical_target_tokens,
+                overlap_units: config.canonical_overlap_units,
+                max_units_per_child: config.canonical_max_units_per_child,
+            },
             embedding_input_budget_tokens: None,
             query_instruction: config.query_instruction.clone(),
             document_instruction: config.document_instruction.clone(),
