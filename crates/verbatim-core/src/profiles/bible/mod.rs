@@ -6,98 +6,17 @@
 //! This is the first concrete profile; the generic data model lives in
 //! [`crate::types`] and [`super`].
 
+pub mod canon_registry;
+
 use super::{
     default_normalize, default_render, ParsedReference, ReferenceConfidence, SourceProfile,
 };
 use crate::types::{CanonicalLocator, ReferenceComponent};
+use canon_registry::CanonRegistry;
 
-/// Protestant 66-book canonical order.
-const BIBLE_BOOKS: &[(&str, &[&str])] = &[
-    ("Genesis", &["gen", "ge", "gn"]),
-    ("Exodus", &["ex", "exo", "exod"]),
-    ("Leviticus", &["lev", "lv", "le"]),
-    ("Numbers", &["num", "nm", "nb"]),
-    ("Deuteronomy", &["deut", "dt", "deutronomy"]),
-    ("Joshua", &["josh", "jos", "jsh"]),
-    ("Judges", &["judg", "jdg", "jdgs"]),
-    ("Ruth", &["ru", "rth"]),
-    ("1 Samuel", &["1 sam", "1sam", "i sam", "1 sm", "1sa"]),
-    ("2 Samuel", &["2 sam", "2sam", "ii sam", "2 sm", "2sa"]),
-    ("1 Kings", &["1 kgs", "1kgs", "i kgs", "1 ki", "1ki"]),
-    ("2 Kings", &["2 kgs", "2kgs", "ii kgs", "2 ki", "2ki"]),
-    ("1 Chronicles", &["1 chron", "1chron", "1 chr", "1ch"]),
-    ("2 Chronicles", &["2 chron", "2chron", "2 chr", "2ch"]),
-    ("Ezra", &["ezr", "ez"]),
-    ("Nehemiah", &["neh", "ne"]),
-    ("Esther", &["est", "esth"]),
-    ("Job", &["jb"]),
-    ("Psalms", &["ps", "psa", "pslm", "psalm"]),
-    ("Proverbs", &["prov", "prv", "pr"]),
-    ("Ecclesiastes", &["eccles", "eccl", "ec", "qoh"]),
-    (
-        "Song of Songs",
-        &["song", "sos", "sg", "canticles", "song of solomon"],
-    ),
-    ("Isaiah", &["isa", "is"]),
-    ("Jeremiah", &["jer", "je", "jr"]),
-    ("Lamentations", &["lam", "lm"]),
-    ("Ezekiel", &["ezek", "eze", "ezk"]),
-    ("Daniel", &["dan", "dn", "da"]),
-    ("Hosea", &["hos", "ho"]),
-    ("Joel", &["joel", "jl"]),
-    ("Amos", &["am", "amo"]),
-    ("Obadiah", &["obad", "ob"]),
-    ("Jonah", &["jonah", "jon", "jnh"]),
-    ("Micah", &["mic", "mi"]),
-    ("Nahum", &["nah", "na"]),
-    ("Habakkuk", &["hab", "hk"]),
-    ("Zephaniah", &["zeph", "zep", "zp"]),
-    ("Haggai", &["hag", "hg"]),
-    ("Zechariah", &["zech", "zec", "zc"]),
-    ("Malachi", &["mal", "ml"]),
-    ("Matthew", &["matt", "mt"]),
-    ("Mark", &["mk", "mrk"]),
-    ("Luke", &["lk", "luk"]),
-    ("John", &["jn", "jhn"]),
-    ("Acts", &["ac"]),
-    ("Romans", &["rom", "ro", "rm"]),
-    ("1 Corinthians", &["1 cor", "1cor", "i cor", "1co"]),
-    ("2 Corinthians", &["2 cor", "2cor", "ii cor", "2co"]),
-    ("Galatians", &["gal", "ga"]),
-    ("Ephesians", &["eph", "ephes"]),
-    ("Philippians", &["phil", "php", "pp"]),
-    ("Colossians", &["col", "cl"]),
-    ("1 Thessalonians", &["1 thess", "1thess", "1 thes", "1th"]),
-    ("2 Thessalonians", &["2 thess", "2thess", "2 thes", "2th"]),
-    ("1 Timothy", &["1 tim", "1tim", "1 ti", "1ti"]),
-    ("2 Timothy", &["2 tim", "2tim", "2 ti", "2ti"]),
-    ("Titus", &["tit", "ti"]),
-    ("Philemon", &["phlm", "philem", "phm"]),
-    ("Hebrews", &["heb", "he"]),
-    ("James", &["jas", "jm"]),
-    ("1 Peter", &["1 pet", "1pet", "1 pe", "1pe"]),
-    ("2 Peter", &["2 pet", "2pet", "2 pe", "2pe"]),
-    ("1 John", &["1 john", "1john", "1 jn", "1jn"]),
-    ("2 John", &["2 john", "2john", "2 jn", "2jn"]),
-    ("3 John", &["3 john", "3john", "3 jn", "3jn"]),
-    ("Jude", &["jd"]),
-    ("Revelation", &["rev", "revelation", "apocalypse", "apoc"]),
-];
-
-/// Find a book by its full name or abbreviation.
+/// Find a book by its full name or abbreviation through the canonical registry.
 fn resolve_book(input: &str) -> Option<(usize, &'static str)> {
-    let normalized = input.trim().to_lowercase();
-    for (ordinal, (name, abbrs)) in BIBLE_BOOKS.iter().enumerate() {
-        if name.to_lowercase() == normalized {
-            return Some((ordinal + 1, name));
-        }
-        for abbr in *abbrs {
-            if *abbr == normalized {
-                return Some((ordinal + 1, name));
-            }
-        }
-    }
-    None
+    CanonRegistry::resolve(input).map(|book| (book.ordinal as usize, book.name))
 }
 
 /// Parse a Bible reference string like "John 3:16" or "1 Cor 13:4-7" or "John 3:16-18".
