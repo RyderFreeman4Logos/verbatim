@@ -19,20 +19,22 @@ fn resolve_book(input: &str) -> Option<(usize, &'static str)> {
     CanonRegistry::resolve(input).map(|book| (book.ordinal as usize, book.name))
 }
 
-/// Parse a Bible reference string like "John 3:16" or "1 Cor 13:4-7" or "John 3:16-18".
+/// Parse a Bible reference string like "John 3:16", "1 Cor 13:4-7", "John 3:16-18",
+/// or a chapter-only / same-book chapter-range reference like "John 3" or "John 3-5".
 ///
-/// Returns `None` if the input does not look like a Bible reference.
+/// Chapter-only and chapter-range references are represented explicitly with a
+/// book + chapter (no fabricated verse) and carry `ReferenceConfidence::Low`,
+/// below exact-verse references. Returns `None` if the input does not look like
+/// a Bible reference, or the range is reversed / malformed.
 pub fn parse_bible_reference(input: &str) -> Option<ParsedReference> {
     let input = input.trim();
     if input.is_empty() {
         return None;
     }
 
-    // Try to match the book name. Book names may contain digits and spaces
-    // (e.g., "1 Corinthians"). We need to greedily try longer prefixes first.
-    // Strategy: find the last space-separated token that looks like "chapter:verse"
-    // or "chapter", then everything before it is the book name.
-
+    // Find the last space-separated token that looks like "chapter:verse" or
+    // "chapter"; everything before it is the book name. Book names may contain
+    // digits and spaces (e.g. "1 Corinthians").
     let colon_pos = input.find(':');
     let space_before_ref = match colon_pos {
         Some(cp) => input[..cp].rfind(' ')?,
@@ -44,58 +46,83 @@ pub fn parse_bible_reference(input: &str) -> Option<ParsedReference> {
 
     let (ordinal, book_name) = resolve_book(book_part)?;
 
-    // Parse the reference part: "3:16", "3:16-18", "3:16-4:2"
-    let (chapter, verse_start, verse_end, cross_chapter) = parse_ref_part(ref_part)?;
+    // Parse the reference part. Returns the start/end chapters plus optional
+    // verse bounds (None for chapter-only / chapter-range references).
+    let (start_ch, end_ch, verse_start, verse_end) = parse_ref_part(ref_part)?;
 
-    // Build components
-    let start = vec![
+    // Reversed chapter ranges fail closed with a stable diagnostic (None).
+    if end_ch < start_ch {
+        return None;
+    }
+
+    let book_comp = |ch: u32| ReferenceComponent {
+        level: "chapter".into(),
+        value: ch.to_string(),
+        ordinal: Some(ch),
+    };
+
+    // Start components: book + chapter (+ verse when this is a verse reference).
+    let mut start = vec![
         ReferenceComponent {
             level: "book".into(),
             value: book_name.to_string(),
             ordinal: Some(ordinal as u32),
         },
-        ReferenceComponent {
-            level: "chapter".into(),
-            value: chapter.to_string(),
-            ordinal: Some(chapter),
-        },
-        ReferenceComponent {
-            level: "verse".into(),
-            value: verse_start.to_string(),
-            ordinal: Some(verse_start),
-        },
+        book_comp(start_ch),
     ];
+    if let Some(vs) = verse_start {
+        start.push(ReferenceComponent {
+            level: "verse".into(),
+            value: vs.to_string(),
+            ordinal: Some(vs),
+        });
+    }
 
-    let end = verse_end.map(|end_verse| {
-        let end_chapter = cross_chapter.unwrap_or(chapter);
-        vec![
+    // End components: verse ranges and same-book chapter ranges.
+    let is_verse = verse_start.is_some();
+    let end = if let Some(ve) = verse_end {
+        let mut e = vec![
             ReferenceComponent {
                 level: "book".into(),
                 value: book_name.to_string(),
                 ordinal: Some(ordinal as u32),
             },
+            book_comp(end_ch),
+        ];
+        e.push(ReferenceComponent {
+            level: "verse".into(),
+            value: ve.to_string(),
+            ordinal: Some(ve),
+        });
+        Some(e)
+    } else if end_ch != start_ch {
+        Some(vec![
             ReferenceComponent {
-                level: "chapter".into(),
-                value: end_chapter.to_string(),
-                ordinal: Some(end_chapter),
+                level: "book".into(),
+                value: book_name.to_string(),
+                ordinal: Some(ordinal as u32),
             },
-            ReferenceComponent {
-                level: "verse".into(),
-                value: end_verse.to_string(),
-                ordinal: Some(end_verse),
-            },
-        ]
-    });
-
-    let display = if let Some(end_verse) = verse_end {
-        let end_ch = cross_chapter.unwrap_or(chapter);
-        if end_ch == chapter {
-            format!("{book_name} {chapter}:{verse_start}-{end_verse}")
-        } else {
-            format!("{book_name} {chapter}:{verse_start}-{end_ch}:{end_verse}")
-        }
+            book_comp(end_ch),
+        ])
     } else {
-        format!("{book_name} {chapter}:{verse_start}")
+        None
+    };
+
+    let display = if is_verse {
+        match verse_end {
+            Some(ve) if end_ch == start_ch => {
+                format!("{book_name} {start_ch}:{}-{ve}", verse_start.unwrap())
+            }
+            Some(ve) => format!(
+                "{book_name} {start_ch}:{}-{end_ch}:{ve}",
+                verse_start.unwrap()
+            ),
+            None => format!("{book_name} {start_ch}:{}", verse_start.unwrap()),
+        }
+    } else if end_ch != start_ch {
+        format!("{book_name} {start_ch}-{end_ch}")
+    } else {
+        format!("{book_name} {start_ch}")
     };
 
     Some(ParsedReference {
@@ -104,12 +131,21 @@ pub fn parse_bible_reference(input: &str) -> Option<ParsedReference> {
         start,
         end,
         display,
-        confidence: ReferenceConfidence::High,
+        confidence: if is_verse {
+            ReferenceConfidence::High
+        } else {
+            // Chapter-only / chapter-range references are plausible but not as
+            // unambiguous as an exact verse.
+            ReferenceConfidence::Low
+        },
     })
 }
 
-/// Parse "3:16", "3:16-18", "3:16-4:2"
-/// Returns (chapter, verse_start, verse_end, cross_chapter_end)
+/// Parse a reference part like "3", "3-5", "3:16", "3:16-18", "3:16-4:2".
+///
+/// Returns `(start_chapter, end_chapter, verse_start, verse_end)`. For chapter
+/// references `verse_start`/`verse_end` are `None`; `end_chapter` equals
+/// `start_chapter` for a single chapter or holds the range end for "3-5".
 fn parse_ref_part(s: &str) -> Option<(u32, u32, Option<u32>, Option<u32>)> {
     let s = s.trim();
 
@@ -120,21 +156,28 @@ fn parse_ref_part(s: &str) -> Option<(u32, u32, Option<u32>, Option<u32>)> {
         if let Some(dash) = rest.find('-') {
             let start: u32 = rest[..dash].trim().parse().ok()?;
             let end_part = rest[dash + 1..].trim();
-            // Check for "3:16-4:2" (cross-chapter)
+            // "3:16-4:2" (cross-chapter verse range)
             if let Some(end_colon) = end_part.find(':') {
                 let end_chapter: u32 = end_part[..end_colon].trim().parse().ok()?;
                 let end_verse: u32 = end_part[end_colon + 1..].trim().parse().ok()?;
-                Some((chapter, start, Some(end_verse), Some(end_chapter)))
+                Some((chapter, end_chapter, Some(start), Some(end_verse)))
             } else {
                 let end_verse: u32 = end_part.parse().ok()?;
-                Some((chapter, start, Some(end_verse), None))
+                Some((chapter, chapter, Some(start), Some(end_verse)))
             }
         } else {
             let verse: u32 = rest.parse().ok()?;
-            Some((chapter, verse, None, None))
+            Some((chapter, chapter, Some(verse), None))
         }
+    } else if let Some(dash) = s.find('-') {
+        // "3-5" (same-book chapter range)
+        let start: u32 = s[..dash].trim().parse().ok()?;
+        let end: u32 = s[dash + 1..].trim().parse().ok()?;
+        Some((start, end, None, None))
     } else {
-        None
+        // "3" (chapter only)
+        let chapter: u32 = s.trim().parse().ok()?;
+        Some((chapter, chapter, None, None))
     }
 }
 
@@ -234,16 +277,79 @@ mod tests {
     }
 
     #[test]
-    fn reject_ambiguous_chapter_references_through_profile_and_registry() {
+    fn chapter_only_is_typed_without_verse() {
+        let parsed = parse_bible_reference("John 3").unwrap();
+        assert_eq!(parsed.display, "John 3");
+        assert!(!parsed.display.contains(':'));
+        assert_eq!(parsed.start.len(), 2);
+        assert_eq!(parsed.start[0].value, "John");
+        assert_eq!(parsed.start[1].value, "3");
+        assert_eq!(parsed.start[1].level, "chapter");
+        assert!(parsed.end.is_none());
+        // Never fabricate a verse component.
+        assert!(!parsed.start.iter().any(|c| c.level == "verse"));
+        // Confidence is below an exact verse.
+        assert_eq!(parsed.confidence, ReferenceConfidence::Low);
+    }
+
+    #[test]
+    fn chapter_range_is_typed_without_verse() {
+        let parsed = parse_bible_reference("John 3-5").unwrap();
+        assert_eq!(parsed.display, "John 3-5");
+        assert!(!parsed.display.contains(':'));
+        assert_eq!(parsed.start.len(), 2);
+        assert_eq!(parsed.start[1].value, "3");
+        let end = parsed.end.unwrap();
+        assert_eq!(end.len(), 2);
+        assert_eq!(end[0].value, "John");
+        assert_eq!(end[1].value, "5");
+        assert_eq!(end[1].level, "chapter");
+        assert!(!end.iter().any(|c| c.level == "verse"));
+        assert_eq!(parsed.confidence, ReferenceConfidence::Low);
+    }
+
+    #[test]
+    fn chapter_reference_aliases_resolve_without_inventing_verse() {
+        for input in ["John 3", "john 3", " John   3 ", "Jn 3", "John 3-5"] {
+            let parsed = parse_bible_reference(input)
+                .unwrap_or_else(|| panic!("{input} must parse as a typed chapter reference"));
+            assert!(
+                !parsed.start.iter().any(|c| c.level == "verse"),
+                "{input} must not fabricate a verse"
+            );
+            assert!(
+                !parsed.display.contains(':'),
+                "{input}: {0}",
+                parsed.display
+            );
+        }
+        assert_eq!(parse_bible_reference("Jn 3").unwrap().display, "John 3");
+        assert_eq!(
+            parse_bible_reference("1 Cor 13").unwrap().display,
+            "1 Corinthians 13"
+        );
+    }
+
+    #[test]
+    fn public_registry_keeps_chapter_reference_fail_closed() {
+        // The public gate still rejects low-confidence chapter-only references,
+        // while the profile itself represents them as typed chapter ranges.
         let profile = BibleProfile::new();
         let registry = crate::profiles::ProfileRegistry::new();
-
-        for input in ["John 3", "john 3", " John   3 ", "Jn 3", "John 3-5"] {
-            let direct = profile.parse_reference(input);
-            let public = registry.try_parse(input);
-            assert!(direct.is_none(), "{input}: {direct:?}");
-            assert!(public.is_none(), "{input}: {public:?}");
+        for input in ["John 3", "john 3", "Jn 3", "John 3-5"] {
+            assert!(profile.parse_reference(input).is_some(), "{input}");
+            assert!(registry.try_parse(input).is_none(), "{input}");
         }
+    }
+
+    #[test]
+    fn reversed_and_malformed_chapter_ranges_fail_closed() {
+        assert!(parse_bible_reference("John 5-3").is_none());
+        assert!(parse_bible_reference("John 3:").is_none());
+        assert!(parse_bible_reference("John :16").is_none());
+        assert!(parse_bible_reference("John 3-").is_none());
+        assert!(parse_bible_reference("John -3").is_none());
+        assert!(parse_bible_reference("John x").is_none());
     }
 
     #[test]
