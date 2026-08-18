@@ -342,6 +342,7 @@ mod tests {
             text: "alpha evidence".to_string(),
             text_hash: "ev-hash".to_string(),
             heading_path: vec!["H".to_string()],
+            language: None,
             position: 0,
         }
     }

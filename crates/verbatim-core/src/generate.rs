@@ -1460,6 +1460,7 @@ mod tests {
                     text: "Freedom is defined as...".into(),
                     text_hash: "h1".into(),
                     heading_path: vec!["Chapter 2".into()],
+                    language: None,
                     position: 0,
                 },
                 EvidenceUnit {
@@ -1475,6 +1476,7 @@ mod tests {
                     text: "The author argues that...".into(),
                     text_hash: "h2".into(),
                     heading_path: vec![],
+                    language: None,
                     position: 1,
                 },
             ],
@@ -1539,6 +1541,7 @@ mod tests {
                     text: "Generated image caption: chartneedle appears in the diagram.".into(),
                     text_hash: "caption-hash".into(),
                     heading_path: vec!["Generated image captions".into()],
+                    language: None,
                     position: 10,
                 },
                 EvidenceUnit {
@@ -1550,6 +1553,7 @@ mod tests {
                     text: "Image evidence at PDF p.7, image 2. Artifact path: image-artifacts/src/img-1.png.".into(),
                     text_hash: "image-hash".into(),
                     heading_path: vec![],
+                    language: None,
                     position: 9,
                 },
             ],
@@ -1613,6 +1617,7 @@ mod tests {
                 text: "ocrneedle scanned invoice total".into(),
                 text_hash: "ocr-text-hash".into(),
                 heading_path: vec!["OCR text".into()],
+                language: None,
                 position: 3,
             }],
             provenance: RetrievalProvenance::seed(1, chunk_id, source_id),
@@ -2260,6 +2265,7 @@ mod tests {
             text: "Second image evidence.".into(),
             text_hash: "image-hash-2".into(),
             heading_path: vec![],
+            language: None,
             position: 11,
         });
         let artifacts = [sample_image_artifact(), artifact_two];

@@ -349,6 +349,7 @@ fn flush_block(
             .iter()
             .map(|heading| heading.text.clone())
             .collect(),
+        language: None,
         position: *position,
     });
     *position += 1;

@@ -26,6 +26,7 @@ fn pdf_evidence_lookup_renders_selector_details_and_preserves_legacy_output() {
         },
         text: "exact".into(),
         heading_path: Vec::new(),
+        language: None,
         position: 2,
         image_artifact: None,
     };

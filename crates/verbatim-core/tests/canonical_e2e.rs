@@ -1,7 +1,8 @@
 use verbatim_core::canonical_chunker::{chunk_canonical_units, CanonicalChunkerConfig};
 use verbatim_core::parser::canonical_jsonl::CanonicalJsonlParser;
+use verbatim_core::store::Store;
 use verbatim_core::traits::Parser;
-use verbatim_core::types::{EvidenceKind, SourceLocator};
+use verbatim_core::types::{EvidenceKind, Source, SourceLocator, SourceStatus};
 
 #[test]
 fn parse_repository_canonical_bible_fixture_end_to_end() {
@@ -57,6 +58,18 @@ fn parse_repository_canonical_bible_fixture_end_to_end() {
 
     assert!(units.iter().any(|unit| unit.text.contains("ἰδοὺ")));
 
+    // Canonical JSONL language survives parse: provided stays, absent stays absent.
+    let revelation = units
+        .iter()
+        .find(|unit| matches!(&unit.locator, SourceLocator::Canonical { locator } if locator.display == "Revelation 7:9"))
+        .expect("fixture must include Revelation 7:9");
+    assert_eq!(revelation.language.as_deref(), Some("el"));
+    let genesis = units
+        .iter()
+        .find(|unit| matches!(&unit.locator, SourceLocator::Canonical { locator } if locator.display == "Genesis 1:1"))
+        .expect("fixture must include Genesis 1:1");
+    assert_eq!(genesis.language, None, "absent language must stay absent");
+
     let reparsed = parser.parse(&path).unwrap();
     assert_eq!(
         units.iter().map(|unit| &unit.id).collect::<Vec<_>>(),
@@ -95,4 +108,57 @@ fn parse_repository_canonical_bible_fixture_end_to_end() {
         "expected multiple books, got {}",
         books.len()
     );
+}
+
+#[test]
+fn canonical_fixture_language_survives_store_round_trip() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/canonical_bible.jsonl");
+    let units = CanonicalJsonlParser.parse(&path).unwrap();
+    let revelation = units
+        .iter()
+        .find(|unit| matches!(&unit.locator, SourceLocator::Canonical { locator } if locator.display == "Revelation 7:9"))
+        .unwrap();
+    let genesis = units
+        .iter()
+        .find(|unit| matches!(&unit.locator, SourceLocator::Canonical { locator } if locator.display == "Genesis 1:1"))
+        .unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "verbatim-canonical-language-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::new(&dir.join("store.db")).unwrap();
+    let source = Source {
+        id: units[0].source_id.clone(),
+        path: path.clone(),
+        hash: "fixture-hash".into(),
+        status: SourceStatus::Indexed,
+        parser_used: Some("canonical_jsonl".into()),
+        last_ingested_at: None,
+    };
+    store.add_source(&source).unwrap();
+    store.bulk_insert_evidence(&units).unwrap();
+
+    let reloaded = store.get_evidence(&revelation.id).unwrap().unwrap();
+    assert_eq!(reloaded.language.as_deref(), Some("el"));
+
+    let genesis_reloaded = store.get_evidence(&genesis.id).unwrap().unwrap();
+    assert_eq!(genesis_reloaded.language, None);
+
+    let all = store.list_evidence_by_source(&source.id).unwrap();
+    assert_eq!(all.len(), 7);
+    assert!(all.iter().any(|u| u.language.as_deref() == Some("el")));
+
+    // Reopen the database to prove language persisted on disk.
+    let reopened = Store::new(&dir.join("store.db")).unwrap();
+    let persisted = reopened.get_evidence(&revelation.id).unwrap().unwrap();
+    assert_eq!(persisted.language.as_deref(), Some("el"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

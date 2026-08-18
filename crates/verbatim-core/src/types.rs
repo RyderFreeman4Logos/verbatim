@@ -760,6 +760,8 @@ pub struct EvidenceUnit {
     pub text: String,
     pub text_hash: String,
     pub heading_path: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     pub position: u32,
 }
 

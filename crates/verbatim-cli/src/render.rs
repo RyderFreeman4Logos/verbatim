@@ -3361,6 +3361,7 @@ mod tests {
             },
             text: "ocrneedle scanned invoice total".into(),
             heading_path: Vec::new(),
+            language: None,
             position: 1,
             image_artifact: None,
         };

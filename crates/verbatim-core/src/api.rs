@@ -759,6 +759,8 @@ pub struct EvidenceResponse {
     pub structured_locator: SourceLocator,
     pub text: String,
     pub heading_path: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     pub position: u32,
     pub image_artifact: Option<ImageArtifactResponse>,
 }

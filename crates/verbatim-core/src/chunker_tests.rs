@@ -18,6 +18,7 @@ fn make_evidence(n: usize, heading: &str) -> Vec<EvidenceUnit> {
             } else {
                 vec![heading.to_string()]
             },
+            language: None,
             position: i as u32,
         })
         .collect()
@@ -556,6 +557,7 @@ fn markdown_evidence(
         text: text.into(),
         text_hash: format!("{slug}-text-hash"),
         heading_path: vec![heading_text],
+        language: None,
         position,
     }
 }

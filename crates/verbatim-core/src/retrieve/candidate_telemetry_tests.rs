@@ -450,6 +450,7 @@ fn batch_hydration_keeps_sql_statement_count_constant_across_fused_candidate_poo
             text: text.clone(),
             text_hash: format!("hash-evidence-{id}"),
             heading_path: vec!["batch".into()],
+            language: None,
             position: 0,
         };
         let chunk = Chunk {

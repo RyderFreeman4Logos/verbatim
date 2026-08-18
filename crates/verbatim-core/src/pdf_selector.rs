@@ -602,6 +602,7 @@ mod tests {
             text: "unique quote".into(),
             text_hash: hex_sha256(b"unique quote"),
             heading_path: Vec::new(),
+            language: None,
             position: 0,
         }];
 
@@ -636,6 +637,7 @@ mod tests {
                     text_hash: hex_sha256(text.as_bytes()),
                     text,
                     heading_path: Vec::new(),
+                    language: None,
                     position: index,
                 }
             })

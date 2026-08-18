@@ -1,5 +1,7 @@
 use super::*;
 
+use verbatim_core::traits::Parser;
+
 #[tokio::test]
 async fn canonical_bible_fixture_ingest_retrieve_passage() {
     let model_server = MockModelServer::start(3).await;
@@ -53,4 +55,50 @@ async fn canonical_bible_fixture_ingest_retrieve_passage() {
     assert_eq!(passage.source_id, source_id.0);
     assert_eq!(passage.locator, "2 Timothy 4:7-8");
     assert_eq!(model_server.chat_requests(), 0);
+}
+
+#[tokio::test]
+async fn canonical_bible_fixture_language_survives_persist_and_inspect() {
+    let test_dir = TestDir::new("canonical-bible-fixture-language");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../verbatim-core/tests/fixtures/canonical_bible.jsonl");
+
+    // Persist the parsed fixture straight to the store: no live embedding provider needed.
+    let config = retrieve_test_config("http://127.0.0.1:1");
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let source_id = pipeline.add_source(&fixture).unwrap();
+    let units = verbatim_core::parser::canonical_jsonl::CanonicalJsonlParser
+        .parse(&fixture)
+        .unwrap();
+    pipeline.store().bulk_insert_evidence(&units).unwrap();
+    let state = test_state(config, test_dir.path(), pipeline);
+
+    let store = state.task_store.lock().unwrap();
+    let evidence = store.list_evidence_by_source(&source_id).unwrap();
+    let find = |display: &str| {
+        evidence
+            .iter()
+            .find(|unit| {
+                matches!(
+                    &unit.locator,
+                    SourceLocator::Canonical { locator } if locator.display == display
+                )
+            })
+            .unwrap_or_else(|| panic!("fixture must include {display}"))
+    };
+    assert_eq!(find("Revelation 7:9").language.as_deref(), Some("el"));
+    assert_eq!(
+        find("Genesis 1:1").language,
+        None,
+        "absent language stays absent"
+    );
+    let revelation_id = find("Revelation 7:9").id.0.clone();
+    drop(store);
+
+    // The public evidence inspection route re-exposes the persisted language.
+    let response = get_evidence(State(state), Path(revelation_id))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(response.language.as_deref(), Some("el"));
 }

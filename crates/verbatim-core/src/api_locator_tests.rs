@@ -41,6 +41,7 @@ fn markdown_locator_serializes_in_evidence_and_retrieve_responses() {
         structured_locator: locator.clone(),
         text: "quoted markdown".into(),
         heading_path: vec!["Intro".into(), "Details".into()],
+        language: None,
         position: 1,
         image_artifact: None,
     };

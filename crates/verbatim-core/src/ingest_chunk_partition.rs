@@ -137,6 +137,7 @@ mod tests {
             text: text.into(),
             text_hash: format!("hash-{id}"),
             heading_path: Vec::new(),
+            language: None,
             position,
         }
     }

@@ -482,13 +482,14 @@ fn normalize_fts_query(query: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[path = "sqlite_fts_test_helpers.rs"]
+mod sqlite_fts_test_helpers;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Store;
-    use crate::types::{
-        Chunk, ChunkType, EvidenceId, EvidenceKind, EvidenceUnit, Source, SourceLocator,
-        SourceStatus,
-    };
+    use crate::types::{Chunk, ChunkType, EvidenceId, EvidenceUnit, Source, SourceStatus};
     use std::path::PathBuf;
 
     fn source(id: &str) -> Source {
@@ -503,21 +504,7 @@ mod tests {
     }
 
     fn evidence(source_id: &SourceId, id: &str) -> EvidenceUnit {
-        EvidenceUnit {
-            id: EvidenceId(id.into()),
-            source_id: source_id.clone(),
-            kind: EvidenceKind::Text,
-            derived_from: None,
-            locator: SourceLocator::Document {
-                path_or_url: source_id.0.clone(),
-                line_start: 1,
-                line_end: None,
-            },
-            text: "text".into(),
-            text_hash: format!("hash-{id}"),
-            heading_path: Vec::new(),
-            position: 0,
-        }
+        sqlite_fts_test_helpers::evidence(source_id, id)
     }
 
     fn child(source_id: &SourceId, id: &str, evidence_id: &EvidenceId, text: &str) -> Chunk {

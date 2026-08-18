@@ -9,6 +9,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use rusqlite::{params, Connection};
 
+#[path = "issue_332_evidence_helper.rs"]
+mod issue_332_evidence_helper;
+
 #[derive(Clone)]
 struct RelocationEmbeddingClient;
 
@@ -344,21 +347,7 @@ async fn issue_332_explicit_move_preserves_identity_and_retrieval() {
 }
 
 fn synthetic_evidence(id: &str, source_id: &SourceId, position: u32) -> EvidenceUnit {
-    EvidenceUnit {
-        id: EvidenceId(id.into()),
-        source_id: source_id.clone(),
-        kind: EvidenceKind::Text,
-        derived_from: None,
-        locator: SourceLocator::Document {
-            path_or_url: "/tmp/parser.txt".into(),
-            line_start: position + 1,
-            line_end: None,
-        },
-        text: format!("evidence {position}"),
-        text_hash: format!("hash-{position}"),
-        heading_path: Vec::new(),
-        position,
-    }
+    issue_332_evidence_helper::synthetic_evidence(id, source_id, position)
 }
 
 #[test]

@@ -291,6 +291,7 @@ pub(crate) fn caption_derived_evidence(
         text_hash: hex_sha256(text.as_bytes()),
         text,
         heading_path: vec!["Generated image captions".to_string()],
+        language: None,
         position,
     }
 }

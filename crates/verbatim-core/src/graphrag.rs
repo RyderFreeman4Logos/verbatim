@@ -1257,6 +1257,7 @@ mod tests {
             text: text.into(),
             text_hash: format!("hash-{chunk_id}"),
             heading_path: Vec::new(),
+            language: None,
             position: 0,
         };
         let chunk = Chunk {

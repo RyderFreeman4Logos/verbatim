@@ -57,6 +57,7 @@ impl Parser for PlaintextParser {
                         text: trimmed.to_string(),
                         text_hash: hex_sha256(trimmed),
                         heading_path: Vec::new(),
+                        language: None,
                         position,
                     });
                     position += 1;
@@ -98,6 +99,7 @@ impl Parser for PlaintextParser {
                 text: trimmed.to_string(),
                 text_hash: hex_sha256(trimmed),
                 heading_path: Vec::new(),
+                language: None,
                 position,
             });
         }
