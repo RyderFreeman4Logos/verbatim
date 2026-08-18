@@ -393,6 +393,7 @@ mod tests {
             text: text.into(),
             text_hash: hex_sha256(text.as_bytes()),
             heading_path: heading.map(|h| vec![h.to_string()]).unwrap_or_default(),
+            language: None,
             position,
         }
     }

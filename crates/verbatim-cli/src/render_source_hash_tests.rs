@@ -29,6 +29,7 @@ fn markdown_evidence_lookup_renders_structured_locator_details() {
         },
         text: "markdown evidence text".into(),
         heading_path: vec!["Intro".into()],
+        language: None,
         position: 2,
         image_artifact: None,
     };

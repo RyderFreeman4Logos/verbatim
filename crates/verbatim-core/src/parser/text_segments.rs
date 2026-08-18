@@ -40,6 +40,7 @@ pub(crate) fn pdf_page_evidence_units(
                 text,
                 text_hash,
                 heading_path: Vec::new(),
+                language: None,
                 position: *position,
             };
             *position += 1;

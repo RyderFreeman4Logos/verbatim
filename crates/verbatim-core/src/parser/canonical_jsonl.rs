@@ -143,6 +143,7 @@ impl Parser for CanonicalJsonlParser {
                 text: entry.text.clone(),
                 text_hash,
                 heading_path,
+                language: entry.language.clone(),
                 position: (index - 1) as u32,
             });
         }
@@ -218,7 +219,6 @@ struct JsonlEntry {
     work_id: String,
     #[serde(default)]
     version_id: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]

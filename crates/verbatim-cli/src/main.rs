@@ -5583,6 +5583,7 @@ mod tests {
             structured_locator: SourceLocator::legacy_pdf(1, 1, None),
             text: "quoted".into(),
             heading_path: Vec::new(),
+            language: None,
             position: 0,
             image_artifact: None,
         }

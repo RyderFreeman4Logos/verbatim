@@ -6074,6 +6074,7 @@ fn prepare_image_artifacts(
             text_hash: hex_sha256(text.as_bytes()),
             text,
             heading_path: Vec::new(),
+            language: None,
             position: start_position + evidence.len() as u32,
         });
         artifacts.push(ImageArtifact {
@@ -6899,6 +6900,7 @@ mod tests {
             text: text.to_string(),
             text_hash: format!("hash-{id}"),
             heading_path: Vec::new(),
+            language: None,
             position: 0,
         }
     }
@@ -9121,6 +9123,7 @@ model = "local-vision"
             text: text.into(),
             text_hash: "hash-text-1".into(),
             heading_path: Vec::new(),
+            language: None,
             position: 0,
         };
         let mut parsed_image = test_parsed_image_artifact("png");

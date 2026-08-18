@@ -500,6 +500,7 @@ pub fn ocr_evidence_from_output(
                 text: text.to_string(),
                 text_hash,
                 heading_path: Vec::new(),
+                language: None,
                 position: start_position + idx as u32,
             })
         })

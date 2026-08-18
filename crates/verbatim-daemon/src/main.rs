@@ -8393,6 +8393,7 @@ async fn get_evidence(
             structured_locator: eu.locator,
             text: eu.text,
             heading_path: eu.heading_path,
+            language: eu.language,
             position: eu.position,
             image_artifact: image_artifact.map(ImageArtifactResponse::from),
         })),
@@ -18402,6 +18403,7 @@ mod tests {
             text: format!("{evidence_id} text."),
             text_hash: format!("{evidence_id}-hash"),
             heading_path: Vec::new(),
+            language: None,
             position: 0,
         };
         let chunk = Chunk {
@@ -18469,6 +18471,7 @@ mod tests {
                 text: format!("verse {verse} text."),
                 text_hash: format!("{id}-hash"),
                 heading_path: Vec::new(),
+                language: None,
                 position: *verse,
             })
             .collect::<Vec<_>>();

@@ -172,6 +172,7 @@ fn sole_source_erasure_prevents_cache_hit_resurrection_for_reseeded_source() {
             text: "image evidence for reseeded source".into(),
             text_hash: "hash-ev-resurrection-v2".into(),
             heading_path: vec!["Images".into()],
+            language: None,
             position: 0,
         }])
         .unwrap();
@@ -273,6 +274,7 @@ fn v1_to_v2_replace_then_erase_purges_historical_v1_caches() {
         text: "image evidence for v2".into(),
         text_hash: "hash-ev-v2".into(),
         heading_path: vec!["Images".into()],
+        language: None,
         position: 0,
     };
     let v2_chunk = Chunk {
@@ -399,6 +401,7 @@ fn v1_to_v2_replace_then_erase_purges_historical_v1_caches() {
             text: "image evidence reusing v1 content".into(),
             text_hash: "hash-ev-reseed-v1".into(),
             heading_path: vec!["Images".into()],
+            language: None,
             position: 0,
         }])
         .unwrap();
@@ -544,6 +547,7 @@ fn pre_commit_orphan_caches_are_purged_on_erasure() {
             text: "image evidence for recompute".into(),
             text_hash: "hash-ev-recompute".into(),
             heading_path: vec!["Images".into()],
+            language: None,
             position: 0,
         }])
         .unwrap();
@@ -610,6 +614,7 @@ fn seed_source_with_caches(
             text: format!("image evidence for {}", source.id.0),
             text_hash: format!("hash-{evidence_id}"),
             heading_path: vec!["Images".into()],
+            language: None,
             position: 0,
         }])
         .unwrap();

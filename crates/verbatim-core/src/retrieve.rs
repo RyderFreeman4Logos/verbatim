@@ -2961,6 +2961,7 @@ mod tests {
             text: text.into(),
             text_hash: format!("hash-{chunk_id}"),
             heading_path: Vec::new(),
+            language: None,
             position: 0,
         };
         let chunk = Chunk {
@@ -3081,6 +3082,7 @@ mod tests {
                 text: (*text).into(),
                 text_hash: format!("hash-{id}"),
                 heading_path: Vec::new(),
+                language: None,
                 position: *verse,
             })
             .collect::<Vec<_>>();
@@ -3170,6 +3172,7 @@ mod tests {
                     text,
                     text_hash: format!("hash-{id}"),
                     heading_path: Vec::new(),
+                    language: None,
                     position: verse,
                 }
             })
@@ -3270,6 +3273,7 @@ mod tests {
                 text: self.text.into(),
                 text_hash: format!("hash-{}", self.chunk_id),
                 heading_path: self.heading_path.clone(),
+                language: None,
                 position: 0,
             };
             let chunk = Chunk {
@@ -3355,6 +3359,7 @@ mod tests {
             text: "Image evidence artifact.".into(),
             text_hash: format!("hash-{chunk_id}"),
             heading_path: Vec::new(),
+            language: None,
             position: 1,
         };
         let chunk = Chunk {
@@ -5484,6 +5489,7 @@ mod tests {
             text: "Parent-only context.".into(),
             text_hash: "hash-parent-extra".into(),
             heading_path: Vec::new(),
+            language: None,
             position: 1,
         };
         store

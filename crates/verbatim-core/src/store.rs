@@ -515,6 +515,12 @@ impl Store {
         )?;
         ensure_column(
             &self.conn,
+            "evidence_units",
+            "language",
+            "ALTER TABLE evidence_units ADD COLUMN language TEXT",
+        )?;
+        ensure_column(
+            &self.conn,
             "tasks",
             "progress_json",
             "ALTER TABLE tasks ADD COLUMN progress_json TEXT",
@@ -1145,7 +1151,7 @@ impl Store {
 
     pub fn get_evidence(&self, id: &EvidenceId) -> Result<Option<EvidenceUnit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, position, derived_from_evidence_id FROM evidence_units WHERE id = ?1"
+            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id FROM evidence_units WHERE id = ?1"
         )?;
         let mut rows = stmt.query_map(params![id.0], row_to_evidence_unit)?;
         match rows.next() {
@@ -1156,7 +1162,7 @@ impl Store {
 
     pub fn list_evidence_by_source(&self, source_id: &SourceId) -> Result<Vec<EvidenceUnit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, position, derived_from_evidence_id FROM evidence_units WHERE source_id = ?1 ORDER BY position"
+            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id FROM evidence_units WHERE source_id = ?1 ORDER BY position"
         )?;
         let rows = stmt.query_map(params![source_id.0], row_to_evidence_unit)?;
         rows.map(|row| row.map_err(Into::into)).collect()
@@ -3365,7 +3371,7 @@ fn replace_source_contents_tx(
 
 fn insert_evidence_units_tx(tx: &Transaction<'_>, units: &[EvidenceUnit]) -> Result<()> {
     let mut stmt = tx.prepare(
-        "INSERT INTO evidence_units (id, source_id, kind, locator_json, text, text_hash, heading_path_json, position, derived_from_evidence_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+        "INSERT INTO evidence_units (id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
     )?;
     for unit in units {
         let locator_json = serde_json::to_string(&unit.locator).context("serialize locator")?;
@@ -3379,6 +3385,7 @@ fn insert_evidence_units_tx(tx: &Transaction<'_>, units: &[EvidenceUnit]) -> Res
             &unit.text,
             &unit.text_hash,
             heading_json,
+            unit.language.as_deref(),
             unit.position,
             unit.derived_from.as_ref().map(|id| &id.0),
         ])?;
@@ -3394,8 +3401,9 @@ fn row_to_evidence_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceUni
     let text: String = row.get(4)?;
     let text_hash: String = row.get(5)?;
     let heading_json: String = row.get(6)?;
-    let position: u32 = row.get(7)?;
-    let derived_from: Option<String> = row.get(8)?;
+    let language: Option<String> = row.get(7)?;
+    let position: u32 = row.get(8)?;
+    let derived_from: Option<String> = row.get(9)?;
 
     let locator = serde_json::from_str(&locator_json)
         .map_err(|err| from_json_error(3, "SourceLocator", err))?;
@@ -3411,6 +3419,7 @@ fn row_to_evidence_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceUni
         text,
         text_hash,
         heading_path,
+        language,
         position,
     })
 }
@@ -4558,6 +4567,7 @@ CREATE TABLE IF NOT EXISTS evidence_units (
     text TEXT NOT NULL,
     text_hash TEXT NOT NULL,
     heading_path_json TEXT,
+    language TEXT,
     position INTEGER NOT NULL,
     derived_from_evidence_id TEXT
 );
@@ -5534,6 +5544,7 @@ pub(crate) mod tests {
                 text: "First paragraph.".into(),
                 text_hash: "h1".into(),
                 heading_path: vec!["Chapter 1".into()],
+                language: None,
                 position: 0,
             },
             EvidenceUnit {
@@ -5545,6 +5556,7 @@ pub(crate) mod tests {
                 text: "Second paragraph.".into(),
                 text_hash: "h2".into(),
                 heading_path: vec!["Chapter 1".into()],
+                language: None,
                 position: 1,
             },
         ]
