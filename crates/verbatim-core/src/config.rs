@@ -214,6 +214,12 @@ pub struct EmbeddingConfig {
     pub query_instruction: String,
     #[serde(default)]
     pub document_instruction: String,
+    #[serde(default = "default_canonical_target_tokens")]
+    pub canonical_target_tokens: usize,
+    #[serde(default = "default_canonical_overlap_units")]
+    pub canonical_overlap_units: usize,
+    #[serde(default = "default_canonical_max_units_per_child")]
+    pub canonical_max_units_per_child: usize,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
     #[serde(default = "default_embedding_timeout_seconds")]
@@ -243,6 +249,9 @@ impl Default for EmbeddingConfig {
             weight_identity: None,
             query_instruction: default_query_instruction(),
             document_instruction: String::new(),
+            canonical_target_tokens: default_canonical_target_tokens(),
+            canonical_overlap_units: default_canonical_overlap_units(),
+            canonical_max_units_per_child: default_canonical_max_units_per_child(),
             batch_size: default_batch_size(),
             timeout_seconds: default_embedding_timeout_seconds(),
             api_key: String::new(),
@@ -288,6 +297,12 @@ impl<'de> Deserialize<'de> for EmbeddingConfig {
             #[serde(default)]
             document_instruction: Option<String>,
             #[serde(default)]
+            canonical_target_tokens: Option<usize>,
+            #[serde(default)]
+            canonical_overlap_units: Option<usize>,
+            #[serde(default)]
+            canonical_max_units_per_child: Option<usize>,
+            #[serde(default)]
             batch_size: Option<usize>,
             #[serde(default)]
             timeout_seconds: Option<u64>,
@@ -320,6 +335,15 @@ impl<'de> Deserialize<'de> for EmbeddingConfig {
                 .query_instruction
                 .unwrap_or_else(default_query_instruction),
             document_instruction: raw.document_instruction.unwrap_or_default(),
+            canonical_target_tokens: raw
+                .canonical_target_tokens
+                .unwrap_or_else(default_canonical_target_tokens),
+            canonical_overlap_units: raw
+                .canonical_overlap_units
+                .unwrap_or_else(default_canonical_overlap_units),
+            canonical_max_units_per_child: raw
+                .canonical_max_units_per_child
+                .unwrap_or_else(default_canonical_max_units_per_child),
             batch_size: raw.batch_size.unwrap_or_else(default_batch_size),
             timeout_seconds: raw
                 .timeout_seconds
@@ -355,6 +379,18 @@ fn default_dimension() -> usize {
 
 fn default_normalize_embeddings() -> bool {
     true
+}
+
+fn default_canonical_target_tokens() -> usize {
+    300
+}
+
+fn default_canonical_overlap_units() -> usize {
+    2
+}
+
+fn default_canonical_max_units_per_child() -> usize {
+    20
 }
 
 fn default_query_instruction() -> String {
