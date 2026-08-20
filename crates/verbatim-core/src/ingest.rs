@@ -635,7 +635,11 @@ impl EmbeddingProfileSpec {
         self.recompute_chunking_policy();
     }
 
-    fn apply_stored_profile_config(&mut self, stored: &StoredEmbeddingProfileConfig) {
+    fn apply_stored_profile_config(
+        &mut self,
+        stored: &StoredEmbeddingProfileConfig,
+        preserve_live_canonical_chunker_config: bool,
+    ) {
         self.endpoint_identity = self
             .endpoint_identity
             .clone()
@@ -661,11 +665,13 @@ impl EmbeddingProfileSpec {
             .weight_identity
             .clone()
             .or_else(|| stored.weight_identity.clone());
-        self.canonical_chunker_config = CanonicalChunkerConfig {
-            target_tokens: stored.canonical_target_tokens,
-            overlap_units: stored.canonical_overlap_units,
-            max_units_per_child: stored.canonical_max_units_per_child,
-        };
+        if !preserve_live_canonical_chunker_config {
+            self.canonical_chunker_config = CanonicalChunkerConfig {
+                target_tokens: stored.canonical_target_tokens,
+                overlap_units: stored.canonical_overlap_units,
+                max_units_per_child: stored.canonical_max_units_per_child,
+            };
+        }
         if preserve_stored_chunking {
             self.chunker_config = ChunkerConfig {
                 child_target_tokens: stored.child_target_tokens,
@@ -990,7 +996,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         let active_profile_id = config.embedding.profile_id.clone();
         let mut embedding_profile_spec = EmbeddingProfileSpec::from_config(&config.embedding);
         if let Some(stored) = store.load_embedding_profile_config(&active_profile_id)? {
-            embedding_profile_spec.apply_stored_profile_config(&stored);
+            embedding_profile_spec.apply_stored_profile_config(&stored, true);
         }
         let profile_reset_on_open = store.ensure_embedding_profile(
             &active_profile_id,
@@ -1081,7 +1087,7 @@ impl IngestPipeline<OpenAiEmbeddingClient> {
         let active_profile_id = config.embedding.profile_id.clone();
         let mut embedding_profile_spec = EmbeddingProfileSpec::from_config(&config.embedding);
         if let Some(stored) = store.load_embedding_profile_config(&active_profile_id)? {
-            embedding_profile_spec.apply_stored_profile_config(&stored);
+            embedding_profile_spec.apply_stored_profile_config(&stored, false);
         }
 
         let hnsw = load_vector_index_for_residency(

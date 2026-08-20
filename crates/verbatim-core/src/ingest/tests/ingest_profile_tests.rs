@@ -48,6 +48,58 @@ fn canonical_chunker_config_changes_profile_hash() {
 }
 
 #[test]
+fn pipeline_open_uses_live_canonical_chunker_config_and_resets_vectors() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let profile_id = EmbeddingProfileId::default_profile();
+    let mut default_config = embedding_context_config(8192);
+    default_config.embedding.canonical_target_tokens = 300;
+    default_config.embedding.canonical_overlap_units = 2;
+    default_config.embedding.canonical_max_units_per_child = 20;
+    let default_hash = EmbeddingProfileSpec::from_config(&default_config.embedding).config_hash();
+
+    {
+        let pipeline = IngestPipeline::new(&default_config, tempdir.path()).unwrap();
+        assert_eq!(pipeline.embedding_profile_spec.config_hash(), default_hash);
+    }
+
+    let store = Store::new(&tempdir.path().join("verbatim.db")).unwrap();
+    let source = test_source("source-1", tempdir.path().join("source.txt"));
+    store.add_source(&source).unwrap();
+    let chunk = insert_child_text(&store, &source.id, "chunk-1", "old text").unwrap();
+    store
+        .replace_all_vector_documents_for_profile(
+            &profile_id,
+            &[VectorDocument {
+                chunk_id: chunk.id,
+                source_id: source.id,
+                vector: vec![1.0, 0.0],
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .list_vector_documents_for_profile(&profile_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(store);
+
+    let mut reopened_config = default_config;
+    reopened_config.embedding.canonical_overlap_units = 4;
+    let reopened_hash = EmbeddingProfileSpec::from_config(&reopened_config.embedding).config_hash();
+    let reopened = IngestPipeline::new(&reopened_config, tempdir.path()).unwrap();
+
+    assert_ne!(default_hash, reopened_hash);
+    assert_eq!(reopened.embedding_profile_spec.config_hash(), reopened_hash);
+    assert!(reopened
+        .store
+        .list_vector_documents_for_profile(&profile_id)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn same_model_with_different_exposed_capability_has_distinct_safe_fingerprint() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut first = embedding_context_config(8192);
