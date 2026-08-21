@@ -65,14 +65,6 @@ pub(super) fn filter_generated_retrieval_evidence(
     Ok(())
 }
 
-pub(super) fn filter(
-    store: &Store,
-    results: &mut Vec<RetrievalResult>,
-    debug: &mut Option<RetrievalDebug>,
-) -> Result<()> {
-    filter_generated_retrieval_evidence(store, results, debug.as_mut(), true)
-}
-
 fn retrieval_debug_has_chunk_identities(debug: &RetrievalDebug) -> bool {
     !debug.bm25_hits.is_empty()
         || !debug.dense_hits.is_empty()

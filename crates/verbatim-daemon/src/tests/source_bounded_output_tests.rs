@@ -4,6 +4,7 @@ use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt;
 
 use super::*;
+use crate::source_bounded_retrieval::filter_generated_retrieval_evidence;
 
 const CORRUPTED_EVIDENCE_TEXT: &str = "Mutated persisted evidence must not escape.";
 

@@ -355,6 +355,14 @@ pub fn pdf_scan_summary(
     evidence: &[EvidenceUnit],
     image_artifacts: &[ImageArtifact],
 ) -> Option<PdfScanSummary> {
+    pdf_scan_summary_with_page_count(None, evidence, image_artifacts)
+}
+
+pub fn pdf_scan_summary_with_page_count(
+    page_count: Option<usize>,
+    evidence: &[EvidenceUnit],
+    image_artifacts: &[ImageArtifact],
+) -> Option<PdfScanSummary> {
     let mut pages: BTreeMap<u32, PageAccumulator> = BTreeMap::new();
 
     for unit in evidence {
@@ -372,6 +380,11 @@ pub fn pdf_scan_summary(
         pages.entry(artifact.page).or_default().image_count += 1;
     }
 
+    if let Some(page_count) = page_count {
+        for page in 1..=page_count as u32 {
+            pages.entry(page).or_default();
+        }
+    }
     if pages.is_empty() {
         return None;
     }
@@ -383,7 +396,7 @@ pub fn pdf_scan_summary(
         .map(|(page, summary)| {
             text_char_count += summary.text_char_count;
             let has_meaningful_text = summary.text_char_count >= MEANINGFUL_TEXT_MIN_CHARS;
-            let image_only = summary.image_count > 0 && !has_meaningful_text;
+            let image_only = !has_meaningful_text;
             if image_only {
                 image_only_page_count += 1;
             }
@@ -399,7 +412,7 @@ pub fn pdf_scan_summary(
         })
         .collect::<Vec<_>>();
 
-    let page_count = page_summaries.len();
+    let page_count = page_count.unwrap_or(page_summaries.len());
     Some(PdfScanSummary {
         page_count,
         text_char_count,

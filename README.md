@@ -257,7 +257,7 @@ verbatim evidence <evidence-id>
 PDF text-layer evidence uses page and paragraph locators. Scanned or image-only
 PDFs are rejected at ingest with the stable `pdf_no_usable_text_layer`
 diagnostic. OCR output and vision captions are derived and are not citable source
-Evidence. Born-digital PDFs with a usable text layer remain supported.
+Evidence. This fail-closed contract is tracked in #505. Born-digital PDFs with a usable text layer remain supported.
 
 ## Concepts
 

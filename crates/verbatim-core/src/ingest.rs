@@ -43,7 +43,8 @@ use crate::index_profile_delete::{
 use crate::memory_budget::{MemoryBudget, MemoryReservationGuard};
 use crate::ocr::{
     configured_ocr_provider, ocr_evidence_from_output, ocr_profile_stale, ocr_required_pages,
-    pdf_scan_summary, source_ingest_diagnostics, OcrPageRequest, OcrProvider,
+    pdf_scan_summary, pdf_scan_summary_with_page_count, source_ingest_diagnostics, OcrPageRequest,
+    OcrProvider,
 };
 use crate::parser;
 use crate::provider::openai_compatible::OpenAiCompatibleVisionModel;
@@ -2041,7 +2042,15 @@ where
                 parsed_image_artifacts,
                 self.image_artifact_limits,
             )?;
-            let pdf_scan = pdf_scan_summary(&evidence, &prepared_image_artifacts.artifacts);
+            let pdf_scan = source_pdf_page_count(&source.path)?
+                .and_then(|page_count| {
+                    pdf_scan_summary_with_page_count(
+                        Some(page_count),
+                        &evidence,
+                        &prepared_image_artifacts.artifacts,
+                    )
+                })
+                .or_else(|| pdf_scan_summary(&evidence, &prepared_image_artifacts.artifacts));
             (evidence, prepared_image_artifacts, pdf_scan)
         };
         if pdf_scan.as_ref().is_some_and(|scan| {
@@ -2111,8 +2120,7 @@ where
                 "generated_evidence_count": caption_evidence.len(),
             }),
         );
-        let mut searchable_evidence = evidence.clone();
-        searchable_evidence.extend(ocr_evidence.clone());
+        let searchable_evidence = evidence.clone();
         tracing::info!(
             evidence_count = searchable_evidence.len(),
             ocr_evidence_count = ocr_evidence.len(),
@@ -6421,6 +6429,31 @@ fn sanitize_extension(value: &str) -> String {
     }
 }
 
+fn source_pdf_page_count(path: &Path) -> Result<Option<usize>> {
+    let is_pdf = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+    if !is_pdf {
+        return Ok(None);
+    }
+
+    #[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
+    {
+        Ok(Some(
+            lopdf::Document::load(path)
+                .context("failed to open PDF for page-count scan")?
+                .get_pages()
+                .len(),
+        ))
+    }
+
+    #[cfg(not(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber")))]
+    {
+        Ok(None)
+    }
+}
+
 fn file_hash(path: &Path) -> Result<String> {
     let data = std::fs::read(path).with_context(|| format!("read file: {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -6476,6 +6509,7 @@ mod tests {
     };
     use crate::vision_caption::{vision_caption_prompt_hash, ImageCaptionStatus};
 
+    mod ingest_pdf_tests;
     #[path = "ingest_profile_tests.rs"]
     mod ingest_profile_tests;
 

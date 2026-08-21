@@ -1,4 +1,5 @@
 use super::*;
+use crate::source_bounded_retrieval::filter_generated_retrieval_evidence;
 
 #[test]
 fn source_bounded_retrieval_batches_evidence_eligibility_queries() {
