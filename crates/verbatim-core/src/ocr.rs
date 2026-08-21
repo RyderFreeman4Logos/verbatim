@@ -534,12 +534,14 @@ pub fn ocr_profile_stale(
         return false;
     };
     let current_hash = profile.profile_hash();
-    diagnostics.ocr.evidence_count == 0
-        || diagnostics
-            .ocr
-            .evidence_profile_hashes
-            .iter()
-            .any(|hash| hash != &current_hash)
+    if diagnostics.ocr.evidence_count == 0 {
+        return false;
+    }
+    diagnostics
+        .ocr
+        .evidence_profile_hashes
+        .iter()
+        .any(|hash| hash != &current_hash)
 }
 
 fn ocr_status(

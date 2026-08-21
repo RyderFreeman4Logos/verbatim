@@ -65,6 +65,11 @@ async fn mixed_pdf_ocr_output_stays_out_of_persistent_evidence() {
         .unwrap()
         .iter()
         .all(|chunk| !chunk.text.contains("ocrneedle")));
+    assert_eq!(
+        pipeline.source_ingest_freshness(&source_id).unwrap(),
+        SourceIngestFreshness::Fresh
+    );
+    assert!(pipeline.check_stale().unwrap().is_empty());
 }
 
 fn write_pdf_with_unsupported_image(path: &std::path::Path) {

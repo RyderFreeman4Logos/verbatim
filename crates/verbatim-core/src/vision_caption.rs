@@ -3,9 +3,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::{ImageDescribeRequest, ImageDescription, ImageInput, VisionModel};
-use crate::types::{
-    hex_sha256, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, SourceId, SourceLocator,
-};
+use crate::types::hex_sha256;
 
 /// Version string included in the deterministic image caption cache key.
 pub const VISION_CAPTION_PROMPT_VERSION: &str = "vision-caption-v1";
@@ -256,101 +254,6 @@ async fn describe(
 fn image_data_uri(image_bytes: &[u8], mime_type: &str) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(image_bytes);
     format!("data:{mime_type};base64,{encoded}")
-}
-
-fn caption_evidence_id(
-    image_id: &crate::types::ImageId,
-    model: &str,
-    prompt_hash: &str,
-) -> EvidenceId {
-    let key = format!("{}\n{model}\n{prompt_hash}", image_id.0);
-    let digest = hex_sha256(key.as_bytes());
-    EvidenceId(format!("{}:caption:{}", image_id.0, &digest[..16]))
-}
-
-pub(crate) fn caption_derived_evidence(
-    source_id: &SourceId,
-    artifact: &ImageArtifact,
-    caption: &ImageCaption,
-    model: &str,
-    prompt_hash: &str,
-    position: u32,
-) -> EvidenceUnit {
-    let locator = SourceLocator::PdfImage {
-        page: artifact.page,
-        image_index: artifact.image_index,
-        bbox: artifact.bbox.clone(),
-    };
-    let text = caption_evidence_text(artifact, &locator, caption, model, prompt_hash);
-    EvidenceUnit {
-        id: caption_evidence_id(&artifact.image_id, model, prompt_hash),
-        source_id: source_id.clone(),
-        kind: EvidenceKind::Generated,
-        derived_from: Some(artifact.evidence_id.clone()),
-        locator,
-        text_hash: hex_sha256(text.as_bytes()),
-        text,
-        heading_path: vec!["Generated image captions".to_string()],
-        language: None,
-        position,
-    }
-}
-
-fn caption_evidence_text(
-    artifact: &ImageArtifact,
-    locator: &SourceLocator,
-    caption: &ImageCaption,
-    model: &str,
-    prompt_hash: &str,
-) -> String {
-    let mut text = format!(
-        "Generated image caption (derived evidence; not original source text and not exact OCR). Original image evidence: {}. Original locator: {locator}. Model: {model}. Prompt hash: {prompt_hash}. Content type: {:?}. Short caption: {}. Detailed description: {}.",
-        artifact.evidence_id.0,
-        caption.content_type,
-        caption.short_caption,
-        caption.detailed_description
-    );
-    append_string_list(
-        &mut text,
-        "Visible text noted by the vision model (not OCR-verified)",
-        &caption.visible_text,
-    );
-    append_string_list(&mut text, "Key entities", &caption.key_entities);
-    if !caption.relationships.is_empty() {
-        text.push_str(" Relationships: ");
-        text.push_str(
-            &caption
-                .relationships
-                .iter()
-                .map(|relationship| {
-                    format!(
-                        "{} -> {} ({})",
-                        relationship.from, relationship.to, relationship.label
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; "),
-        );
-        text.push('.');
-    }
-    append_string_list(
-        &mut text,
-        "Answerable questions",
-        &caption.answerable_questions,
-    );
-    append_string_list(&mut text, "Uncertainties", &caption.uncertainties);
-    text
-}
-
-fn append_string_list(text: &mut String, label: &str, items: &[String]) {
-    if items.is_empty() {
-        return;
-    }
-    text.push(' ');
-    text.push_str(label);
-    text.push_str(": ");
-    text.push_str(&items.join("; "));
-    text.push('.');
 }
 
 fn require_string_items(field: &str, items: &[String]) -> Result<()> {

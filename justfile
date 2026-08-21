@@ -148,7 +148,7 @@ fmt:
     staged_rs=()
     while IFS= read -r -d '' path; do
         staged_rs+=("$path")
-    done < <(git diff --cached --name-only -z -- '*.rs')
+    done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.rs')
     unstaged_rs=()
     while IFS= read -r -d '' path; do
         unstaged_rs+=("$path")
