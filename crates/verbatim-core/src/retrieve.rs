@@ -54,6 +54,7 @@ pub struct RetrievalPipeline<'a> {
     rerank_config: Option<&'a RerankConfig>,
     reranker: Option<&'a dyn Reranker>,
     bypass_prefix_cache: bool,
+    canonical_fused_tail: bool,
     required_profile_id: Option<EmbeddingProfileId>,
     vector_residency: VectorIndexResidency,
     read_resource: Option<Arc<ObservableResource>>,
@@ -248,6 +249,7 @@ impl<'a> RetrievalPipeline<'a> {
             rerank_config: None,
             reranker: None,
             bypass_prefix_cache: false,
+            canonical_fused_tail: false,
             required_profile_id: None,
             vector_residency: VectorIndexResidency::ResidentHnsw,
             read_resource: None,
@@ -276,6 +278,7 @@ impl<'a> RetrievalPipeline<'a> {
             rerank_config: None,
             reranker: None,
             bypass_prefix_cache: false,
+            canonical_fused_tail: false,
             required_profile_id: None,
             vector_residency: VectorIndexResidency::ResidentHnsw,
             read_resource: None,
@@ -696,11 +699,8 @@ impl<'a> RetrievalPipeline<'a> {
 
         let display_evidence_pack = if include_debug {
             let display_pack_started = Instant::now();
-            let canonical_display_results = if results.iter().any(canonical_multi_evidence_result) {
-                self.canonical_debug_results(&results, &canonical_fused)?
-            } else {
-                results.clone()
-            };
+            let canonical_display_results =
+                self.canonical_display_results(&results, &canonical_fused)?;
             let (
                 display_evidence_pack,
                 canonical_support_embedding_ms,

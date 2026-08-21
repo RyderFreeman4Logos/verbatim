@@ -3,9 +3,26 @@ use anyhow::{anyhow, Result};
 use crate::overfetch::{SearchBudget, SearchBudgetFields};
 use crate::types::{ChunkId, RetrievalProvenance, RetrievalResult};
 
-use super::RetrievalPipeline;
+use super::{canonical_multi_evidence_result, RetrievalPipeline};
 
 impl<'a> RetrievalPipeline<'a> {
+    pub fn with_canonical_fused_tail(mut self) -> Self {
+        self.canonical_fused_tail = true;
+        self
+    }
+
+    pub(super) fn canonical_display_results(
+        &self,
+        results: &[RetrievalResult],
+        fused: &[(ChunkId, f32)],
+    ) -> Result<Vec<RetrievalResult>> {
+        if self.canonical_fused_tail && results.iter().any(canonical_multi_evidence_result) {
+            self.canonical_debug_results(results, fused)
+        } else {
+            Ok(results.to_vec())
+        }
+    }
+
     pub(super) fn search_budget(&self) -> Result<SearchBudget> {
         let dense_candidate_k = u32::try_from(self.config.dense_top_k.max(1))?;
         let lexical_candidate_k = u32::try_from(self.config.bm25_top_k.max(1))?;
