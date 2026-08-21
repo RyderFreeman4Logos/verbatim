@@ -1,15 +1,19 @@
 # Verbatim
 
-Verbatim is a local, daemon-backed document retrieval tool for grounded answers
-and citation-first context packs. It indexes your local sources, retrieves
-ranked evidence with stable IDs and locators, and can optionally call a
-configured chat model to write an answer over that evidence.
+Verbatim is a local, daemon-backed evidence search engine. It indexes your
+sources, retrieves ranked passages with stable IDs and locators, and never
+invents citations. A configured text model is optional: it may rewrite queries
+or review hits, but it does not author evidence. Open the original locator when
+you need a second confirmation.
+
+1.0 targets Linux x86_64, including a VM or Docker Linux next to a local
+inference box. macOS and Windows are post-1.0.
 
 Use Verbatim when you need:
 
-- local document search over PDFs, Markdown, text, or code;
-- agent-friendly retrieval output with deterministic evidence IDs;
-- generated answers that cite inspectable source evidence;
+- local document search over text-layer PDFs, Markdown, text, or code;
+- agent-friendly retrieval with deterministic evidence IDs and pagination;
+- optional LLM review or grounded answers that still cite inspectable evidence;
 - a thin CLI that talks to one long-running daemon instead of rebuilding state
   per command.
 
@@ -247,9 +251,9 @@ verbatim retrieve --source-id <source-id> --format json --show-locator \
 verbatim evidence <evidence-id>
 ```
 
-PDF text-layer evidence uses page and paragraph locators. Scanned or image-only
-PDFs require explicit OCR-backed indexing for deterministic text; vision
-captions are model-derived descriptions, not OCR.
+PDF text-layer evidence uses page and paragraph locators. Ingest rejects
+scanned or image-only PDFs: OCR and vision captions are not citable evidence.
+Born-digital PDFs with a usable text layer remain supported.
 
 ## Concepts
 
