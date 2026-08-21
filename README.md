@@ -1,9 +1,12 @@
 # Verbatim
 
 Verbatim is a local, daemon-backed evidence search engine. It indexes your
-sources, retrieves ranked passages with stable IDs and locators, and never
-invents citations. A configured text model is optional: it may rewrite queries
-or review hits, but it does not author evidence. Open the original locator when
+sources and retrieves ranked passages with stable IDs and locators. Retrieval
+returns inspectable evidence; when citation verification is enabled and passes,
+final answers cite that retrieved evidence. Streaming or otherwise unverified
+model output is not covered by that guarantee and should be checked against the
+original locator. A configured text model is optional: it may review hits or
+rerank results, but it does not author evidence. Open the original locator when
 you need a second confirmation.
 
 1.0 targets Linux x86_64, including a VM or Docker Linux next to a local
@@ -13,7 +16,7 @@ Use Verbatim when you need:
 
 - local document search over text-layer PDFs, Markdown, text, or code;
 - agent-friendly retrieval with deterministic evidence IDs and pagination;
-- optional LLM review or grounded answers that still cite inspectable evidence;
+- optional LLM review or verified answers with inspectable evidence citations;
 - a thin CLI that talks to one long-running daemon instead of rebuilding state
   per command.
 
@@ -251,9 +254,12 @@ verbatim retrieve --source-id <source-id> --format json --show-locator \
 verbatim evidence <evidence-id>
 ```
 
-PDF text-layer evidence uses page and paragraph locators. Ingest rejects
-scanned or image-only PDFs: OCR and vision captions are not citable evidence.
-Born-digital PDFs with a usable text layer remain supported.
+PDF text-layer evidence uses page and paragraph locators. Scanned or image-only
+PDF pages are not currently rejected at ingest: without OCR, ingest can continue
+with a warning; with OCR configured, OCR-derived evidence can be indexed and
+searched with page/line locators. The fail-closed rejection policy is tracked by
+#505 and is not yet shipped. Born-digital PDFs with a usable text layer remain
+supported.
 
 ## Concepts
 
