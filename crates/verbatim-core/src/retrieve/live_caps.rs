@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 
 use crate::overfetch::{SearchBudget, SearchBudgetFields};
+use crate::types::{ChunkId, RetrievalProvenance, RetrievalResult};
 
 use super::RetrievalPipeline;
 
@@ -23,5 +24,64 @@ impl<'a> RetrievalPipeline<'a> {
             debug_output_size: final_hydration_list_size,
         })
         .map_err(|error| anyhow!("invalid retrieval search budget: {error}"))
+    }
+
+    pub(super) fn canonical_debug_results(
+        &self,
+        results: &[RetrievalResult],
+        fused: &[(ChunkId, f32)],
+    ) -> Result<Vec<RetrievalResult>> {
+        let mut seen = results
+            .iter()
+            .map(|result| result.chunk_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let extra = fused
+            .iter()
+            .enumerate()
+            .filter(|(_, (chunk_id, _))| seen.insert(chunk_id.clone()))
+            .collect::<Vec<_>>();
+        if extra.is_empty() {
+            return Ok(results.to_vec());
+        }
+
+        let chunk_ids = extra
+            .iter()
+            .map(|(_, (chunk_id, _))| (*chunk_id).clone())
+            .collect::<Vec<_>>();
+        let chunks = self.store.get_chunks(&chunk_ids)?;
+        let parent_ids = chunks
+            .values()
+            .filter_map(|chunk| {
+                chunk
+                    .as_ref()
+                    .ok()
+                    .and_then(|chunk| chunk.parent_chunk_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let parents = self.store.get_chunks(&parent_ids)?;
+        let mut canonical_results = results.to_vec();
+
+        for (rank, (chunk_id, score)) in extra {
+            let Some(Ok(chunk)) = chunks.get(chunk_id) else {
+                continue;
+            };
+            let chunk = chunk.clone();
+            let provenance =
+                RetrievalProvenance::seed(rank + 1, chunk.id.clone(), chunk.source_id.clone());
+            let parent_chunk = chunk
+                .parent_chunk_id
+                .as_ref()
+                .and_then(|parent_id| parents.get(parent_id))
+                .and_then(|parent| parent.as_ref().ok())
+                .cloned();
+            canonical_results.push(self.result_for_chunk_with_parent(
+                chunk,
+                parent_chunk,
+                *score,
+                provenance,
+            )?);
+        }
+
+        Ok(canonical_results)
     }
 }

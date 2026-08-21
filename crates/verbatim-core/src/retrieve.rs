@@ -597,6 +597,11 @@ impl<'a> RetrievalPipeline<'a> {
             fused,
             debug: reranker_debug,
         } = self.rerank_fused(query, fused).await?;
+        let canonical_fused = if include_debug {
+            fused.clone()
+        } else {
+            Vec::new()
+        };
         if matches!(reranker_debug.status, RetrievalRerankStatus::Succeeded) {
             candidate_counters.add_reranked(fused.len() as u64)?;
         }
@@ -691,6 +696,11 @@ impl<'a> RetrievalPipeline<'a> {
 
         let display_evidence_pack = if include_debug {
             let display_pack_started = Instant::now();
+            let canonical_display_results = if results.iter().any(canonical_multi_evidence_result) {
+                self.canonical_debug_results(&results, &canonical_fused)?
+            } else {
+                results.clone()
+            };
             let (
                 display_evidence_pack,
                 canonical_support_embedding_ms,
@@ -699,7 +709,7 @@ impl<'a> RetrievalPipeline<'a> {
                 .display_evidence_pack_debug(
                     query,
                     query_vector.as_deref(),
-                    &results,
+                    &canonical_display_results,
                     debug_options.canonical_budget,
                 )
                 .await;
