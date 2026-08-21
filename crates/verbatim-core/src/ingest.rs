@@ -11059,7 +11059,7 @@ model = "local-vision"
     async fn pdf_ingest_writes_stable_image_artifacts_and_removes_them_with_source() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("image-fixture.pdf");
-        write_pdf_with_image(&path);
+        write_pdf_with_text_and_image_filter(&path, None, &[255u8; 8 * 8 * 3]);
         let store = Store::in_memory().unwrap();
         let source = test_source("src-1", path);
         store.add_source(&source).unwrap();
@@ -11188,7 +11188,7 @@ model = "local-vision"
     async fn pdf_image_caption_success_persists_derived_evidence_and_reuses_cache() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("image-fixture.pdf");
-        write_pdf_with_image(&path);
+        write_pdf_with_text_and_image_filter(&path, None, &[255u8; 8 * 8 * 3]);
         let store = Store::in_memory().unwrap();
         let source = test_source("src-1", path);
         store.add_source(&source).unwrap();
@@ -11359,7 +11359,7 @@ model = "local-vision"
     async fn pdf_image_caption_disabled_preserves_successful_cache() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("image-fixture.pdf");
-        write_pdf_with_image(&path);
+        write_pdf_with_text_and_image_filter(&path, None, &[255u8; 8 * 8 * 3]);
         let store = Store::in_memory().unwrap();
         let source = test_source("src-1", path);
         store.add_source(&source).unwrap();
@@ -11597,7 +11597,7 @@ model = "local-vision"
     async fn pdf_image_caption_repairs_malformed_json_once() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("image-fixture.pdf");
-        write_pdf_with_image(&path);
+        write_pdf_with_text_and_image_filter(&path, None, &[255u8; 8 * 8 * 3]);
         let store = Store::in_memory().unwrap();
         let source = test_source("src-1", path);
         store.add_source(&source).unwrap();
@@ -11636,7 +11636,7 @@ model = "local-vision"
     async fn pdf_image_caption_records_repair_failure_without_aborting_ingest() {
         let tempdir = tempfile::tempdir().unwrap();
         let path = tempdir.path().join("image-fixture.pdf");
-        write_pdf_with_image(&path);
+        write_pdf_with_text_and_image_filter(&path, None, &[255u8; 8 * 8 * 3]);
         let store = Store::in_memory().unwrap();
         let source = test_source("src-1", path);
         store.add_source(&source).unwrap();
