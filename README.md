@@ -1,15 +1,22 @@
 # Verbatim
 
-Verbatim is a local, daemon-backed document retrieval tool for grounded answers
-and citation-first context packs. It indexes your local sources, retrieves
-ranked evidence with stable IDs and locators, and can optionally call a
-configured chat model to write an answer over that evidence.
+Verbatim is a local, daemon-backed evidence search engine. It indexes your
+sources and retrieves ranked passages with stable IDs and locators. Retrieval
+returns inspectable evidence; when citation verification is enabled and passes,
+final answers cite that retrieved evidence. Streaming or otherwise unverified
+model output is not covered by that guarantee and should be checked against the
+original locator. A configured text model is optional: it may review hits or
+rerank results, but it does not author evidence. Open the original locator when
+you need a second confirmation.
+
+1.0 targets Linux x86_64, including a VM or Docker Linux next to a local
+inference box. macOS and Windows are post-1.0.
 
 Use Verbatim when you need:
 
-- local document search over PDFs, Markdown, text, or code;
-- agent-friendly retrieval output with deterministic evidence IDs;
-- generated answers that cite inspectable source evidence;
+- local document search over text-layer PDFs, Markdown, text, or code;
+- agent-friendly retrieval with deterministic evidence IDs and pagination;
+- optional LLM review or verified answers with inspectable evidence citations;
 - a thin CLI that talks to one long-running daemon instead of rebuilding state
   per command.
 
@@ -248,8 +255,11 @@ verbatim evidence <evidence-id>
 ```
 
 PDF text-layer evidence uses page and paragraph locators. Scanned or image-only
-PDFs require explicit OCR-backed indexing for deterministic text; vision
-captions are model-derived descriptions, not OCR.
+PDF pages are not currently rejected at ingest: without OCR, ingest can continue
+with a warning; with OCR configured, OCR-derived evidence can be indexed and
+searched with page/line locators. The fail-closed rejection policy is tracked by
+#505 and is not yet shipped. Born-digital PDFs with a usable text layer remain
+supported.
 
 ## Concepts
 
