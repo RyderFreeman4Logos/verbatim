@@ -510,6 +510,28 @@ pub struct IndexingOutcome {
     pub embedding_cache: EmbeddingCacheStats,
 }
 
+/// Stable machine-readable diagnostics for rejected ingest requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestDiagnosticCode {
+    PdfNoUsableTextLayer,
+}
+
+impl IngestDiagnosticCode {
+    pub const fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::PdfNoUsableTextLayer => "pdf_no_usable_text_layer",
+        }
+    }
+}
+
+impl std::fmt::Display for IngestDiagnosticCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.diagnostic_code())
+    }
+}
+
+impl std::error::Error for IngestDiagnosticCode {}
+
 /// Result for one source inside a multi-source background ingest batch.
 #[derive(Debug, Clone)]
 pub struct SourceIngestOutcome {
@@ -2022,6 +2044,11 @@ where
             let pdf_scan = pdf_scan_summary(&evidence, &prepared_image_artifacts.artifacts);
             (evidence, prepared_image_artifacts, pdf_scan)
         };
+        if pdf_scan.as_ref().is_some_and(|scan| {
+            scan.page_count > 0 && scan.image_only_page_count == scan.page_count
+        }) {
+            bail!(IngestDiagnosticCode::PdfNoUsableTextLayer);
+        }
         self.record_task_phase(
             task_id,
             phase,
@@ -8408,7 +8435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scanned_image_only_pdf_ingest_reports_ocr_disabled_warning_and_status() {
+    async fn scanned_image_only_pdf_ingest_rejects_without_ocr() {
         let tempdir = tempfile::tempdir().unwrap();
         let store = Store::in_memory().unwrap();
         let mut pipeline = IngestPipeline::from_parts(
@@ -8420,45 +8447,36 @@ mod tests {
         let path = tempdir.path().join("scanned.pdf");
         write_pdf_with_image(&path);
         let source_id = pipeline.add_source(&path).unwrap();
-        let task_id = TaskId("task-ocr-disabled".into());
-        pipeline
-            .store()
-            .create_task(&task_id, TaskKind::Ingest, &serde_json::json!({}))
-            .unwrap();
+        let original = pipeline.store().get_source(&source_id).unwrap().unwrap();
 
-        pipeline
-            .ingest_source_with_task(&source_id, &task_id)
+        let error = pipeline
+            .ingest_source(&source_id)
             .await
-            .unwrap();
+            .expect_err("image-only PDFs must fail closed");
 
-        let evidence = pipeline
+        assert_eq!(
+            error.downcast_ref::<IngestDiagnosticCode>(),
+            Some(&IngestDiagnosticCode::PdfNoUsableTextLayer)
+        );
+        assert_eq!(error.to_string(), "pdf_no_usable_text_layer");
+        assert!(pipeline
             .store()
             .list_evidence_by_source(&source_id)
-            .unwrap();
-        assert!(evidence.iter().any(|unit| unit.kind == EvidenceKind::Image));
-        assert!(evidence.iter().all(|unit| unit.kind != EvidenceKind::Ocr));
-        let artifacts = pipeline
-            .store()
-            .list_image_artifacts_by_source(&source_id)
-            .unwrap();
-        let diagnostics = source_ingest_diagnostics(&path, &evidence, &artifacts, None);
-        let pdf = diagnostics.pdf.as_ref().unwrap();
-        assert!(pdf.ocr_recommended);
-        assert_eq!(pdf.image_only_page_count, 1);
-        assert_eq!(diagnostics.ocr.status, OcrSourceStatus::Disabled);
-
-        let events = pipeline
-            .store()
-            .list_task_events(&task_id, None, 100)
-            .unwrap();
-        assert!(events.iter().any(|event| {
-            event.event_type == "warning" && event.message.contains("OCR disabled")
-        }));
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            pipeline
+                .store()
+                .get_source(&source_id)
+                .unwrap()
+                .unwrap()
+                .hash,
+            original.hash
+        );
     }
 
     #[tokio::test]
-    async fn scanned_pdf_ocr_enabled_indexes_locator_backed_evidence_and_marks_profile_change_stale(
-    ) {
+    async fn scanned_image_only_pdf_rejects_before_configured_ocr() {
         let tempdir = tempfile::tempdir().unwrap();
         let store = Store::in_memory().unwrap();
         let ocr = MockOcrProvider::new("eng", "default");
@@ -8473,88 +8491,22 @@ mod tests {
         write_pdf_with_image(&path);
         let source_id = pipeline.add_source(&path).unwrap();
 
-        pipeline.ingest_source(&source_id).await.unwrap();
+        let error = pipeline
+            .ingest_source(&source_id)
+            .await
+            .expect_err("configured OCR must not rescue image-only PDFs");
 
-        assert_eq!(ocr.call_count(), 1);
-        let evidence = pipeline
+        assert_eq!(
+            error.downcast_ref::<IngestDiagnosticCode>(),
+            Some(&IngestDiagnosticCode::PdfNoUsableTextLayer)
+        );
+        assert_eq!(error.to_string(), "pdf_no_usable_text_layer");
+        assert_eq!(ocr.call_count(), 0);
+        assert!(pipeline
             .store()
             .list_evidence_by_source(&source_id)
-            .unwrap();
-        let ocr_evidence = evidence
-            .iter()
-            .find(|unit| unit.kind == EvidenceKind::Ocr)
-            .expect("OCR evidence should be stored");
-        assert_eq!(ocr_evidence.text, "ocrneedle scanned invoice total");
-        match &ocr_evidence.locator {
-            SourceLocator::PdfOcr {
-                page,
-                page_label,
-                line_index,
-                bbox: Some(bbox),
-                ocr,
-                ..
-            } => {
-                assert_eq!(*page, 1);
-                assert_eq!(page_label.as_deref(), Some("1"));
-                assert_eq!(*line_index, 1);
-                assert_eq!(bbox.x0, 10.0);
-                assert_eq!(ocr.profile.engine, "mock-ocr");
-                assert_eq!(ocr.profile.language, "eng");
-                assert_eq!(ocr.confidence, Some(0.97));
-                assert_eq!(ocr.text_hash, ocr_evidence.text_hash);
-            }
-            other => panic!("expected OCR locator, got {other:?}"),
-        }
-
-        assert!(!pipeline
-            .lexical_index()
-            .search("ocrneedle", 5)
             .unwrap()
             .is_empty());
-        let lexical_index = pipeline.lexical_index();
-        let retrieval_config = RetrievalConfig {
-            dense_top_k: 0,
-            bm25_top_k: 5,
-            ..RetrievalConfig::default()
-        };
-        let retrieval = RetrievalPipeline::new(
-            pipeline.hnsw(),
-            &lexical_index,
-            pipeline.store(),
-            &StaticEmbeddingClient,
-            &retrieval_config,
-        );
-        let results = retrieval
-            .search_filtered("ocrneedle", Some(&source_id))
-            .await
-            .unwrap();
-        assert!(results.iter().any(|result| {
-            result
-                .evidence_units
-                .iter()
-                .any(|unit| unit.kind == EvidenceKind::Ocr)
-        }));
-
-        let artifacts = pipeline
-            .store()
-            .list_image_artifacts_by_source(&source_id)
-            .unwrap();
-        let diagnostics =
-            source_ingest_diagnostics(&path, &evidence, &artifacts, Some(&ocr.profile()));
-        assert_eq!(diagnostics.ocr.status, OcrSourceStatus::Applied);
-
-        pipeline.ocr_provider = Some(Box::new(MockOcrProvider::new("deu", "default")));
-        let stale = pipeline.check_stale().unwrap();
-        assert_eq!(stale, vec![source_id.clone()]);
-        assert_eq!(
-            pipeline
-                .store()
-                .get_source(&source_id)
-                .unwrap()
-                .unwrap()
-                .status,
-            SourceStatus::Stale
-        );
     }
 
     #[test]

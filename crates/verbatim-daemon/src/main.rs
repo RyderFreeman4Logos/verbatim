@@ -126,7 +126,7 @@ use deletion_api::{
     delete_source, list_deletion_reports, reconcile_deletions_on_startup,
     start_deletion_reconcile_scheduler, STARTUP_DELETION_RECONCILE_BATCH_SIZE,
 };
-use source_bounded_retrieval::filter_generated_retrieval_evidence;
+use source_bounded_retrieval::{filter, filter_generated_retrieval_evidence};
 use source_relocation_api::relocate_source;
 
 // ---------------------------------------------------------------------------
@@ -7512,7 +7512,7 @@ async fn prepare_retrieve_context(
             filter_generated_retrieval_evidence(
                 pipeline.store(),
                 &mut results,
-                &mut debug,
+                Some(&mut debug),
                 controls.include_debug,
             )
         })?;
@@ -7630,7 +7630,8 @@ async fn prepare_generation_context(
                 );
                 Ok::<_, anyhow::Error>((results, retrieval_debug))
             });
-            let (results, mut retrieval_debug) = retrieval_result?;
+            let (mut results, mut retrieval_debug) = retrieval_result?;
+            filter(pipeline.store(), &mut results, &mut retrieval_debug)?;
             if let Some(debug) = retrieval_debug.as_mut() {
                 debug.retrieval_search_sql_statement_count = retrieval_search_sql_statement_count;
                 debug.retrieval_resource_counters = retrieval_resource_counters;
@@ -8386,7 +8387,7 @@ async fn get_evidence(
             id: eu.id.0,
             source_id: eu.source_id.0,
             source_hash,
-            source_bounded: eu.kind != EvidenceKind::Generated,
+            source_bounded: matches!(eu.kind, EvidenceKind::Text | EvidenceKind::Image),
             text_hash: eu.text_hash,
             derived_from: eu.derived_from.map(|id| id.0),
             locator: eu.locator.to_string(),

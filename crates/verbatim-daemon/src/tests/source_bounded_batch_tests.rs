@@ -20,7 +20,7 @@ fn source_bounded_retrieval_batches_evidence_eligibility_queries() {
         let mut results = all_results[..candidate_count].to_vec();
         let mut debug = empty_retrieval_debug();
         let (filtered, count) = store.count_sql_statements(|| {
-            filter_generated_retrieval_evidence(&store, &mut results, &mut debug, false)
+            filter_generated_retrieval_evidence(&store, &mut results, Some(&mut debug), false)
         });
         filtered.unwrap();
         assert_eq!(results.len(), candidate_count);
@@ -80,7 +80,7 @@ fn source_bounded_retrieval_fails_closed_per_invalid_persisted_evidence() {
         })
         .collect();
 
-    filter_generated_retrieval_evidence(&store, &mut results, &mut debug, true)
+    filter_generated_retrieval_evidence(&store, &mut results, Some(&mut debug), true)
         .expect("invalid evidence is candidate-local");
 
     assert_eq!(
@@ -135,4 +135,39 @@ fn persist_retrieval_filter_fixture(name: &str, results: &[RetrievalResult]) -> 
     store.bulk_insert_chunks(&chunks).unwrap();
     store.link_chunk_evidence(&links).unwrap();
     dir
+}
+
+#[test]
+fn source_bounded_retrieval_omits_ocr_evidence_without_debug() {
+    let store = Store::in_memory().unwrap();
+    let mut results = vec![test_retrieval_result(
+        1,
+        "ocr-chunk",
+        "ocr-evidence",
+        EvidenceKind::Ocr,
+    )];
+    let result = &results[0];
+    store
+        .add_source(&Source {
+            id: result.evidence_units[0].source_id.clone(),
+            path: "ocr.pdf".into(),
+            hash: "source-hash".into(),
+            status: SourceStatus::Indexed,
+            parser_used: Some("test".into()),
+            last_ingested_at: None,
+        })
+        .expect("OCR source persists for the negative retrieval fixture");
+    store
+        .bulk_insert_evidence(&result.evidence_units)
+        .expect("OCR evidence persists for the negative retrieval fixture");
+    store
+        .bulk_insert_chunks(std::slice::from_ref(&result.chunk))
+        .expect("OCR chunk persists for the negative retrieval fixture");
+    store
+        .link_chunk_evidence(&[(result.chunk.id.clone(), result.evidence_units[0].id.clone())])
+        .expect("OCR chunk links to its evidence");
+
+    filter_generated_retrieval_evidence(&store, &mut results, None, false)
+        .expect("source-bounded retrieval filters OCR evidence");
+    assert!(results.is_empty());
 }

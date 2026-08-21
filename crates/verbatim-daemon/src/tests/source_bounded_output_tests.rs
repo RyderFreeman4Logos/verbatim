@@ -150,7 +150,7 @@ async fn public_generated_evidence_is_not_source_bounded() {
     )
     .expect("OCR evidence response");
     assert_eq!(returned.id, ocr.id.0);
-    assert!(returned.source_bounded);
+    assert!(!returned.source_bounded);
     assert_eq!(returned.text_hash, ocr.text_hash);
     assert_eq!(returned.text, ocr.text);
 }
@@ -598,7 +598,7 @@ fn final_retrieve_response(
     filter_generated_retrieval_evidence(
         store,
         &mut input.results,
-        &mut input.debug,
+        Some(&mut input.debug),
         input.controls.include_debug,
     )?;
     input.sources = sources_for_results(&input.results, store)?;

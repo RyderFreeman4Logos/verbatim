@@ -8,10 +8,13 @@ use verbatim_core::types::{ChunkId, EvidenceKind, RetrievalDebug, RetrievalResul
 pub(super) fn filter_generated_retrieval_evidence(
     store: &Store,
     results: &mut Vec<RetrievalResult>,
-    debug: &mut RetrievalDebug,
+    mut debug: Option<&mut RetrievalDebug>,
     include_debug: bool,
 ) -> Result<()> {
-    let has_debug_identities = include_debug && retrieval_debug_has_chunk_identities(debug);
+    let has_debug_identities = include_debug
+        && debug
+            .as_ref()
+            .is_some_and(|debug| retrieval_debug_has_chunk_identities(debug));
     if results.is_empty() && !has_debug_identities {
         return Ok(());
     }
@@ -19,14 +22,18 @@ pub(super) fn filter_generated_retrieval_evidence(
     let source_bounded_chunk_ids = source_bounded_retrieval_chunk_ids(
         store,
         results,
-        has_debug_identities.then_some(&*debug),
+        if has_debug_identities {
+            debug.as_deref()
+        } else {
+            None
+        },
     )?;
     let result_count = results.len();
     results.retain(|result| {
         let directly_source_bounded = result
             .evidence_units
             .iter()
-            .all(|evidence| evidence.kind != EvidenceKind::Generated);
+            .all(|evidence| matches!(evidence.kind, EvidenceKind::Text | EvidenceKind::Image));
         let persisted_source_bounded = source_bounded_chunk_ids.contains(&result.chunk_id)
             && result
                 .provenance
@@ -40,18 +47,30 @@ pub(super) fn filter_generated_retrieval_evidence(
         for (index, result) in results.iter_mut().enumerate() {
             result.provenance.result_rank = index + 1;
         }
-        refresh_evidence_pack_debug(debug, results);
+        if let Some(debug) = debug.as_deref_mut() {
+            refresh_evidence_pack_debug(debug, results);
+        }
     }
 
     if has_debug_identities {
-        filter_retrieval_debug_chunk_identities(
-            debug,
-            &source_bounded_chunk_ids,
-            results_changed,
-            results,
-        );
+        if let Some(debug) = debug {
+            filter_retrieval_debug_chunk_identities(
+                debug,
+                &source_bounded_chunk_ids,
+                results_changed,
+                results,
+            );
+        }
     }
     Ok(())
+}
+
+pub(super) fn filter(
+    store: &Store,
+    results: &mut Vec<RetrievalResult>,
+    debug: &mut Option<RetrievalDebug>,
+) -> Result<()> {
+    filter_generated_retrieval_evidence(store, results, debug.as_mut(), true)
 }
 
 fn retrieval_debug_has_chunk_identities(debug: &RetrievalDebug) -> bool {
@@ -110,7 +129,8 @@ fn source_bounded_retrieval_chunk_ids(
         let source_bounded = chunk.evidence_unit_ids.iter().all(|evidence_id| {
             matches!(
                 evidence.get(evidence_id),
-                Some(Ok(evidence)) if evidence.kind != EvidenceKind::Generated
+                Some(Ok(evidence))
+                    if matches!(evidence.kind, EvidenceKind::Text | EvidenceKind::Image)
             )
         });
         if source_bounded {
