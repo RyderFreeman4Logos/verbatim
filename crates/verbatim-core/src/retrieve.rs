@@ -5,6 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
+mod live_caps;
 mod source_filter;
 mod vector_search_resource;
 
@@ -440,6 +441,7 @@ impl<'a> RetrievalPipeline<'a> {
     ) -> Result<RetrievalSearchOutput> {
         let include_debug = debug_options.is_some();
         let debug_options = debug_options.unwrap_or_default();
+        let search_budget = self.search_budget()?;
         let mut local_spans_ms = RetrievalLocalSpansMs::default();
         let mut candidate_counters = CandidateCounters::default();
         if source_filter.is_some_and(HashSet::is_empty) {
@@ -536,23 +538,37 @@ impl<'a> RetrievalPipeline<'a> {
                 }
                 fused = scoped_fused;
             }
+            fused.truncate(search_budget.fused_pool_size as usize);
             let rrf_fusion_ms = elapsed_ms(rrf_started);
             let bm25_returned = bm25_results.len() as u64;
             let fused_count = fused.len() as u64;
 
             let debug_pack_started = Instant::now();
             let bm25_hits = if include_debug {
-                self.stage_debug_hits(&bm25_results, source_filter)?
+                self.stage_debug_hits(
+                    &bm25_results,
+                    source_filter,
+                    search_budget.debug_output_size as usize,
+                )?
             } else {
                 Vec::new()
             };
             let dense_hits = if include_debug {
-                self.stage_debug_hits(&dense_results, source_filter)?
+                self.stage_debug_hits(
+                    &dense_results,
+                    source_filter,
+                    search_budget.debug_output_size as usize,
+                )?
             } else {
                 Vec::new()
             };
             let rrf_fused_hits = if include_debug {
-                self.fused_debug_hits(&fused, &dense_results, &bm25_results)?
+                self.fused_debug_hits(
+                    &fused,
+                    &dense_results,
+                    &bm25_results,
+                    search_budget.debug_output_size as usize,
+                )?
             } else {
                 Vec::new()
             };
@@ -590,6 +606,10 @@ impl<'a> RetrievalPipeline<'a> {
             self.with_read_permit(|| {
                 let result_hydration_started = Instant::now();
                 let mut results = Vec::new();
+                let fused = fused
+                    .into_iter()
+                    .take(search_budget.final_hydration_list_size as usize)
+                    .collect::<Vec<_>>();
                 let chunk_ids = fused
                     .iter()
                     .map(|(chunk_id, _)| chunk_id.clone())
@@ -1193,11 +1213,21 @@ impl<'a> RetrievalPipeline<'a> {
         &self,
         hits: &[(ChunkId, f32)],
         source_filter: Option<&HashSet<SourceId>>,
+        debug_output_size: usize,
     ) -> Result<Vec<RetrievalStageHit>> {
+        let hits = hits.iter().take(debug_output_size).collect::<Vec<_>>();
+        let chunk_ids = hits
+            .iter()
+            .map(|(chunk_id, _)| (*chunk_id).clone())
+            .collect::<Vec<_>>();
+        let chunks = self.store.get_chunks(&chunk_ids)?;
         let mut debug_hits = Vec::new();
 
-        for (rank, (chunk_id, score)) in hits.iter().enumerate() {
-            let chunk = self.store.get_chunk(chunk_id)?;
+        for (rank, (chunk_id, score)) in hits.into_iter().enumerate() {
+            let chunk = chunks
+                .get(chunk_id)
+                .map(|chunk| chunk.as_ref().map_err(|error| anyhow!(error.to_string())))
+                .transpose()?;
             if source_filter.is_some_and(|source_ids| {
                 chunk
                     .as_ref()
@@ -1212,7 +1242,7 @@ impl<'a> RetrievalPipeline<'a> {
                 source_id: chunk.as_ref().map(|chunk| chunk.source_id.clone()),
                 score: *score,
                 evidence_ids: chunk
-                    .map(|chunk| chunk.evidence_unit_ids)
+                    .map(|chunk| chunk.evidence_unit_ids.clone())
                     .unwrap_or_default(),
             });
         }
@@ -1225,14 +1255,24 @@ impl<'a> RetrievalPipeline<'a> {
         hits: &[(ChunkId, f32)],
         dense_results: &[(ChunkId, f32)],
         bm25_results: &[(ChunkId, f32)],
+        debug_output_size: usize,
     ) -> Result<Vec<RetrievalFusedHit>> {
         let dense_ranks = rank_by_chunk_id(dense_results);
         let bm25_ranks = rank_by_chunk_id(bm25_results);
+        let hits = hits.iter().take(debug_output_size).collect::<Vec<_>>();
+        let chunk_ids = hits
+            .iter()
+            .map(|(chunk_id, _)| (*chunk_id).clone())
+            .collect::<Vec<_>>();
+        let chunks = self.store.get_chunks(&chunk_ids)?;
 
         hits.iter()
             .enumerate()
             .map(|(rank, (chunk_id, score))| {
-                let chunk = self.store.get_chunk(chunk_id)?;
+                let chunk = chunks
+                    .get(chunk_id)
+                    .map(|chunk| chunk.as_ref().map_err(|error| anyhow!(error.to_string())))
+                    .transpose()?;
                 Ok(RetrievalFusedHit {
                     rank: rank + 1,
                     chunk_id: chunk_id.clone(),
@@ -1241,7 +1281,7 @@ impl<'a> RetrievalPipeline<'a> {
                     dense_rank: dense_ranks.get(chunk_id).copied(),
                     bm25_rank: bm25_ranks.get(chunk_id).copied(),
                     evidence_ids: chunk
-                        .map(|chunk| chunk.evidence_unit_ids)
+                        .map(|chunk| chunk.evidence_unit_ids.clone())
                         .unwrap_or_default(),
                 })
             })
@@ -5880,6 +5920,9 @@ mod tests {
         .unwrap();
         assert_eq!(globally_limited_results.len(), 2);
     }
+
+    #[path = "../live_caps_tests.rs"]
+    mod live_caps_tests;
 
     fn chunk_ids(results: &[RetrievalResult]) -> Vec<String> {
         results
