@@ -2171,7 +2171,6 @@ mod tests {
     use std::env;
     use std::ffi::OsString;
     use std::fs;
-    use std::io::{Read as _, Write as _};
     use std::net::{SocketAddr, TcpListener};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};

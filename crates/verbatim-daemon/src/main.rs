@@ -7739,11 +7739,11 @@ fn run_generation_retrieval_once(
     source_filter: Option<&HashSet<SourceId>>,
     debug_options: RetrievalDebugOptions,
 ) -> Result<(Vec<RetrievalResult>, Option<RetrievalDebug>)> {
-    let (results, debug) = runtime.block_on(retrieval.search_source_set_with_debug_options(
-        question,
-        source_filter,
-        debug_options,
-    ))?;
+    let (results, debug) = runtime.block_on(
+        retrieval
+            .with_canonical_fused_tail()
+            .search_source_set_with_debug_options(question, source_filter, debug_options),
+    )?;
     Ok((results, Some(debug)))
 }
 
@@ -9842,6 +9842,8 @@ mod tests {
     mod auth_middleware_daemon_tests;
     #[path = "issue_332_explicit_move_route_tests.rs"]
     mod issue_332_explicit_move_route_tests;
+    #[path = "retrieve_sidecar_tests.rs"]
+    mod retrieve_sidecar_tests;
     #[path = "source_bounded_output_tests.rs"]
     mod source_bounded_output_tests;
     #[path = "sql_statement_telemetry_tests.rs"]
