@@ -1,6 +1,10 @@
 # Evaluation Fixtures
 
-Verbatim keeps the MVP regression suite deterministic. Fast tests use small in-memory stores, tiny generated PDF fixtures, and mocked model providers for embedding, vision captioning, and verification. They do not require network access or local Qwen/vLLM endpoints.
+Verbatim keeps the MVP regression suite deterministic. Fast tests use small
+in-memory stores, tiny generated PDF fixtures, and mocked model providers for
+embedding and verification. Caption and OCR fixtures verify that non-source
+text does not become Evidence. They do not require network access or local
+Qwen/vLLM endpoints.
 
 For the release checklist and manual model-backed smoke sequence, see [mvp.md](mvp.md).
 
@@ -25,7 +29,10 @@ cargo test --workspace --all-features
 just pre-commit-fast
 ```
 
-The `mvp_regression` filter covers Markdown headings and links, plaintext paragraphs, tiny PDF text and diagram fixtures, same-stem source IDs, changed-source re-ingest, source removal, image caption indexing, graph expansion, and verifier pass/revise/fail behavior.
+The `mvp_regression` filter covers Markdown headings and links, plaintext
+paragraphs, tiny PDF text and diagram fixtures, same-stem source IDs,
+changed-source re-ingest, source removal, source-bounded caption/OCR refusal,
+graph expansion, and verifier pass/revise/fail behavior.
 
 ## Optional Model-Backed Eval
 
@@ -37,7 +44,8 @@ cat > "${tmpdir}/mvp-eval.md" <<'EOF'
 # MVP Eval
 
 Verbatim should answer with a citation when evidence is present.
-Graph expansion and image captions are regression-critical behaviors.
+Graph expansion and source-bounded caption refusal are regression-critical
+behaviors.
 EOF
 
 verbatim daemon start

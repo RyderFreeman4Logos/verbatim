@@ -16,8 +16,8 @@ Verbatim MVP includes:
   Tantivy BM25 search.
 - Pure Rust PDF parsing through `pdf_oxide` by default, with `pdfplumber` behind
   an optional feature.
-- PDF text evidence, PDF image artifact evidence, and optional generated image
-  caption evidence.
+- PDF text evidence and PDF image artifact evidence. Generated image captions
+  and OCR output are not Evidence.
 - Hybrid retrieval with reciprocal-rank fusion.
 - Evidence inspection and citation mapping through `verbatim evidence <eid>`.
 - Citation verification, enabled by default.
@@ -272,7 +272,8 @@ cat > "${tmpdir}/mvp-smoke.md" <<'EOF'
 # MVP Smoke
 
 Verbatim answers with grounded citations.
-Graph expansion and image caption indexing are MVP regression behaviors.
+Graph expansion and refusal of image captions as Evidence are MVP regression
+behaviors.
 EOF
 ```
 
@@ -370,7 +371,7 @@ Passing signal:
 - `evidence <eid>` prints the source id, evidence kind, locator, position, and
   text.
 
-## PDF Text And Image Evidence
+## PDF Text And Image Handling
 
 Add and ingest PDFs the same way:
 
@@ -386,27 +387,9 @@ are stored under the data directory and bounded by `[parser.image_artifacts]`
 limits. `pdf_oxide` is the default parser. Unsupported image filters are skipped
 with warnings; supported text evidence continues to ingest.
 
-Generated image caption evidence is derived evidence. Enable it only when a
-vision-capable OpenAI-compatible chat endpoint is available:
-
-```toml
-[vision]
-enabled = true
-provider = "openai_compatible"
-base_url = "http://gb10:18009/v1"
-model = "qwen3.6-27B"
-
-[chat.vision_attachments]
-enabled = true
-model_supports_vision = true
-max_images = 2
-max_total_bytes = 8388608
-detail = "auto"
-```
-
-Generated captions are searchable and cite their original image evidence through
-`derived_from`. Treat them as model-derived descriptions, not exact OCR or
-original PDF text.
+Generated image captions and OCR output are not citable or searchable Evidence.
+Source-bounded retrieval refuses them. Scanned or image-only PDFs fail closed;
+born-digital PDFs with a usable text layer continue to ingest.
 
 ## Rerank
 
@@ -511,9 +494,8 @@ unavailable, Verbatim logs a warning and falls back to local HNSW search.
 - Rerank is missing: check `[rerank].enabled` and the reranker `base_url`.
 - Graph expansion is missing: check `[graph].enabled`, `max_expanded_chunks`,
   and whether the retrieved seed has graph neighbors.
-- PDF image captions are missing: check `[vision].enabled`, the vision endpoint,
-  and `[chat.vision_attachments]` if the model must receive image pixels during
-  generation/verification.
+- OCR output and image captions are not citable Evidence. Use the source text
+  layer, or provide a born-digital PDF with a usable text layer.
 - Qdrant is not used in MVP. Leave it disabled unless working on issue #17.
 
 ## Release Checklist
@@ -537,7 +519,8 @@ Manual model-backed validation:
 - CLI can add, list, inspect, ingest, ask, and inspect evidence.
 - PDF text evidence works.
 - PDF image artifact evidence works.
-- Generated PDF image caption evidence works when `[vision].enabled = true`.
+- Scanned and image-only PDFs are rejected; OCR output and vision captions do
+  not become Evidence.
 - Local Qwen-compatible embedding/chat endpoints can be configured.
 - Rerank can be enabled and disabled.
 - Graph expansion can be enabled and disabled.

@@ -1,5 +1,9 @@
 # Verbatim
 
+Verbatim's ranking is probabilistic, but the evidence returned by source-bounded
+retrieval is not generated. Every evidence passage is resolved from indexed,
+traceable source material. See the full [safety model](docs/safety-model.md).
+
 Verbatim is a local, daemon-backed evidence search engine. It indexes your
 sources and retrieves ranked passages with stable IDs and locators. Retrieval
 returns inspectable evidence; when citation verification is enabled and passes,
@@ -276,9 +280,9 @@ membership in SQLite, and records both collection logical path and canonical
 source path. Collection sync creates or reuses canonical-path source IDs, so one
 physical file can belong to multiple collections without duplicate indexing.
 
-**Evidence**: The citation unit returned by retrieval and answer generation.
-Evidence has a stable ID, source ID, kind, locator, snippet/text, and optional
-structured locator/provenance fields.
+**Evidence**: The citation unit returned by source-bounded retrieval and by
+verified answer generation. Evidence has a stable ID, source ID, kind,
+locator, snippet/text, and optional structured locator/provenance fields.
 
 **Chunks and vectors**: Ingest parses source text into parent/child chunks,
 stores metadata and text in SQLite, builds BM25 search indexes with Tantivy, and
