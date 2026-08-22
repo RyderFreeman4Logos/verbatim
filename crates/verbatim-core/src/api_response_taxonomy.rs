@@ -40,9 +40,48 @@ impl ResponseTextTaxonomy {
                 OutputTextPlane::DeterministicInterfaceText,
             ),
             ("citations[].text_preview", OutputTextPlane::Evidence),
-            ("citations[].metadata", OutputTextPlane::Metadata),
-            ("collection_filter", OutputTextPlane::Metadata),
-            ("retrieval", OutputTextPlane::Metadata),
+            ("citations[].evidence_id", OutputTextPlane::Metadata),
+            ("citations[].kind", OutputTextPlane::Metadata),
+            ("citations[].derived_from", OutputTextPlane::Metadata),
+            ("citations[].locator", OutputTextPlane::Metadata),
+            (
+                "citations[].collections[].collection_id",
+                OutputTextPlane::Metadata,
+            ),
+            ("citations[].collections[].name", OutputTextPlane::Metadata),
+            (
+                "citations[].collections[].logical_path",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "citations[].collections[].source_path",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "citations[].collections[].member_updated_at",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "collection_filter.requested.collection_ids[]",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "collection_filter.requested.names[]",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "collection_filter.applied[].collection_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "collection_filter.applied[].name",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "collection_filter.applied[].last_synced_at",
+                OutputTextPlane::Metadata,
+            ),
+            ("collection_filter.warnings[]", OutputTextPlane::Metadata),
         ])
     }
 
@@ -53,7 +92,54 @@ impl ResponseTextTaxonomy {
                 "results[].label",
                 OutputTextPlane::DeterministicInterfaceText,
             ),
-            ("metadata", OutputTextPlane::Metadata),
+            ("task_id", OutputTextPlane::Metadata),
+            ("query", OutputTextPlane::Metadata),
+            ("source_id", OutputTextPlane::Metadata),
+            ("embedding_profile_id", OutputTextPlane::Metadata),
+            (
+                "audit_receipt.embedding_profile_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "audit_receipt.results[].evidence_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "audit_receipt.results[].text_hash",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "audit_receipt.results[].source_hash",
+                OutputTextPlane::Metadata,
+            ),
+            ("timings[].phase", OutputTextPlane::Metadata),
+            ("results[].evidence_id", OutputTextPlane::Metadata),
+            ("results[].text_hash", OutputTextPlane::Metadata),
+            ("results[].source_id", OutputTextPlane::Metadata),
+            ("results[].source_hash", OutputTextPlane::Metadata),
+            ("results[].source_path", OutputTextPlane::Metadata),
+            ("results[].chunk_id", OutputTextPlane::Metadata),
+            ("results[].kind", OutputTextPlane::Metadata),
+            ("results[].role", OutputTextPlane::Metadata),
+            ("results[].locator", OutputTextPlane::Metadata),
+            ("results[].derived_from", OutputTextPlane::Metadata),
+            (
+                "results[].collections[].collection_id",
+                OutputTextPlane::Metadata,
+            ),
+            ("results[].collections[].name", OutputTextPlane::Metadata),
+            (
+                "results[].collections[].logical_path",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].collections[].source_path",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].collections[].member_updated_at",
+                OutputTextPlane::Metadata,
+            ),
         ])
     }
 
@@ -66,7 +152,14 @@ impl ResponseTextTaxonomy {
         Self::from_fields(&[
             ("text", text_plane),
             ("heading_path[]", text_plane),
-            ("metadata", OutputTextPlane::Metadata),
+            ("id", OutputTextPlane::Metadata),
+            ("source_id", OutputTextPlane::Metadata),
+            ("source_hash", OutputTextPlane::Metadata),
+            ("text_hash", OutputTextPlane::Metadata),
+            ("kind", OutputTextPlane::Metadata),
+            ("derived_from", OutputTextPlane::Metadata),
+            ("locator", OutputTextPlane::Metadata),
+            ("language", OutputTextPlane::Metadata),
         ])
     }
 
