@@ -1186,9 +1186,10 @@ const ASK_AFTER_HELP: &str = r#"Examples:
   verbatim ask --no-generate --format json "What evidence is relevant?"
 
 Caveats:
-  Normal ask invokes the configured chat model after retrieval.
-  --context-only and --no-generate return retrieval context without chat
-  generation; --background is not supported in that mode.
+  Normal ask and streaming output are generated interpretations, not
+  source-bounded unless citation verification passes.
+  --context-only and --no-generate return source-bounded context, not a
+  generated answer; --background is not supported in that mode.
   --limit, --page-size, and --page only apply with --context-only or
   --no-generate.
   --format only applies with --context-only or --no-generate.
@@ -1199,6 +1200,8 @@ const EVIDENCE_AFTER_HELP: &str = r#"Examples:
 
 Evidence ids come from retrieve --show-debug --verbose, retrieve --format json,
 ask citations, and retrieval debug packs.
+
+This is source-bounded rendering of a persisted evidence id.
 "#;
 
 const RESOLVE_AFTER_HELP: &str = r#"Examples:
@@ -2478,9 +2481,12 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
         assert!(ask_help.contains("Generate a cited answer"));
-        assert!(ask_help.contains("Normal ask invokes the configured chat model"));
+        assert!(ask_help.contains("Normal ask and streaming output are generated interpretations"));
+        assert!(ask_help.contains("source-bounded unless citation verification passes"));
         assert!(ask_help.contains("--context-only"));
         assert!(ask_help.contains("--no-generate"));
+        assert!(ask_help.contains("return source-bounded context"));
+        assert!(ask_help.contains("generated answer"));
         assert!(ask_help.contains("--limit"));
         assert!(ask_help.contains("--page-size"));
         assert!(ask_help.contains("--page"));
@@ -2491,11 +2497,20 @@ mod tests {
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
         assert!(retrieve_help.contains("without invoking chat generation"));
+        assert!(retrieve_help.contains("source-bounded evidence"));
+        assert!(retrieve_help.contains("best-effort"));
+        assert!(retrieve_help.contains("not exhaustive"));
         assert!(retrieve_help.contains("markdown"));
         assert!(retrieve_help.contains("json"));
         assert!(retrieve_help.contains("snippets"));
         assert!(retrieve_help.contains("tsv"));
         assert!(retrieve_help.contains("csv"));
+
+        let (code, evidence_help, stderr, _, _) = run_mock(["evidence", "--help"]);
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        assert!(evidence_help.contains("source-bounded rendering"));
+        assert!(evidence_help.contains("persisted evidence id"));
     }
 
     #[test]
