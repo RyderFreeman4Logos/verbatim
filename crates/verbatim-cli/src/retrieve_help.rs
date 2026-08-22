@@ -15,6 +15,8 @@ pub const RETRIEVE_AFTER_HELP: &str = r#"Examples:
 Debugging:
   retrieve never invokes chat generation.
   It returns evidence context without invoking chat generation.
+  Default retrieve output is source-bounded evidence; ranking is best-effort,
+  not exhaustive.
   Default markdown is compact: rank, score, citation, stable evidence id, and snippet only.
   Without --source-id or --collection, retrieve uses the configured collection
   scope; an empty retrieval.default_collections intentionally searches all sources.
