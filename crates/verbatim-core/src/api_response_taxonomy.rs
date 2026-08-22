@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::{CitationResponse, RetrieveResultResponse};
+
 /// Closed text planes for retrieval-only response schemas.
 /// `GeneratedInterpretation` is never source text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,8 +31,13 @@ impl ResponseTextTaxonomy {
     const VERSION: u8 = 1;
 
     pub fn ask_response() -> Self {
-        Self::from_fields(&[
+        Self::ask_response_with_citations(&[])
+    }
+
+    pub fn ask_response_with_citations(citations: &[CitationResponse]) -> Self {
+        let mut taxonomy = Self::from_fields(&[
             ("answer", OutputTextPlane::GeneratedInterpretation),
+            ("answer_kind", OutputTextPlane::Metadata),
             (
                 "generated_interpretation.text",
                 OutputTextPlane::GeneratedInterpretation,
@@ -39,7 +46,6 @@ impl ResponseTextTaxonomy {
                 "citations[].label",
                 OutputTextPlane::DeterministicInterfaceText,
             ),
-            ("citations[].text_preview", OutputTextPlane::Evidence),
             ("citations[].evidence_id", OutputTextPlane::Metadata),
             ("citations[].kind", OutputTextPlane::Metadata),
             ("citations[].derived_from", OutputTextPlane::Metadata),
@@ -82,12 +88,26 @@ impl ResponseTextTaxonomy {
                 OutputTextPlane::Metadata,
             ),
             ("collection_filter.warnings[]", OutputTextPlane::Metadata),
-        ])
+        ]);
+        if citations.is_empty() {
+            taxonomy.push("citations[].text_preview", OutputTextPlane::Evidence);
+        } else {
+            for (index, citation) in citations.iter().enumerate() {
+                taxonomy.push(
+                    format!("citations[{index}].text_preview"),
+                    text_plane_for_kind(&citation.kind, None),
+                );
+            }
+        }
+        taxonomy
     }
 
     pub fn retrieve_response() -> Self {
-        Self::from_fields(&[
-            ("results[].snippet", OutputTextPlane::Evidence),
+        Self::retrieve_response_with_results(&[])
+    }
+
+    pub fn retrieve_response_with_results(results: &[RetrieveResultResponse]) -> Self {
+        let mut taxonomy = Self::from_fields(&[
             (
                 "results[].label",
                 OutputTextPlane::DeterministicInterfaceText,
@@ -96,6 +116,27 @@ impl ResponseTextTaxonomy {
             ("query", OutputTextPlane::Metadata),
             ("source_id", OutputTextPlane::Metadata),
             ("embedding_profile_id", OutputTextPlane::Metadata),
+            (
+                "collection_filter.requested.collection_ids[]",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "collection_filter.requested.names[]",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "collection_filter.applied[].collection_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "collection_filter.applied[].name",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "collection_filter.applied[].last_synced_at",
+                OutputTextPlane::Metadata,
+            ),
+            ("collection_filter.warnings[]", OutputTextPlane::Metadata),
             (
                 "audit_receipt.embedding_profile_id",
                 OutputTextPlane::Metadata,
@@ -122,7 +163,6 @@ impl ResponseTextTaxonomy {
             ("results[].kind", OutputTextPlane::Metadata),
             ("results[].role", OutputTextPlane::Metadata),
             ("results[].locator", OutputTextPlane::Metadata),
-            ("results[].derived_from", OutputTextPlane::Metadata),
             (
                 "results[].collections[].collection_id",
                 OutputTextPlane::Metadata,
@@ -140,7 +180,160 @@ impl ResponseTextTaxonomy {
                 "results[].collections[].member_updated_at",
                 OutputTextPlane::Metadata,
             ),
-        ])
+            (
+                "results[].structured_locator.type",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.path_or_url",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.path",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.ocr.profile.provider",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.ocr.profile.engine",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.ocr.profile.engine_version",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.ocr.profile.language",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.ocr.profile.profile",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.ocr.profile_hash",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.ocr.text_hash",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.heading_slug",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.heading_path[].text",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.heading_path[].slug",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.profile_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.work_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.version_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.display",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.normalized",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.start[].level",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.start[].value",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.end[].level",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.end[].value",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.backing_selectors[].type",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.backing_selectors[].exact",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.backing_selectors[].prefix",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.backing_selectors[].suffix",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.backing_selectors[].id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.backing_selectors[].scheme",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].structured_locator.backing_selectors[].value",
+                OutputTextPlane::Metadata,
+            ),
+            ("results[].provenance.origin", OutputTextPlane::Metadata),
+            (
+                "results[].provenance.seed_chunk_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].provenance.seed_source_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].provenance.graph_path[].edge_type",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].provenance.graph_path[].from_node_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].provenance.graph_path[].to_node_id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "results[].provenance.graph_path[].direction",
+                OutputTextPlane::Metadata,
+            ),
+            ("results[].derived_from", OutputTextPlane::Metadata),
+        ]);
+        if results.is_empty() {
+            taxonomy.push("results[].snippet", OutputTextPlane::Evidence);
+        } else {
+            for (index, result) in results.iter().enumerate() {
+                taxonomy.push(
+                    format!("results[{index}].snippet"),
+                    text_plane_for_kind(&result.kind, Some(&result.role)),
+                );
+            }
+        }
+        taxonomy
     }
 
     pub fn evidence_response(source_bounded: bool) -> Self {
@@ -159,20 +352,123 @@ impl ResponseTextTaxonomy {
             ("kind", OutputTextPlane::Metadata),
             ("derived_from", OutputTextPlane::Metadata),
             ("locator", OutputTextPlane::Metadata),
+            ("structured_locator.type", OutputTextPlane::Metadata),
+            ("structured_locator.path_or_url", OutputTextPlane::Metadata),
+            ("structured_locator.path", OutputTextPlane::Metadata),
+            (
+                "structured_locator.ocr.profile.provider",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.ocr.profile.engine",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.ocr.profile.engine_version",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.ocr.profile.language",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.ocr.profile.profile",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.ocr.profile_hash",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.ocr.text_hash",
+                OutputTextPlane::Metadata,
+            ),
+            ("structured_locator.heading_slug", OutputTextPlane::Metadata),
+            (
+                "structured_locator.heading_path[].text",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.heading_path[].slug",
+                OutputTextPlane::Metadata,
+            ),
+            ("structured_locator.profile_id", OutputTextPlane::Metadata),
+            ("structured_locator.work_id", OutputTextPlane::Metadata),
+            ("structured_locator.version_id", OutputTextPlane::Metadata),
+            ("structured_locator.display", OutputTextPlane::Metadata),
+            ("structured_locator.normalized", OutputTextPlane::Metadata),
+            (
+                "structured_locator.start[].level",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.start[].value",
+                OutputTextPlane::Metadata,
+            ),
+            ("structured_locator.end[].level", OutputTextPlane::Metadata),
+            ("structured_locator.end[].value", OutputTextPlane::Metadata),
+            (
+                "structured_locator.backing_selectors[].type",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.backing_selectors[].exact",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.backing_selectors[].prefix",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.backing_selectors[].suffix",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.backing_selectors[].id",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.backing_selectors[].scheme",
+                OutputTextPlane::Metadata,
+            ),
+            (
+                "structured_locator.backing_selectors[].value",
+                OutputTextPlane::Metadata,
+            ),
+            ("image_artifact.image_id", OutputTextPlane::Metadata),
+            ("image_artifact.path", OutputTextPlane::Metadata),
+            ("image_artifact.content_hash", OutputTextPlane::Metadata),
+            ("image_artifact.mime_type", OutputTextPlane::Metadata),
             ("language", OutputTextPlane::Metadata),
         ])
     }
 
     fn from_fields(fields: &[(&str, OutputTextPlane)]) -> Self {
-        Self {
+        let mut taxonomy = Self {
             version: Self::VERSION,
-            fields: fields
-                .iter()
-                .map(|(field, plane)| TextFieldTaxonomy {
-                    field: (*field).into(),
-                    plane: *plane,
-                })
-                .collect(),
+            fields: Vec::with_capacity(fields.len()),
+        };
+        for (field, plane) in fields {
+            taxonomy.push((*field).to_string(), *plane);
         }
+        taxonomy
+    }
+
+    fn push(&mut self, field: impl Into<String>, plane: OutputTextPlane) {
+        self.fields.push(TextFieldTaxonomy {
+            field: field.into(),
+            plane,
+        });
+    }
+}
+
+fn text_plane_for_kind(kind: &str, role: Option<&str>) -> OutputTextPlane {
+    if kind == "generated"
+        || matches!(role, Some("generated" | "image_caption_generated"))
+        || matches!(kind, "image_caption_generated")
+    {
+        OutputTextPlane::GeneratedInterpretation
+    } else {
+        OutputTextPlane::Evidence
     }
 }

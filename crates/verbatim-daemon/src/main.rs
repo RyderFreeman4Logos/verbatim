@@ -5071,20 +5071,21 @@ async fn execute_ask_task_inner_with_config(
         show_retrieval,
     );
     let response_started = Instant::now();
+    let citations = gen_result
+        .citations
+        .into_iter()
+        .map(|citation| {
+            citation_response_with_collections(citation, &query_scope.collection_provenance)
+        })
+        .collect::<Vec<_>>();
     let response = AskResponse {
         answer: gen_result.answer.clone(),
         answer_kind: AnswerKind::GeneratedInterpretation,
-        text_taxonomy: ResponseTextTaxonomy::ask_response(),
+        text_taxonomy: ResponseTextTaxonomy::ask_response_with_citations(&citations),
         generated_interpretation: Some(GeneratedInterpretationResponse {
             text: gen_result.answer,
         }),
-        citations: gen_result
-            .citations
-            .into_iter()
-            .map(|citation| {
-                citation_response_with_collections(citation, &query_scope.collection_provenance)
-            })
-            .collect(),
+        citations,
         verified: gen_result.verified,
         retrieval: retrieval_for_response,
         context: None,
@@ -7852,7 +7853,7 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
     Ok(RetrieveResponse {
         task_id: task_id.0,
         query,
-        text_taxonomy: ResponseTextTaxonomy::retrieve_response(),
+        text_taxonomy: ResponseTextTaxonomy::retrieve_response_with_results(&results_page),
         source_id: source_filter.map(|source_id| source_id.0),
         collection_filter,
         embedding_profile_id: embedding_profile_id.into_string(),
