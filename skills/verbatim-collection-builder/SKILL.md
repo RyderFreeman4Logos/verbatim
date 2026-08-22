@@ -60,7 +60,7 @@ verbatim task wait --timeout 25m "$TASK"
 verbatim task show "$TASK"
 
 # 6. Verify retrieval.
-verbatim retrieve --collection <name> --require-fresh --page-size 3 --limit 3 "<smoke query>"
+verbatim retrieve --collection <name> --require-fresh "<smoke query>"
 ```
 
 Completion criteria:

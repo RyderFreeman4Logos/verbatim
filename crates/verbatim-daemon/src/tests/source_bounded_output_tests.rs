@@ -12,6 +12,8 @@ const CORRUPTED_EVIDENCE_TEXT: &str = "Mutated persisted evidence must not escap
 mod audit_receipt_tests;
 #[path = "canonical_fixture_passage_tests.rs"]
 mod canonical_fixture_passage_tests;
+#[path = "default_retrieval_scope_tests.rs"]
+mod default_retrieval_scope_tests;
 #[path = "source_bounded_batch_tests.rs"]
 mod source_bounded_batch_tests;
 #[path = "source_hash_receipt_tests.rs"]

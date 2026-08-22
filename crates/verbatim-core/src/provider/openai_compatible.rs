@@ -392,7 +392,7 @@ impl OpenAiCompatibleReranker {
         query: &str,
         docs: Vec<RerankDoc>,
         top_n: usize,
-    ) -> Result<ProviderRerankOutcome, ProviderRerankFailure> {
+    ) -> Result<ProviderRerankOutcome, Box<ProviderRerankFailure>> {
         let mut diagnostics = RerankDiagnostics::default();
         let capability = self.load_rerank_capability(false).await;
         diagnostics.capability = Some(rerank_capability_diagnostics(&capability));
@@ -413,7 +413,7 @@ impl OpenAiCompatibleReranker {
                 diagnostics.capability = Some(rerank_capability_diagnostics(&refresh));
 
                 let Some(refreshed_capability) = refresh.value else {
-                    return Err(ProviderRerankFailure { error, diagnostics });
+                    return Err(Box::new(ProviderRerankFailure { error, diagnostics }));
                 };
 
                 let retry_shape = RerankRequestShape::new(
@@ -428,13 +428,13 @@ impl OpenAiCompatibleReranker {
 
                 match self.post_rerank(query, &docs, &retry_shape).await {
                     Ok(hits) => Ok(ProviderRerankOutcome { hits, diagnostics }),
-                    Err(retry_error) => Err(ProviderRerankFailure {
+                    Err(retry_error) => Err(Box::new(ProviderRerankFailure {
                         error: retry_error,
                         diagnostics,
-                    }),
+                    })),
                 }
             }
-            Err(error) => Err(ProviderRerankFailure { error, diagnostics }),
+            Err(error) => Err(Box::new(ProviderRerankFailure { error, diagnostics })),
         }
     }
 

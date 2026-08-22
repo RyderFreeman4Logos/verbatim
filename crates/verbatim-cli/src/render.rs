@@ -2223,10 +2223,11 @@ where
     for row in retrieve_display_rows(response) {
         writeln!(
             writer,
-            "{}. score={} {}",
+            "{}. score={} {} id={}",
             row.rank,
             format_score(row.score),
-            row.citation
+            row.citation,
+            row.evidence_id
         )?;
         write_indented_snippet(writer, row.snippet, "   ")?;
     }
@@ -2654,6 +2655,7 @@ struct RetrieveDisplayRow<'a> {
     rank: usize,
     score: f32,
     citation: String,
+    evidence_id: &'a str,
     collection: String,
     source: String,
     locator: String,
@@ -2670,6 +2672,7 @@ fn retrieve_display_rows(response: &RetrieveResponse) -> Vec<RetrieveDisplayRow<
                 rank: result.rank,
                 score: result.score,
                 citation: format!("[{locator}]"),
+                evidence_id: &result.evidence_id,
                 collection: display_collection_names(&result.collections),
                 source: display_source(result, &locator),
                 locator,
@@ -3386,7 +3389,9 @@ mod tests {
         write_retrieve_response(&mut output, &response).unwrap();
         let output = String::from_utf8(output).unwrap();
 
-        assert!(output.contains("3. score=0.9876 [doc.md L10 markdown:paragraph #intro]"));
+        assert!(output.contains(
+            "3. score=0.9876 [doc.md L10 markdown:paragraph #intro] id=internal-ev-abc123"
+        ));
         assert!(output.contains("   alpha\tbeta"));
         assert!(output.contains("   gamma, \"delta\" 中文"));
         assert_low_noise_retrieve_output(&output);
@@ -3562,7 +3567,6 @@ mod tests {
             "kind=",
             "member_updated_at=",
             "task-internal-123",
-            "internal-ev-abc123",
             "src-internal-123",
             "collection-internal-123",
             "chunk-internal-123",

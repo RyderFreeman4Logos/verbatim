@@ -4027,14 +4027,10 @@ fn blob_to_vector(blob: &[u8]) -> Result<Vec<f32>> {
     if !blob.len().is_multiple_of(4) {
         anyhow::bail!("vector BLOB length {} is not a multiple of 4", blob.len());
     }
-    let mut result = Vec::with_capacity(blob.len() / 4);
-    for chunk in blob.chunks_exact(4) {
-        // chunks_exact(4) guarantees 4-byte slices; the is_multiple_of
-        // guard above already verified blob.len() is divisible by 4.
-        let bytes: [u8; 4] = match chunk.try_into() {
-            Ok(arr) => arr,
-            Err(_) => continue, // unreachable given guards above
-        };
+    let (chunks, remainder) = blob.as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    let mut result = Vec::with_capacity(chunks.len());
+    for &bytes in chunks {
         result.push(f32::from_le_bytes(bytes));
     }
     Ok(result)
@@ -4079,12 +4075,14 @@ fn vector_blob_squared_l2_distance(query: &[f32], blob: &[u8]) -> Result<f32> {
 }
 
 fn vector_blob_squared_l2_distance_scalar(query: &[f32], blob: &[u8], len: usize) -> f32 {
+    let (chunks, remainder) = blob.as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
     query
         .iter()
         .take(len)
-        .zip(blob.chunks_exact(4))
-        .map(|(left, bytes)| {
-            let right = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        .zip(chunks.iter())
+        .map(|(left, &bytes)| {
+            let right = f32::from_le_bytes(bytes);
             (left - right) * (left - right)
         })
         .sum()

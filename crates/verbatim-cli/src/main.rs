@@ -20,11 +20,13 @@ mod auth;
 mod client;
 mod local;
 mod render;
+mod retrieve_help;
 mod source_cli;
 mod sse;
 
 use client::{CliError, DaemonClient, HttpDaemonClient, TaskWaitTimeout};
 use local::{LocalActions, RealLocalActions};
+use retrieve_help::RETRIEVE_AFTER_HELP;
 
 fn main() -> ExitCode {
     let mut stdout = std::io::stdout();
@@ -1192,39 +1194,6 @@ Caveats:
   --format only applies with --context-only or --no-generate.
 "#;
 
-const RETRIEVE_AFTER_HELP: &str = r#"Examples:
-  verbatim retrieve "What does the report conclude?"
-  verbatim retrieve --format snippets "What supports it?"
-  verbatim retrieve --text-only "What supports it?"
-  verbatim retrieve --format tsv "What supports it?"
-  verbatim retrieve --format csv "What supports it?"
-  verbatim retrieve --source-id <source-id> --page-size 1 "What supports it?"
-  verbatim retrieve --collection articles "What evidence is relevant?"
-  verbatim retrieve --collection articles --collection areskapitalon "What changed?"
-  verbatim retrieve --show-debug "What evidence is relevant?"
-  verbatim retrieve --show-debug --verbose "What evidence is relevant?"
-  verbatim retrieve --show-locator "What evidence is relevant?"
-  verbatim retrieve --format json --show-debug "What evidence is relevant?"
-
-Debugging:
-  retrieve never invokes chat generation.
-  It returns evidence context without invoking chat generation.
-  Default markdown is compact: rank, score, citation, and snippet only.
-  Scores are ranked chunk-level scores; canonical multi-locator compact
-  snippets show a chunk-internal support unit for the query.
-  snippets/text-only omit headers and debug metadata; TSV/CSV emit fixed
-  columns: rank, score, citation, collection, source, locator, snippet.
-  --collection filters against materialized daemon membership and does not
-  rescan collection roots during retrieve.
-  --show-debug writes a compact JSON retrieval diagnostic summary with local
-  stage spans to stderr.
-  --show-debug --verbose writes the full task diagnostics, engine controls,
-  timing, locators, internal evidence metadata, and deterministic
-  dense/BM25/RRF/rerank ranking details and local stage spans to stderr.
-  JSON output retains structured locator/provenance fields and full evidence
-  identifiers for evidence lookups, but retrieval debug diagnostics stay on stderr.
-"#;
-
 const EVIDENCE_AFTER_HELP: &str = r#"Examples:
   verbatim evidence <evidence-id>
 
@@ -1590,10 +1559,10 @@ enum Commands {
         /// Use this embedding profile for retrieval.
         #[arg(long = "embedding-profile")]
         embedding_profile: Option<String>,
-        /// Maximum evidence/context entries to consider before pagination.
+        /// Override the configured maximum evidence/context entries before pagination.
         #[arg(long, value_parser = parse_nonzero_usize)]
         limit: Option<usize>,
-        /// Evidence/context entries per page. Use 1 for agent-sized pages.
+        /// Override the configured evidence/context entries per page.
         #[arg(long, value_parser = parse_nonzero_usize)]
         page_size: Option<usize>,
         /// 1-based page number.
@@ -1631,7 +1600,7 @@ enum Commands {
         /// Include structured locator/provenance fields in the response.
         #[arg(long = "show-locator")]
         show_locator: bool,
-        /// Group retrieved evidence from the same chunk as passage blocks before pagination.
+        /// Render full canonical passage blocks instead of the default matching support units.
         #[arg(long = "passage", action = ArgAction::SetTrue)]
         passage: bool,
         /// Output format. JSON includes structured locator/provenance fields.
@@ -2478,11 +2447,14 @@ mod tests {
     #[test]
     fn retrieve_help_documents_debug_locator_and_generation_caveats() {
         let (code, help, stderr, _, _) = run_mock(["retrieve", "--help"]);
+        let normalized_help = help.replace('\n', " ");
 
         assert_eq!(code.unwrap(), 0);
         assert!(stderr.is_empty());
         assert!(help.contains("retrieve never invokes chat generation"));
         assert!(help.contains("Default markdown is compact"));
+        assert!(help.contains("retrieval.default_collections"));
+        assert!(normalized_help.contains("retrieval.default_limit and retrieval.default_page_size"));
         assert!(help.contains("Scores are ranked chunk-level scores"));
         assert!(help.contains("chunk-internal support unit"));
         assert!(help.contains("snippets/text-only omit headers"));
@@ -4035,6 +4007,26 @@ mod tests {
         assert!(!stdout.contains("source_path:"));
         assert!(!stdout.contains("controls:"));
         assert!(!stdout.contains("timing:"));
+    }
+
+    #[test]
+    fn retrieve_default_is_compact_and_identifies_evidence() {
+        let (code, stdout, stderr, client, _) = run_mock(["retrieve", "What", "is", "cited?"]);
+
+        assert_eq!(code.unwrap(), 0);
+        assert!(stderr.is_empty());
+        let request = client.last_retrieve.borrow();
+        let request = request.as_ref().unwrap();
+        assert!(request.limit.is_none());
+        assert!(request.page_size.is_none());
+        assert!(request.page.is_none());
+        assert!(!request.include_debug);
+        assert!(!request.include_locator);
+        assert!(!request.passage);
+        assert!(stdout.contains("1. score=0.0310 [doc.md L1] id=ev-1"));
+        assert!(stdout.contains("   compact cited text"));
+        assert!(!stdout.contains("Context pack:"));
+        assert!(!stdout.contains("/tmp/doc.md"));
     }
 
     #[test]
