@@ -195,7 +195,7 @@ fn legacy_evidence_response_without_taxonomy_uses_source_bounded_plane() {
 
 #[test]
 fn response_text_taxonomy_round_trips_all_four_planes() {
-    let taxonomy = ResponseTextTaxonomy::ask_response();
+    let taxonomy = ResponseTextTaxonomy::ask_response_with_citations(&[]);
     let encoded = serde_json::to_value(&taxonomy).unwrap();
     let decoded: ResponseTextTaxonomy = serde_json::from_value(encoded).unwrap();
 

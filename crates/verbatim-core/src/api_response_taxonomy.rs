@@ -34,7 +34,10 @@ impl ResponseTextTaxonomy {
     const VERSION: u8 = 1;
 
     pub fn ask_response() -> Self {
-        Self::ask_response_with_citations(&[])
+        Self::from_fields(&[
+            ("answer", OutputTextPlane::GeneratedInterpretation),
+            ("answer_kind", OutputTextPlane::Metadata),
+        ])
     }
 
     pub fn ask_response_with_citations(citations: &[CitationResponse]) -> Self {

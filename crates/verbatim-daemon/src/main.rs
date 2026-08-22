@@ -5081,7 +5081,7 @@ async fn execute_ask_task_inner_with_config(
     let response = AskResponse {
         answer: gen_result.answer.clone(),
         answer_kind: AnswerKind::GeneratedInterpretation,
-        text_taxonomy: ResponseTextTaxonomy::ask_response_with_citations(&citations),
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
         generated_interpretation: Some(GeneratedInterpretationResponse {
             text: gen_result.answer,
         }),
