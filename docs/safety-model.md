@@ -67,6 +67,36 @@ a scanned or image-only PDF fails closed.
 Version 1.0 supports Linux x86_64 hosts, Linux VMs, and Docker Linux. This does
 not imply a native macOS or Windows port.
 
+## Threat Examples
+
+- **Fabrication — prompt injection in retrieved text:** a passage can contain
+  instructions intended to steer a later generated interpretation. The
+  source-bounded renderer returns the passage as source text; users must not
+  treat instructions inside it as trusted directions.
+- **Lifecycle/applicability — stale or superseded policy:** an older policy can
+  remain indexed and rank highly. Mark or remove it from the active scope.
+- **Ingest/OCR — OCR corruption:** Verbatim refuses OCR as Evidence. Treating
+  external OCR output as citable would bypass that boundary.
+- **Attribution — wrong PDF version:** a locator can identify a PDF passage but
+  does not establish that the selected revision is the applicable one.
+- **Authorization — ACL failure:** a missing or misapplied collection or source
+  rule can expose evidence to a user who is not authorized to receive it.
+- **Completeness — candidate-recall failure:** lexical or embedding candidates
+  can miss relevant material. Retrieval is best-effort, not exhaustive.
+- **Authorization — hosted reranker or embedding disclosure:** sending a query
+  or context to a hosted endpoint can disclose it without authorization.
+
+## Guarantees and Assumptions
+
+- **Enforced guarantee — source-bounded evidence:** rendering resolves indexed
+  evidence IDs to source text and does not author Evidence.
+- **Enforced guarantee — OCR exclusion:** scanned and image-only PDFs fail
+  closed; OCR output and vision captions are not citable Evidence.
+- **Operational assumptions:** source selection and version status, ACL policy
+  application, hosted-endpoint terms, and human review are managed correctly.
+- **Not guarantees:** ranking quality, candidate recall, source correctness,
+  and generated interpretation remain fallible.
+
 ## High-Risk Deployments
 
 - Enforce collection and source access control before retrieval.
