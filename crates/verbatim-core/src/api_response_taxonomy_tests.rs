@@ -51,6 +51,25 @@ fn ask_response_taxonomy_never_labels_generated_or_interface_text_as_evidence() 
 }
 
 #[test]
+fn legacy_evidence_response_without_taxonomy_uses_source_bounded_plane() {
+    let response: EvidenceResponse = serde_json::from_str(include_str!(
+        "fixtures/legacy_evidence_response_without_taxonomy.json"
+    ))
+    .unwrap();
+
+    assert!(!response.source_bounded);
+    for field in ["text", "heading_path[]"] {
+        let taxonomy = response
+            .text_taxonomy
+            .fields
+            .iter()
+            .find(|entry| entry.field == field)
+            .expect("legacy field classification");
+        assert_eq!(taxonomy.plane, OutputTextPlane::GeneratedInterpretation);
+    }
+}
+
+#[test]
 fn response_text_taxonomy_round_trips_all_four_planes() {
     let taxonomy = ResponseTextTaxonomy::ask_response();
     let encoded = serde_json::to_value(&taxonomy).unwrap();
