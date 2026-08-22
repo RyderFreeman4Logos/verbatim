@@ -4,6 +4,7 @@ use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt;
 
 use super::*;
+use crate::source_bounded_retrieval::filter_generated_retrieval_evidence;
 
 const CORRUPTED_EVIDENCE_TEXT: &str = "Mutated persisted evidence must not escape.";
 
@@ -150,7 +151,7 @@ async fn public_generated_evidence_is_not_source_bounded() {
     )
     .expect("OCR evidence response");
     assert_eq!(returned.id, ocr.id.0);
-    assert!(returned.source_bounded);
+    assert!(!returned.source_bounded);
     assert_eq!(returned.text_hash, ocr.text_hash);
     assert_eq!(returned.text, ocr.text);
 }
@@ -412,6 +413,7 @@ async fn source_bounded_retrieval_debug_omits_production_caption_chunk_identitie
     write_pdf_with_text_and_image(&pdf_path);
 
     let mut config = retrieve_test_config(&model_server.base_url);
+    config.embedding.enabled = false;
     config.vision.enabled = true;
     config.vision.base_url.clone_from(&model_server.base_url);
     config.vision.model = "test-vision".into();
@@ -419,24 +421,14 @@ async fn source_bounded_retrieval_debug_omits_production_caption_chunk_identitie
     let source_id = pipeline.add_source(&pdf_path).unwrap();
     pipeline.ingest_source(&source_id).await.unwrap();
 
-    let generated = pipeline
-        .store()
-        .list_evidence_by_source(&source_id)
-        .unwrap()
-        .into_iter()
-        .find(|evidence| evidence.kind == EvidenceKind::Generated)
-        .expect("production caption evidence persists");
-    let caption_chunk = pipeline
-        .store()
-        .list_chunks_by_source(&source_id)
-        .unwrap()
-        .into_iter()
-        .find(|chunk| chunk.evidence_unit_ids == vec![generated.id.clone()])
-        .expect("production caption owns a dedicated chunk");
-    assert!(caption_chunk
-        .id
-        .0
-        .starts_with(&format!("{}:chunk:", generated.id.0)));
+    let (generated_id, caption_chunk_id) = source_bounded_batch_tests::persist_legacy_caption(
+        &pipeline,
+        &source_id,
+        "captiondebugneedle",
+        "legacy-caption-debug",
+        "legacy-caption-debug-chunk",
+        "captiondebugneedle legacy generated caption",
+    );
 
     let state = test_state(config, test_dir.path(), pipeline);
     let response = retrieve(
@@ -466,8 +458,9 @@ async fn source_bounded_retrieval_debug_omits_production_caption_chunk_identitie
     .0;
 
     let serialized = serde_json::to_string(&response).expect("response serializes");
-    assert!(!serialized.contains(&generated.id.0), "{serialized}");
-    assert!(!serialized.contains(&caption_chunk.id.0), "{serialized}");
+    assert!(response.results.is_empty(), "{serialized}");
+    assert!(!serialized.contains(&generated_id.0), "{serialized}");
+    assert!(!serialized.contains(&caption_chunk_id.0), "{serialized}");
 }
 
 #[tokio::test]
@@ -500,20 +493,14 @@ async fn source_bounded_retrieval_no_debug_omits_production_caption_seed_identit
     let source_id = pipeline.add_source(&pdf_path).unwrap();
     pipeline.ingest_source(&source_id).await.unwrap();
 
-    let generated = pipeline
-        .store()
-        .list_evidence_by_source(&source_id)
-        .unwrap()
-        .into_iter()
-        .find(|evidence| evidence.kind == EvidenceKind::Generated)
-        .expect("production caption evidence persists");
-    let caption_chunk = pipeline
-        .store()
-        .list_chunks_by_source(&source_id)
-        .unwrap()
-        .into_iter()
-        .find(|chunk| chunk.evidence_unit_ids == vec![generated.id.clone()])
-        .expect("production caption owns a dedicated chunk");
+    let (generated_id, caption_chunk_id) = source_bounded_batch_tests::persist_legacy_caption(
+        &pipeline,
+        &source_id,
+        "captionseedneedle",
+        "legacy-caption-seed",
+        "legacy-caption-seed-chunk",
+        "captionseedneedle legacy generated caption",
+    );
 
     let state = test_state(config, test_dir.path(), pipeline);
     let response = retrieve(
@@ -544,8 +531,9 @@ async fn source_bounded_retrieval_no_debug_omits_production_caption_seed_identit
 
     assert!(response.debug.is_none());
     let serialized = serde_json::to_string(&response).expect("response serializes");
-    assert!(!serialized.contains(&caption_chunk.id.0), "{serialized}");
-    assert!(!serialized.contains(&generated.id.0), "{serialized}");
+    assert!(response.results.is_empty(), "{serialized}");
+    assert!(!serialized.contains(&caption_chunk_id.0), "{serialized}");
+    assert!(!serialized.contains(&generated_id.0), "{serialized}");
 }
 
 #[test]
@@ -598,7 +586,7 @@ fn final_retrieve_response(
     filter_generated_retrieval_evidence(
         store,
         &mut input.results,
-        &mut input.debug,
+        Some(&mut input.debug),
         input.controls.include_debug,
     )?;
     input.sources = sources_for_results(&input.results, store)?;

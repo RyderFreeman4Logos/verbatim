@@ -1,4 +1,73 @@
 use super::*;
+use crate::source_bounded_retrieval::filter_generated_retrieval_evidence;
+use verbatim_core::traits::LexicalIndex;
+
+pub(super) fn persist_legacy_caption(
+    pipeline: &IngestPipeline,
+    source_id: &SourceId,
+    caption_marker: &str,
+    evidence_id: &str,
+    chunk_id: &str,
+    text: &str,
+) -> (EvidenceId, ChunkId) {
+    let store = pipeline.store();
+    let evidence = store.list_evidence_by_source(source_id).unwrap();
+    assert!(
+        evidence.iter().all(|unit| {
+            unit.kind != EvidenceKind::Generated && !unit.text.contains(caption_marker)
+        }),
+        "caption evidence persisted: {evidence:?}"
+    );
+    let evidence_ids = evidence
+        .iter()
+        .map(|unit| unit.id.clone())
+        .collect::<HashSet<_>>();
+    let chunks = store.list_chunks_by_source(source_id).unwrap();
+    assert!(
+        chunks.iter().all(|chunk| {
+            !chunk.text.contains(caption_marker)
+                && chunk
+                    .evidence_unit_ids
+                    .iter()
+                    .all(|id| evidence_ids.contains(id))
+        }),
+        "caption chunk persisted: {chunks:?}"
+    );
+    let source_evidence = evidence
+        .iter()
+        .find(|unit| unit.kind == EvidenceKind::Text)
+        .expect("production text evidence persists")
+        .clone();
+    let source_chunk = chunks
+        .iter()
+        .find(|chunk| chunk.evidence_unit_ids.contains(&source_evidence.id))
+        .expect("production text chunk persists")
+        .clone();
+
+    let mut generated = source_evidence.clone();
+    generated.id = EvidenceId(evidence_id.into());
+    generated.kind = EvidenceKind::Generated;
+    generated.derived_from = Some(source_evidence.id);
+    generated.text = text.into();
+    generated.text_hash = verbatim_core::types::hex_sha256(generated.text.as_bytes());
+    let mut chunk = source_chunk;
+    chunk.id = ChunkId(chunk_id.into());
+    chunk.source_id = source_id.clone();
+    chunk.chunk_hash = format!("{chunk_id}-hash");
+    chunk.text = text.into();
+    chunk.evidence_unit_ids = vec![generated.id.clone()];
+    store
+        .bulk_insert_evidence(std::slice::from_ref(&generated))
+        .unwrap();
+    store
+        .bulk_insert_chunks(std::slice::from_ref(&chunk))
+        .unwrap();
+    store
+        .link_chunk_evidence(&[(chunk.id.clone(), generated.id.clone())])
+        .unwrap();
+    pipeline.lexical_index().rebuild_from_store(store).unwrap();
+    (generated.id, chunk.id)
+}
 
 #[test]
 fn source_bounded_retrieval_batches_evidence_eligibility_queries() {
@@ -20,7 +89,7 @@ fn source_bounded_retrieval_batches_evidence_eligibility_queries() {
         let mut results = all_results[..candidate_count].to_vec();
         let mut debug = empty_retrieval_debug();
         let (filtered, count) = store.count_sql_statements(|| {
-            filter_generated_retrieval_evidence(&store, &mut results, &mut debug, false)
+            filter_generated_retrieval_evidence(&store, &mut results, Some(&mut debug), false)
         });
         filtered.unwrap();
         assert_eq!(results.len(), candidate_count);
@@ -80,7 +149,7 @@ fn source_bounded_retrieval_fails_closed_per_invalid_persisted_evidence() {
         })
         .collect();
 
-    filter_generated_retrieval_evidence(&store, &mut results, &mut debug, true)
+    filter_generated_retrieval_evidence(&store, &mut results, Some(&mut debug), true)
         .expect("invalid evidence is candidate-local");
 
     assert_eq!(
@@ -135,4 +204,39 @@ fn persist_retrieval_filter_fixture(name: &str, results: &[RetrievalResult]) -> 
     store.bulk_insert_chunks(&chunks).unwrap();
     store.link_chunk_evidence(&links).unwrap();
     dir
+}
+
+#[test]
+fn source_bounded_retrieval_omits_ocr_evidence_without_debug() {
+    let store = Store::in_memory().unwrap();
+    let mut results = vec![test_retrieval_result(
+        1,
+        "ocr-chunk",
+        "ocr-evidence",
+        EvidenceKind::Ocr,
+    )];
+    let result = &results[0];
+    store
+        .add_source(&Source {
+            id: result.evidence_units[0].source_id.clone(),
+            path: "ocr.pdf".into(),
+            hash: "source-hash".into(),
+            status: SourceStatus::Indexed,
+            parser_used: Some("test".into()),
+            last_ingested_at: None,
+        })
+        .expect("OCR source persists for the negative retrieval fixture");
+    store
+        .bulk_insert_evidence(&result.evidence_units)
+        .expect("OCR evidence persists for the negative retrieval fixture");
+    store
+        .bulk_insert_chunks(std::slice::from_ref(&result.chunk))
+        .expect("OCR chunk persists for the negative retrieval fixture");
+    store
+        .link_chunk_evidence(&[(result.chunk.id.clone(), result.evidence_units[0].id.clone())])
+        .expect("OCR chunk links to its evidence");
+
+    filter_generated_retrieval_evidence(&store, &mut results, None, false)
+        .expect("source-bounded retrieval filters OCR evidence");
+    assert!(results.is_empty());
 }

@@ -255,11 +255,9 @@ verbatim evidence <evidence-id>
 ```
 
 PDF text-layer evidence uses page and paragraph locators. Scanned or image-only
-PDF pages are not currently rejected at ingest: without OCR, ingest can continue
-with a warning; with OCR configured, OCR-derived evidence can be indexed and
-searched with page/line locators. The fail-closed rejection policy is tracked by
-#505 and is not yet shipped. Born-digital PDFs with a usable text layer remain
-supported.
+PDFs are rejected at ingest with the stable `pdf_no_usable_text_layer`
+diagnostic. OCR output and vision captions are derived and are not citable source
+Evidence. This fail-closed contract is tracked in #505. Born-digital PDFs with a usable text layer remain supported.
 
 ## Concepts
 

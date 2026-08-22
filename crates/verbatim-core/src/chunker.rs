@@ -603,50 +603,6 @@ fn text_for_span<'a>(text: &'a str, start: u64, end: u64, subject: &str) -> Resu
         .ok_or_else(|| anyhow!("{subject} provenance range {start}..{end} is invalid"))
 }
 
-pub(crate) fn full_unit_evidence_spans(
-    chunks: &[Chunk],
-    evidence: &[EvidenceUnit],
-) -> Vec<ChunkEvidenceSpan> {
-    let evidence_by_id = evidence
-        .iter()
-        .map(|unit| (&unit.id, unit))
-        .collect::<HashMap<_, _>>();
-    let mut spans = Vec::new();
-
-    for chunk in chunks {
-        let mut search_start = 0;
-        for evidence_id in &chunk.evidence_unit_ids {
-            let Some(unit) = evidence_by_id.get(evidence_id) else {
-                continue;
-            };
-            let Some(start) = chunk.text[search_start..]
-                .find(&unit.text)
-                .map(|offset| search_start + offset)
-            else {
-                continue;
-            };
-            let end = start + unit.text.len();
-            spans.push(ChunkEvidenceSpan {
-                chunk_id: chunk.id.clone(),
-                evidence_id: unit.id.clone(),
-                chunk_byte_start: start as u64,
-                chunk_byte_end: end as u64,
-                evidence_byte_start: 0,
-                evidence_byte_end: unit.text.len() as u64,
-                evidence_text_hash: unit.text_hash.clone(),
-                locator: unit.locator.clone(),
-                trust: if unit.derived_from.is_some() {
-                    EvidenceSpanTrust::Derived
-                } else {
-                    EvidenceSpanTrust::Direct
-                },
-            });
-            search_start = end;
-        }
-    }
-    spans
-}
-
 pub fn deterministic_chunk_hash(
     chunk_type: ChunkType,
     text: &str,

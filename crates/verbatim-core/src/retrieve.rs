@@ -6,6 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 
 mod live_caps;
+mod source_bounded;
 mod source_filter;
 mod vector_search_resource;
 
@@ -541,6 +542,7 @@ impl<'a> RetrievalPipeline<'a> {
                 }
                 fused = scoped_fused;
             }
+            source_bounded::filter(self.store, &mut fused)?;
             fused.truncate(search_budget.fused_pool_size as usize);
             let rrf_fusion_ms = elapsed_ms(rrf_started);
             let bm25_returned = bm25_results.len() as u64;
@@ -2572,6 +2574,9 @@ mod tests {
     };
 
     mod hosted_rerank_document_export_tests;
+
+    #[path = "source_bounded_rerank_tests.rs"]
+    mod source_bounded_rerank_tests;
 
     #[test]
     fn rrf_merges_rankings() {
