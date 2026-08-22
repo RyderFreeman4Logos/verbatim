@@ -93,7 +93,10 @@ impl ResponseTextTaxonomy {
                 "collection_filter.applied[].last_synced_at",
                 OutputTextPlane::Metadata,
             ),
-            ("collection_filter.warnings[]", OutputTextPlane::Metadata),
+            (
+                "collection_filter.warnings[]",
+                OutputTextPlane::DeterministicInterfaceText,
+            ),
         ]);
         if citations.is_empty() {
             taxonomy.push("citations[].text_preview", OutputTextPlane::Evidence);
@@ -149,7 +152,10 @@ impl ResponseTextTaxonomy {
                 "collection_filter.applied[].last_synced_at",
                 OutputTextPlane::Metadata,
             ),
-            ("collection_filter.warnings[]", OutputTextPlane::Metadata),
+            (
+                "collection_filter.warnings[]",
+                OutputTextPlane::DeterministicInterfaceText,
+            ),
             (
                 "audit_receipt.embedding_profile_id",
                 OutputTextPlane::Metadata,
@@ -543,7 +549,7 @@ fn collect_serialized_string_leaves(
 }
 
 fn text_plane_for_serialized_path(root: &Value, path: &str) -> OutputTextPlane {
-    if path == "answer" || path.contains(".generated_interpretation.") {
+    if path == "answer" || path_has_component(path, "generated_interpretation") {
         return OutputTextPlane::GeneratedInterpretation;
     }
     if path.ends_with(".text_preview") {
@@ -562,11 +568,14 @@ fn text_plane_for_serialized_path(root: &Value, path: &str) -> OutputTextPlane {
             .and_then(Value::as_str);
         return text_plane_for_kind(kind, role);
     }
+    if path_has_component(path, "collection_filter") && path_has_component(path, "warnings") {
+        return OutputTextPlane::DeterministicInterfaceText;
+    }
     if (path.contains("citations[") || path.contains("results[")) && path.ends_with(".label") {
         return OutputTextPlane::DeterministicInterfaceText;
     }
-    if (path == "text" || path.starts_with("heading_path[") || path.contains(".heading_path["))
-        && !path.contains(".structured_locator.")
+    if (path == "text" || path_has_component(path, "heading_path"))
+        && !path_has_component(path, "structured_locator")
     {
         let bounded = lookup_path(
             root,
@@ -585,6 +594,11 @@ fn text_plane_for_serialized_path(root: &Value, path: &str) -> OutputTextPlane {
         };
     }
     OutputTextPlane::Metadata
+}
+
+fn path_has_component(path: &str, component: &str) -> bool {
+    path.split('.')
+        .any(|part| part.split('[').next() == Some(component))
 }
 
 fn replace_last_component(path: &str, component: &str, replacement: &str) -> String {

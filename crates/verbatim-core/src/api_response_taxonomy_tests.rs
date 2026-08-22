@@ -55,6 +55,10 @@ fn ask_response_taxonomy_classifies_generated_and_source_citation_text_by_kind()
         serde_json::json!("generated_interpretation")
     );
     assert_eq!(
+        plane_for("generated_interpretation.text"),
+        serde_json::json!("generated_interpretation")
+    );
+    assert_eq!(
         plane_for("citations[].label"),
         serde_json::json!("deterministic_interface_text")
     );
@@ -208,6 +212,20 @@ fn response_text_taxonomy_round_trips_all_four_planes() {
         OutputTextPlane::GeneratedInterpretation,
     ] {
         assert!(taxonomy.fields.iter().any(|field| field.plane == plane));
+    }
+    for taxonomy in [
+        ResponseTextTaxonomy::ask_response_with_citations(&[]),
+        ResponseTextTaxonomy::retrieve_response(),
+    ] {
+        assert_eq!(
+            taxonomy
+                .fields
+                .iter()
+                .find(|field| field.field == "collection_filter.warnings[]")
+                .unwrap()
+                .plane,
+            OutputTextPlane::DeterministicInterfaceText
+        );
     }
 }
 
@@ -425,10 +443,18 @@ fn response_taxonomy_paths_resolve_to_serialized_text_leaves() {
         "derived_from": "ev-0",
         "locator": "doc.md L1",
         "structured_locator": {
-            "type": "Document",
-            "path_or_url": "/tmp/doc.md",
+            "type": "Markdown",
+            "path": "/tmp/doc.md",
             "line_start": 1,
-            "line_end": 1
+            "line_end": 1,
+            "byte_start": 0,
+            "byte_end": 5,
+            "block_kind": "paragraph",
+            "block_index": 0,
+            "block_hash": "hash",
+            "heading_level": 1,
+            "heading_slug": "heading",
+            "heading_path": [{"level": 1, "text": "Heading", "slug": "heading", "line": 1}]
         },
         "text": "quote",
         "heading_path": ["Heading"],
@@ -454,6 +480,26 @@ fn response_taxonomy_paths_resolve_to_serialized_text_leaves() {
         ("evidence", serde_json::to_value(evidence).unwrap()),
     ] {
         assert_taxonomy_paths_resolve(name, &response);
+        if name == "ask" || name == "retrieve" {
+            let warning = response["text_taxonomy"]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|field| field["field"] == "collection_filter.warnings[]")
+                .expect("serialized collection warning taxonomy field");
+            assert_eq!(
+                warning["plane"],
+                serde_json::json!("deterministic_interface_text")
+            );
+        } else {
+            let heading = response["text_taxonomy"]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|field| field["field"] == "structured_locator.heading_path[].text")
+                .expect("serialized locator heading taxonomy field");
+            assert_eq!(heading["plane"], serde_json::json!("metadata"));
+        }
     }
 }
 
