@@ -585,6 +585,8 @@ pub struct GeneratedInterpretationResponse {
 #[path = "api_response_taxonomy.rs"]
 mod response_taxonomy;
 pub use response_taxonomy::{OutputTextPlane, ResponseTextTaxonomy, TextFieldTaxonomy};
+#[path = "api_response_serialization.rs"]
+mod response_serialization;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -593,22 +595,16 @@ pub enum AnswerKind {
     EvidenceOnly,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AskResponse {
     pub answer: String,
     pub answer_kind: AnswerKind,
-    #[serde(default = "ResponseTextTaxonomy::ask_response")]
     pub text_taxonomy: ResponseTextTaxonomy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_interpretation: Option<GeneratedInterpretationResponse>,
-    #[serde(default)]
     pub citations: Vec<CitationResponse>,
     pub verified: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalDebug>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<RetrieveResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection_filter: Option<CollectionFilterResponse>,
 }
 
@@ -653,15 +649,12 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetrieveResponse {
     pub task_id: String,
     pub query: String,
-    #[serde(default = "ResponseTextTaxonomy::retrieve_response_legacy")]
     pub text_taxonomy: ResponseTextTaxonomy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection_filter: Option<CollectionFilterResponse>,
     pub embedding_profile_id: String,
     pub limit: usize,
@@ -672,11 +665,8 @@ pub struct RetrieveResponse {
     pub source_bounded: bool,
     pub controls: RetrieveControlsResponse,
     pub audit_receipt: AuditReceipt,
-    #[serde(default)]
     pub timings: Vec<RetrieveTimingResponse>,
-    #[serde(default)]
     pub results: Vec<RetrieveResultResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug: Option<RetrievalDebug>,
 }
 
@@ -753,12 +743,11 @@ pub struct CitationResponse {
     pub text_preview: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceResponse {
     pub id: String,
     pub source_id: String,
     pub text_taxonomy: ResponseTextTaxonomy,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub source_hash: Option<String>,
     pub source_bounded: bool,
     pub text_hash: String,
@@ -768,64 +757,9 @@ pub struct EvidenceResponse {
     pub structured_locator: SourceLocator,
     pub text: String,
     pub heading_path: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     pub position: u32,
     pub image_artifact: Option<ImageArtifactResponse>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EvidenceResponseWire {
-    id: String,
-    source_id: String,
-    #[serde(default)]
-    text_taxonomy: Option<ResponseTextTaxonomy>,
-    #[serde(default)]
-    source_hash: Option<String>,
-    source_bounded: bool,
-    text_hash: String,
-    kind: String,
-    #[serde(default)]
-    derived_from: Option<String>,
-    locator: String,
-    structured_locator: SourceLocator,
-    text: String,
-    heading_path: Vec<String>,
-    #[serde(default)]
-    language: Option<String>,
-    position: u32,
-    #[serde(default)]
-    image_artifact: Option<ImageArtifactResponse>,
-}
-
-impl<'de> Deserialize<'de> for EvidenceResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let response = EvidenceResponseWire::deserialize(deserializer)?;
-        let text_taxonomy = response
-            .text_taxonomy
-            .unwrap_or_else(|| ResponseTextTaxonomy::evidence_response(response.source_bounded));
-
-        Ok(Self {
-            id: response.id,
-            source_id: response.source_id,
-            text_taxonomy,
-            source_hash: response.source_hash,
-            source_bounded: response.source_bounded,
-            text_hash: response.text_hash,
-            kind: response.kind,
-            derived_from: response.derived_from,
-            locator: response.locator,
-            structured_locator: response.structured_locator,
-            text: response.text,
-            heading_path: response.heading_path,
-            language: response.language,
-            position: response.position,
-            image_artifact: response.image_artifact,
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

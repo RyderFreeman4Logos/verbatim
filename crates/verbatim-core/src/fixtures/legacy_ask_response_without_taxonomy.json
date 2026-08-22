@@ -1,0 +1,17 @@
+{
+  "answer": "Generated answer.",
+  "answer_kind": "generated_interpretation",
+  "generated_interpretation": {"text": "Generated answer."},
+  "citations": [
+    {
+      "label": "E1",
+      "evidence_id": "generated-1",
+      "kind": "generated",
+      "derived_from": null,
+      "collections": [],
+      "locator": "generated",
+      "text_preview": "Generated citation text."
+    }
+  ],
+  "verified": false
+}

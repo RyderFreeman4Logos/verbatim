@@ -1,0 +1,52 @@
+{
+  "task_id": "task-1",
+  "query": "question",
+  "embedding_profile_id": "default",
+  "limit": 1,
+  "page_size": 1,
+  "page": 1,
+  "total_results": 1,
+  "returned_results": 1,
+  "source_bounded": true,
+  "controls": {
+    "fast": false,
+    "rerank_enabled": false,
+    "dense_top_k": 1,
+    "bm25_top_k": 1,
+    "rrf_k": 1,
+    "rerank_top_n": 1
+  },
+  "audit_receipt": {
+    "version": 1,
+    "embedding_profile_id": "default",
+    "source_bounded": true,
+    "controls": {
+      "fast": false,
+      "rerank_enabled": false,
+      "dense_top_k": 1,
+      "bm25_top_k": 1,
+      "rrf_k": 1,
+      "rerank_top_n": 1
+    },
+    "results": []
+  },
+  "timings": [],
+  "results": [
+    {
+      "index": 0,
+      "rank": 1,
+      "label": "E1",
+      "evidence_id": "caption-1",
+      "text_hash": "text-hash",
+      "source_id": "src-1",
+      "source_hash": "source-hash",
+      "chunk_id": "chunk-1",
+      "kind": "generated",
+      "role": "image_caption_generated",
+      "score": 1.0,
+      "locator": "generated",
+      "derived_from": "image-1",
+      "snippet": "Generated caption."
+    }
+  ]
+}

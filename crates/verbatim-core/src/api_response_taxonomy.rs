@@ -1,4 +1,7 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::{CitationResponse, RetrieveResultResponse};
 
@@ -104,10 +107,6 @@ impl ResponseTextTaxonomy {
 
     pub fn retrieve_response() -> Self {
         Self::retrieve_response_with_results_and_options(&[], false)
-    }
-
-    pub(crate) fn retrieve_response_legacy() -> Self {
-        Self::retrieve_response_with_results_and_options(&[], true)
     }
 
     pub fn retrieve_response_with_results(results: &[RetrieveResultResponse]) -> Self {
@@ -485,15 +484,163 @@ impl ResponseTextTaxonomy {
             plane,
         });
     }
+
+    pub(crate) fn from_serialized_value(value: &Value) -> Self {
+        let mut fields = Vec::new();
+        collect_serialized_string_leaves(value, value, "", &mut fields);
+        let mut seen = HashSet::new();
+        fields.retain(|field| seen.insert(field.field.clone()));
+        Self {
+            version: Self::VERSION,
+            fields,
+        }
+    }
+}
+
+fn collect_serialized_string_leaves(
+    root: &Value,
+    value: &Value,
+    path: &str,
+    fields: &mut Vec<TextFieldTaxonomy>,
+) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if child_path == "text_taxonomy"
+                    || child_path.split('.').any(|part| part == "text_taxonomy")
+                {
+                    continue;
+                }
+                collect_serialized_string_leaves(root, child, &child_path, fields);
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                collect_serialized_string_leaves(root, child, &format!("{path}[{index}]"), fields);
+            }
+        }
+        Value::String(_) => {
+            let field = if path.ends_with(".text_preview") || path.ends_with(".snippet") {
+                path.to_string()
+            } else {
+                normalize_array_indices(path)
+            };
+            fields.push(TextFieldTaxonomy {
+                plane: text_plane_for_serialized_path(root, path),
+                field,
+            });
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn text_plane_for_serialized_path(root: &Value, path: &str) -> OutputTextPlane {
+    if path == "answer" || path.contains(".generated_interpretation.") {
+        return OutputTextPlane::GeneratedInterpretation;
+    }
+    if path.ends_with(".text_preview") {
+        return text_plane_for_kind(
+            lookup_path(root, &replace_last_component(path, "text_preview", "kind"))
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            None,
+        );
+    }
+    if path.ends_with(".snippet") {
+        let kind = lookup_path(root, &replace_last_component(path, "snippet", "kind"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let role = lookup_path(root, &replace_last_component(path, "snippet", "role"))
+            .and_then(Value::as_str);
+        return text_plane_for_kind(kind, role);
+    }
+    if (path.contains("citations[") || path.contains("results[")) && path.ends_with(".label") {
+        return OutputTextPlane::DeterministicInterfaceText;
+    }
+    if (path == "text" || path.starts_with("heading_path[") || path.contains(".heading_path["))
+        && !path.contains(".structured_locator.")
+    {
+        let bounded = lookup_path(
+            root,
+            &replace_last_component(
+                path,
+                path.rsplit('.').next().unwrap_or(path),
+                "source_bounded",
+            ),
+        )
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+        return if bounded {
+            OutputTextPlane::Evidence
+        } else {
+            OutputTextPlane::GeneratedInterpretation
+        };
+    }
+    OutputTextPlane::Metadata
+}
+
+fn replace_last_component(path: &str, component: &str, replacement: &str) -> String {
+    path.strip_suffix(component)
+        .map(|prefix| format!("{prefix}{replacement}"))
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn lookup_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for component in path.split('.') {
+        let (key, index) = component
+            .strip_suffix(']')
+            .and_then(|component| component.rsplit_once('['))
+            .map(|(key, index)| (key, index.parse::<usize>().ok()))
+            .unwrap_or((component, None));
+        current = current.get(key)?;
+        if let Some(index) = index {
+            current = current.get(index)?;
+        }
+    }
+    Some(current)
+}
+
+fn normalize_array_indices(path: &str) -> String {
+    let mut normalized = String::new();
+    let mut chars = path.chars();
+    while let Some(character) = chars.next() {
+        if character != '[' {
+            normalized.push(character);
+            continue;
+        }
+        for character in chars.by_ref() {
+            if character == ']' {
+                break;
+            }
+        }
+        normalized.push_str("[]");
+    }
+    normalized
 }
 
 fn text_plane_for_kind(kind: &str, role: Option<&str>) -> OutputTextPlane {
-    if kind == "generated"
-        || matches!(role, Some("generated" | "image_caption_generated"))
-        || matches!(kind, "image_caption_generated")
-    {
+    if matches!(
+        kind,
+        "generated" | "image_caption_generated" | "ocr" | "ocr_text"
+    ) || matches!(
+        role,
+        Some("generated" | "image_caption_generated" | "ocr" | "ocr_text")
+    ) {
         OutputTextPlane::GeneratedInterpretation
-    } else {
+    } else if matches!(
+        role,
+        Some("original_text" | "text" | "image" | "image_artifact")
+    ) || (role.is_none()
+        && matches!(kind, "original_text" | "text" | "image" | "image_artifact"))
+    {
         OutputTextPlane::Evidence
+    } else {
+        OutputTextPlane::GeneratedInterpretation
     }
 }

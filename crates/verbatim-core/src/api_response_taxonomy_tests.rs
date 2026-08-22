@@ -469,7 +469,7 @@ fn assert_taxonomy_paths_resolve(name: &str, response: &serde_json::Value) {
 
     let mut leaves = Vec::new();
     collect_string_leaves(response, String::new(), &mut leaves);
-    for leaf in leaves {
+    for leaf in &leaves {
         let matches = fields
             .iter()
             .filter(|field| {
@@ -480,6 +480,17 @@ fn assert_taxonomy_paths_resolve(name: &str, response: &serde_json::Value) {
         assert_eq!(
             matches, 1,
             "{name} leaf {leaf:?} has {matches} taxonomy entries"
+        );
+    }
+    for field in fields {
+        let path = field["field"].as_str().expect("taxonomy field path");
+        let matches = leaves
+            .iter()
+            .filter(|leaf| taxonomy_path_matches(path, leaf))
+            .count();
+        assert!(
+            matches > 0,
+            "{name} taxonomy path {path:?} resolves to no serialized string leaf"
         );
     }
 }
@@ -510,7 +521,11 @@ fn collect_string_leaves(value: &serde_json::Value, path: String, leaves: &mut V
 }
 
 fn taxonomy_path_matches(pattern: &str, concrete: &str) -> bool {
-    normalize_array_indices(pattern) == normalize_array_indices(concrete)
+    if pattern.ends_with(".text_preview") || pattern.ends_with(".snippet") {
+        pattern == concrete
+    } else {
+        normalize_array_indices(pattern) == normalize_array_indices(concrete)
+    }
 }
 
 fn normalize_array_indices(path: &str) -> String {
@@ -537,4 +552,185 @@ fn normalize_array_indices(path: &str) -> String {
         }
     }
     normalized
+}
+
+#[test]
+fn compact_ask_taxonomy_omits_absent_optional_paths() {
+    let response: AskResponse = serde_json::from_value(serde_json::json!({
+        "answer": "Answer [E1].",
+        "answer_kind": "evidence_only",
+        "citations": [],
+        "verified": false
+    }))
+    .unwrap();
+    let encoded = serde_json::to_value(response).unwrap();
+    let fields = encoded["text_taxonomy"]["fields"]
+        .as_array()
+        .expect("published text taxonomy");
+
+    assert!(!fields
+        .iter()
+        .any(|field| field["field"] == "generated_interpretation.text"));
+    assert_taxonomy_paths_resolve("compact ask", &encoded);
+}
+
+#[test]
+fn taxonomy_classifies_requested_ask_retrieval_debug() {
+    let response = AskResponse {
+        answer: "Answer [E1].".into(),
+        answer_kind: AnswerKind::EvidenceOnly,
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
+        generated_interpretation: None,
+        citations: Vec::new(),
+        verified: false,
+        retrieval: Some(crate::types::RetrievalDebug {
+            dense_vector_path: crate::types::RetrievalDenseVectorPath::Bm25Only,
+            query_embedding_latency_ms: None,
+            retrieval_search_sql_statement_count: None,
+            retrieval_resource_counters: None,
+            local_spans_ms: crate::types::RetrievalLocalSpansMs::default(),
+            candidate_counters: Default::default(),
+            evidence_pack_mode: crate::types::RetrievalDebugEvidencePackMode::Full,
+            final_evidence_count: 0,
+            display_evidence_count: 0,
+            bm25_hits: Vec::new(),
+            dense_hits: Vec::new(),
+            rrf_fused_hits: Vec::new(),
+            graph_expanded_hits: Vec::new(),
+            reranker: crate::types::RetrievalRerankDebug::disabled(),
+            final_evidence_pack: Vec::new(),
+            display_evidence_pack: Vec::new(),
+        }),
+        context: None,
+        collection_filter: None,
+    };
+    let encoded = serde_json::to_value(response).unwrap();
+
+    assert_taxonomy_paths_resolve("ask retrieval debug", &encoded);
+    assert!(encoded["text_taxonomy"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field["field"] == "retrieval.dense_vector_path"));
+}
+
+#[test]
+fn taxonomy_omits_unselected_evidence_locator_variants() {
+    let response: EvidenceResponse = serde_json::from_value(serde_json::json!({
+        "id": "ev-1",
+        "source_id": "src-1",
+        "source_bounded": true,
+        "text_hash": "hash",
+        "kind": "text",
+        "derived_from": null,
+        "locator": "doc.md L1",
+        "structured_locator": {
+            "type": "Document",
+            "path_or_url": "doc.md",
+            "line_start": 1,
+            "line_end": 1
+        },
+        "text": "quote",
+        "heading_path": [],
+        "language": null,
+        "position": 0,
+        "image_artifact": null
+    }))
+    .unwrap();
+    let encoded = serde_json::to_value(response).unwrap();
+    let fields = encoded["text_taxonomy"]["fields"].as_array().unwrap();
+
+    assert!(!fields
+        .iter()
+        .any(|field| field["field"] == "structured_locator.ocr.profile.provider"));
+    assert!(!fields
+        .iter()
+        .any(|field| field["field"] == "image_artifact.path"));
+    assert_taxonomy_paths_resolve("document evidence", &encoded);
+}
+
+#[test]
+fn legacy_ask_generated_citation_does_not_fall_into_evidence() {
+    let response: AskResponse = serde_json::from_str(include_str!(
+        "fixtures/legacy_ask_response_without_taxonomy.json"
+    ))
+    .unwrap();
+    let field = response
+        .text_taxonomy
+        .fields
+        .iter()
+        .find(|field| field.field.ends_with("text_preview"))
+        .expect("legacy citation classification");
+
+    assert_ne!(field.plane, OutputTextPlane::Evidence);
+}
+
+#[test]
+fn legacy_retrieve_caption_does_not_fall_into_evidence() {
+    let response: RetrieveResponse = serde_json::from_str(include_str!(
+        "fixtures/legacy_retrieve_caption_without_taxonomy.json"
+    ))
+    .unwrap();
+    let field = response
+        .text_taxonomy
+        .fields
+        .iter()
+        .find(|field| field.field.ends_with("snippet"))
+        .expect("legacy result classification");
+
+    assert_ne!(field.plane, OutputTextPlane::Evidence);
+}
+
+#[test]
+fn ocr_and_unknown_retrieval_roles_fail_closed_outside_evidence() {
+    let citations = [CitationResponse {
+        label: "E1".into(),
+        evidence_id: "ev-ocr".into(),
+        kind: "ocr".into(),
+        derived_from: None,
+        collections: Vec::new(),
+        locator: "ocr".into(),
+        text_preview: "OCR text".into(),
+    }];
+    let ask_taxonomy = ResponseTextTaxonomy::ask_response_with_citations(&citations);
+    assert_ne!(
+        ask_taxonomy
+            .fields
+            .iter()
+            .find(|field| field.field.ends_with("text_preview"))
+            .unwrap()
+            .plane,
+        OutputTextPlane::Evidence
+    );
+
+    let results = [RetrieveResultResponse {
+        index: 0,
+        rank: 1,
+        label: "E1".into(),
+        evidence_id: "ev-unknown".into(),
+        text_hash: "hash".into(),
+        source_id: "src".into(),
+        source_hash: "source-hash".into(),
+        source_path: None,
+        collections: Vec::new(),
+        chunk_id: "chunk".into(),
+        kind: "text".into(),
+        role: "unknown_role".into(),
+        score: 1.0,
+        locator: "unknown".into(),
+        structured_locator: None,
+        provenance: None,
+        derived_from: None,
+        snippet: "unknown text".into(),
+    }];
+    let retrieve_taxonomy = ResponseTextTaxonomy::retrieve_response_with_results(&results);
+    assert_ne!(
+        retrieve_taxonomy
+            .fields
+            .iter()
+            .find(|field| field.field.ends_with("snippet"))
+            .unwrap()
+            .plane,
+        OutputTextPlane::Evidence
+    );
 }
