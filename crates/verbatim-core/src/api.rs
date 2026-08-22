@@ -657,7 +657,7 @@ fn is_false(value: &bool) -> bool {
 pub struct RetrieveResponse {
     pub task_id: String,
     pub query: String,
-    #[serde(default = "ResponseTextTaxonomy::retrieve_response")]
+    #[serde(default = "ResponseTextTaxonomy::retrieve_response_legacy")]
     pub text_taxonomy: ResponseTextTaxonomy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,

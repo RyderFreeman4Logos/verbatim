@@ -103,10 +103,21 @@ impl ResponseTextTaxonomy {
     }
 
     pub fn retrieve_response() -> Self {
-        Self::retrieve_response_with_results(&[])
+        Self::retrieve_response_with_results_and_options(&[], false)
+    }
+
+    pub(crate) fn retrieve_response_legacy() -> Self {
+        Self::retrieve_response_with_results_and_options(&[], true)
     }
 
     pub fn retrieve_response_with_results(results: &[RetrieveResultResponse]) -> Self {
+        Self::retrieve_response_with_results_and_options(results, false)
+    }
+
+    fn retrieve_response_with_results_and_options(
+        results: &[RetrieveResultResponse],
+        include_optional_fields: bool,
+    ) -> Self {
         let mut taxonomy = Self::from_fields(&[
             (
                 "results[].label",
@@ -323,6 +334,20 @@ impl ResponseTextTaxonomy {
             ),
             ("results[].derived_from", OutputTextPlane::Metadata),
         ]);
+        if !include_optional_fields
+            && !results
+                .iter()
+                .any(|result| result.structured_locator.is_some())
+        {
+            taxonomy
+                .fields
+                .retain(|field| !field.field.starts_with("results[].structured_locator."));
+        }
+        if !include_optional_fields && !results.iter().any(|result| result.provenance.is_some()) {
+            taxonomy
+                .fields
+                .retain(|field| !field.field.starts_with("results[].provenance."));
+        }
         if results.is_empty() {
             taxonomy.push("results[].snippet", OutputTextPlane::Evidence);
         } else {
