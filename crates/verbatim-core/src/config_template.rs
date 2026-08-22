@@ -66,7 +66,7 @@ max_backoff_millis = 5000
 dense_top_k = 80
 bm25_top_k = 50
 rrf_k = 60
-# Default pagination and scope for retrieve/context output.
+# Default pagination (page size) and scope for retrieve/context output.
 default_limit = 12
 default_page_size = 1
 default_collections = []
