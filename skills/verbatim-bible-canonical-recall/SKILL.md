@@ -28,57 +28,36 @@ source id:  csb_bible-...
 format:     canonical JSONL
 ```
 
-Use collection filters, not source-id shorthand, unless the user explicitly gives the full source id:
+When `csb_bible` is the configured retrieval scope, the default query is enough:
 
 ```bash
-verbatim retrieve "The Lord is my shepherd" \
-  --collection csb_bible \
-  --passage \
-  --page-size 3 \
-  --limit 10
+verbatim retrieve "The Lord is my shepherd"
 ```
 
-Do **not** use `-s csb_bible`; `-s/--source-id` expects a full source id.
+Use `--collection csb_bible` only to override the configured scope. Do **not** use
+`-s csb_bible`; `-s/--source-id` expects a full source id.
 
 ## Passage Retrieval
 
-Prefer `--passage` for Bible/canonical queries. It groups retrieved evidence from the same canonical chunk before pagination, so `--page-size 1` means one passage block, not one verse.
-
-Treat no-passage Bible recall as potentially misleading. Verified example:
-
-```bash
-verbatim retrieve "从此以后，有公义的冠冕为我留存" \
-  --collection csb_bible \
-  --page-size 10 \
-  --limit 1
-```
-
-This ranks the correct chunk but renders `[2 Timothy 4:1]` with only verse 1 (`I solemnly charge you...`), while the remembered phrase is in 2 Timothy 4:8. This is tracked as product/UX bug #228: the displayed evidence row does not visibly support the query even though the chunk score is high. Adding `--passage` renders `[2 Timothy 4:1-13]` and includes the crown sentence. Until the CLI is fixed, agents should use `--passage` by default for canonical recall and inspect JSON/debug output before calling a no-passage top row unrelated.
+Default compact retrieval selects the matching verse/support unit inside a canonical
+chunk, so the shown text supports the query. Use `--passage` only when a full
+chunk-level passage block is required.
 
 ```bash
-verbatim retrieve "There is reserved for me the crown of righteousness" \
-  --collection csb_bible \
-  --passage \
-  --page-size 1 \
-  --limit 1
+verbatim retrieve "There is reserved for me the crown of righteousness"
 ```
 
 Expected shape:
 
 ```text
-1. score=... [2 Timothy 4:1-13]
-   ... I have fought the good fight ... There is reserved for me the crown of righteousness ...
+1. score=... [2 Timothy 4:8] id=...
+   There is reserved for me the crown of righteousness ...
 ```
 
 For clean agent context without scores:
 
 ```bash
-verbatim retrieve "There is reserved for me the crown of righteousness" \
-  --collection csb_bible \
-  --passage \
-  --text-only \
-  --page-size 1 \
-  --limit 1
+verbatim retrieve "There is reserved for me the crown of righteousness" --text-only
 ```
 
 Use default markdown, TSV, or JSON when score visibility matters.
@@ -103,9 +82,9 @@ Example user prompt:
 Run variants:
 
 ```bash
-verbatim retrieve "一个人和神摔跤然后得到一个新名字" --collection csb_bible --passage --page-size 3 --limit 10
-verbatim retrieve "a man wrestles with God and receives a new name" --collection csb_bible --passage --page-size 3 --limit 10
-verbatim retrieve "Jacob wrestled with God and was named Israel" --collection csb_bible --passage --page-size 3 --limit 10
+verbatim retrieve "一个人和神摔跤然后得到一个新名字"
+verbatim retrieve "a man wrestles with God and receives a new name"
+verbatim retrieve "Jacob wrestled with God and was named Israel"
 ```
 
 Then answer with evidence, e.g. `Genesis 32:20-31`, and mention related but less direct passages such as `Genesis 35:10-20` only if retrieved.
@@ -123,12 +102,12 @@ Example:
 
 ```bash
 # May retrieve thematically related crown/righteousness passages but miss 2 Timothy 4.
-verbatim retrieve "从此以后，有公义的冠冕为你留存" --collection csb_bible --passage
+verbatim retrieve "从此以后，有公义的冠冕为你留存"
 
 # Better for CSB because the verse is first-person.
-verbatim retrieve "从此以后，有公义的冠冕为我留存" --collection csb_bible --passage
-verbatim retrieve "There is reserved for me the crown of righteousness" --collection csb_bible --passage
-verbatim retrieve "crown of righteousness reserved for me righteous Judge" --collection csb_bible --passage
+verbatim retrieve "从此以后，有公义的冠冕为我留存"
+verbatim retrieve "There is reserved for me the crown of righteousness"
+verbatim retrieve "crown of righteousness reserved for me righteous Judge"
 ```
 
 ## Concept / Theology Questions
@@ -138,11 +117,7 @@ For abstract theology or ethics questions, retrieve first, interpret second.
 Example:
 
 ```bash
-verbatim retrieve "the idea that forgiving someone should be repeated again and again, not counted" \
-  --collection csb_bible \
-  --passage \
-  --page-size 5 \
-  --limit 10
+verbatim retrieve "the idea that forgiving someone should be repeated again and again, not counted"
 ```
 
 Then separate:
@@ -166,11 +141,8 @@ Use debug when ranking is surprising:
 ```bash
 verbatim retrieve "<query>" \
   --collection csb_bible \
-  --passage \
   --show-debug \
   --format json \
-  --page-size 5 \
-  --limit 5 \
   >/tmp/bible-results.json \
   2>/tmp/bible-debug.json
 ```
@@ -199,7 +171,7 @@ verbatim collection add-root csb_bible <path-to-canonical-bible.jsonl>
 verbatim collection sync csb_bible
 TASK=$(verbatim ingest --background | grep -oE 'task-[A-Za-z0-9_:-]+' | head -n1)
 verbatim task wait --timeout 25m "$TASK"
-verbatim retrieve "The Lord is my shepherd" --collection csb_bible --passage --page-size 1 --limit 1
+verbatim retrieve "The Lord is my shepherd" --collection csb_bible
 ```
 
 Completion criteria:
@@ -211,7 +183,7 @@ Completion criteria:
 
 1. **Letting the LLM write Scripture.** Always quote from Verbatim output, not memory.
 2. **Using one Chinese query against an English collection.** Run English/normalized variants.
-3. **Missing `--passage`.** Verse-only snippets are often too narrow for pastoral/theological questions.
+3. **Unneeded `--passage`.** Default snippets already select matching canonical support; use full passages only when required.
 4. **Over-trusting score.** A high score can still be thematically wrong in cross-lingual retrieval.
 5. **Forgetting that some terms are doctrinal, not direct biblical phrases.** Cite supporting texts, and label interpretation.
 6. **Using source-id syntax for collections.** Use `--collection csb_bible`, not `-s csb_bible`.
@@ -219,7 +191,7 @@ Completion criteria:
 ## Verification Checklist
 
 - [ ] Correct Bible/canonical collection selected.
-- [ ] `--passage` used for context unless the user requested verse-only output.
+- [ ] The displayed canonical snippet directly supports the claim; use `--passage` only for full context.
 - [ ] Multiple query variants used for recall/cross-lingual prompts.
 - [ ] Locators deduped and classified as direct/related/uncertain.
 - [ ] Scores/debug inspected when results are surprising.

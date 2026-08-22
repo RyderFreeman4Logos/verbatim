@@ -20,43 +20,33 @@ For agent answers, prefer retrieving evidence first, reading enough context, the
 
 ## Choose the Right Retrieval Format
 
-- Default markdown: compact rank, score, citation, and snippet/passage. Good for humans and reliability inspection.
+- Default markdown: compact rank, score, citation, stable evidence id, and snippet. Good for humans and reliability inspection.
 - `--text-only` / `--format snippets`: cleanest stdout for agent context, but omits scores.
 - `--format tsv` / `csv`: fixed columns including rank, score, citation, collection, source, locator, snippet.
 - `--format json`: full structured fields, evidence ids, locators, provenance; best for programmatic merging/deduping.
 - `--show-debug`: compact retrieval diagnostics to stderr; use when debugging ranking or candidate counts.
 - `--show-debug --verbose`: full diagnostics; redirect to a file, do not paste into an LLM context.
 
-## Basic Collection Retrieval
+## Default Retrieval
 
 ```bash
-verbatim retrieve "<question>" \
-  --collection <name> \
-  --require-fresh \
-  --page-size 3 \
-  --limit 10
+verbatim retrieve "<question>"
 ```
 
-Use `--require-fresh` when the user expects current collection state. If it fails due stale membership, sync/ingest the collection before answering.
+The daemon supplies `retrieval.default_collections`, `default_limit`, and
+`default_page_size`. Use `--collection`, `--source-id`, `--limit`, or
+`--page-size` only to override that context for a specific request.
 
 For low-noise agent context:
 
 ```bash
-verbatim retrieve "<question>" \
-  --collection <name> \
-  --format snippets \
-  --page-size 5 \
-  --limit 10
+verbatim retrieve "<question>" --format snippets
 ```
 
 For programmatic confidence/ranking analysis:
 
 ```bash
-verbatim retrieve "<question>" \
-  --collection <name> \
-  --format json \
-  --page-size 10 \
-  --limit 20 > /tmp/verbatim-results.json
+verbatim retrieve "<question>" --format json > /tmp/verbatim-results.json
 ```
 
 Completion criteria:
@@ -64,7 +54,8 @@ Completion criteria:
 - The agent records top locators/scores or evidence ids when relevant.
 - The final answer only claims facts supported by retrieved text.
 
-For Bible/canonical collections, add `--passage` by default. Raw evidence-row retrieval can rank the correct multi-verse chunk but display only a nearby/lead verse that does not visibly support the query; this is tracked as product/UX bug #228. Example: the Chinese crown query `从此以后，有公义的冠冕为我留存` without `--passage` displays `2 Timothy 4:1`, while `--passage` displays `2 Timothy 4:1-13` containing `There is reserved for me the crown of righteousness`.
+Canonical compact results select the matching in-chunk support unit by default.
+Use `--passage` only when the full canonical chunk is needed.
 
 ## Scores and Confidence
 
@@ -78,8 +69,8 @@ Use them as warning signals:
 When the user asks to inspect reliability, avoid `--text-only` and use default markdown, TSV, or JSON because `--text-only` omits scores:
 
 ```bash
-verbatim retrieve "<question>" --collection <name> --page-size 5 --limit 5
-verbatim retrieve "<question>" --collection <name> --format tsv --page-size 5 --limit 5
+verbatim retrieve "<question>"
+verbatim retrieve "<question>" --format tsv
 ```
 
 ## Query Expansion Workflow
@@ -156,7 +147,7 @@ For reproducible comparisons, record:
 When producing a user-facing answer:
 
 1. Retrieve evidence.
-2. Read enough context or use `--passage` if passages are available.
+2. Read enough context; use `--passage` only when the full canonical chunk is needed.
 3. Cite locators/source names.
 4. Separate direct evidence from interpretation.
 5. State uncertainty if scores/results are weak.
@@ -179,7 +170,7 @@ Example final wording:
 
 ## Verification Checklist
 
-- [ ] Correct collection/source filter used.
+- [ ] Configured scope is correct, or an explicit collection/source override was used.
 - [ ] Freshness requirement resolved.
 - [ ] Retrieval output includes enough context.
 - [ ] Scores/debug checked when reliability is in question.

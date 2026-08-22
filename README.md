@@ -187,6 +187,16 @@ verbatim retrieve --collection areskapitalon "What does Areskapitalon cover?"
 verbatim ask --collection articles "What does the article set conclude?"
 ```
 
+The common retrieval path uses the daemon's configured scope and pagination:
+
+```sh
+verbatim retrieve "What evidence is relevant?"
+```
+
+Set `[retrieval].default_collections` to keep that default scoped. An empty
+value intentionally searches all indexed sources; `--collection`, `--source-id`,
+`--limit`, and `--page-size` are per-request overrides.
+
 Ask with citations:
 
 ```sh
@@ -196,16 +206,11 @@ verbatim ask --source-id <source-id> "What does the report conclude?"
 Retrieve context without chat generation and inspect one evidence item:
 
 ```sh
-verbatim retrieve --source-id <source-id> \
-  "What does the report conclude?"
-verbatim retrieve --source-id <source-id> --format snippets \
-  "What does the report conclude?"
-verbatim retrieve --source-id <source-id> --format tsv \
-  "What does the report conclude?"
-verbatim retrieve --source-id <source-id> --format csv \
-  "What does the report conclude?"
-verbatim retrieve --source-id <source-id> --format json --show-debug \
-  "What does the report conclude?"
+verbatim retrieve "What does the report conclude?"
+verbatim retrieve "What does the report conclude?" --format snippets
+verbatim retrieve "What does the report conclude?" --format tsv
+verbatim retrieve "What does the report conclude?" --format csv
+verbatim retrieve "What does the report conclude?" --format json --show-debug
 verbatim evidence <evidence-id>
 ```
 
@@ -315,11 +320,13 @@ control queued work.
 
 **Retrieval output**: `retrieve` and `ask --context-only` return evidence
 without invoking chat generation. Default Markdown is compact: rank, score,
-citation, and snippet. Use `--format snippets` or `--text-only` for citation
-plus snippet only, and `--format tsv` or `--format csv` for fixed-column output.
+citation, stable evidence id, and snippet. It uses configured `default_limit`,
+`default_page_size`, and `default_collections`. Use `--format snippets` or
+`--text-only` for citation plus snippet only, and `--format tsv` or `--format csv`
+for fixed-column output.
 Add `--show-debug` for compact deterministic ranking diagnostics, or use
 `--show-debug --verbose`, `--show-locator`, or JSON format when you need
-locators, provenance, internal evidence ids, and other debugging details.
+structured locators, provenance, and other debugging details.
 
 ## Command Reference
 

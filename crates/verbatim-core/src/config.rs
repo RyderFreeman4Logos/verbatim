@@ -414,6 +414,8 @@ pub struct RetrievalConfig {
     pub default_limit: usize,
     #[serde(default = "default_retrieval_page_size")]
     pub default_page_size: usize,
+    #[serde(default)]
+    pub default_collections: Vec<String>,
 }
 
 impl Default for RetrievalConfig {
@@ -424,6 +426,7 @@ impl Default for RetrievalConfig {
             rrf_k: 60,
             default_limit: default_retrieval_limit(),
             default_page_size: default_retrieval_page_size(),
+            default_collections: Vec::new(),
         }
     }
 }
@@ -1778,6 +1781,7 @@ fn is_reload_safe_key(key: &str) -> bool {
             | "retrieval.rrf_k"
             | "retrieval.default_limit"
             | "retrieval.default_page_size"
+            | "retrieval.default_collections"
             | "graph.enabled"
             | "graph.max_hops"
             | "graph.max_expanded_chunks"

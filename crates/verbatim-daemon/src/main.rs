@@ -113,6 +113,7 @@ mod audit_receipt;
 mod auth_middleware;
 #[path = "deletion_api.rs"]
 mod deletion_api;
+mod retrieval_scope;
 #[path = "routes.rs"]
 mod routes;
 #[path = "source_bounded_retrieval.rs"]
@@ -125,6 +126,9 @@ mod sqlite_durability_ops;
 use deletion_api::{
     delete_source, list_deletion_reports, reconcile_deletions_on_startup,
     start_deletion_reconcile_scheduler, STARTUP_DELETION_RECONCILE_BATCH_SIZE,
+};
+use retrieval_scope::{
+    apply_default_collection_scope, collection_filter_names, collection_freshness_remediation_error,
 };
 use source_bounded_retrieval::filter_generated_retrieval_evidence;
 use source_relocation_api::relocate_source;
@@ -4640,7 +4644,11 @@ async fn execute_retrieve_task_inner(
     let queue_wait_ms = task_queue_wait_ms(&state, task_id).await?;
     let question = req.question;
     let source_id = req.source_id.map(SourceId);
-    let collection_filter = req.collection_filter;
+    let collection_filter = apply_default_collection_scope(
+        &controls.config.retrieval,
+        source_id.as_ref(),
+        req.collection_filter,
+    );
     let embedding_profile_id = parse_embedding_profile_id(
         req.embedding_profile_id.as_deref(),
         &controls.config.embedding.profile_id,
@@ -4873,7 +4881,11 @@ async fn execute_ask_task_inner_with_config(
     let queue_wait_ms = task_queue_wait_ms(&state, task_id).await?;
     let question = req.question;
     let source_id = req.source_id.map(SourceId);
-    let collection_filter = req.collection_filter;
+    let collection_filter = apply_default_collection_scope(
+        &config.retrieval,
+        source_id.as_ref(),
+        req.collection_filter,
+    );
     let embedding_profile_id = parse_embedding_profile_id(
         req.embedding_profile_id.as_deref(),
         &config.embedding.profile_id,
@@ -5158,7 +5170,11 @@ async fn execute_ask_stream_task_inner(
     ensure_task_started(&state, task_id).await?;
     let question = req.question;
     let source_id = req.source_id.map(SourceId);
-    let collection_filter = req.collection_filter;
+    let collection_filter = apply_default_collection_scope(
+        &config.retrieval,
+        source_id.as_ref(),
+        req.collection_filter,
+    );
     let embedding_profile_id = parse_embedding_profile_id(
         req.embedding_profile_id.as_deref(),
         &config.embedding.profile_id,
@@ -5741,87 +5757,6 @@ fn resolve_query_scope_from_store(
         collection_filter: Some(response),
         collection_provenance,
     })
-}
-
-fn collection_filter_names(filter: &CollectionFilterRequest) -> Result<Vec<String>> {
-    let mut names = BTreeSet::new();
-    for raw_name in filter.collection_ids.iter().chain(&filter.names) {
-        let name = raw_name.trim();
-        if name.is_empty() {
-            bail!("collection filter values must not be empty");
-        }
-        validate_collection_name(name)?;
-        names.insert(name.to_string());
-    }
-    Ok(names.into_iter().collect())
-}
-
-fn collection_freshness_remediation_error(
-    requested_collection_names: &BTreeSet<String>,
-    required_collection_syncs: &BTreeSet<String>,
-    required_source_ingests: &BTreeSet<String>,
-) -> String {
-    const MAX_SOURCE_COMMANDS: usize = 25;
-
-    let mut message = String::from(
-        "collection filter requires fresh collection membership and member indexes.\n\nRun the relevant remediation command(s), then retry the query:",
-    );
-
-    if required_collection_syncs.is_empty() && required_source_ingests.is_empty() {
-        message.push_str("\n  verbatim collection sync <name>");
-        message.push_str("\n  verbatim reindex --stale");
-        append_collection_retry_command(&mut message, requested_collection_names);
-        return message;
-    }
-
-    for name in required_collection_syncs {
-        message.push_str(&format!("\n  verbatim collection sync {}", shell_arg(name)));
-    }
-
-    for source_id in required_source_ingests.iter().take(MAX_SOURCE_COMMANDS) {
-        message.push_str(&format!("\n  verbatim ingest {}", shell_arg(source_id)));
-    }
-
-    if required_source_ingests.len() > MAX_SOURCE_COMMANDS {
-        let omitted = required_source_ingests.len() - MAX_SOURCE_COMMANDS;
-        message.push_str(&format!(
-            "\n  # {omitted} more stale member source(s) omitted; to rebuild every stale source, run:"
-        ));
-        message.push_str("\n  verbatim reindex --stale");
-    } else if !required_source_ingests.is_empty() {
-        message.push_str("\n  # To rebuild every stale source instead, run:");
-        message.push_str("\n  verbatim reindex --stale");
-    }
-
-    append_collection_retry_command(&mut message, requested_collection_names);
-    message
-}
-
-fn append_collection_retry_command(
-    message: &mut String,
-    requested_collection_names: &BTreeSet<String>,
-) {
-    if requested_collection_names.is_empty() {
-        return;
-    }
-
-    let collection_args = requested_collection_names
-        .iter()
-        .map(|name| format!(" --collection {}", shell_arg(name)))
-        .collect::<String>();
-    message.push_str(&format!(
-        "\n\nAfter the command(s) complete, retry:\n  verbatim ask{collection_args} --require-fresh '<question>'"
-    ));
-}
-
-fn shell_arg(value: &str) -> String {
-    if value.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
-    }) {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\"'\"'"))
-    }
 }
 
 fn collection_result_provenance(member: &CollectionMember) -> CollectionResultProvenance {

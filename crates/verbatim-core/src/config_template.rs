@@ -66,9 +66,10 @@ max_backoff_millis = 5000
 dense_top_k = 80
 bm25_top_k = 50
 rrf_k = 60
-# default_limit is the default page size for answer/context output.
+# Default pagination and scope for retrieve/context output.
 default_limit = 12
 default_page_size = 1
+default_collections = []
 
 [vector_index]
 # low_memory scans SQLite-stored vectors at query time and avoids resident HNSW.
