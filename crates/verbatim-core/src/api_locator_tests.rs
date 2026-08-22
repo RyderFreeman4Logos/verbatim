@@ -32,6 +32,7 @@ fn markdown_locator_serializes_in_evidence_and_retrieve_responses() {
     let evidence = EvidenceResponse {
         id: "ev-md".into(),
         source_id: "src-1".into(),
+        text_taxonomy: ResponseTextTaxonomy::evidence_response(true),
         source_hash: Some("persisted-source-hash".into()),
         source_bounded: true,
         text_hash: "verified-text-hash".into(),

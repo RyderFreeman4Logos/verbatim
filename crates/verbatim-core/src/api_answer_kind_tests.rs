@@ -3,6 +3,7 @@ fn ask_response_serializes_generated_interpretation_separately_from_evidence() {
     let response = AskResponse {
         answer: "Legacy generated answer.".into(),
         answer_kind: AnswerKind::GeneratedInterpretation,
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
         generated_interpretation: Some(GeneratedInterpretationResponse {
             text: "Generated interpretation.".into(),
         }),
@@ -33,6 +34,7 @@ fn ask_response_serializes_context_only_as_evidence_only() {
     let response = AskResponse {
         answer: String::new(),
         answer_kind: AnswerKind::EvidenceOnly,
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
         generated_interpretation: None,
         citations: Vec::new(),
         verified: false,

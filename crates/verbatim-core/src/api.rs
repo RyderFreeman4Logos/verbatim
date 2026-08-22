@@ -576,11 +576,15 @@ pub struct AskRequest {
     pub page: Option<usize>,
 }
 
-/// Model-authored text that must remain distinct from persisted evidence.
+/// Model-authored text kept distinct from persisted evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedInterpretationResponse {
     pub text: String,
 }
+
+#[path = "api_response_taxonomy.rs"]
+mod response_taxonomy;
+pub use response_taxonomy::{OutputTextPlane, ResponseTextTaxonomy, TextFieldTaxonomy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -593,6 +597,7 @@ pub enum AnswerKind {
 pub struct AskResponse {
     pub answer: String,
     pub answer_kind: AnswerKind,
+    pub text_taxonomy: ResponseTextTaxonomy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_interpretation: Option<GeneratedInterpretationResponse>,
     #[serde(default)]
@@ -651,6 +656,7 @@ fn is_false(value: &bool) -> bool {
 pub struct RetrieveResponse {
     pub task_id: String,
     pub query: String,
+    pub text_taxonomy: ResponseTextTaxonomy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -749,6 +755,7 @@ pub struct CitationResponse {
 pub struct EvidenceResponse {
     pub id: String,
     pub source_id: String,
+    pub text_taxonomy: ResponseTextTaxonomy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_hash: Option<String>,
     pub source_bounded: bool,
@@ -1218,3 +1225,7 @@ mod tests {
 #[cfg(test)]
 #[path = "api_locator_tests.rs"]
 mod api_locator_tests;
+
+#[cfg(test)]
+#[path = "api_response_taxonomy_tests.rs"]
+mod api_response_taxonomy_tests;

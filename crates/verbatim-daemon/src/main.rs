@@ -41,11 +41,12 @@ use verbatim_core::api::{
     IdleReclaimBackendResult, IdleReclaimCycleResult, IdleReclaimHealth, ImageArtifactResponse,
     IndexGcRequest, IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse,
     IndexStatusResponse, IngestResponse, ReadinessHealth, ReindexRequest, ReindexResponse,
-    RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
-    SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate, TaskEventsResponse,
-    TaskIngestRequest, TaskListAggregate, TaskListResponse, TaskProfileResponse, TaskQueueTurnover,
-    TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse,
-    TaskWaitEvent, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
+    ResponseTextTaxonomy, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+    RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
+    TaskEventsResponse, TaskIngestRequest, TaskListAggregate, TaskListResponse,
+    TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
+    TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent, VectorJsonCleanupRequest,
+    VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -5073,6 +5074,7 @@ async fn execute_ask_task_inner_with_config(
     let response = AskResponse {
         answer: gen_result.answer.clone(),
         answer_kind: AnswerKind::GeneratedInterpretation,
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
         generated_interpretation: Some(GeneratedInterpretationResponse {
             text: gen_result.answer,
         }),
@@ -5423,6 +5425,7 @@ async fn execute_context_only_ask_task_inner(
     Ok(AskResponse {
         answer: String::new(),
         answer_kind: AnswerKind::EvidenceOnly,
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
         generated_interpretation: None,
         citations: Vec::new(),
         verified: false,
@@ -7849,6 +7852,7 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
     Ok(RetrieveResponse {
         task_id: task_id.0,
         query,
+        text_taxonomy: ResponseTextTaxonomy::retrieve_response(),
         source_id: source_filter.map(|source_id| source_id.0),
         collection_filter,
         embedding_profile_id: embedding_profile_id.into_string(),
@@ -8322,22 +8326,26 @@ async fn get_evidence(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match evidence {
-        Some(eu) => Ok(Json(EvidenceResponse {
-            kind: evidence_kind_name(eu.kind).to_string(),
-            id: eu.id.0,
-            source_id: eu.source_id.0,
-            source_hash,
-            source_bounded: matches!(eu.kind, EvidenceKind::Text | EvidenceKind::Image),
-            text_hash: eu.text_hash,
-            derived_from: eu.derived_from.map(|id| id.0),
-            locator: eu.locator.to_string(),
-            structured_locator: eu.locator,
-            text: eu.text,
-            heading_path: eu.heading_path,
-            language: eu.language,
-            position: eu.position,
-            image_artifact: image_artifact.map(ImageArtifactResponse::from),
-        })),
+        Some(eu) => {
+            let source_bounded = matches!(eu.kind, EvidenceKind::Text | EvidenceKind::Image);
+            Ok(Json(EvidenceResponse {
+                kind: evidence_kind_name(eu.kind).to_string(),
+                id: eu.id.0,
+                source_id: eu.source_id.0,
+                text_taxonomy: ResponseTextTaxonomy::evidence_response(source_bounded),
+                source_hash,
+                source_bounded,
+                text_hash: eu.text_hash,
+                derived_from: eu.derived_from.map(|id| id.0),
+                locator: eu.locator.to_string(),
+                structured_locator: eu.locator,
+                text: eu.text,
+                heading_path: eu.heading_path,
+                language: eu.language,
+                position: eu.position,
+                image_artifact: image_artifact.map(ImageArtifactResponse::from),
+            }))
+        }
         None => Err(err(
             StatusCode::NOT_FOUND,
             anyhow::anyhow!("evidence not found: {eid}"),
