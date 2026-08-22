@@ -33,6 +33,44 @@ async fn unsupported_filter_image_only_pdf_rejects_without_ocr() {
         .is_empty());
 }
 
+#[cfg(feature = "parser-pdf-oxide")]
+#[tokio::test]
+async fn short_text_layer_pdf_ingests_with_pdf_oxide() {
+    assert_short_text_layer_pdf_ingests().await;
+}
+
+#[cfg(feature = "parser-pdfplumber")]
+#[tokio::test]
+async fn short_text_layer_pdf_ingests_with_pdfplumber() {
+    assert_short_text_layer_pdf_ingests().await;
+}
+
+async fn assert_short_text_layer_pdf_ingests() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut pipeline = IngestPipeline::from_parts(
+        Store::in_memory().unwrap(),
+        HnswIndex::new(),
+        StaticEmbeddingClient,
+        tempdir.path().to_path_buf(),
+    );
+    let path = tempdir.path().join("short-text-layer.pdf");
+    write_pdf_with_text(&path, "OK");
+    let source_id = pipeline.add_source(&path).unwrap();
+
+    pipeline
+        .ingest_source(&source_id)
+        .await
+        .expect("non-empty short text layer must remain usable evidence");
+
+    let evidence = pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap();
+    assert!(evidence
+        .iter()
+        .any(|unit| unit.kind == EvidenceKind::Text && unit.text == "OK"));
+}
+
 #[tokio::test]
 async fn mixed_pdf_ocr_output_stays_out_of_persistent_evidence() {
     let tempdir = tempfile::tempdir().unwrap();

@@ -396,7 +396,7 @@ pub fn pdf_scan_summary_with_page_count(
         .map(|(page, summary)| {
             text_char_count += summary.text_char_count;
             let has_meaningful_text = summary.text_char_count >= MEANINGFUL_TEXT_MIN_CHARS;
-            let image_only = !has_meaningful_text;
+            let image_only = summary.text_char_count == 0;
             if image_only {
                 image_only_page_count += 1;
             }
