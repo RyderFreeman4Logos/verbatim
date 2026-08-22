@@ -1,5 +1,73 @@
 use super::*;
 use crate::source_bounded_retrieval::filter_generated_retrieval_evidence;
+use verbatim_core::traits::LexicalIndex;
+
+pub(super) fn persist_legacy_caption(
+    pipeline: &IngestPipeline,
+    source_id: &SourceId,
+    caption_marker: &str,
+    evidence_id: &str,
+    chunk_id: &str,
+    text: &str,
+) -> (EvidenceId, ChunkId) {
+    let store = pipeline.store();
+    let evidence = store.list_evidence_by_source(source_id).unwrap();
+    assert!(
+        evidence.iter().all(|unit| {
+            unit.kind != EvidenceKind::Generated && !unit.text.contains(caption_marker)
+        }),
+        "caption evidence persisted: {evidence:?}"
+    );
+    let evidence_ids = evidence
+        .iter()
+        .map(|unit| unit.id.clone())
+        .collect::<HashSet<_>>();
+    let chunks = store.list_chunks_by_source(source_id).unwrap();
+    assert!(
+        chunks.iter().all(|chunk| {
+            !chunk.text.contains(caption_marker)
+                && chunk
+                    .evidence_unit_ids
+                    .iter()
+                    .all(|id| evidence_ids.contains(id))
+        }),
+        "caption chunk persisted: {chunks:?}"
+    );
+    let source_evidence = evidence
+        .iter()
+        .find(|unit| unit.kind == EvidenceKind::Text)
+        .expect("production text evidence persists")
+        .clone();
+    let source_chunk = chunks
+        .iter()
+        .find(|chunk| chunk.evidence_unit_ids.contains(&source_evidence.id))
+        .expect("production text chunk persists")
+        .clone();
+
+    let mut generated = source_evidence.clone();
+    generated.id = EvidenceId(evidence_id.into());
+    generated.kind = EvidenceKind::Generated;
+    generated.derived_from = Some(source_evidence.id);
+    generated.text = text.into();
+    generated.text_hash = verbatim_core::types::hex_sha256(generated.text.as_bytes());
+    let mut chunk = source_chunk;
+    chunk.id = ChunkId(chunk_id.into());
+    chunk.source_id = source_id.clone();
+    chunk.chunk_hash = format!("{chunk_id}-hash");
+    chunk.text = text.into();
+    chunk.evidence_unit_ids = vec![generated.id.clone()];
+    store
+        .bulk_insert_evidence(std::slice::from_ref(&generated))
+        .unwrap();
+    store
+        .bulk_insert_chunks(std::slice::from_ref(&chunk))
+        .unwrap();
+    store
+        .link_chunk_evidence(&[(chunk.id.clone(), generated.id.clone())])
+        .unwrap();
+    pipeline.lexical_index().rebuild_from_store(store).unwrap();
+    (generated.id, chunk.id)
+}
 
 #[test]
 fn source_bounded_retrieval_batches_evidence_eligibility_queries() {
