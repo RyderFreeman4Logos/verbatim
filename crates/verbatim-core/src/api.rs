@@ -597,6 +597,7 @@ pub enum AnswerKind {
 pub struct AskResponse {
     pub answer: String,
     pub answer_kind: AnswerKind,
+    #[serde(default = "ResponseTextTaxonomy::ask_response")]
     pub text_taxonomy: ResponseTextTaxonomy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_interpretation: Option<GeneratedInterpretationResponse>,
@@ -656,6 +657,7 @@ fn is_false(value: &bool) -> bool {
 pub struct RetrieveResponse {
     pub task_id: String,
     pub query: String,
+    #[serde(default = "ResponseTextTaxonomy::retrieve_response")]
     pub text_taxonomy: ResponseTextTaxonomy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
@@ -755,6 +757,7 @@ pub struct CitationResponse {
 pub struct EvidenceResponse {
     pub id: String,
     pub source_id: String,
+    #[serde(default = "legacy_evidence_response_taxonomy")]
     pub text_taxonomy: ResponseTextTaxonomy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_hash: Option<String>,
@@ -770,6 +773,10 @@ pub struct EvidenceResponse {
     pub language: Option<String>,
     pub position: u32,
     pub image_artifact: Option<ImageArtifactResponse>,
+}
+
+fn legacy_evidence_response_taxonomy() -> ResponseTextTaxonomy {
+    ResponseTextTaxonomy::evidence_response(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
