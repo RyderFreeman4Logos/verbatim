@@ -54,7 +54,6 @@ impl ResponseTextTaxonomy {
                 OutputTextPlane::DeterministicInterfaceText,
             ),
             ("metadata", OutputTextPlane::Metadata),
-            ("debug", OutputTextPlane::Metadata),
         ])
     }
 
