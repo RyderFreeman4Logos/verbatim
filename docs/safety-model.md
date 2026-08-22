@@ -67,6 +67,9 @@ a scanned or image-only PDF fails closed.
 Version 1.0 supports Linux x86_64 hosts, Linux VMs, and Docker Linux. This does
 not imply a native macOS or Windows port.
 
+No GUI, TUI, or web help is shipped in Linux x86_64 1.0; CLI `--help` is the
+user-facing path classification.
+
 ## Threat Examples
 
 - **Fabrication — prompt injection in retrieved text:** a passage can contain
@@ -96,6 +99,14 @@ not imply a native macOS or Windows port.
   application, hosted-endpoint terms, and human review are managed correctly.
 - **Not guarantees:** ranking quality, candidate recall, source correctness,
   and generated interpretation remain fallible.
+
+## Guarantee-to-Test Map
+
+| Documented claim | Coverage or status |
+| --- | --- |
+| Enforced guarantee — source-bounded evidence | `public_evidence_endpoint_revalidates_persisted_text` re-renders persisted text and verifies its hash. |
+| Enforced guarantee — OCR exclusion | `scanned_image_only_pdf_ingest_rejects_without_ocr` and `scanned_image_only_pdf_rejects_before_configured_ocr` fail closed; `source_bounded_retrieval_omits_generated_captions_from_all_response_forms` excludes generated captions. |
+| Source selection, ACLs, hosted endpoints, completeness, and human review | Operational assumptions; they are not runtime guarantees. |
 
 ## High-Risk Deployments
 
