@@ -331,22 +331,23 @@ fn concurrent_erasure_cannot_reintroduce_a_tombstoned_source() {
     store.add_source(&source).unwrap();
     drop(store);
 
+    // Open both stores before either thread can wait at the barrier. If opening
+    // fails under suite load, the test fails instead of orphaning its peer.
+    let eraser_store = Store::new(&database_path).unwrap();
+    let adder_store = Store::new(&database_path).unwrap();
+
     let barrier = Arc::new(Barrier::new(2));
     let eraser_barrier = Arc::clone(&barrier);
-    let eraser_path = database_path.clone();
     let eraser_source = source.clone();
     let eraser = std::thread::spawn(move || {
-        let store = Store::new(&eraser_path).unwrap();
         eraser_barrier.wait();
-        store.remove_source(&eraser_source.id).unwrap();
+        eraser_store.remove_source(&eraser_source.id).unwrap();
     });
     let adder_barrier = Arc::clone(&barrier);
-    let adder_path = database_path.clone();
     let adder_source = source.clone();
     let adder = std::thread::spawn(move || {
-        let store = Store::new(&adder_path).unwrap();
         adder_barrier.wait();
-        store.add_source(&adder_source)
+        adder_store.add_source(&adder_source)
     });
 
     eraser.join().unwrap();
