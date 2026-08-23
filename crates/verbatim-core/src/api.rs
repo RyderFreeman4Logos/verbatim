@@ -576,11 +576,17 @@ pub struct AskRequest {
     pub page: Option<usize>,
 }
 
-/// Model-authored text that must remain distinct from persisted evidence.
+/// Model-authored text kept distinct from persisted evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedInterpretationResponse {
     pub text: String,
 }
+
+#[path = "api_response_taxonomy.rs"]
+mod response_taxonomy;
+pub use response_taxonomy::{OutputTextPlane, ResponseTextTaxonomy, TextFieldTaxonomy};
+#[path = "api_response_serialization.rs"]
+mod response_serialization;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -589,20 +595,16 @@ pub enum AnswerKind {
     EvidenceOnly,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AskResponse {
     pub answer: String,
     pub answer_kind: AnswerKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_taxonomy: ResponseTextTaxonomy,
     pub generated_interpretation: Option<GeneratedInterpretationResponse>,
-    #[serde(default)]
     pub citations: Vec<CitationResponse>,
     pub verified: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<RetrievalDebug>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<RetrieveResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection_filter: Option<CollectionFilterResponse>,
 }
 
@@ -647,13 +649,12 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetrieveResponse {
     pub task_id: String,
     pub query: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_taxonomy: ResponseTextTaxonomy,
     pub source_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection_filter: Option<CollectionFilterResponse>,
     pub embedding_profile_id: String,
     pub limit: usize,
@@ -664,11 +665,8 @@ pub struct RetrieveResponse {
     pub source_bounded: bool,
     pub controls: RetrieveControlsResponse,
     pub audit_receipt: AuditReceipt,
-    #[serde(default)]
     pub timings: Vec<RetrieveTimingResponse>,
-    #[serde(default)]
     pub results: Vec<RetrieveResultResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug: Option<RetrievalDebug>,
 }
 
@@ -745,11 +743,11 @@ pub struct CitationResponse {
     pub text_preview: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceResponse {
     pub id: String,
     pub source_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_taxonomy: ResponseTextTaxonomy,
     pub source_hash: Option<String>,
     pub source_bounded: bool,
     pub text_hash: String,
@@ -759,7 +757,6 @@ pub struct EvidenceResponse {
     pub structured_locator: SourceLocator,
     pub text: String,
     pub heading_path: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     pub position: u32,
     pub image_artifact: Option<ImageArtifactResponse>,
@@ -1218,3 +1215,7 @@ mod tests {
 #[cfg(test)]
 #[path = "api_locator_tests.rs"]
 mod api_locator_tests;
+
+#[cfg(test)]
+#[path = "api_response_taxonomy_tests.rs"]
+mod api_response_taxonomy_tests;

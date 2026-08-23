@@ -3,6 +3,7 @@ fn markdown_evidence_lookup_renders_structured_locator_details() {
     let response = EvidenceResponse {
         id: "ev-md".into(),
         source_id: "src-1".into(),
+        text_taxonomy: ResponseTextTaxonomy::evidence_response(true),
         source_hash: Some("persisted-source-hash".into()),
         source_bounded: true,
         text_hash: "receipt-text-hash".into(),
@@ -55,6 +56,7 @@ fn retrieve_debug_output_renders_markdown_structured_locator_when_present() {
     let response = RetrieveResponse {
         task_id: "task-1".into(),
         query: "markdown".into(),
+        text_taxonomy: ResponseTextTaxonomy::retrieve_response(),
         source_id: None,
         collection_filter: None,
         embedding_profile_id: "default".into(),

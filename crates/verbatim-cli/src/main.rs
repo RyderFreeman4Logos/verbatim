@@ -2164,11 +2164,12 @@ mod tests {
         EvidenceResponse, HealthResponse, IdleExitActivitySnapshot, IdleExitHealth,
         IdleReclaimActivitySnapshot, IdleReclaimBackendResult, IdleReclaimCycleResult,
         IdleReclaimHealth, IngestResponse, ReadinessHealth, ReindexRequest, ReindexResponse,
-        RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
-        RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
-        TaskEventsResponse, TaskListAggregate, TaskListResponse, TaskProfileResponse,
-        TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate,
-        TaskSummaryResponse, AUDIT_RECEIPT_VERSION, COLLECTION_CLI_API_PARITY,
+        ResponseTextTaxonomy, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
+        RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
+        TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskListAggregate, TaskListResponse,
+        TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
+        TaskStaleRunningAggregate, TaskSummaryResponse, AUDIT_RECEIPT_VERSION,
+        COLLECTION_CLI_API_PARITY,
     };
     use verbatim_core::collection::{
         CollectionRecord, CollectionRoot, CollectionRootKind, CollectionStatus,
@@ -5580,6 +5581,7 @@ mod tests {
         EvidenceResponse {
             id: "ev-1".into(),
             source_id: "src-1".into(),
+            text_taxonomy: ResponseTextTaxonomy::evidence_response(true),
             source_hash: Some("persisted-source-hash".into()),
             source_bounded: true,
             text_hash: "receipt-text-hash".into(),
@@ -5611,6 +5613,7 @@ mod tests {
         RetrieveResponse {
             task_id: "task-1".into(),
             query: request.question.clone(),
+            text_taxonomy: ResponseTextTaxonomy::retrieve_response(),
             source_id: request.source_id.clone(),
             collection_filter: None,
             embedding_profile_id: request

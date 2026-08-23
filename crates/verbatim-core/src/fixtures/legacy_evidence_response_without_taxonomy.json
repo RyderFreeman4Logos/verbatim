@@ -1,0 +1,18 @@
+{
+  "id": "ev-legacy-generated",
+  "source_id": "src-generated",
+  "source_bounded": false,
+  "text_hash": "generated-hash",
+  "kind": "generated",
+  "derived_from": null,
+  "locator": "generated://text",
+  "structured_locator": {
+    "type": "Document",
+    "path_or_url": "generated://text",
+    "line_start": 1,
+    "line_end": null
+  },
+  "text": "Model-authored text.",
+  "heading_path": ["Generated"],
+  "position": 0
+}

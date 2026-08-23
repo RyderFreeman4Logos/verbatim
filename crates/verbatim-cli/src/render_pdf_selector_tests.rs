@@ -12,6 +12,7 @@ fn pdf_evidence_lookup_renders_selector_details_and_preserves_legacy_output() {
     let mut response = EvidenceResponse {
         id: "ev-pdf".into(),
         source_id: "src-1".into(),
+        text_taxonomy: verbatim_core::api::ResponseTextTaxonomy::evidence_response(true),
         source_hash: Some("persisted-source-hash".into()),
         source_bounded: true,
         text_hash: selector.selected_text_hash.clone(),

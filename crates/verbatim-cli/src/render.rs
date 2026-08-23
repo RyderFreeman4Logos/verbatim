@@ -3221,8 +3221,8 @@ mod tests {
     use super::*;
     use verbatim_core::api::{
         AuditReceipt, AuditReceiptResult, CollectionResultProvenance, ConfigResponse,
-        EvidenceResponse, RetrieveControlsResponse, RetrieveResponse, RetrieveResultResponse,
-        RetrieveTimingResponse, SourceResponse, AUDIT_RECEIPT_VERSION,
+        EvidenceResponse, ResponseTextTaxonomy, RetrieveControlsResponse, RetrieveResponse,
+        RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, AUDIT_RECEIPT_VERSION,
     };
     use verbatim_core::task::{TaskId, TaskKind, TaskStatus};
     use verbatim_core::types::{
@@ -3236,6 +3236,7 @@ mod tests {
         let response = AskResponse {
             answer: "Legacy generated answer.".into(),
             answer_kind: verbatim_core::api::AnswerKind::GeneratedInterpretation,
+            text_taxonomy: ResponseTextTaxonomy::ask_response(),
             generated_interpretation: Some(verbatim_core::api::GeneratedInterpretationResponse {
                 text: "Generated interpretation.".into(),
             }),
@@ -3338,6 +3339,7 @@ mod tests {
         let response = EvidenceResponse {
             id: "ev-ocr".into(),
             source_id: "src-1".into(),
+            text_taxonomy: ResponseTextTaxonomy::evidence_response(true),
             source_hash: Some("persisted-source-hash".into()),
             source_bounded: true,
             text_hash: "receipt-text-hash".into(),
@@ -3487,6 +3489,7 @@ mod tests {
         RetrieveResponse {
             task_id: "task-internal-123".into(),
             query: "fixture query".into(),
+            text_taxonomy: ResponseTextTaxonomy::retrieve_response(),
             source_id: Some("src-internal-123".into()),
             collection_filter: None,
             embedding_profile_id: "default".into(),

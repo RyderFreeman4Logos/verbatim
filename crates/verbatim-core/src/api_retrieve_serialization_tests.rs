@@ -3,6 +3,7 @@ fn retrieve_result_omits_structured_locator_until_requested() {
     let response = RetrieveResponse {
         task_id: "task-1".into(),
         query: "What is cited?".into(),
+        text_taxonomy: ResponseTextTaxonomy::retrieve_response(),
         source_id: None,
         collection_filter: None,
         embedding_profile_id: "default".into(),
@@ -73,5 +74,17 @@ fn retrieve_result_omits_structured_locator_until_requested() {
     assert!(encoded.contains("\"source_hash\":\"persisted-source-hash\""));
     assert!(!encoded.contains("structured_locator"));
     assert!(!encoded.contains("provenance"));
-    assert!(!encoded.contains("debug"));
+    let encoded_value = serde_json::to_value(&response).unwrap();
+    assert!(encoded_value.get("debug").is_none());
+
+    let mut requested = response;
+    requested.results[0].structured_locator = Some(SourceLocator::Document {
+        path_or_url: "/tmp/doc.md".into(),
+        line_start: 1,
+        line_end: Some(1),
+    });
+    requested.text_taxonomy =
+        ResponseTextTaxonomy::retrieve_response_with_results(&requested.results);
+    let requested_encoded = serde_json::to_string(&requested).unwrap();
+    assert!(requested_encoded.contains("structured_locator"));
 }

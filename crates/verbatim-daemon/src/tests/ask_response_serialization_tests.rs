@@ -3,6 +3,7 @@ fn ask_response_omits_retrieval_when_debug_is_off() {
     let response = AskResponse {
         answer: "Answer [E1].".into(),
         answer_kind: AnswerKind::EvidenceOnly,
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
         generated_interpretation: None,
         citations: Vec::new(),
         verified: false,
@@ -13,16 +14,16 @@ fn ask_response_omits_retrieval_when_debug_is_off() {
 
     let encoded = serde_json::to_value(response).unwrap();
 
+    assert_eq!(encoded["answer"], "Answer [E1].");
+    assert_eq!(encoded["answer_kind"], "evidence_only");
+    assert_eq!(encoded["citations"], serde_json::json!([]));
+    assert!(!encoded["verified"].as_bool().unwrap());
     assert_eq!(
-        encoded,
-        serde_json::json!({
-            "answer": "Answer [E1].",
-            "answer_kind": "evidence_only",
-            "citations": [],
-            "verified": false,
-        })
+        encoded["text_taxonomy"],
+        serde_json::to_value(ResponseTextTaxonomy::ask_response()).unwrap()
     );
     assert!(encoded.get("collection_filter").is_none());
+    assert!(encoded.get("retrieval").is_none());
 }
 
 #[test]
@@ -30,6 +31,7 @@ fn ask_response_includes_structured_retrieval_when_requested() {
     let response = AskResponse {
         answer: "Answer [E1].".into(),
         answer_kind: AnswerKind::EvidenceOnly,
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
         generated_interpretation: None,
         citations: Vec::new(),
         verified: false,
