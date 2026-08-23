@@ -23,6 +23,12 @@ fn search_filtered_fts(
         .map(|source_id| source_id.0.clone())
         .collect::<Vec<_>>();
     source_ids.sort_unstable();
+    let variable_limit = store
+        .connection()
+        .limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER)? as usize;
+    if source_ids.len().saturating_add(2) > variable_limit {
+        return Err(crate::overfetch::OverfetchError::UnsupportedStrictFilter.into());
+    }
     let source_placeholders = (2..source_ids.len() + 2)
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
