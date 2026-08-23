@@ -550,7 +550,10 @@ fn collect_string_leaves(value: &serde_json::Value, path: String, leaves: &mut V
                 } else {
                     format!("{path}.{key}")
                 };
-                if child_path == "text_taxonomy" || child_path.starts_with("text_taxonomy.") {
+                if child_path
+                    .split('.')
+                    .any(|part| part.split('[').next() == Some("text_taxonomy"))
+                {
                     continue;
                 }
                 collect_string_leaves(value, child_path, leaves);
@@ -780,3 +783,5 @@ fn ocr_and_unknown_retrieval_roles_fail_closed_outside_evidence() {
         OutputTextPlane::Evidence
     );
 }
+
+include!("api_response_taxonomy_class_sweep_tests.rs");

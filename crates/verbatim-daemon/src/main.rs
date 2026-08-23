@@ -8333,7 +8333,10 @@ async fn get_evidence(
                 kind: evidence_kind_name(eu.kind).to_string(),
                 id: eu.id.0,
                 source_id: eu.source_id.0,
-                text_taxonomy: ResponseTextTaxonomy::evidence_response(source_bounded),
+                text_taxonomy: ResponseTextTaxonomy::evidence_response_for_kind(
+                    evidence_kind_name(eu.kind),
+                    source_bounded,
+                ),
                 source_hash,
                 source_bounded,
                 text_hash: eu.text_hash,

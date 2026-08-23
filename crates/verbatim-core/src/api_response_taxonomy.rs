@@ -370,11 +370,12 @@ impl ResponseTextTaxonomy {
     }
 
     pub fn evidence_response(source_bounded: bool) -> Self {
-        let text_plane = if source_bounded {
-            OutputTextPlane::Evidence
-        } else {
-            OutputTextPlane::GeneratedInterpretation
-        };
+        Self::evidence_response_for_kind("text", source_bounded)
+    }
+
+    pub fn evidence_response_for_kind(kind: &str, source_bounded: bool) -> Self {
+        let text_plane = text_plane_for_evidence_kind(kind, source_bounded);
+
         Self::from_fields(&[
             ("text", text_plane),
             ("heading_path[]", text_plane),
@@ -571,13 +572,24 @@ fn text_plane_for_serialized_path(root: &Value, path: &str) -> OutputTextPlane {
     if path_has_component(path, "collection_filter") && path_has_component(path, "warnings") {
         return OutputTextPlane::DeterministicInterfaceText;
     }
-    if (path.contains("citations[") || path.contains("results[")) && path.ends_with(".label") {
+    if path.ends_with(".label")
+        && (path_has_component(path, "citations")
+            || path_has_component(path, "results")
+            || path_has_component(path, "final_evidence_pack")
+            || path_has_component(path, "display_evidence_pack"))
+    {
         return OutputTextPlane::DeterministicInterfaceText;
     }
     if (path == "text" || path_has_component(path, "heading_path"))
         && !path_has_component(path, "structured_locator")
     {
-        let bounded = lookup_path(
+        let kind = lookup_path(
+            root,
+            &replace_last_component(path, path.rsplit('.').next().unwrap_or(path), "kind"),
+        )
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+        let source_bounded = lookup_path(
             root,
             &replace_last_component(
                 path,
@@ -587,11 +599,7 @@ fn text_plane_for_serialized_path(root: &Value, path: &str) -> OutputTextPlane {
         )
         .and_then(Value::as_bool)
         .unwrap_or(false);
-        return if bounded {
-            OutputTextPlane::Evidence
-        } else {
-            OutputTextPlane::GeneratedInterpretation
-        };
+        return text_plane_for_evidence_kind(kind, source_bounded);
     }
     OutputTextPlane::Metadata
 }
@@ -642,22 +650,25 @@ fn normalize_array_indices(path: &str) -> String {
 }
 
 fn text_plane_for_kind(kind: &str, role: Option<&str>) -> OutputTextPlane {
-    if matches!(
-        kind,
-        "generated" | "image_caption_generated" | "ocr" | "ocr_text"
-    ) || matches!(
-        role,
-        Some("generated" | "image_caption_generated" | "ocr" | "ocr_text")
-    ) {
-        OutputTextPlane::GeneratedInterpretation
-    } else if matches!(
-        role,
-        Some("original_text" | "text" | "image" | "image_artifact")
-    ) || (role.is_none()
-        && matches!(kind, "original_text" | "text" | "image" | "image_artifact"))
-    {
-        OutputTextPlane::Evidence
-    } else {
-        OutputTextPlane::GeneratedInterpretation
+    match role {
+        None => match kind {
+            "original_text" | "text" => OutputTextPlane::Evidence,
+            "image" | "image_artifact" => OutputTextPlane::Metadata,
+            _ => OutputTextPlane::GeneratedInterpretation,
+        },
+        Some("original_text") if kind == "text" => OutputTextPlane::Evidence,
+        Some("image_artifact") if kind == "image" => OutputTextPlane::Metadata,
+        _ => OutputTextPlane::GeneratedInterpretation,
+    }
+}
+
+fn text_plane_for_evidence_kind(kind: &str, source_bounded: bool) -> OutputTextPlane {
+    if !source_bounded {
+        return OutputTextPlane::GeneratedInterpretation;
+    }
+    match kind {
+        "text" => OutputTextPlane::Evidence,
+        "image" | "image_artifact" => OutputTextPlane::Metadata,
+        _ => OutputTextPlane::GeneratedInterpretation,
     }
 }

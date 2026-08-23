@@ -61,13 +61,8 @@ impl<'de> Deserialize<'de> for AskResponse {
         D: serde::Deserializer<'de>,
     {
         let wire = AskResponseWire::deserialize(deserializer)?;
-        let text_taxonomy = match wire.text_taxonomy.clone() {
-            Some(taxonomy) => taxonomy,
-            None => {
-                let value = serde_json::to_value(&wire).map_err(serde::de::Error::custom)?;
-                ResponseTextTaxonomy::from_serialized_value(&value)
-            }
-        };
+        let value = serde_json::to_value(&wire).map_err(serde::de::Error::custom)?;
+        let text_taxonomy = ResponseTextTaxonomy::from_serialized_value(&value);
         Ok(Self {
             answer: wire.answer,
             answer_kind: wire.answer_kind,
@@ -152,13 +147,8 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
         D: serde::Deserializer<'de>,
     {
         let wire = RetrieveResponseWire::deserialize(deserializer)?;
-        let text_taxonomy = match wire.text_taxonomy.clone() {
-            Some(taxonomy) => taxonomy,
-            None => {
-                let value = serde_json::to_value(&wire).map_err(serde::de::Error::custom)?;
-                ResponseTextTaxonomy::from_serialized_value(&value)
-            }
-        };
+        let value = serde_json::to_value(&wire).map_err(serde::de::Error::custom)?;
+        let text_taxonomy = ResponseTextTaxonomy::from_serialized_value(&value);
         Ok(Self {
             task_id: wire.task_id,
             query: wire.query,
@@ -211,13 +201,8 @@ impl<'de> Deserialize<'de> for EvidenceResponse {
         D: serde::Deserializer<'de>,
     {
         let response = EvidenceResponseWire::deserialize(deserializer)?;
-        let text_taxonomy = match response.text_taxonomy.clone() {
-            Some(taxonomy) => taxonomy,
-            None => {
-                let value = serde_json::to_value(&response).map_err(serde::de::Error::custom)?;
-                ResponseTextTaxonomy::from_serialized_value(&value)
-            }
-        };
+        let value = serde_json::to_value(&response).map_err(serde::de::Error::custom)?;
+        let text_taxonomy = ResponseTextTaxonomy::from_serialized_value(&value);
 
         Ok(Self {
             id: response.id,
