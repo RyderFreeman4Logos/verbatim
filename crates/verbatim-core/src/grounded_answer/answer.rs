@@ -109,17 +109,20 @@ impl AnswerDraft {
 
     /// True when every claim cites only allowed evidence unit ids.
     pub fn cites_only_allowed(&self, plan: &AnswerPlan) -> bool {
-        let allowed: std::collections::BTreeSet<&str> = plan
-            .allowed_evidence_unit_ids
+        self.claims
             .iter()
-            .map(String::as_str)
-            .collect();
-        self.claims.iter().all(|c| {
-            c.cited_evidence_unit_ids
-                .iter()
-                .all(|id| allowed.contains(id.as_str()))
-        })
+            .all(|claim| evidence_ids_only_allowed(plan, &claim.cited_evidence_unit_ids))
     }
+}
+
+/// Shared allowlist predicate for drafts and constrained evidence selection.
+pub(super) fn evidence_ids_only_allowed(plan: &AnswerPlan, ids: &[String]) -> bool {
+    let allowed: std::collections::BTreeSet<&str> = plan
+        .allowed_evidence_unit_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    ids.iter().all(|id| allowed.contains(id.as_str()))
 }
 
 /// One publishable factual claim with resolvable evidence.
