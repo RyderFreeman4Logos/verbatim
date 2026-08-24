@@ -20,6 +20,7 @@ use crate::types::{
 };
 
 mod resolve_report_artifact;
+pub use resolve_report_artifact::ReportArtifactManifest;
 
 const HARD_MAX_COMMUNITIES: usize = 256;
 const HARD_MAX_REPORT_CLAIMS: usize = 24;
@@ -96,15 +97,6 @@ impl CommunityReport {
         Ok(hex_sha256(&serde_json::to_vec(&payload)?))
     }
 }
-/// Reconstructed manifest for a derived GraphRAG report artifact.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReportArtifactManifest {
-    pub id: ReportArtifactId,
-    pub generation: String,
-    pub content_hash: String,
-    pub report: CommunityReport,
-}
-
 /// Ranked community report hit for a broad corpus-level query.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlobalSearchHit {

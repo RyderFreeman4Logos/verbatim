@@ -29,6 +29,10 @@ fn resolve_report_artifact_reconstructs_existing_report_and_returns_none_when_mi
     assert_eq!(manifest.report, report);
     assert_eq!(manifest.generation, report.generation);
     assert_eq!(manifest.content_hash, report.content_hash);
+    assert_eq!(
+        manifest.derived_kind,
+        crate::wire_schemas::DerivedArtifactKind::GraphReport
+    );
     // The hash verifies against recomputation over the payload.
     assert_eq!(
         manifest.report.recompute_content_hash().unwrap(),
