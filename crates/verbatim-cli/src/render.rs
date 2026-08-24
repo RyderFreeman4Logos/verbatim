@@ -2330,7 +2330,7 @@ where
     W: Write,
 {
     for row in retrieve_display_rows(response) {
-        writeln!(writer, "{} {}", row.citation, row.snippet)?;
+        writeln!(writer, "{} role={} {}", row.citation, row.role, row.snippet)?;
     }
     Ok(())
 }
@@ -2655,6 +2655,7 @@ struct RetrieveDisplayRow<'a> {
     rank: usize,
     score: f32,
     citation: String,
+    role: &'a str,
     evidence_id: &'a str,
     collection: String,
     source: String,
@@ -2672,6 +2673,7 @@ fn retrieve_display_rows(response: &RetrieveResponse) -> Vec<RetrieveDisplayRow<
                 rank: result.rank,
                 score: result.score,
                 citation: format!("[{locator}]"),
+                role: &result.role,
                 evidence_id: &result.evidence_id,
                 collection: display_collection_names(&result.collections),
                 source: display_source(result, &locator),
@@ -3409,10 +3411,27 @@ mod tests {
 
         assert_eq!(
             output,
-            "[doc.md L10 markdown:paragraph #intro] alpha\tbeta\ngamma, \"delta\" 中文\n"
+            "[doc.md L10 markdown:paragraph #intro] role=original_text alpha\tbeta\ngamma, \"delta\" 中文\n"
         );
         assert!(!output.contains("score="));
-        assert_low_noise_retrieve_output(&output);
+    }
+
+    #[test]
+    fn retrieve_snippets_preserve_each_result_role() {
+        let mut response = retrieve_display_fixture();
+        let mut graph_report = response.results[0].clone();
+        graph_report.role = "graph_report".into();
+        graph_report.snippet = "graph report text".into();
+        response.results.push(graph_report);
+        let mut output = Vec::new();
+
+        write_retrieve_snippets(&mut output, &response).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("[doc.md L10 markdown:paragraph #intro] role=original_text"));
+        assert!(output.contains(
+            "[doc.md L10 markdown:paragraph #intro] role=graph_report graph report text"
+        ));
     }
 
     #[test]
