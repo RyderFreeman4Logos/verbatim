@@ -95,6 +95,40 @@ fn resolve_report_artifact_persists_manifest_by_generation_and_content_hash() {
 }
 
 #[test]
+fn remove_source_deletes_its_persisted_report_artifact() {
+    let store = Store::in_memory().unwrap();
+    let source = source("src");
+    let config = enabled_config();
+    insert_chunk(&store, &source, "chunk-a", "Climate evidence.");
+    store
+        .upsert_graph_nodes(std::slice::from_ref(&generated_claim(
+            &source.id,
+            "Climate reports discuss rainfall trends.",
+            "Climate",
+            "Rainfall",
+            "chunk-a:1-1",
+        )))
+        .unwrap();
+    let service = GraphRagService::new(&store, &config);
+    let report = service.community_reports(None).unwrap().pop().unwrap();
+    let artifact_id = ReportArtifactId::new(&report.id).unwrap();
+
+    service.resolve_report_artifact(&artifact_id).unwrap();
+    store.remove_source(&source.id).unwrap();
+
+    let rows: u64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM report_artifacts WHERE report_id = ?1",
+            [artifact_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
+    assert_eq!(service.resolve_report_artifact(&artifact_id).unwrap(), None);
+}
+
+#[test]
 fn resolve_source_scoped_report_artifact_when_matching_entities_exist_in_another_source() {
     let store = Store::in_memory().unwrap();
     let source_a = source("source-a");
