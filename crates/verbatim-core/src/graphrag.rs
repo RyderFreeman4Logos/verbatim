@@ -85,16 +85,17 @@ pub struct CommunityReport {
     #[serde(default)]
     pub generation: String,
 }
-
 impl CommunityReport {
     /// Recompute the SHA-256 digest of the report payload.
     pub fn recompute_content_hash(&self) -> Result<String> {
-        let mut report = self.clone();
-        report.content_hash.clear();
-        Ok(hex_sha256(&serde_json::to_vec(&report)?))
+        let mut payload = serde_json::to_value(self)?;
+        payload
+            .as_object_mut()
+            .expect("CommunityReport serializes as an object")
+            .remove("content_hash");
+        Ok(hex_sha256(&serde_json::to_vec(&payload)?))
     }
 }
-
 /// Reconstructed manifest for a derived GraphRAG report artifact.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReportArtifactManifest {

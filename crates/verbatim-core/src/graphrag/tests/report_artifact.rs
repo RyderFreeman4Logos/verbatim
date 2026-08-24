@@ -136,6 +136,12 @@ fn community_report_records_generation_and_content_hash_manifest() {
         report.recompute_content_hash().unwrap(),
         report.content_hash
     );
+    let mut payload = serde_json::to_value(&report).unwrap();
+    payload.as_object_mut().unwrap().remove("content_hash");
+    assert_eq!(
+        hex_sha256(&serde_json::to_vec(&payload).unwrap()),
+        report.content_hash
+    );
 
     // Identical graph state ⇒ identical manifest.
     let again = service.community_reports(None).unwrap().pop().unwrap();
