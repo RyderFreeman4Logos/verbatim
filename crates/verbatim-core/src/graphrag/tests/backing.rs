@@ -29,6 +29,8 @@ fn backing_results_use_best_report_order_and_deduplicate_evidence() {
         summary: id.into(),
         claims: Vec::new(),
         evidence,
+        content_hash: String::new(),
+        generation: String::new(),
     };
     let hits = vec![
         GlobalSearchHit {

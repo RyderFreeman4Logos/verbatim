@@ -80,6 +80,28 @@ pub struct CommunityReport {
     pub summary: String,
     pub claims: Vec<CommunityReportClaim>,
     pub evidence: Vec<CommunityReportEvidence>,
+    #[serde(default)]
+    pub content_hash: String,
+    #[serde(default)]
+    pub generation: String,
+}
+
+impl CommunityReport {
+    /// Recompute the SHA-256 digest of the report payload.
+    pub fn recompute_content_hash(&self) -> Result<String> {
+        let mut report = self.clone();
+        report.content_hash.clear();
+        Ok(hex_sha256(&serde_json::to_vec(&report)?))
+    }
+}
+
+/// Reconstructed manifest for a derived GraphRAG report artifact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportArtifactManifest {
+    pub id: ReportArtifactId,
+    pub generation: String,
+    pub content_hash: String,
+    pub report: CommunityReport,
 }
 
 /// Ranked community report hit for a broad corpus-level query.
@@ -244,17 +266,24 @@ pub fn detect_communities(nodes: &[GraphNode], edges: &[GraphEdge]) -> Vec<Graph
         }
     }
 
-    let mut entity_ids_by_label: HashMap<String, Vec<String>> = HashMap::new();
-    for node in generated_nodes
-        .iter()
-        .filter(|node| node.kind == GraphNodeKind::GeneratedEntity)
-    {
-        let key = lookup_key(&node_label(node));
-        if !key.is_empty() {
-            entity_ids_by_label
-                .entry(key)
-                .or_default()
-                .push(node.id.0.clone());
+    let mut node_ids_by_label: HashMap<String, Vec<String>> = HashMap::new();
+    for node in &generated_nodes {
+        let labels = match node.kind {
+            GraphNodeKind::GeneratedEntity => vec![node_label(node)],
+            GraphNodeKind::GeneratedClaim => ["subject", "object"]
+                .into_iter()
+                .filter_map(|field| metadata_string(node.metadata.as_ref(), field))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for label in labels {
+            let key = lookup_key(&label);
+            if !key.is_empty() {
+                node_ids_by_label
+                    .entry(key)
+                    .or_default()
+                    .push(node.id.0.clone());
+            }
         }
     }
 
@@ -267,9 +296,9 @@ pub fn detect_communities(nodes: &[GraphNode], edges: &[GraphEdge]) -> Vec<Graph
                 continue;
             };
             let key = lookup_key(&value);
-            if let Some(entity_ids) = entity_ids_by_label.get(&key) {
-                for entity_id in entity_ids {
-                    union.union(&node.id.0, entity_id);
+            if let Some(node_ids) = node_ids_by_label.get(&key) {
+                for node_id in node_ids {
+                    union.union(&node.id.0, node_id);
                 }
             }
         }
@@ -399,13 +428,17 @@ pub fn build_community_reports(
 
         let title = community_title(community, &nodes_by_id);
         let summary = build_report_summary(&title, &claims, max_chars);
-        reports.push(CommunityReport {
+        let mut report = CommunityReport {
             id: community.id.clone(),
             title,
             summary,
             claims,
             evidence,
-        });
+            content_hash: String::new(),
+            generation: hex_sha256(serde_json::to_string(community)?.as_bytes()),
+        };
+        report.content_hash = report.recompute_content_hash()?;
+        reports.push(report);
     }
 
     reports.sort_by(|left, right| left.id.cmp(&right.id));

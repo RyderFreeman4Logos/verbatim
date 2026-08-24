@@ -5,7 +5,7 @@ impl GraphRagService<'_> {
     pub fn resolve_report_artifact(
         &self,
         id: &ReportArtifactId,
-    ) -> Result<Option<CommunityReport>> {
+    ) -> Result<Option<ReportArtifactManifest>> {
         for source_filter in std::iter::once(None).chain(
             self.store
                 .list_sources()?
@@ -19,7 +19,12 @@ impl GraphRagService<'_> {
                         ReportArtifactId::new(&report.id).is_ok_and(|report_id| report_id == *id)
                     })
             {
-                return Ok(Some(report));
+                return Ok(Some(ReportArtifactManifest {
+                    id: id.clone(),
+                    generation: report.generation.clone(),
+                    content_hash: report.content_hash.clone(),
+                    report,
+                }));
             }
         }
         Ok(None)
