@@ -4295,12 +4295,15 @@ mod tests {
         assert_eq!(text_client.calls.borrow().as_slice(), ["retrieve"]);
 
         assert_eq!(text_stdout, snippets_stdout);
-        assert_eq!(snippets_stdout, "[doc.md L1] compact cited text\n");
+        assert_eq!(
+            snippets_stdout,
+            "[doc.md L1] role=original_text compact cited text\n"
+        );
         assert!(!snippets_stdout.contains("Context pack:"));
         assert!(!snippets_stdout.contains("score="));
         assert!(!snippets_stdout.contains("/tmp/doc.md"));
         assert!(!snippets_stdout.contains("evidence="));
-        assert!(!snippets_stdout.contains("role="));
+        assert!(snippets_stdout.contains("role=original_text"));
         assert!(!snippets_stdout.contains("kind="));
     }
 
