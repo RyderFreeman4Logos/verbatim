@@ -889,14 +889,14 @@ pub struct RetrievalResult {
     pub provenance: RetrievalProvenance,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalOrigin {
     #[default]
     Seed,
     GraphExpansion,
+    GraphReport,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphTraversalDirection {
@@ -1236,6 +1236,7 @@ pub enum RetrievalEvidenceRole {
     OcrText,
     ImageArtifact,
     ImageCaptionGenerated,
+    GraphReport,
     Generated,
 }
 

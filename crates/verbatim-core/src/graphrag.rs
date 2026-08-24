@@ -16,7 +16,7 @@ use crate::store::Store;
 use crate::types::report_artifact::ReportArtifactId;
 use crate::types::{
     hex_sha256, ChunkId, EvidenceId, EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
-    GraphNodeKind, RetrievalProvenance, RetrievalResult, SourceId,
+    GraphNodeKind, RetrievalResult, SourceId,
 };
 
 mod resolve_report_artifact;
@@ -525,11 +525,7 @@ fn backing_results_from_hits(
             results.push(RetrievalResult {
                 chunk_id: chunk.id.clone(),
                 score: hit.score,
-                provenance: RetrievalProvenance::seed(
-                    result_rank,
-                    chunk.id.clone(),
-                    chunk.source_id.clone(),
-                ),
+                provenance: crate::retrieve::graph_report_provenance(result_rank),
                 chunk,
                 evidence_units: vec![evidence],
             });
@@ -1008,8 +1004,7 @@ mod tests {
 
     use crate::store::Store;
     use crate::types::{
-        Chunk, ChunkType, EdgeType, EvidenceKind, RetrievalProvenance, Source, SourceLocator,
-        SourceStatus,
+        Chunk, ChunkType, EdgeType, EvidenceKind, Source, SourceLocator, SourceStatus,
     };
 
     #[path = "backing.rs"]
@@ -1335,7 +1330,11 @@ mod tests {
             score: 1.0,
             chunk: chunk.clone(),
             evidence_units: evidence,
-            provenance: RetrievalProvenance::seed(1, chunk.id.clone(), chunk.source_id.clone()),
+            provenance: crate::types::RetrievalProvenance::seed(
+                1,
+                chunk.id.clone(),
+                chunk.source_id.clone(),
+            ),
         }
     }
 

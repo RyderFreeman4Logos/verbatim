@@ -5,10 +5,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
+mod evidence_roles;
 mod live_caps;
 mod source_bounded;
 mod source_filter;
 mod vector_search_resource;
+
+pub(crate) use evidence_roles::{evidence_debug_role, graph_report_provenance};
 
 use crate::config::{GraphConfig, QdrantConfig, RerankConfig, RetrievalConfig};
 #[cfg(feature = "qdrant")]
@@ -22,14 +25,14 @@ use crate::traits::{
     RerankRequestDiagnostics, Reranker, VectorIndex,
 };
 use crate::types::{
-    Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
-    EvidenceUnit, GraphExpansionStep, GraphNodeId, GraphNodeKind, GraphTraversalDirection, ImageId,
+    Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceUnit,
+    GraphExpansionStep, GraphNodeId, GraphNodeKind, GraphTraversalDirection, ImageId,
     RetrievalDebug, RetrievalDebugEvidencePackMode, RetrievalDenseVectorPath,
-    RetrievalEvidencePackEntry, RetrievalEvidenceRole, RetrievalFusedHit,
-    RetrievalGraphExpansionDebug, RetrievalLocalSpansMs, RetrievalLocatorDebug,
-    RetrievalProvenance, RetrievalRerankCapabilityDebug, RetrievalRerankCapabilityState,
-    RetrievalRerankDebug, RetrievalRerankRequestDebug, RetrievalRerankScore, RetrievalRerankStatus,
-    RetrievalResult, RetrievalStageHit, SourceId, SourceLocator, VectorIndexResidency,
+    RetrievalEvidencePackEntry, RetrievalFusedHit, RetrievalGraphExpansionDebug,
+    RetrievalLocalSpansMs, RetrievalLocatorDebug, RetrievalProvenance,
+    RetrievalRerankCapabilityDebug, RetrievalRerankCapabilityState, RetrievalRerankDebug,
+    RetrievalRerankRequestDebug, RetrievalRerankScore, RetrievalRerankStatus, RetrievalResult,
+    RetrievalStageHit, SourceId, SourceLocator, VectorIndexResidency,
 };
 use source_filter::{
     single_source_filter, source_filter_excludes, source_filter_ingest_hint, source_filter_scope,
@@ -2211,7 +2214,7 @@ fn evidence_pack_debug_with_display_selection(
                 score: result.score,
                 evidence_id: evidence.id.clone(),
                 source_id: evidence.source_id.clone(),
-                role: evidence_debug_role(evidence),
+                role: evidence_debug_role(result.provenance.origin, evidence),
                 kind: evidence.kind,
                 derived_from: evidence.derived_from.clone(),
                 locator: RetrievalLocatorDebug {
@@ -2317,7 +2320,7 @@ fn push_evidence_pack_debug_entry(
         score: result.score,
         evidence_id: evidence.id.clone(),
         source_id: evidence.source_id.clone(),
-        role: evidence_debug_role(evidence),
+        role: evidence_debug_role(result.provenance.origin, evidence),
         kind: evidence.kind,
         derived_from: evidence.derived_from.clone(),
         locator: RetrievalLocatorDebug {
@@ -2453,18 +2456,6 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f32> {
     }
 
     Some(dot / (left_norm.sqrt() * right_norm.sqrt()))
-}
-
-fn evidence_debug_role(evidence: &EvidenceUnit) -> RetrievalEvidenceRole {
-    match evidence.kind {
-        EvidenceKind::Text => RetrievalEvidenceRole::OriginalText,
-        EvidenceKind::Ocr => RetrievalEvidenceRole::OcrText,
-        EvidenceKind::Image => RetrievalEvidenceRole::ImageArtifact,
-        EvidenceKind::Generated if evidence.derived_from.is_some() => {
-            RetrievalEvidenceRole::ImageCaptionGenerated
-        }
-        EvidenceKind::Generated => RetrievalEvidenceRole::Generated,
-    }
 }
 
 fn rrf_fusion(dense: &[(ChunkId, f32)], bm25: &[(ChunkId, f32)], k: usize) -> Vec<(ChunkId, f32)> {
