@@ -1,7 +1,9 @@
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rusqlite::params_from_iter;
+
+use crate::types::report_artifact::is_report_artifact_id;
 
 use super::{
     row_to_chunk_tuple, row_to_evidence_unit, tuple_to_chunk_with_evidence_ids, Chunk, ChunkId,
@@ -62,6 +64,9 @@ impl Store {
         &self,
         ids: &[EvidenceId],
     ) -> Result<HashMap<EvidenceId, Result<EvidenceUnit>>> {
+        if let Some(id) = ids.iter().find(|id| is_report_artifact_id(&id.0)) {
+            bail!("report artifact ids are not evidence: {}", id.0);
+        }
         let mut seen = HashSet::with_capacity(ids.len());
         let ids = ids
             .iter()

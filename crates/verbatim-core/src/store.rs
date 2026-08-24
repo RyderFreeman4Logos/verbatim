@@ -21,6 +21,7 @@ use crate::task::{
     TaskProfile, TaskProgressSnapshot, TaskSpan, TaskStatus, TaskSummary, TASK_SPAN_MAX_PER_TASK,
 };
 use crate::traits::VectorDocument;
+use crate::types::report_artifact::is_report_artifact_id;
 use crate::types::{
     hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
     EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, ImageArtifact,
@@ -1150,6 +1151,9 @@ impl Store {
     }
 
     pub fn get_evidence(&self, id: &EvidenceId) -> Result<Option<EvidenceUnit>> {
+        if is_report_artifact_id(&id.0) {
+            bail!("report artifact ids are not evidence: {}", id.0);
+        }
         let mut stmt = self.conn.prepare(
             "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id FROM evidence_units WHERE id = ?1"
         )?;

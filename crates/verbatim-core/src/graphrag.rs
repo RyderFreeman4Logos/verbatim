@@ -13,10 +13,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::GraphGlobalSearchConfig;
 use crate::store::Store;
+use crate::types::report_artifact::ReportArtifactId;
 use crate::types::{
     hex_sha256, ChunkId, EvidenceId, EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId,
     GraphNodeKind, RetrievalProvenance, RetrievalResult, SourceId,
 };
+
+mod resolve_report_artifact;
 
 const HARD_MAX_COMMUNITIES: usize = 256;
 const HARD_MAX_REPORT_CLAIMS: usize = 24;
@@ -977,6 +980,10 @@ mod tests {
 
     #[path = "backing.rs"]
     mod backing_tests;
+    #[path = "evidence_lookup.rs"]
+    mod evidence_lookup_tests;
+    #[path = "report_artifact.rs"]
+    mod report_artifact_tests;
 
     #[test]
     fn canonicalization_groups_entities_stably() {

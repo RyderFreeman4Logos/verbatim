@@ -44,6 +44,8 @@ fn sanitize_source_stem(stem: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EvidenceId(pub String);
 
+pub mod report_artifact;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ImageId(pub String);
 
