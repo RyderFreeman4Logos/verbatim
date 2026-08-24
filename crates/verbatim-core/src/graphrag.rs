@@ -389,7 +389,6 @@ pub fn build_community_reports(
                 claims.push(claim);
             }
         }
-
         for edge_id in &community.edge_ids {
             let Some(edge) = edges_by_id.get(&edge_id.0) else {
                 continue;
@@ -398,7 +397,6 @@ pub fn build_community_reports(
                 claims.push(claim);
             }
         }
-
         claims.sort_by(|left, right| {
             left.text
                 .cmp(&right.text)
@@ -413,9 +411,19 @@ pub fn build_community_reports(
         if claims.is_empty() {
             continue;
         }
-
         let evidence = collect_claim_evidence(store, &claims, max_evidence)?;
-        if evidence.is_empty() {
+        let backing_evidence_ids = evidence
+            .iter()
+            .map(|backing| &backing.evidence.id)
+            .collect::<BTreeSet<_>>();
+        claims.retain(|claim| {
+            !claim.evidence_ids.is_empty()
+                && claim
+                    .evidence_ids
+                    .iter()
+                    .all(|evidence_id| backing_evidence_ids.contains(evidence_id))
+        });
+        if claims.is_empty() {
             continue;
         }
 

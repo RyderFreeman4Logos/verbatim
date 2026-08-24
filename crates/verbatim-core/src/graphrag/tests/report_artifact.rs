@@ -2,6 +2,50 @@ use super::*;
 use crate::types::report_artifact::ReportArtifactId;
 
 #[test]
+fn report_claims_are_limited_to_resolvable_report_backing_evidence() {
+    let store = Store::in_memory().unwrap();
+    let source = source("src");
+    insert_chunk(&store, &source, "chunk-a", "Alpha evidence.");
+    insert_chunk(&store, &source, "chunk-b", "Beta evidence.");
+    let claims = [
+        generated_claim(
+            &source.id,
+            "Alpha is supported.",
+            "Subject",
+            "Object",
+            "chunk-a:1-1",
+        ),
+        generated_claim(
+            &source.id,
+            "Beta is supported.",
+            "Subject",
+            "Object",
+            "chunk-b:1-1",
+        ),
+    ];
+    let communities = detect_communities(&claims, &[]);
+    let mut config = enabled_config();
+    config.max_evidence_per_report = 1;
+
+    let reports = build_community_reports(&store, &claims, &[], &communities, &config).unwrap();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].claims.len(), 1);
+    let backing_ids = reports[0]
+        .evidence
+        .iter()
+        .map(|backing| &backing.evidence.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(reports[0].claims.iter().all(|claim| {
+        !claim.evidence_ids.is_empty()
+            && claim
+                .evidence_ids
+                .iter()
+                .all(|evidence_id| backing_ids.contains(evidence_id))
+    }));
+}
+
+#[test]
 fn resolve_report_artifact_reconstructs_existing_report_and_returns_none_when_missing() {
     let store = Store::in_memory().unwrap();
     let source = source("src");
