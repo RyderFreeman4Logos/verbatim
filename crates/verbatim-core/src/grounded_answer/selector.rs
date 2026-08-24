@@ -11,7 +11,7 @@ use super::run::WorkflowRun;
 use super::workflow::{fail_closed, WorkflowOutcome};
 use crate::store::Store;
 use crate::types::report_artifact::is_report_artifact_id;
-use crate::types::EvidenceId;
+use crate::types::{EvidenceId, EvidenceKind};
 
 /// Testable boundary for a schema-constrained selector response.
 pub trait EvidenceIdSelector {
@@ -130,13 +130,14 @@ fn validate_selection(
     let evidence = store
         .get_evidence_batch(&ids)
         .map_err(|error| WorkflowError::missing_evidence(error.to_string()))?;
-    if evidence.len() != ids.len()
-        || ids
-            .iter()
-            .any(|id| !matches!(evidence.get(id), Some(Ok(_))))
-    {
+    if evidence.len() != ids.len() || ids.iter().any(|id| {
+        !matches!(
+            evidence.get(id),
+            Some(Ok(evidence)) if matches!(evidence.kind, EvidenceKind::Text | EvidenceKind::Image)
+        )
+    }) {
         return Err(WorkflowError::missing_evidence(
-            "selector chose unknown or unreadable evidence",
+            "selector chose unknown, unreadable, or non-citable evidence",
         ));
     }
     Ok(ids)
@@ -154,6 +155,14 @@ mod tests {
     impl EvidenceIdSelector for StaticEvidenceSelector {
         fn select_evidence_ids(&self, _: &AnswerPlan) -> WorkflowResult<String> {
             Ok(self.0.into())
+        }
+    }
+
+    struct FailingEvidenceSelector;
+
+    impl EvidenceIdSelector for FailingEvidenceSelector {
+        fn select_evidence_ids(&self, _: &AnswerPlan) -> WorkflowResult<String> {
+            Err(WorkflowError::verification_failed("selector timed out"))
         }
     }
 
@@ -202,6 +211,137 @@ mod tests {
             result,
             EvidenceSelectionResult::Terminal(outcome) if outcome.is_abstained()
         ));
+    }
+
+    fn persist_evidence(store: &Store, id: &str, kind: crate::types::EvidenceKind) {
+        let source = crate::types::Source {
+            id: crate::types::SourceId(format!("source-{id}")),
+            path: std::path::PathBuf::from(format!("/tmp/{id}.txt")),
+            hash: format!("source-hash-{id}"),
+            status: crate::types::SourceStatus::Indexed,
+            parser_used: Some("plaintext".into()),
+            last_ingested_at: None,
+        };
+        store.add_source(&source).unwrap();
+        store
+            .bulk_insert_evidence(&[crate::types::EvidenceUnit {
+                id: EvidenceId(id.into()),
+                source_id: source.id,
+                kind,
+                derived_from: None,
+                locator: crate::types::SourceLocator::Document {
+                    path_or_url: source.path.to_string_lossy().into_owned(),
+                    line_start: 1,
+                    line_end: None,
+                },
+                text: "persisted evidence".into(),
+                text_hash: format!("evidence-hash-{id}"),
+                heading_path: Vec::new(),
+                language: None,
+                position: 0,
+            }])
+            .unwrap();
+    }
+
+    #[test]
+    fn allowlisted_non_citable_kinds_abstain() {
+        let (_directory, store) = store();
+        persist_evidence(&store, "eu-ocr", crate::types::EvidenceKind::Ocr);
+        persist_evidence(
+            &store,
+            "eu-generated",
+            crate::types::EvidenceKind::Generated,
+        );
+
+        for (id, response) in [
+            (
+                "eu-ocr",
+                "{\"decision\":\"select\",\"selected_evidence_ids\":[\"eu-ocr\"]}",
+            ),
+            (
+                "eu-generated",
+                "{\"decision\":\"select\",\"selected_evidence_ids\":[\"eu-generated\"]}",
+            ),
+        ] {
+            assert_abstained(
+                select_persisted_evidence(
+                    run(),
+                    &policy(true),
+                    &plan(vec![id.into()]),
+                    &StaticEvidenceSelector(response),
+                    &store,
+                )
+                .unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn allowlisted_persisted_citable_kinds_are_selected() {
+        let (_directory, store) = store();
+        persist_evidence(&store, "eu-text", crate::types::EvidenceKind::Text);
+        persist_evidence(&store, "eu-image", crate::types::EvidenceKind::Image);
+
+        for (id, response) in [
+            (
+                "eu-text",
+                "{\"decision\":\"select\",\"selected_evidence_ids\":[\"eu-text\"]}",
+            ),
+            (
+                "eu-image",
+                "{\"decision\":\"select\",\"selected_evidence_ids\":[\"eu-image\"]}",
+            ),
+        ] {
+            assert_eq!(
+                select_persisted_evidence(
+                    run(),
+                    &policy(true),
+                    &plan(vec![id.into()]),
+                    &StaticEvidenceSelector(response),
+                    &store,
+                )
+                .unwrap(),
+                EvidenceSelectionResult::Selected {
+                    evidence_ids: vec![EvidenceId(id.into())],
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn selector_error_abstains() {
+        let (_directory, store) = store();
+        assert_abstained(
+            select_persisted_evidence(
+                run(),
+                &policy(true),
+                &plan(vec!["eu-text".into()]),
+                &FailingEvidenceSelector,
+                &store,
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn missing_requirements_or_conflicts_abstain() {
+        let (_directory, store) = store();
+        persist_evidence(&store, "eu-text", crate::types::EvidenceKind::Text);
+        for response in [
+            "{\"decision\":\"select\",\"selected_evidence_ids\":[\"eu-text\"],\"missing_requirements\":[\"citation\"]}",
+            "{\"decision\":\"select\",\"selected_evidence_ids\":[\"eu-text\"],\"conflicts\":[\"contradiction\"]}",
+        ] {
+            assert_abstained(
+                select_persisted_evidence(
+                    run(),
+                    &policy(true),
+                    &plan(vec!["eu-text".into()]),
+                    &StaticEvidenceSelector(response),
+                    &store,
+                )
+                .unwrap(),
+            );
+        }
     }
 
     #[test]

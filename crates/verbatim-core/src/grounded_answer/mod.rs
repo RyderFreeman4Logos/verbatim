@@ -6,15 +6,16 @@
 //! [`GroundedAnswer`] or typed abstention. Fail-closed: model/schema/policy
 //! failure never becomes a verified answer. No live model calls, daemon/CLI
 //! wiring, SSE, or filesystem access. The constrained selector is the sole
-//! exception to the Store boundary: it resolves ids but never publishes text.
+//! Store boundary: it validates persisted citable ids but never exposes text.
 //!
 //! Residual: live model integration, policy engine implementation, ADK-Rust
 //! package wiring, benchmarks, streaming, closing #356.
 //! See `docs/architecture/grounded-answer-workflow.md`.
 //!
 //! Layering: reuses [`crate::wire_schemas`] (API-002), [`crate::pagination`]
-//! (API-003), and [`crate::sdk`] operation envelopes (SDK-001). Does **not**
-//! import Store/SQL/filesystem types.
+//! (API-003), and [`crate::sdk`] operation envelopes (SDK-001). Apart from
+//! the selector's private Store validation, it does **not** import SQL or
+//! filesystem types.
 
 mod answer;
 mod citation;
