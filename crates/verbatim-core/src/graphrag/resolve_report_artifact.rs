@@ -6,8 +6,22 @@ impl GraphRagService<'_> {
         &self,
         id: &ReportArtifactId,
     ) -> Result<Option<CommunityReport>> {
-        Ok(self.community_reports(None)?.into_iter().find(|report| {
-            ReportArtifactId::new(&report.id).is_ok_and(|report_id| report_id == *id)
-        }))
+        for source_filter in std::iter::once(None).chain(
+            self.store
+                .list_sources()?
+                .iter()
+                .map(|source| Some(&source.id)),
+        ) {
+            if let Some(report) =
+                self.community_reports(source_filter)?
+                    .into_iter()
+                    .find(|report| {
+                        ReportArtifactId::new(&report.id).is_ok_and(|report_id| report_id == *id)
+                    })
+            {
+                return Ok(Some(report));
+            }
+        }
+        Ok(None)
     }
 }
