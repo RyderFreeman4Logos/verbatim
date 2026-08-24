@@ -4723,6 +4723,13 @@ CREATE INDEX IF NOT EXISTS graph_edges_to_idx
     ON graph_edges(to_node_id);
 CREATE INDEX IF NOT EXISTS graph_edges_type_idx
     ON graph_edges(source_id, edge_type);
+CREATE TABLE IF NOT EXISTS report_artifacts (
+    report_id TEXT NOT NULL,
+    generation TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (report_id, generation, content_hash)
+);
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,

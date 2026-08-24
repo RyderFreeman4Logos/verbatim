@@ -40,6 +40,61 @@ fn resolve_report_artifact_reconstructs_existing_report_and_returns_none_when_mi
 }
 
 #[test]
+fn resolve_report_artifact_persists_manifest_by_generation_and_content_hash() {
+    let store = Store::in_memory().unwrap();
+    let source = source("src");
+    let config = enabled_config();
+    insert_chunk(&store, &source, "chunk-a", "Climate evidence.");
+    store
+        .upsert_graph_nodes(std::slice::from_ref(&generated_claim(
+            &source.id,
+            "Climate reports discuss rainfall trends.",
+            "Climate",
+            "Rainfall",
+            "chunk-a:1-1",
+        )))
+        .unwrap();
+    let service = GraphRagService::new(&store, &config);
+    let report = service.community_reports(None).unwrap().pop().unwrap();
+    let artifact_id = ReportArtifactId::new(&report.id).unwrap();
+
+    let manifest = service
+        .resolve_report_artifact(&artifact_id)
+        .unwrap()
+        .expect("resolved artifact manifest");
+    let (generation, content_hash, payload): (String, String, String) = store
+        .connection()
+        .query_row(
+            "SELECT generation, content_hash, payload_json
+             FROM report_artifacts
+             WHERE report_id = ?1",
+            [artifact_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(generation, manifest.generation);
+    assert_eq!(content_hash, manifest.content_hash);
+    assert_eq!(
+        serde_json::from_str::<CommunityReport>(&payload).unwrap(),
+        manifest.report
+    );
+
+    assert_eq!(
+        service.resolve_report_artifact(&artifact_id).unwrap(),
+        Some(manifest)
+    );
+    let rows: u64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM report_artifacts WHERE report_id = ?1",
+            [artifact_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[test]
 fn resolve_source_scoped_report_artifact_when_matching_entities_exist_in_another_source() {
     let store = Store::in_memory().unwrap();
     let source_a = source("source-a");
