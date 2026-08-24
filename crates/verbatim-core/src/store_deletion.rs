@@ -515,7 +515,7 @@ impl Store {
     /// Unlike an explicit erasure, this deliberately leaves the source id reusable.
     pub fn remove_source_for_housekeeping(&self, id: &SourceId) -> Result<u64> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
+        delete_source_and_report_artifacts_tx(&tx, id)?;
         let generation = bump_all_profile_index_generations(&tx)?;
         tx.commit()?;
         Ok(generation)
@@ -530,7 +530,7 @@ impl Store {
         // Delete first so CASCADE drops this source's live rows; then anti-join
         // purge every content-addressed cache row no remaining live source owns.
         // This catches historical V1 hashes after V2 replace and pre-commit orphans.
-        tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
+        delete_source_and_report_artifacts_tx(&tx, id)?;
         if record_source_tombstone(&mut tx, id, retention_policy, DeletionOutcome::Pending)? {
             let report = initial_deletion_report(retention_policy, DeletionOutcome::Pending);
             self.persist_deletion_report_tx(&mut tx, id, retention_policy, &report)?;
@@ -566,7 +566,7 @@ impl Store {
         self.ensure_write_capacity(SqliteWriteOperation::Ingest)?;
         (|| {
             let tx = self.conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
+            delete_source_and_report_artifacts_tx(&tx, id)?;
             replace_vector_documents_for_profile_tx(&tx, profile_id, vectors)?;
             let generation = bump_all_profile_index_generations(&tx)?;
             tx.commit()?;
@@ -589,7 +589,7 @@ impl Store {
             // Delete first so CASCADE drops this source's live rows; then anti-join
             // purge every content-addressed cache row no remaining live source owns.
             // This catches historical V1 hashes after V2 replace and pre-commit orphans.
-            tx.execute("DELETE FROM sources WHERE id = ?1", params![&id.0])?;
+            delete_source_and_report_artifacts_tx(&tx, id)?;
             if record_source_tombstone(&mut tx, id, retention_policy, qdrant_outcome)? {
                 let report = initial_deletion_report(retention_policy, qdrant_outcome);
                 self.persist_deletion_report_tx(&mut tx, id, retention_policy, &report)?;
@@ -738,6 +738,18 @@ fn initial_deletion_report(
         retention_policy.backup_outcome_at(current_unix_timestamp_secs()),
     );
     report
+}
+
+fn delete_source_and_report_artifacts_tx(
+    transaction: &Transaction<'_>,
+    source_id: &SourceId,
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM report_artifacts WHERE EXISTS (SELECT 1 FROM json_tree(report_artifacts.payload_json) WHERE json_tree.key = 'source_id' AND json_tree.value = ?1)",
+        params![&source_id.0],
+    )?;
+    transaction.execute("DELETE FROM sources WHERE id = ?1", params![&source_id.0])?;
+    Ok(())
 }
 
 /// Purge content-addressed cache rows that no remaining live source references.
