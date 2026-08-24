@@ -12,6 +12,7 @@ use crate::provider::openai_compatible::OpenAiCompatibleChatModel;
 use crate::provider::{
     ChatContentPart, ChatMessage, ChatModel, ChatRequest, ImageUrl, ProviderError,
 };
+use crate::types::report_artifact::is_report_artifact_id;
 use crate::types::{
     CitationRef, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, RetrievalResult,
     SourceLocator,
@@ -835,6 +836,7 @@ fn verifier_source_inputs(
 ) -> Vec<VerifierEvidenceInput> {
     citations
         .iter()
+        .filter(|citation| !is_report_artifact_id(&citation.evidence_id.0))
         .map(|citation| VerifierEvidenceInput {
             id: citation.label.clone(),
             evidence_id: citation.evidence_id.0.clone(),
@@ -1294,6 +1296,7 @@ Rules:
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("generate/tests/report_artifact_tests.rs");
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -1622,25 +1625,6 @@ mod tests {
             }],
             provenance: RetrievalProvenance::seed(1, chunk_id, source_id),
         }]
-    }
-
-    #[test]
-    fn source_pack_includes_all_evidence() {
-        let pack = build_source_pack(&sample_results(), &GenerationContext::default(), false);
-        assert!(pack.text.contains("[E1 | original_text |"));
-        assert!(pack.text.contains("[E2 | original_text |"));
-        assert!(pack.text.contains("original_text:\nFreedom is defined"));
-        assert_eq!(pack.evidence_refs.len(), 2);
-    }
-
-    #[test]
-    fn extract_cited_references() {
-        let pack = build_source_pack(&sample_results(), &GenerationContext::default(), false);
-        let answer = "The concept [E1, E2] is important.";
-        let citations = extract_citations(answer, &pack.evidence_refs);
-        assert_eq!(citations.len(), 2);
-        assert_eq!(citations[0].label, "E1");
-        assert_eq!(citations[1].label, "E2");
     }
 
     #[test]
