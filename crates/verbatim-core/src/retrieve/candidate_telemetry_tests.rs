@@ -79,6 +79,47 @@ async fn scoped_retrieval_keeps_configured_candidate_limits() {
 }
 
 #[tokio::test]
+async fn lexical_source_filter_fails_closed_when_backend_cannot_apply_predicate() {
+    let store = Store::in_memory().unwrap();
+    let wanted = source("src-lexical-wanted");
+    let excluded = source("src-lexical-excluded");
+    store.add_source(&wanted).unwrap();
+    store.add_source(&excluded).unwrap();
+    let wanted_chunk = insert_text_chunk(&store, &wanted, "chunk-lexical-wanted", "alpha wanted");
+    let excluded_chunk =
+        insert_text_chunk(&store, &excluded, "chunk-lexical-excluded", "alpha excluded");
+    let vector_index = StaticVectorIndex::new(Vec::new());
+    let lexical_index = StaticLexicalIndex::new(vec![
+        (excluded_chunk.id, 1.0),
+        (wanted_chunk.id, 0.9),
+    ]);
+    let embed_client = KeywordEmbeddingClient;
+    let config = RetrievalConfig {
+        dense_top_k: 0,
+        bm25_top_k: 1,
+        ..RetrievalConfig::default()
+    };
+    let pipeline = RetrievalPipeline::new(
+        &vector_index,
+        &lexical_index,
+        &store,
+        &embed_client,
+        &config,
+    )
+    .with_embedding_enabled(false);
+
+    let error = pipeline
+        .search_filtered("alpha", Some(&wanted.id))
+        .await
+        .expect_err("unsupported lexical strict filtering must not return partial success");
+
+    assert_eq!(
+        error.downcast_ref::<crate::overfetch::OverfetchError>(),
+        Some(&crate::overfetch::OverfetchError::UnsupportedStrictFilter)
+    );
+}
+
+#[tokio::test]
 async fn source_filter_adaptively_overfetches_local_dense_top_k() {
     let store = Store::in_memory().unwrap();
     let wanted = source("src-wanted");

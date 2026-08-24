@@ -515,12 +515,14 @@ impl<'a> RetrievalPipeline<'a> {
             bm25_returned,
             fused_count,
         ) = self.with_read_permit(|| {
-            let bm25_started = Instant::now();
-            let bm25_results = self.lexical_index.search(query, bm25_top_k)?;
-            let bm25_search_ms = elapsed_ms(bm25_started);
+            let started = Instant::now();
+            let bm25 = self
+                .lexical_index
+                .search_filtered(query, bm25_top_k, source_filter)?;
+            let bm25_search_ms = elapsed_ms(started);
 
             let rrf_started = Instant::now();
-            let mut fused = rrf_fusion(&dense_results, &bm25_results, self.config.rrf_k);
+            let mut fused = rrf_fusion(&dense_results, &bm25, self.config.rrf_k);
             if source_filter.is_some() {
                 let candidate_ids = fused
                     .iter()
@@ -545,13 +547,13 @@ impl<'a> RetrievalPipeline<'a> {
             source_bounded::filter(self.store, &mut fused)?;
             fused.truncate(search_budget.fused_pool_size as usize);
             let rrf_fusion_ms = elapsed_ms(rrf_started);
-            let bm25_returned = bm25_results.len() as u64;
+            let bm25_returned = bm25.len() as u64;
             let fused_count = fused.len() as u64;
 
             let debug_pack_started = Instant::now();
             let bm25_hits = if include_debug {
                 self.stage_debug_hits(
-                    &bm25_results,
+                    &bm25,
                     source_filter,
                     search_budget.debug_output_size as usize,
                 )?
@@ -571,7 +573,7 @@ impl<'a> RetrievalPipeline<'a> {
                 self.fused_debug_hits(
                     &fused,
                     &dense_results,
-                    &bm25_results,
+                    &bm25,
                     search_budget.debug_output_size as usize,
                 )?
             } else {

@@ -1,5 +1,9 @@
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    limits::Limit, params, params_from_iter, types::Value, Connection, OptionalExtension,
+    Transaction,
+};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::store::Store;
@@ -73,15 +77,6 @@ pub struct FtsMaintenanceCounts {
     pub orphan_rows: u64,
 }
 
-impl FtsMaintenanceCounts {
-    fn is_empty_and_aligned(self) -> bool {
-        self.child_rows == 0
-            && self.fts_rows == 0
-            && self.missing_rows == 0
-            && self.orphan_rows == 0
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FtsMaintenanceOutcome {
     pub status: FtsMaintenanceStatus,
@@ -124,7 +119,7 @@ impl<'a> SqliteFtsIndex<'a> {
                     duration: started.elapsed(),
                 })
             }
-            Some(reason) if counts.is_empty_and_aligned() => {
+            Some(reason) if fts_counts_empty_and_aligned(counts) => {
                 mark_fts_current(conn, started, reason)
                     .context("mark empty SQLite FTS index current")
             }
@@ -181,6 +176,8 @@ impl<'a> SqliteFtsIndex<'a> {
         })
     }
 }
+
+include!("sqlite_fts_filter.rs");
 
 impl LexicalIndex for SqliteFtsIndex<'_> {
     fn upsert(&self, document: &LexicalDocument) -> Result<()> {
@@ -256,6 +253,18 @@ impl LexicalIndex for SqliteFtsIndex<'_> {
             .context("execute FTS search")?;
 
         rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    fn search_filtered(
+        &self,
+        query: &str,
+        top_k: usize,
+        source_filter: Option<&HashSet<SourceId>>,
+    ) -> Result<Vec<(ChunkId, f32)>> {
+        let Some(source_filter) = source_filter else {
+            return self.search(query, top_k);
+        };
+        search_filtered_fts(self.store, query, top_k, source_filter)
     }
 
     fn rebuild_from_store(&self, _store: &Store) -> Result<()> {

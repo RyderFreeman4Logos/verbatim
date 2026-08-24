@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +84,23 @@ pub trait LexicalIndex {
     fn delete_source(&self, source_id: &SourceId) -> Result<()>;
     /// Return ranked child chunk IDs for a user query.
     fn search(&self, query: &str, top_k: usize) -> Result<Vec<(ChunkId, f32)>>;
+    /// Return ranked child chunk IDs after applying a strict source filter.
+    ///
+    /// Backends without native source filtering fail closed instead of
+    /// returning an unscoped candidate prefix for post-filtering.
+    fn search_filtered(
+        &self,
+        query: &str,
+        top_k: usize,
+        source_filter: Option<&HashSet<SourceId>>,
+    ) -> Result<Vec<(ChunkId, f32)>> {
+        if top_k == 0 || source_filter.is_none() {
+            return self.search(query, top_k);
+        }
+        Err(anyhow!(
+            crate::overfetch::OverfetchError::UnsupportedStrictFilter
+        ))
+    }
     /// Rebuild the complete lexical index from SQLite's authoritative chunks.
     fn rebuild_from_store(&self, store: &Store) -> Result<()>;
 }
