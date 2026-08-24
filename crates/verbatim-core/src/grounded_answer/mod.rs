@@ -4,16 +4,18 @@
 //! QueryPlan → EvidencePack → ContextPack → AnswerPlan/draft → claim
 //! verification → deterministic citation rendering → published
 //! [`GroundedAnswer`] or typed abstention. Fail-closed: model/schema/policy
-//! failure never becomes a verified answer. No live model calls, Store
-//! access, SSE, or daemon/CLI wiring.
+//! failure never becomes a verified answer. No live model calls, daemon/CLI
+//! wiring, SSE, or filesystem access. The constrained selector is the sole
+//! Store boundary: it validates persisted citable ids but never exposes text.
 //!
 //! Residual: live model integration, policy engine implementation, ADK-Rust
 //! package wiring, benchmarks, streaming, closing #356.
 //! See `docs/architecture/grounded-answer-workflow.md`.
 //!
 //! Layering: reuses [`crate::wire_schemas`] (API-002), [`crate::pagination`]
-//! (API-003), and [`crate::sdk`] operation envelopes (SDK-001). Does **not**
-//! import Store/SQL/filesystem types.
+//! (API-003), and [`crate::sdk`] operation envelopes (SDK-001). Apart from
+//! the selector's private Store validation, it does **not** import SQL or
+//! filesystem types.
 
 mod answer;
 mod citation;
@@ -21,6 +23,7 @@ mod claim;
 mod error;
 mod policy;
 mod run;
+mod selector;
 mod stage;
 mod workflow;
 
@@ -47,6 +50,7 @@ pub use run::{
     WorkflowFinalStatus, WorkflowRun, WorkflowRunFields, WorkflowRunRecord, WorkflowStageRecord,
     WorkflowWarning, WorkflowWarningSeverity, GROUNDED_ANSWER_WORKFLOW_SCHEMA_VERSION,
 };
+pub use selector::{select_persisted_evidence, EvidenceIdSelector, EvidenceSelectionResult};
 pub use stage::WorkflowStage;
 pub use workflow::{
     abstain_outcome, advance_stage, decide_after_verification, fail_closed, try_publish,
