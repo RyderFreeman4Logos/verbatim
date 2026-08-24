@@ -1,5 +1,17 @@
 use super::*;
+use crate::wire_schemas::DerivedArtifactKind;
 use rusqlite::OptionalExtension;
+
+/// Reconstructed manifest for a derived GraphRAG report artifact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportArtifactManifest {
+    pub id: ReportArtifactId,
+    /// Explicitly classifies this report as derived rather than source evidence.
+    pub derived_kind: DerivedArtifactKind,
+    pub generation: String,
+    pub content_hash: String,
+    pub report: CommunityReport,
+}
 
 impl GraphRagService<'_> {
     /// Reconstruct a derived report artifact from the current graph state.
@@ -22,6 +34,7 @@ impl GraphRagService<'_> {
             {
                 let manifest = ReportArtifactManifest {
                     id: id.clone(),
+                    derived_kind: DerivedArtifactKind::GraphReport,
                     generation: report.generation.clone(),
                     content_hash: report.content_hash.clone(),
                     report,
