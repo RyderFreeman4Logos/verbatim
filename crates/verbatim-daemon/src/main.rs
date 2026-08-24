@@ -104,8 +104,8 @@ use verbatim_core::types::{
     CanonicalLocator, CitationRef, EmbeddingCacheStats, EmbeddingProfileId, EvidenceId,
     EvidenceKind, EvidenceUnit, ImageArtifact, ReferenceComponent, RetrievalDebug,
     RetrievalDenseVectorPath, RetrievalEvidencePackEntry, RetrievalEvidenceRole,
-    RetrievalLocalSpansMs, RetrievalRerankStatus, RetrievalResult, Source, SourceId, SourceLocator,
-    SourceStatus,
+    RetrievalLocalSpansMs, RetrievalOrigin, RetrievalProvenance, RetrievalRerankStatus,
+    RetrievalResult, Source, SourceId, SourceLocator, SourceStatus,
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 
@@ -8020,7 +8020,8 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> Result<Retrie
             .unwrap_or_default(),
         chunk_id: group.result.chunk_id.0.clone(),
         kind: evidence_kind_name(first.kind).to_string(),
-        role: retrieval_role_name(retrieval_evidence_role(first)).to_string(),
+        role: retrieval_role_name(retrieval_evidence_role(first, &group.result.provenance))
+            .to_string(),
         score: group.result.score,
         locator,
         structured_locator,
@@ -8215,7 +8216,8 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
                     .unwrap_or_default(),
                 chunk_id: entry.chunk_id.0.clone(),
                 kind: evidence_kind_name(evidence.kind).to_string(),
-                role: retrieval_role_name(retrieval_evidence_role(&evidence)).to_string(),
+                role: retrieval_role_name(retrieval_evidence_role(&evidence, &entry.provenance))
+                    .to_string(),
                 score: entry.score,
                 locator: evidence.locator.to_string(),
                 structured_locator: include_locator.then(|| evidence.locator.clone()),
@@ -8382,11 +8384,19 @@ fn retrieval_role_name(role: RetrievalEvidenceRole) -> &'static str {
         RetrievalEvidenceRole::OcrText => "ocr_text",
         RetrievalEvidenceRole::ImageArtifact => "image_artifact",
         RetrievalEvidenceRole::ImageCaptionGenerated => "image_caption_generated",
+        RetrievalEvidenceRole::GraphReport => "graph_report",
         RetrievalEvidenceRole::Generated => "generated",
     }
 }
 
-fn retrieval_evidence_role(evidence: &EvidenceUnit) -> RetrievalEvidenceRole {
+fn retrieval_evidence_role(
+    evidence: &EvidenceUnit,
+    provenance: &RetrievalProvenance,
+) -> RetrievalEvidenceRole {
+    if provenance.origin == RetrievalOrigin::GraphReport {
+        return RetrievalEvidenceRole::GraphReport;
+    }
+
     match evidence.kind {
         EvidenceKind::Text => RetrievalEvidenceRole::OriginalText,
         EvidenceKind::Ocr => RetrievalEvidenceRole::OcrText,
@@ -9797,6 +9807,8 @@ mod tests {
     mod auth_middleware_daemon_tests;
     #[path = "issue_332_explicit_move_route_tests.rs"]
     mod issue_332_explicit_move_route_tests;
+    #[path = "issue_533_graphrag_retrieve_label_tests.rs"]
+    mod issue_533_graphrag_retrieve_label_tests;
     #[path = "retrieve_sidecar_tests.rs"]
     mod retrieve_sidecar_tests;
     #[path = "source_bounded_output_tests.rs"]
