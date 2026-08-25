@@ -5,11 +5,12 @@ fn verifier_source_inputs_reject_report_artifact_ids() {
         &build_source_pack(&sample_results(), &GenerationContext::default(), false).evidence_refs,
     );
     citations[0].evidence_id = EvidenceId("graphrag://report/community-1".into());
+    citations[0].backing_evidence_id = None;
     assert!(verifier_source_inputs(&citations, &[]).is_empty());
 }
 
 #[test]
-fn graph_report_context_pack_uses_backing_evidence_id() {
+fn graph_report_context_pack_uses_canonical_artifact_id() {
     let mut results = sample_results();
     results[0].provenance.origin = crate::types::RetrievalOrigin::GraphReport;
     results[0].provenance.report_artifact_id = Some(
@@ -20,7 +21,14 @@ fn graph_report_context_pack_uses_backing_evidence_id() {
     let pack = build_source_pack(&results[..1], &GenerationContext::default(), false);
     let citations = extract_citations("Known [E1].", &pack.evidence_refs);
 
-    assert_eq!(citations[0].evidence_id.0, "ev-1");
+    assert_eq!(
+        citations[0].evidence_id.0,
+        "graphrag://report/legacy-community"
+    );
+    assert_eq!(
+        citations[0].backing_evidence_id.as_ref(),
+        Some(&EvidenceId("ev-1".into()))
+    );
     assert_eq!(citations[0].role, RetrievalEvidenceRole::GraphReport);
 }
 

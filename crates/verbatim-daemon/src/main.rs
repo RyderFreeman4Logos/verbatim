@@ -8422,13 +8422,17 @@ fn citation_response_with_collections(
     collection_provenance: &HashMap<String, Vec<CollectionResultProvenance>>,
 ) -> CitationResponse {
     let kind = citation_kind_name(&citation);
+    let evidence_id = citation
+        .backing_evidence_id
+        .clone()
+        .unwrap_or_else(|| citation.evidence_id.clone());
     let collections = collection_provenance
         .get(&citation.source_id.0)
         .cloned()
         .unwrap_or_default();
     CitationResponse {
         label: citation.label,
-        evidence_id: citation.evidence_id.0,
+        evidence_id: evidence_id.0,
         kind: kind.to_string(),
         role: citation.role.as_str().to_string(),
         derived_from: citation.derived_from.map(|id| id.0),

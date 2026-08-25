@@ -1269,6 +1269,9 @@ pub struct RetrievalLocatorDebug {
 pub struct CitationRef {
     pub label: String,
     pub evidence_id: EvidenceId,
+    /// Store-backed identity used when publishing a citation as evidence.
+    #[serde(skip)]
+    pub backing_evidence_id: Option<EvidenceId>,
     pub source_id: SourceId,
     pub kind: EvidenceKind,
     pub role: RetrievalEvidenceRole,

@@ -64,6 +64,7 @@ async fn graphrag_retrieve_results_publish_graph_report_without_relabeling_seed_
         .report_artifact_id
         .as_str()
         .to_owned();
+    let graph_evidence_id = chunk.evidence_unit_ids[0].clone();
 
     let state = test_state(config, test_dir.path(), pipeline);
     let Json(response) = retrieve(
@@ -86,7 +87,7 @@ async fn graphrag_retrieve_results_publish_graph_report_without_relabeling_seed_
     let graph_result = response
         .results
         .iter()
-        .find(|result| result.evidence_id == report_artifact_id)
+        .find(|result| result.evidence_id == graph_evidence_id.0)
         .expect("GraphRAG-backed result");
     assert_eq!(graph_result.role, "graph_report");
     assert_eq!(
