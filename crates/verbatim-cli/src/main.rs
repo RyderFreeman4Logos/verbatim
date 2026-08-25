@@ -4018,7 +4018,7 @@ mod tests {
         assert!(!stdout.contains("task-1"));
         assert!(!stdout.contains("/tmp/doc.md"));
         assert!(!stdout.contains("evidence="));
-        assert!(!stdout.contains("role="));
+        assert!(stdout.contains("role=original_text"));
         assert!(!stdout.contains("kind="));
         assert!(!stdout.contains("source_path:"));
         assert!(!stdout.contains("controls:"));
