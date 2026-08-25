@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "report_artifact_evidence_4xx_tests.rs"]
+mod report_artifact_evidence_4xx_tests;
+
 #[test]
 fn compact_retrieve_emits_persisted_source_hash() {
     assert_retrieve_source_hash(false);

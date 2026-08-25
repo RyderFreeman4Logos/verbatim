@@ -8326,7 +8326,13 @@ async fn get_evidence(
         Ok::<_, anyhow::Error>((evidence, source_hash, image_artifact))
     })
     .await
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .map_err(|e| {
+        if verbatim_core::types::report_artifact::is_report_artifact_id(&eid) {
+            err(StatusCode::BAD_REQUEST, e)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    })?;
 
     match evidence {
         Some(eu) => {
