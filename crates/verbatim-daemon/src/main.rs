@@ -8299,6 +8299,12 @@ async fn get_evidence(
     State(state): State<SharedState>,
     Path(eid): Path<String>,
 ) -> Result<Json<EvidenceResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if verbatim_core::types::report_artifact::is_report_artifact_id(&eid) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("report artifact ids are not evidence: {eid}"),
+        ));
+    }
     let eid_clone = eid.clone();
     let (evidence, source_hash, image_artifact) = with_task_store_read(&state, move |store| {
         let evidence = store

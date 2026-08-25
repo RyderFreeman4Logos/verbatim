@@ -60,7 +60,7 @@ const PATH_TASK_EVENTS: &str = "/api/tasks/{id}/events";
 const PATH_TASK_WAIT: &str = "/api/tasks/{id}/wait";
 const PATH_TASK_CANCEL: &str = "/api/tasks/{id}/cancel";
 const PATH_TASK_RESUME: &str = "/api/tasks/{id}/resume";
-const PATH_EVIDENCE_BY_EID: &str = "/api/evidence/{eid}";
+const PATH_EVIDENCE_BY_EID: &str = "/api/evidence/{*eid}";
 
 /// Ordered path templates registered by [`build_router`].
 ///
@@ -251,6 +251,7 @@ mod tests {
         template
             .replace("{id}", "probe-id")
             .replace("{name}", "probe-name")
+            .replace("{*eid}", "probe-eid")
             .replace("{eid}", "probe-eid")
     }
 
