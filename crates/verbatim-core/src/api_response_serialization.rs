@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AnswerKind, AskResponse, AuditReceipt, CitationResponse, CollectionFilterResponse,
-    EvidenceResponse, GeneratedInterpretationResponse, ImageArtifactResponse, ResponseTextTaxonomy,
-    RetrievalDebug, RetrieveControlsResponse, RetrieveResponse, RetrieveResultResponse,
-    RetrieveTimingResponse, SourceLocator,
+    retrieve_envelope, AnswerKind, AskResponse, AuditReceipt, CitationResponse,
+    CollectionFilterResponse, EvidenceResponse, GeneratedInterpretationResponse,
+    ImageArtifactResponse, ResponseTextTaxonomy, RetrievalDebug, RetrieveControlsResponse,
+    RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceLocator,
 };
+use crate::wire_schemas::EvidencePackEnvelope;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AskResponseWire {
@@ -102,6 +103,8 @@ struct RetrieveResponseWire {
     results: Vec<RetrieveResultResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     debug: Option<RetrievalDebug>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence_pack: Option<EvidencePackEnvelope>,
 }
 
 impl Serialize for RetrieveResponse {
@@ -127,6 +130,11 @@ impl Serialize for RetrieveResponse {
             timings: self.timings.clone(),
             results: self.results.clone(),
             debug: self.debug.clone(),
+            evidence_pack: retrieve_envelope::evidence_pack_from_retrieve(
+                &self.query,
+                &self.results,
+            )
+            .map_err(serde::ser::Error::custom)?,
         };
         let mut value = serde_json::to_value(wire).map_err(serde::ser::Error::custom)?;
         let taxonomy = serde_json::to_value(ResponseTextTaxonomy::from_serialized_value(&value))
@@ -147,6 +155,12 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
         D: serde::Deserializer<'de>,
     {
         let wire = RetrieveResponseWire::deserialize(deserializer)?;
+        retrieve_envelope::evidence_pack_from_retrieve(&wire.query, &wire.results)
+            .map_err(serde::de::Error::custom)?;
+        if let Some(pack) = &wire.evidence_pack {
+            retrieve_envelope::bind_evidence_pack_to_retrieve(&wire.query, &wire.results, pack)
+                .map_err(serde::de::Error::custom)?;
+        }
         let value = serde_json::to_value(&wire).map_err(serde::de::Error::custom)?;
         let text_taxonomy = ResponseTextTaxonomy::from_serialized_value(&value);
         Ok(Self {

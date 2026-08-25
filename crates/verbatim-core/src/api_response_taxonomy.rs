@@ -507,6 +507,14 @@ impl ResponseTextTaxonomy {
     }
 }
 
+const RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS: &[&str] = &[
+    "evidence_pack.evidence_unit_ids[]",
+    "evidence_pack.header.identity.artifact_id",
+    "evidence_pack.header.identity.content_hash",
+    "evidence_pack.header.identity.kind",
+    "evidence_pack.query_plan_hash",
+];
+
 fn collect_serialized_string_leaves(
     root: &Value,
     value: &Value,
@@ -515,7 +523,13 @@ fn collect_serialized_string_leaves(
 ) {
     match value {
         Value::Object(object) => {
+            let synthesize_pack = should_synthesize_retrieve_evidence_pack(object);
+            let mut emitted_pack = false;
             for (key, child) in object {
+                if synthesize_pack && !emitted_pack && key.as_str() > "evidence_pack" {
+                    push_retrieve_evidence_pack_identity_fields(path, fields);
+                    emitted_pack = true;
+                }
                 let child_path = if path.is_empty() {
                     key.clone()
                 } else {
@@ -527,6 +541,9 @@ fn collect_serialized_string_leaves(
                     continue;
                 }
                 collect_serialized_string_leaves(root, child, &child_path, fields);
+            }
+            if synthesize_pack && !emitted_pack {
+                push_retrieve_evidence_pack_identity_fields(path, fields);
             }
         }
         Value::Array(values) => {
@@ -546,6 +563,37 @@ fn collect_serialized_string_leaves(
             });
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn should_synthesize_retrieve_evidence_pack(object: &serde_json::Map<String, Value>) -> bool {
+    if object.contains_key("evidence_pack") || object.get("query").and_then(Value::as_str).is_none()
+    {
+        return false;
+    }
+    let Some(results) = object.get("results").and_then(Value::as_array) else {
+        return false;
+    };
+    !results.is_empty()
+        && results.iter().all(|result| {
+            result
+                .get("evidence_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty())
+        })
+}
+
+fn push_retrieve_evidence_pack_identity_fields(path: &str, fields: &mut Vec<TextFieldTaxonomy>) {
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}.")
+    };
+    for field in RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS {
+        fields.push(TextFieldTaxonomy {
+            field: format!("{prefix}{field}"),
+            plane: OutputTextPlane::Metadata,
+        });
     }
 }
 
