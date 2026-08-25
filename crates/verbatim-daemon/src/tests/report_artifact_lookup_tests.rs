@@ -138,6 +138,21 @@ async fn secret_bearing_report_artifact_id_diagnostics_stay_closed() {
     );
 }
 
+#[tokio::test]
+async fn busy_pipeline_returns_service_unavailable() {
+    let test_dir = TestDir::new("report-artifact-pipeline-busy");
+    let config = retrieve_test_config("http://127.0.0.1:9/v1");
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let state = test_state(config, test_dir.path(), pipeline);
+    let pipeline = take_pipeline(&state).expect("take pipeline slot");
+    let app = daemon_router(Arc::clone(&state));
+
+    let response = artifact_route_get(&app, CANONICAL_MISSING).await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    restore_pipeline(&state, pipeline).expect("restore pipeline slot");
+}
+
 fn missing_artifact_app(name: &str) -> Router {
     let (test_dir, store, _persisted) = persisted_output_fixture(name, None);
     drop(store);

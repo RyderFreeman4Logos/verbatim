@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Reserved namespace for derived GraphRAG report artifacts.
 pub const REPORT_ARTIFACT_ID_PREFIX: &str = "graphrag://report/";
@@ -40,9 +40,19 @@ impl fmt::Display for ReportArtifactIdError {
 impl Error for ReportArtifactIdError {}
 
 /// Typed identity for a derived GraphRAG report artifact.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ReportArtifactId(String);
+
+impl<'de> Deserialize<'de> for ReportArtifactId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl ReportArtifactId {
     /// Parse a canonical `graphrag://report/` or legacy `graphrag:report:` id.

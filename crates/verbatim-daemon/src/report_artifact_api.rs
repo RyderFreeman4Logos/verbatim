@@ -23,7 +23,7 @@ pub(super) async fn get_report_artifact(
         GraphRagService::new(pipeline.store(), &graph_config).resolve_report_artifact(&artifact_id)
     })
     .await
-    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    .map_err(pipeline_access_error)?;
     match resolved {
         Some(manifest) => Ok(Json(manifest)),
         None => {
