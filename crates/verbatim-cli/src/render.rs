@@ -2223,11 +2223,12 @@ where
     for row in retrieve_display_rows(response) {
         writeln!(
             writer,
-            "{}. score={} {} id={}",
+            "{}. score={} {} id={} role={}",
             row.rank,
             format_score(row.score),
             row.citation,
-            row.evidence_id
+            row.evidence_id,
+            row.role
         )?;
         write_indented_snippet(writer, row.snippet, "   ")?;
     }
@@ -2364,6 +2365,7 @@ where
             "rank",
             "score",
             "citation",
+            "role",
             "collection",
             "source",
             "locator",
@@ -2378,6 +2380,7 @@ where
                 row.rank.to_string(),
                 format_score(row.score),
                 row.citation,
+                row.role.to_string(),
                 row.collection,
                 row.source,
                 row.locator,
@@ -3386,8 +3389,8 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_compact_markdown_omits_debug_metadata_and_paths() {
-        let response = retrieve_display_fixture();
+    fn retrieve_compact_markdown_preserves_each_result_role() {
+        let response = retrieve_display_fixture_with_graph_report();
         let mut output = Vec::new();
 
         write_retrieve_response(&mut output, &response).unwrap();
@@ -3396,6 +3399,8 @@ mod tests {
         assert!(output.contains(
             "3. score=0.9876 [doc.md L10 markdown:paragraph #intro] id=internal-ev-abc123"
         ));
+        assert!(output.contains("role=original_text"));
+        assert!(output.contains("role=graph_report"));
         assert!(output.contains("   alpha\tbeta"));
         assert!(output.contains("   gamma, \"delta\" 中文"));
         assert_low_noise_retrieve_output(&output);
@@ -3436,7 +3441,7 @@ mod tests {
 
     #[test]
     fn retrieve_tsv_round_trips_special_characters_with_fixed_columns() {
-        let response = retrieve_display_fixture();
+        let response = retrieve_display_fixture_with_graph_report();
         let mut output = Vec::new();
 
         write_retrieve_tsv(&mut output, &response).unwrap();
@@ -3451,27 +3456,30 @@ mod tests {
                 "rank",
                 "score",
                 "citation",
+                "role",
                 "collection",
                 "source",
                 "locator",
                 "snippet"
             ]
         );
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         let record = &records[0];
-        assert_eq!(record.len(), 7);
+        assert_eq!(record.len(), 8);
         assert_eq!(record[0], "3");
         assert_eq!(record[1], "0.9876");
         assert_eq!(record[2], "[doc.md L10 markdown:paragraph #intro]");
-        assert_eq!(record[3], "articles");
-        assert_eq!(record[4], "nested/doc.md");
-        assert_eq!(record[5], "doc.md L10 markdown:paragraph #intro");
-        assert_eq!(record[6], "alpha\tbeta\ngamma, \"delta\" 中文");
+        assert_eq!(record[3], "original_text");
+        assert_eq!(record[4], "articles");
+        assert_eq!(record[5], "nested/doc.md");
+        assert_eq!(record[6], "doc.md L10 markdown:paragraph #intro");
+        assert_eq!(record[7], "alpha\tbeta\ngamma, \"delta\" 中文");
+        assert_eq!(records[1][3], "graph_report");
     }
 
     #[test]
     fn retrieve_csv_round_trips_special_characters_with_fixed_columns() {
-        let response = retrieve_display_fixture();
+        let response = retrieve_display_fixture_with_graph_report();
         let mut output = Vec::new();
 
         write_retrieve_csv(&mut output, &response).unwrap();
@@ -3486,22 +3494,37 @@ mod tests {
                 "rank",
                 "score",
                 "citation",
+                "role",
                 "collection",
                 "source",
                 "locator",
                 "snippet"
             ]
         );
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         let record = &records[0];
-        assert_eq!(record.len(), 7);
+        assert_eq!(record.len(), 8);
         assert_eq!(record[0], "3");
         assert_eq!(record[1], "0.9876");
         assert_eq!(record[2], "[doc.md L10 markdown:paragraph #intro]");
-        assert_eq!(record[3], "articles");
-        assert_eq!(record[4], "nested/doc.md");
-        assert_eq!(record[5], "doc.md L10 markdown:paragraph #intro");
-        assert_eq!(record[6], "alpha\tbeta\ngamma, \"delta\" 中文");
+        assert_eq!(record[3], "original_text");
+        assert_eq!(record[4], "articles");
+        assert_eq!(record[5], "nested/doc.md");
+        assert_eq!(record[6], "doc.md L10 markdown:paragraph #intro");
+        assert_eq!(record[7], "alpha\tbeta\ngamma, \"delta\" 中文");
+        assert_eq!(records[1][3], "graph_report");
+    }
+
+    fn retrieve_display_fixture_with_graph_report() -> RetrieveResponse {
+        let mut response = retrieve_display_fixture();
+        let mut graph_report = response.results[0].clone();
+        graph_report.rank = 4;
+        graph_report.role = "graph_report".into();
+        graph_report.snippet = "graph report text".into();
+        response.results.push(graph_report);
+        response.total_results = 2;
+        response.returned_results = 2;
+        response
     }
 
     fn retrieve_display_fixture() -> RetrieveResponse {
@@ -3585,7 +3608,6 @@ mod tests {
             "timing:",
             "source_path:",
             "evidence=",
-            "role=",
             "kind=",
             "member_updated_at=",
             "task-internal-123",
