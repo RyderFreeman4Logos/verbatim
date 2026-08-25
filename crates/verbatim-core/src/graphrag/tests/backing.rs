@@ -29,8 +29,8 @@ fn backing_results_use_best_report_order_and_deduplicate_evidence() {
         summary: id.into(),
         claims: Vec::new(),
         evidence,
-        content_hash: String::new(),
-        generation: String::new(),
+        content_hash: format!("hash-{id}"),
+        generation: format!("gen-{id}"),
     };
     let hits = vec![
         GlobalSearchHit {
@@ -70,6 +70,21 @@ fn backing_results_use_best_report_order_and_deduplicate_evidence() {
             .unwrap()
             .as_str(),
         "graphrag://report/best"
+    );
+    assert_eq!(
+        results[0].provenance.report_artifact_schema_version,
+        Some(crate::wire_schemas::WIRE_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        results[0].provenance.report_artifact_generation.as_deref(),
+        Some("gen-best")
+    );
+    assert_eq!(
+        results[0]
+            .provenance
+            .report_artifact_content_hash
+            .as_deref(),
+        Some("hash-best")
     );
 }
 

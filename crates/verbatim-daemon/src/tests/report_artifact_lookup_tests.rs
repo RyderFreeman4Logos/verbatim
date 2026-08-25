@@ -78,6 +78,14 @@ async fn present_report_artifact_returns_manifest() {
         )
     });
     assert_eq!(wire["id"], artifact_id.as_str());
+    assert_eq!(
+        wire["schema_version"],
+        serde_json::json!({
+            "major": 1,
+            "minor": 0,
+            "patch": 0
+        })
+    );
     assert_eq!(wire["derived_kind"], "graph_report");
     assert_eq!(wire["report"]["id"], report.id);
     assert_ne_evidence_unit(&body);

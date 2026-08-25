@@ -116,6 +116,16 @@ async fn graphrag_retrieve_results_publish_graph_report_without_relabeling_seed_
         .expect("GraphRAG-backed debug entry");
     assert_eq!(graph_entry["role"], "graph_report");
     assert_eq!(graph_entry["provenance"]["origin"], "graph_report");
+    assert_eq!(
+        graph_entry["provenance"]["report_artifact_schema_version"],
+        serde_json::json!({"major": 1, "minor": 0, "patch": 0})
+    );
+    assert!(graph_entry["provenance"]["report_artifact_generation"]
+        .as_str()
+        .is_some_and(|generation| !generation.is_empty()));
+    assert!(graph_entry["provenance"]["report_artifact_content_hash"]
+        .as_str()
+        .is_some_and(|content_hash| !content_hash.is_empty()));
     let seed_entry = debug_pack
         .iter()
         .find(|entry| entry["source_id"] == distractor_source_id.0)

@@ -1,5 +1,5 @@
 use super::*;
-use crate::wire_schemas::DerivedArtifactKind;
+use crate::wire_schemas::{DerivedArtifactKind, WireSchemaVersion, WIRE_SCHEMA_VERSION};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportArtifactManifest {
     pub id: ReportArtifactId,
+    pub schema_version: WireSchemaVersion,
     /// Explicitly classifies this report as derived rather than source evidence.
     pub derived_kind: DerivedArtifactKind,
     pub generation: String,
@@ -35,6 +36,7 @@ impl GraphRagService<'_> {
             {
                 let manifest = ReportArtifactManifest {
                     id: id.clone(),
+                    schema_version: WIRE_SCHEMA_VERSION,
                     derived_kind: DerivedArtifactKind::GraphReport,
                     generation: report.generation.clone(),
                     content_hash: report.content_hash.clone(),

@@ -919,6 +919,12 @@ pub struct RetrievalProvenance {
     /// Canonical derived-artifact identity for graph-report results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report_artifact_id: Option<report_artifact::ReportArtifactId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_artifact_schema_version: Option<crate::wire_schemas::WireSchemaVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_artifact_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_artifact_content_hash: Option<String>,
     #[serde(default)]
     pub result_rank: usize,
     #[serde(default)]
@@ -938,6 +944,9 @@ impl RetrievalProvenance {
         Self {
             origin: RetrievalOrigin::Seed,
             report_artifact_id: None,
+            report_artifact_schema_version: None,
+            report_artifact_generation: None,
+            report_artifact_content_hash: None,
             result_rank,
             seed_rank: Some(result_rank),
             seed_chunk_id: Some(chunk_id),
@@ -958,6 +967,9 @@ impl RetrievalProvenance {
         Self {
             origin: RetrievalOrigin::GraphExpansion,
             report_artifact_id: None,
+            report_artifact_schema_version: None,
+            report_artifact_generation: None,
+            report_artifact_content_hash: None,
             result_rank,
             seed_rank: Some(seed_rank),
             seed_chunk_id: Some(seed_chunk_id),
@@ -973,6 +985,9 @@ impl Default for RetrievalProvenance {
         Self {
             origin: RetrievalOrigin::Seed,
             report_artifact_id: None,
+            report_artifact_schema_version: None,
+            report_artifact_generation: None,
+            report_artifact_content_hash: None,
             result_rank: 0,
             seed_rank: None,
             seed_chunk_id: None,

@@ -110,6 +110,10 @@ fn resolve_report_artifact_reconstructs_existing_report_and_returns_none_when_mi
         .unwrap()
         .expect("resolved artifact manifest");
     assert_eq!(manifest.id, artifact_id);
+    assert_eq!(
+        manifest.schema_version,
+        crate::wire_schemas::WIRE_SCHEMA_VERSION
+    );
     assert_eq!(manifest.report, report);
     assert_eq!(manifest.generation, report.generation);
     assert_eq!(manifest.content_hash, report.content_hash);
