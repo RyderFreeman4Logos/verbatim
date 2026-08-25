@@ -1,3 +1,4 @@
+use crate::types::report_artifact::ReportArtifactId;
 use crate::types::{EvidenceUnit, RetrievalEvidenceRole, RetrievalOrigin, RetrievalProvenance};
 
 pub(crate) fn evidence_debug_role(
@@ -19,9 +20,13 @@ pub(crate) fn evidence_debug_role(
     }
 }
 
-pub(crate) fn graph_report_provenance(result_rank: usize) -> RetrievalProvenance {
+pub(crate) fn graph_report_provenance(
+    result_rank: usize,
+    report_artifact_id: ReportArtifactId,
+) -> RetrievalProvenance {
     RetrievalProvenance {
         origin: RetrievalOrigin::GraphReport,
+        report_artifact_id: Some(report_artifact_id),
         result_rank,
         seed_rank: None,
         seed_chunk_id: None,

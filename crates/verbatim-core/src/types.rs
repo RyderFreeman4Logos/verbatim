@@ -916,6 +916,9 @@ pub struct GraphExpansionStep {
 pub struct RetrievalProvenance {
     #[serde(default)]
     pub origin: RetrievalOrigin,
+    /// Canonical derived-artifact identity for graph-report results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_artifact_id: Option<report_artifact::ReportArtifactId>,
     #[serde(default)]
     pub result_rank: usize,
     #[serde(default)]
@@ -934,6 +937,7 @@ impl RetrievalProvenance {
     pub fn seed(result_rank: usize, chunk_id: ChunkId, source_id: SourceId) -> Self {
         Self {
             origin: RetrievalOrigin::Seed,
+            report_artifact_id: None,
             result_rank,
             seed_rank: Some(result_rank),
             seed_chunk_id: Some(chunk_id),
@@ -953,6 +957,7 @@ impl RetrievalProvenance {
     ) -> Self {
         Self {
             origin: RetrievalOrigin::GraphExpansion,
+            report_artifact_id: None,
             result_rank,
             seed_rank: Some(seed_rank),
             seed_chunk_id: Some(seed_chunk_id),
@@ -967,6 +972,7 @@ impl Default for RetrievalProvenance {
     fn default() -> Self {
         Self {
             origin: RetrievalOrigin::Seed,
+            report_artifact_id: None,
             result_rank: 0,
             seed_rank: None,
             seed_chunk_id: None,
@@ -1263,6 +1269,9 @@ pub struct RetrievalLocatorDebug {
 pub struct CitationRef {
     pub label: String,
     pub evidence_id: EvidenceId,
+    /// Store-backed identity used only to resolve source evidence for verification.
+    #[serde(skip)]
+    pub backing_evidence_id: Option<EvidenceId>,
     pub source_id: SourceId,
     pub kind: EvidenceKind,
     pub role: RetrievalEvidenceRole,

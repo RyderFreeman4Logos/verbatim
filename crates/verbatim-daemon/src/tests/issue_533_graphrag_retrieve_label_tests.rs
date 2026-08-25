@@ -58,6 +58,12 @@ async fn graphrag_retrieve_results_publish_graph_report_without_relabeling_seed_
         .store()
         .upsert_graph_nodes(std::slice::from_ref(&claim))
         .unwrap();
+    let report_artifact_id = GraphRagService::new(pipeline.store(), &config.graph.global_search)
+        .global_search("What supports zirconium provenance?", None)
+        .unwrap()[0]
+        .report_artifact_id
+        .as_str()
+        .to_owned();
     let graph_evidence_id = chunk.evidence_unit_ids[0].clone();
 
     let state = test_state(config, test_dir.path(), pipeline);
@@ -106,7 +112,7 @@ async fn graphrag_retrieve_results_publish_graph_report_without_relabeling_seed_
         .unwrap_or_else(|| debug["display_evidence_pack"].as_array().unwrap());
     let graph_entry = debug_pack
         .iter()
-        .find(|entry| entry["evidence_id"] == graph_evidence_id.0)
+        .find(|entry| entry["provenance"]["report_artifact_id"] == report_artifact_id)
         .expect("GraphRAG-backed debug entry");
     assert_eq!(graph_entry["role"], "graph_report");
     assert_eq!(graph_entry["provenance"]["origin"], "graph_report");

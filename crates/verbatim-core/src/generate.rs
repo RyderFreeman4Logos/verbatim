@@ -13,11 +13,14 @@ use crate::provider::{
     ChatContentPart, ChatMessage, ChatModel, ChatRequest, ImageUrl, ProviderError,
 };
 use crate::retrieve::evidence_debug_role;
-use crate::types::report_artifact::is_report_artifact_id;
 use crate::types::{
     CitationRef, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, RetrievalEvidenceRole,
     RetrievalResult, SourceLocator,
 };
+
+mod verifier_evidence;
+
+use verifier_evidence::verifier_source_inputs;
 
 pub struct Generator {
     chat_model: Arc<dyn ChatModel>,
@@ -715,6 +718,12 @@ fn build_source_pack(
 
             evidence_refs.push(EvidenceRef {
                 label: eid_label,
+                citation_id: result
+                    .provenance
+                    .report_artifact_id
+                    .as_ref()
+                    .map(|id| EvidenceId(id.as_str().to_owned()))
+                    .unwrap_or_else(|| eu.id.clone()),
                 evidence: eu.clone(),
                 role,
             });
@@ -738,6 +747,7 @@ fn build_source_pack(
 
 struct EvidenceRef {
     label: String,
+    citation_id: EvidenceId,
     evidence: EvidenceUnit,
     role: RetrievalEvidenceRole,
 }
@@ -833,146 +843,6 @@ fn has_fully_resolved_citations(answer: &str, citations: &[CitationRef]) -> bool
                 .iter()
                 .map(|citation| citation.label.clone())
                 .collect::<HashSet<_>>()
-}
-
-fn verifier_source_inputs(
-    citations: &[CitationRef],
-    attachments: &[SourcePackAttachment],
-) -> Vec<VerifierEvidenceInput> {
-    citations
-        .iter()
-        .filter(|citation| !is_report_artifact_id(&citation.evidence_id.0))
-        .map(|citation| VerifierEvidenceInput {
-            id: citation.label.clone(),
-            evidence_id: citation.evidence_id.0.clone(),
-            source_id: citation.source_id.0.clone(),
-            kind: citation_kind_label(citation.kind, citation.derived_from.as_ref()),
-            locator: verifier_locator(&citation.locator),
-            text: citation.text_preview.clone(),
-            provenance: verifier_provenance(citation),
-            visual_support: verifier_visual_support(citation, attachments),
-        })
-        .collect()
-}
-
-fn verifier_provenance(citation: &CitationRef) -> VerifierEvidenceProvenance {
-    let summary = match (citation.kind, citation.derived_from.as_ref()) {
-        (EvidenceKind::Text, _) => "original source text",
-        (EvidenceKind::Ocr, _) => "OCR-derived source text with structured locator",
-        (EvidenceKind::Image, _) => "original image artifact locator",
-        (EvidenceKind::Generated, Some(_)) => {
-            "generated image caption derived from original image artifact"
-        }
-        (EvidenceKind::Generated, None) => "generated derived evidence",
-    };
-
-    VerifierEvidenceProvenance {
-        summary,
-        derived_from: citation.derived_from.as_ref().map(|id| id.0.clone()),
-        derivation_chain: verifier_derivation_chain(citation),
-    }
-}
-
-fn verifier_derivation_chain(citation: &CitationRef) -> Vec<VerifierDerivationStep> {
-    match (citation.kind, citation.derived_from.as_ref()) {
-        (EvidenceKind::Generated, Some(source_image_id)) => vec![
-            VerifierDerivationStep {
-                evidence_id: source_image_id.0.clone(),
-                source_id: citation.source_id.0.clone(),
-                kind: "image_artifact",
-                locator: verifier_locator(&citation.locator),
-                relation: "original_image_artifact",
-            },
-            VerifierDerivationStep {
-                evidence_id: citation.evidence_id.0.clone(),
-                source_id: citation.source_id.0.clone(),
-                kind: "image_caption_generated",
-                locator: verifier_locator(&citation.locator),
-                relation: "generated_caption_from_image",
-            },
-        ],
-        _ => vec![VerifierDerivationStep {
-            evidence_id: citation.evidence_id.0.clone(),
-            source_id: citation.source_id.0.clone(),
-            kind: citation_kind_label(citation.kind, citation.derived_from.as_ref()),
-            locator: verifier_locator(&citation.locator),
-            relation: "source_evidence",
-        }],
-    }
-}
-
-fn verifier_visual_support(
-    citation: &CitationRef,
-    attachments: &[SourcePackAttachment],
-) -> VerifierVisualSupport {
-    let image_evidence_id = citation_image_artifact_evidence_id(citation).cloned();
-    let vision_attachment = match &image_evidence_id {
-        Some(_) if citation_has_attachment(citation, attachments) => "included",
-        Some(_) => "not_included",
-        None => "not_applicable",
-    };
-
-    let (support_level, caution) = match (citation.kind, citation.derived_from.as_ref()) {
-        (EvidenceKind::Text, _) => (
-            "text_only",
-            "Use this source for document text claims, not visual content claims.",
-        ),
-        (EvidenceKind::Ocr, _) => (
-            "ocr_text",
-            "OCR-derived text can support document text claims; consider OCR confidence for weak scans.",
-        ),
-        (EvidenceKind::Image, _) if vision_attachment == "included" => (
-            "image_pixels_available",
-            "The verifier can inspect the cited image payload for visual claims.",
-        ),
-        (EvidenceKind::Image, _) => (
-            "artifact_locator_only",
-            "Image metadata identifies the artifact and location, but does not prove visual content without caption or pixels.",
-        ),
-        (EvidenceKind::Generated, Some(_)) if vision_attachment == "included" => (
-            "caption_plus_pixels",
-            "Generated caption is derived evidence; pixels are also available for visual verification.",
-        ),
-        (EvidenceKind::Generated, Some(_)) => (
-            "caption_only_conservative",
-            "Generated caption is weaker than original text or inspected pixels; revise over-strong visual claims.",
-        ),
-        (EvidenceKind::Generated, None) => (
-            "generated_text",
-            "Generated evidence is not original source text.",
-        ),
-    };
-
-    VerifierVisualSupport {
-        support_level,
-        vision_attachment,
-        image_evidence_id: image_evidence_id.map(|id| id.0),
-        caution,
-    }
-}
-
-fn verifier_locator(locator: &SourceLocator) -> VerifierLocatorInput {
-    VerifierLocatorInput {
-        display: locator.to_string(),
-        structured: locator.clone(),
-    }
-}
-
-fn citation_has_attachment(citation: &CitationRef, attachments: &[SourcePackAttachment]) -> bool {
-    attachments.iter().any(|attachment| {
-        attachment
-            .labels
-            .iter()
-            .any(|label| label == &citation.label)
-    })
-}
-
-fn citation_image_artifact_evidence_id(citation: &CitationRef) -> Option<&EvidenceId> {
-    match citation.kind {
-        EvidenceKind::Image => Some(&citation.evidence_id),
-        EvidenceKind::Generated => citation.derived_from.as_ref(),
-        EvidenceKind::Text | EvidenceKind::Ocr => None,
-    }
 }
 
 impl GenerationContext {
@@ -1175,7 +1045,8 @@ fn extract_citations(answer: &str, evidence_refs: &[EvidenceRef]) -> Vec<Citatio
         if cited_labels.contains(&eref.label) && seen.insert(eref.label.clone()) {
             citations.push(CitationRef {
                 label: eref.label.clone(),
-                evidence_id: eref.evidence.id.clone(),
+                evidence_id: eref.citation_id.clone(),
+                backing_evidence_id: Some(eref.evidence.id.clone()),
                 source_id: eref.evidence.source_id.clone(),
                 kind: eref.evidence.kind,
                 role: eref.role,
@@ -1763,6 +1634,7 @@ mod tests {
         let citations = vec![CitationRef {
             label: "E1".into(),
             evidence_id: EvidenceId("ev-1".into()),
+            backing_evidence_id: None,
             source_id: SourceId("src".into()),
             kind: EvidenceKind::Text,
             role: RetrievalEvidenceRole::OriginalText,

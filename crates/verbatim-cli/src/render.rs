@@ -3406,6 +3406,7 @@ mod tests {
         ));
         assert!(output.contains("role=original_text"));
         assert!(output.contains("role=graph_report"));
+        assert!(output.contains("id=graphrag://report/community-1 role=graph_report"));
         assert!(output.contains("   alpha\tbeta"));
         assert!(output.contains("   gamma, \"delta\" 中文"));
         assert_low_noise_retrieve_output(&output);
@@ -3524,6 +3525,7 @@ mod tests {
         let mut response = retrieve_display_fixture();
         let mut graph_report = response.results[0].clone();
         graph_report.rank = 4;
+        graph_report.evidence_id = "graphrag://report/community-1".into();
         graph_report.role = "graph_report".into();
         graph_report.snippet = "graph report text".into();
         response.results.push(graph_report);

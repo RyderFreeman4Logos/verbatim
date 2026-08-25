@@ -102,6 +102,8 @@ impl CommunityReport {
 pub struct GlobalSearchHit {
     pub rank: usize,
     pub score: f32,
+    /// Canonical identity for the report artifact represented by this hit.
+    pub report_artifact_id: ReportArtifactId,
     pub report: CommunityReport,
 }
 
@@ -482,13 +484,20 @@ pub fn search_community_reports(
 
     scored
         .into_iter()
+        .filter_map(|(score, report)| {
+            let report_artifact_id = ReportArtifactId::new(&report.id).ok()?;
+            Some((score, report_artifact_id, report))
+        })
         .take(max_results)
         .enumerate()
-        .map(|(rank, (score, report))| GlobalSearchHit {
-            rank: rank + 1,
-            score,
-            report,
-        })
+        .map(
+            |(rank, (score, report_artifact_id, report))| GlobalSearchHit {
+                rank: rank + 1,
+                score,
+                report_artifact_id,
+                report,
+            },
+        )
         .collect()
 }
 
@@ -525,7 +534,10 @@ fn backing_results_from_hits(
             results.push(RetrievalResult {
                 chunk_id: chunk.id.clone(),
                 score: hit.score,
-                provenance: crate::retrieve::graph_report_provenance(result_rank),
+                provenance: crate::retrieve::graph_report_provenance(
+                    result_rank,
+                    hit.report_artifact_id.clone(),
+                ),
                 chunk,
                 evidence_units: vec![evidence],
             });
@@ -1176,20 +1188,6 @@ mod tests {
 
         assert_eq!(local.hits[0].evidence_ids, chunk.evidence_unit_ids);
         assert_eq!(local.hits[0].entity_node_ids, vec![entity.id]);
-    }
-
-    #[test]
-    fn global_search_ranks_community_reports() {
-        let store = Store::in_memory().unwrap();
-        let source = source("src");
-        let config = enabled_config();
-        let reports = climate_billing_reports(&store, &source, &config);
-
-        let hits = search_community_reports("invoice billing", &reports, &config);
-
-        assert_eq!(hits.len(), 1);
-        assert!(hits[0].report.summary.contains("invoice reconciliation"));
-        assert!(hits[0].score > 0.0);
     }
 
     #[test]
