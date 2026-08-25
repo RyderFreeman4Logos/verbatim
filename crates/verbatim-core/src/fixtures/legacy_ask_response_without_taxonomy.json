@@ -7,6 +7,7 @@
       "label": "E1",
       "evidence_id": "generated-1",
       "kind": "generated",
+      "role": "generated",
       "derived_from": null,
       "collections": [],
       "locator": "generated",

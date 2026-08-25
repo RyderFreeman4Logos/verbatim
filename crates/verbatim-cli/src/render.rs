@@ -2875,8 +2875,13 @@ where
             .unwrap_or_default();
         writeln!(
             writer,
-            "  [{}] evidence={} kind={} locator={}{}",
-            citation.label, citation.evidence_id, citation.kind, citation.locator, derived
+            "  [{}] evidence={} kind={} role={} locator={}{}",
+            citation.label,
+            citation.evidence_id,
+            citation.kind,
+            citation.role,
+            citation.locator,
+            derived
         )?;
         write_collection_provenance(writer, &citation.collections, "      ")?;
     }

@@ -113,6 +113,7 @@ fn provenance_tuples_fail_closed_and_preserve_metadata_classification() {
             label: "E1".into(),
             evidence_id: "ev-1".into(),
             kind: kind.into(),
+            role: kind.into(),
             derived_from: None,
             collections: Vec::new(),
             locator: "locator".into(),
