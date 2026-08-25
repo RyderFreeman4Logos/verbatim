@@ -114,6 +114,8 @@ mod audit_receipt;
 mod auth_middleware;
 #[path = "deletion_api.rs"]
 mod deletion_api;
+#[path = "report_artifact_api.rs"]
+mod report_artifact_api;
 mod retrieval_scope;
 #[path = "routes.rs"]
 mod routes;
@@ -128,6 +130,7 @@ use deletion_api::{
     delete_source, list_deletion_reports, reconcile_deletions_on_startup,
     start_deletion_reconcile_scheduler, STARTUP_DELETION_RECONCILE_BATCH_SIZE,
 };
+use report_artifact_api::get_report_artifact;
 use retrieval_scope::{
     apply_default_collection_scope, collection_filter_names, collection_freshness_remediation_error,
 };

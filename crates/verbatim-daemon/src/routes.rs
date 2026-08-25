@@ -61,6 +61,7 @@ const PATH_TASK_WAIT: &str = "/api/tasks/{id}/wait";
 const PATH_TASK_CANCEL: &str = "/api/tasks/{id}/cancel";
 const PATH_TASK_RESUME: &str = "/api/tasks/{id}/resume";
 const PATH_EVIDENCE_BY_EID: &str = "/api/evidence/{*eid}";
+const PATH_REPORT_ARTIFACT_BY_ID: &str = "/api/report-artifact/{*id}";
 
 /// Ordered path templates registered by [`build_router`].
 ///
@@ -107,6 +108,7 @@ pub(crate) const ROUTE_PATH_TEMPLATES: &[&str] = &[
     PATH_TASK_CANCEL,
     PATH_TASK_RESUME,
     PATH_EVIDENCE_BY_EID,
+    PATH_REPORT_ARTIFACT_BY_ID,
 ];
 
 /// Number of `.route(...)` registrations installed by [`build_router`].
@@ -195,6 +197,7 @@ pub(crate) fn build_router(state: SharedState) -> Router {
         .route(PATH_TASK_CANCEL, post(super::cancel_task_handler))
         .route(PATH_TASK_RESUME, post(super::resume_task_handler))
         .route(PATH_EVIDENCE_BY_EID, get(super::get_evidence))
+        .route(PATH_REPORT_ARTIFACT_BY_ID, get(super::get_report_artifact))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             super::track_http_activity,
@@ -253,6 +256,7 @@ mod tests {
             .replace("{name}", "probe-name")
             .replace("{*eid}", "probe-eid")
             .replace("{eid}", "probe-eid")
+            .replace("{*id}", "probe-id")
     }
 
     /// Probe with an unused method so a registered path yields 405 while an
@@ -286,8 +290,8 @@ mod tests {
             "registered_route_path_templates must report the same count build_router uses"
         );
         assert_eq!(
-            ROUTE_REGISTRATION_COUNT, 39,
-            "expected 39 daemon route registrations in the first #342 slice"
+            ROUTE_REGISTRATION_COUNT, 40,
+            "expected 40 daemon route registrations after report-artifact lookup"
         );
     }
 
@@ -308,7 +312,7 @@ mod tests {
         );
         assert_eq!(
             registered_route_path_templates().last().copied(),
-            Some(PATH_EVIDENCE_BY_EID)
+            Some(PATH_REPORT_ARTIFACT_BY_ID)
         );
         // Spot-check registrations use the shared path-constant values (same
         // literals build_router passes to `.route(...)`).
@@ -356,6 +360,7 @@ mod tests {
                 PATH_TASK_CANCEL,
                 PATH_TASK_RESUME,
                 PATH_EVIDENCE_BY_EID,
+                PATH_REPORT_ARTIFACT_BY_ID,
             ]
         );
     }
