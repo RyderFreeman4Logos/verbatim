@@ -241,6 +241,7 @@ fn response_taxonomy_paths_resolve_to_serialized_text_leaves() {
             "label": "E1",
             "evidence_id": "ev-1",
             "kind": "text",
+            "role": "original_text",
             "derived_from": "ev-0",
             "collections": [{
                 "collection_id": "col-1",
@@ -261,6 +262,7 @@ fn response_taxonomy_paths_resolve_to_serialized_text_leaves() {
             "label": "E2",
             "evidence_id": "ev-2",
             "kind": "text",
+            "role": "original_text",
             "derived_from": null,
             "collections": [],
             "locator": "paper.md L2",
