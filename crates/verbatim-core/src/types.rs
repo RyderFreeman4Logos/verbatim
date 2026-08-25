@@ -45,6 +45,7 @@ fn sanitize_source_stem(stem: &str) -> String {
 pub struct EvidenceId(pub String);
 
 pub mod report_artifact;
+mod retrieval_provenance;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ImageId(pub String);
@@ -912,7 +913,7 @@ pub struct GraphExpansionStep {
     pub direction: GraphTraversalDirection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetrievalProvenance {
     #[serde(default)]
     pub origin: RetrievalOrigin,

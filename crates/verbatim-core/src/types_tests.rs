@@ -1,6 +1,9 @@
 use super::*;
 use crate::retrieval_telemetry::RetrievalResourceCounters;
 
+#[path = "types_retrieval_provenance_wire_decode.rs"]
+mod retrieval_provenance_wire_decode_tests;
+
 #[test]
 fn mvp_regression_source_ids_include_path_hash_to_avoid_stem_collisions() {
     let tmp = tempfile::tempdir().unwrap();

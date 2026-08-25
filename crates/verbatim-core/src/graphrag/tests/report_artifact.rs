@@ -1,6 +1,9 @@
 use super::*;
 use crate::types::report_artifact::ReportArtifactId;
 
+#[path = "report_artifact_wire_decode.rs"]
+mod report_artifact_wire_decode_tests;
+
 #[test]
 fn global_search_ranks_community_reports_with_artifact_id() {
     let store = Store::in_memory().unwrap();
