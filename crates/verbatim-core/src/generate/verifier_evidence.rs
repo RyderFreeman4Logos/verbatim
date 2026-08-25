@@ -24,7 +24,7 @@ pub(super) fn verifier_source_inputs(
                 locator: verifier_locator(&citation.locator),
                 text: citation.text_preview.clone(),
                 provenance: verifier_provenance(citation, evidence_id),
-                visual_support: verifier_visual_support(citation, attachments),
+                visual_support: verifier_visual_support(citation, evidence_id, attachments),
             })
         })
         .collect()
@@ -84,9 +84,10 @@ fn verifier_derivation_chain(
 
 fn verifier_visual_support(
     citation: &CitationRef,
+    evidence_id: &EvidenceId,
     attachments: &[SourcePackAttachment],
 ) -> VerifierVisualSupport {
-    let image_evidence_id = citation_image_artifact_evidence_id(citation).cloned();
+    let image_evidence_id = citation_image_artifact_evidence_id(citation, evidence_id).cloned();
     let vision_attachment = match &image_evidence_id {
         Some(_) if citation_has_attachment(citation, attachments) => "included",
         Some(_) => "not_included",
@@ -148,9 +149,12 @@ fn citation_has_attachment(citation: &CitationRef, attachments: &[SourcePackAtta
     })
 }
 
-fn citation_image_artifact_evidence_id(citation: &CitationRef) -> Option<&EvidenceId> {
+fn citation_image_artifact_evidence_id<'a>(
+    citation: &'a CitationRef,
+    evidence_id: &'a EvidenceId,
+) -> Option<&'a EvidenceId> {
     match citation.kind {
-        EvidenceKind::Image => Some(&citation.evidence_id),
+        EvidenceKind::Image => Some(evidence_id),
         EvidenceKind::Generated => citation.derived_from.as_ref(),
         EvidenceKind::Text | EvidenceKind::Ocr => None,
     }
