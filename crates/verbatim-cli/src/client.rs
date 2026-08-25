@@ -696,7 +696,7 @@ impl DaemonClient for HttpDaemonClient {
     fn get_evidence(&self, evidence_id: &str) -> CliResult<EvidenceResponse> {
         self.request_json::<EvidenceResponse, ()>(
             Method::GET,
-            &format!("/api/evidence/{evidence_id}"),
+            &format!("/api/evidence/{}", encode_query_component(evidence_id)),
             None,
         )
     }
@@ -950,6 +950,7 @@ mod tests {
     use super::*;
 
     include!("tests/issue_332_client_route_tests.rs");
+    include!("tests/report_artifact_evidence_route_tests.rs");
 
     #[test]
     fn bind_to_base_url_adds_http_scheme() {
