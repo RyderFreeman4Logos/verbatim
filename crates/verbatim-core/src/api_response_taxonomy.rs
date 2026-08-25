@@ -571,13 +571,16 @@ fn should_synthesize_retrieve_evidence_pack(object: &serde_json::Map<String, Val
     {
         return false;
     }
-    object
-        .get("results")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|result| result.get("evidence_id").and_then(Value::as_str))
-        .any(|id| !id.trim().is_empty())
+    let Some(results) = object.get("results").and_then(Value::as_array) else {
+        return false;
+    };
+    !results.is_empty()
+        && results.iter().all(|result| {
+            result
+                .get("evidence_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty())
+        })
 }
 
 fn push_retrieve_evidence_pack_identity_fields(path: &str, fields: &mut Vec<TextFieldTaxonomy>) {

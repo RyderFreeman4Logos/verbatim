@@ -290,3 +290,57 @@ fn live_retrieve_response_mismatched_query_plan_hash_is_rejected() {
     serde_json::from_value::<RetrieveResponse>(encoded)
         .expect_err("evidence pack query_plan_hash must match the adjacent query");
 }
+
+fn mixed_blank_retrieve_response() -> RetrieveResponse {
+    let mut response = sample_retrieve_response("What is cited?", "ev-1");
+    let mut blank = response.results[0].clone();
+    blank.index = 1;
+    blank.rank = 2;
+    blank.label = "E2".into();
+    blank.evidence_id = " ".into();
+    response.results.push(blank);
+    response.total_results = 2;
+    response.returned_results = 2;
+    response
+}
+
+fn encoded_retrieve_without_pack(evidence_ids: &[&str]) -> serde_json::Value {
+    let mut encoded =
+        serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
+    let template = encoded["results"][0].clone();
+    let results = encoded["results"].as_array_mut().unwrap();
+    results.clear();
+    for (index, evidence_id) in evidence_ids.iter().enumerate() {
+        let mut result = template.clone();
+        result["index"] = serde_json::json!(index);
+        result["rank"] = serde_json::json!(index + 1);
+        result["evidence_id"] = serde_json::json!(evidence_id);
+        results.push(result);
+    }
+    encoded.as_object_mut().unwrap().remove("evidence_pack");
+    encoded
+}
+
+#[test]
+fn live_retrieve_response_mixed_blank_evidence_id_serialize_is_rejected() {
+    serde_json::to_value(mixed_blank_retrieve_response())
+        .expect_err("mixed blank results[].evidence_id must fail closed on serialize");
+}
+
+#[test]
+fn live_retrieve_response_mixed_blank_evidence_id_deserialize_is_rejected() {
+    serde_json::from_value::<RetrieveResponse>(encoded_retrieve_without_pack(&["ev-1", " "]))
+        .expect_err("mixed blank results[].evidence_id must fail closed on deserialize");
+}
+
+#[test]
+fn live_retrieve_response_all_blank_evidence_id_serialize_is_rejected() {
+    serde_json::to_value(sample_retrieve_response("What is cited?", " "))
+        .expect_err("all-blank results[].evidence_id must fail closed on serialize");
+}
+
+#[test]
+fn live_retrieve_response_all_blank_evidence_id_deserialize_is_rejected() {
+    serde_json::from_value::<RetrieveResponse>(encoded_retrieve_without_pack(&[" "]))
+        .expect_err("all-blank results[].evidence_id must fail closed on deserialize");
+}

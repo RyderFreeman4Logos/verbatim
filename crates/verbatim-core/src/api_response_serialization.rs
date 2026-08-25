@@ -155,6 +155,8 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
         D: serde::Deserializer<'de>,
     {
         let wire = RetrieveResponseWire::deserialize(deserializer)?;
+        retrieve_envelope::evidence_pack_from_retrieve(&wire.query, &wire.results)
+            .map_err(serde::de::Error::custom)?;
         if let Some(pack) = &wire.evidence_pack {
             retrieve_envelope::bind_evidence_pack_to_retrieve(&wire.query, &wire.results, pack)
                 .map_err(serde::de::Error::custom)?;

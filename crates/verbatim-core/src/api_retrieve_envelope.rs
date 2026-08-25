@@ -51,18 +51,28 @@ pub(super) fn bind_evidence_pack_to_retrieve(
     Ok(())
 }
 
+fn require_non_blank_result_evidence_ids(results: &[RetrieveResultResponse]) -> Result<()> {
+    if results
+        .iter()
+        .any(|result| result.evidence_id.trim().is_empty())
+    {
+        anyhow::bail!("results[].evidence_id must not be blank");
+    }
+    Ok(())
+}
+
 pub(super) fn evidence_pack_from_retrieve(
     query: &str,
     results: &[RetrieveResultResponse],
 ) -> Result<Option<EvidencePackEnvelope>> {
+    require_non_blank_result_evidence_ids(results)?;
+    if results.is_empty() {
+        return Ok(None);
+    }
     let evidence_unit_ids: Vec<String> = results
         .iter()
         .map(|result| result.evidence_id.clone())
-        .filter(|id| !id.trim().is_empty())
         .collect();
-    if evidence_unit_ids.is_empty() {
-        return Ok(None);
-    }
     let plan = query_plan_from_question(query)?;
     EvidencePackEnvelope::new(EvidencePackFields {
         artifact_id: LIVE_RETRIEVE_EVIDENCE_PACK_ID.into(),
