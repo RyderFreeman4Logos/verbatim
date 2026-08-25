@@ -8422,17 +8422,13 @@ fn citation_response_with_collections(
     collection_provenance: &HashMap<String, Vec<CollectionResultProvenance>>,
 ) -> CitationResponse {
     let kind = citation_kind_name(&citation);
-    let evidence_id = citation
-        .backing_evidence_id
-        .clone()
-        .unwrap_or_else(|| citation.evidence_id.clone());
     let collections = collection_provenance
         .get(&citation.source_id.0)
         .cloned()
         .unwrap_or_default();
     CitationResponse {
         label: citation.label,
-        evidence_id: evidence_id.0,
+        evidence_id: citation.evidence_id.0,
         kind: kind.to_string(),
         role: citation.role.as_str().to_string(),
         derived_from: citation.derived_from.map(|id| id.0),
@@ -15495,6 +15491,7 @@ mod tests {
         .global_search("zirconium provenance", None)
         .unwrap();
         assert_eq!(global_hits.len(), 1, "fixture must contain a global report");
+        let report_artifact_id = global_hits[0].report_artifact_id.as_str().to_owned();
         let graph_evidence_id = chunk.evidence_unit_ids[0].clone();
 
         let state = test_state(config, test_dir.path(), pipeline);
@@ -15550,7 +15547,7 @@ mod tests {
             retrieval.final_evidence_pack[0].evidence_id,
             graph_evidence_id
         );
-        assert_eq!(response.citations[0].evidence_id, graph_evidence_id.0);
+        assert_eq!(response.citations[0].evidence_id, report_artifact_id);
         let published_ids = retrieval
             .final_evidence_pack
             .iter()
@@ -15560,12 +15557,6 @@ mod tests {
                     .results
                     .iter()
                     .map(|result| EvidenceId(result.evidence_id.clone())),
-            )
-            .chain(
-                response
-                    .citations
-                    .iter()
-                    .map(|citation| EvidenceId(citation.evidence_id.clone())),
             )
             .collect::<Vec<_>>();
         let pipeline = state.pipeline.lock().unwrap();
@@ -15589,7 +15580,7 @@ mod tests {
         let verifier_payload = serde_json::to_string(&chat_payloads[1]).unwrap();
         assert!(source_pack_payload.contains("SOURCE PACK"));
         assert!(source_pack_payload.contains("authoritative stored passage"));
-        assert!(verifier_payload.contains(&response.citations[0].evidence_id));
+        assert!(verifier_payload.contains(&graph_evidence_id.0));
         assert!(!source_pack_payload.contains("graphrag:"));
         assert!(!verifier_payload.contains("graphrag:"));
         assert!(!source_pack_payload.contains(graph_report_prose));

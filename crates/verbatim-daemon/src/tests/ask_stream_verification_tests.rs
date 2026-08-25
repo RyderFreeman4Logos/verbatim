@@ -71,6 +71,48 @@ fn event_data<'a>(body: &'a str, event: &str) -> Vec<&'a str> {
         .collect()
 }
 
+fn report_citation() -> CitationRef {
+    CitationRef {
+        label: "E1".into(),
+        evidence_id: EvidenceId("graphrag://report/community-1".into()),
+        backing_evidence_id: Some(EvidenceId("ev-1".into())),
+        source_id: SourceId("src-1".into()),
+        kind: EvidenceKind::Text,
+        role: RetrievalEvidenceRole::GraphReport,
+        derived_from: None,
+        locator: SourceLocator::Document {
+            path_or_url: "report.md".into(),
+            line_start: 1,
+            line_end: Some(1),
+        },
+        text_preview: "Report claim".into(),
+    }
+}
+
+#[test]
+fn sync_ask_citation_publishes_report_artifact_identity() {
+    let response = citation_response_with_collections(report_citation(), &HashMap::new());
+
+    assert_eq!(response.evidence_id, "graphrag://report/community-1");
+}
+
+#[test]
+fn sse_citation_event_publishes_report_artifact_identity() {
+    let event = AskCitationEvent {
+        citations: vec![citation_response_with_collections(
+            report_citation(),
+            &HashMap::new(),
+        )],
+        verified: true,
+    };
+    let encoded = serde_json::to_value(event).unwrap();
+
+    assert_eq!(
+        encoded["citations"][0]["evidence_id"],
+        "graphrag://report/community-1"
+    );
+}
+
 #[tokio::test]
 async fn ask_stream_with_verifier_publishes_only_one_generated_interpretation_answer() {
     let raw_draft = "The safe answer is alpha [E1].";
