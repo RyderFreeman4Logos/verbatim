@@ -587,6 +587,8 @@ mod response_taxonomy;
 pub use response_taxonomy::{OutputTextPlane, ResponseTextTaxonomy, TextFieldTaxonomy};
 #[path = "api_response_serialization.rs"]
 mod response_serialization;
+#[path = "api_retrieve_envelope.rs"]
+mod retrieve_envelope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -608,40 +610,24 @@ pub struct AskResponse {
     pub collection_filter: Option<CollectionFilterResponse>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrieveRequest {
     pub question: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
-    #[serde(default, skip_serializing_if = "CollectionFilterRequest::is_empty")]
     pub collection_filter: CollectionFilterRequest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_profile_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<usize>,
-    #[serde(default)]
     pub fast: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dense_top_k: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bm25_top_k: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank_top_n: Option<usize>,
-    #[serde(default)]
     pub bypass_cache: bool,
-    #[serde(default)]
     pub include_debug: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub include_debug_packs: bool,
-    #[serde(default)]
     pub include_locator: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
     pub passage: bool,
 }
 
@@ -1220,3 +1206,7 @@ mod api_locator_tests;
 #[cfg(test)]
 #[path = "api_response_taxonomy_tests.rs"]
 mod api_response_taxonomy_tests;
+
+#[cfg(test)]
+#[path = "api_retrieve_envelope_wire_tests.rs"]
+mod api_retrieve_envelope_wire_tests;
