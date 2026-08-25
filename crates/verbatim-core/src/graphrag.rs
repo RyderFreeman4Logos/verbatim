@@ -537,6 +537,8 @@ fn backing_results_from_hits(
                 provenance: crate::retrieve::graph_report_provenance(
                     result_rank,
                     hit.report_artifact_id.clone(),
+                    &hit.report.generation,
+                    &hit.report.content_hash,
                 ),
                 chunk,
                 evidence_units: vec![evidence],

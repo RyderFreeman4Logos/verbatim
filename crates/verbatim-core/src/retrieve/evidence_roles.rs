@@ -23,10 +23,15 @@ pub(crate) fn evidence_debug_role(
 pub(crate) fn graph_report_provenance(
     result_rank: usize,
     report_artifact_id: ReportArtifactId,
+    generation: &str,
+    content_hash: &str,
 ) -> RetrievalProvenance {
     RetrievalProvenance {
         origin: RetrievalOrigin::GraphReport,
         report_artifact_id: Some(report_artifact_id),
+        report_artifact_schema_version: Some(crate::wire_schemas::WIRE_SCHEMA_VERSION),
+        report_artifact_generation: Some(generation.to_owned()),
+        report_artifact_content_hash: Some(content_hash.to_owned()),
         result_rank,
         seed_rank: None,
         seed_chunk_id: None,

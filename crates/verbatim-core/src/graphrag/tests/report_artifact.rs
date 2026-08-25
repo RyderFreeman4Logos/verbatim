@@ -1,6 +1,9 @@
 use super::*;
 use crate::types::report_artifact::ReportArtifactId;
 
+#[path = "report_artifact_wire_decode.rs"]
+mod report_artifact_wire_decode_tests;
+
 #[test]
 fn global_search_ranks_community_reports_with_artifact_id() {
     let store = Store::in_memory().unwrap();
@@ -110,6 +113,10 @@ fn resolve_report_artifact_reconstructs_existing_report_and_returns_none_when_mi
         .unwrap()
         .expect("resolved artifact manifest");
     assert_eq!(manifest.id, artifact_id);
+    assert_eq!(
+        manifest.schema_version,
+        crate::wire_schemas::WIRE_SCHEMA_VERSION
+    );
     assert_eq!(manifest.report, report);
     assert_eq!(manifest.generation, report.generation);
     assert_eq!(manifest.content_hash, report.content_hash);
@@ -156,9 +163,9 @@ fn report_artifact_json_deserialization_uses_parse_boundary() {
         .unwrap();
     let mut wire = serde_json::to_value(manifest).unwrap();
 
-    wire["id"] = serde_json::json!("graphrag:report:community-test");
+    wire["id"] = serde_json::json!(format!("graphrag:report:{}", report.id));
     let normalized: ReportArtifactManifest = serde_json::from_value(wire.clone()).unwrap();
-    assert_eq!(normalized.id.as_str(), "graphrag://report/community-test");
+    assert_eq!(normalized.id.as_str(), artifact_id.as_str());
 
     wire["id"] = serde_json::json!("not-an-artifact-id");
     assert!(serde_json::from_value::<ReportArtifactManifest>(wire).is_err());

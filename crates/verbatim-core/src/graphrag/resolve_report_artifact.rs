@@ -1,17 +1,83 @@
 use super::*;
-use crate::wire_schemas::DerivedArtifactKind;
+use crate::wire_schemas::{
+    CanonicalIdentity, CanonicalIdentityFields, DerivedArtifactKind, WireArtifactKind,
+    WireSchemaVersion, WIRE_SCHEMA_VERSION,
+};
+use anyhow::bail;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 /// Reconstructed manifest for a derived GraphRAG report artifact.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReportArtifactManifest {
     pub id: ReportArtifactId,
+    pub schema_version: WireSchemaVersion,
     /// Explicitly classifies this report as derived rather than source evidence.
     pub derived_kind: DerivedArtifactKind,
     pub generation: String,
     pub content_hash: String,
     pub report: CommunityReport,
+}
+
+#[derive(Deserialize)]
+struct ReportArtifactManifestRaw {
+    id: ReportArtifactId,
+    schema_version: WireSchemaVersion,
+    derived_kind: DerivedArtifactKind,
+    generation: String,
+    content_hash: String,
+    report: CommunityReport,
+}
+
+impl ReportArtifactManifest {
+    pub fn validate(&self) -> Result<()> {
+        if self.generation.trim().is_empty() {
+            bail!("generation must not be empty");
+        }
+        CanonicalIdentity::new(CanonicalIdentityFields {
+            kind: WireArtifactKind::DerivedArtifact,
+            schema_version: self.schema_version,
+            artifact_id: self.id.as_str().to_string(),
+            content_hash: self.content_hash.clone(),
+        })?;
+        if self.derived_kind != DerivedArtifactKind::GraphReport {
+            bail!("derived_kind must be graph_report");
+        }
+        let expected_id = ReportArtifactId::new(&self.report.id)?;
+        if self.id != expected_id {
+            bail!("artifact id does not match embedded report");
+        }
+        if self.generation != self.report.generation {
+            bail!("generation does not match embedded report");
+        }
+        if self.content_hash != self.report.content_hash {
+            bail!("content hash does not match embedded report");
+        }
+        let recomputed = self.report.recompute_content_hash()?;
+        if self.content_hash != recomputed {
+            bail!("content hash does not match recomputed report hash");
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReportArtifactManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = ReportArtifactManifestRaw::deserialize(deserializer)?;
+        let value = Self {
+            id: raw.id,
+            schema_version: raw.schema_version,
+            derived_kind: raw.derived_kind,
+            generation: raw.generation,
+            content_hash: raw.content_hash,
+            report: raw.report,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
 }
 
 impl GraphRagService<'_> {
@@ -35,6 +101,7 @@ impl GraphRagService<'_> {
             {
                 let manifest = ReportArtifactManifest {
                     id: id.clone(),
+                    schema_version: WIRE_SCHEMA_VERSION,
                     derived_kind: DerivedArtifactKind::GraphReport,
                     generation: report.generation.clone(),
                     content_hash: report.content_hash.clone(),

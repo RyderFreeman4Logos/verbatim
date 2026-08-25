@@ -6,6 +6,8 @@ fn graph_report_and_seed_results() -> Vec<RetrievalResult> {
     graph.provenance = crate::retrieve::graph_report_provenance(
         1,
         crate::types::report_artifact::ReportArtifactId::new("community-1").unwrap(),
+        "gen-1",
+        "hash-1",
     );
     seed.evidence_units.remove(0);
     seed.chunk_id = ChunkId("c2".into());
