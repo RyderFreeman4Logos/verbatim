@@ -161,7 +161,8 @@ pub(super) fn endpoint_required_role(method: &Method, path: &str) -> Option<Role
             if path.starts_with("/api/sources/")
                 || path.starts_with("/api/collections/")
                 || path.starts_with("/api/tasks")
-                || path.starts_with("/api/evidence/") =>
+                || path.starts_with("/api/evidence/")
+                || path.starts_with("/api/report-artifact/") =>
         {
             Some(Role::Reader)
         }

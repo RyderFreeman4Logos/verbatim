@@ -88,6 +88,43 @@ fn resolve_report_artifact_reconstructs_existing_report_and_returns_none_when_mi
 }
 
 #[test]
+fn report_artifact_json_deserialization_uses_parse_boundary() {
+    let legacy: ReportArtifactId =
+        serde_json::from_str(r#""graphrag:report:community-test""#).unwrap();
+    assert_eq!(legacy.as_str(), "graphrag://report/community-test");
+    assert!(serde_json::from_str::<ReportArtifactId>(r#""not-an-artifact-id""#).is_err());
+
+    let store = Store::in_memory().unwrap();
+    let source = source("src");
+    let config = enabled_config();
+    insert_chunk(&store, &source, "chunk-a", "Climate evidence.");
+    store
+        .upsert_graph_nodes(std::slice::from_ref(&generated_claim(
+            &source.id,
+            "Climate reports discuss rainfall trends.",
+            "Climate",
+            "Rainfall",
+            "chunk-a:1-1",
+        )))
+        .unwrap();
+    let service = GraphRagService::new(&store, &config);
+    let report = service.community_reports(None).unwrap().pop().unwrap();
+    let artifact_id = ReportArtifactId::new(&report.id).unwrap();
+    let manifest = service
+        .resolve_report_artifact(&artifact_id)
+        .unwrap()
+        .unwrap();
+    let mut wire = serde_json::to_value(manifest).unwrap();
+
+    wire["id"] = serde_json::json!("graphrag:report:community-test");
+    let normalized: ReportArtifactManifest = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(normalized.id.as_str(), "graphrag://report/community-test");
+
+    wire["id"] = serde_json::json!("not-an-artifact-id");
+    assert!(serde_json::from_value::<ReportArtifactManifest>(wire).is_err());
+}
+
+#[test]
 fn resolve_report_artifact_persists_manifest_by_generation_and_content_hash() {
     let store = Store::in_memory().unwrap();
     let source = source("src");

@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Reserved namespace for derived GraphRAG report artifacts.
 pub const REPORT_ARTIFACT_ID_PREFIX: &str = "graphrag://report/";
@@ -44,7 +44,29 @@ impl Error for ReportArtifactIdError {}
 #[serde(transparent)]
 pub struct ReportArtifactId(String);
 
+impl<'de> Deserialize<'de> for ReportArtifactId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl ReportArtifactId {
+    /// Parse a canonical `graphrag://report/` or legacy `graphrag:report:` id.
+    pub fn parse(value: &str) -> Result<Self, ReportArtifactIdError> {
+        if !is_report_artifact_id(value) {
+            return Err(ReportArtifactIdError::new(value));
+        }
+        let community_id = value
+            .strip_prefix(REPORT_ARTIFACT_ID_PREFIX)
+            .or_else(|| value.strip_prefix("graphrag:report:"))
+            .unwrap_or(value);
+        Self::new(community_id)
+    }
+
     /// Build the canonical artifact id for `community_id`.
     pub fn new(community_id: &str) -> Result<Self, ReportArtifactIdError> {
         let community_id = community_id.trim();

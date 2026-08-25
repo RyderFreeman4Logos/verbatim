@@ -1,9 +1,10 @@
 use super::*;
 use crate::wire_schemas::DerivedArtifactKind;
 use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
 
 /// Reconstructed manifest for a derived GraphRAG report artifact.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportArtifactManifest {
     pub id: ReportArtifactId,
     /// Explicitly classifies this report as derived rather than source evidence.

@@ -21,6 +21,7 @@ use verbatim_core::api::{
 };
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
+use verbatim_core::graphrag::ReportArtifactManifest;
 
 #[cfg(test)]
 use crate::auth::HTTP_ERROR_TRUNCATION_MARKER;
@@ -76,6 +77,16 @@ impl From<std::io::Error> for CliError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
+}
+
+pub fn write_report_artifact<W: Write>(
+    writer: &mut W,
+    artifact: &ReportArtifactManifest,
+) -> CliResult<()> {
+    serde_json::to_writer_pretty(&mut *writer, artifact)
+        .map_err(|error| CliError::Api(error.to_string()))?;
+    writeln!(writer)?;
+    Ok(())
 }
 
 pub trait DaemonClient {
@@ -155,6 +166,12 @@ pub trait DaemonClient {
         W: Write;
     fn retrieve(&self, request: &RetrieveRequest) -> CliResult<RetrieveResponse>;
     fn get_evidence(&self, evidence_id: &str) -> CliResult<EvidenceResponse>;
+    fn get_report_artifact(&self, artifact_id: &str) -> CliResult<ReportArtifactManifest> {
+        let _ = artifact_id;
+        Err(CliError::Api(
+            "report-artifact lookup is not implemented".into(),
+        ))
+    }
     fn get_config(&self) -> CliResult<ConfigResponse>;
     fn health(&self) -> CliResult<HealthResponse>;
 }
@@ -701,6 +718,17 @@ impl DaemonClient for HttpDaemonClient {
         )
     }
 
+    fn get_report_artifact(&self, artifact_id: &str) -> CliResult<ReportArtifactManifest> {
+        self.request_json::<ReportArtifactManifest, ()>(
+            Method::GET,
+            &format!(
+                "/api/report-artifact/{}",
+                encode_query_component(artifact_id)
+            ),
+            None,
+        )
+    }
+
     fn get_config(&self) -> CliResult<ConfigResponse> {
         self.request_json::<ConfigResponse, ()>(Method::GET, "/api/config", None)
     }
@@ -951,6 +979,7 @@ mod tests {
 
     include!("tests/issue_332_client_route_tests.rs");
     include!("tests/report_artifact_evidence_route_tests.rs");
+    include!("tests/report_artifact_lookup_route_tests.rs");
 
     #[test]
     fn bind_to_base_url_adds_http_scheme() {

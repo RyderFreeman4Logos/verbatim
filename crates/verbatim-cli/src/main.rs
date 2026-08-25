@@ -20,6 +20,8 @@ mod auth;
 mod client;
 mod local;
 mod render;
+mod report_artifact_cli;
+mod resolve_cli;
 mod retrieve_help;
 mod source_cli;
 mod sse;
@@ -453,7 +455,7 @@ where
             Ok(0)
         }
         Commands::Resolve { reference, format } => {
-            run_resolve(&reference, format, stdout)?;
+            resolve_cli::run_resolve(&reference, format, stdout)?;
             Ok(0)
         }
         Commands::Evidence { eid } => {
@@ -461,70 +463,11 @@ where
             render::write_evidence(stdout, &evidence)?;
             Ok(0)
         }
+        Commands::ReportArtifact { id } => report_artifact_cli::run(&id, stdout, client),
         Commands::Config { command } => run_config(command, stdout, client, local),
         Commands::Daemon { command } => run_daemon(command, stdout, client, local),
         Commands::Task { command } => run_task(command, stdout, client, local),
     }
-}
-
-/// Run the `resolve` command: parse a canonical reference and display its
-/// normalized form.
-fn run_resolve<W>(
-    reference: &str,
-    format: Option<ResolveFormat>,
-    stdout: &mut W,
-) -> Result<(), CliError>
-where
-    W: Write,
-{
-    let registry = verbatim_core::profiles::ProfileRegistry::new();
-    let parsed = registry.try_parse(reference).ok_or_else(|| {
-        CliError::Api(format!(
-            "could not parse \"{reference}\" as a canonical reference"
-        ))
-    })?;
-
-    // Build normalized key from start components
-    let normalized: String = parsed
-        .start
-        .iter()
-        .map(|c| c.value.to_lowercase().replace(' ', ""))
-        .collect::<Vec<_>>()
-        .join(":");
-
-    match format {
-        Some(ResolveFormat::Json) => {
-            let end_display = parsed.end.as_ref().map(|end| {
-                end.iter()
-                    .map(|c| c.value.clone())
-                    .collect::<Vec<_>>()
-                    .join(":")
-            });
-            writeln!(
-                stdout,
-                "{}",
-                serde_json::json!({
-                    "profile": parsed.profile_id,
-                    "raw": parsed.raw,
-                    "display": parsed.display,
-                    "normalized": normalized,
-                    "start": parsed.start.iter().map(|c| serde_json::json!({
-                        "level": c.level,
-                        "value": c.value,
-                        "ordinal": c.ordinal,
-                    })).collect::<Vec<_>>(),
-                    "end": end_display,
-                })
-            )?;
-        }
-        Some(ResolveFormat::Text) | None => {
-            writeln!(stdout, "display:   {}", parsed.display)?;
-            writeln!(stdout, "normalized: {}", normalized)?;
-            writeln!(stdout, "profile:   {}", parsed.profile_id)?;
-        }
-    }
-
-    Ok(())
 }
 
 fn run_collection<W, C>(
@@ -1638,6 +1581,12 @@ enum Commands {
         /// Evidence id.
         #[arg(value_name = "EVIDENCE_ID")]
         eid: String,
+    },
+    /// Inspect one derived GraphRAG report artifact.
+    ReportArtifact {
+        /// Report artifact id.
+        #[arg(value_name = "ARTIFACT_ID")]
+        id: String,
     },
     /// Inspect or update configuration.
     #[command(
