@@ -8421,6 +8421,7 @@ fn citation_response_with_collections(
         label: citation.label,
         evidence_id: citation.evidence_id.0,
         kind: kind.to_string(),
+        role: citation.role.as_str().to_string(),
         derived_from: citation.derived_from.map(|id| id.0),
         collections,
         locator: citation.locator.to_string(),

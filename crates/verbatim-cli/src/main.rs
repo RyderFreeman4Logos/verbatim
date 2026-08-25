@@ -5605,6 +5605,7 @@ mod tests {
             label: "E1".into(),
             evidence_id: "ev-1".into(),
             kind: "original_text".into(),
+            role: "original_text".into(),
             derived_from: None,
             collections: Vec::new(),
             locator: "PDF p.1 para.1".into(),

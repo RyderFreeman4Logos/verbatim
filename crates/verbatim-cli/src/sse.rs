@@ -300,7 +300,7 @@ mod tests {
             "event: token\n",
             "data: {\"text\":\"lo [E1].\"}\n\n",
             "event: citation\n",
-            "data: {\"citations\":[{\"label\":\"E1\",\"evidence_id\":\"ev-1\",\"kind\":\"original_text\",\"derived_from\":null,\"locator\":\"PDF p.1 para.1\",\"text_preview\":\"preview\"}],\"verified\":false}\n\n",
+            "data: {\"citations\":[{\"label\":\"E1\",\"evidence_id\":\"ev-1\",\"kind\":\"original_text\",\"role\":\"original_text\",\"derived_from\":null,\"locator\":\"PDF p.1 para.1\",\"text_preview\":\"preview\"}],\"verified\":false}\n\n",
         );
         let mut stdout = FlushRecorder::default();
 

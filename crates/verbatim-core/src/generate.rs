@@ -12,10 +12,11 @@ use crate::provider::openai_compatible::OpenAiCompatibleChatModel;
 use crate::provider::{
     ChatContentPart, ChatMessage, ChatModel, ChatRequest, ImageUrl, ProviderError,
 };
+use crate::retrieve::evidence_debug_role;
 use crate::types::report_artifact::is_report_artifact_id;
 use crate::types::{
-    CitationRef, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, RetrievalResult,
-    SourceLocator,
+    CitationRef, EvidenceId, EvidenceKind, EvidenceUnit, ImageArtifact, RetrievalEvidenceRole,
+    RetrievalResult, SourceLocator,
 };
 
 pub struct Generator {
@@ -697,6 +698,7 @@ fn build_source_pack(
 
             let eid_label = format!("E{counter}");
             seen_evidence.insert(eu.id.0.clone(), counter);
+            let role = evidence_debug_role(result.provenance.origin, eu);
             let artifact = context.image_artifact_for(eu).cloned();
             let attachment = include_attachments
                 .then(|| context.image_attachment_for(eu).cloned())
@@ -706,6 +708,7 @@ fn build_source_pack(
                 &mut pack,
                 &eid_label,
                 eu,
+                role,
                 artifact.as_ref(),
                 attachment.as_ref(),
             );
@@ -713,6 +716,7 @@ fn build_source_pack(
             evidence_refs.push(EvidenceRef {
                 label: eid_label,
                 evidence: eu.clone(),
+                role,
             });
 
             counter += 1;
@@ -735,6 +739,7 @@ fn build_source_pack(
 struct EvidenceRef {
     label: String,
     evidence: EvidenceUnit,
+    role: RetrievalEvidenceRole,
 }
 
 #[derive(Clone)]
@@ -1062,6 +1067,7 @@ fn push_source_pack_entry(
     pack: &mut String,
     label: &str,
     evidence: &EvidenceUnit,
+    role: RetrievalEvidenceRole,
     artifact: Option<&ImageArtifact>,
     attachment: Option<&ImageAttachment>,
 ) {
@@ -1073,7 +1079,8 @@ fn push_source_pack_entry(
         .unwrap_or_default();
 
     pack.push_str(&format!(
-        "[{label} | {kind} | {locator}{derived}]\n",
+        "[{label} | {role} | {locator}{derived}]\n",
+        role = role.as_str(),
         locator = evidence.locator
     ));
 
@@ -1171,6 +1178,7 @@ fn extract_citations(answer: &str, evidence_refs: &[EvidenceRef]) -> Vec<Citatio
                 evidence_id: eref.evidence.id.clone(),
                 source_id: eref.evidence.source_id.clone(),
                 kind: eref.evidence.kind,
+                role: eref.role,
                 derived_from: eref.evidence.derived_from.clone(),
                 locator: eref.evidence.locator.clone(),
                 text_preview: eref.evidence.text.chars().take(200).collect(),
@@ -1297,6 +1305,7 @@ Rules:
 mod tests {
     use super::*;
     include!("generate/tests/report_artifact_tests.rs");
+    include!("generate/tests/issue_539_ask_citation_role_tests.rs");
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -1756,6 +1765,7 @@ mod tests {
             evidence_id: EvidenceId("ev-1".into()),
             source_id: SourceId("src".into()),
             kind: EvidenceKind::Text,
+            role: RetrievalEvidenceRole::OriginalText,
             derived_from: None,
             locator: SourceLocator::legacy_pdf(42, 3, None),
             text_preview: "Freedom...".into(),

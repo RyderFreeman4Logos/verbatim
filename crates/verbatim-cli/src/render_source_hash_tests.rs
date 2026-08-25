@@ -1,4 +1,29 @@
 #[test]
+fn write_citations_includes_retrieve_role() {
+    let citations = [CitationResponse {
+        label: "E1".into(),
+        evidence_id: "ev-graph".into(),
+        kind: "original_text".into(),
+        role: "graph_report".into(),
+        derived_from: None,
+        collections: Vec::new(),
+        locator: "PDF p.1 para.1".into(),
+        text_preview: "preview".into(),
+    }];
+    let mut output = Vec::new();
+
+    write_citations(&mut output, &citations).unwrap();
+    let output = String::from_utf8(output).unwrap();
+
+    assert!(
+        output.contains(
+            "[E1] evidence=ev-graph kind=original_text role=graph_report locator=PDF p.1 para.1"
+        ),
+        "{output}"
+    );
+}
+
+#[test]
 fn markdown_evidence_lookup_renders_structured_locator_details() {
     let response = EvidenceResponse {
         id: "ev-md".into(),

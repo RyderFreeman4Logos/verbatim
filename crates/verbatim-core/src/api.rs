@@ -736,6 +736,7 @@ pub struct CitationResponse {
     pub label: String,
     pub evidence_id: String,
     pub kind: String,
+    pub role: String,
     pub derived_from: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collections: Vec<CollectionResultProvenance>,
