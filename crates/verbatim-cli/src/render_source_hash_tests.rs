@@ -2,7 +2,7 @@
 fn write_citations_includes_retrieve_role() {
     let citations = [CitationResponse {
         label: "E1".into(),
-        evidence_id: "ev-graph".into(),
+        evidence_id: "graphrag://report/community-1".into(),
         kind: "original_text".into(),
         role: "graph_report".into(),
         derived_from: None,
@@ -17,7 +17,7 @@ fn write_citations_includes_retrieve_role() {
 
     assert!(
         output.contains(
-            "[E1] evidence=ev-graph kind=original_text role=graph_report locator=PDF p.1 para.1"
+            "[E1] evidence=graphrag://report/community-1 kind=original_text role=graph_report locator=PDF p.1 para.1"
         ),
         "{output}"
     );

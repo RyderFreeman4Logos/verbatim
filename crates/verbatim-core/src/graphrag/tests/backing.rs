@@ -36,11 +36,13 @@ fn backing_results_use_best_report_order_and_deduplicate_evidence() {
         GlobalSearchHit {
             rank: 2,
             score: 1.0,
+            report_artifact_id: ReportArtifactId::new("lower").unwrap(),
             report: report("lower", vec![backing(&alpha, &alpha_evidence)]),
         },
         GlobalSearchHit {
             rank: 1,
             score: 4.0,
+            report_artifact_id: ReportArtifactId::new("best").unwrap(),
             report: report(
                 "best",
                 vec![
@@ -60,6 +62,15 @@ fn backing_results_use_best_report_order_and_deduplicate_evidence() {
     assert_eq!(results[1].score, 4.0);
     assert_eq!(results[0].provenance.result_rank, 1);
     assert_eq!(results[1].provenance.result_rank, 2);
+    assert_eq!(
+        results[0]
+            .provenance
+            .report_artifact_id
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "graphrag://report/best"
+    );
 }
 
 #[test]

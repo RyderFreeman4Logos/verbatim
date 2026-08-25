@@ -2,6 +2,46 @@ use super::*;
 use crate::types::report_artifact::ReportArtifactId;
 
 #[test]
+fn global_search_ranks_community_reports_with_artifact_id() {
+    let store = Store::in_memory().unwrap();
+    let source = source("src");
+    let config = enabled_config();
+    let reports = climate_billing_reports(&store, &source, &config);
+
+    let hits = search_community_reports("invoice billing", &reports, &config);
+
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].report.summary.contains("invoice reconciliation"));
+    assert!(hits[0].score > 0.0);
+    assert_eq!(
+        hits[0].report_artifact_id.as_str(),
+        format!("graphrag://report/{}", hits[0].report.id)
+    );
+}
+
+#[test]
+fn global_search_hit_normalizes_legacy_report_artifact_id() {
+    let store = Store::in_memory().unwrap();
+    let source = source("src");
+    let config = enabled_config();
+    let reports = climate_billing_reports(&store, &source, &config);
+    let hit = search_community_reports("invoice billing", &reports, &config)
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut value = serde_json::to_value(hit).unwrap();
+    value["report_artifact_id"] =
+        serde_json::Value::String("graphrag:report:legacy-community".into());
+
+    let normalized: GlobalSearchHit = serde_json::from_value(value).unwrap();
+
+    assert_eq!(
+        normalized.report_artifact_id.as_str(),
+        "graphrag://report/legacy-community"
+    );
+}
+
+#[test]
 fn report_claims_are_limited_to_resolvable_report_backing_evidence() {
     let store = Store::in_memory().unwrap();
     let source = source("src");
