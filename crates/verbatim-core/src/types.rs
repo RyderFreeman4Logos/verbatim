@@ -966,14 +966,6 @@ impl RetrievalProvenance {
             graph_path,
         }
     }
-
-    /// Return the report-artifact id for graph reports, or the backing evidence id otherwise.
-    pub fn result_id(&self, evidence_id: &EvidenceId) -> EvidenceId {
-        self.report_artifact_id
-            .as_ref()
-            .map(|id| EvidenceId(id.as_str().to_owned()))
-            .unwrap_or_else(|| evidence_id.clone())
-    }
 }
 
 impl Default for RetrievalProvenance {

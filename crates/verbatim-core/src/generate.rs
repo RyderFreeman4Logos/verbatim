@@ -715,7 +715,6 @@ fn build_source_pack(
 
             evidence_refs.push(EvidenceRef {
                 label: eid_label,
-                evidence_id: result.provenance.result_id(&eu.id),
                 evidence: eu.clone(),
                 role,
             });
@@ -739,7 +738,6 @@ fn build_source_pack(
 
 struct EvidenceRef {
     label: String,
-    evidence_id: EvidenceId,
     evidence: EvidenceUnit,
     role: RetrievalEvidenceRole,
 }
@@ -1177,7 +1175,7 @@ fn extract_citations(answer: &str, evidence_refs: &[EvidenceRef]) -> Vec<Citatio
         if cited_labels.contains(&eref.label) && seen.insert(eref.label.clone()) {
             citations.push(CitationRef {
                 label: eref.label.clone(),
-                evidence_id: eref.evidence_id.clone(),
+                evidence_id: eref.evidence.id.clone(),
                 source_id: eref.evidence.source_id.clone(),
                 kind: eref.evidence.kind,
                 role: eref.role,
