@@ -1,4 +1,4 @@
-use crate::types::{RetrievalProvenance, RetrievalResult};
+use crate::types::{RetrievalOrigin, RetrievalProvenance, RetrievalResult};
 use serde_json::{json, Value};
 
 fn valid_identity_provenance() -> Value {
@@ -87,4 +87,33 @@ fn retrieval_result_decode_rejects_invalid_provenance_leaf() {
     provenance["report_artifact_schema_version"] = json!({"major": 99, "minor": 0, "patch": 0});
     serde_json::from_str::<RetrievalResult>(&enclosing_result(provenance).to_string())
         .expect_err("enclosing RetrievalResult must reject invalid provenance");
+}
+
+#[test]
+fn retrieval_provenance_graph_report_missing_identity_fails() {
+    decode_provenance(&json!({"origin": "graph_report"}))
+        .expect_err("GraphReport must carry complete report identity");
+}
+
+#[test]
+fn retrieval_provenance_seed_must_not_carry_report_identity() {
+    let mut wire = valid_identity_provenance();
+    wire["origin"] = json!("seed");
+    decode_provenance(&wire).expect_err("Seed must not carry report identity");
+}
+
+#[test]
+fn retrieval_provenance_graph_expansion_must_not_carry_report_identity() {
+    let mut wire = valid_identity_provenance();
+    wire["origin"] = json!("graph_expansion");
+    decode_provenance(&wire).expect_err("GraphExpansion must not carry report identity");
+}
+
+#[test]
+fn retrieval_provenance_graph_report_round_trip_decodes() {
+    let decoded = decode_provenance(&valid_identity_provenance()).expect("valid GraphReport");
+    assert_eq!(decoded.origin, RetrievalOrigin::GraphReport);
+    let encoded = serde_json::to_string(&decoded).expect("serialize");
+    let round_trip: RetrievalProvenance = serde_json::from_str(&encoded).expect("round-trip");
+    assert_eq!(decoded, round_trip);
 }

@@ -163,9 +163,9 @@ fn report_artifact_json_deserialization_uses_parse_boundary() {
         .unwrap();
     let mut wire = serde_json::to_value(manifest).unwrap();
 
-    wire["id"] = serde_json::json!("graphrag:report:community-test");
+    wire["id"] = serde_json::json!(format!("graphrag:report:{}", report.id));
     let normalized: ReportArtifactManifest = serde_json::from_value(wire.clone()).unwrap();
-    assert_eq!(normalized.id.as_str(), "graphrag://report/community-test");
+    assert_eq!(normalized.id.as_str(), artifact_id.as_str());
 
     wire["id"] = serde_json::json!("not-an-artifact-id");
     assert!(serde_json::from_value::<ReportArtifactManifest>(wire).is_err());

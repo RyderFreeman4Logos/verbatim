@@ -20,10 +20,19 @@ impl RetrievalProvenance {
                 && self.report_artifact_generation.is_none()
                 && self.report_artifact_content_hash.is_none()
             {
+                if self.origin == RetrievalOrigin::GraphReport {
+                    bail!("graph report provenance must carry complete report identity");
+                }
                 return Ok(());
             }
             bail!("report artifact identity fields must be all present or all absent");
         };
+        if matches!(
+            self.origin,
+            RetrievalOrigin::Seed | RetrievalOrigin::GraphExpansion
+        ) {
+            bail!("seed and graph expansion provenance must not carry report identity");
+        }
         if generation.trim().is_empty() {
             bail!("generation must not be empty");
         }

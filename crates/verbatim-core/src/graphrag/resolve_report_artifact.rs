@@ -40,6 +40,23 @@ impl ReportArtifactManifest {
             artifact_id: self.id.as_str().to_string(),
             content_hash: self.content_hash.clone(),
         })?;
+        if self.derived_kind != DerivedArtifactKind::GraphReport {
+            bail!("derived_kind must be graph_report");
+        }
+        let expected_id = ReportArtifactId::new(&self.report.id)?;
+        if self.id != expected_id {
+            bail!("artifact id does not match embedded report");
+        }
+        if self.generation != self.report.generation {
+            bail!("generation does not match embedded report");
+        }
+        if self.content_hash != self.report.content_hash {
+            bail!("content hash does not match embedded report");
+        }
+        let recomputed = self.report.recompute_content_hash()?;
+        if self.content_hash != recomputed {
+            bail!("content hash does not match recomputed report hash");
+        }
         Ok(())
     }
 }
