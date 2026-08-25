@@ -19,6 +19,38 @@ pub(super) fn query_plan_from_question(question: &str) -> Result<QueryPlanEnvelo
     })
 }
 
+pub(super) fn bind_query_plan_to_question(
+    question: &str,
+    plan: Option<QueryPlanEnvelope>,
+) -> Result<QueryPlanEnvelope> {
+    let expected = query_plan_from_question(question)?;
+    if let Some(plan) = plan {
+        plan.validate()?;
+        if plan.header.identity.content_hash != expected.header.identity.content_hash {
+            anyhow::bail!("query plan identity does not match the executed question");
+        }
+    }
+    Ok(expected)
+}
+
+pub(super) fn bind_evidence_pack_to_retrieve(
+    query: &str,
+    results: &[RetrieveResultResponse],
+    pack: &EvidencePackEnvelope,
+) -> Result<()> {
+    pack.validate()?;
+    let Some(expected) = evidence_pack_from_retrieve(query, results)? else {
+        anyhow::bail!("evidence pack must match returned evidence");
+    };
+    if pack.query_plan_hash != expected.query_plan_hash {
+        anyhow::bail!("evidence pack query_plan_hash does not match the adjacent query");
+    }
+    if pack.evidence_unit_ids != expected.evidence_unit_ids {
+        anyhow::bail!("evidence pack evidence_unit_ids do not match results");
+    }
+    Ok(())
+}
+
 pub(super) fn evidence_pack_from_retrieve(
     query: &str,
     results: &[RetrieveResultResponse],
@@ -118,11 +150,8 @@ impl<'de> Deserialize<'de> for RetrieveRequest {
         D: serde::Deserializer<'de>,
     {
         let wire = RetrieveRequestWire::deserialize(deserializer)?;
-        if let Some(plan) = wire.query_plan {
-            plan.validate().map_err(serde::de::Error::custom)?;
-        } else {
-            query_plan_from_question(&wire.question).map_err(serde::de::Error::custom)?;
-        }
+        bind_query_plan_to_question(&wire.question, wire.query_plan)
+            .map_err(serde::de::Error::custom)?;
         Ok(Self {
             question: wire.question,
             source_id: wire.source_id,

@@ -156,7 +156,8 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
     {
         let wire = RetrieveResponseWire::deserialize(deserializer)?;
         if let Some(pack) = &wire.evidence_pack {
-            pack.validate().map_err(serde::de::Error::custom)?;
+            retrieve_envelope::bind_evidence_pack_to_retrieve(&wire.query, &wire.results, pack)
+                .map_err(serde::de::Error::custom)?;
         }
         let value = serde_json::to_value(&wire).map_err(serde::de::Error::custom)?;
         let text_taxonomy = ResponseTextTaxonomy::from_serialized_value(&value);

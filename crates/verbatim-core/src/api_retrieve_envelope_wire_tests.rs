@@ -89,7 +89,7 @@ fn sample_retrieve_response(query: &str, evidence_id: &str) -> RetrieveResponse 
 
 #[test]
 fn live_retrieve_request_valid_query_plan_envelope_round_trips() {
-    let plan = sample_query_plan();
+    let plan = live_question_plan("What is cited?");
     let request: RetrieveRequest = serde_json::from_value(serde_json::json!({
         "question": plan.query_text,
         "query_plan": plan,
@@ -218,4 +218,75 @@ fn live_retrieve_response_incomplete_identity_is_rejected() {
     encoded["evidence_pack"] = pack_json;
     serde_json::from_value::<RetrieveResponse>(encoded)
         .expect_err("incomplete evidence pack identity must fail closed");
+}
+
+#[test]
+fn live_retrieve_request_mismatched_question_vs_envelope_is_rejected() {
+    let plan = sample_query_plan();
+    serde_json::from_value::<RetrieveRequest>(serde_json::json!({
+        "question": "A different question",
+        "query_plan": plan,
+    }))
+    .expect_err("request envelope must match the executed question");
+}
+
+#[test]
+fn live_retrieve_request_noncanonical_plan_hash_is_rejected() {
+    let plan = sample_query_plan();
+    assert_eq!(plan.query_text, "What is cited?");
+    assert!(!plan.steps.is_empty());
+    serde_json::from_value::<RetrieveRequest>(serde_json::json!({
+        "question": plan.query_text,
+        "query_plan": plan,
+    }))
+    .expect_err("request plan hash must match the effective question plan");
+}
+
+fn live_question_plan(question: &str) -> QueryPlanEnvelope {
+    QueryPlanEnvelope::new(QueryPlanFields {
+        artifact_id: "live-retrieve".into(),
+        query_text: question.into(),
+        steps: Vec::new(),
+        generation: None,
+        profile_ref: None,
+    })
+    .unwrap()
+}
+
+#[test]
+fn live_retrieve_response_mismatched_evidence_ids_are_rejected() {
+    let mut encoded =
+        serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
+    let plan = live_question_plan("What is cited?");
+    let pack = EvidencePackEnvelope::new(crate::wire_schemas::EvidencePackFields {
+        artifact_id: "ep-live-retrieve".into(),
+        evidence_unit_ids: vec!["ev-other".into()],
+        query_plan_hash: plan.header.identity.content_hash.as_str().into(),
+        generation: None,
+        profile_ref: None,
+    })
+    .unwrap();
+    pack.validate().unwrap();
+    encoded["evidence_pack"] = serde_json::to_value(pack).unwrap();
+    serde_json::from_value::<RetrieveResponse>(encoded)
+        .expect_err("evidence pack ids must match results[].evidence_id");
+}
+
+#[test]
+fn live_retrieve_response_mismatched_query_plan_hash_is_rejected() {
+    let mut encoded =
+        serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
+    let other = live_question_plan("A different question");
+    let pack = EvidencePackEnvelope::new(crate::wire_schemas::EvidencePackFields {
+        artifact_id: "ep-live-retrieve".into(),
+        evidence_unit_ids: vec!["ev-1".into()],
+        query_plan_hash: other.header.identity.content_hash.as_str().into(),
+        generation: None,
+        profile_ref: None,
+    })
+    .unwrap();
+    pack.validate().unwrap();
+    encoded["evidence_pack"] = serde_json::to_value(pack).unwrap();
+    serde_json::from_value::<RetrieveResponse>(encoded)
+        .expect_err("evidence pack query_plan_hash must match the adjacent query");
 }
