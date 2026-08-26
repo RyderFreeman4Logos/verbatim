@@ -512,6 +512,7 @@ const RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS: &[&str] = &[
     "evidence_pack.header.identity.artifact_id",
     "evidence_pack.header.identity.content_hash",
     "evidence_pack.header.identity.kind",
+    "evidence_pack.header.profile_ref",
     "evidence_pack.query_plan_hash",
 ];
 
@@ -520,6 +521,7 @@ const ASK_CONTEXT_PACK_IDENTITY_FIELDS: &[&str] = &[
     "context_pack.header.identity.artifact_id",
     "context_pack.header.identity.content_hash",
     "context_pack.header.identity.kind",
+    "context_pack.header.profile_ref",
     "context_pack.selected_unit_ids[]",
 ];
 
