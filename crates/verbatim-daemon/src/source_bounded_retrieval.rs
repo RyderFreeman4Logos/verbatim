@@ -4,24 +4,28 @@ use anyhow::Result;
 use verbatim_core::api::RetrieveResponse;
 use verbatim_core::retrieve::refresh_evidence_pack_debug;
 use verbatim_core::store::Store;
-use verbatim_core::types::{ChunkId, EvidenceKind, RetrievalDebug, RetrievalResult};
+use verbatim_core::types::{
+    ChunkId, EmbeddingProfileId, EvidenceKind, RetrievalDebug, RetrievalResult,
+};
 
 pub(super) fn filter_generated_retrieval_evidence(
     store: &Store,
+    embedding_profile_id: &EmbeddingProfileId,
     results: &mut Vec<RetrievalResult>,
     mut debug: Option<&mut RetrievalDebug>,
     include_debug: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let has_debug_identities = include_debug
         && debug
             .as_ref()
             .is_some_and(|debug| retrieval_debug_has_chunk_identities(debug));
     if results.is_empty() && !has_debug_identities {
-        return Ok(());
+        return Ok(None);
     }
 
-    let source_bounded_chunk_ids = source_bounded_retrieval_chunk_ids(
+    let (source_bounded_chunk_ids, generation) = source_bounded_retrieval_chunk_ids(
         store,
+        embedding_profile_id,
         results,
         if has_debug_identities {
             debug.as_deref()
@@ -63,7 +67,7 @@ pub(super) fn filter_generated_retrieval_evidence(
             );
         }
     }
-    Ok(())
+    Ok(generation)
 }
 
 fn retrieval_debug_has_chunk_identities(debug: &RetrievalDebug) -> bool {
@@ -76,9 +80,10 @@ fn retrieval_debug_has_chunk_identities(debug: &RetrievalDebug) -> bool {
 
 fn source_bounded_retrieval_chunk_ids(
     store: &Store,
+    embedding_profile_id: &EmbeddingProfileId,
     results: &[RetrievalResult],
     debug: Option<&RetrievalDebug>,
-) -> Result<HashSet<ChunkId>> {
+) -> Result<(HashSet<ChunkId>, Option<String>)> {
     let mut candidate_ids = HashSet::new();
     for result in results {
         candidate_ids.insert(result.chunk_id.clone());
@@ -110,7 +115,8 @@ fn source_bounded_retrieval_chunk_ids(
         .filter_map(|chunk| chunk.as_ref().ok())
         .flat_map(|chunk| chunk.evidence_unit_ids.iter().cloned())
         .collect::<Vec<_>>();
-    let evidence = store.get_evidence_batch(&evidence_ids)?;
+    let (evidence, generation) =
+        store.get_evidence_batch_with_index_generation(&evidence_ids, embedding_profile_id)?;
     let mut source_bounded_chunk_ids = HashSet::new();
     for (chunk_id, chunk) in chunks {
         let Ok(chunk) = chunk else {
@@ -130,7 +136,7 @@ fn source_bounded_retrieval_chunk_ids(
             source_bounded_chunk_ids.insert(chunk_id);
         }
     }
-    Ok(source_bounded_chunk_ids)
+    Ok((source_bounded_chunk_ids, generation))
 }
 
 fn filter_retrieval_debug_chunk_identities(
@@ -203,12 +209,13 @@ fn filter_retrieval_debug_chunk_identities(
 pub(super) fn executed_retrieve_for_generated_ask(
     question: &str,
     embedding_profile_id: impl Into<String>,
+    generation: Option<String>,
     results: &[RetrievalResult],
 ) -> RetrieveResponse {
     RetrieveResponse::from_executed_ask_units(
         question,
         embedding_profile_id,
-        None,
+        generation,
         results.iter().flat_map(|result| {
             result
                 .evidence_units

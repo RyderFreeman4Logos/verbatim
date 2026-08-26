@@ -1,5 +1,7 @@
 use super::*;
-use crate::source_bounded_retrieval::filter_generated_retrieval_evidence;
+use crate::source_bounded_retrieval::{
+    executed_retrieve_for_generated_ask, filter_generated_retrieval_evidence,
+};
 use verbatim_core::traits::LexicalIndex;
 
 pub(super) fn persist_legacy_caption(
@@ -89,7 +91,13 @@ fn source_bounded_retrieval_batches_evidence_eligibility_queries() {
         let mut results = all_results[..candidate_count].to_vec();
         let mut debug = empty_retrieval_debug();
         let (filtered, count) = store.count_sql_statements(|| {
-            filter_generated_retrieval_evidence(&store, &mut results, Some(&mut debug), false)
+            filter_generated_retrieval_evidence(
+                &store,
+                &EmbeddingProfileId::default_profile(),
+                &mut results,
+                Some(&mut debug),
+                false,
+            )
         });
         filtered.unwrap();
         assert_eq!(results.len(), candidate_count);
@@ -149,8 +157,14 @@ fn source_bounded_retrieval_fails_closed_per_invalid_persisted_evidence() {
         })
         .collect();
 
-    filter_generated_retrieval_evidence(&store, &mut results, Some(&mut debug), true)
-        .expect("invalid evidence is candidate-local");
+    filter_generated_retrieval_evidence(
+        &store,
+        &EmbeddingProfileId::default_profile(),
+        &mut results,
+        Some(&mut debug),
+        true,
+    )
+    .expect("invalid evidence is candidate-local");
 
     assert_eq!(
         results
@@ -236,7 +250,94 @@ fn source_bounded_retrieval_omits_ocr_evidence_without_debug() {
         .link_chunk_evidence(&[(result.chunk.id.clone(), result.evidence_units[0].id.clone())])
         .expect("OCR chunk links to its evidence");
 
-    filter_generated_retrieval_evidence(&store, &mut results, None, false)
-        .expect("source-bounded retrieval filters OCR evidence");
+    filter_generated_retrieval_evidence(
+        &store,
+        &EmbeddingProfileId::default_profile(),
+        &mut results,
+        None,
+        false,
+    )
+    .expect("source-bounded retrieval filters OCR evidence");
     assert!(results.is_empty());
+}
+
+fn persist_generated_ask_generation_fixture(
+    name: &str,
+    generation: &str,
+    results: &[RetrievalResult],
+) -> (TestDir, Store) {
+    let dir = persist_retrieval_filter_fixture(name, results);
+    let database_path = dir.path().join("verbatim.db");
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO embedding_profile_index_meta (profile_id, generation)
+             VALUES (?1, ?2)",
+            ["default", generation],
+        )
+        .unwrap();
+    drop(connection);
+    let store = Store::open_existing_readonly(&database_path).unwrap();
+    (dir, store)
+}
+
+fn generated_ask_from_paid_retrieve(store: &Store, results: &[RetrievalResult]) -> AskResponse {
+    let mut results = results.to_vec();
+    let generation = filter_generated_retrieval_evidence(
+        store,
+        &EmbeddingProfileId::default_profile(),
+        &mut results,
+        None,
+        false,
+    )
+    .expect("paid retrieve read succeeds");
+    AskResponse {
+        answer: "Generated interpretation.".into(),
+        answer_kind: AnswerKind::GeneratedInterpretation,
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
+        generated_interpretation: Some(GeneratedInterpretationResponse {
+            text: "Generated interpretation.".into(),
+        }),
+        citations: Vec::new(),
+        verified: false,
+        retrieval: None,
+        context: Some(executed_retrieve_for_generated_ask(
+            "What is cited?",
+            "default",
+            generation,
+            &results,
+        )),
+        collection_filter: None,
+    }
+}
+
+#[test]
+fn generated_ask_context_pack_stamps_generation_from_paid_retrieve() {
+    let results = vec![test_retrieval_result(
+        1,
+        "chunk-1",
+        "ev-1",
+        EvidenceKind::Text,
+    )];
+    let (_dir, store) = persist_generated_ask_generation_fixture("stamp", "7", &results);
+    let encoded = serde_json::to_value(generated_ask_from_paid_retrieve(&store, &results)).unwrap();
+    assert!(encoded.get("context").is_none());
+    assert_eq!(encoded["context_pack"]["header"]["generation"], "7");
+}
+
+#[test]
+fn generated_ask_context_pack_generation_mismatch_is_rejected() {
+    let results = vec![test_retrieval_result(
+        1,
+        "chunk-1",
+        "ev-1",
+        EvidenceKind::Text,
+    )];
+    let (_dir, store) = persist_generated_ask_generation_fixture("mismatch", "7", &results);
+    let response = generated_ask_from_paid_retrieve(&store, &results);
+    let mut encoded = serde_json::to_value(&response).unwrap();
+    encoded["context_pack"]["header"]["generation"] = serde_json::json!("other");
+    encoded["context"] = serde_json::to_value(response.context).unwrap();
+    serde_json::from_value::<AskResponse>(encoded)
+        .expect_err("context pack generation must match the executed index generation");
 }
