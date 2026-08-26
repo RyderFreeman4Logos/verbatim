@@ -85,6 +85,7 @@ fn retrieve_debug_output_renders_markdown_structured_locator_when_present() {
         source_id: None,
         collection_filter: None,
         embedding_profile_id: "default".into(),
+        generation: None,
         limit: 1,
         page_size: 1,
         page: 1,

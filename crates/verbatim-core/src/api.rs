@@ -643,6 +643,7 @@ pub struct RetrieveResponse {
     pub source_id: Option<String>,
     pub collection_filter: Option<CollectionFilterResponse>,
     pub embedding_profile_id: String,
+    pub generation: Option<String>,
     pub limit: usize,
     pub page_size: usize,
     pub page: usize,

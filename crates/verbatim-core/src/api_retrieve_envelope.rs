@@ -48,10 +48,13 @@ pub(super) fn bind_evidence_pack_to_retrieve(
     query: &str,
     results: &[RetrieveResultResponse],
     embedding_profile_id: &str,
+    generation: Option<&str>,
     pack: &EvidencePackEnvelope,
 ) -> Result<()> {
     pack.validate()?;
-    let Some(expected) = evidence_pack_from_retrieve(query, results, embedding_profile_id)? else {
+    let Some(expected) =
+        evidence_pack_from_retrieve(query, results, embedding_profile_id, generation)?
+    else {
         anyhow::bail!("evidence pack must match returned evidence");
     };
     if pack.query_plan_hash != expected.query_plan_hash {
@@ -62,6 +65,9 @@ pub(super) fn bind_evidence_pack_to_retrieve(
     }
     if pack.header.profile_ref != expected.header.profile_ref {
         anyhow::bail!("evidence pack profile_ref does not match the executed embedding profile");
+    }
+    if pack.header.generation != expected.header.generation {
+        anyhow::bail!("evidence pack generation does not match the executed index generation");
     }
     Ok(())
 }
@@ -76,6 +82,7 @@ pub(super) fn context_pack_from_ask_context(
         &context.query,
         &context.results,
         &context.embedding_profile_id,
+        context.generation.as_deref(),
     )?
     else {
         return Ok(None);
@@ -85,7 +92,7 @@ pub(super) fn context_pack_from_ask_context(
         evidence_pack_hash: evidence_pack.header.identity.content_hash.as_str().into(),
         selected_unit_ids: evidence_pack.evidence_unit_ids,
         model_fingerprint: None,
-        generation: None,
+        generation: context.generation.clone(),
         profile_ref: Some(context.embedding_profile_id.clone()),
     })
     .map(Some)
@@ -115,6 +122,9 @@ pub(super) fn bind_context_pack_to_ask_context(
     if pack.header.profile_ref != expected.header.profile_ref {
         anyhow::bail!("context pack profile_ref does not match the executed embedding profile");
     }
+    if pack.header.generation != expected.header.generation {
+        anyhow::bail!("context pack generation does not match the executed index generation");
+    }
     Ok(())
 }
 
@@ -132,6 +142,7 @@ pub(super) fn evidence_pack_from_retrieve(
     query: &str,
     results: &[RetrieveResultResponse],
     embedding_profile_id: &str,
+    generation: Option<&str>,
 ) -> Result<Option<EvidencePackEnvelope>> {
     require_non_blank_result_evidence_ids(results)?;
     if results.is_empty() {
@@ -146,7 +157,7 @@ pub(super) fn evidence_pack_from_retrieve(
         artifact_id: LIVE_RETRIEVE_EVIDENCE_PACK_ID.into(),
         evidence_unit_ids,
         query_plan_hash: plan.header.identity.content_hash.as_str().into(),
-        generation: None,
+        generation: generation.map(str::to_string),
         profile_ref: Some(embedding_profile_id.to_string()),
     })
     .map(Some)

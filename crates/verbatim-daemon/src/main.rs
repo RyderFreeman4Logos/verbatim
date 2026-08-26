@@ -7850,6 +7850,7 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
         })?;
         (total_results, results_page)
     };
+    let generation = store.index_generation_for_profile(&embedding_profile_id)?;
     let (controls_response, audit_receipt) =
         audit_receipt::snapshot(embedding_profile_id.as_str(), &controls, &results_page);
 
@@ -7860,6 +7861,7 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
         source_id: source_filter.map(|source_id| source_id.0),
         collection_filter,
         embedding_profile_id: embedding_profile_id.into_string(),
+        generation: Some(generation.to_string()),
         limit: controls.limit,
         page_size: controls.page_size,
         page: controls.page,

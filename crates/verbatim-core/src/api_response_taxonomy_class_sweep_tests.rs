@@ -22,6 +22,22 @@ fn assert_taxonomy_recomputed<T: serde::Serialize>(
     assert_taxonomy_paths_resolve(name, &serde_json::to_value(response).unwrap());
 }
 
+fn assert_header_generation_is_metadata(name: &str, value: &serde_json::Value, fields: &[&str]) {
+    let taxonomy = ResponseTextTaxonomy::from_serialized_value(value);
+    for field in fields {
+        let entry = taxonomy
+            .fields
+            .iter()
+            .find(|entry| entry.field == *field)
+            .unwrap_or_else(|| panic!("{name} missing {field}"));
+        assert_eq!(
+            entry.plane,
+            OutputTextPlane::Metadata,
+            "{name} {field} must be metadata"
+        );
+    }
+}
+
 #[test]
 fn supplied_taxonomy_is_recomputed_for_all_response_shapes() {
     let mut ask = tampered_taxonomy(serde_json::from_str(include_str!(
@@ -32,6 +48,15 @@ fn supplied_taxonomy_is_recomputed_for_all_response_shapes() {
         "fixtures/legacy_retrieve_caption_without_taxonomy.json"
     ))
     .unwrap());
+    ask["context"]["generation"] = serde_json::json!("7");
+    assert_header_generation_is_metadata(
+        "ask with nested retrieve context",
+        &ask,
+        &[
+            "context.evidence_pack.header.generation",
+            "context_pack.header.generation",
+        ],
+    );
     assert_taxonomy_recomputed(
         "ask with nested retrieve context",
         ask,
@@ -39,12 +64,19 @@ fn supplied_taxonomy_is_recomputed_for_all_response_shapes() {
         |response| response.text_taxonomy.clone(),
     );
 
+    let mut retrieve = tampered_taxonomy(serde_json::from_str(include_str!(
+        "fixtures/legacy_retrieve_caption_without_taxonomy.json"
+    ))
+    .unwrap());
+    retrieve["generation"] = serde_json::json!("7");
+    assert_header_generation_is_metadata(
+        "retrieve",
+        &retrieve,
+        &["evidence_pack.header.generation"],
+    );
     assert_taxonomy_recomputed(
         "retrieve",
-        tampered_taxonomy(serde_json::from_str(include_str!(
-            "fixtures/legacy_retrieve_caption_without_taxonomy.json"
-        ))
-        .unwrap()),
+        retrieve,
         |value| serde_json::from_value::<RetrieveResponse>(value).unwrap(),
         |response| response.text_taxonomy.clone(),
     );

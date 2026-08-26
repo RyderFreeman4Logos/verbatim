@@ -98,6 +98,8 @@ struct RetrieveResponseWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     collection_filter: Option<CollectionFilterResponse>,
     embedding_profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<String>,
     limit: usize,
     page_size: usize,
     page: usize,
@@ -128,6 +130,7 @@ impl Serialize for RetrieveResponse {
             source_id: self.source_id.clone(),
             collection_filter: self.collection_filter.clone(),
             embedding_profile_id: self.embedding_profile_id.clone(),
+            generation: self.generation.clone(),
             limit: self.limit,
             page_size: self.page_size,
             page: self.page,
@@ -143,6 +146,7 @@ impl Serialize for RetrieveResponse {
                 &self.query,
                 &self.results,
                 &self.embedding_profile_id,
+                self.generation.as_deref(),
             )
             .map_err(serde::ser::Error::custom)?,
         };
@@ -169,6 +173,7 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
             &wire.query,
             &wire.results,
             &wire.embedding_profile_id,
+            wire.generation.as_deref(),
         )
         .map_err(serde::de::Error::custom)?;
         if let Some(pack) = &wire.evidence_pack {
@@ -176,6 +181,7 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
                 &wire.query,
                 &wire.results,
                 &wire.embedding_profile_id,
+                wire.generation.as_deref(),
                 pack,
             )
             .map_err(serde::de::Error::custom)?;
@@ -189,6 +195,7 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
             source_id: wire.source_id,
             collection_filter: wire.collection_filter,
             embedding_profile_id: wire.embedding_profile_id,
+            generation: wire.generation,
             limit: wire.limit,
             page_size: wire.page_size,
             page: wire.page,
