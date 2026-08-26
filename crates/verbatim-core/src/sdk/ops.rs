@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use crate::pagination::{SnapshotPageRequest, SnapshotPageResponse};
 use crate::wire_schemas::{
     ContextPackEnvelope, DerivedArtifactEnvelope, EvidencePackEnvelope, QueryPlanEnvelope,
-    WorkflowEnvelope,
 };
 
 use super::error::{ClientError, ClientResult};
+
+pub use super::workflow_run::{WorkflowRunRequest, WorkflowRunResponse};
 
 // ---------------------------------------------------------------------------
 // Source / upload
@@ -384,51 +385,8 @@ pub struct VerifyResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Workflow / task / artifact
+// Task / artifact
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunRequest {
-    pub workflow: WorkflowEnvelope,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
-}
-
-impl WorkflowRunRequest {
-    pub fn new(workflow: WorkflowEnvelope) -> ClientResult<Self> {
-        let req = Self {
-            workflow,
-            idempotency_key: None,
-        };
-        req.validate()?;
-        Ok(req)
-    }
-
-    pub fn validate(&self) -> ClientResult<()> {
-        self.workflow
-            .validate()
-            .map_err(|err| ClientError::validation(err.to_string()))?;
-        if let Some(k) = &self.idempotency_key {
-            require_non_empty("idempotency_key", k)?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunResponse {
-    pub workflow: WorkflowEnvelope,
-    pub run_id: String,
-}
-
-impl WorkflowRunResponse {
-    pub fn validate(&self) -> ClientResult<()> {
-        self.workflow
-            .validate()
-            .map_err(|err| ClientError::validation(err.to_string()))?;
-        require_non_empty("run_id", &self.run_id)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSubmitRequest {
@@ -586,7 +544,7 @@ impl ArtifactGetResponse {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn require_non_empty(field: &str, value: &str) -> ClientResult<()> {
+pub(super) fn require_non_empty(field: &str, value: &str) -> ClientResult<()> {
     if value.trim().is_empty() {
         return Err(ClientError::validation(format!(
             "{field} must not be empty"
