@@ -26,6 +26,22 @@ fn live_workflow_wire_valid_envelope_round_trips() {
 }
 
 #[test]
+fn live_workflow_wire_unknown_schema_version_fails_closed_without_optional_packs() {
+    let mut request = live_workflow_request(sample_query_plan(), None, None);
+    request.workflow.header.schema_version.major = 99;
+    request.workflow.header.identity.schema_version.major = 99;
+    serde_json::to_value(&request)
+        .expect_err("workflow request must reject an unknown schema version on serialize");
+
+    let mut encoded =
+        serde_json::to_value(live_workflow_request(sample_query_plan(), None, None)).unwrap();
+    encoded["query_plan"]["header"]["schema_version"]["major"] = serde_json::json!(99);
+    encoded["query_plan"]["header"]["identity"]["schema_version"]["major"] = serde_json::json!(99);
+    serde_json::from_value::<WorkflowRunRequest>(encoded)
+        .expect_err("workflow request must reject an unknown schema version on deserialize");
+}
+
+#[test]
 fn live_workflow_wire_mismatched_payload_vs_envelope_is_rejected() {
     let query_plan = sample_query_plan();
     let other_query_plan = QueryPlanEnvelope::new(QueryPlanFields {

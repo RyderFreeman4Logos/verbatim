@@ -69,6 +69,20 @@ fn with_unknown_field<T: serde::Serialize>(value: &T) -> Vec<u8> {
     serde_json::to_vec(&json).unwrap()
 }
 
+fn mark_unknown_schema_version(header: &mut WireEnvelopeHeader) {
+    let version = WireSchemaVersion::new(99, 0, 0);
+    header.schema_version = version;
+    header.identity.schema_version = version;
+}
+
+fn with_unknown_schema_version<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    let mut json = serde_json::to_value(value).unwrap();
+    let version = serde_json::json!({ "major": 99, "minor": 0, "patch": 0 });
+    json["header"]["schema_version"] = version.clone();
+    json["header"]["identity"]["schema_version"] = version;
+    json
+}
+
 #[test]
 fn wire_schema_version_current_is_supported() {
     assert!(WIRE_SCHEMA_VERSION.is_supported());
@@ -139,40 +153,63 @@ fn golden_style_roundtrip_all_envelopes() {
 }
 
 #[test]
-fn unknown_schema_version_fails_closed_on_decode() {
+fn unknown_schema_version_fails_closed_on_serialize() {
     let mut plan = sample_query_plan();
-    plan.header.schema_version = WireSchemaVersion::new(99, 0, 0);
-    plan.header.identity.schema_version = WireSchemaVersion::new(99, 0, 0);
-    let bytes = encode_wire_document(&plan).unwrap();
-    let err = decode_query_plan_envelope_json(&bytes).expect_err("must fail closed");
+    mark_unknown_schema_version(&mut plan.header);
+    let err = encode_wire_document(&plan).expect_err("query plan must fail closed");
     assert!(err.to_string().contains("unsupported"), "{err}");
 
     let mut ep = sample_evidence_pack("abc123deadbeef01");
-    ep.header.schema_version = WireSchemaVersion::new(2, 0, 0);
-    ep.header.identity.schema_version = WireSchemaVersion::new(2, 0, 0);
-    let ep_bytes = encode_wire_document(&ep).unwrap();
-    let err = decode_evidence_pack_envelope_json(&ep_bytes).expect_err("must fail closed");
+    mark_unknown_schema_version(&mut ep.header);
+    let err = encode_wire_document(&ep).expect_err("evidence pack must fail closed");
     assert!(err.to_string().contains("unsupported"), "{err}");
 
     let mut cp = sample_context_pack("abc123deadbeef01");
-    cp.header.schema_version = WireSchemaVersion::new(0, 9, 0);
-    cp.header.identity.schema_version = WireSchemaVersion::new(0, 9, 0);
-    let cp_bytes = encode_wire_document(&cp).unwrap();
-    let err = decode_context_pack_envelope_json(&cp_bytes).expect_err("must fail closed");
+    mark_unknown_schema_version(&mut cp.header);
+    let err = encode_wire_document(&cp).expect_err("context pack must fail closed");
     assert!(err.to_string().contains("unsupported"), "{err}");
 
     let mut da = sample_derived("abc123deadbeef01");
-    da.header.schema_version = WireSchemaVersion::new(3, 1, 0);
-    da.header.identity.schema_version = WireSchemaVersion::new(3, 1, 0);
-    let da_bytes = encode_wire_document(&da).unwrap();
-    let err = decode_derived_artifact_envelope_json(&da_bytes).expect_err("must fail closed");
+    mark_unknown_schema_version(&mut da.header);
+    let err = encode_wire_document(&da).expect_err("derived artifact must fail closed");
     assert!(err.to_string().contains("unsupported"), "{err}");
 
     let mut wf = sample_workflow("abc123deadbeef01");
-    wf.header.schema_version = WireSchemaVersion::new(9, 9, 9);
-    wf.header.identity.schema_version = WireSchemaVersion::new(9, 9, 9);
-    let wf_bytes = encode_wire_document(&wf).unwrap();
-    let err = decode_workflow_envelope_json(&wf_bytes).expect_err("must fail closed");
+    mark_unknown_schema_version(&mut wf.header);
+    let err = encode_wire_document(&wf).expect_err("workflow must fail closed");
+    assert!(err.to_string().contains("unsupported"), "{err}");
+}
+
+#[test]
+fn unknown_schema_version_fails_closed_on_deserialize() {
+    let err = serde_json::from_value::<QueryPlanEnvelope>(with_unknown_schema_version(
+        &sample_query_plan(),
+    ))
+    .expect_err("query plan must fail closed");
+    assert!(err.to_string().contains("unsupported"), "{err}");
+
+    let err = serde_json::from_value::<EvidencePackEnvelope>(with_unknown_schema_version(
+        &sample_evidence_pack("abc123deadbeef01"),
+    ))
+    .expect_err("evidence pack must fail closed");
+    assert!(err.to_string().contains("unsupported"), "{err}");
+
+    let err = serde_json::from_value::<ContextPackEnvelope>(with_unknown_schema_version(
+        &sample_context_pack("abc123deadbeef01"),
+    ))
+    .expect_err("context pack must fail closed");
+    assert!(err.to_string().contains("unsupported"), "{err}");
+
+    let err = serde_json::from_value::<DerivedArtifactEnvelope>(with_unknown_schema_version(
+        &sample_derived("abc123deadbeef01"),
+    ))
+    .expect_err("derived artifact must fail closed");
+    assert!(err.to_string().contains("unsupported"), "{err}");
+
+    let err = serde_json::from_value::<WorkflowEnvelope>(with_unknown_schema_version(
+        &sample_workflow("abc123deadbeef01"),
+    ))
+    .expect_err("workflow must fail closed");
     assert!(err.to_string().contains("unsupported"), "{err}");
 }
 
