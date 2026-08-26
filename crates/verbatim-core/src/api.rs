@@ -555,24 +555,16 @@ pub struct TaskWaitEvent {
     pub terminal: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AskRequest {
     pub question: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
-    #[serde(default, skip_serializing_if = "CollectionFilterRequest::is_empty")]
     pub collection_filter: CollectionFilterRequest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_profile_id: Option<String>,
-    #[serde(default)]
     pub show_retrieval: bool,
-    #[serde(default)]
     pub context_only: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<usize>,
 }
 
