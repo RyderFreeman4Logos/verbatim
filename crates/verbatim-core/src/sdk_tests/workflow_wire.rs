@@ -132,3 +132,82 @@ fn live_workflow_wire_all_blank_unit_ids_deserialize_is_rejected() {
     serde_json::from_value::<WorkflowRunRequest>(encoded)
         .expect_err("all blank context unit ids must fail closed on deserialize");
 }
+
+#[test]
+fn live_workflow_request_stamps_profile_ref_and_generation() {
+    let query_plan = sample_query_plan();
+    let request = live_workflow_request(query_plan.clone(), None, None);
+    assert_eq!(
+        request.workflow.header.profile_ref,
+        query_plan.header.profile_ref
+    );
+    assert_eq!(
+        request.workflow.header.generation,
+        query_plan.header.generation
+    );
+
+    let evidence_pack = sample_evidence_pack(query_plan.header.identity.content_hash.as_str());
+    let context_pack = sample_context_pack(evidence_pack.header.identity.content_hash.as_str());
+    let request = live_workflow_request(
+        query_plan.clone(),
+        Some(evidence_pack.clone()),
+        Some(context_pack.clone()),
+    );
+    assert_eq!(
+        request.workflow.header.profile_ref,
+        query_plan.header.profile_ref
+    );
+    assert_eq!(
+        request.workflow.header.generation,
+        query_plan.header.generation
+    );
+    assert_eq!(
+        request.workflow.header.profile_ref,
+        evidence_pack.header.profile_ref
+    );
+    assert_eq!(
+        request.workflow.header.generation,
+        evidence_pack.header.generation
+    );
+    assert_eq!(
+        request.workflow.header.profile_ref,
+        context_pack.header.profile_ref
+    );
+    assert_eq!(
+        request.workflow.header.generation,
+        context_pack.header.generation
+    );
+}
+
+#[test]
+fn live_workflow_request_profile_ref_and_generation_mismatch_is_rejected() {
+    let query_plan = sample_query_plan();
+    let evidence_pack = sample_evidence_pack(query_plan.header.identity.content_hash.as_str());
+    let context_pack = sample_context_pack(evidence_pack.header.identity.content_hash.as_str());
+    let request = live_workflow_request(
+        query_plan.clone(),
+        Some(evidence_pack.clone()),
+        Some(context_pack),
+    );
+
+    let mut encoded = serde_json::to_value(&request).unwrap();
+    encoded["evidence_pack"]["header"]["profile_ref"] = serde_json::json!("other");
+    serde_json::from_value::<WorkflowRunRequest>(encoded)
+        .expect_err("workflow profile_ref must match the executed evidence pack");
+
+    let mut encoded = serde_json::to_value(&request).unwrap();
+    encoded["context_pack"]["header"]["generation"] = serde_json::json!("other");
+    serde_json::from_value::<WorkflowRunRequest>(encoded)
+        .expect_err("workflow generation must match the executed context pack");
+
+    let mut mismatched = evidence_pack;
+    mismatched.header.profile_ref = Some("other".into());
+    WorkflowRunRequest::new(
+        "wf-sdk-live",
+        WorkflowPhase::Assembling,
+        query_plan,
+        Some(mismatched),
+        None,
+    )
+    .expect_err("workflow profile_ref must match the executed evidence pack");
+}
