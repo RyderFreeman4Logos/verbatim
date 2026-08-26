@@ -1,10 +1,11 @@
 use super::{
-    AuditReceipt, AuditReceiptResult, ResponseTextTaxonomy, RetrieveControlsResponse,
-    RetrieveRequest, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
-    AUDIT_RECEIPT_VERSION,
+    AnswerKind, AskResponse, AuditReceipt, AuditReceiptResult, ResponseTextTaxonomy,
+    RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+    RetrieveTimingResponse, AUDIT_RECEIPT_VERSION,
 };
 use crate::wire_schemas::{
-    decode_evidence_pack_envelope_json, decode_query_plan_envelope_json, EvidencePackEnvelope,
+    decode_context_pack_envelope_json, decode_evidence_pack_envelope_json,
+    decode_query_plan_envelope_json, ContextPackEnvelope, ContextPackFields, EvidencePackEnvelope,
     QueryPlanEnvelope, QueryPlanFields, WireSchemaVersion, WIRE_SCHEMA_VERSION,
 };
 
@@ -85,6 +86,74 @@ fn sample_retrieve_response(query: &str, evidence_id: &str) -> RetrieveResponse 
         }],
         debug: None,
     }
+}
+
+fn sample_ask_context_response(evidence_id: &str) -> AskResponse {
+    AskResponse {
+        answer: String::new(),
+        answer_kind: AnswerKind::EvidenceOnly,
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
+        generated_interpretation: None,
+        citations: Vec::new(),
+        verified: false,
+        retrieval: None,
+        context: Some(sample_retrieve_response("What is cited?", evidence_id)),
+        collection_filter: None,
+    }
+}
+
+fn context_pack_with(
+    evidence_pack_hash: impl Into<String>,
+    selected_unit_ids: Vec<String>,
+) -> ContextPackEnvelope {
+    ContextPackEnvelope::new(ContextPackFields {
+        artifact_id: "live-ask-context".into(),
+        evidence_pack_hash: evidence_pack_hash.into(),
+        selected_unit_ids,
+        model_fingerprint: None,
+        generation: None,
+        profile_ref: None,
+    })
+    .unwrap()
+}
+
+fn encoded_ask_context_without_pack(evidence_ids: &[&str]) -> serde_json::Value {
+    let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    let template = encoded["context"]["results"][0].clone();
+    let results = encoded["context"]["results"].as_array_mut().unwrap();
+    results.clear();
+    for (index, evidence_id) in evidence_ids.iter().enumerate() {
+        let mut result = template.clone();
+        result["index"] = serde_json::json!(index);
+        result["rank"] = serde_json::json!(index + 1);
+        result["evidence_id"] = serde_json::json!(evidence_id);
+        results.push(result);
+    }
+    encoded["context"]
+        .as_object_mut()
+        .unwrap()
+        .remove("evidence_pack");
+    encoded.as_object_mut().unwrap().remove("context_pack");
+    encoded
+}
+
+fn encoded_ask_context_with_blank_context_pack_ids(evidence_ids: &[&str]) -> serde_json::Value {
+    let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    let mut pack = serde_json::to_value(context_pack_with(
+        context_pack_hash(&encoded),
+        vec!["ev-1".into()],
+    ))
+    .unwrap();
+    pack["selected_unit_ids"] = serde_json::json!(evidence_ids);
+    encoded["context_pack"] = pack;
+    encoded
+}
+
+fn context_pack_hash(encoded: &serde_json::Value) -> String {
+    encoded["context"]["evidence_pack"]["header"]["identity"]["content_hash"]
+        .as_str()
+        .unwrap()
+        .into()
 }
 
 #[test]
@@ -175,6 +244,84 @@ fn live_retrieve_response_valid_evidence_pack_envelope_round_trips() {
 
     let back: RetrieveResponse = serde_json::from_value(encoded).unwrap();
     assert_eq!(back.results[0].evidence_id, "ev-1");
+}
+
+#[test]
+fn live_ask_context_pack_valid_envelope_round_trips() {
+    let response = sample_ask_context_response("ev-1");
+    let encoded = serde_json::to_value(&response).unwrap();
+    let pack = decode_context_pack_envelope_json(
+        encoded
+            .get("context_pack")
+            .map(|value| serde_json::to_vec(value).unwrap())
+            .expect("live ask context response must carry ContextPackEnvelope")
+            .as_slice(),
+    )
+    .unwrap();
+
+    assert_eq!(pack.header.schema_version, WIRE_SCHEMA_VERSION);
+    assert_eq!(pack.evidence_pack_hash, context_pack_hash(&encoded));
+    assert_eq!(pack.selected_unit_ids, vec!["ev-1".to_string()]);
+    pack.validate().unwrap();
+    assert!(encoded["text_taxonomy"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field["field"] == "context_pack.header.identity.content_hash"));
+
+    let back: AskResponse = serde_json::from_value(encoded).unwrap();
+    assert_eq!(back.context.unwrap().results[0].evidence_id, "ev-1");
+}
+
+#[test]
+fn live_ask_context_pack_mismatched_payload_vs_envelope_is_rejected() {
+    let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    encoded["context_pack"] = serde_json::to_value(context_pack_with(
+        context_pack_hash(&encoded),
+        vec!["ev-other".into()],
+    ))
+    .unwrap();
+
+    serde_json::from_value::<AskResponse>(encoded)
+        .expect_err("context pack ids must match context.results[].evidence_id");
+}
+
+#[test]
+fn live_ask_context_pack_noncanonical_evidence_hash_is_rejected() {
+    let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    encoded["context_pack"] = serde_json::to_value(context_pack_with(
+        "other-evidence-pack",
+        vec!["ev-1".into()],
+    ))
+    .unwrap();
+
+    serde_json::from_value::<AskResponse>(encoded)
+        .expect_err("context pack evidence hash must match the returned context");
+}
+
+#[test]
+fn live_ask_context_pack_incomplete_or_unknown_identity_is_rejected() {
+    let mut incomplete = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    let mut pack = serde_json::to_value(context_pack_with(
+        context_pack_hash(&incomplete),
+        vec!["ev-1".into()],
+    ))
+    .unwrap();
+    pack["header"]["identity"]
+        .as_object_mut()
+        .unwrap()
+        .remove("content_hash");
+    incomplete["context_pack"] = pack;
+    serde_json::from_value::<AskResponse>(incomplete)
+        .expect_err("incomplete context pack identity must fail closed");
+
+    let mut unknown = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    let mut pack = context_pack_with(context_pack_hash(&unknown), vec!["ev-1".into()]);
+    pack.header.schema_version = WireSchemaVersion::new(2, 0, 0);
+    pack.header.identity.schema_version = WireSchemaVersion::new(2, 0, 0);
+    unknown["context_pack"] = serde_json::to_value(pack).unwrap();
+    serde_json::from_value::<AskResponse>(unknown)
+        .expect_err("unknown context pack identity schema must fail closed");
 }
 
 #[test]
@@ -343,4 +490,38 @@ fn live_retrieve_response_all_blank_evidence_id_serialize_is_rejected() {
 fn live_retrieve_response_all_blank_evidence_id_deserialize_is_rejected() {
     serde_json::from_value::<RetrieveResponse>(encoded_retrieve_without_pack(&[" "]))
         .expect_err("all-blank results[].evidence_id must fail closed on deserialize");
+}
+
+#[test]
+fn live_ask_context_pack_mixed_blank_ids_serialize_and_deserialize_are_rejected() {
+    let mut response = sample_ask_context_response("ev-1");
+    let context = response.context.as_mut().unwrap();
+    let mut blank = context.results[0].clone();
+    blank.index = 1;
+    blank.rank = 2;
+    blank.label = "E2".into();
+    blank.evidence_id = " ".into();
+    context.results.push(blank);
+    context.total_results = 2;
+    context.returned_results = 2;
+    serde_json::to_value(response)
+        .expect_err("mixed blank context results[].evidence_id must fail closed on serialize");
+
+    serde_json::from_value::<AskResponse>(encoded_ask_context_without_pack(&["ev-1", " "]))
+        .expect_err("legacy context without a pack must still reject blank result ids");
+    serde_json::from_value::<AskResponse>(encoded_ask_context_with_blank_context_pack_ids(&[
+        "ev-1", " ",
+    ]))
+    .expect_err("context pack must reject mixed blank selected_unit_ids");
+}
+
+#[test]
+fn live_ask_context_pack_all_blank_ids_serialize_and_deserialize_are_rejected() {
+    serde_json::to_value(sample_ask_context_response(" "))
+        .expect_err("all-blank context results[].evidence_id must fail closed on serialize");
+
+    serde_json::from_value::<AskResponse>(encoded_ask_context_without_pack(&[" "]))
+        .expect_err("legacy context without a pack must still reject blank result ids");
+    serde_json::from_value::<AskResponse>(encoded_ask_context_with_blank_context_pack_ids(&[" "]))
+        .expect_err("context pack must reject all-blank selected_unit_ids");
 }

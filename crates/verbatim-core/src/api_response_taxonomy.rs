@@ -515,6 +515,14 @@ const RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS: &[&str] = &[
     "evidence_pack.query_plan_hash",
 ];
 
+const ASK_CONTEXT_PACK_IDENTITY_FIELDS: &[&str] = &[
+    "context_pack.evidence_pack_hash",
+    "context_pack.header.identity.artifact_id",
+    "context_pack.header.identity.content_hash",
+    "context_pack.header.identity.kind",
+    "context_pack.selected_unit_ids[]",
+];
+
 fn collect_serialized_string_leaves(
     root: &Value,
     value: &Value,
@@ -524,11 +532,18 @@ fn collect_serialized_string_leaves(
     match value {
         Value::Object(object) => {
             let synthesize_pack = should_synthesize_retrieve_evidence_pack(object);
+            let synthesize_context_pack = should_synthesize_ask_context_pack(object);
             let mut emitted_pack = false;
+            let mut emitted_context_pack = false;
             for (key, child) in object {
                 if synthesize_pack && !emitted_pack && key.as_str() > "evidence_pack" {
                     push_retrieve_evidence_pack_identity_fields(path, fields);
                     emitted_pack = true;
+                }
+                if synthesize_context_pack && !emitted_context_pack && key.as_str() > "context_pack"
+                {
+                    push_ask_context_pack_identity_fields(path, fields);
+                    emitted_context_pack = true;
                 }
                 let child_path = if path.is_empty() {
                     key.clone()
@@ -544,6 +559,9 @@ fn collect_serialized_string_leaves(
             }
             if synthesize_pack && !emitted_pack {
                 push_retrieve_evidence_pack_identity_fields(path, fields);
+            }
+            if synthesize_context_pack && !emitted_context_pack {
+                push_ask_context_pack_identity_fields(path, fields);
             }
         }
         Value::Array(values) => {
@@ -567,20 +585,31 @@ fn collect_serialized_string_leaves(
 }
 
 fn should_synthesize_retrieve_evidence_pack(object: &serde_json::Map<String, Value>) -> bool {
-    if object.contains_key("evidence_pack") || object.get("query").and_then(Value::as_str).is_none()
-    {
-        return false;
-    }
-    let Some(results) = object.get("results").and_then(Value::as_array) else {
-        return false;
-    };
-    !results.is_empty()
-        && results.iter().all(|result| {
-            result
-                .get("evidence_id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.trim().is_empty())
-        })
+    !object.contains_key("evidence_pack") && has_non_blank_retrieve_result_ids(object)
+}
+
+fn should_synthesize_ask_context_pack(object: &serde_json::Map<String, Value>) -> bool {
+    !object.contains_key("context_pack")
+        && object
+            .get("context")
+            .and_then(Value::as_object)
+            .is_some_and(has_non_blank_retrieve_result_ids)
+}
+
+fn has_non_blank_retrieve_result_ids(object: &serde_json::Map<String, Value>) -> bool {
+    object.get("query").and_then(Value::as_str).is_some()
+        && object
+            .get("results")
+            .and_then(Value::as_array)
+            .is_some_and(|results| {
+                !results.is_empty()
+                    && results.iter().all(|result| {
+                        result
+                            .get("evidence_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.trim().is_empty())
+                    })
+            })
 }
 
 fn push_retrieve_evidence_pack_identity_fields(path: &str, fields: &mut Vec<TextFieldTaxonomy>) {
@@ -590,6 +619,20 @@ fn push_retrieve_evidence_pack_identity_fields(path: &str, fields: &mut Vec<Text
         format!("{path}.")
     };
     for field in RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS {
+        fields.push(TextFieldTaxonomy {
+            field: format!("{prefix}{field}"),
+            plane: OutputTextPlane::Metadata,
+        });
+    }
+}
+
+fn push_ask_context_pack_identity_fields(path: &str, fields: &mut Vec<TextFieldTaxonomy>) {
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}.")
+    };
+    for field in ASK_CONTEXT_PACK_IDENTITY_FIELDS {
         fields.push(TextFieldTaxonomy {
             field: format!("{prefix}{field}"),
             plane: OutputTextPlane::Metadata,

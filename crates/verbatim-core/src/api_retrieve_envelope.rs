@@ -1,13 +1,17 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use super::{is_false, CollectionFilterRequest, RetrieveRequest, RetrieveResultResponse};
+use super::{
+    is_false, CollectionFilterRequest, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+};
 use crate::wire_schemas::{
-    EvidencePackEnvelope, EvidencePackFields, QueryPlanEnvelope, QueryPlanFields,
+    ContextPackEnvelope, ContextPackFields, EvidencePackEnvelope, EvidencePackFields,
+    QueryPlanEnvelope, QueryPlanFields,
 };
 
 const LIVE_RETRIEVE_QUERY_PLAN_ID: &str = "live-retrieve";
 const LIVE_RETRIEVE_EVIDENCE_PACK_ID: &str = "live-retrieve-evidence";
+const LIVE_ASK_CONTEXT_PACK_ID: &str = "live-ask-context";
 
 pub(super) fn query_plan_from_question(question: &str) -> Result<QueryPlanEnvelope> {
     QueryPlanEnvelope::new(QueryPlanFields {
@@ -47,6 +51,50 @@ pub(super) fn bind_evidence_pack_to_retrieve(
     }
     if pack.evidence_unit_ids != expected.evidence_unit_ids {
         anyhow::bail!("evidence pack evidence_unit_ids do not match results");
+    }
+    Ok(())
+}
+
+pub(super) fn context_pack_from_ask_context(
+    context: Option<&RetrieveResponse>,
+) -> Result<Option<ContextPackEnvelope>> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    let Some(evidence_pack) = evidence_pack_from_retrieve(&context.query, &context.results)? else {
+        return Ok(None);
+    };
+    ContextPackEnvelope::new(ContextPackFields {
+        artifact_id: LIVE_ASK_CONTEXT_PACK_ID.into(),
+        evidence_pack_hash: evidence_pack.header.identity.content_hash.as_str().into(),
+        selected_unit_ids: evidence_pack.evidence_unit_ids,
+        model_fingerprint: None,
+        generation: None,
+        profile_ref: None,
+    })
+    .map(Some)
+}
+
+pub(super) fn bind_context_pack_to_ask_context(
+    context: Option<&RetrieveResponse>,
+    pack: Option<&ContextPackEnvelope>,
+) -> Result<()> {
+    let expected = context_pack_from_ask_context(context)?;
+    let Some(pack) = pack else {
+        return Ok(());
+    };
+    pack.validate()?;
+    let Some(expected) = expected else {
+        anyhow::bail!("context pack must match returned context");
+    };
+    if pack.evidence_pack_hash != expected.evidence_pack_hash {
+        anyhow::bail!("context pack evidence_pack_hash does not match returned context");
+    }
+    if pack.selected_unit_ids != expected.selected_unit_ids {
+        anyhow::bail!("context pack selected_unit_ids do not match context results");
+    }
+    if pack.header.identity != expected.header.identity {
+        anyhow::bail!("context pack identity does not match returned context");
     }
     Ok(())
 }
