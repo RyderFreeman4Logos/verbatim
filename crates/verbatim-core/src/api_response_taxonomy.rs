@@ -380,6 +380,9 @@ impl ResponseTextTaxonomy {
             ("text", text_plane),
             ("heading_path[]", text_plane),
             ("id", OutputTextPlane::Metadata),
+            ("identity.artifact_id", OutputTextPlane::Metadata),
+            ("identity.content_hash", OutputTextPlane::Metadata),
+            ("identity.kind", OutputTextPlane::Metadata),
             ("source_id", OutputTextPlane::Metadata),
             ("source_hash", OutputTextPlane::Metadata),
             ("text_hash", OutputTextPlane::Metadata),
@@ -537,6 +540,8 @@ fn collect_serialized_string_leaves(
         Value::Object(object) => {
             let synthesize_pack = should_synthesize_retrieve_evidence_pack(object);
             let synthesize_context_pack = should_synthesize_ask_context_pack(object);
+            let mut evidence_identity =
+                super::evidence_identity::EvidenceIdentityTaxonomy::start(object);
             let mut emitted_pack = false;
             let mut emitted_context_pack = false;
             for (key, child) in object {
@@ -549,6 +554,7 @@ fn collect_serialized_string_leaves(
                     push_ask_context_pack_identity_fields(path, fields);
                     emitted_context_pack = true;
                 }
+                evidence_identity.emit_before(path, key, fields);
                 let child_path = if path.is_empty() {
                     key.clone()
                 } else {
@@ -567,6 +573,7 @@ fn collect_serialized_string_leaves(
             if synthesize_context_pack && !emitted_context_pack {
                 push_ask_context_pack_identity_fields(path, fields);
             }
+            evidence_identity.emit_after(path, fields);
         }
         Value::Array(values) => {
             for (index, child) in values.iter().enumerate() {
