@@ -7822,13 +7822,14 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
         sources,
         retrieval_ms,
     } = input;
-    let (total_results, results_page) = if controls.passage {
+    let (total_results, results_page, generation) = if controls.passage {
         retrieve_passage_result_page(RetrieveResultPageInput {
             store,
             results: &results,
             debug: &debug,
             sources: &sources,
             collection_provenance: &collection_provenance,
+            embedding_profile_id: &embedding_profile_id,
             limit: controls.limit,
             page_size: controls.page_size,
             page: controls.page,
@@ -7837,20 +7838,20 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
     } else {
         let display_pack = retrieve_display_evidence_pack(&debug);
         let total_results = retrieve_display_evidence_count(&debug, display_pack);
-        let results_page = retrieve_result_page(RetrieveResultPageInput {
+        let (results_page, generation) = retrieve_result_page(RetrieveResultPageInput {
             store,
             results: &results,
             debug: &debug,
             sources: &sources,
             collection_provenance: &collection_provenance,
+            embedding_profile_id: &embedding_profile_id,
             limit: controls.limit,
             page_size: controls.page_size,
             page: controls.page,
             include_locator: controls.include_locator,
         })?;
-        (total_results, results_page)
+        (total_results, results_page, generation)
     };
-    let generation = store.index_generation_for_profile(&embedding_profile_id)?;
     let (controls_response, audit_receipt) =
         audit_receipt::snapshot(embedding_profile_id.as_str(), &controls, &results_page);
 
@@ -7881,13 +7882,14 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
 
 fn retrieve_passage_result_page(
     input: RetrieveResultPageInput<'_>,
-) -> Result<(usize, Vec<RetrieveResultResponse>)> {
+) -> Result<(usize, Vec<RetrieveResultResponse>, u64)> {
     let RetrieveResultPageInput {
         store,
         results,
         debug: _,
         sources,
         collection_provenance,
+        embedding_profile_id,
         limit,
         page_size,
         page,
@@ -7898,7 +7900,11 @@ fn retrieve_passage_result_page(
     let end = total_results.min(limit);
     let start = page_start(page, page_size);
     if start >= end {
-        return Ok((total_results, Vec::new()));
+        return Ok((
+            total_results,
+            Vec::new(),
+            store.index_generation_for_profile(embedding_profile_id)?,
+        ));
     }
 
     let page = groups
@@ -7914,11 +7920,20 @@ fn retrieve_passage_result_page(
                 group,
                 sources,
                 collection_provenance,
+                embedding_profile_id,
                 include_locator,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((total_results, page))
+    let generation = page
+        .first()
+        .map(|(_, generation)| *generation)
+        .context("paged retrieve missing index generation")?;
+    Ok((
+        total_results,
+        page.into_iter().map(|(result, _)| result).collect(),
+        generation,
+    ))
 }
 
 fn retrieve_display_evidence_pack(debug: &RetrievalDebug) -> &[RetrievalEvidencePackEntry] {
@@ -7983,23 +7998,33 @@ struct PassageGroupResponseInput<'a> {
     group: &'a PassageGroup<'a>,
     sources: &'a HashMap<String, Source>,
     collection_provenance: &'a HashMap<String, Vec<CollectionResultProvenance>>,
+    embedding_profile_id: &'a EmbeddingProfileId,
     include_locator: bool,
 }
 
-fn passage_group_response(input: PassageGroupResponseInput<'_>) -> Result<RetrieveResultResponse> {
+fn passage_group_response(
+    input: PassageGroupResponseInput<'_>,
+) -> Result<(RetrieveResultResponse, u64)> {
     let PassageGroupResponseInput {
         store,
         group_index,
         group,
         sources,
         collection_provenance,
+        embedding_profile_id,
         include_locator,
     } = input;
+    let mut generation = None;
     let evidence_units = group
         .result
         .evidence_units
         .iter()
-        .map(|evidence| store.resolve_source_bounded_evidence(evidence))
+        .map(|evidence| {
+            let (evidence, page_generation) = store
+                .resolve_source_bounded_evidence_for_profile(evidence, embedding_profile_id)?;
+            generation = Some(page_generation);
+            Ok(evidence)
+        })
         .collect::<Result<Vec<_>>>()?;
     let first = evidence_units
         .first()
@@ -8009,31 +8034,35 @@ fn passage_group_response(input: PassageGroupResponseInput<'_>) -> Result<Retrie
         .expect("passage groups are never empty");
     let source = prefetched_source(sources, &first.source_id)?;
     let (locator, structured_locator) = passage_locator(first, last, include_locator);
+    let generation = generation.context("passage group missing index generation")?;
 
-    Ok(RetrieveResultResponse {
-        index: group_index,
-        rank: group_index + 1,
-        label: format!("E{}", group.first_evidence_ordinal),
-        evidence_id: first.id.0.clone(),
-        text_hash: first.text_hash.clone(),
-        source_id: first.source_id.0.clone(),
-        source_hash: source.hash.clone(),
-        source_path: Some(source.path.display().to_string()),
-        collections: collection_provenance
-            .get(&first.source_id.0)
-            .cloned()
-            .unwrap_or_default(),
-        chunk_id: group.result.chunk_id.0.clone(),
-        kind: evidence_kind_name(first.kind).to_string(),
-        role: retrieval_role_name(retrieval_evidence_role(first, &group.result.provenance))
-            .to_string(),
-        score: group.result.score,
-        locator,
-        structured_locator,
-        provenance: include_locator.then(|| group.result.provenance.clone()),
-        derived_from: first.derived_from.as_ref().map(|id| id.0.clone()),
-        snippet: passage_snippet(&evidence_units),
-    })
+    Ok((
+        RetrieveResultResponse {
+            index: group_index,
+            rank: group_index + 1,
+            label: format!("E{}", group.first_evidence_ordinal),
+            evidence_id: first.id.0.clone(),
+            text_hash: first.text_hash.clone(),
+            source_id: first.source_id.0.clone(),
+            source_hash: source.hash.clone(),
+            source_path: Some(source.path.display().to_string()),
+            collections: collection_provenance
+                .get(&first.source_id.0)
+                .cloned()
+                .unwrap_or_default(),
+            chunk_id: group.result.chunk_id.0.clone(),
+            kind: evidence_kind_name(first.kind).to_string(),
+            role: retrieval_role_name(retrieval_evidence_role(first, &group.result.provenance))
+                .to_string(),
+            score: group.result.score,
+            locator,
+            structured_locator,
+            provenance: include_locator.then(|| group.result.provenance.clone()),
+            derived_from: first.derived_from.as_ref().map(|id| id.0.clone()),
+            snippet: passage_snippet(&evidence_units),
+        },
+        generation,
+    ))
 }
 
 fn passage_locator(
@@ -8171,19 +8200,23 @@ struct RetrieveResultPageInput<'a> {
     debug: &'a RetrievalDebug,
     sources: &'a HashMap<String, Source>,
     collection_provenance: &'a HashMap<String, Vec<CollectionResultProvenance>>,
+    embedding_profile_id: &'a EmbeddingProfileId,
     limit: usize,
     page_size: usize,
     page: usize,
     include_locator: bool,
 }
 
-fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<RetrieveResultResponse>> {
+fn retrieve_result_page(
+    input: RetrieveResultPageInput<'_>,
+) -> Result<(Vec<RetrieveResultResponse>, u64)> {
     let RetrieveResultPageInput {
         store,
         results,
         debug,
         sources,
         collection_provenance,
+        embedding_profile_id,
         limit,
         page_size,
         page,
@@ -8193,10 +8226,14 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
     let start = page_start(page, page_size);
     let end = display_pack.len().min(limit);
     if start >= end {
-        return Ok(Vec::new());
+        return Ok((
+            Vec::new(),
+            store.index_generation_for_profile(embedding_profile_id)?,
+        ));
     }
 
-    display_pack
+    let mut generation = None;
+    let results_page = display_pack
         .iter()
         .enumerate()
         .skip(start)
@@ -8204,7 +8241,9 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
         .take(page_size)
         .map(|(index, entry)| {
             let expected = selected_retrieval_evidence(results, entry)?;
-            let evidence = store.resolve_source_bounded_evidence(expected)?;
+            let (evidence, page_generation) = store
+                .resolve_source_bounded_evidence_for_profile(expected, embedding_profile_id)?;
+            generation = Some(page_generation);
             let source = prefetched_source(sources, &evidence.source_id)?;
             Ok(RetrieveResultResponse {
                 index,
@@ -8231,7 +8270,11 @@ fn retrieve_result_page(input: RetrieveResultPageInput<'_>) -> Result<Vec<Retrie
                 snippet: compact_snippet(&evidence.text, DEFAULT_SNIPPET_CHARS),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((
+        results_page,
+        generation.context("paged retrieve missing index generation")?,
+    ))
 }
 
 fn selected_retrieval_evidence<'a>(
