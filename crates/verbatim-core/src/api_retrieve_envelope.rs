@@ -2,7 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    is_false, CollectionFilterRequest, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+    is_false, AskRequest, CollectionFilterRequest, RetrieveRequest, RetrieveResponse,
+    RetrieveResultResponse,
 };
 use crate::wire_schemas::{
     ContextPackEnvelope, ContextPackFields, EvidencePackEnvelope, EvidencePackFields,
@@ -264,6 +265,79 @@ impl<'de> Deserialize<'de> for RetrieveRequest {
             include_debug_packs: wire.include_debug_packs,
             include_locator: wire.include_locator,
             passage: wire.passage,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AskRequestWire {
+    question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    query_plan: Option<QueryPlanEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "CollectionFilterRequest::is_empty")]
+    collection_filter: CollectionFilterRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_profile_id: Option<String>,
+    #[serde(default)]
+    show_retrieval: bool,
+    #[serde(default)]
+    context_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page: Option<usize>,
+}
+
+impl Serialize for AskRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let query_plan =
+            query_plan_from_question(&self.question, self.embedding_profile_id.as_deref())
+                .map_err(serde::ser::Error::custom)?;
+        AskRequestWire {
+            question: self.question.clone(),
+            query_plan: Some(query_plan),
+            source_id: self.source_id.clone(),
+            collection_filter: self.collection_filter.clone(),
+            embedding_profile_id: self.embedding_profile_id.clone(),
+            show_retrieval: self.show_retrieval,
+            context_only: self.context_only,
+            limit: self.limit,
+            page_size: self.page_size,
+            page: self.page,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AskRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = AskRequestWire::deserialize(deserializer)?;
+        bind_query_plan_to_question(
+            &wire.question,
+            wire.embedding_profile_id.as_deref(),
+            wire.query_plan,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            question: wire.question,
+            source_id: wire.source_id,
+            collection_filter: wire.collection_filter,
+            embedding_profile_id: wire.embedding_profile_id,
+            show_retrieval: wire.show_retrieval,
+            context_only: wire.context_only,
+            limit: wire.limit,
+            page_size: wire.page_size,
+            page: wire.page,
         })
     }
 }

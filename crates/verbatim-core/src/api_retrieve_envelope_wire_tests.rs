@@ -1,5 +1,5 @@
 use super::{
-    AnswerKind, AskResponse, AuditReceipt, AuditReceiptResult, ResponseTextTaxonomy,
+    AnswerKind, AskRequest, AskResponse, AuditReceipt, AuditReceiptResult, ResponseTextTaxonomy,
     RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
     RetrieveTimingResponse, AUDIT_RECEIPT_VERSION,
 };
@@ -615,4 +615,86 @@ fn live_envelope_generation_ask_context_mismatch_is_rejected() {
     encoded["context_pack"]["header"]["generation"] = serde_json::json!("other");
     serde_json::from_value::<AskResponse>(encoded)
         .expect_err("context pack generation must match the executed index generation");
+}
+
+#[test]
+fn live_ask_request_valid_query_plan_envelope_round_trips() {
+    let plan = live_question_plan_with_profile("What is cited?", "default");
+    let request: AskRequest = serde_json::from_value(serde_json::json!({
+        "question": plan.query_text,
+        "embedding_profile_id": "default",
+        "query_plan": plan,
+    }))
+    .unwrap();
+    assert_eq!(request.question, plan.query_text);
+    assert_eq!(request.embedding_profile_id.as_deref(), Some("default"));
+
+    let encoded = serde_json::to_value(&request).unwrap();
+    let back = decode_query_plan_envelope_json(
+        encoded
+            .get("query_plan")
+            .and_then(serde_json::Value::as_object)
+            .map(|value| serde_json::to_vec(value).unwrap())
+            .expect("live ask request must carry QueryPlanEnvelope")
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(back.header.schema_version, WIRE_SCHEMA_VERSION);
+    assert_eq!(back.query_text, plan.query_text);
+    assert_eq!(back.header.profile_ref.as_deref(), Some("default"));
+    assert!(back.header.generation.is_none());
+    back.validate().unwrap();
+}
+
+#[test]
+fn live_ask_request_legacy_question_only_projects_through_query_plan_envelope() {
+    let request: AskRequest =
+        serde_json::from_value(serde_json::json!({"question": "What is cited?"})).unwrap();
+    assert_eq!(request.question, "What is cited?");
+
+    let encoded = serde_json::to_value(&request).unwrap();
+    let plan = decode_query_plan_envelope_json(
+        encoded
+            .get("query_plan")
+            .map(|value| serde_json::to_vec(value).unwrap())
+            .expect("legacy question-only ask must project through QueryPlanEnvelope")
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(plan.query_text, "What is cited?");
+    assert!(plan.header.generation.is_none());
+    plan.validate().unwrap();
+}
+
+#[test]
+fn live_ask_request_mismatched_question_vs_envelope_is_rejected() {
+    let plan = sample_query_plan();
+    serde_json::from_value::<AskRequest>(serde_json::json!({
+        "question": "A different question",
+        "query_plan": plan,
+    }))
+    .expect_err("request envelope must match the executed question");
+}
+
+#[test]
+fn live_ask_request_mismatched_profile_vs_envelope_is_rejected() {
+    let mut plan = serde_json::to_value(live_question_plan("What is cited?")).unwrap();
+    plan["header"]["profile_ref"] = serde_json::json!("other");
+    serde_json::from_value::<AskRequest>(serde_json::json!({
+        "question": "What is cited?",
+        "embedding_profile_id": "default",
+        "query_plan": plan,
+    }))
+    .expect_err("query plan profile_ref must match the executed embedding profile");
+}
+
+fn live_question_plan_with_profile(question: &str, profile: &str) -> QueryPlanEnvelope {
+    QueryPlanEnvelope::new(QueryPlanFields {
+        artifact_id: "live-retrieve".into(),
+        query_text: question.into(),
+        steps: Vec::new(),
+        generation: None,
+        profile_ref: Some(profile.into()),
+    })
+    .unwrap()
 }
