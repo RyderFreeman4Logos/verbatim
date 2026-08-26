@@ -16,6 +16,7 @@ mod config;
 mod cursor_iter;
 mod error;
 mod ops;
+mod workflow_run;
 
 pub use capability::{
     decode_sdk_capability_descriptor_json, CapabilityCache, CapabilityNegotiation,

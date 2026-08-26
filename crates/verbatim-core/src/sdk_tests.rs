@@ -10,10 +10,14 @@ use crate::pagination::{
 };
 use crate::storage_ports::{PageCursor, StorageGeneration};
 use crate::wire_schemas::{
-    ContextPackEnvelope, ContextPackFields, DerivedArtifactEnvelope, DerivedArtifactFields,
-    DerivedArtifactKind, EvidencePackEnvelope, EvidencePackFields, QueryPlanEnvelope,
-    QueryPlanFields, WorkflowEnvelope, WorkflowEnvelopeFields, WorkflowPhase,
+    encode_wire_document, CanonicalIdentity, ContextPackEnvelope, ContextPackFields,
+    DerivedArtifactEnvelope, DerivedArtifactFields, DerivedArtifactKind, EvidencePackEnvelope,
+    EvidencePackFields, QueryPlanEnvelope, QueryPlanFields, WireArtifactKind, WorkflowEnvelope,
+    WorkflowEnvelopeFields, WorkflowPhase, WIRE_SCHEMA_VERSION,
 };
+
+#[path = "sdk_tests/workflow_wire.rs"]
+mod workflow_wire;
 
 fn sample_query_plan() -> QueryPlanEnvelope {
     QueryPlanEnvelope::new(QueryPlanFields {
@@ -72,6 +76,82 @@ fn sample_workflow(plan_hash: &str) -> WorkflowEnvelope {
         profile_ref: Some("profile:default".into()),
     })
     .unwrap()
+}
+
+#[derive(serde::Serialize)]
+struct ContextPackIdentityBody {
+    evidence_pack_hash: String,
+    selected_unit_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_fingerprint: Option<String>,
+}
+
+fn context_pack_with_selected_ids(
+    evidence_pack_hash: &str,
+    selected_unit_ids: Vec<String>,
+) -> ContextPackEnvelope {
+    let mut context_pack = sample_context_pack(evidence_pack_hash);
+    context_pack.selected_unit_ids = selected_unit_ids;
+    let body = ContextPackIdentityBody {
+        evidence_pack_hash: context_pack.evidence_pack_hash.clone(),
+        selected_unit_ids: context_pack.selected_unit_ids.clone(),
+        model_fingerprint: context_pack.model_fingerprint.clone(),
+    };
+    context_pack.header.identity = CanonicalIdentity::from_body(
+        WireArtifactKind::ContextPack,
+        WIRE_SCHEMA_VERSION,
+        context_pack.header.identity.artifact_id.clone(),
+        &encode_wire_document(&body).unwrap(),
+    )
+    .unwrap();
+    context_pack
+}
+
+fn workflow_for_context(
+    query_plan: &QueryPlanEnvelope,
+    context_pack: &ContextPackEnvelope,
+) -> WorkflowEnvelope {
+    WorkflowEnvelope::new(WorkflowEnvelopeFields {
+        artifact_id: "wf-sdk-live".into(),
+        phase: WorkflowPhase::Assembling,
+        query_plan_hash: query_plan.header.identity.content_hash.as_str().into(),
+        evidence_pack_hash: Some(context_pack.evidence_pack_hash.clone()),
+        context_pack_hash: Some(context_pack.header.identity.content_hash.as_str().into()),
+        generation: None,
+        profile_ref: None,
+    })
+    .unwrap()
+}
+
+fn live_workflow_request(
+    query_plan: QueryPlanEnvelope,
+    evidence_pack: Option<EvidencePackEnvelope>,
+    context_pack: Option<ContextPackEnvelope>,
+) -> WorkflowRunRequest {
+    WorkflowRunRequest::new(
+        "wf-sdk-live",
+        WorkflowPhase::Assembling,
+        query_plan,
+        evidence_pack,
+        context_pack,
+    )
+    .unwrap()
+}
+
+fn workflow_request_with_context_ids(selected_unit_ids: Vec<String>) -> WorkflowRunRequest {
+    let query_plan = sample_query_plan();
+    let evidence_pack = sample_evidence_pack(query_plan.header.identity.content_hash.as_str());
+    let context_pack = context_pack_with_selected_ids(
+        evidence_pack.header.identity.content_hash.as_str(),
+        selected_unit_ids,
+    );
+    WorkflowRunRequest {
+        workflow: workflow_for_context(&query_plan, &context_pack),
+        query_plan,
+        evidence_pack: None,
+        context_pack: Some(context_pack),
+        idempotency_key: None,
+    }
 }
 
 fn sample_page_request(query_plan_hash: &str) -> SnapshotPageRequest {
@@ -300,7 +380,6 @@ fn r_a_g_operation_envelopes_construct() {
     let cp = sample_context_pack(&ep_hash);
     let cp_hash = cp.header.identity.content_hash.as_str().to_string();
     let da = sample_derived(&cp_hash);
-    let wf = sample_workflow(&plan_hash);
 
     RetrieveRequest::new(plan).unwrap().validate().unwrap();
     EvidenceGetRequest::new(&ep_hash)
@@ -313,7 +392,16 @@ fn r_a_g_operation_envelopes_construct() {
         .unwrap()
         .validate()
         .unwrap();
-    WorkflowRunRequest::new(wf).unwrap().validate().unwrap();
+    WorkflowRunRequest::new(
+        "wf-sdk-1",
+        WorkflowPhase::Retrieving,
+        sample_query_plan(),
+        None,
+        None,
+    )
+    .unwrap()
+    .validate()
+    .unwrap();
 
     let art = ArtifactRef::new("derived_artifact", "da-sdk-1")
         .unwrap()
@@ -569,10 +657,7 @@ impl VerbatimClient for StubClient {
 
     async fn run_workflow(&self, request: WorkflowRunRequest) -> ClientResult<WorkflowRunResponse> {
         request.validate()?;
-        Ok(WorkflowRunResponse {
-            workflow: request.workflow.clone(),
-            run_id: "run-1".into(),
-        })
+        WorkflowRunResponse::new("run-1", request)
     }
 
     async fn submit_task(&self, request: TaskSubmitRequest) -> ClientResult<TaskSubmitResponse> {
@@ -674,9 +759,17 @@ async fn verbatim_client_stub_round_trip() {
         .unwrap();
     assert!(verified.ok);
 
-    let wf = sample_workflow(&plan_hash);
     let run = client
-        .run_workflow(WorkflowRunRequest::new(wf).unwrap())
+        .run_workflow(
+            WorkflowRunRequest::new(
+                "wf-sdk-1",
+                WorkflowPhase::Retrieving,
+                sample_query_plan(),
+                None,
+                None,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(run.run_id, "run-1");
