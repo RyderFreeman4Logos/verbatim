@@ -534,3 +534,55 @@ fn live_ask_context_pack_all_blank_ids_serialize_and_deserialize_are_rejected() 
     serde_json::from_value::<AskResponse>(encoded_ask_context_with_blank_context_pack_ids(&[" "]))
         .expect_err("context pack must reject all-blank selected_unit_ids");
 }
+
+#[test]
+fn live_envelope_profile_ref_retrieve_request_stamps_executed_profile() {
+    let request: RetrieveRequest = serde_json::from_value(serde_json::json!({
+        "question": "What is cited?",
+        "embedding_profile_id": "default",
+    }))
+    .unwrap();
+    let encoded = serde_json::to_value(&request).unwrap();
+    assert_eq!(encoded["query_plan"]["header"]["profile_ref"], "default");
+}
+
+#[test]
+fn live_envelope_profile_ref_retrieve_response_stamps_executed_profile() {
+    let encoded = serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
+    assert_eq!(encoded["evidence_pack"]["header"]["profile_ref"], "default");
+}
+
+#[test]
+fn live_envelope_profile_ref_ask_context_stamps_executed_profile() {
+    let encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    assert_eq!(encoded["context_pack"]["header"]["profile_ref"], "default");
+}
+
+#[test]
+fn live_envelope_profile_ref_retrieve_request_mismatch_is_rejected() {
+    let mut plan = serde_json::to_value(live_question_plan("What is cited?")).unwrap();
+    plan["header"]["profile_ref"] = serde_json::json!("other");
+    serde_json::from_value::<RetrieveRequest>(serde_json::json!({
+        "question": "What is cited?",
+        "embedding_profile_id": "default",
+        "query_plan": plan,
+    }))
+    .expect_err("query plan profile_ref must match the executed embedding profile");
+}
+
+#[test]
+fn live_envelope_profile_ref_retrieve_response_mismatch_is_rejected() {
+    let mut encoded =
+        serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
+    encoded["evidence_pack"]["header"]["profile_ref"] = serde_json::json!("other");
+    serde_json::from_value::<RetrieveResponse>(encoded)
+        .expect_err("evidence pack profile_ref must match the executed embedding profile");
+}
+
+#[test]
+fn live_envelope_profile_ref_ask_context_mismatch_is_rejected() {
+    let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    encoded["context_pack"]["header"]["profile_ref"] = serde_json::json!("other");
+    serde_json::from_value::<AskResponse>(encoded)
+        .expect_err("context pack profile_ref must match the executed embedding profile");
+}

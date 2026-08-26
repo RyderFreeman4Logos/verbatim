@@ -142,6 +142,7 @@ impl Serialize for RetrieveResponse {
             evidence_pack: retrieve_envelope::evidence_pack_from_retrieve(
                 &self.query,
                 &self.results,
+                &self.embedding_profile_id,
             )
             .map_err(serde::ser::Error::custom)?,
         };
@@ -164,11 +165,20 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
         D: serde::Deserializer<'de>,
     {
         let wire = RetrieveResponseWire::deserialize(deserializer)?;
-        retrieve_envelope::evidence_pack_from_retrieve(&wire.query, &wire.results)
-            .map_err(serde::de::Error::custom)?;
+        retrieve_envelope::evidence_pack_from_retrieve(
+            &wire.query,
+            &wire.results,
+            &wire.embedding_profile_id,
+        )
+        .map_err(serde::de::Error::custom)?;
         if let Some(pack) = &wire.evidence_pack {
-            retrieve_envelope::bind_evidence_pack_to_retrieve(&wire.query, &wire.results, pack)
-                .map_err(serde::de::Error::custom)?;
+            retrieve_envelope::bind_evidence_pack_to_retrieve(
+                &wire.query,
+                &wire.results,
+                &wire.embedding_profile_id,
+                pack,
+            )
+            .map_err(serde::de::Error::custom)?;
         }
         let value = serde_json::to_value(&wire).map_err(serde::de::Error::custom)?;
         let text_taxonomy = ResponseTextTaxonomy::from_serialized_value(&value);
