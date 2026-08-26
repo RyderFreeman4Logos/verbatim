@@ -6,7 +6,7 @@ use super::{
     ImageArtifactResponse, ResponseTextTaxonomy, RetrievalDebug, RetrieveControlsResponse,
     RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceLocator,
 };
-use crate::wire_schemas::EvidencePackEnvelope;
+use crate::wire_schemas::{ContextPackEnvelope, EvidencePackEnvelope};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AskResponseWire {
@@ -23,6 +23,8 @@ struct AskResponseWire {
     retrieval: Option<RetrievalDebug>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context: Option<RetrieveResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_pack: Option<ContextPackEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     collection_filter: Option<CollectionFilterResponse>,
 }
@@ -41,6 +43,8 @@ impl Serialize for AskResponse {
             verified: self.verified,
             retrieval: self.retrieval.clone(),
             context: self.context.clone(),
+            context_pack: retrieve_envelope::context_pack_from_ask_context(self.context.as_ref())
+                .map_err(serde::ser::Error::custom)?,
             collection_filter: self.collection_filter.clone(),
         };
         let mut value = serde_json::to_value(wire).map_err(serde::ser::Error::custom)?;
@@ -62,6 +66,11 @@ impl<'de> Deserialize<'de> for AskResponse {
         D: serde::Deserializer<'de>,
     {
         let wire = AskResponseWire::deserialize(deserializer)?;
+        retrieve_envelope::bind_context_pack_to_ask_context(
+            wire.context.as_ref(),
+            wire.context_pack.as_ref(),
+        )
+        .map_err(serde::de::Error::custom)?;
         let value = serde_json::to_value(&wire).map_err(serde::de::Error::custom)?;
         let text_taxonomy = ResponseTextTaxonomy::from_serialized_value(&value);
         Ok(Self {
