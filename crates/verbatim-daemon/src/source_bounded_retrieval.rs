@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
+use verbatim_core::api::RetrieveResponse;
 use verbatim_core::retrieve::refresh_evidence_pack_debug;
 use verbatim_core::store::Store;
 use verbatim_core::types::{ChunkId, EvidenceKind, RetrievalDebug, RetrievalResult};
@@ -197,4 +198,22 @@ fn filter_retrieval_debug_chunk_identities(
             true
         });
     }
+}
+
+pub(super) fn executed_retrieve_for_generated_ask(
+    question: &str,
+    embedding_profile_id: impl Into<String>,
+    results: &[RetrievalResult],
+) -> RetrieveResponse {
+    RetrieveResponse::from_executed_ask_units(
+        question,
+        embedding_profile_id,
+        None,
+        results.iter().flat_map(|result| {
+            result
+                .evidence_units
+                .iter()
+                .map(|evidence| evidence.id.0.as_str())
+        }),
+    )
 }

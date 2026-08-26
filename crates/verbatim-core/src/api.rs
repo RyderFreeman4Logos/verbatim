@@ -1203,3 +1203,7 @@ mod api_response_taxonomy_tests;
 #[cfg(test)]
 #[path = "api_retrieve_envelope_wire_tests.rs"]
 mod api_retrieve_envelope_wire_tests;
+
+#[cfg(test)]
+#[path = "api_generated_ask_context_pack_wire_tests.rs"]
+mod api_generated_ask_context_pack_wire_tests;
