@@ -5573,6 +5573,7 @@ mod tests {
                 .embedding_profile_id
                 .clone()
                 .unwrap_or_else(|| "default".into()),
+            generation: None,
             limit: request.limit.unwrap_or(12),
             page_size: request.page_size.unwrap_or(1),
             page: request.page.unwrap_or(1),

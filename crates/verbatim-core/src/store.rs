@@ -41,6 +41,8 @@ mod store_cache;
 mod store_chunk_batch;
 #[path = "store_deletion.rs"]
 mod store_deletion;
+#[path = "store_source_bounded_generation.rs"]
+mod store_source_bounded_generation;
 #[path = "store_statement_count.rs"]
 mod store_statement_count;
 pub use source_contents_replacement::{

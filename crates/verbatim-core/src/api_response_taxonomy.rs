@@ -509,6 +509,7 @@ impl ResponseTextTaxonomy {
 
 const RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS: &[&str] = &[
     "evidence_pack.evidence_unit_ids[]",
+    "evidence_pack.header.generation",
     "evidence_pack.header.identity.artifact_id",
     "evidence_pack.header.identity.content_hash",
     "evidence_pack.header.identity.kind",
@@ -518,6 +519,7 @@ const RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS: &[&str] = &[
 
 const ASK_CONTEXT_PACK_IDENTITY_FIELDS: &[&str] = &[
     "context_pack.evidence_pack_hash",
+    "context_pack.header.generation",
     "context_pack.header.identity.artifact_id",
     "context_pack.header.identity.content_hash",
     "context_pack.header.identity.kind",

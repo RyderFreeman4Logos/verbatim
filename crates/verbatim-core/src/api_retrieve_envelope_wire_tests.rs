@@ -28,6 +28,7 @@ fn sample_retrieve_response(query: &str, evidence_id: &str) -> RetrieveResponse 
         source_id: None,
         collection_filter: None,
         embedding_profile_id: "default".into(),
+        generation: Some("7".into()),
         limit: 12,
         page_size: 1,
         page: 1,
@@ -585,4 +586,33 @@ fn live_envelope_profile_ref_ask_context_mismatch_is_rejected() {
     encoded["context_pack"]["header"]["profile_ref"] = serde_json::json!("other");
     serde_json::from_value::<AskResponse>(encoded)
         .expect_err("context pack profile_ref must match the executed embedding profile");
+}
+
+#[test]
+fn live_envelope_generation_retrieve_response_stamps_executed_generation() {
+    let encoded = serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
+    assert_eq!(encoded["evidence_pack"]["header"]["generation"], "7");
+}
+
+#[test]
+fn live_envelope_generation_ask_context_stamps_executed_generation() {
+    let encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    assert_eq!(encoded["context_pack"]["header"]["generation"], "7");
+}
+
+#[test]
+fn live_envelope_generation_retrieve_response_mismatch_is_rejected() {
+    let mut encoded =
+        serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
+    encoded["evidence_pack"]["header"]["generation"] = serde_json::json!("other");
+    serde_json::from_value::<RetrieveResponse>(encoded)
+        .expect_err("evidence pack generation must match the executed index generation");
+}
+
+#[test]
+fn live_envelope_generation_ask_context_mismatch_is_rejected() {
+    let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    encoded["context_pack"]["header"]["generation"] = serde_json::json!("other");
+    serde_json::from_value::<AskResponse>(encoded)
+        .expect_err("context pack generation must match the executed index generation");
 }

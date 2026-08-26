@@ -125,6 +125,7 @@ fn retrieve_response_taxonomy_classifies_generated_and_source_result_text_by_rol
         source_id: Some("src".into()),
         collection_filter: None,
         embedding_profile_id: "default".into(),
+        generation: None,
         limit: 2,
         page_size: 2,
         page: 1,
