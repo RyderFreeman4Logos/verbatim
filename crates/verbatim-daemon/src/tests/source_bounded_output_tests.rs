@@ -587,6 +587,7 @@ fn final_retrieve_response(
 ) -> Result<RetrieveResponse> {
     filter_generated_retrieval_evidence(
         store,
+        &input.embedding_profile_id,
         &mut input.results,
         Some(&mut input.debug),
         input.controls.include_debug,

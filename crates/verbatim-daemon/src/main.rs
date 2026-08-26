@@ -4921,7 +4921,7 @@ async fn execute_ask_task_inner_with_config(
             .with_active_worker_kind(TaskKind::Ask.as_str()),
     )
     .await;
-    let (results, generation_context, retrieval_debug) = prepare_generation_context(
+    let (results, generation_context, retrieval_debug, generation) = prepare_generation_context(
         Arc::clone(&state),
         &question,
         query_scope.source_filter.clone(),
@@ -5095,6 +5095,7 @@ async fn execute_ask_task_inner_with_config(
             source_bounded_retrieval::executed_retrieve_for_generated_ask(
                 &question,
                 embedding_profile_id.as_str(),
+                generation,
                 &results,
             ),
         ),
@@ -5218,7 +5219,7 @@ async fn execute_ask_stream_task_inner(
             .with_active_worker_kind(TaskKind::Ask.as_str()),
     )
     .await;
-    let (results, generation_context, retrieval_debug) = prepare_generation_context(
+    let (results, generation_context, retrieval_debug, _generation) = prepare_generation_context(
         Arc::clone(&state),
         &question,
         query_scope.source_filter.clone(),
@@ -7459,10 +7460,12 @@ async fn prepare_retrieve_context(
         with_sqlite_reader_permit(&sqlite_reader, || {
             filter_generated_retrieval_evidence(
                 pipeline.store(),
+                &embedding_profile_id,
                 &mut results,
                 Some(&mut debug),
                 controls.include_debug,
             )
+            .map(|_| ())
         })?;
         let sources = with_sqlite_reader_permit(&sqlite_reader, || {
             sources_for_results(&results, pipeline.store())
@@ -7511,6 +7514,7 @@ async fn prepare_generation_context(
         Vec<RetrievalResult>,
         GenerationContext,
         Option<RetrievalDebug>,
+        Option<String>,
     ),
     (StatusCode, Json<ErrorResponse>),
 > {
@@ -7528,7 +7532,7 @@ async fn prepare_generation_context(
     let sqlite_reader = Arc::clone(&state.resources.sqlite_reader);
     let vector_search = Arc::clone(&state.resources.vector_search);
     let runtime = tokio::runtime::Handle::current();
-    let (results, generation_context, retrieval_debug) =
+    let (results, generation_context, retrieval_debug, generation) =
         with_query_pipeline(&state, move |pipeline| {
             with_sqlite_reader_permit(&sqlite_reader, || {
                 prepare_query_embedding_profile_readonly(
@@ -7579,8 +7583,9 @@ async fn prepare_generation_context(
                 Ok::<_, anyhow::Error>((results, retrieval_debug))
             });
             let (mut results, mut retrieval_debug) = retrieval_result?;
-            filter_generated_retrieval_evidence(
+            let generation = filter_generated_retrieval_evidence(
                 pipeline.store(),
+                &embedding_profile_id,
                 &mut results,
                 retrieval_debug.as_mut(),
                 true,
@@ -7602,12 +7607,13 @@ async fn prepare_generation_context(
                 results,
                 GenerationContext::new(image_artifacts, image_attachments),
                 retrieval_debug,
+                generation,
             ))
         })
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok((results, generation_context, retrieval_debug))
+    Ok((results, generation_context, retrieval_debug, generation))
 }
 
 fn ask_debug_options(config: &Config, show_retrieval: bool) -> RetrievalDebugOptions {
