@@ -6,7 +6,7 @@ use super::{
 use crate::wire_schemas::{
     decode_context_pack_envelope_json, decode_evidence_pack_envelope_json,
     decode_query_plan_envelope_json, ContextPackEnvelope, ContextPackFields, EvidencePackEnvelope,
-    QueryPlanEnvelope, QueryPlanFields, WireSchemaVersion, WIRE_SCHEMA_VERSION,
+    QueryPlanEnvelope, QueryPlanFields, WIRE_SCHEMA_VERSION,
 };
 
 fn sample_query_plan() -> QueryPlanEnvelope {
@@ -117,6 +117,13 @@ fn context_pack_with(
     .unwrap()
 }
 
+fn with_unknown_schema_version(mut envelope: serde_json::Value) -> serde_json::Value {
+    let version = serde_json::json!({ "major": 99, "minor": 0, "patch": 0 });
+    envelope["header"]["schema_version"] = version.clone();
+    envelope["header"]["identity"]["schema_version"] = version;
+    envelope
+}
+
 fn encoded_ask_context_without_pack(evidence_ids: &[&str]) -> serde_json::Value {
     let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
     let template = encoded["context"]["results"][0].clone();
@@ -183,11 +190,11 @@ fn live_retrieve_request_valid_query_plan_envelope_round_trips() {
 
 #[test]
 fn live_retrieve_request_unknown_schema_version_is_rejected() {
-    let mut plan = sample_query_plan();
-    plan.header.schema_version = WireSchemaVersion::new(99, 0, 0);
-    plan.header.identity.schema_version = WireSchemaVersion::new(99, 0, 0);
+    let plan = sample_query_plan();
+    let question = plan.query_text.clone();
+    let plan = with_unknown_schema_version(serde_json::to_value(plan).unwrap());
     serde_json::from_value::<RetrieveRequest>(serde_json::json!({
-        "question": plan.query_text,
+        "question": question,
         "query_plan": plan,
     }))
     .expect_err("unknown query plan schema must fail closed");
@@ -316,10 +323,14 @@ fn live_ask_context_pack_incomplete_or_unknown_identity_is_rejected() {
         .expect_err("incomplete context pack identity must fail closed");
 
     let mut unknown = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
-    let mut pack = context_pack_with(context_pack_hash(&unknown), vec!["ev-1".into()]);
-    pack.header.schema_version = WireSchemaVersion::new(2, 0, 0);
-    pack.header.identity.schema_version = WireSchemaVersion::new(2, 0, 0);
-    unknown["context_pack"] = serde_json::to_value(pack).unwrap();
+    let pack = with_unknown_schema_version(
+        serde_json::to_value(context_pack_with(
+            context_pack_hash(&unknown),
+            vec!["ev-1".into()],
+        ))
+        .unwrap(),
+    );
+    unknown["context_pack"] = pack;
     serde_json::from_value::<AskResponse>(unknown)
         .expect_err("unknown context pack identity schema must fail closed");
 }
@@ -329,7 +340,7 @@ fn live_retrieve_response_unknown_schema_version_is_rejected() {
     let mut encoded =
         serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
     let plan = sample_query_plan();
-    let mut pack = EvidencePackEnvelope::new(crate::wire_schemas::EvidencePackFields {
+    let pack = EvidencePackEnvelope::new(crate::wire_schemas::EvidencePackFields {
         artifact_id: "ep-live-retrieve".into(),
         evidence_unit_ids: vec!["ev-1".into()],
         query_plan_hash: plan.header.identity.content_hash.as_str().into(),
@@ -337,9 +348,7 @@ fn live_retrieve_response_unknown_schema_version_is_rejected() {
         profile_ref: None,
     })
     .unwrap();
-    pack.header.schema_version = WireSchemaVersion::new(2, 0, 0);
-    pack.header.identity.schema_version = WireSchemaVersion::new(2, 0, 0);
-    encoded["evidence_pack"] = serde_json::to_value(pack).unwrap();
+    encoded["evidence_pack"] = with_unknown_schema_version(serde_json::to_value(pack).unwrap());
     serde_json::from_value::<RetrieveResponse>(encoded)
         .expect_err("unknown evidence pack schema must fail closed");
 }

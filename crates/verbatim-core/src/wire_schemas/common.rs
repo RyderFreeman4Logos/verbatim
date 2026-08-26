@@ -6,8 +6,7 @@ use std::fmt;
 
 /// Wire schema version for documents in this module.
 ///
-/// Unknown versions must fail closed on decode rather than being silently
-/// accepted as current-schema envelopes.
+/// Unknown versions must fail closed during serialization and deserialization.
 pub const WIRE_SCHEMA_VERSION: WireSchemaVersion = WireSchemaVersion::new(1, 0, 0);
 
 /// Semantic wire schema version (`major.minor.patch`).
@@ -15,12 +14,46 @@ pub const WIRE_SCHEMA_VERSION: WireSchemaVersion = WireSchemaVersion::new(1, 0, 
 /// Distinct from storage/migration schema stamps: this versions the public
 /// artifact envelopes exchanged among clients, coordinator, storage, and
 /// workflows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WireSchemaVersion {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireSchemaVersionWire {
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
+
+impl Serialize for WireSchemaVersion {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        validate_wire_schema_version(*self).map_err(serde::ser::Error::custom)?;
+        WireSchemaVersionWire {
+            major: self.major,
+            minor: self.minor,
+            patch: self.patch,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireSchemaVersion {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WireSchemaVersionWire::deserialize(deserializer)?;
+        let version = Self::new(wire.major, wire.minor, wire.patch);
+        validate_wire_schema_version(version).map_err(serde::de::Error::custom)?;
+        Ok(version)
+    }
 }
 
 impl WireSchemaVersion {
