@@ -116,6 +116,7 @@ pub enum WireArtifactKind {
     ContextPack,
     DerivedArtifact,
     WorkflowEnvelope,
+    Evidence,
 }
 
 impl WireArtifactKind {
@@ -126,6 +127,7 @@ impl WireArtifactKind {
             Self::ContextPack => "context_pack",
             Self::DerivedArtifact => "derived_artifact",
             Self::WorkflowEnvelope => "workflow_envelope",
+            Self::Evidence => "evidence",
         }
     }
 }
