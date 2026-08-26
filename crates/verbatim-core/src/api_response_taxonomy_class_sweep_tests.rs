@@ -64,6 +64,31 @@ fn supplied_taxonomy_is_recomputed_for_all_response_shapes() {
         |response| response.text_taxonomy.clone(),
     );
 
+    let mut generated: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/legacy_ask_response_without_taxonomy.json"
+    ))
+    .unwrap();
+    generated["context"] = serde_json::from_str(include_str!(
+        "fixtures/legacy_retrieve_caption_without_taxonomy.json"
+    ))
+    .unwrap();
+    generated["context"]["generation"] = serde_json::json!("7");
+    let generated = tampered_taxonomy(
+        serde_json::to_value(serde_json::from_value::<AskResponse>(generated).unwrap()).unwrap(),
+    );
+    assert!(generated.get("context").is_none());
+    assert_header_generation_is_metadata(
+        "generated ask without context",
+        &generated,
+        &["context_pack.header.generation"],
+    );
+    assert_taxonomy_recomputed(
+        "generated ask without context",
+        generated,
+        |value| serde_json::from_value::<AskResponse>(value).unwrap(),
+        |response| response.text_taxonomy.clone(),
+    );
+
     let mut retrieve = tampered_taxonomy(serde_json::from_str(include_str!(
         "fixtures/legacy_retrieve_caption_without_taxonomy.json"
     ))

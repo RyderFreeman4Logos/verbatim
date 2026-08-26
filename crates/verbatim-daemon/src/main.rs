@@ -5091,7 +5091,13 @@ async fn execute_ask_task_inner_with_config(
         citations,
         verified: gen_result.verified,
         retrieval: retrieval_for_response,
-        context: None,
+        context: Some(
+            source_bounded_retrieval::executed_retrieve_for_generated_ask(
+                &question,
+                embedding_profile_id.as_str(),
+                &results,
+            ),
+        ),
         collection_filter: query_scope.collection_filter,
     };
     let response_formatting_ms = elapsed_ms(response_started);

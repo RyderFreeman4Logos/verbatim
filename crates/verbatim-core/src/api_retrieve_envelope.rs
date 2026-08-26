@@ -2,8 +2,9 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    is_false, AskRequest, CollectionFilterRequest, RetrieveRequest, RetrieveResponse,
-    RetrieveResultResponse,
+    is_false, AskRequest, AuditReceipt, CollectionFilterRequest, ResponseTextTaxonomy,
+    RetrieveControlsResponse, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+    AUDIT_RECEIPT_VERSION,
 };
 use crate::wire_schemas::{
     ContextPackEnvelope, ContextPackFields, EvidencePackEnvelope, EvidencePackFields,
@@ -109,6 +110,9 @@ pub(super) fn bind_context_pack_to_ask_context(
     };
     pack.validate()?;
     let Some(expected) = expected else {
+        if context.is_none() {
+            return Ok(());
+        }
         anyhow::bail!("context pack must match returned context");
     };
     if pack.evidence_pack_hash != expected.evidence_pack_hash {
@@ -339,5 +343,75 @@ impl<'de> Deserialize<'de> for AskRequest {
             page_size: wire.page_size,
             page: wire.page,
         })
+    }
+}
+
+impl RetrieveResponse {
+    pub fn from_executed_ask_units(
+        query: impl Into<String>,
+        embedding_profile_id: impl Into<String>,
+        generation: Option<String>,
+        evidence_ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let embedding_profile_id = embedding_profile_id.into();
+        let results: Vec<RetrieveResultResponse> = evidence_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, evidence_id)| RetrieveResultResponse {
+                index,
+                rank: index + 1,
+                label: format!("E{}", index + 1),
+                evidence_id: evidence_id.into(),
+                text_hash: String::new(),
+                source_id: String::new(),
+                source_hash: String::new(),
+                source_path: None,
+                collections: Vec::new(),
+                chunk_id: String::new(),
+                kind: "text".into(),
+                role: "original_text".into(),
+                score: 0.0,
+                locator: String::new(),
+                structured_locator: None,
+                provenance: None,
+                derived_from: None,
+                snippet: String::new(),
+            })
+            .collect();
+        let returned_results = results.len();
+        let controls = RetrieveControlsResponse {
+            fast: false,
+            rerank_enabled: false,
+            dense_top_k: 0,
+            bm25_top_k: 0,
+            rrf_k: 0,
+            rerank_top_n: 0,
+        };
+        Self {
+            task_id: String::new(),
+            query: query.into(),
+            text_taxonomy: ResponseTextTaxonomy::retrieve_response(),
+            source_id: None,
+            collection_filter: None,
+            embedding_profile_id: embedding_profile_id.clone(),
+            generation,
+            limit: returned_results,
+            page_size: returned_results.max(1),
+            page: 1,
+            total_results: returned_results,
+            returned_results,
+            source_bounded: true,
+            controls: controls.clone(),
+            audit_receipt: AuditReceipt {
+                version: AUDIT_RECEIPT_VERSION,
+                embedding_profile_id,
+                source_bounded: true,
+                controls,
+                results: Vec::new(),
+            },
+            timings: Vec::new(),
+            results,
+            debug: None,
+        }
     }
 }

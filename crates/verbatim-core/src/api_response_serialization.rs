@@ -42,7 +42,10 @@ impl Serialize for AskResponse {
             citations: self.citations.clone(),
             verified: self.verified,
             retrieval: self.retrieval.clone(),
-            context: self.context.clone(),
+            context: match self.answer_kind {
+                AnswerKind::GeneratedInterpretation => None,
+                AnswerKind::EvidenceOnly => self.context.clone(),
+            },
             context_pack: retrieve_envelope::context_pack_from_ask_context(self.context.as_ref())
                 .map_err(serde::ser::Error::custom)?,
             collection_filter: self.collection_filter.clone(),
