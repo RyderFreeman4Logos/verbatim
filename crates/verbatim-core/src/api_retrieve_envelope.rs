@@ -133,6 +133,14 @@ pub(super) fn bind_context_pack_to_ask_context(
     Ok(())
 }
 
+pub fn generated_ask_stream_context_pack(
+    context: Option<&RetrieveResponse>,
+    supplied: Option<&ContextPackEnvelope>,
+) -> Result<Option<ContextPackEnvelope>> {
+    bind_context_pack_to_ask_context(context, supplied)?;
+    context_pack_from_ask_context(context)
+}
+
 fn require_non_blank_result_evidence_ids(results: &[RetrieveResultResponse]) -> Result<()> {
     if results
         .iter()

@@ -1,6 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
+use verbatim_core::wire_schemas::decode_context_pack_envelope_json;
 
 use super::*;
 
@@ -216,4 +217,23 @@ async fn ask_stream_without_verifier_preserves_token_streaming() {
     assert!(event_data(&body, "answer").is_empty(), "SSE: {body}");
     assert_eq!(model_server.chat_requests(), 1);
     assert_eq!(model_server.chat_payloads()[0]["stream"], true);
+}
+
+#[tokio::test]
+async fn generated_ask_stream_context_pack_stamps_sse_from_retrieve() {
+    let raw_answer = "The unverified streamed answer is alpha [E1].";
+    let (body, _model_server) =
+        ask_stream_body("ask-stream-context-pack-stamp", false, &[raw_answer]).await;
+
+    assert!(event_data(&body, "answer").is_empty(), "SSE: {body}");
+    let packs = event_data(&body, "context_pack");
+    assert_eq!(packs.len(), 1, "SSE: {body}");
+    let pack_json: serde_json::Value = serde_json::from_str(packs[0]).unwrap();
+    assert!(pack_json.get("context").is_none());
+    assert!(pack_json.get("answer").is_none());
+    let pack = decode_context_pack_envelope_json(packs[0].as_bytes()).unwrap();
+    assert!(!pack.selected_unit_ids.is_empty());
+    assert_eq!(pack.header.profile_ref.as_deref(), Some("default"));
+    assert!(pack.header.generation.is_some());
+    assert!(pack.model_fingerprint.is_none());
 }

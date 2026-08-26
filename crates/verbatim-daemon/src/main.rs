@@ -29,24 +29,24 @@ use tokio::signal;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use verbatim_core::api::{
-    AddCollectionRootRequest, AddCollectionRootResponse, AddSourceRequest, AddSourceResponse,
-    AnswerKind, AppliedCollectionFilterResponse, AskCitationEvent, AskErrorEvent, AskRequest,
-    AskResponse, AskTokenEvent, CheckStaleResponse, CitationResponse, CollectionFilterRequest,
-    CollectionFilterResponse, CollectionResponse, CollectionResultProvenance,
-    CollectionStatusResponse, CollectionSyncPathRequest, CollectionSyncRequest,
-    CollectionSyncResponse, CollectionWatcherResponse, CollectionWatcherStatus,
-    CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
-    CreateCollectionRequest, ErrorResponse, EvidenceResponse, GeneratedInterpretationResponse,
-    HealthResponse, IdleExitActivitySnapshot, IdleExitHealth, IdleReclaimActivitySnapshot,
-    IdleReclaimBackendResult, IdleReclaimCycleResult, IdleReclaimHealth, ImageArtifactResponse,
-    IndexGcRequest, IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse,
-    IndexStatusResponse, IngestResponse, ReadinessHealth, ReindexRequest, ReindexResponse,
-    ResponseTextTaxonomy, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
-    RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
-    TaskEventsResponse, TaskIngestRequest, TaskListAggregate, TaskListResponse,
-    TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
-    TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent, VectorJsonCleanupRequest,
-    VectorJsonCleanupResponse,
+    generated_ask_stream_context_pack, AddCollectionRootRequest, AddCollectionRootResponse,
+    AddSourceRequest, AddSourceResponse, AnswerKind, AppliedCollectionFilterResponse,
+    AskCitationEvent, AskErrorEvent, AskRequest, AskResponse, AskTokenEvent, CheckStaleResponse,
+    CitationResponse, CollectionFilterRequest, CollectionFilterResponse, CollectionResponse,
+    CollectionResultProvenance, CollectionStatusResponse, CollectionSyncPathRequest,
+    CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
+    CollectionWatcherStatus, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
+    ConfigResponse, CreateCollectionRequest, ErrorResponse, EvidenceResponse,
+    GeneratedInterpretationResponse, HealthResponse, IdleExitActivitySnapshot, IdleExitHealth,
+    IdleReclaimActivitySnapshot, IdleReclaimBackendResult, IdleReclaimCycleResult,
+    IdleReclaimHealth, ImageArtifactResponse, IndexGcRequest, IndexGcResponse,
+    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
+    ReadinessHealth, ReindexRequest, ReindexResponse, ResponseTextTaxonomy, RetrieveRequest,
+    RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
+    TaskCreatedResponse, TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskIngestRequest,
+    TaskListAggregate, TaskListResponse, TaskProfileResponse, TaskQueueTurnover,
+    TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse,
+    TaskWaitEvent, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -5219,7 +5219,7 @@ async fn execute_ask_stream_task_inner(
             .with_active_worker_kind(TaskKind::Ask.as_str()),
     )
     .await;
-    let (results, generation_context, retrieval_debug, _generation) = prepare_generation_context(
+    let (results, generation_context, retrieval_debug, generation) = prepare_generation_context(
         Arc::clone(&state),
         &question,
         query_scope.source_filter.clone(),
@@ -5397,6 +5397,18 @@ async fn execute_ask_stream_task_inner(
         ),
     )
     .await?;
+
+    let context = source_bounded_retrieval::executed_retrieve_for_generated_ask(
+        &question,
+        embedding_profile_id.as_str(),
+        generation,
+        &results,
+    );
+    if let Some(pack) = generated_ask_stream_context_pack(Some(&context), None)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+    {
+        send_stream_event(&tx, sse_json_event("context_pack", &pack)).await?;
+    }
 
     if show_retrieval {
         if let Some(debug) = retrieval_debug {

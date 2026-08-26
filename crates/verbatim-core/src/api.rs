@@ -581,6 +581,7 @@ pub use response_taxonomy::{OutputTextPlane, ResponseTextTaxonomy, TextFieldTaxo
 mod response_serialization;
 #[path = "api_retrieve_envelope.rs"]
 mod retrieve_envelope;
+pub use retrieve_envelope::generated_ask_stream_context_pack;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1207,3 +1208,7 @@ mod api_retrieve_envelope_wire_tests;
 #[cfg(test)]
 #[path = "api_generated_ask_context_pack_wire_tests.rs"]
 mod api_generated_ask_context_pack_wire_tests;
+
+#[cfg(test)]
+#[path = "api_generated_ask_stream_context_pack_wire_tests.rs"]
+mod api_generated_ask_stream_context_pack_wire_tests;
