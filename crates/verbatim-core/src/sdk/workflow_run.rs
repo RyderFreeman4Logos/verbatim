@@ -36,6 +36,8 @@ impl WorkflowRunRequest {
             None,
             None,
         )?;
+        let (generation, profile_ref) =
+            workflow_bound_headers(&query_plan, evidence_pack.as_ref(), context_pack.as_ref())?;
         let req = Self {
             workflow: WorkflowEnvelope::new(WorkflowEnvelopeFields {
                 artifact_id: artifact_id.into(),
@@ -43,8 +45,8 @@ impl WorkflowRunRequest {
                 query_plan_hash,
                 evidence_pack_hash,
                 context_pack_hash,
-                generation: None,
-                profile_ref: None,
+                generation,
+                profile_ref,
             })
             .map_err(|err| ClientError::validation(err.to_string()))?,
             query_plan,
@@ -212,22 +214,62 @@ fn validate_workflow_payload(
         workflow.evidence_pack_hash.as_deref(),
         workflow.context_pack_hash.as_deref(),
     )?;
+    let (generation, profile_ref) =
+        workflow_bound_headers(query_plan, evidence_pack, context_pack)?;
     let expected = WorkflowEnvelope::new(WorkflowEnvelopeFields {
         artifact_id: workflow.header.identity.artifact_id.clone(),
         phase: workflow.phase,
         query_plan_hash,
         evidence_pack_hash,
         context_pack_hash,
-        generation: workflow.header.generation.clone(),
-        profile_ref: workflow.header.profile_ref.clone(),
+        generation,
+        profile_ref,
     })
     .map_err(|err| ClientError::validation(err.to_string()))?;
-    if workflow.header.identity != expected.header.identity {
+    if workflow.header.identity != expected.header.identity
+        || workflow.header.profile_ref != expected.header.profile_ref
+        || workflow.header.generation != expected.header.generation
+    {
         return Err(ClientError::validation(
             "workflow envelope identity does not match the executed or returned payload",
         ));
     }
     Ok(())
+}
+
+fn workflow_bound_headers(
+    query_plan: &QueryPlanEnvelope,
+    evidence_pack: Option<&EvidencePackEnvelope>,
+    context_pack: Option<&ContextPackEnvelope>,
+) -> ClientResult<(Option<String>, Option<String>)> {
+    let profile_ref = query_plan.header.profile_ref.clone();
+    for (label, header) in [
+        evidence_pack.map(|pack| ("evidence pack", &pack.header)),
+        context_pack.map(|pack| ("context pack", &pack.header)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if header.profile_ref != profile_ref {
+            return Err(ClientError::validation(format!(
+                "workflow profile_ref does not match the executed {label}"
+            )));
+        }
+    }
+    let generation = match (evidence_pack, context_pack) {
+        (None, None) => query_plan.header.generation.clone(),
+        (Some(evidence), Some(context)) => {
+            if evidence.header.generation != context.header.generation {
+                return Err(ClientError::validation(
+                    "workflow generation does not match the executed context pack",
+                ));
+            }
+            evidence.header.generation.clone()
+        }
+        (Some(pack), None) => pack.header.generation.clone(),
+        (None, Some(pack)) => pack.header.generation.clone(),
+    };
+    Ok((generation, profile_ref))
 }
 
 fn workflow_payload_hashes(
