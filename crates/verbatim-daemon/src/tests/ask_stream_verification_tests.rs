@@ -1,7 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
-use verbatim_core::wire_schemas::decode_context_pack_envelope_json;
+use verbatim_core::wire_schemas::{decode_context_pack_envelope_json, WIRE_SCHEMA_VERSION};
 
 use super::*;
 
@@ -217,6 +217,50 @@ async fn ask_stream_without_verifier_preserves_token_streaming() {
     assert!(event_data(&body, "answer").is_empty(), "SSE: {body}");
     assert_eq!(model_server.chat_requests(), 1);
     assert_eq!(model_server.chat_payloads()[0]["stream"], true);
+}
+
+#[tokio::test]
+async fn default_generated_ask_stream_publishes_terminal_derived_identity() {
+    let raw_answer = "The unverified streamed answer is alpha [E1].";
+    let (body, _model_server) =
+        ask_stream_body("ask-stream-generated-interpretation", false, &[raw_answer]).await;
+
+    let citations = event_data(&body, "citation");
+    assert_eq!(citations.len(), 1, "SSE: {body}");
+    let citation: AskCitationEvent = serde_json::from_str(citations[0]).unwrap();
+    let completed_answer = format!(
+        "{raw_answer}\n\nReferences:\n[{}] {}: {}\n",
+        citation.citations[0].label, citation.citations[0].kind, citation.citations[0].locator
+    );
+
+    let interpretations = event_data(&body, "generated_interpretation");
+    assert_eq!(interpretations.len(), 1, "SSE: {body}");
+    let interpretation: serde_json::Value = serde_json::from_str(interpretations[0]).unwrap();
+    assert_eq!(interpretation["text"], completed_answer);
+    assert_eq!(interpretation["identity"]["kind"], "derived_artifact");
+    assert_eq!(
+        interpretation["identity"]["artifact_id"],
+        "live-ask-generated-interpretation"
+    );
+    assert_eq!(
+        interpretation["identity"]["schema_version"]["major"],
+        WIRE_SCHEMA_VERSION.major
+    );
+    assert_eq!(
+        interpretation["identity"]["schema_version"]["minor"],
+        WIRE_SCHEMA_VERSION.minor
+    );
+    assert_eq!(
+        interpretation["identity"]["schema_version"]["patch"],
+        WIRE_SCHEMA_VERSION.patch
+    );
+    assert!(interpretation["identity"]["content_hash"]
+        .as_str()
+        .is_some_and(|hash| !hash.is_empty()));
+    assert!(interpretation.get("header").is_none());
+    assert!(interpretation.get("model_fingerprint").is_none());
+    assert!(interpretation.get("source_pack_hash").is_none());
+    assert!(body.trim_end().ends_with(interpretations[0]), "SSE: {body}");
 }
 
 #[tokio::test]

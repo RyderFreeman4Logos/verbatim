@@ -8,8 +8,9 @@ use crate::wire_schemas::{
 
 const LIVE_ASK_GENERATED_INTERPRETATION_ID: &str = "live-ask-generated-interpretation";
 
+/// Serialized generated-answer text with its canonical identity.
 #[derive(Debug, Serialize, Deserialize)]
-pub(super) struct GeneratedInterpretationWire {
+pub struct GeneratedInterpretationWire {
     text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     identity: Option<CanonicalIdentity>,
@@ -20,7 +21,8 @@ struct GeneratedInterpretationIdentityBody {
     text: String,
 }
 
-pub(super) fn generated_interpretation_wire(
+/// Serializes a generated interpretation with its canonical identity.
+pub fn generated_interpretation_wire(
     answer_kind: AnswerKind,
     response: Option<&GeneratedInterpretationResponse>,
 ) -> Result<Option<GeneratedInterpretationWire>> {

@@ -29,24 +29,25 @@ use tokio::signal;
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 
 use verbatim_core::api::{
-    generated_ask_stream_context_pack, AddCollectionRootRequest, AddCollectionRootResponse,
-    AddSourceRequest, AddSourceResponse, AnswerKind, AppliedCollectionFilterResponse,
-    AskCitationEvent, AskErrorEvent, AskRequest, AskResponse, AskTokenEvent, CheckStaleResponse,
-    CitationResponse, CollectionFilterRequest, CollectionFilterResponse, CollectionResponse,
-    CollectionResultProvenance, CollectionStatusResponse, CollectionSyncPathRequest,
-    CollectionSyncRequest, CollectionSyncResponse, CollectionWatcherResponse,
-    CollectionWatcherStatus, CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse,
-    ConfigResponse, CreateCollectionRequest, ErrorResponse, EvidenceResponse,
-    GeneratedInterpretationResponse, HealthResponse, IdleExitActivitySnapshot, IdleExitHealth,
-    IdleReclaimActivitySnapshot, IdleReclaimBackendResult, IdleReclaimCycleResult,
-    IdleReclaimHealth, ImageArtifactResponse, IndexGcRequest, IndexGcResponse,
-    IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse, IngestResponse,
-    ReadinessHealth, ReindexRequest, ReindexResponse, ResponseTextTaxonomy, RetrieveRequest,
-    RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse, SourceResponse,
-    TaskCreatedResponse, TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskIngestRequest,
-    TaskListAggregate, TaskListResponse, TaskProfileResponse, TaskQueueTurnover,
-    TaskQueueTurnoverWindow, TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse,
-    TaskWaitEvent, VectorJsonCleanupRequest, VectorJsonCleanupResponse,
+    generated_ask_stream_context_pack, generated_interpretation_wire, AddCollectionRootRequest,
+    AddCollectionRootResponse, AddSourceRequest, AddSourceResponse, AnswerKind,
+    AppliedCollectionFilterResponse, AskCitationEvent, AskErrorEvent, AskRequest, AskResponse,
+    AskTokenEvent, CheckStaleResponse, CitationResponse, CollectionFilterRequest,
+    CollectionFilterResponse, CollectionResponse, CollectionResultProvenance,
+    CollectionStatusResponse, CollectionSyncPathRequest, CollectionSyncRequest,
+    CollectionSyncResponse, CollectionWatcherResponse, CollectionWatcherStatus,
+    CollectionWatcherUpdateRequest, CollectionWatchersStatusResponse, ConfigResponse,
+    CreateCollectionRequest, ErrorResponse, EvidenceResponse, GeneratedInterpretationResponse,
+    HealthResponse, IdleExitActivitySnapshot, IdleExitHealth, IdleReclaimActivitySnapshot,
+    IdleReclaimBackendResult, IdleReclaimCycleResult, IdleReclaimHealth, ImageArtifactResponse,
+    IndexGcRequest, IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse,
+    IndexStatusResponse, IngestResponse, ReadinessHealth, ReindexRequest, ReindexResponse,
+    ResponseTextTaxonomy, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
+    RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
+    TaskEventsResponse, TaskIngestRequest, TaskListAggregate, TaskListResponse,
+    TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
+    TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent, VectorJsonCleanupRequest,
+    VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -5418,6 +5419,25 @@ async fn execute_ask_stream_task_inner(
     if let Some(collection_filter) = &query_scope.collection_filter {
         send_stream_event(&tx, sse_json_event("collection_filter", collection_filter)).await?;
     }
+
+    let generated_interpretation = generated_interpretation_wire(
+        AnswerKind::GeneratedInterpretation,
+        Some(&GeneratedInterpretationResponse {
+            text: gen_result.answer.clone(),
+        }),
+    )
+    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
+    .ok_or_else(|| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("generated interpretation must be present for a generated answer"),
+        )
+    })?;
+    send_stream_event(
+        &tx,
+        sse_json_event("generated_interpretation", &generated_interpretation),
+    )
+    .await?;
 
     finish_task_success(
         &state,

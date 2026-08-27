@@ -586,6 +586,7 @@ pub use retrieve_envelope::generated_ask_stream_context_pack;
 mod evidence_identity;
 #[path = "api_generated_ask_identity.rs"]
 mod generated_ask_identity;
+pub use generated_ask_identity::{generated_interpretation_wire, GeneratedInterpretationWire};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
