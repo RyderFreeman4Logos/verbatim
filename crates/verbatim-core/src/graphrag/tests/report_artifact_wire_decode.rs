@@ -67,6 +67,7 @@ fn consistent_manifest_json() -> Value {
         "derived_kind": "graph_report",
         "generation": "gen-1",
         "content_hash": content_hash,
+        "identity": manifest_identity(&content_hash),
         "report": {
             "id": "c1",
             "title": "t",
@@ -76,6 +77,15 @@ fn consistent_manifest_json() -> Value {
             "generation": "gen-1",
             "content_hash": content_hash
         }
+    })
+}
+
+fn manifest_identity(content_hash: &str) -> Value {
+    json!({
+        "kind": "derived_artifact",
+        "schema_version": {"major": 1, "minor": 0, "patch": 0},
+        "artifact_id": "graphrag://report/c1",
+        "content_hash": content_hash
     })
 }
 
@@ -104,4 +114,26 @@ fn report_artifact_manifest_decode_rejects_stale_content_hash() {
 #[test]
 fn report_artifact_manifest_consistent_identity_decodes() {
     decode_manifest(&consistent_manifest_json()).expect("matching outer and report identity");
+}
+
+#[test]
+fn report_artifact_manifest_decode_requires_matching_canonical_identity() {
+    let mut missing = consistent_manifest_json();
+    missing.as_object_mut().unwrap().remove("identity");
+    decode_manifest(&missing).expect_err("manifest identity must be supplied");
+
+    for (field, replacement) in [
+        ("kind", json!("evidence")),
+        (
+            "schema_version",
+            json!({"major": 1, "minor": 0, "patch": 1}),
+        ),
+        ("artifact_id", json!("graphrag://report/other")),
+        ("content_hash", json!("deadbeef")),
+    ] {
+        let mut mismatched = consistent_manifest_json();
+        mismatched["identity"][field] = replacement;
+        decode_manifest(&mismatched)
+            .expect_err("manifest identity {field} must match the reconstructed manifest");
+    }
 }

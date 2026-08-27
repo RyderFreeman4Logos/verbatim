@@ -1,6 +1,6 @@
 use super::*;
 use verbatim_core::config::GraphGlobalSearchConfig;
-use verbatim_core::graphrag::GraphRagService;
+use verbatim_core::graphrag::{CommunityReport, GraphRagService};
 use verbatim_core::types::report_artifact::ReportArtifactId;
 
 const CANONICAL_MISSING: &str = "graphrag://report/community-test";
@@ -88,6 +88,14 @@ async fn present_report_artifact_returns_manifest() {
     );
     assert_eq!(wire["derived_kind"], "graph_report");
     assert_eq!(wire["report"]["id"], report.id);
+    let report_body: CommunityReport = serde_json::from_value(wire["report"].clone()).unwrap();
+    assert_eq!(wire["identity"]["kind"], "derived_artifact");
+    assert_eq!(wire["identity"]["schema_version"], wire["schema_version"]);
+    assert_eq!(wire["identity"]["artifact_id"], wire["id"]);
+    assert_eq!(
+        wire["identity"]["content_hash"],
+        report_body.recompute_content_hash().unwrap()
+    );
     assert_ne_evidence_unit(&body);
 }
 
