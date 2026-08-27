@@ -542,9 +542,12 @@ fn collect_serialized_string_leaves(
             let synthesize_context_pack = should_synthesize_ask_context_pack(object);
             let mut evidence_identity =
                 super::evidence_identity::EvidenceIdentityTaxonomy::start(object);
+            let mut retrieval_run_identity =
+                super::retrieval_run_identity::RetrievalRunIdentityTaxonomy::start(object);
             let mut emitted_pack = false;
             let mut emitted_context_pack = false;
             for (key, child) in object {
+                retrieval_run_identity.emit_before(path, key, fields);
                 if synthesize_pack && !emitted_pack && key.as_str() > "evidence_pack" {
                     push_retrieve_evidence_pack_identity_fields(path, fields);
                     emitted_pack = true;
@@ -567,6 +570,7 @@ fn collect_serialized_string_leaves(
                 }
                 collect_serialized_string_leaves(root, child, &child_path, fields);
             }
+            retrieval_run_identity.emit_after(path, fields);
             if synthesize_pack && !emitted_pack {
                 push_retrieve_evidence_pack_identity_fields(path, fields);
             }

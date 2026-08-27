@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    evidence_identity, generated_ask_identity, retrieve_envelope, AnswerKind, AskResponse,
-    AuditReceipt, CitationResponse, CollectionFilterResponse, EvidenceResponse,
-    ResponseTextTaxonomy, RetrievalDebug, RetrieveControlsResponse, RetrieveResponse,
-    RetrieveResultResponse, RetrieveTimingResponse,
+    evidence_identity, generated_ask_identity, retrieval_run_identity, retrieve_envelope,
+    AnswerKind, AskResponse, AuditReceipt, CitationResponse, CollectionFilterResponse,
+    EvidenceResponse, ResponseTextTaxonomy, RetrievalDebug, RetrieveControlsResponse,
+    RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
 };
 use crate::wire_schemas::{CanonicalIdentity, ContextPackEnvelope, EvidencePackEnvelope};
 
@@ -129,6 +129,30 @@ struct RetrieveResponseWire {
     debug: Option<RetrievalDebug>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     evidence_pack: Option<EvidencePackEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<CanonicalIdentity>,
+}
+
+impl RetrieveResponseWire {
+    fn retrieval_run_identity_body(&self) -> retrieval_run_identity::RetrievalRunIdentityBody {
+        retrieval_run_identity::RetrievalRunIdentityBody {
+            task_id: self.task_id.clone(),
+            query: self.query.clone(),
+            source_id: self.source_id.clone(),
+            collection_filter: self.collection_filter.clone(),
+            embedding_profile_id: self.embedding_profile_id.clone(),
+            generation: self.generation.clone(),
+            limit: self.limit,
+            page_size: self.page_size,
+            page: self.page,
+            total_results: self.total_results,
+            returned_results: self.returned_results,
+            source_bounded: self.source_bounded,
+            controls: self.controls.clone(),
+            audit_receipt: self.audit_receipt.clone(),
+            results: self.results.clone(),
+        }
+    }
 }
 
 impl Serialize for RetrieveResponse {
@@ -136,6 +160,11 @@ impl Serialize for RetrieveResponse {
     where
         S: serde::Serializer,
     {
+        let identity = retrieval_run_identity::stamp_retrieval_run_identity(
+            &retrieval_run_identity::RetrievalRunIdentityBody::from_response(self),
+            None,
+        )
+        .map_err(serde::ser::Error::custom)?;
         let wire = RetrieveResponseWire {
             task_id: self.task_id.clone(),
             query: self.query.clone(),
@@ -162,6 +191,7 @@ impl Serialize for RetrieveResponse {
                 self.generation.as_deref(),
             )
             .map_err(serde::ser::Error::custom)?,
+            identity: Some(identity),
         };
         let mut value = serde_json::to_value(wire).map_err(serde::ser::Error::custom)?;
         let taxonomy = serde_json::to_value(ResponseTextTaxonomy::from_serialized_value(&value))
@@ -182,6 +212,11 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
         D: serde::Deserializer<'de>,
     {
         let wire = RetrieveResponseWire::deserialize(deserializer)?;
+        retrieval_run_identity::stamp_retrieval_run_identity(
+            &wire.retrieval_run_identity_body(),
+            wire.identity.as_ref(),
+        )
+        .map_err(serde::de::Error::custom)?;
         retrieve_envelope::evidence_pack_from_retrieve(
             &wire.query,
             &wire.results,

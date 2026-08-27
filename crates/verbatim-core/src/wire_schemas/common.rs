@@ -117,6 +117,7 @@ pub enum WireArtifactKind {
     DerivedArtifact,
     WorkflowEnvelope,
     Evidence,
+    RetrievalRun,
 }
 
 impl WireArtifactKind {
@@ -128,6 +129,7 @@ impl WireArtifactKind {
             Self::DerivedArtifact => "derived_artifact",
             Self::WorkflowEnvelope => "workflow_envelope",
             Self::Evidence => "evidence",
+            Self::RetrievalRun => "retrieval_run",
         }
     }
 }
