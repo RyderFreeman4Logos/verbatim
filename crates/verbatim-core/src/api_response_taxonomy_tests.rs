@@ -60,6 +60,13 @@ fn ask_response_taxonomy_classifies_generated_and_source_citation_text_by_kind()
         plane_for("generated_interpretation.text"),
         serde_json::json!("generated_interpretation")
     );
+    for field in [
+        "generated_interpretation.identity.artifact_id",
+        "generated_interpretation.identity.content_hash",
+        "generated_interpretation.identity.kind",
+    ] {
+        assert_eq!(plane_for(field), serde_json::json!("metadata"));
+    }
     assert_eq!(
         plane_for("citations[].label"),
         serde_json::json!("deterministic_interface_text")

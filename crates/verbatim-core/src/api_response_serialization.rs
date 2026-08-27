@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    evidence_identity, retrieve_envelope, AnswerKind, AskResponse, AuditReceipt, CitationResponse,
-    CollectionFilterResponse, EvidenceResponse, GeneratedInterpretationResponse,
+    evidence_identity, generated_ask_identity, retrieve_envelope, AnswerKind, AskResponse,
+    AuditReceipt, CitationResponse, CollectionFilterResponse, EvidenceResponse,
     ResponseTextTaxonomy, RetrievalDebug, RetrieveControlsResponse, RetrieveResponse,
     RetrieveResultResponse, RetrieveTimingResponse,
 };
@@ -15,7 +15,7 @@ struct AskResponseWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text_taxonomy: Option<ResponseTextTaxonomy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    generated_interpretation: Option<GeneratedInterpretationResponse>,
+    generated_interpretation: Option<generated_ask_identity::GeneratedInterpretationWire>,
     #[serde(default)]
     citations: Vec<CitationResponse>,
     verified: bool,
@@ -38,7 +38,11 @@ impl Serialize for AskResponse {
             answer: self.answer.clone(),
             answer_kind: self.answer_kind,
             text_taxonomy: None,
-            generated_interpretation: self.generated_interpretation.clone(),
+            generated_interpretation: generated_ask_identity::generated_interpretation_wire(
+                self.answer_kind,
+                self.generated_interpretation.as_ref(),
+            )
+            .map_err(serde::ser::Error::custom)?,
             citations: self.citations.clone(),
             verified: self.verified,
             retrieval: self.retrieval.clone(),
@@ -76,11 +80,17 @@ impl<'de> Deserialize<'de> for AskResponse {
         .map_err(serde::de::Error::custom)?;
         let value = serde_json::to_value(&wire).map_err(serde::de::Error::custom)?;
         let text_taxonomy = ResponseTextTaxonomy::from_serialized_value(&value);
+        let generated_interpretation =
+            generated_ask_identity::bind_generated_interpretation_to_answer_kind(
+                wire.answer_kind,
+                wire.generated_interpretation,
+            )
+            .map_err(serde::de::Error::custom)?;
         Ok(Self {
             answer: wire.answer,
             answer_kind: wire.answer_kind,
             text_taxonomy,
-            generated_interpretation: wire.generated_interpretation,
+            generated_interpretation,
             citations: wire.citations,
             verified: wire.verified,
             retrieval: wire.retrieval,
