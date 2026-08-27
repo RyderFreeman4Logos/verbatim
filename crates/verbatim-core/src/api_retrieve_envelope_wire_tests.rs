@@ -9,6 +9,24 @@ use crate::wire_schemas::{
     QueryPlanEnvelope, QueryPlanFields, WIRE_SCHEMA_VERSION,
 };
 
+macro_rules! assert_ask_decode_error_contains {
+    ($encoded:expr, $expected:expr) => {
+        assert!(serde_json::from_value::<AskResponse>($encoded)
+            .expect_err("malformed ask response must fail closed")
+            .to_string()
+            .contains($expected));
+    };
+}
+
+const SELECTED_IDS_ERROR: &str = "context pack selected_unit_ids do not match context results";
+const EVIDENCE_HASH_ERROR: &str = "context pack evidence_pack_hash does not match returned context";
+const BLANK_RESULT_ID_ERROR: &str = "results[].evidence_id must not be blank";
+const BLANK_SELECTED_ID_ERROR: &str = "selected_unit_ids must not contain empty entries";
+const PROFILE_ERROR: &str =
+    "context pack profile_ref does not match the executed embedding profile";
+const GENERATION_ERROR: &str =
+    "context pack generation does not match the executed index generation";
+
 fn sample_query_plan() -> QueryPlanEnvelope {
     QueryPlanEnvelope::new(QueryPlanFields {
         artifact_id: "qp-live-retrieve".into(),
@@ -131,18 +149,27 @@ fn encoded_ask_context_without_pack(evidence_ids: &[&str]) -> serde_json::Value 
     let template = encoded["context"]["results"][0].clone();
     let results = encoded["context"]["results"].as_array_mut().unwrap();
     results.clear();
-    for (index, evidence_id) in evidence_ids.iter().enumerate() {
+    for index in 0..evidence_ids.len() {
         let mut result = template.clone();
         result["index"] = serde_json::json!(index);
         result["rank"] = serde_json::json!(index + 1);
-        result["evidence_id"] = serde_json::json!(evidence_id);
+        result["evidence_id"] = serde_json::json!(format!("ev-valid-{index}"));
         results.push(result);
     }
     encoded["context"]
         .as_object_mut()
         .unwrap()
         .remove("evidence_pack");
+    encoded["context"]
+        .as_object_mut()
+        .unwrap()
+        .remove("identity");
     encoded.as_object_mut().unwrap().remove("context_pack");
+    let mut encoded = super::with_ask_run_identity(encoded);
+    let results = encoded["context"]["results"].as_array_mut().unwrap();
+    for (result, evidence_id) in results.iter_mut().zip(evidence_ids) {
+        result["evidence_id"] = serde_json::json!(evidence_id);
+    }
     encoded
 }
 
@@ -155,7 +182,7 @@ fn encoded_ask_context_with_blank_context_pack_ids(evidence_ids: &[&str]) -> ser
     .unwrap();
     pack["selected_unit_ids"] = serde_json::json!(evidence_ids);
     encoded["context_pack"] = pack;
-    encoded
+    super::with_ask_run_identity(encoded)
 }
 
 fn context_pack_hash(encoded: &serde_json::Value) -> String {
@@ -164,7 +191,6 @@ fn context_pack_hash(encoded: &serde_json::Value) -> String {
         .unwrap()
         .into()
 }
-
 #[test]
 fn live_retrieve_request_valid_query_plan_envelope_round_trips() {
     let plan = live_question_plan("What is cited?");
@@ -189,7 +215,6 @@ fn live_retrieve_request_valid_query_plan_envelope_round_trips() {
     assert_eq!(back.query_text, plan.query_text);
     back.validate().unwrap();
 }
-
 #[test]
 fn live_retrieve_request_unknown_schema_version_is_rejected() {
     let plan = sample_query_plan();
@@ -201,7 +226,6 @@ fn live_retrieve_request_unknown_schema_version_is_rejected() {
     }))
     .expect_err("unknown query plan schema must fail closed");
 }
-
 #[test]
 fn live_retrieve_request_incomplete_identity_is_rejected() {
     let mut plan = serde_json::to_value(sample_query_plan()).unwrap();
@@ -215,7 +239,6 @@ fn live_retrieve_request_incomplete_identity_is_rejected() {
     }))
     .expect_err("incomplete query plan identity must fail closed");
 }
-
 #[test]
 fn live_retrieve_request_legacy_question_only_projects_through_query_plan_envelope() {
     let request: RetrieveRequest =
@@ -234,7 +257,6 @@ fn live_retrieve_request_legacy_question_only_projects_through_query_plan_envelo
     assert_eq!(plan.query_text, "What is cited?");
     plan.validate().unwrap();
 }
-
 #[test]
 fn live_retrieve_response_valid_evidence_pack_envelope_round_trips() {
     let response = sample_retrieve_response("What is cited?", "ev-1");
@@ -254,7 +276,6 @@ fn live_retrieve_response_valid_evidence_pack_envelope_round_trips() {
     let back: RetrieveResponse = serde_json::from_value(encoded).unwrap();
     assert_eq!(back.results[0].evidence_id, "ev-1");
 }
-
 #[test]
 fn post_retrieve_response_stamps_retrieval_run_identity() {
     let response = sample_retrieve_response("What is cited?", "ev-1");
@@ -281,7 +302,6 @@ fn post_retrieve_response_stamps_retrieval_run_identity() {
     let back: RetrieveResponse = serde_json::from_value(encoded).unwrap();
     assert_eq!(back.results, response.results);
 }
-
 #[test]
 fn post_retrieve_response_retrieval_run_identity_mismatch_fails_closed() {
     let mut encoded =
@@ -296,7 +316,6 @@ fn post_retrieve_response_retrieval_run_identity_mismatch_fails_closed() {
     serde_json::from_value::<RetrieveResponse>(encoded)
         .expect_err("retrieval-run identity must match the executed response body");
 }
-
 #[test]
 fn post_ask_response_stamps_ask_run_identity() {
     let response = sample_ask_context_response("ev-1");
@@ -328,7 +347,6 @@ fn post_ask_response_stamps_ask_run_identity() {
         response.context.unwrap().results,
     );
 }
-
 #[test]
 fn post_ask_response_ask_run_identity_mismatch_fails_closed() {
     let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
@@ -343,7 +361,6 @@ fn post_ask_response_ask_run_identity_mismatch_fails_closed() {
     serde_json::from_value::<AskResponse>(encoded)
         .expect_err("ask-run identity must match the executed response body");
 }
-
 #[test]
 fn live_ask_context_pack_valid_envelope_round_trips() {
     let response = sample_ask_context_response("ev-1");
@@ -370,7 +387,6 @@ fn live_ask_context_pack_valid_envelope_round_trips() {
     let back: AskResponse = serde_json::from_value(encoded).unwrap();
     assert_eq!(back.context.unwrap().results[0].evidence_id, "ev-1");
 }
-
 #[test]
 fn live_ask_context_pack_mismatched_payload_vs_envelope_is_rejected() {
     let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
@@ -379,11 +395,10 @@ fn live_ask_context_pack_mismatched_payload_vs_envelope_is_rejected() {
         vec!["ev-other".into()],
     ))
     .unwrap();
+    let encoded = super::with_ask_run_identity(encoded);
 
-    serde_json::from_value::<AskResponse>(encoded)
-        .expect_err("context pack ids must match context.results[].evidence_id");
+    assert_ask_decode_error_contains!(encoded, SELECTED_IDS_ERROR);
 }
-
 #[test]
 fn live_ask_context_pack_noncanonical_evidence_hash_is_rejected() {
     let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
@@ -392,11 +407,10 @@ fn live_ask_context_pack_noncanonical_evidence_hash_is_rejected() {
         vec!["ev-1".into()],
     ))
     .unwrap();
+    let encoded = super::with_ask_run_identity(encoded);
 
-    serde_json::from_value::<AskResponse>(encoded)
-        .expect_err("context pack evidence hash must match the returned context");
+    assert_ask_decode_error_contains!(encoded, EVIDENCE_HASH_ERROR);
 }
-
 #[test]
 fn live_ask_context_pack_incomplete_or_unknown_identity_is_rejected() {
     let mut incomplete = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
@@ -410,8 +424,7 @@ fn live_ask_context_pack_incomplete_or_unknown_identity_is_rejected() {
         .unwrap()
         .remove("content_hash");
     incomplete["context_pack"] = pack;
-    serde_json::from_value::<AskResponse>(incomplete)
-        .expect_err("incomplete context pack identity must fail closed");
+    assert_ask_decode_error_contains!(incomplete, "missing field `content_hash`");
 
     let mut unknown = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
     let pack = with_unknown_schema_version(
@@ -422,10 +435,8 @@ fn live_ask_context_pack_incomplete_or_unknown_identity_is_rejected() {
         .unwrap(),
     );
     unknown["context_pack"] = pack;
-    serde_json::from_value::<AskResponse>(unknown)
-        .expect_err("unknown context pack identity schema must fail closed");
+    assert_ask_decode_error_contains!(unknown, "unsupported wire schema version");
 }
-
 #[test]
 fn live_retrieve_response_unknown_schema_version_is_rejected() {
     let mut encoded =
@@ -443,7 +454,6 @@ fn live_retrieve_response_unknown_schema_version_is_rejected() {
     serde_json::from_value::<RetrieveResponse>(encoded)
         .expect_err("unknown evidence pack schema must fail closed");
 }
-
 #[test]
 fn live_retrieve_response_incomplete_identity_is_rejected() {
     let mut encoded =
@@ -466,7 +476,6 @@ fn live_retrieve_response_incomplete_identity_is_rejected() {
     serde_json::from_value::<RetrieveResponse>(encoded)
         .expect_err("incomplete evidence pack identity must fail closed");
 }
-
 #[test]
 fn live_retrieve_request_mismatched_question_vs_envelope_is_rejected() {
     let plan = sample_query_plan();
@@ -476,7 +485,6 @@ fn live_retrieve_request_mismatched_question_vs_envelope_is_rejected() {
     }))
     .expect_err("request envelope must match the executed question");
 }
-
 #[test]
 fn live_retrieve_request_noncanonical_plan_hash_is_rejected() {
     let plan = sample_query_plan();
@@ -499,7 +507,6 @@ fn live_question_plan(question: &str) -> QueryPlanEnvelope {
     })
     .unwrap()
 }
-
 #[test]
 fn live_retrieve_response_mismatched_evidence_ids_are_rejected() {
     let mut encoded =
@@ -518,7 +525,6 @@ fn live_retrieve_response_mismatched_evidence_ids_are_rejected() {
     serde_json::from_value::<RetrieveResponse>(encoded)
         .expect_err("evidence pack ids must match results[].evidence_id");
 }
-
 #[test]
 fn live_retrieve_response_mismatched_query_plan_hash_is_rejected() {
     let mut encoded =
@@ -567,31 +573,26 @@ fn encoded_retrieve_without_pack(evidence_ids: &[&str]) -> serde_json::Value {
     encoded.as_object_mut().unwrap().remove("evidence_pack");
     encoded
 }
-
 #[test]
 fn live_retrieve_response_mixed_blank_evidence_id_serialize_is_rejected() {
     serde_json::to_value(mixed_blank_retrieve_response())
         .expect_err("mixed blank results[].evidence_id must fail closed on serialize");
 }
-
 #[test]
 fn live_retrieve_response_mixed_blank_evidence_id_deserialize_is_rejected() {
     serde_json::from_value::<RetrieveResponse>(encoded_retrieve_without_pack(&["ev-1", " "]))
         .expect_err("mixed blank results[].evidence_id must fail closed on deserialize");
 }
-
 #[test]
 fn live_retrieve_response_all_blank_evidence_id_serialize_is_rejected() {
     serde_json::to_value(sample_retrieve_response("What is cited?", " "))
         .expect_err("all-blank results[].evidence_id must fail closed on serialize");
 }
-
 #[test]
 fn live_retrieve_response_all_blank_evidence_id_deserialize_is_rejected() {
     serde_json::from_value::<RetrieveResponse>(encoded_retrieve_without_pack(&[" "]))
         .expect_err("all-blank results[].evidence_id must fail closed on deserialize");
 }
-
 #[test]
 fn live_ask_context_pack_mixed_blank_ids_serialize_and_deserialize_are_rejected() {
     let mut response = sample_ask_context_response("ev-1");
@@ -607,25 +608,29 @@ fn live_ask_context_pack_mixed_blank_ids_serialize_and_deserialize_are_rejected(
     serde_json::to_value(response)
         .expect_err("mixed blank context results[].evidence_id must fail closed on serialize");
 
-    serde_json::from_value::<AskResponse>(encoded_ask_context_without_pack(&["ev-1", " "]))
-        .expect_err("legacy context without a pack must still reject blank result ids");
-    serde_json::from_value::<AskResponse>(encoded_ask_context_with_blank_context_pack_ids(&[
-        "ev-1", " ",
-    ]))
-    .expect_err("context pack must reject mixed blank selected_unit_ids");
+    assert_ask_decode_error_contains!(
+        encoded_ask_context_without_pack(&["ev-1", " "]),
+        BLANK_RESULT_ID_ERROR
+    );
+    assert_ask_decode_error_contains!(
+        encoded_ask_context_with_blank_context_pack_ids(&["ev-1", " "]),
+        BLANK_SELECTED_ID_ERROR
+    );
 }
-
 #[test]
 fn live_ask_context_pack_all_blank_ids_serialize_and_deserialize_are_rejected() {
     serde_json::to_value(sample_ask_context_response(" "))
         .expect_err("all-blank context results[].evidence_id must fail closed on serialize");
 
-    serde_json::from_value::<AskResponse>(encoded_ask_context_without_pack(&[" "]))
-        .expect_err("legacy context without a pack must still reject blank result ids");
-    serde_json::from_value::<AskResponse>(encoded_ask_context_with_blank_context_pack_ids(&[" "]))
-        .expect_err("context pack must reject all-blank selected_unit_ids");
+    assert_ask_decode_error_contains!(
+        encoded_ask_context_without_pack(&[" "]),
+        BLANK_RESULT_ID_ERROR
+    );
+    assert_ask_decode_error_contains!(
+        encoded_ask_context_with_blank_context_pack_ids(&[" "]),
+        BLANK_SELECTED_ID_ERROR
+    );
 }
-
 #[test]
 fn live_envelope_profile_ref_retrieve_request_stamps_executed_profile() {
     let request: RetrieveRequest = serde_json::from_value(serde_json::json!({
@@ -636,19 +641,16 @@ fn live_envelope_profile_ref_retrieve_request_stamps_executed_profile() {
     let encoded = serde_json::to_value(&request).unwrap();
     assert_eq!(encoded["query_plan"]["header"]["profile_ref"], "default");
 }
-
 #[test]
 fn live_envelope_profile_ref_retrieve_response_stamps_executed_profile() {
     let encoded = serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
     assert_eq!(encoded["evidence_pack"]["header"]["profile_ref"], "default");
 }
-
 #[test]
 fn live_envelope_profile_ref_ask_context_stamps_executed_profile() {
     let encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
     assert_eq!(encoded["context_pack"]["header"]["profile_ref"], "default");
 }
-
 #[test]
 fn live_envelope_profile_ref_retrieve_request_mismatch_is_rejected() {
     let mut plan = serde_json::to_value(live_question_plan("What is cited?")).unwrap();
@@ -660,7 +662,6 @@ fn live_envelope_profile_ref_retrieve_request_mismatch_is_rejected() {
     }))
     .expect_err("query plan profile_ref must match the executed embedding profile");
 }
-
 #[test]
 fn live_envelope_profile_ref_retrieve_response_mismatch_is_rejected() {
     let mut encoded =
@@ -669,27 +670,23 @@ fn live_envelope_profile_ref_retrieve_response_mismatch_is_rejected() {
     serde_json::from_value::<RetrieveResponse>(encoded)
         .expect_err("evidence pack profile_ref must match the executed embedding profile");
 }
-
 #[test]
 fn live_envelope_profile_ref_ask_context_mismatch_is_rejected() {
     let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
     encoded["context_pack"]["header"]["profile_ref"] = serde_json::json!("other");
-    serde_json::from_value::<AskResponse>(encoded)
-        .expect_err("context pack profile_ref must match the executed embedding profile");
+    let encoded = super::with_ask_run_identity(encoded);
+    assert_ask_decode_error_contains!(encoded, PROFILE_ERROR);
 }
-
 #[test]
 fn live_envelope_generation_retrieve_response_stamps_executed_generation() {
     let encoded = serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
     assert_eq!(encoded["evidence_pack"]["header"]["generation"], "7");
 }
-
 #[test]
 fn live_envelope_generation_ask_context_stamps_executed_generation() {
     let encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
     assert_eq!(encoded["context_pack"]["header"]["generation"], "7");
 }
-
 #[test]
 fn live_envelope_generation_retrieve_response_mismatch_is_rejected() {
     let mut encoded =
@@ -698,15 +695,13 @@ fn live_envelope_generation_retrieve_response_mismatch_is_rejected() {
     serde_json::from_value::<RetrieveResponse>(encoded)
         .expect_err("evidence pack generation must match the executed index generation");
 }
-
 #[test]
 fn live_envelope_generation_ask_context_mismatch_is_rejected() {
     let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
     encoded["context_pack"]["header"]["generation"] = serde_json::json!("other");
-    serde_json::from_value::<AskResponse>(encoded)
-        .expect_err("context pack generation must match the executed index generation");
+    let encoded = super::with_ask_run_identity(encoded);
+    assert_ask_decode_error_contains!(encoded, GENERATION_ERROR);
 }
-
 #[test]
 fn live_ask_request_valid_query_plan_envelope_round_trips() {
     let plan = live_question_plan_with_profile("What is cited?", "default");
@@ -735,7 +730,6 @@ fn live_ask_request_valid_query_plan_envelope_round_trips() {
     assert!(back.header.generation.is_none());
     back.validate().unwrap();
 }
-
 #[test]
 fn live_ask_request_legacy_question_only_projects_through_query_plan_envelope() {
     let request: AskRequest =
@@ -755,7 +749,6 @@ fn live_ask_request_legacy_question_only_projects_through_query_plan_envelope() 
     assert!(plan.header.generation.is_none());
     plan.validate().unwrap();
 }
-
 #[test]
 fn live_ask_request_mismatched_question_vs_envelope_is_rejected() {
     let plan = sample_query_plan();
@@ -765,7 +758,6 @@ fn live_ask_request_mismatched_question_vs_envelope_is_rejected() {
     }))
     .expect_err("request envelope must match the executed question");
 }
-
 #[test]
 fn live_ask_request_mismatched_profile_vs_envelope_is_rejected() {
     let mut plan = serde_json::to_value(live_question_plan("What is cited?")).unwrap();
