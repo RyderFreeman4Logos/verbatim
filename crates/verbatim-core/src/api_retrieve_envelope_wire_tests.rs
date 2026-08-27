@@ -255,6 +255,48 @@ fn live_retrieve_response_valid_evidence_pack_envelope_round_trips() {
 }
 
 #[test]
+fn post_retrieve_response_stamps_retrieval_run_identity() {
+    let response = sample_retrieve_response("What is cited?", "ev-1");
+    let encoded = serde_json::to_value(&response).unwrap();
+    let identity = encoded
+        .get("identity")
+        .expect("normal POST retrieve response must carry retrieval-run identity");
+
+    assert_eq!(identity["kind"], "retrieval_run");
+    assert_eq!(
+        identity["schema_version"],
+        serde_json::json!({"major": 1, "minor": 0, "patch": 0})
+    );
+    assert_eq!(identity["artifact_id"], response.task_id);
+    assert!(identity["content_hash"]
+        .as_str()
+        .is_some_and(|hash| !hash.is_empty()));
+    assert!(encoded["text_taxonomy"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field["field"] == "identity.content_hash" && field["plane"] == "metadata"));
+
+    let back: RetrieveResponse = serde_json::from_value(encoded).unwrap();
+    assert_eq!(back.results, response.results);
+}
+
+#[test]
+fn post_retrieve_response_retrieval_run_identity_mismatch_fails_closed() {
+    let mut encoded =
+        serde_json::to_value(sample_retrieve_response("What is cited?", "ev-1")).unwrap();
+    encoded["identity"] = serde_json::json!({
+        "kind": "query_plan",
+        "schema_version": {"major": 1, "minor": 0, "patch": 0},
+        "artifact_id": "task-1",
+        "content_hash": "mismatched-retrieval-run-body"
+    });
+
+    serde_json::from_value::<RetrieveResponse>(encoded)
+        .expect_err("retrieval-run identity must match the executed response body");
+}
+
+#[test]
 fn live_ask_context_pack_valid_envelope_round_trips() {
     let response = sample_ask_context_response("ev-1");
     let encoded = serde_json::to_value(&response).unwrap();

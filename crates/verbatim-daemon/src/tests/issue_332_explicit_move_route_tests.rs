@@ -54,6 +54,39 @@ fn issue_332_retrieve_request(source_id: &SourceId) -> RetrieveRequest {
 }
 
 #[tokio::test]
+async fn post_retrieve_stamps_retrieval_run_identity() {
+    let test_dir = TestDir::new("retrieval-run-identity-route");
+    let source_path = test_dir.path().join("identity.md");
+    fs::write(
+        &source_path,
+        "The retrieval-run response has one stable identity.",
+    )
+    .unwrap();
+    let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+    config.embedding.enabled = false;
+    config.rerank.enabled = false;
+    let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let source_id = pipeline.add_source(&source_path).unwrap();
+    pipeline.ingest_source(&source_id).await.unwrap();
+    let app = daemon_router(test_state(config, test_dir.path(), pipeline));
+
+    let response = issue_332_request(
+        &app,
+        Method::POST,
+        "/api/retrieve",
+        issue_332_retrieve_request(&source_id),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let retrieved: serde_json::Value = issue_332_body(response).await;
+    assert_eq!(retrieved["identity"]["kind"], "retrieval_run");
+    assert_eq!(retrieved["identity"]["artifact_id"], retrieved["task_id"]);
+    serde_json::from_value::<RetrieveResponse>(retrieved)
+        .expect("stamped retrieval-run response must validate on decode");
+}
+
+#[tokio::test]
 async fn issue_332_existing_source_routes_keep_raw_id_semantics() {
     let test_dir = TestDir::new("issue-332-route-raw-source-id");
     let source_path = test_dir.path().join("legacy.md");

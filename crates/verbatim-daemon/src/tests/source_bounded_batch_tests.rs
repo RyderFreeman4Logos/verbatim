@@ -291,6 +291,9 @@ fn generated_ask_from_paid_retrieve(store: &Store, results: &[RetrievalResult]) 
         false,
     )
     .expect("paid retrieve read succeeds");
+    let mut context =
+        executed_retrieve_for_generated_ask("What is cited?", "default", generation, &results);
+    context.task_id = "generated-ask-retrieve".into();
     AskResponse {
         answer: "Generated interpretation.".into(),
         answer_kind: AnswerKind::GeneratedInterpretation,
@@ -301,12 +304,7 @@ fn generated_ask_from_paid_retrieve(store: &Store, results: &[RetrievalResult]) 
         citations: Vec::new(),
         verified: false,
         retrieval: None,
-        context: Some(executed_retrieve_for_generated_ask(
-            "What is cited?",
-            "default",
-            generation,
-            &results,
-        )),
+        context: Some(context),
         collection_filter: None,
     }
 }

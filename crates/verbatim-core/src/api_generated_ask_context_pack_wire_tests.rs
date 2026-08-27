@@ -5,6 +5,13 @@ use super::{
 use crate::wire_schemas::decode_context_pack_envelope_json;
 
 fn sample_generated_ask(evidence_id: &str) -> AskResponse {
+    let mut context = RetrieveResponse::from_executed_ask_units(
+        "What is cited?",
+        "default",
+        Some("7".into()),
+        [evidence_id],
+    );
+    context.task_id = "generated-ask-retrieve".into();
     AskResponse {
         answer: "Generated interpretation.".into(),
         answer_kind: AnswerKind::GeneratedInterpretation,
@@ -15,12 +22,7 @@ fn sample_generated_ask(evidence_id: &str) -> AskResponse {
         citations: Vec::new(),
         verified: false,
         retrieval: None,
-        context: Some(RetrieveResponse::from_executed_ask_units(
-            "What is cited?",
-            "default",
-            Some("7".into()),
-            [evidence_id],
-        )),
+        context: Some(context),
         collection_filter: None,
     }
 }
