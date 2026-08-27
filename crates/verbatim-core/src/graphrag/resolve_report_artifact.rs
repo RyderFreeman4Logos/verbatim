@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 pub struct ReportArtifactManifest {
     pub id: ReportArtifactId,
     pub schema_version: WireSchemaVersion,
+    /// Canonical identity for this public derived artifact.
+    pub identity: CanonicalIdentity,
     /// Explicitly classifies this report as derived rather than source evidence.
     pub derived_kind: DerivedArtifactKind,
     pub generation: String,
@@ -23,6 +25,7 @@ pub struct ReportArtifactManifest {
 struct ReportArtifactManifestRaw {
     id: ReportArtifactId,
     schema_version: WireSchemaVersion,
+    identity: CanonicalIdentity,
     derived_kind: DerivedArtifactKind,
     generation: String,
     content_hash: String,
@@ -34,12 +37,16 @@ impl ReportArtifactManifest {
         if self.generation.trim().is_empty() {
             bail!("generation must not be empty");
         }
-        CanonicalIdentity::new(CanonicalIdentityFields {
+        let expected_identity = CanonicalIdentity::new(CanonicalIdentityFields {
             kind: WireArtifactKind::DerivedArtifact,
             schema_version: self.schema_version,
             artifact_id: self.id.as_str().to_string(),
-            content_hash: self.content_hash.clone(),
+            content_hash: self.report.recompute_content_hash()?,
         })?;
+        self.identity.validate()?;
+        if self.identity != expected_identity {
+            bail!("identity does not match report artifact manifest");
+        }
         if self.derived_kind != DerivedArtifactKind::GraphReport {
             bail!("derived_kind must be graph_report");
         }
@@ -53,8 +60,7 @@ impl ReportArtifactManifest {
         if self.content_hash != self.report.content_hash {
             bail!("content hash does not match embedded report");
         }
-        let recomputed = self.report.recompute_content_hash()?;
-        if self.content_hash != recomputed {
+        if self.content_hash != expected_identity.content_hash.as_str() {
             bail!("content hash does not match recomputed report hash");
         }
         Ok(())
@@ -70,6 +76,7 @@ impl<'de> Deserialize<'de> for ReportArtifactManifest {
         let value = Self {
             id: raw.id,
             schema_version: raw.schema_version,
+            identity: raw.identity,
             derived_kind: raw.derived_kind,
             generation: raw.generation,
             content_hash: raw.content_hash,
@@ -99,12 +106,19 @@ impl GraphRagService<'_> {
                         ReportArtifactId::new(&report.id).is_ok_and(|report_id| report_id == *id)
                     })
             {
+                let content_hash = report.recompute_content_hash()?;
                 let manifest = ReportArtifactManifest {
                     id: id.clone(),
                     schema_version: WIRE_SCHEMA_VERSION,
+                    identity: CanonicalIdentity::new(CanonicalIdentityFields {
+                        kind: WireArtifactKind::DerivedArtifact,
+                        schema_version: WIRE_SCHEMA_VERSION,
+                        artifact_id: id.as_str().to_string(),
+                        content_hash: content_hash.clone(),
+                    })?,
                     derived_kind: DerivedArtifactKind::GraphReport,
                     generation: report.generation.clone(),
-                    content_hash: report.content_hash.clone(),
+                    content_hash,
                     report,
                 };
                 let stored_payload = self
@@ -122,10 +136,12 @@ impl GraphRagService<'_> {
                     )
                     .optional()?;
                 if let Some(payload) = stored_payload {
-                    return Ok(Some(ReportArtifactManifest {
+                    let manifest = ReportArtifactManifest {
                         report: serde_json::from_str(&payload)?,
                         ..manifest
-                    }));
+                    };
+                    manifest.validate()?;
+                    return Ok(Some(manifest));
                 }
                 self.store.connection().execute(
                     "INSERT INTO report_artifacts (report_id, generation, content_hash, payload_json)
