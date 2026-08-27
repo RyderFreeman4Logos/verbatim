@@ -100,6 +100,62 @@ async fn present_report_artifact_returns_manifest() {
 }
 
 #[tokio::test]
+async fn stored_report_payload_identity_mismatch_fails_closed() {
+    let (test_dir, store, persisted) = persisted_output_fixture("report-artifact-corrupt", None);
+    let chunk_id = persisted.chunk.id.0.clone();
+    let source_id = persisted.evidence_units[0].source_id.clone();
+    let claim = generated_claim_node(&source_id, &chunk_id);
+    store
+        .upsert_graph_nodes(std::slice::from_ref(&claim))
+        .unwrap();
+    let graph_config = GraphGlobalSearchConfig {
+        enabled: true,
+        ..GraphGlobalSearchConfig::default()
+    };
+    let report = GraphRagService::new(&store, &graph_config)
+        .community_reports(None)
+        .unwrap()
+        .pop()
+        .expect("seeded claim must produce a community report");
+    let artifact_id = ReportArtifactId::new(&report.id).unwrap();
+    let app = artifact_test_app(test_dir.path(), true);
+
+    assert_eq!(
+        artifact_route_get(&app, artifact_id.as_str())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let mut corrupted_report = report;
+    corrupted_report.summary = "corrupt stored report payload".into();
+    let changed = rusqlite::Connection::open(test_dir.path().join("verbatim.db"))
+        .unwrap()
+        .execute(
+            "UPDATE report_artifacts SET payload_json = ?1
+             WHERE report_id = ?2 AND generation = ?3 AND content_hash = ?4",
+            [
+                serde_json::to_string(&corrupted_report).unwrap(),
+                artifact_id.as_str().to_string(),
+                corrupted_report.generation.clone(),
+                corrupted_report.content_hash.clone(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "initial GET must persist the report payload");
+
+    let response = artifact_route_get(&app, artifact_id.as_str()).await;
+    let status = response.status();
+    let body = evidence_route_body(response).await;
+    let body_text = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body_text}");
+    assert!(
+        !body_text.contains(&corrupted_report.summary),
+        "mismatched stored report body must not be returned: {body_text}"
+    );
+}
+
+#[tokio::test]
 async fn reserved_report_artifact_ids_on_evidence_route_stay_typed_4xx() {
     let app = missing_artifact_app("report-artifact-evidence-still-4xx");
     for id in [CANONICAL_MISSING, LEGACY_MISSING] {

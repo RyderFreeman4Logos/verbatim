@@ -136,10 +136,12 @@ impl GraphRagService<'_> {
                     )
                     .optional()?;
                 if let Some(payload) = stored_payload {
-                    return Ok(Some(ReportArtifactManifest {
+                    let manifest = ReportArtifactManifest {
                         report: serde_json::from_str(&payload)?,
                         ..manifest
-                    }));
+                    };
+                    manifest.validate()?;
+                    return Ok(Some(manifest));
                 }
                 self.store.connection().execute(
                     "INSERT INTO report_artifacts (report_id, generation, content_hash, payload_json)
