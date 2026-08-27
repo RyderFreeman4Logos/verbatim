@@ -652,7 +652,10 @@ fn push_ask_context_pack_identity_fields(path: &str, fields: &mut Vec<TextFieldT
 }
 
 fn text_plane_for_serialized_path(root: &Value, path: &str) -> OutputTextPlane {
-    if path == "answer" || path_has_component(path, "generated_interpretation") {
+    if path == "answer"
+        || (path_has_component(path, "generated_interpretation")
+            && !path_has_component(path, "identity"))
+    {
         return OutputTextPlane::GeneratedInterpretation;
     }
     if path.ends_with(".text_preview") {

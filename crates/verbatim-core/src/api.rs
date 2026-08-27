@@ -584,6 +584,8 @@ mod retrieve_envelope;
 pub use retrieve_envelope::generated_ask_stream_context_pack;
 #[path = "api_evidence_identity.rs"]
 mod evidence_identity;
+#[path = "api_generated_ask_identity.rs"]
+mod generated_ask_identity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1218,3 +1220,7 @@ mod api_generated_ask_stream_context_pack_wire_tests;
 #[cfg(test)]
 #[path = "api_evidence_identity_wire_tests.rs"]
 mod api_evidence_identity_wire_tests;
+
+#[cfg(test)]
+#[path = "api_generated_ask_derived_identity_wire_tests.rs"]
+mod api_generated_ask_derived_identity_wire_tests;

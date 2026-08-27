@@ -19,7 +19,17 @@ fn ask_response_serializes_generated_interpretation_separately_from_evidence() {
     assert_eq!(encoded["answer"], "Legacy generated answer.");
     assert_eq!(
         encoded["generated_interpretation"],
-        serde_json::json!({"text": "Generated interpretation."})
+        serde_json::json!({
+            "text": "Generated interpretation.",
+            "identity": {
+                "artifact_id": "live-ask-generated-interpretation",
+                "kind": "derived_artifact",
+                "schema_version": crate::wire_schemas::WIRE_SCHEMA_VERSION,
+                "content_hash": crate::wire_schemas::wire_content_hash(
+                    br#"{"text":"Generated interpretation."}"#,
+                ),
+            },
+        })
     );
     assert_eq!(
         encoded["answer_kind"],
