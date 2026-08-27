@@ -13,6 +13,7 @@ fn sample_generated_ask(evidence_id: &str) -> AskResponse {
     );
     context.task_id = "generated-ask-retrieve".into();
     AskResponse {
+        task_id: "generated-ask-run".into(),
         answer: "Generated interpretation.".into(),
         answer_kind: AnswerKind::GeneratedInterpretation,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),

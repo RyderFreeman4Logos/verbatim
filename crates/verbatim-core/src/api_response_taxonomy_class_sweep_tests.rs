@@ -49,6 +49,7 @@ fn supplied_taxonomy_is_recomputed_for_all_response_shapes() {
     ))
     .unwrap());
     ask["context"]["generation"] = serde_json::json!("7");
+    let ask = with_ask_run_identity(ask);
     assert_header_generation_is_metadata(
         "ask with nested retrieve context",
         &ask,
@@ -74,7 +75,10 @@ fn supplied_taxonomy_is_recomputed_for_all_response_shapes() {
     .unwrap();
     generated["context"]["generation"] = serde_json::json!("7");
     let generated = tampered_taxonomy(
-        serde_json::to_value(serde_json::from_value::<AskResponse>(generated).unwrap()).unwrap(),
+        serde_json::to_value(
+            serde_json::from_value::<AskResponse>(with_ask_run_identity(generated)).unwrap(),
+        )
+        .unwrap(),
     );
     assert!(generated.get("context").is_none());
     assert_header_generation_is_metadata(

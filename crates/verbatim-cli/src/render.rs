@@ -3244,6 +3244,7 @@ mod tests {
     #[test]
     fn ask_response_labels_generated_interpretation() {
         let response = AskResponse {
+            task_id: "generated-ask-run".into(),
             answer: "Legacy generated answer.".into(),
             answer_kind: verbatim_core::api::AnswerKind::GeneratedInterpretation,
             text_taxonomy: ResponseTextTaxonomy::ask_response(),

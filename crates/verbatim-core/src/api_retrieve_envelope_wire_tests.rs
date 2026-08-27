@@ -91,6 +91,7 @@ fn sample_retrieve_response(query: &str, evidence_id: &str) -> RetrieveResponse 
 
 fn sample_ask_context_response(evidence_id: &str) -> AskResponse {
     AskResponse {
+        task_id: "task-1".into(),
         answer: String::new(),
         answer_kind: AnswerKind::EvidenceOnly,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),
@@ -294,6 +295,53 @@ fn post_retrieve_response_retrieval_run_identity_mismatch_fails_closed() {
 
     serde_json::from_value::<RetrieveResponse>(encoded)
         .expect_err("retrieval-run identity must match the executed response body");
+}
+
+#[test]
+fn post_ask_response_stamps_ask_run_identity() {
+    let response = sample_ask_context_response("ev-1");
+    let encoded = serde_json::to_value(&response).unwrap();
+    let identity = encoded
+        .get("identity")
+        .expect("normal POST ask response must carry ask-run identity");
+
+    assert_eq!(encoded["task_id"], "task-1");
+    assert_eq!(identity["kind"], "ask_run");
+    assert_eq!(
+        identity["schema_version"],
+        serde_json::to_value(WIRE_SCHEMA_VERSION).unwrap()
+    );
+    assert_eq!(identity["artifact_id"], "task-1");
+    assert!(identity["content_hash"]
+        .as_str()
+        .is_some_and(|hash| !hash.is_empty()));
+    assert!(encoded["text_taxonomy"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field["field"] == "identity.content_hash" && field["plane"] == "metadata"));
+
+    let back: AskResponse = serde_json::from_value(encoded).unwrap();
+    assert_eq!(back.task_id, response.task_id);
+    assert_eq!(
+        back.context.unwrap().results,
+        response.context.unwrap().results,
+    );
+}
+
+#[test]
+fn post_ask_response_ask_run_identity_mismatch_fails_closed() {
+    let mut encoded = serde_json::to_value(sample_ask_context_response("ev-1")).unwrap();
+    encoded["task_id"] = serde_json::json!("other-task");
+    encoded["identity"] = serde_json::json!({
+        "kind": "query_plan",
+        "schema_version": {"major": 1, "minor": 0, "patch": 0},
+        "artifact_id": "task-1",
+        "content_hash": "mismatched-ask-run-body"
+    });
+
+    serde_json::from_value::<AskResponse>(encoded)
+        .expect_err("ask-run identity must match the executed response body");
 }
 
 #[test]

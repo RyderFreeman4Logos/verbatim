@@ -3,6 +3,7 @@ use crate::wire_schemas::WIRE_SCHEMA_VERSION;
 
 fn sample_generated_ask() -> AskResponse {
     AskResponse {
+        task_id: "generated-ask-run".into(),
         answer: "Generated interpretation.".into(),
         answer_kind: AnswerKind::GeneratedInterpretation,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),

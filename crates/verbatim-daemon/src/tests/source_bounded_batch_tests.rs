@@ -295,6 +295,7 @@ fn generated_ask_from_paid_retrieve(store: &Store, results: &[RetrievalResult]) 
         executed_retrieve_for_generated_ask("What is cited?", "default", generation, &results);
     context.task_id = "generated-ask-retrieve".into();
     AskResponse {
+        task_id: "generated-ask-run".into(),
         answer: "Generated interpretation.".into(),
         answer_kind: AnswerKind::GeneratedInterpretation,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),
