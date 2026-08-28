@@ -4008,7 +4008,8 @@ async fn task_profile_response(
                     task_id.0
                 )
             })?;
-            Ok(TaskProfileResponse { profile })
+            TaskProfileResponse::new(profile)
+                .map_err(|e| anyhow::anyhow!("stamp task profile identity: {e}"))
         })
     })
     .await
@@ -15388,6 +15389,14 @@ mod tests {
         assert_eq!(profile_response.profile.task_id, task_id);
         assert_eq!(profile_response.profile.task_kind, TaskKind::Ask);
         assert_eq!(profile_response.profile.status, TaskStatus::Succeeded);
+        assert_eq!(
+            profile_response.identity.kind,
+            verbatim_core::wire_schemas::WireArtifactKind::TaskProfile
+        );
+        assert_eq!(profile_response.identity.artifact_id, task_id.0);
+        let wire = serde_json::to_vec(&profile_response).unwrap();
+        let decoded: TaskProfileResponse = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(decoded, profile_response);
         let value = serde_json::to_value(&profile_response.profile).unwrap();
         assert_eq!(value["controls"]["retrieval"]["dense_top_k"], 11);
         assert_eq!(value["controls"]["retrieval"]["bm25_top_k"], 7);
@@ -15791,6 +15800,14 @@ mod tests {
         );
         assert_eq!(profile_response.profile.task_kind, TaskKind::Retrieve);
         assert_eq!(profile_response.profile.status, TaskStatus::Succeeded);
+        assert_eq!(
+            profile_response.identity.kind,
+            verbatim_core::wire_schemas::WireArtifactKind::TaskProfile
+        );
+        assert_eq!(
+            profile_response.identity.artifact_id,
+            retrieve_response.task_id
+        );
         assert_eq!(
             profile_response.profile.schema_version,
             verbatim_core::task::TASK_PROFILE_SCHEMA_VERSION

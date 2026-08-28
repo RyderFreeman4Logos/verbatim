@@ -3389,11 +3389,9 @@ mod tests {
     #[test]
     fn task_profile_human_ask_output_includes_ask_sections_and_retrieval_summary() {
         let client = MockDaemonClient::default();
-        client
-            .task_profile_response
-            .replace(Some(TaskProfileResponse {
-                profile: sample_ask_task_profile("task-ask"),
-            }));
+        client.task_profile_response.replace(Some(
+            TaskProfileResponse::new(sample_ask_task_profile("task-ask")).unwrap(),
+        ));
         let local = MockLocalActions::default();
 
         let (code, stdout, stderr) =
@@ -5046,9 +5044,7 @@ mod tests {
                 .task_profile_response
                 .borrow()
                 .clone()
-                .unwrap_or_else(|| TaskProfileResponse {
-                    profile: sample_task_profile(task_id),
-                }))
+                .unwrap_or_else(|| TaskProfileResponse::new(sample_task_profile(task_id)).unwrap()))
         }
 
         fn get_task_events(

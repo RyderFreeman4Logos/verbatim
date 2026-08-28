@@ -483,9 +483,10 @@ pub struct TaskMutationResponse {
     pub identity: crate::wire_schemas::CanonicalIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskProfileResponse {
     pub profile: TaskProfile,
+    pub identity: crate::wire_schemas::CanonicalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1240,6 +1241,9 @@ mod tests {
     include!("api_retrieve_serialization_tests.rs");
 }
 
+#[path = "api_task_profile_identity.rs"]
+mod api_task_profile_identity;
+
 #[cfg(test)]
 #[path = "api_locator_tests.rs"]
 mod api_locator_tests;
@@ -1271,3 +1275,7 @@ mod api_generated_ask_derived_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_task_run_identity_wire_tests.rs"]
 mod api_task_run_identity_wire_tests;
+
+#[cfg(test)]
+#[path = "api_task_profile_identity_wire_tests.rs"]
+mod api_task_profile_identity_wire_tests;

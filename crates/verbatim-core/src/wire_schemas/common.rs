@@ -120,6 +120,7 @@ pub enum WireArtifactKind {
     RetrievalRun,
     AskRun,
     TaskRun,
+    TaskProfile,
 }
 
 impl WireArtifactKind {
@@ -134,6 +135,7 @@ impl WireArtifactKind {
             Self::RetrievalRun => "retrieval_run",
             Self::AskRun => "ask_run",
             Self::TaskRun => "task_run",
+            Self::TaskProfile => "task_profile",
         }
     }
 }
