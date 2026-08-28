@@ -1444,7 +1444,9 @@ mod tests {
             "\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":\"2\",",
             "\"request\":{\"question_chars\":4},\"result\":{\"citation_count\":1},\"error\":null},",
             "\"spans\":[{\"sequence\":1,\"task_id\":\"task-1\",\"phase\":\"chat\",",
-            "\"started_at\":\"1\",\"duration_ms\":5,\"metadata\":{\"citation_count\":1}}]}"
+            "\"started_at\":\"1\",\"duration_ms\":5,\"metadata\":{\"citation_count\":1}}],",
+            "\"identity\":{\"kind\":\"task_run\",\"schema_version\":{\"major\":1,\"minor\":0,\"patch\":0},",
+            "\"artifact_id\":\"task-1\",\"content_hash\":\"502537cc588ccc5d7edf2dd54f0fcc3ad2b5fecad0623eb56d185ddd1956f2ba\"}}"
         );
         let server = TestServer::respond_many(vec![
             "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"task_id\":\"task-1\"}".to_string(),

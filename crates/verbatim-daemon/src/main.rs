@@ -3950,7 +3950,7 @@ async fn task_summary_response(
             .into_iter()
             .map(|span| public_task_span(span, &redaction))
             .collect();
-        Ok(TaskSummaryResponse { task, spans })
+        TaskSummaryResponse::new(task, spans)
     })
     .await
     .map_err(|e| {

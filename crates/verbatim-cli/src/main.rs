@@ -5646,8 +5646,8 @@ mod tests {
     }
 
     fn sample_task_response(status: TaskStatus) -> TaskSummaryResponse {
-        TaskSummaryResponse {
-            task: TaskSummary {
+        TaskSummaryResponse::new(
+            TaskSummary {
                 id: TaskId("task-1".into()),
                 kind: TaskKind::Ask,
                 status,
@@ -5666,7 +5666,7 @@ mod tests {
                         .with_endpoint(TaskEndpointSummary::single_call("embedding", 12)),
                 ),
             },
-            spans: vec![
+            vec![
                 TaskSpan {
                     sequence: 1,
                     task_id: TaskId("task-1".into()),
@@ -5691,7 +5691,8 @@ mod tests {
                     }),
                 },
             ],
-        }
+        )
+        .expect("task response identity")
     }
 
     fn sample_task_list_response() -> TaskListResponse {
