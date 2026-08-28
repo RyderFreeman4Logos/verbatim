@@ -1131,9 +1131,7 @@ mod tests {
 
     #[test]
     fn http_add_source_posts_json_to_daemon() {
-        let server = TestServer::respond_once(
-            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"src-1\"}",
-        );
+        let server = TestServer::respond_once(ADD_SOURCE_RESPONSE);
         let client = HttpDaemonClient::with_base_url(server.base_url());
 
         let response = client.add_source("/tmp/doc.pdf").unwrap();
