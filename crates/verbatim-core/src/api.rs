@@ -17,6 +17,7 @@ use crate::types::{
     BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceIngestDiagnostics,
     SourceLocator,
 };
+use crate::wire_schemas::CanonicalIdentity;
 
 /// HTTP methods used by shared daemon API route metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -553,14 +554,13 @@ pub struct TaskEventsResponse {
     pub events: Vec<TaskEvent>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskWaitEvent {
     pub task: TaskSummary,
-    #[serde(default)]
     pub events: Vec<TaskEvent>,
-    #[serde(default)]
     pub spans: Vec<TaskSpan>,
     pub terminal: bool,
+    pub identity: CanonicalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1275,6 +1275,9 @@ mod api_generated_ask_derived_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_task_run_identity_wire_tests.rs"]
 mod api_task_run_identity_wire_tests;
+#[cfg(test)]
+#[path = "api_task_wait_identity_wire_tests.rs"]
+mod api_task_wait_identity_wire_tests;
 
 #[cfg(test)]
 #[path = "api_task_profile_identity_wire_tests.rs"]

@@ -7316,12 +7316,12 @@ async fn task_wait_snapshot(
             Vec::new()
         };
         let terminal = task.status.is_terminal();
-        Ok::<_, anyhow::Error>(TaskWaitEvent {
-            task: public_task_summary(task, &redaction),
+        TaskWaitEvent::new(
+            public_task_summary(task, &redaction),
             events,
             spans,
             terminal,
-        })
+        )
     })
     .await
     .map_err(|e| {
