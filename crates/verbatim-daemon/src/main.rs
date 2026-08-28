@@ -12569,6 +12569,7 @@ mod tests {
         .await
         .unwrap();
         ensure_task_started(&state, &completed).await.unwrap();
+        state.ingest_queue_active.store(true, Ordering::Release);
         finish_task_success(
             &state,
             &completed,
