@@ -4781,7 +4781,7 @@ mod tests {
     impl DaemonClient for MockDaemonClient {
         fn add_source(&self, path: &str) -> client::CliResult<AddSourceResponse> {
             self.calls.borrow_mut().push(format!("add_source:{path}"));
-            Ok(AddSourceResponse { id: "src-1".into() })
+            Ok(AddSourceResponse::new("src-1").unwrap())
         }
 
         fn list_sources(&self) -> client::CliResult<Vec<SourceResponse>> {

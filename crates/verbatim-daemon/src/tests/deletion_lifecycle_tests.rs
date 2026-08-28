@@ -115,3 +115,26 @@ async fn deletion_scheduler_continues_beyond_the_startup_batch_limit() {
         "the scheduler started with more actionable candidates than one bounded batch"
     );
 }
+
+#[tokio::test]
+async fn add_source_publishes_source_created_identity_after_persistence() {
+    let test_dir = TestDir::new("add-source-source-created-identity");
+    let source_path = test_dir.path().join("doc.md");
+    fs::write(&source_path, "source-created identity fixture").unwrap();
+    let config = retrieve_test_config("http://127.0.0.1:9/v1");
+    let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
+    let state = test_state(config, test_dir.path(), pipeline);
+
+    let (status, Json(response)) = add_source(
+        State(Arc::clone(&state)),
+        Json(AddSourceRequest {
+            path: source_path.display().to_string(),
+        }),
+    )
+    .await
+    .expect("source creation succeeds");
+
+    assert_eq!(status, StatusCode::CREATED);
+    let expected = AddSourceResponse::new(response.id.clone()).unwrap();
+    assert_eq!(response.identity, expected.identity);
+}

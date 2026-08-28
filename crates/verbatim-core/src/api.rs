@@ -155,10 +155,7 @@ pub struct AddSourceRequest {
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AddSourceResponse {
-    pub id: String,
-}
+pub use api_source_created_identity::AddSourceResponse;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelocateSourceRequest {
@@ -1240,6 +1237,9 @@ mod api_task_profile_identity;
 
 #[path = "api_task_created_identity.rs"]
 mod api_task_created_identity;
+
+#[path = "api_source_created_identity.rs"]
+mod api_source_created_identity;
 
 #[cfg(test)]
 #[path = "api_locator_tests.rs"]

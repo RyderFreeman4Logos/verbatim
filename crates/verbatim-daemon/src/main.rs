@@ -2207,7 +2207,7 @@ async fn add_source(
 
     Ok((
         StatusCode::CREATED,
-        Json(AddSourceResponse { id: result.0 }),
+        Json(AddSourceResponse::new(result.0).unwrap()),
     ))
 }
 
