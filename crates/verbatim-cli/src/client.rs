@@ -1467,7 +1467,7 @@ mod tests {
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_summary}"
             ),
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"events\":[{\"sequence\":2,\"task_id\":\"task-1\",\"event_type\":\"phase\",\"message\":\"done\",\"payload\":{},\"created_at\":\"2\"}]}".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"task_id\":\"task-1\",\"events\":[{\"sequence\":2,\"task_id\":\"task-1\",\"event_type\":\"phase\",\"message\":\"done\",\"payload\":{},\"created_at\":\"2\"}],\"identity\":{\"kind\":\"task_events\",\"schema_version\":{\"major\":1,\"minor\":0,\"patch\":0},\"artifact_id\":\"task-1\",\"content_hash\":\"d3b255d8f296abc290572a161ad36ef1cd2e84370b299d6a77a08bc05609a3c6\"}}".to_string(),
             task_wait_response(
                 TASK_WAIT_TERMINAL_TASK,
                 "[]",

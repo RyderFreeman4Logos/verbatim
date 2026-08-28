@@ -4158,7 +4158,7 @@ async fn task_events_response(
             .into_iter()
             .map(|event| public_task_event_for_source(event, &redaction))
             .collect();
-        Ok(TaskEventsResponse { events })
+        TaskEventsResponse::new(task_id, events)
     })
     .await
     .map_err(|e| {
@@ -10744,6 +10744,7 @@ mod tests {
             .unwrap();
         let wait = task_wait_snapshot(&state, task_id, None, 10).await.unwrap();
         let encoded = serde_json::to_string(&(show, list, events, wait)).unwrap();
+        assert!(encoded.contains("\"kind\":\"task_events\""));
 
         for forbidden in [
             marker,

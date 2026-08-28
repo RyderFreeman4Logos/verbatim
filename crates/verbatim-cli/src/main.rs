@@ -5055,9 +5055,8 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("get_task_events:{task_id}:{after:?}"));
-            Ok(TaskEventsResponse {
-                events: vec![sample_task_event()],
-            })
+            TaskEventsResponse::new(TaskId(task_id.into()), vec![sample_task_event()])
+                .map_err(|error| client::CliError::Api(error.to_string()))
         }
 
         fn wait_task<W>(
