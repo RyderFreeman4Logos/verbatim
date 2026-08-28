@@ -3619,11 +3619,9 @@ mod tests {
                 sampled_task_ids: vec!["task-run".into()],
                 last_event_sequence: 0,
             }));
-        client.task_list_response.replace(Some(TaskListResponse {
-            total: 0,
-            tasks: Vec::new(),
-            aggregate: None,
-        }));
+        client.task_list_response.replace(Some(
+            TaskListResponse::new(Vec::new(), 0, None).expect("empty task list identity"),
+        ));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
 
@@ -3852,11 +3850,9 @@ mod tests {
         let client = MockDaemonClient::default();
         let local = MockLocalActions::default();
         local.task_list_history_clear_error.replace(true);
-        client.task_list_response.replace(Some(TaskListResponse {
-            total: 0,
-            tasks: Vec::new(),
-            aggregate: None,
-        }));
+        client.task_list_response.replace(Some(
+            TaskListResponse::new(Vec::new(), 0, None).expect("empty task list identity"),
+        ));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
 
@@ -5696,10 +5692,8 @@ mod tests {
     }
 
     fn sample_task_list_response() -> TaskListResponse {
-        TaskListResponse {
-            total: 4,
-            aggregate: None,
-            tasks: vec![
+        TaskListResponse::new(
+            vec![
                 TaskSummary {
                     id: TaskId("task-run".into()),
                     kind: TaskKind::Ingest,
@@ -5775,7 +5769,10 @@ mod tests {
                     ),
                 },
             ],
-        }
+            4,
+            None,
+        )
+        .expect("sample task list identity")
     }
 
     fn sample_task_list_aggregate(

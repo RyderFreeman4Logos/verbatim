@@ -4065,11 +4065,7 @@ async fn list_tasks_handler(
                 })
                 .collect::<Result<Vec<_>>>()?;
             let aggregate = task_list_aggregate(store)?;
-            Ok::<_, anyhow::Error>(TaskListResponse {
-                tasks,
-                total: page.total,
-                aggregate: Some(aggregate),
-            })
+            TaskListResponse::new(tasks, page.total, Some(aggregate))
         })
     })
     .await
@@ -12900,7 +12896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plateau_queue_integration_daemon_api_metadata_is_wire_serializable() {
+    async fn task_list_identity_daemon_api_metadata_is_wire_serializable() {
         let test_dir = TestDir::new("plateau-queue-integration-daemon-api");
         let config = retrieve_test_config("http://127.0.0.1:9/v1");
         let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
