@@ -16,8 +16,8 @@ use verbatim_core::api::{
     IndexGcResponse, IndexProfileDeleteRequest, IndexProfileDeleteResponse, IndexStatusResponse,
     IngestResponse, ReindexRequest, ReindexResponse, RelocateSourceRequest, RetrieveRequest,
     RetrieveResponse, SourceResponse, TaskCreatedResponse, TaskEventsResponse, TaskIngestRequest,
-    TaskListResponse, TaskProfileResponse, TaskSummaryResponse, VectorJsonCleanupRequest,
-    VectorJsonCleanupResponse,
+    TaskListResponse, TaskMutationResponse, TaskProfileResponse, TaskSummaryResponse,
+    VectorJsonCleanupRequest, VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
@@ -159,8 +159,8 @@ pub trait DaemonClient {
     ) -> CliResult<()>
     where
         W: Write;
-    fn cancel_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
-    fn resume_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse>;
+    fn cancel_task(&self, task_id: &str) -> CliResult<TaskMutationResponse>;
+    fn resume_task(&self, task_id: &str) -> CliResult<TaskMutationResponse>;
     fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> CliResult<()>
     where
         W: Write;
@@ -670,16 +670,16 @@ impl DaemonClient for HttpDaemonClient {
         }
     }
 
-    fn cancel_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse> {
-        self.request_json::<TaskSummaryResponse, ()>(
+    fn cancel_task(&self, task_id: &str) -> CliResult<TaskMutationResponse> {
+        self.request_json::<TaskMutationResponse, ()>(
             Method::POST,
             &format!("/api/tasks/{task_id}/cancel"),
             None,
         )
     }
 
-    fn resume_task(&self, task_id: &str) -> CliResult<TaskSummaryResponse> {
-        self.request_json::<TaskSummaryResponse, ()>(
+    fn resume_task(&self, task_id: &str) -> CliResult<TaskMutationResponse> {
+        self.request_json::<TaskMutationResponse, ()>(
             Method::POST,
             &format!("/api/tasks/{task_id}/resume"),
             None,
@@ -1444,6 +1444,15 @@ mod tests {
             "\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":\"2\",",
             "\"request\":{\"question_chars\":4},\"result\":{\"citation_count\":1},\"error\":null},",
             "\"spans\":[{\"sequence\":1,\"task_id\":\"task-1\",\"phase\":\"chat\",",
+            "\"started_at\":\"1\",\"duration_ms\":5,\"metadata\":{\"citation_count\":1}}],",
+            "\"identity\":{\"kind\":\"task_run\",\"schema_version\":{\"major\":1,\"minor\":0,\"patch\":0},",
+            "\"artifact_id\":\"task-1\",\"content_hash\":\"502537cc588ccc5d7edf2dd54f0fcc3ad2b5fecad0623eb56d185ddd1956f2ba\"}}"
+        );
+        let task_mutation = concat!(
+            "{\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"succeeded\",",
+            "\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":\"2\",",
+            "\"request\":{\"question_chars\":4},\"result\":{\"citation_count\":1},\"error\":null},",
+            "\"spans\":[{\"sequence\":1,\"task_id\":\"task-1\",\"phase\":\"chat\",",
             "\"started_at\":\"1\",\"duration_ms\":5,\"metadata\":{\"citation_count\":1}}]}"
         );
         let server = TestServer::respond_many(vec![
@@ -1455,10 +1464,10 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"events\":[{\"sequence\":2,\"task_id\":\"task-1\",\"event_type\":\"phase\",\"message\":\"done\",\"payload\":{},\"created_at\":\"2\"}]}".to_string(),
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: task\ndata: {\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"succeeded\",\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":\"2\",\"request\":{},\"result\":{},\"error\":null},\"events\":[],\"spans\":[],\"terminal\":true}\n\n".to_string(),
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_summary}"
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_mutation}"
             ),
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_summary}"
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_mutation}"
             ),
         ]);
         let client = HttpDaemonClient::with_base_url(server.base_url());

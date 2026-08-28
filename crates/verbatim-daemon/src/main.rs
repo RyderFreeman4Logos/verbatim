@@ -45,9 +45,9 @@ use verbatim_core::api::{
     ResponseTextTaxonomy, RetrieveRequest, RetrieveResponse, RetrieveResultResponse,
     RetrieveTimingResponse, SourceResponse, TaskCreatedResponse, TaskEmbeddingWaitAggregate,
     TaskEventsResponse, TaskIngestRequest, TaskListAggregate, TaskListResponse,
-    TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
-    TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent, VectorJsonCleanupRequest,
-    VectorJsonCleanupResponse,
+    TaskMutationResponse, TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow,
+    TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse, TaskWaitEvent,
+    VectorJsonCleanupRequest, VectorJsonCleanupResponse,
 };
 use verbatim_core::collection::{
     diff_collection_members, validate_collection_name, CollectionIgnoreRules, CollectionMember,
@@ -3935,10 +3935,10 @@ fn is_private_task_telemetry_key(key: &str) -> bool {
         || normalized.ends_with("vectorvalues")
 }
 
-async fn task_summary_response(
+async fn task_summary_parts(
     state: &SharedState,
     task_id: TaskId,
-) -> Result<TaskSummaryResponse, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(TaskSummary, Vec<TaskSpan>), (StatusCode, Json<ErrorResponse>)> {
     with_task_store_read(state, move |store| {
         let task = store
             .get_task(&task_id)?
@@ -3950,7 +3950,7 @@ async fn task_summary_response(
             .into_iter()
             .map(|span| public_task_span(span, &redaction))
             .collect();
-        Ok(TaskSummaryResponse { task, spans })
+        Ok((task, spans))
     })
     .await
     .map_err(|e| {
@@ -3960,6 +3960,22 @@ async fn task_summary_response(
             err(StatusCode::INTERNAL_SERVER_ERROR, e)
         }
     })
+}
+
+async fn task_summary_response(
+    state: &SharedState,
+    task_id: TaskId,
+) -> Result<TaskSummaryResponse, (StatusCode, Json<ErrorResponse>)> {
+    let (task, spans) = task_summary_parts(state, task_id).await?;
+    TaskSummaryResponse::new(task, spans).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+async fn task_mutation_response(
+    state: &SharedState,
+    task_id: TaskId,
+) -> Result<TaskMutationResponse, (StatusCode, Json<ErrorResponse>)> {
+    let (task, spans) = task_summary_parts(state, task_id).await?;
+    Ok(TaskMutationResponse { task, spans })
 }
 
 async fn task_profile_response(
@@ -4474,25 +4490,25 @@ async fn list_task_events_handler(
 async fn cancel_task_handler(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-) -> Result<Json<TaskSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<TaskMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let task_id = TaskId(id);
     let changed = cancel_task_record(&state, &task_id).await?;
     if changed {
         schedule_ingest_queue(Arc::clone(&state));
     }
     if !changed {
-        let response = task_summary_response(&state, task_id.clone()).await?;
+        let response = task_mutation_response(&state, task_id.clone()).await?;
         if response.task.status.is_terminal() {
             return Ok(Json(response));
         }
     }
-    task_summary_response(&state, task_id).await.map(Json)
+    task_mutation_response(&state, task_id).await.map(Json)
 }
 
 async fn resume_task_handler(
     State(state): State<SharedState>,
     Path(id): Path<String>,
-) -> Result<Json<TaskSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<TaskMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let task_id = TaskId(id);
     let plan = resume_task_record(&state, &task_id).await?;
     if plan.queue_claimable {
@@ -4500,7 +4516,7 @@ async fn resume_task_handler(
     } else {
         spawn_resumed_indexing_task(Arc::clone(&state), plan);
     }
-    task_summary_response(&state, task_id).await.map(Json)
+    task_mutation_response(&state, task_id).await.map(Json)
 }
 
 async fn resume_task_record(
@@ -16830,6 +16846,11 @@ mod tests {
                 .unwrap();
 
         assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
+        assert!(!serde_json::to_value(&cancelled)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("identity"));
     }
 
     #[tokio::test]
@@ -17729,6 +17750,11 @@ mod tests {
         assert_eq!(resumed.task.request["source_id"], TASK_TELEMETRY_REDACTED);
         assert!(resumed.task.result.is_none());
         assert!(resumed.task.error.is_none());
+        assert!(!serde_json::to_value(&resumed)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("identity"));
         let events = task_events_response(&state, failed_id.clone(), None, Some(10))
             .await
             .unwrap()

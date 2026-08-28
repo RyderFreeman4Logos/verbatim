@@ -2116,8 +2116,8 @@ mod tests {
         ResponseTextTaxonomy, RetrieveControlsResponse, RetrieveRequest, RetrieveResponse,
         RetrieveResultResponse, RetrieveTimingResponse, SourceResponse, TaskCreatedResponse,
         TaskEmbeddingWaitAggregate, TaskEventsResponse, TaskListAggregate, TaskListResponse,
-        TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow, TaskReasonBucket,
-        TaskStaleRunningAggregate, TaskSummaryResponse, AUDIT_RECEIPT_VERSION,
+        TaskMutationResponse, TaskProfileResponse, TaskQueueTurnover, TaskQueueTurnoverWindow,
+        TaskReasonBucket, TaskStaleRunningAggregate, TaskSummaryResponse, AUDIT_RECEIPT_VERSION,
         COLLECTION_CLI_API_PARITY,
     };
     use verbatim_core::collection::{
@@ -5081,18 +5081,18 @@ mod tests {
             Ok(())
         }
 
-        fn cancel_task(&self, task_id: &str) -> client::CliResult<TaskSummaryResponse> {
+        fn cancel_task(&self, task_id: &str) -> client::CliResult<TaskMutationResponse> {
             self.calls
                 .borrow_mut()
                 .push(format!("cancel_task:{task_id}"));
-            Ok(sample_task_response(TaskStatus::Cancelled))
+            Ok(sample_task_mutation_response(TaskStatus::Cancelled))
         }
 
-        fn resume_task(&self, task_id: &str) -> client::CliResult<TaskSummaryResponse> {
+        fn resume_task(&self, task_id: &str) -> client::CliResult<TaskMutationResponse> {
             self.calls
                 .borrow_mut()
                 .push(format!("resume_task:{task_id}"));
-            Ok(sample_task_response(TaskStatus::Queued))
+            Ok(sample_task_mutation_response(TaskStatus::Queued))
         }
 
         fn ask<W>(&self, request: &AskRequest, stdout: &mut W) -> client::CliResult<()>
@@ -5646,8 +5646,8 @@ mod tests {
     }
 
     fn sample_task_response(status: TaskStatus) -> TaskSummaryResponse {
-        TaskSummaryResponse {
-            task: TaskSummary {
+        TaskSummaryResponse::new(
+            TaskSummary {
                 id: TaskId("task-1".into()),
                 kind: TaskKind::Ask,
                 status,
@@ -5666,7 +5666,7 @@ mod tests {
                         .with_endpoint(TaskEndpointSummary::single_call("embedding", 12)),
                 ),
             },
-            spans: vec![
+            vec![
                 TaskSpan {
                     sequence: 1,
                     task_id: TaskId("task-1".into()),
@@ -5691,7 +5691,13 @@ mod tests {
                     }),
                 },
             ],
-        }
+        )
+        .expect("task response identity")
+    }
+
+    fn sample_task_mutation_response(status: TaskStatus) -> TaskMutationResponse {
+        let TaskSummaryResponse { task, spans, .. } = sample_task_response(status);
+        TaskMutationResponse { task, spans }
     }
 
     fn sample_task_list_response() -> TaskListResponse {

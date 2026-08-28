@@ -469,8 +469,15 @@ pub struct TaskIngestRequest {
     pub vectors_only: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskSummaryResponse {
+    pub task: TaskSummary,
+    pub spans: Vec<TaskSpan>,
+    pub identity: crate::wire_schemas::CanonicalIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskMutationResponse {
     pub task: TaskSummary,
     #[serde(default)]
     pub spans: Vec<TaskSpan>,
@@ -590,6 +597,8 @@ mod evidence_identity;
 mod generated_ask_identity;
 #[path = "api_retrieval_run_identity.rs"]
 mod retrieval_run_identity;
+#[path = "api_task_run_identity.rs"]
+mod task_run_identity;
 pub use generated_ask_identity::{generated_interpretation_wire, GeneratedInterpretationWire};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1258,3 +1267,7 @@ mod api_evidence_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_generated_ask_derived_identity_wire_tests.rs"]
 mod api_generated_ask_derived_identity_wire_tests;
+
+#[cfg(test)]
+#[path = "api_task_run_identity_wire_tests.rs"]
+mod api_task_run_identity_wire_tests;
