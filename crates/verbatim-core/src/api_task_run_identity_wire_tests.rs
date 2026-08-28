@@ -1,4 +1,4 @@
-use super::TaskSummaryResponse;
+use super::{TaskMutationResponse, TaskSummaryResponse};
 use crate::task::{TaskId, TaskKind, TaskSpan};
 use crate::wire_schemas::{encode_wire_document, wire_content_hash};
 use serde::Serialize;
@@ -59,6 +59,14 @@ fn decode(value: Value) -> Result<TaskSummaryResponse, serde_json::Error> {
     serde_json::from_value(value)
 }
 
+fn legacy_task_mutation_response(status: &str, with_span: bool) -> Value {
+    let mut wire = valid_task_summary_response(status, with_span);
+    wire.as_object_mut()
+        .expect("task mutation fixture is an object")
+        .remove("identity");
+    wire
+}
+
 fn mutate_task_status(wire: &mut Value) {
     wire["task"]["status"] = json!("failed");
 }
@@ -117,5 +125,22 @@ fn task_summary_response_rejects_identity_body_mismatch() {
             decode(wire).is_err(),
             "task summary identity mismatch must reject: {name}"
         );
+    }
+}
+
+#[test]
+fn task_mutation_response_keeps_legacy_wire_without_task_run_identity() {
+    for status in ["queued", "running", "succeeded", "failed", "cancelled"] {
+        for with_span in [false, true] {
+            let wire = legacy_task_mutation_response(status, with_span);
+            let response: TaskMutationResponse =
+                serde_json::from_value(wire.clone()).expect("legacy task mutation decodes");
+            let encoded = serde_json::to_value(response).expect("legacy task mutation encodes");
+            assert_eq!(encoded, wire, "status={status} with_span={with_span}");
+            assert!(
+                !encoded.as_object().unwrap().contains_key("identity"),
+                "status={status} with_span={with_span}"
+            );
+        }
     }
 }

@@ -476,6 +476,12 @@ pub struct TaskSummaryResponse {
     pub identity: crate::wire_schemas::CanonicalIdentity,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskMutationResponse {
+    pub task: TaskSummary,
+    pub spans: Vec<TaskSpan>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskProfileResponse {
     pub profile: TaskProfile,
