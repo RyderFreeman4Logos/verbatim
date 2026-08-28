@@ -5697,7 +5697,7 @@ mod tests {
 
     fn sample_task_mutation_response(status: TaskStatus) -> TaskMutationResponse {
         let TaskSummaryResponse { task, spans, .. } = sample_task_response(status);
-        TaskMutationResponse { task, spans }
+        TaskMutationResponse::new(task, spans).expect("sample task mutation identity")
     }
 
     fn sample_task_list_response() -> TaskListResponse {

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use super::{TaskSummary, TaskSummaryResponse};
+use super::{TaskMutationResponse, TaskSummary, TaskSummaryResponse};
 use crate::task::TaskSpan;
 use crate::wire_schemas::{
     encode_wire_document, CanonicalIdentity, WireArtifactKind, WIRE_SCHEMA_VERSION,
@@ -14,11 +14,12 @@ struct TaskRunIdentityBody<'a> {
 }
 
 impl<'a> TaskRunIdentityBody<'a> {
+    fn from_parts(task: &'a TaskSummary, spans: &'a [TaskSpan]) -> Self {
+        Self { task, spans }
+    }
+
     fn from_response(response: &'a TaskSummaryResponse) -> Self {
-        Self {
-            task: &response.task,
-            spans: &response.spans,
-        }
+        Self::from_parts(&response.task, &response.spans)
     }
 }
 
@@ -49,12 +50,17 @@ struct TaskSummaryResponseWire {
     identity: CanonicalIdentity,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct TaskMutationResponseWire {
+    task: TaskSummary,
+    #[serde(default)]
+    spans: Vec<TaskSpan>,
+    identity: CanonicalIdentity,
+}
+
 impl TaskSummaryResponse {
     pub fn new(task: TaskSummary, spans: Vec<TaskSpan>) -> Result<Self> {
-        let body = TaskRunIdentityBody {
-            task: &task,
-            spans: &spans,
-        };
+        let body = TaskRunIdentityBody::from_parts(&task, &spans);
         let identity = stamp_task_run_identity(&body, None)?;
         Ok(Self {
             task,
@@ -90,10 +96,56 @@ impl<'de> Deserialize<'de> for TaskSummaryResponse {
         D: serde::Deserializer<'de>,
     {
         let wire = TaskSummaryResponseWire::deserialize(deserializer)?;
-        let body = TaskRunIdentityBody {
-            task: &wire.task,
-            spans: &wire.spans,
-        };
+        let body = TaskRunIdentityBody::from_parts(&wire.task, &wire.spans);
+        let identity = stamp_task_run_identity(&body, Some(&wire.identity))
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            task: wire.task,
+            spans: wire.spans,
+            identity,
+        })
+    }
+}
+
+impl TaskMutationResponse {
+    pub fn new(task: TaskSummary, spans: Vec<TaskSpan>) -> Result<Self> {
+        let body = TaskRunIdentityBody::from_parts(&task, &spans);
+        let identity = stamp_task_run_identity(&body, None)?;
+        Ok(Self {
+            task,
+            spans,
+            identity,
+        })
+    }
+
+    fn identity_body(&self) -> TaskRunIdentityBody<'_> {
+        TaskRunIdentityBody::from_parts(&self.task, &self.spans)
+    }
+}
+
+impl Serialize for TaskMutationResponse {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let identity = stamp_task_run_identity(&self.identity_body(), Some(&self.identity))
+            .map_err(serde::ser::Error::custom)?;
+        TaskMutationResponseWire {
+            task: self.task.clone(),
+            spans: self.spans.clone(),
+            identity,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskMutationResponse {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = TaskMutationResponseWire::deserialize(deserializer)?;
+        let body = TaskRunIdentityBody::from_parts(&wire.task, &wire.spans);
         let identity = stamp_task_run_identity(&body, Some(&wire.identity))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
