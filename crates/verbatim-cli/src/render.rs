@@ -3681,15 +3681,7 @@ mod tests {
     }
 
     fn source_fixture(id: &str, status: &str, path: &str) -> SourceResponse {
-        SourceResponse {
-            id: id.into(),
-            path: path.into(),
-            status: status.into(),
-            hash: "abc123".into(),
-            parser_used: None,
-            last_ingested_at: None,
-            diagnostics: None,
-        }
+        SourceResponse::new(id, path, status, "abc123", None, None, None).unwrap()
     }
 
     #[test]

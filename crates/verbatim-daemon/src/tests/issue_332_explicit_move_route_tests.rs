@@ -1,6 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::{header, Method, Request, StatusCode};
+use serde_json::Value;
 use tower::ServiceExt;
 use verbatim_core::api::{
     ErrorResponse, EvidenceResponse, RetrieveRequest, RetrieveResponse, SourceResponse,
@@ -87,7 +88,7 @@ async fn post_retrieve_stamps_retrieval_run_identity() {
 }
 
 #[tokio::test]
-async fn issue_332_existing_source_routes_keep_raw_id_semantics() {
+async fn issue_332_source_record_identity_is_published_by_inspect_and_list() {
     let test_dir = TestDir::new("issue-332-route-raw-source-id");
     let source_path = test_dir.path().join("legacy.md");
     fs::write(&source_path, "legacy route source").unwrap();
@@ -116,8 +117,20 @@ async fn issue_332_existing_source_routes_keep_raw_id_semantics() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let source: SourceResponse = issue_332_body(response).await;
+    let source_wire: Value = issue_332_body(response).await;
+    assert_eq!(source_wire["identity"]["kind"], "source_record");
+    let source: SourceResponse = serde_json::from_value(source_wire)
+        .expect("stamped source-record response must validate on decode");
     assert_eq!(source.id, source_id.0);
+
+    let response =
+        issue_332_request(&app, Method::GET, "/api/sources", serde_json::Value::Null).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let sources_wire: Value = issue_332_body(response).await;
+    assert_eq!(sources_wire[0]["identity"]["kind"], "source_record");
+    let sources: Vec<SourceResponse> = serde_json::from_value(sources_wire)
+        .expect("stamped source-record list must validate on decode");
+    assert_eq!(sources.len(), 1);
 
     let response = issue_332_request(
         &app,
@@ -187,7 +200,7 @@ async fn issue_332_relocation_json_rejections_use_bad_request_error_response() {
 }
 
 #[tokio::test]
-async fn issue_332_public_relocation_preserves_retrieval_and_citation_resolution() {
+async fn issue_332_source_record_identity_is_published_by_relocation() {
     let model_server = MockModelServer::start(3).await;
     let test_dir = TestDir::new("issue-332-route-success");
     let old_path = test_dir.path().join("before.md");
@@ -220,7 +233,10 @@ async fn issue_332_public_relocation_preserves_retrieval_and_citation_resolution
     .await;
 
     assert_eq!(response.status(), StatusCode::OK);
-    let relocated: SourceResponse = issue_332_body(response).await;
+    let relocated_wire: Value = issue_332_body(response).await;
+    assert_eq!(relocated_wire["identity"]["kind"], "source_record");
+    let relocated: SourceResponse = serde_json::from_value(relocated_wire)
+        .expect("stamped relocated source record must validate on decode");
     assert_eq!(relocated.id, source_id.0);
     assert_eq!(
         relocated.path,

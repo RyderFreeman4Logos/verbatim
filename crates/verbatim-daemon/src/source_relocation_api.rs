@@ -24,7 +24,9 @@ pub(super) async fn relocate_source(
     .map_err(pipeline_access_error)?
     .map_err(relocation_operation_error)?;
 
-    Ok(Json(catalog_source_response(source)))
+    Ok(Json(catalog_source_response(source).map_err(|error| {
+        err(StatusCode::INTERNAL_SERVER_ERROR, error)
+    })?))
 }
 
 fn relocation_json_rejection(rejection: JsonRejection) -> (StatusCode, Json<ErrorResponse>) {
@@ -59,16 +61,16 @@ fn relocation_operation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorRe
     }
 }
 
-fn catalog_source_response(source: Source) -> SourceResponse {
-    SourceResponse {
-        id: source.id.0,
-        path: source.path.to_string_lossy().into_owned(),
-        status: format!("{:?}", source.status),
-        hash: source.hash,
-        parser_used: source.parser_used,
-        last_ingested_at: source.last_ingested_at,
-        diagnostics: None,
-    }
+fn catalog_source_response(source: Source) -> Result<SourceResponse> {
+    SourceResponse::new(
+        source.id.0,
+        source.path.to_string_lossy().into_owned(),
+        format!("{:?}", source.status),
+        source.hash,
+        source.parser_used,
+        source.last_ingested_at,
+        None,
+    )
 }
 
 #[cfg(test)]

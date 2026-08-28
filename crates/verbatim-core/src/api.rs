@@ -13,10 +13,7 @@ use crate::memory_budget::MemoryBudgetSnapshot;
 use crate::resource::ResourceQueueSnapshot;
 use crate::store::VectorJsonCleanupReport;
 use crate::task::{TaskEvent, TaskId, TaskProfile, TaskSpan, TaskSummary};
-use crate::types::{
-    BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceIngestDiagnostics,
-    SourceLocator,
-};
+use crate::types::{BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceLocator};
 use crate::wire_schemas::CanonicalIdentity;
 
 /// HTTP methods used by shared daemon API route metadata.
@@ -156,23 +153,12 @@ pub struct AddSourceRequest {
 }
 
 pub use api_source_created_identity::AddSourceResponse;
+pub use api_source_record_identity::SourceResponse;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelocateSourceRequest {
     pub source_id: String,
     pub new_path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SourceResponse {
-    pub id: String,
-    pub path: String,
-    pub status: String,
-    pub hash: String,
-    pub parser_used: Option<String>,
-    pub last_ingested_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostics: Option<SourceIngestDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1238,6 +1224,9 @@ mod api_task_profile_identity;
 #[path = "api_task_created_identity.rs"]
 mod api_task_created_identity;
 
+#[path = "api_source_record_identity.rs"]
+mod api_source_record_identity;
+
 #[path = "api_source_created_identity.rs"]
 mod api_source_created_identity;
 
@@ -1288,3 +1277,7 @@ mod api_task_profile_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_task_created_identity_wire_tests.rs"]
 mod api_task_created_identity_wire_tests;
+
+#[cfg(test)]
+#[path = "api_source_record_identity_wire_tests.rs"]
+mod api_source_record_identity_wire_tests;

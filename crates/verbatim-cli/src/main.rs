@@ -4806,10 +4806,17 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("relocate_source:{id}:{new_path}"));
-            let mut source = sample_source();
-            source.id = id.to_string();
-            source.path = new_path.to_string();
-            Ok(source)
+            let source = sample_source();
+            Ok(SourceResponse::new(
+                id,
+                new_path,
+                source.status,
+                source.hash,
+                source.parser_used,
+                source.last_ingested_at,
+                source.diagnostics,
+            )
+            .unwrap())
         }
 
         fn check_sources(&self) -> client::CliResult<CheckStaleResponse> {
@@ -5271,15 +5278,7 @@ mod tests {
     }
 
     fn sample_source() -> SourceResponse {
-        SourceResponse {
-            id: "src-1".into(),
-            path: "/tmp/doc.pdf".into(),
-            status: "Pending".into(),
-            hash: "hash".into(),
-            parser_used: None,
-            last_ingested_at: None,
-            diagnostics: None,
-        }
+        SourceResponse::new("src-1", "/tmp/doc.pdf", "Pending", "hash", None, None, None).unwrap()
     }
 
     fn sample_collection_record() -> CollectionRecord {

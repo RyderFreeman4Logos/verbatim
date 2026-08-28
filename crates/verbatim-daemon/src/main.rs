@@ -2215,20 +2215,21 @@ async fn list_sources(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<SourceResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let sources = with_task_store_read(&state, |store| {
-        let sources = store
+        store
             .list_sources()?
             .into_iter()
-            .map(|source| SourceResponse {
-                id: source.id.0,
-                path: source.path.to_string_lossy().into_owned(),
-                status: format!("{:?}", source.status),
-                hash: source.hash,
-                parser_used: source.parser_used,
-                last_ingested_at: source.last_ingested_at,
-                diagnostics: None,
+            .map(|source| {
+                SourceResponse::new(
+                    source.id.0,
+                    source.path.to_string_lossy().into_owned(),
+                    format!("{:?}", source.status),
+                    source.hash,
+                    source.parser_used,
+                    source.last_ingested_at,
+                    None,
+                )
             })
-            .collect::<Vec<_>>();
-        Ok::<_, anyhow::Error>(sources)
+            .collect::<Result<Vec<_>>>()
     })
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -2279,15 +2280,15 @@ fn source_response(
         &image_artifacts,
         current_ocr_profile,
     );
-    Ok(SourceResponse {
-        id: source.id.0,
-        path: source.path.to_string_lossy().into_owned(),
-        status: format!("{:?}", source.status),
-        hash: source.hash,
-        parser_used: source.parser_used,
-        last_ingested_at: source.last_ingested_at,
-        diagnostics: Some(diagnostics),
-    })
+    SourceResponse::new(
+        source.id.0,
+        source.path.to_string_lossy().into_owned(),
+        format!("{:?}", source.status),
+        source.hash,
+        source.parser_used,
+        source.last_ingested_at,
+        Some(diagnostics),
+    )
 }
 
 fn source_remove_error(source_id: &str, error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
