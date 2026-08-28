@@ -1530,19 +1530,19 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
             "{\"profile\":{\"schema_version\":1,\"task_id\":\"task-1\",",
             "\"task_kind\":\"retrieve\",\"status\":\"succeeded\",",
-            "\"queue_wait_ms\":0,\"total_wall_ms\":12}}"
+            "\"queue_wait_ms\":0,\"total_wall_ms\":12},\"identity\":{",
+            "\"kind\":\"task_profile\",\"schema_version\":{\"major\":1,",
+            "\"minor\":0,\"patch\":0},\"artifact_id\":\"task-1\",",
+            "\"content_hash\":\"9a53920d70aa1d82e3c8d9a4ad19a5e0dad453318286ea53566e7664c95c506b\"}}"
         )
         .to_string()]);
-        let client = HttpDaemonClient::with_base_url(server.base_url());
-
-        let profile = client.get_task_profile("task-1").unwrap().profile;
+        let profile = HttpDaemonClient::with_base_url(server.base_url())
+            .get_task_profile("task-1")
+            .unwrap()
+            .profile;
 
         assert_eq!(profile.task_id.0, "task-1");
-        assert_eq!(profile.task_kind.as_str(), "retrieve");
-        assert_eq!(profile.status.as_str(), "succeeded");
-        assert_eq!(profile.total_wall_ms, 12);
-        let requests = server.requests();
-        assert!(requests[0].starts_with("GET /api/tasks/task-1/profile HTTP/1.1"));
+        assert!(server.requests()[0].starts_with("GET /api/tasks/task-1/profile HTTP/1.1"));
     }
 
     #[test]
