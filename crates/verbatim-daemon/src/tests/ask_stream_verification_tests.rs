@@ -220,7 +220,7 @@ async fn ask_stream_without_verifier_preserves_token_streaming() {
 }
 
 #[tokio::test]
-async fn default_generated_ask_stream_publishes_terminal_derived_identity() {
+async fn default_generated_ask_stream_publishes_terminal_identities() {
     let raw_answer = "The unverified streamed answer is alpha [E1].";
     let (body, _model_server) =
         ask_stream_body("ask-stream-generated-interpretation", false, &[raw_answer]).await;
@@ -260,7 +260,33 @@ async fn default_generated_ask_stream_publishes_terminal_derived_identity() {
     assert!(interpretation.get("header").is_none());
     assert!(interpretation.get("model_fingerprint").is_none());
     assert!(interpretation.get("source_pack_hash").is_none());
-    assert!(body.trim_end().ends_with(interpretations[0]), "SSE: {body}");
+
+    let ask_runs = event_data(&body, "ask_run");
+    assert_eq!(ask_runs.len(), 1, "SSE: {body}");
+    let ask_run: serde_json::Value = serde_json::from_str(ask_runs[0]).unwrap();
+    assert_eq!(ask_run["answer"], completed_answer);
+    assert_eq!(ask_run["answer_kind"], "generated_interpretation");
+    assert_eq!(ask_run["identity"]["kind"], "ask_run");
+    assert_eq!(ask_run["identity"]["artifact_id"], ask_run["task_id"]);
+    assert_eq!(
+        ask_run["identity"]["schema_version"],
+        serde_json::to_value(WIRE_SCHEMA_VERSION).unwrap()
+    );
+    assert!(ask_run["identity"]["content_hash"]
+        .as_str()
+        .is_some_and(|hash| !hash.is_empty()));
+    let decoded: AskResponse = serde_json::from_value(ask_run.clone()).unwrap();
+    assert_eq!(decoded.answer, completed_answer);
+    assert_eq!(
+        decoded.generated_interpretation.unwrap().text,
+        completed_answer
+    );
+
+    let mut mismatched = ask_run;
+    mismatched["identity"]["kind"] = serde_json::json!("derived_artifact");
+    serde_json::from_value::<AskResponse>(mismatched)
+        .expect_err("stream ask-run identity mismatch must fail closed");
+    assert!(body.trim_end().ends_with(ask_runs[0]), "SSE: {body}");
 }
 
 #[tokio::test]

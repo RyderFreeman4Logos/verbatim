@@ -5378,22 +5378,20 @@ async fn execute_ask_stream_task_inner(
     .await?;
 
     let citation_count = gen_result.citations.len();
+    let citations = gen_result
+        .citations
+        .iter()
+        .cloned()
+        .map(|citation| {
+            citation_response_with_collections(citation, &query_scope.collection_provenance)
+        })
+        .collect::<Vec<_>>();
     send_stream_event(
         &tx,
         sse_json_event(
             "citation",
             &AskCitationEvent {
-                citations: gen_result
-                    .citations
-                    .iter()
-                    .cloned()
-                    .map(|citation| {
-                        citation_response_with_collections(
-                            citation,
-                            &query_scope.collection_provenance,
-                        )
-                    })
-                    .collect(),
+                citations: citations.clone(),
                 verified: gen_result.verified,
             },
         ),
@@ -5413,8 +5411,8 @@ async fn execute_ask_stream_task_inner(
     }
 
     if show_retrieval {
-        if let Some(debug) = retrieval_debug {
-            send_stream_event(&tx, sse_json_event("retrieval", &debug)).await?;
+        if let Some(debug) = retrieval_debug.as_ref() {
+            send_stream_event(&tx, sse_json_event("retrieval", debug)).await?;
         }
     }
     if let Some(collection_filter) = &query_scope.collection_filter {
@@ -5439,6 +5437,22 @@ async fn execute_ask_stream_task_inner(
         sse_json_event("generated_interpretation", &generated_interpretation),
     )
     .await?;
+
+    let response = AskResponse {
+        task_id: task_id.0.clone(),
+        answer: gen_result.answer.clone(),
+        answer_kind: AnswerKind::GeneratedInterpretation,
+        text_taxonomy: ResponseTextTaxonomy::ask_response(),
+        generated_interpretation: Some(GeneratedInterpretationResponse {
+            text: gen_result.answer.clone(),
+        }),
+        citations,
+        verified: gen_result.verified,
+        retrieval: show_retrieval.then_some(retrieval_debug).flatten(),
+        context: Some(context),
+        collection_filter: query_scope.collection_filter,
+    };
+    send_stream_event(&tx, sse_json_event("ask_run", &response)).await?;
 
     finish_task_success(
         &state,
