@@ -582,6 +582,8 @@ mod response_serialization;
 #[path = "api_retrieve_envelope.rs"]
 mod retrieve_envelope;
 pub use retrieve_envelope::generated_ask_stream_context_pack;
+#[path = "api_ask_run_identity.rs"]
+mod ask_run_identity;
 #[path = "api_evidence_identity.rs"]
 mod evidence_identity;
 #[path = "api_generated_ask_identity.rs"]
@@ -599,6 +601,7 @@ pub enum AnswerKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AskResponse {
+    pub task_id: String,
     pub answer: String,
     pub answer_kind: AnswerKind,
     pub text_taxonomy: ResponseTextTaxonomy,
@@ -608,6 +611,34 @@ pub struct AskResponse {
     pub retrieval: Option<RetrievalDebug>,
     pub context: Option<RetrieveResponse>,
     pub collection_filter: Option<CollectionFilterResponse>,
+}
+
+#[cfg(test)]
+pub(super) fn with_ask_run_identity(mut value: Value) -> Value {
+    value["task_id"] = Value::String("legacy-ask-run".into());
+    let body = ask_run_identity::AskRunIdentityBody {
+        task_id: value["task_id"].as_str().unwrap().into(),
+        answer: value["answer"].as_str().unwrap().into(),
+        answer_kind: serde_json::from_value(value["answer_kind"].clone()).unwrap(),
+        citations: serde_json::from_value(value["citations"].clone()).unwrap(),
+        verified: value["verified"].as_bool().unwrap(),
+        context_pack: value
+            .get("context_pack")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .unwrap(),
+        collection_filter: value
+            .get("collection_filter")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .unwrap(),
+    };
+    value["identity"] =
+        serde_json::to_value(ask_run_identity::stamp_ask_run_identity(&body, None).unwrap())
+            .unwrap();
+    value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

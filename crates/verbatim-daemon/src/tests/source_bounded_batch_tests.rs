@@ -295,6 +295,7 @@ fn generated_ask_from_paid_retrieve(store: &Store, results: &[RetrievalResult]) 
         executed_retrieve_for_generated_ask("What is cited?", "default", generation, &results);
     context.task_id = "generated-ask-retrieve".into();
     AskResponse {
+        task_id: "generated-ask-run".into(),
         answer: "Generated interpretation.".into(),
         answer_kind: AnswerKind::GeneratedInterpretation,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),
@@ -333,9 +334,16 @@ fn generated_ask_context_pack_generation_mismatch_is_rejected() {
     )];
     let (_dir, store) = persist_generated_ask_generation_fixture("mismatch", "7", &results);
     let response = generated_ask_from_paid_retrieve(&store, &results);
-    let mut encoded = serde_json::to_value(&response).unwrap();
-    encoded["context_pack"]["header"]["generation"] = serde_json::json!("other");
+    let mut matching = response.clone();
+    matching.context.as_mut().unwrap().generation = Some("other".into());
+    let mut encoded = serde_json::to_value(matching).unwrap();
     encoded["context"] = serde_json::to_value(response.context).unwrap();
-    serde_json::from_value::<AskResponse>(encoded)
-        .expect_err("context pack generation must match the executed index generation");
+    let error = serde_json::from_value::<AskResponse>(encoded)
+        .expect_err("context pack generation must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("context pack generation does not match the executed index generation"),
+        "unexpected context pack generation error: {error}"
+    );
 }

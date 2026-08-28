@@ -5083,6 +5083,7 @@ async fn execute_ask_task_inner_with_config(
         })
         .collect::<Vec<_>>();
     let response = AskResponse {
+        task_id: task_id.0.clone(),
         answer: gen_result.answer.clone(),
         answer_kind: AnswerKind::GeneratedInterpretation,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),
@@ -5466,6 +5467,7 @@ async fn execute_context_only_ask_task_inner(
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let context = execute_retrieve_task_inner(state, task_id, retrieve_req, controls).await?;
     Ok(AskResponse {
+        task_id: task_id.0.clone(),
         answer: String::new(),
         answer_kind: AnswerKind::EvidenceOnly,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),

@@ -1,6 +1,7 @@
 #[test]
 fn ask_response_omits_retrieval_when_debug_is_off() {
     let response = AskResponse {
+        task_id: "ask-run-test".into(),
         answer: "Answer [E1].".into(),
         answer_kind: AnswerKind::EvidenceOnly,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),
@@ -18,10 +19,13 @@ fn ask_response_omits_retrieval_when_debug_is_off() {
     assert_eq!(encoded["answer_kind"], "evidence_only");
     assert_eq!(encoded["citations"], serde_json::json!([]));
     assert!(!encoded["verified"].as_bool().unwrap());
-    assert_eq!(
-        encoded["text_taxonomy"],
-        serde_json::to_value(ResponseTextTaxonomy::ask_response()).unwrap()
-    );
+    assert_eq!(encoded["task_id"], "ask-run-test");
+    assert_eq!(encoded["identity"]["kind"], "ask_run");
+    assert!(encoded["text_taxonomy"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field["field"] == "identity.content_hash" && field["plane"] == "metadata"));
     assert!(encoded.get("collection_filter").is_none());
     assert!(encoded.get("retrieval").is_none());
 }
@@ -29,6 +33,7 @@ fn ask_response_omits_retrieval_when_debug_is_off() {
 #[test]
 fn ask_response_includes_structured_retrieval_when_requested() {
     let response = AskResponse {
+        task_id: "ask-run-test".into(),
         answer: "Answer [E1].".into(),
         answer_kind: AnswerKind::EvidenceOnly,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),

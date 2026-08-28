@@ -1,15 +1,16 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    evidence_identity, generated_ask_identity, retrieval_run_identity, retrieve_envelope,
-    AnswerKind, AskResponse, AuditReceipt, CitationResponse, CollectionFilterResponse,
-    EvidenceResponse, ResponseTextTaxonomy, RetrievalDebug, RetrieveControlsResponse,
-    RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
+    ask_run_identity, evidence_identity, generated_ask_identity, retrieval_run_identity,
+    retrieve_envelope, AnswerKind, AskResponse, AuditReceipt, CitationResponse,
+    CollectionFilterResponse, EvidenceResponse, ResponseTextTaxonomy, RetrievalDebug,
+    RetrieveControlsResponse, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
 };
 use crate::wire_schemas::{CanonicalIdentity, ContextPackEnvelope, EvidencePackEnvelope};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AskResponseWire {
+    task_id: String,
     answer: String,
     answer_kind: AnswerKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -27,6 +28,21 @@ struct AskResponseWire {
     context_pack: Option<ContextPackEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     collection_filter: Option<CollectionFilterResponse>,
+    identity: CanonicalIdentity,
+}
+
+impl AskResponseWire {
+    fn ask_run_identity_body(&self) -> ask_run_identity::AskRunIdentityBody {
+        ask_run_identity::AskRunIdentityBody {
+            task_id: self.task_id.clone(),
+            answer: self.answer.clone(),
+            answer_kind: self.answer_kind,
+            citations: self.citations.clone(),
+            verified: self.verified,
+            context_pack: self.context_pack.clone(),
+            collection_filter: self.collection_filter.clone(),
+        }
+    }
 }
 
 impl Serialize for AskResponse {
@@ -34,7 +50,23 @@ impl Serialize for AskResponse {
     where
         S: serde::Serializer,
     {
+        let context_pack = retrieve_envelope::context_pack_from_ask_context(self.context.as_ref())
+            .map_err(serde::ser::Error::custom)?;
+        let identity = ask_run_identity::stamp_ask_run_identity(
+            &ask_run_identity::AskRunIdentityBody {
+                task_id: self.task_id.clone(),
+                answer: self.answer.clone(),
+                answer_kind: self.answer_kind,
+                citations: self.citations.clone(),
+                verified: self.verified,
+                context_pack: context_pack.clone(),
+                collection_filter: self.collection_filter.clone(),
+            },
+            None,
+        )
+        .map_err(serde::ser::Error::custom)?;
         let wire = AskResponseWire {
+            task_id: self.task_id.clone(),
             answer: self.answer.clone(),
             answer_kind: self.answer_kind,
             text_taxonomy: None,
@@ -50,9 +82,9 @@ impl Serialize for AskResponse {
                 AnswerKind::GeneratedInterpretation => None,
                 AnswerKind::EvidenceOnly => self.context.clone(),
             },
-            context_pack: retrieve_envelope::context_pack_from_ask_context(self.context.as_ref())
-                .map_err(serde::ser::Error::custom)?,
+            context_pack,
             collection_filter: self.collection_filter.clone(),
+            identity,
         };
         let mut value = serde_json::to_value(wire).map_err(serde::ser::Error::custom)?;
         let taxonomy = serde_json::to_value(ResponseTextTaxonomy::from_serialized_value(&value))
@@ -73,6 +105,11 @@ impl<'de> Deserialize<'de> for AskResponse {
         D: serde::Deserializer<'de>,
     {
         let wire = AskResponseWire::deserialize(deserializer)?;
+        ask_run_identity::stamp_ask_run_identity(
+            &wire.ask_run_identity_body(),
+            Some(&wire.identity),
+        )
+        .map_err(serde::de::Error::custom)?;
         retrieve_envelope::bind_context_pack_to_ask_context(
             wire.context.as_ref(),
             wire.context_pack.as_ref(),
@@ -87,6 +124,7 @@ impl<'de> Deserialize<'de> for AskResponse {
             )
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
+            task_id: wire.task_id,
             answer: wire.answer,
             answer_kind: wire.answer_kind,
             text_taxonomy,

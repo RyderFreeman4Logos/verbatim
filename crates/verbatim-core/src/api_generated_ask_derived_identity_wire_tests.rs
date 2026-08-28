@@ -3,6 +3,7 @@ use crate::wire_schemas::WIRE_SCHEMA_VERSION;
 
 fn sample_generated_ask() -> AskResponse {
     AskResponse {
+        task_id: "generated-ask-run".into(),
         answer: "Generated interpretation.".into(),
         answer_kind: AnswerKind::GeneratedInterpretation,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),
@@ -61,6 +62,12 @@ fn generated_ask_derived_identity_mismatch_is_rejected() {
 
     encoded["generated_interpretation"]["identity"]["artifact_id"] =
         serde_json::json!("other-generated-answer");
-    serde_json::from_value::<AskResponse>(encoded)
-        .expect_err("generated interpretation identity must match the executed answer text");
+    let error = serde_json::from_value::<AskResponse>(encoded)
+        .expect_err("generated interpretation identity must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("generated interpretation identity does not match the executed answer text"),
+        "unexpected generated interpretation error: {error}"
+    );
 }

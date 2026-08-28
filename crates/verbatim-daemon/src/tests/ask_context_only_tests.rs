@@ -118,6 +118,11 @@ async fn ask_context_only_returns_context_pack_when_chat_is_disabled_and_unavail
     .0;
 
     assert!(response.answer.is_empty());
+    let task_id = response.task_id.clone();
+    let encoded = serde_json::to_value(&response).unwrap();
+    assert_eq!(encoded["task_id"], task_id);
+    assert_eq!(encoded["identity"]["kind"], "ask_run");
+    assert_eq!(encoded["identity"]["artifact_id"], response.task_id);
     assert!(response.generated_interpretation.is_none());
     assert!(response.citations.is_empty());
     assert!(!response.verified);

@@ -27,6 +27,7 @@ fn ask_response_taxonomy_classifies_generated_and_source_citation_text_by_kind()
         },
     ];
     let response = AskResponse {
+        task_id: "generated-ask-run".into(),
         answer: "Legacy generated answer.".into(),
         answer_kind: AnswerKind::GeneratedInterpretation,
         text_taxonomy: ResponseTextTaxonomy::ask_response_with_citations(&citations),
@@ -241,7 +242,7 @@ fn response_text_taxonomy_round_trips_all_four_planes() {
 
 #[test]
 fn response_taxonomy_paths_resolve_to_serialized_text_leaves() {
-    let ask: AskResponse = serde_json::from_value(serde_json::json!({
+    let ask: AskResponse = serde_json::from_value(with_ask_run_identity(serde_json::json!({
         "answer": "answer",
         "answer_kind": "generated_interpretation",
         "generated_interpretation": {"text": "generated"},
@@ -304,7 +305,7 @@ fn response_taxonomy_paths_resolve_to_serialized_text_leaves() {
             "warnings": ["none", "stale"],
             "stale": false
         }
-    }))
+    })))
     .unwrap();
     let retrieve: RetrieveResponse = serde_json::from_value(serde_json::json!({
         "task_id": "task-1",
@@ -617,12 +618,12 @@ fn normalize_array_indices(path: &str) -> String {
 
 #[test]
 fn compact_ask_taxonomy_omits_absent_optional_paths() {
-    let response: AskResponse = serde_json::from_value(serde_json::json!({
+    let response: AskResponse = serde_json::from_value(with_ask_run_identity(serde_json::json!({
         "answer": "Answer [E1].",
         "answer_kind": "evidence_only",
         "citations": [],
         "verified": false
-    }))
+    })))
     .unwrap();
     let encoded = serde_json::to_value(response).unwrap();
     let fields = encoded["text_taxonomy"]["fields"]
@@ -638,6 +639,7 @@ fn compact_ask_taxonomy_omits_absent_optional_paths() {
 #[test]
 fn taxonomy_classifies_requested_ask_retrieval_debug() {
     let response = AskResponse {
+        task_id: "evidence-only-ask-run".into(),
         answer: "Answer [E1].".into(),
         answer_kind: AnswerKind::EvidenceOnly,
         text_taxonomy: ResponseTextTaxonomy::ask_response(),
@@ -708,22 +710,6 @@ fn taxonomy_omits_unselected_evidence_locator_variants() {
         .iter()
         .any(|field| field["field"] == "image_artifact.path"));
     assert_taxonomy_paths_resolve("document evidence", &encoded);
-}
-
-#[test]
-fn legacy_ask_generated_citation_does_not_fall_into_evidence() {
-    let response: AskResponse = serde_json::from_str(include_str!(
-        "fixtures/legacy_ask_response_without_taxonomy.json"
-    ))
-    .unwrap();
-    let field = response
-        .text_taxonomy
-        .fields
-        .iter()
-        .find(|field| field.field.ends_with("text_preview"))
-        .expect("legacy citation classification");
-
-    assert_ne!(field.plane, OutputTextPlane::Evidence);
 }
 
 #[test]
