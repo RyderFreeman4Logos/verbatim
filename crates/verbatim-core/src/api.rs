@@ -479,6 +479,7 @@ pub struct TaskSummaryResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskMutationResponse {
     pub task: TaskSummary,
+    #[serde(default)]
     pub spans: Vec<TaskSpan>,
 }
 

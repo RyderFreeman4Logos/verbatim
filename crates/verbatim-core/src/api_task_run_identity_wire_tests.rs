@@ -143,4 +143,16 @@ fn task_mutation_response_keeps_legacy_wire_without_task_run_identity() {
             );
         }
     }
+
+    let mut omitted_spans = legacy_task_mutation_response("succeeded", false);
+    omitted_spans
+        .as_object_mut()
+        .expect("task mutation fixture is an object")
+        .remove("spans");
+    let response: TaskMutationResponse = serde_json::from_value(omitted_spans)
+        .expect("legacy task mutation with omitted spans decodes");
+    assert!(response.spans.is_empty());
+    let encoded = serde_json::to_value(response).expect("legacy task mutation encodes");
+    assert_eq!(encoded["spans"], json!([]));
+    assert!(!encoded.as_object().unwrap().contains_key("identity"));
 }
