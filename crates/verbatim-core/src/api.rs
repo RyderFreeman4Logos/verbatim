@@ -490,13 +490,12 @@ pub struct TaskProfileResponse {
     pub identity: crate::wire_schemas::CanonicalIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskListResponse {
-    #[serde(default)]
     pub tasks: Vec<TaskSummary>,
     pub total: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<TaskListAggregate>,
+    pub identity: CanonicalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -601,6 +600,8 @@ mod generated_ask_identity;
 mod retrieval_run_identity;
 #[path = "api_task_events_identity.rs"]
 mod task_events_identity;
+#[path = "api_task_list_identity.rs"]
+mod task_list_identity;
 #[path = "api_task_run_identity.rs"]
 mod task_run_identity;
 pub use generated_ask_identity::{generated_interpretation_wire, GeneratedInterpretationWire};
@@ -1200,7 +1201,6 @@ mod tests {
         assert!(!request.include_locator);
         assert!(!request.passage);
     }
-
     #[test]
     fn health_response_defaults_missing_readiness_to_ready() {
         let response: HealthResponse =
@@ -1212,7 +1212,6 @@ mod tests {
         assert_eq!(response.readiness.startup_phase, "ready");
         assert!(response.readiness.degraded_reason.is_none());
     }
-
     #[test]
     fn health_response_serializes_starting_readiness_fields() {
         let response = HealthResponse {
@@ -1243,7 +1242,6 @@ mod tests {
 
     include!("api_retrieve_serialization_tests.rs");
 }
-
 #[path = "api_task_profile_identity.rs"]
 mod api_task_profile_identity;
 
@@ -1274,10 +1272,12 @@ mod api_evidence_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_generated_ask_derived_identity_wire_tests.rs"]
 mod api_generated_ask_derived_identity_wire_tests;
-
 #[cfg(test)]
 #[path = "api_task_events_identity_wire_tests.rs"]
 mod api_task_events_identity_wire_tests;
+#[cfg(test)]
+#[path = "api_task_list_identity_wire_tests.rs"]
+mod api_task_list_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_task_run_identity_wire_tests.rs"]
 mod api_task_run_identity_wire_tests;

@@ -3510,6 +3510,7 @@ mod tests {
         *local.now_millis.borrow_mut() = 1_000;
         let mut first = sample_task_list_response();
         first.total = 10;
+        let first = restamp_task_list_response(first);
         client.task_list_response.replace(Some(first));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -3521,6 +3522,7 @@ mod tests {
         *local.now_millis.borrow_mut() = 301_000;
         let mut second = sample_task_list_response();
         second.total = 5;
+        let second = restamp_task_list_response(second);
         client.task_list_response.replace(Some(second));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -3556,6 +3558,7 @@ mod tests {
         for (index, task) in current_queue.tasks.iter_mut().enumerate() {
             task.id = TaskId(format!("new-task-{index}"));
         }
+        let current_queue = restamp_task_list_response(current_queue);
         client.task_list_response.replace(Some(current_queue));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -3588,6 +3591,7 @@ mod tests {
         let mut current_queue = sample_task_list_response();
         current_queue.total = 5;
         current_queue.aggregate = Some(sample_task_list_aggregate(1, 1, 0, 0, 0));
+        let current_queue = restamp_task_list_response(current_queue);
         client.task_list_response.replace(Some(current_queue));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -3619,11 +3623,9 @@ mod tests {
                 sampled_task_ids: vec!["task-run".into()],
                 last_event_sequence: 0,
             }));
-        client.task_list_response.replace(Some(TaskListResponse {
-            total: 0,
-            tasks: Vec::new(),
-            aggregate: None,
-        }));
+        client.task_list_response.replace(Some(
+            TaskListResponse::new(Vec::new(), 0, None).expect("empty task list identity"),
+        ));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
 
@@ -3649,6 +3651,7 @@ mod tests {
             }));
         let mut response = sample_task_list_response();
         response.aggregate = Some(sample_task_list_aggregate(3, 3, 2, 125_000, 1));
+        let response = restamp_task_list_response(response);
         client.task_list_response.replace(Some(response));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -3677,6 +3680,7 @@ mod tests {
             }));
         let mut response = sample_task_list_response();
         response.aggregate = Some(sample_task_list_aggregate(0, 0, 0, 0, 0));
+        let response = restamp_task_list_response(response);
         client.task_list_response.replace(Some(response));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -3741,6 +3745,7 @@ mod tests {
             0,   // publish_complete_running
             200, // event_sequence_ceiling
         ));
+        let response = restamp_task_list_response(response);
         client.task_list_response.replace(Some(response));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -3780,6 +3785,7 @@ mod tests {
             0,   // publish_complete_running
             200, // event_sequence_ceiling advanced (progress chatter only)
         ));
+        let response = restamp_task_list_response(response);
         client.task_list_response.replace(Some(response));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
@@ -3807,6 +3813,7 @@ mod tests {
             }));
         let mut daemon_response = sample_task_list_response();
         daemon_response.aggregate = Some(sample_task_list_aggregate(1, 1, 1, 65_000, 1));
+        let daemon_response = restamp_task_list_response(daemon_response);
         let server =
             TaskListHttpServer::respond_json(serde_json::to_string(&daemon_response).unwrap());
         let client = HttpDaemonClient::with_base_url(server.base_url());
@@ -3852,11 +3859,9 @@ mod tests {
         let client = MockDaemonClient::default();
         let local = MockLocalActions::default();
         local.task_list_history_clear_error.replace(true);
-        client.task_list_response.replace(Some(TaskListResponse {
-            total: 0,
-            tasks: Vec::new(),
-            aggregate: None,
-        }));
+        client.task_list_response.replace(Some(
+            TaskListResponse::new(Vec::new(), 0, None).expect("empty task list identity"),
+        ));
 
         let (code, stdout, stderr) = run_mock_with(["task", "list"], &client, &local);
 
@@ -5696,10 +5701,8 @@ mod tests {
     }
 
     fn sample_task_list_response() -> TaskListResponse {
-        TaskListResponse {
-            total: 4,
-            aggregate: None,
-            tasks: vec![
+        TaskListResponse::new(
+            vec![
                 TaskSummary {
                     id: TaskId("task-run".into()),
                     kind: TaskKind::Ingest,
@@ -5775,7 +5778,15 @@ mod tests {
                     ),
                 },
             ],
-        }
+            4,
+            None,
+        )
+        .expect("sample task list identity")
+    }
+
+    fn restamp_task_list_response(response: TaskListResponse) -> TaskListResponse {
+        TaskListResponse::new(response.tasks, response.total, response.aggregate)
+            .expect("task list fixture identity")
     }
 
     fn sample_task_list_aggregate(
