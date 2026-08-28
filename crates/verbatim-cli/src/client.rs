@@ -1346,11 +1346,21 @@ mod tests {
         ));
     }
 
+    fn task_created_http_response(task_id: &str) -> String {
+        let body = serde_json::to_string(
+            &TaskCreatedResponse::new(task_id).expect("task-created response fixture"),
+        )
+        .expect("task-created response encodes");
+        format!(
+            "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+        )
+    }
+
     #[test]
     fn http_reindex_posts_json_to_daemon() {
         let server = TestServer::respond_many(vec![
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"reindexed\":1}".to_string(),
-            "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"task_id\":\"task-1\"}".to_string(),
+            task_created_http_response("task-1"),
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"reindexed\":2}".to_string(),
         ]);
         let client = HttpDaemonClient::with_base_url(server.base_url());
@@ -1462,8 +1472,8 @@ mod tests {
             "\"artifact_id\":\"task-1\",\"content_hash\":\"502537cc588ccc5d7edf2dd54f0fcc3ad2b5fecad0623eb56d185ddd1956f2ba\"}}"
         );
         let server = TestServer::respond_many(vec![
-            "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"task_id\":\"task-1\"}".to_string(),
-            "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"task_id\":\"task-2\"}".to_string(),
+            task_created_http_response("task-1"),
+            task_created_http_response("task-2"),
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_summary}"
             ),

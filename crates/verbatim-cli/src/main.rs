@@ -4956,9 +4956,7 @@ mod tests {
         fn submit_ask_task(&self, request: &AskRequest) -> client::CliResult<TaskCreatedResponse> {
             self.calls.borrow_mut().push("submit_ask_task".into());
             self.last_ask.replace(Some(request.clone()));
-            Ok(TaskCreatedResponse {
-                task_id: "task-1".into(),
-            })
+            Ok(TaskCreatedResponse::new("task-1").expect("task-created response fixture"))
         }
 
         fn submit_ingest_task(
@@ -4971,9 +4969,7 @@ mod tests {
             self.calls.borrow_mut().push(format!(
                 "submit_ingest_task:{source_id:?}:{force}:{embedding_profile_id:?}:{vectors_only}"
             ));
-            Ok(TaskCreatedResponse {
-                task_id: "task-1".into(),
-            })
+            Ok(TaskCreatedResponse::new("task-1").expect("task-created response fixture"))
         }
 
         fn submit_reindex_task(
@@ -4982,9 +4978,7 @@ mod tests {
         ) -> client::CliResult<TaskCreatedResponse> {
             self.calls.borrow_mut().push("submit_reindex_task".into());
             self.last_reindex.replace(Some(request.clone()));
-            Ok(TaskCreatedResponse {
-                task_id: "task-1".into(),
-            })
+            Ok(TaskCreatedResponse::new("task-1").expect("task-created response fixture"))
         }
 
         fn index_status(&self) -> client::CliResult<IndexStatusResponse> {
