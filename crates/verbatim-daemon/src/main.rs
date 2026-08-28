@@ -3975,7 +3975,7 @@ async fn task_mutation_response(
     task_id: TaskId,
 ) -> Result<TaskMutationResponse, (StatusCode, Json<ErrorResponse>)> {
     let (task, spans) = task_summary_parts(state, task_id).await?;
-    Ok(TaskMutationResponse { task, spans })
+    TaskMutationResponse::new(task, spans).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 async fn task_profile_response(
@@ -16846,11 +16846,9 @@ mod tests {
                 .unwrap();
 
         assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
-        assert!(!serde_json::to_value(&cancelled)
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .contains_key("identity"));
+        let wire = serde_json::to_value(&cancelled).unwrap();
+        assert_eq!(wire["identity"]["kind"], "task_run");
+        assert_eq!(wire["identity"]["artifact_id"], task_id.0);
     }
 
     #[tokio::test]
@@ -17750,11 +17748,9 @@ mod tests {
         assert_eq!(resumed.task.request["source_id"], TASK_TELEMETRY_REDACTED);
         assert!(resumed.task.result.is_none());
         assert!(resumed.task.error.is_none());
-        assert!(!serde_json::to_value(&resumed)
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .contains_key("identity"));
+        let wire = serde_json::to_value(&resumed).unwrap();
+        assert_eq!(wire["identity"]["kind"], "task_run");
+        assert_eq!(wire["identity"]["artifact_id"], failed_id.0);
         let events = task_events_response(&state, failed_id.clone(), None, Some(10))
             .await
             .unwrap()

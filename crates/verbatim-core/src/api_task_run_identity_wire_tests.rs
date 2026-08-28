@@ -59,12 +59,8 @@ fn decode(value: Value) -> Result<TaskSummaryResponse, serde_json::Error> {
     serde_json::from_value(value)
 }
 
-fn legacy_task_mutation_response(status: &str, with_span: bool) -> Value {
-    let mut wire = valid_task_summary_response(status, with_span);
-    wire.as_object_mut()
-        .expect("task mutation fixture is an object")
-        .remove("identity");
-    wire
+fn decode_mutation(value: Value) -> Result<TaskMutationResponse, serde_json::Error> {
+    serde_json::from_value(value)
 }
 
 fn mutate_task_status(wire: &mut Value) {
@@ -129,30 +125,44 @@ fn task_summary_response_rejects_identity_body_mismatch() {
 }
 
 #[test]
-fn task_mutation_response_keeps_legacy_wire_without_task_run_identity() {
+fn task_mutation_response_stamps_task_run_identity_for_lifecycle_snapshots() {
     for status in ["queued", "running", "succeeded", "failed", "cancelled"] {
         for with_span in [false, true] {
-            let wire = legacy_task_mutation_response(status, with_span);
-            let response: TaskMutationResponse =
-                serde_json::from_value(wire.clone()).expect("legacy task mutation decodes");
-            let encoded = serde_json::to_value(response).expect("legacy task mutation encodes");
+            let wire = valid_task_summary_response(status, with_span);
+            let response = decode_mutation(wire.clone())
+                .expect("valid task mutation identity fixture decodes");
+            let encoded = serde_json::to_value(response).expect("task mutation encodes");
             assert_eq!(encoded, wire, "status={status} with_span={with_span}");
-            assert!(
-                !encoded.as_object().unwrap().contains_key("identity"),
-                "status={status} with_span={with_span}"
-            );
+            assert_eq!(encoded["identity"]["kind"], "task_run");
+            assert_eq!(encoded["identity"]["artifact_id"], "task-fixture");
         }
     }
 
-    let mut omitted_spans = legacy_task_mutation_response("succeeded", false);
+    let mut omitted_spans = valid_task_summary_response("succeeded", false);
     omitted_spans
         .as_object_mut()
         .expect("task mutation fixture is an object")
         .remove("spans");
-    let response: TaskMutationResponse = serde_json::from_value(omitted_spans)
-        .expect("legacy task mutation with omitted spans decodes");
+    let response = decode_mutation(omitted_spans).expect("task mutation accepts omitted spans");
     assert!(response.spans.is_empty());
-    let encoded = serde_json::to_value(response).expect("legacy task mutation encodes");
+    let encoded = serde_json::to_value(response).expect("task mutation encodes");
     assert_eq!(encoded["spans"], json!([]));
-    assert!(!encoded.as_object().unwrap().contains_key("identity"));
+    assert_eq!(encoded["identity"]["kind"], "task_run");
+}
+
+#[test]
+fn task_mutation_response_rejects_identity_body_mismatch() {
+    for (name, mutate) in [
+        ("task_status", mutate_task_status as fn(&mut Value)),
+        ("task_id", mutate_task_id),
+        ("span_metadata", mutate_span_metadata),
+        ("content_hash", mutate_content_hash),
+    ] {
+        let mut wire = valid_task_summary_response("succeeded", true);
+        mutate(&mut wire);
+        assert!(
+            decode_mutation(wire).is_err(),
+            "task mutation identity mismatch must reject: {name}"
+        );
+    }
 }

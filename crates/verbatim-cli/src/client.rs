@@ -1453,7 +1453,9 @@ mod tests {
             "\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":\"2\",",
             "\"request\":{\"question_chars\":4},\"result\":{\"citation_count\":1},\"error\":null},",
             "\"spans\":[{\"sequence\":1,\"task_id\":\"task-1\",\"phase\":\"chat\",",
-            "\"started_at\":\"1\",\"duration_ms\":5,\"metadata\":{\"citation_count\":1}}]}"
+            "\"started_at\":\"1\",\"duration_ms\":5,\"metadata\":{\"citation_count\":1}}],",
+            "\"identity\":{\"kind\":\"task_run\",\"schema_version\":{\"major\":1,\"minor\":0,\"patch\":0},",
+            "\"artifact_id\":\"task-1\",\"content_hash\":\"502537cc588ccc5d7edf2dd54f0fcc3ad2b5fecad0623eb56d185ddd1956f2ba\"}}"
         );
         let server = TestServer::respond_many(vec![
             "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"task_id\":\"task-1\"}".to_string(),
@@ -1491,7 +1493,9 @@ mod tests {
                 .task_id,
             "task-2"
         );
-        assert_eq!(client.get_task("task-1").unwrap().task.id.0, "task-1");
+        let summary = client.get_task("task-1").unwrap();
+        assert_eq!(summary.task.id.0, "task-1");
+        assert_eq!(summary.identity.artifact_id, "task-1");
         assert_eq!(
             client.get_task_events("task-1", Some(1)).unwrap().events[0].sequence,
             2
@@ -1501,14 +1505,12 @@ mod tests {
             .wait_task("task-1", Some(2), TaskWaitTimeout::Unbounded, &mut stdout)
             .unwrap();
         assert!(String::from_utf8(stdout).unwrap().contains("Task: task-1"));
-        assert_eq!(
-            client.cancel_task("task-1").unwrap().task.status.as_str(),
-            "succeeded"
-        );
-        assert_eq!(
-            client.resume_task("task-1").unwrap().task.status.as_str(),
-            "succeeded"
-        );
+        let cancelled = client.cancel_task("task-1").unwrap();
+        assert_eq!(cancelled.task.status.as_str(), "succeeded");
+        assert_eq!(cancelled.identity.artifact_id, "task-1");
+        let resumed = client.resume_task("task-1").unwrap();
+        assert_eq!(resumed.task.status.as_str(), "succeeded");
+        assert_eq!(resumed.identity.artifact_id, "task-1");
 
         let requests = server.requests();
         assert!(requests[0].starts_with("POST /api/tasks/ask HTTP/1.1"));

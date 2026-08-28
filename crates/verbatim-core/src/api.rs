@@ -476,11 +476,11 @@ pub struct TaskSummaryResponse {
     pub identity: crate::wire_schemas::CanonicalIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskMutationResponse {
     pub task: TaskSummary,
-    #[serde(default)]
     pub spans: Vec<TaskSpan>,
+    pub identity: crate::wire_schemas::CanonicalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
