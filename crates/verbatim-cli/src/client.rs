@@ -982,6 +982,9 @@ mod tests {
     include!("tests/report_artifact_lookup_route_tests.rs");
     include!("tests/task_wait_client_fixtures.rs");
 
+    use verbatim_core::api::TaskWaitEvent;
+    use verbatim_core::task::{TaskEvent, TaskSpan, TaskSummary};
+
     #[test]
     fn bind_to_base_url_adds_http_scheme() {
         assert_eq!(
