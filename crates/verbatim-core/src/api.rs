@@ -12,7 +12,7 @@ use crate::index_profile_delete::{IndexProfileDeleteApplyReport, IndexProfileDel
 use crate::memory_budget::MemoryBudgetSnapshot;
 use crate::resource::ResourceQueueSnapshot;
 use crate::store::VectorJsonCleanupReport;
-use crate::task::{TaskEvent, TaskProfile, TaskSpan, TaskSummary};
+use crate::task::{TaskEvent, TaskId, TaskProfile, TaskSpan, TaskSummary};
 use crate::types::{
     BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceIngestDiagnostics,
     SourceLocator,
@@ -548,10 +548,11 @@ pub struct TaskReasonBucket {
     pub count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskEventsResponse {
-    #[serde(default)]
+    pub task_id: TaskId,
     pub events: Vec<TaskEvent>,
+    pub identity: CanonicalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -598,6 +599,8 @@ mod evidence_identity;
 mod generated_ask_identity;
 #[path = "api_retrieval_run_identity.rs"]
 mod retrieval_run_identity;
+#[path = "api_task_events_identity.rs"]
+mod task_events_identity;
 #[path = "api_task_run_identity.rs"]
 mod task_run_identity;
 pub use generated_ask_identity::{generated_interpretation_wire, GeneratedInterpretationWire};
@@ -1272,6 +1275,9 @@ mod api_evidence_identity_wire_tests;
 #[path = "api_generated_ask_derived_identity_wire_tests.rs"]
 mod api_generated_ask_derived_identity_wire_tests;
 
+#[cfg(test)]
+#[path = "api_task_events_identity_wire_tests.rs"]
+mod api_task_events_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_task_run_identity_wire_tests.rs"]
 mod api_task_run_identity_wire_tests;
