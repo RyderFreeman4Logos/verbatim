@@ -980,6 +980,7 @@ mod tests {
     include!("tests/issue_332_client_route_tests.rs");
     include!("tests/report_artifact_evidence_route_tests.rs");
     include!("tests/report_artifact_lookup_route_tests.rs");
+    include!("tests/task_wait_client_fixtures.rs");
 
     #[test]
     fn bind_to_base_url_adds_http_scheme() {
@@ -1464,7 +1465,12 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_summary}"
             ),
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"events\":[{\"sequence\":2,\"task_id\":\"task-1\",\"event_type\":\"phase\",\"message\":\"done\",\"payload\":{},\"created_at\":\"2\"}]}".to_string(),
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: task\ndata: {\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"succeeded\",\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":\"2\",\"request\":{},\"result\":{},\"error\":null},\"events\":[],\"spans\":[],\"terminal\":true}\n\n".to_string(),
+            task_wait_response(
+                TASK_WAIT_TERMINAL_TASK,
+                "[]",
+                "[]",
+                true,
+            ),
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{task_mutation}"
             ),
@@ -1574,18 +1580,10 @@ mod tests {
 
     #[test]
     fn http_task_wait_read_timeout_returns_distinct_error_and_last_state() {
-        let server = TestServer::respond_slow_stream(
-            concat!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
-                "event: task\n",
-                "data: {\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"running\",",
-                "\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":null,",
-                "\"request\":{},\"result\":null,\"error\":null,",
-                "\"progress\":{\"phase\":{\"name\":\"chat\",\"started_at\":\"1\",\"elapsed_ms\":100},",
-                "\"recent_status\":\"streaming\"}},\"events\":[],\"spans\":[],\"terminal\":false}\n\n",
-            ),
-            Duration::from_secs(2),
+        let wait_response = Box::leak(
+            task_wait_response(TASK_WAIT_RUNNING_TASK, "[]", "[]", false).into_boxed_str(),
         );
+        let server = TestServer::respond_slow_stream(wait_response, Duration::from_secs(2));
         let client = HttpDaemonClient::with_base_url(server.base_url());
         let mut stdout = Vec::new();
 

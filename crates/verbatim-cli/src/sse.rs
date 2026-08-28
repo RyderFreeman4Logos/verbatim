@@ -277,7 +277,21 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::{self, Cursor, Read, Write};
 
+    use verbatim_core::api::TaskWaitEvent;
+    use verbatim_core::task::{TaskEvent, TaskSpan, TaskSummary};
+
     use super::*;
+
+    fn task_wait_stream(task: &str, events: &str, spans: &str, terminal: bool) -> String {
+        let task = serde_json::from_str::<TaskSummary>(task).unwrap();
+        let events = serde_json::from_str::<Vec<TaskEvent>>(events).unwrap();
+        let spans = serde_json::from_str::<Vec<TaskSpan>>(spans).unwrap();
+        let event = TaskWaitEvent::new(task, events, spans, terminal).unwrap();
+        format!(
+            "event: task\ndata: {}\n\n",
+            serde_json::to_string(&event).unwrap()
+        )
+    }
 
     #[test]
     fn parses_named_data_frame() {
@@ -347,11 +361,11 @@ mod tests {
 
     #[test]
     fn consumes_task_wait_events_and_renders_terminal_summary() {
-        let stream = concat!(
-            "event: task\n",
-            "data: {\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"succeeded\",\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":\"2\",\"request\":{\"question_chars\":4},\"result\":{\"citation_count\":1},\"error\":null},",
-            "\"events\":[{\"sequence\":2,\"task_id\":\"task-1\",\"event_type\":\"phase\",\"message\":\"retrieval complete\",\"payload\":{\"result_count\":1},\"created_at\":\"2\"}],",
-            "\"spans\":[{\"sequence\":1,\"task_id\":\"task-1\",\"phase\":\"retrieval\",\"started_at\":\"1\",\"duration_ms\":8,\"metadata\":{\"result_count\":1}}],\"terminal\":true}\n\n",
+        let stream = task_wait_stream(
+            r#"{"id":"task-1","kind":"ask","status":"succeeded","created_at":"1","updated_at":"2","started_at":"1","finished_at":"2","request":{"question_chars":4},"result":{"citation_count":1},"error":null}"#,
+            r#"[{"sequence":2,"task_id":"task-1","event_type":"phase","message":"retrieval complete","payload":{"result_count":1},"created_at":"2"}]"#,
+            r#"[{"sequence":1,"task_id":"task-1","phase":"retrieval","started_at":"1","duration_ms":8,"metadata":{"result_count":1}}]"#,
+            true,
         );
         let mut stdout = Vec::new();
 
@@ -366,11 +380,11 @@ mod tests {
 
     #[test]
     fn consumes_task_wait_tick_and_renders_live_progress() {
-        let stream = concat!(
-            "event: task\n",
-            "data: {\"task\":{\"id\":\"task-1\",\"kind\":\"ask\",\"status\":\"running\",\"created_at\":\"1\",\"updated_at\":\"2\",\"started_at\":\"1\",\"finished_at\":null,\"request\":{\"question_chars\":4},\"result\":null,\"error\":null,",
-            "\"progress\":{\"phase\":{\"name\":\"chat\",\"started_at\":\"1\",\"elapsed_ms\":2000},\"counters\":[{\"name\":\"chat_bytes_streamed\",\"completed\":12}],\"endpoints\":[{\"name\":\"chat\",\"calls\":1,\"latest_latency_ms\":2000,\"first_token_latency_ms\":300,\"p50_latency_ms\":2000,\"p95_latency_ms\":2000}],\"active_worker_kind\":\"ask\",\"recent_status\":\"streaming\"}},",
-            "\"events\":[],\"spans\":[],\"terminal\":false}\n\n",
+        let stream = task_wait_stream(
+            r#"{"id":"task-1","kind":"ask","status":"running","created_at":"1","updated_at":"2","started_at":"1","finished_at":null,"request":{"question_chars":4},"result":null,"error":null,"progress":{"phase":{"name":"chat","started_at":"1","elapsed_ms":2000},"counters":[{"name":"chat_bytes_streamed","completed":12}],"endpoints":[{"name":"chat","calls":1,"latest_latency_ms":2000,"first_token_latency_ms":300,"p50_latency_ms":2000,"p95_latency_ms":2000}],"active_worker_kind":"ask","recent_status":"streaming"}}"#,
+            "[]",
+            "[]",
+            false,
         );
         let mut stdout = Vec::new();
 
