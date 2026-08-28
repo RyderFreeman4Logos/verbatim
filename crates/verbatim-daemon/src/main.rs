@@ -4356,7 +4356,7 @@ async fn submit_ask_task(
     )
     .await?;
     spawn_ask_task(state, task_id.clone(), req);
-    Ok(Json(TaskCreatedResponse { task_id: task_id.0 }))
+    created_response(task_id)
 }
 
 async fn retrieve(
@@ -4407,7 +4407,7 @@ async fn submit_ingest_task(
     if req.source_id.is_none() {
         let task_id = create_background_ingest_batch(&state, req).await?;
         schedule_ingest_queue(Arc::clone(&state));
-        return Ok(Json(TaskCreatedResponse { task_id: task_id.0 }));
+        return created_response(task_id);
     }
     let Some(source_id) = req.source_id.clone() else {
         return Err(err(
@@ -4430,7 +4430,7 @@ async fn submit_ingest_task(
     );
     let task_id = create_persisted_task_with_id(&state, task_id, TaskKind::Ingest, request).await?;
     schedule_ingest_queue(Arc::clone(&state));
-    Ok(Json(TaskCreatedResponse { task_id: task_id.0 }))
+    created_response(task_id)
 }
 
 async fn submit_reindex_task(
@@ -4457,7 +4457,15 @@ async fn submit_reindex_task(
     )
     .await?;
     schedule_ingest_queue(Arc::clone(&state));
-    Ok(Json(TaskCreatedResponse { task_id: task_id.0 }))
+    created_response(task_id)
+}
+
+fn created_response(
+    task_id: TaskId,
+) -> Result<Json<TaskCreatedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    TaskCreatedResponse::new(task_id.0)
+        .map(Json)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))
 }
 
 async fn show_task(

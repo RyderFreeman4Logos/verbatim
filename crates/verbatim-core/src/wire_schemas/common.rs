@@ -123,6 +123,7 @@ pub enum WireArtifactKind {
     TaskProfile,
     TaskEvents,
     TaskList,
+    TaskCreated,
 }
 
 impl WireArtifactKind {
@@ -140,6 +141,7 @@ impl WireArtifactKind {
             Self::TaskProfile => "task_profile",
             Self::TaskEvents => "task_events",
             Self::TaskList => "task_list",
+            Self::TaskCreated => "task_created",
         }
     }
 }

@@ -385,7 +385,6 @@ pub struct CollectionResultProvenance {
 pub struct IngestResponse {
     pub ingested: usize,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReindexRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -401,18 +400,15 @@ pub struct ReindexRequest {
     #[serde(default)]
     pub vectors_only: bool,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReindexResponse {
     pub reindexed: usize,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexGcRequest {
     #[serde(default)]
     pub dry_run: bool,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexGcResponse {
     pub dry_run: bool,
@@ -420,7 +416,6 @@ pub struct IndexGcResponse {
     pub plan: IndexGcPlan,
     pub apply: IndexGcApplyReport,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexProfileDeleteRequest {
     pub profile_id: String,
@@ -431,14 +426,12 @@ pub struct IndexProfileDeleteRequest {
     #[serde(default)]
     pub allow_active: bool,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexProfileDeleteResponse {
     pub dry_run: bool,
     pub plan: IndexProfileDeletePlan,
     pub apply: IndexProfileDeleteApplyReport,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorJsonCleanupRequest {
     #[serde(default)]
@@ -446,18 +439,17 @@ pub struct VectorJsonCleanupRequest {
     #[serde(default)]
     pub confirm: bool,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorJsonCleanupResponse {
     pub dry_run: bool,
     pub report: VectorJsonCleanupReport,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCreatedResponse {
     pub task_id: String,
+    pub identity: CanonicalIdentity,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskIngestRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1242,8 +1234,12 @@ mod tests {
 
     include!("api_retrieve_serialization_tests.rs");
 }
+
 #[path = "api_task_profile_identity.rs"]
 mod api_task_profile_identity;
+
+#[path = "api_task_created_identity.rs"]
+mod api_task_created_identity;
 
 #[cfg(test)]
 #[path = "api_locator_tests.rs"]
@@ -1288,3 +1284,7 @@ mod api_task_wait_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_task_profile_identity_wire_tests.rs"]
 mod api_task_profile_identity_wire_tests;
+
+#[cfg(test)]
+#[path = "api_task_created_identity_wire_tests.rs"]
+mod api_task_created_identity_wire_tests;
