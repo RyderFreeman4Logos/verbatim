@@ -155,6 +155,8 @@ struct AppState {
     pipeline: std::sync::Mutex<Option<IngestPipeline>>,
     /// Independent task metadata connection for serialized writes.
     task_store: std::sync::Mutex<Store>,
+    #[cfg(test)]
+    fail_next_task_success_persistence: AtomicBool,
     index_status_cache: std::sync::RwLock<Option<IndexStatusResponse>>,
     readiness: std::sync::RwLock<ReadinessHealth>,
     resources: DaemonResources,
@@ -3516,6 +3518,16 @@ async fn finish_task_success_with_optional_profile(
     result: serde_json::Value,
     profile: Option<TaskProfile>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    #[cfg(test)]
+    if state
+        .fail_next_task_success_persistence
+        .swap(false, Ordering::AcqRel)
+    {
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("injected task success persistence failure"),
+        ));
+    }
     let state_for_queue = Arc::clone(state);
     let task_id = task_id.clone();
     let outcome = with_task_store_write(state, move |store| {
@@ -5452,8 +5464,6 @@ async fn execute_ask_stream_task_inner(
         context: Some(context),
         collection_filter: query_scope.collection_filter,
     };
-    send_stream_event(&tx, sse_json_event("ask_run", &response)).await?;
-
     finish_task_success(
         &state,
         task_id,
@@ -5465,6 +5475,7 @@ async fn execute_ask_stream_task_inner(
         ),
     )
     .await?;
+    send_stream_event(&tx, sse_json_event("ask_run", &response)).await?;
     Ok(())
 }
 
@@ -9672,6 +9683,8 @@ async fn run_daemon_with_config(config: Config) -> Result<()> {
     let state: SharedState = Arc::new(AppState {
         pipeline: std::sync::Mutex::new(None),
         task_store: std::sync::Mutex::new(task_store),
+        #[cfg(test)]
+        fail_next_task_success_persistence: AtomicBool::new(false),
         index_status_cache: std::sync::RwLock::new(None),
         readiness: std::sync::RwLock::new(ReadinessHealth::starting(
             "initializing_pipeline",
@@ -18635,6 +18648,7 @@ mod tests {
             task_store: std::sync::Mutex::new(
                 sqlite_durability_ops::open_task_store(&config, data_dir).unwrap(),
             ),
+            fail_next_task_success_persistence: AtomicBool::new(false),
             index_status_cache: std::sync::RwLock::new(index_status_cache),
             readiness: std::sync::RwLock::new(ReadinessHealth::ready()),
             resources: daemon_resources(&config.daemon.resources),

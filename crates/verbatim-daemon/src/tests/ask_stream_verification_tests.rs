@@ -9,6 +9,7 @@ async fn ask_stream_body(
     name: &str,
     verifier_enabled: bool,
     chat_responses: &[&str],
+    fail_success_persistence: bool,
 ) -> (String, MockModelServer) {
     let model_server =
         MockModelServer::start_with_chat_responses(3, chat_responses.iter().copied()).await;
@@ -30,6 +31,10 @@ async fn ask_stream_body(
     let source_id = pipeline.add_source(&source_path).unwrap();
     pipeline.ingest_source(&source_id).await.unwrap();
     let state = test_state(config, test_dir.path(), pipeline);
+    state.fail_next_task_success_persistence.store(
+        fail_success_persistence,
+        std::sync::atomic::Ordering::Release,
+    );
     let app = Router::new()
         .route("/api/ask/stream", post(ask_stream))
         .with_state(state);
@@ -121,6 +126,7 @@ async fn ask_stream_with_verifier_publishes_only_one_generated_interpretation_an
         "ask-stream-verifier-pass",
         true,
         &[raw_draft, r#"{"verdict":"pass","unsupported_claims":[]}"#],
+        false,
     )
     .await;
 
@@ -156,6 +162,7 @@ async fn ask_stream_with_verifier_publishes_revision_without_superseded_draft() 
             revised,
             r#"{"verdict":"pass","unsupported_claims":[]}"#,
         ],
+        false,
     )
     .await;
 
@@ -181,6 +188,7 @@ async fn ask_stream_with_invalid_verifier_publishes_only_safe_error() {
         "ask-stream-verifier-invalid",
         true,
         &[raw_draft, "not valid verifier JSON"],
+        false,
     )
     .await;
 
@@ -207,7 +215,7 @@ async fn ask_stream_with_invalid_verifier_publishes_only_safe_error() {
 async fn ask_stream_without_verifier_preserves_token_streaming() {
     let raw_answer = "The unverified streamed answer is alpha [E1].";
     let (body, model_server) =
-        ask_stream_body("ask-stream-verifier-disabled", false, &[raw_answer]).await;
+        ask_stream_body("ask-stream-verifier-disabled", false, &[raw_answer], false).await;
 
     let tokens = event_data(&body, "token");
     assert_eq!(tokens.len(), 1, "SSE: {body}");
@@ -222,8 +230,13 @@ async fn ask_stream_without_verifier_preserves_token_streaming() {
 #[tokio::test]
 async fn default_generated_ask_stream_publishes_terminal_identities() {
     let raw_answer = "The unverified streamed answer is alpha [E1].";
-    let (body, _model_server) =
-        ask_stream_body("ask-stream-generated-interpretation", false, &[raw_answer]).await;
+    let (body, _model_server) = ask_stream_body(
+        "ask-stream-generated-interpretation",
+        false,
+        &[raw_answer],
+        false,
+    )
+    .await;
 
     let citations = event_data(&body, "citation");
     assert_eq!(citations.len(), 1, "SSE: {body}");
@@ -290,10 +303,25 @@ async fn default_generated_ask_stream_publishes_terminal_identities() {
 }
 
 #[tokio::test]
+async fn generated_ask_stream_persists_success_before_ask_run() {
+    let raw_answer = "The unverified streamed answer is alpha [E1].";
+    let (body, _model_server) = ask_stream_body(
+        "ask-stream-success-before-ask-run",
+        false,
+        &[raw_answer],
+        true,
+    )
+    .await;
+
+    assert!(event_data(&body, "ask_run").is_empty(), "SSE: {body}");
+    assert_eq!(event_data(&body, "error").len(), 1, "SSE: {body}");
+}
+
+#[tokio::test]
 async fn generated_ask_stream_context_pack_stamps_sse_from_retrieve() {
     let raw_answer = "The unverified streamed answer is alpha [E1].";
     let (body, _model_server) =
-        ask_stream_body("ask-stream-context-pack-stamp", false, &[raw_answer]).await;
+        ask_stream_body("ask-stream-context-pack-stamp", false, &[raw_answer], false).await;
 
     assert!(event_data(&body, "answer").is_empty(), "SSE: {body}");
     let packs = event_data(&body, "context_pack");
