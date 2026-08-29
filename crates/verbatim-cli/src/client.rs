@@ -485,11 +485,16 @@ impl DaemonClient for HttpDaemonClient {
 
     fn collection_watcher_status(&self, name: &str) -> CliResult<CollectionWatcherResponse> {
         let route = CollectionApiEndpoint::CollectionWatcherStatus;
-        self.request_json::<CollectionWatcherResponse, ()>(
-            collection_method(route),
-            &route.path(name),
-            None,
-        )
+        let response: CollectionWatcherResponse = self
+            .request_json::<CollectionWatcherResponse, ()>(
+                collection_method(route),
+                &route.path(name),
+                None,
+            )?;
+        response
+            .validate_for_collection(name)
+            .map_err(|error| CliError::Api(error.to_string()))?;
+        Ok(response)
     }
 
     fn update_collection_watcher(
@@ -498,7 +503,12 @@ impl DaemonClient for HttpDaemonClient {
         request: &CollectionWatcherUpdateRequest,
     ) -> CliResult<CollectionWatcherResponse> {
         let route = CollectionApiEndpoint::UpdateCollectionWatcher;
-        self.request_json(collection_method(route), &route.path(name), Some(request))
+        let response: CollectionWatcherResponse =
+            self.request_json(collection_method(route), &route.path(name), Some(request))?;
+        response
+            .validate_for_collection(name)
+            .map_err(|error| CliError::Api(error.to_string()))?;
+        Ok(response)
     }
 
     fn ingest(
@@ -1158,169 +1168,7 @@ mod tests {
         assert!(request.contains("\"path\":\"/tmp/doc.pdf\""));
     }
 
-    #[test]
-    fn http_collection_routes_are_plumbed_from_shared_inventory() {
-        let collection = concat!(
-            "{\"collection\":{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"},",
-            "\"roots\":[],\"members\":[]}"
-        );
-        let collection_root = COLLECTION_ROOT_RESPONSE;
-        let collection_list = "[{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}]";
-        let sync = COLLECTION_SYNC_RESPONSE;
-        let status = COLLECTION_STATUS_RESPONSE;
-        let watcher_status = concat!(
-            "{\"collection_name\":\"articles\",\"watch_enabled\":true,",
-            "\"auto_index_enabled\":false,\"active\":true,\"ignored_by_config\":false,",
-            "\"watched_root_count\":1,\"pending_event_count\":0}"
-        );
-        let watcher = format!(
-            "{{\"collection\":{{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}},\
-             \"watcher\":{watcher_status}}}"
-        );
-        let watchers = serde_json::to_string(
-            &CollectionWatchersStatusResponse::new(vec![
-                serde_json::from_str(watcher_status).unwrap()
-            ])
-            .unwrap(),
-        )
-        .unwrap();
-        let server = TestServer::respond_many(vec![
-            json_response("201 Created", collection),
-            json_response("200 OK", collection_root),
-            json_response("200 OK", collection_list),
-            json_response("200 OK", collection),
-            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
-            json_response("200 OK", sync),
-            json_response("200 OK", &status),
-            json_response("200 OK", watchers.as_str()),
-            json_response("200 OK", watcher.as_str()),
-            json_response("200 OK", watcher.as_str()),
-        ]);
-        let client = HttpDaemonClient::with_base_url(server.base_url());
-
-        assert_eq!(
-            client
-                .create_collection(&CreateCollectionRequest {
-                    name: "articles".into(),
-                    ignore_patterns: vec!["drafts/".into()],
-                })
-                .unwrap()
-                .collection
-                .name,
-            "articles"
-        );
-        assert!(
-            client
-                .add_collection_root(
-                    "articles",
-                    &AddCollectionRootRequest {
-                        path: "/tmp/articles".into(),
-                    },
-                )
-                .unwrap()
-                .added
-        );
-        assert_eq!(client.list_collections().unwrap()[0].name, "articles");
-        assert_eq!(
-            client.get_collection("articles").unwrap().collection.name,
-            "articles"
-        );
-        client.delete_collection("articles").unwrap();
-        assert_eq!(
-            client
-                .sync_collection(
-                    "articles",
-                    &CollectionSyncRequest {
-                        paths: Vec::new(),
-                        max_depth: Some(7),
-                    },
-                )
-                .unwrap()
-                .report
-                .member_count,
-            1
-        );
-        assert_eq!(
-            client
-                .collection_status("articles")
-                .unwrap()
-                .status
-                .member_count,
-            1
-        );
-        assert_eq!(
-            client.list_collection_watcher_statuses().unwrap().watchers[0].collection_name,
-            "articles"
-        );
-        assert!(
-            client
-                .collection_watcher_status("articles")
-                .unwrap()
-                .watcher
-                .active
-        );
-        assert!(
-            client
-                .update_collection_watcher(
-                    "articles",
-                    &CollectionWatcherUpdateRequest {
-                        enabled: true,
-                        auto_index_enabled: Some(false),
-                    },
-                )
-                .unwrap()
-                .watcher
-                .watch_enabled
-        );
-
-        let requests = server.requests();
-        assert_collection_request(&requests[0], CollectionApiEndpoint::CreateCollection, None);
-        assert!(requests[0].contains("\"ignore_patterns\":[\"drafts/\"]"));
-        assert_collection_request(
-            &requests[1],
-            CollectionApiEndpoint::AddCollectionRoot,
-            Some("articles"),
-        );
-        assert!(requests[1].contains("\"path\":\"/tmp/articles\""));
-        assert_collection_request(&requests[2], CollectionApiEndpoint::ListCollections, None);
-        assert_collection_request(
-            &requests[3],
-            CollectionApiEndpoint::GetCollection,
-            Some("articles"),
-        );
-        assert_collection_request(
-            &requests[4],
-            CollectionApiEndpoint::DeleteCollection,
-            Some("articles"),
-        );
-        assert_collection_request(
-            &requests[5],
-            CollectionApiEndpoint::SyncCollection,
-            Some("articles"),
-        );
-        assert!(requests[5].contains("\"max_depth\":7"));
-        assert_collection_request(
-            &requests[6],
-            CollectionApiEndpoint::CollectionStatus,
-            Some("articles"),
-        );
-        assert_collection_request(
-            &requests[7],
-            CollectionApiEndpoint::ListCollectionWatcherStatuses,
-            None,
-        );
-        assert_collection_request(
-            &requests[8],
-            CollectionApiEndpoint::CollectionWatcherStatus,
-            Some("articles"),
-        );
-        assert_collection_request(
-            &requests[9],
-            CollectionApiEndpoint::UpdateCollectionWatcher,
-            Some("articles"),
-        );
-        assert!(requests[9].contains("\"enabled\":true"));
-    }
+    include!("tests/collection_watcher_http_fixture.rs");
 
     #[test]
     fn http_ingest_force_uses_query_parameter() {

@@ -4912,10 +4912,12 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("collection_watcher_status:{name}"));
-            Ok(CollectionWatcherResponse {
-                collection: sample_collection_record(),
-                watcher: sample_collection_watcher_status(),
-            })
+            let collection = sample_collection_record();
+            let watcher = sample_collection_watcher_status();
+            Ok(
+                CollectionWatcherResponse::new(collection.name.clone(), collection, watcher)
+                    .map_err(|error| client::CliError::Api(error.to_string()))?,
+            )
         }
 
         fn update_collection_watcher(
@@ -4927,14 +4929,16 @@ mod tests {
                 .borrow_mut()
                 .push(format!("update_collection_watcher:{name}"));
             self.last_watcher_update.replace(Some(request.clone()));
-            Ok(CollectionWatcherResponse {
-                collection: sample_collection_record(),
-                watcher: CollectionWatcherStatus {
-                    watch_enabled: request.enabled,
-                    auto_index_enabled: request.auto_index_enabled.unwrap_or(true),
-                    ..sample_collection_watcher_status()
-                },
-            })
+            let collection = sample_collection_record();
+            let watcher = CollectionWatcherStatus {
+                watch_enabled: request.enabled,
+                auto_index_enabled: request.auto_index_enabled.unwrap_or(true),
+                ..sample_collection_watcher_status()
+            };
+            Ok(
+                CollectionWatcherResponse::new(collection.name.clone(), collection, watcher)
+                    .map_err(|error| client::CliError::Api(error.to_string()))?,
+            )
         }
 
         fn ingest(
