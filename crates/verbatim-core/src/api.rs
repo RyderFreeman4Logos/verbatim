@@ -257,9 +257,10 @@ pub struct CollectionResponse {
     pub members: Vec<CollectionMember>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionStatusResponse {
     pub status: CollectionStatus,
+    pub identity: CanonicalIdentity,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionWatcherUpdateRequest {
@@ -1217,33 +1218,31 @@ mod tests {
 
     include!("api_retrieve_serialization_tests.rs");
 }
+#[path = "api_collection_status_result_identity.rs"]
+mod api_collection_status_result_identity;
 #[path = "api_collection_sync_result_identity.rs"]
 mod api_collection_sync_result_identity;
 #[path = "api_ingest_result_identity.rs"]
 mod api_ingest_result_identity;
+#[cfg(test)]
+#[path = "api_locator_tests.rs"]
+mod api_locator_tests;
 #[path = "api_reindex_result_identity.rs"]
 mod api_reindex_result_identity;
+#[cfg(test)]
+#[path = "api_response_taxonomy_tests.rs"]
+mod api_response_taxonomy_tests;
+#[cfg(test)]
+#[path = "api_retrieve_envelope_wire_tests.rs"]
+mod api_retrieve_envelope_wire_tests;
+#[path = "api_source_created_identity.rs"]
+mod api_source_created_identity;
 #[path = "api_source_record_identity.rs"]
 mod api_source_record_identity;
 #[path = "api_task_created_identity.rs"]
 mod api_task_created_identity;
 #[path = "api_task_profile_identity.rs"]
 mod api_task_profile_identity;
-
-#[path = "api_source_created_identity.rs"]
-mod api_source_created_identity;
-
-#[cfg(test)]
-#[path = "api_locator_tests.rs"]
-mod api_locator_tests;
-
-#[cfg(test)]
-#[path = "api_response_taxonomy_tests.rs"]
-mod api_response_taxonomy_tests;
-
-#[cfg(test)]
-#[path = "api_retrieve_envelope_wire_tests.rs"]
-mod api_retrieve_envelope_wire_tests;
 
 #[cfg(test)]
 #[path = "api_generated_ask_context_pack_wire_tests.rs"]
@@ -1274,17 +1273,18 @@ mod api_task_run_identity_wire_tests;
 mod api_task_wait_identity_wire_tests;
 
 #[cfg(test)]
+#[path = "api_ingest_result_identity_wire_tests.rs"]
+mod api_ingest_result_identity_wire_tests;
+#[cfg(test)]
+#[path = "api_source_record_identity_wire_tests.rs"]
+mod api_source_record_identity_wire_tests;
+#[cfg(test)]
+#[path = "api_task_created_identity_wire_tests.rs"]
+mod api_task_created_identity_wire_tests;
+#[cfg(test)]
 #[path = "api_task_profile_identity_wire_tests.rs"]
 mod api_task_profile_identity_wire_tests;
 
 #[cfg(test)]
-#[path = "api_task_created_identity_wire_tests.rs"]
-mod api_task_created_identity_wire_tests;
-
-#[cfg(test)]
-#[path = "api_source_record_identity_wire_tests.rs"]
-mod api_source_record_identity_wire_tests;
-
-#[cfg(test)]
-#[path = "api_ingest_result_identity_wire_tests.rs"]
-mod api_ingest_result_identity_wire_tests;
+#[path = "api_collection_status_result_identity_wire_tests.rs"]
+mod api_collection_status_result_identity_wire_tests;
