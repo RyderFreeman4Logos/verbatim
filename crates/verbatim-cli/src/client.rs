@@ -457,11 +457,16 @@ impl DaemonClient for HttpDaemonClient {
 
     fn collection_status(&self, name: &str) -> CliResult<CollectionStatusResponse> {
         let route = CollectionApiEndpoint::CollectionStatus;
-        self.request_json::<CollectionStatusResponse, ()>(
-            collection_method(route),
-            &route.path(name),
-            None,
-        )
+        let response: CollectionStatusResponse = self
+            .request_json::<CollectionStatusResponse, ()>(
+                collection_method(route),
+                &route.path(name),
+                None,
+            )?;
+        response
+            .validate_for_collection(name)
+            .map_err(|error| CliError::Api(error.to_string()))?;
+        Ok(response)
     }
 
     fn list_collection_watcher_statuses(&self) -> CliResult<CollectionWatchersStatusResponse> {
@@ -1163,10 +1168,7 @@ mod tests {
         );
         let collection_list = "[{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}]";
         let sync = COLLECTION_SYNC_RESPONSE;
-        let status = concat!(
-            "{\"status\":{\"collection\":{\"name\":\"articles\",\"created_at\":\"1\",",
-            "\"updated_at\":\"2\"},\"root_count\":1,\"member_count\":1}}"
-        );
+        let status = COLLECTION_STATUS_RESPONSE;
         let watcher_status = concat!(
             "{\"collection_name\":\"articles\",\"watch_enabled\":true,",
             "\"auto_index_enabled\":false,\"active\":true,\"ignored_by_config\":false,",
@@ -1184,7 +1186,7 @@ mod tests {
             json_response("200 OK", collection),
             "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
             json_response("200 OK", sync),
-            json_response("200 OK", status),
+            json_response("200 OK", &status),
             json_response("200 OK", watchers.as_str()),
             json_response("200 OK", watcher.as_str()),
             json_response("200 OK", watcher.as_str()),

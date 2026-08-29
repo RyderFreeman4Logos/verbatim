@@ -2469,7 +2469,7 @@ async fn collection_status(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     match status {
-        Some(status) => Ok(Json(CollectionStatusResponse { status })),
+        Some(status) => collection_status_response(&name, status),
         None => Err(err(
             StatusCode::NOT_FOUND,
             anyhow::anyhow!("collection not found: {name}"),
@@ -13479,7 +13479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collection_handlers_create_root_sync_and_status() {
+    async fn collection_status_result_identity() {
         let test_dir = TestDir::new("collection-sync");
         let root = test_dir.path().join("articles");
         fs::create_dir_all(&root).unwrap();

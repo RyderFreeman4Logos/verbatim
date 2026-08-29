@@ -129,6 +129,7 @@ pub enum WireArtifactKind {
     IngestResult,
     ReindexResult,
     CollectionSyncResult,
+    CollectionStatusResult,
 }
 
 impl WireArtifactKind {
@@ -152,6 +153,7 @@ impl WireArtifactKind {
             Self::IngestResult => "ingest_result",
             Self::ReindexResult => "reindex_result",
             Self::CollectionSyncResult => "collection_sync_result",
+            Self::CollectionStatusResult => "collection_status_result",
         }
     }
 }

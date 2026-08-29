@@ -4890,13 +4890,14 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("collection_status:{name}"));
-            Ok(CollectionStatusResponse {
-                status: CollectionStatus {
-                    collection: sample_collection_record(),
-                    root_count: 1,
-                    member_count: 1,
-                },
-            })
+            let mut status = CollectionStatus {
+                collection: sample_collection_record(),
+                root_count: 1,
+                member_count: 1,
+            };
+            status.collection.name = name.to_owned();
+            Ok(CollectionStatusResponse::new(name, status)
+                .map_err(|error| client::CliError::Api(error.to_string()))?)
         }
 
         fn list_collection_watcher_statuses(
