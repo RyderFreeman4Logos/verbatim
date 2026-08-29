@@ -239,13 +239,12 @@ pub struct CollectionSyncRequest {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CollectionResponse {
     pub collection: CollectionRecord,
-    #[serde(default)]
     pub roots: Vec<CollectionRoot>,
-    #[serde(default)]
     pub members: Vec<CollectionMember>,
+    pub identity: CanonicalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1213,6 +1212,8 @@ mod tests {
 #[path = "api_collection_root_result_identity.rs"]
 mod api_collection_root_result_identity;
 pub use api_collection_root_result_identity::AddCollectionRootResponse;
+#[path = "api_collection_result_identity.rs"]
+mod api_collection_result_identity;
 #[path = "api_collection_status_result_identity.rs"]
 mod api_collection_status_result_identity;
 #[path = "api_collection_sync_result_identity.rs"]
@@ -1270,6 +1271,9 @@ mod api_task_run_identity_wire_tests;
 mod api_task_wait_identity_wire_tests;
 
 #[cfg(test)]
+#[path = "api_collection_status_result_identity_wire_tests.rs"]
+mod api_collection_status_result_identity_wire_tests;
+#[cfg(test)]
 #[path = "api_ingest_result_identity_wire_tests.rs"]
 mod api_ingest_result_identity_wire_tests;
 #[cfg(test)]
@@ -1281,7 +1285,3 @@ mod api_task_created_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_task_profile_identity_wire_tests.rs"]
 mod api_task_profile_identity_wire_tests;
-
-#[cfg(test)]
-#[path = "api_collection_status_result_identity_wire_tests.rs"]
-mod api_collection_status_result_identity_wire_tests;
