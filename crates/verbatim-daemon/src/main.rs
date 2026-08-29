@@ -124,6 +124,7 @@ mod routes;
 mod source_bounded_retrieval;
 #[path = "source_relocation_api.rs"]
 mod source_relocation_api;
+include!("collection_sync_response.rs");
 #[path = "sqlite_durability_ops.rs"]
 mod sqlite_durability_ops;
 
@@ -2453,8 +2454,7 @@ async fn sync_collection(
             collection_error(&name_for_error, e)
         }
     })?;
-
-    Ok(Json(CollectionSyncResponse { report }))
+    collection_sync_response(name_for_error, report)
 }
 
 async fn collection_status(

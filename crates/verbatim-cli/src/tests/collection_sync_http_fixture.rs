@@ -1,0 +1,1 @@
+const COLLECTION_SYNC_RESPONSE: &str = r#"{"report":{"member_count":1,"added":1,"removed":0,"unchanged":0,"scanned_roots":1,"max_depth":32},"identity":{"kind":"collection_sync_result","schema_version":{"major":1,"minor":0,"patch":0},"artifact_id":"articles","content_hash":"a7fbaa7988e9e9e5cdafa833bde998e276af1a16896d97088d7252b2bd1da7fd"}}"#;
