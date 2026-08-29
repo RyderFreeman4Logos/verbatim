@@ -6906,9 +6906,8 @@ async fn execute_started_reindex_task(
 ) -> Result<ReindexResponse, (StatusCode, Json<ErrorResponse>)> {
     let (outcome, profile_id) =
         run_indexing_operation(Arc::clone(&state), task_id, &controls, "reindex").await?;
-    let response = ReindexResponse {
-        reindexed: outcome.source_count,
-    };
+    let response = ReindexResponse::new(outcome.source_count)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     finish_task_success(
         &state,
         task_id,
