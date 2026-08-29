@@ -8,7 +8,6 @@ use crate::collection::{
 };
 use crate::config::ConfigReloadMetadata;
 use crate::index_gc::{IndexGcApplyReport, IndexGcConfig, IndexGcPlan};
-use crate::index_profile_delete::{IndexProfileDeleteApplyReport, IndexProfileDeletePlan};
 use crate::memory_budget::MemoryBudgetSnapshot;
 use crate::resource::ResourceQueueSnapshot;
 use crate::task::{TaskEvent, TaskId, TaskProfile, TaskSpan, TaskSummary};
@@ -401,12 +400,7 @@ pub struct IndexProfileDeleteRequest {
     #[serde(default)]
     pub allow_active: bool,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexProfileDeleteResponse {
-    pub dry_run: bool,
-    pub plan: IndexProfileDeletePlan,
-    pub apply: IndexProfileDeleteApplyReport,
-}
+pub use api_index_profile_delete_result_identity::IndexProfileDeleteResponse;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorJsonCleanupRequest {
     #[serde(default)]
@@ -1214,6 +1208,8 @@ mod api_collection_status_result_identity;
 mod api_collection_sync_result_identity;
 #[path = "api_collection_watchers_status_result_identity.rs"]
 mod api_collection_watchers_status_result_identity;
+#[path = "api_index_profile_delete_result_identity.rs"]
+mod api_index_profile_delete_result_identity;
 #[path = "api_ingest_result_identity.rs"]
 mod api_ingest_result_identity;
 #[cfg(test)]

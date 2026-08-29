@@ -5438,11 +5438,11 @@ mod tests {
         let artifact = verbatim_core::index_profile_delete::IndexProfileArtifactPlan {
             path: PathBuf::from("/tmp/verbatim/indexes/profiles/old-profile"),
             approximate_bytes: 4096,
-            reason: "profile-scoped published vector artifacts are obsolete".into(),
+            reason: "obsolete".into(),
         };
-        IndexProfileDeleteResponse {
+        IndexProfileDeleteResponse::new(
             dry_run,
-            plan: verbatim_core::index_profile_delete::IndexProfileDeletePlan {
+            verbatim_core::index_profile_delete::IndexProfileDeletePlan {
                 profile_id: "old-profile".into(),
                 active_profile: false,
                 sqlite,
@@ -5450,7 +5450,7 @@ mod tests {
                 skipped: Vec::new(),
                 approximate_reclaim_bytes: artifact.approximate_bytes,
             },
-            apply: if dry_run {
+            if dry_run {
                 verbatim_core::index_profile_delete::IndexProfileDeleteApplyReport::default()
             } else {
                 verbatim_core::index_profile_delete::IndexProfileDeleteApplyReport {
@@ -5459,7 +5459,8 @@ mod tests {
                     reclaimed_bytes: artifact.approximate_bytes,
                 }
             },
-        }
+        )
+        .unwrap()
     }
 
     fn sample_vector_json_cleanup_response(dry_run: bool) -> VectorJsonCleanupResponse {

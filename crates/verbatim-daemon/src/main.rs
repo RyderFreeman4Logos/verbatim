@@ -2152,11 +2152,9 @@ async fn index_delete_profile(
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(pipeline_access_error)?;
-    Ok(Json(IndexProfileDeleteResponse {
-        dry_run,
-        plan,
-        apply,
-    }))
+    let response = IndexProfileDeleteResponse::new(dry_run, plan, apply)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(response))
 }
 
 async fn vector_json_cleanup(
@@ -16756,6 +16754,11 @@ mod tests {
         .await
         .unwrap();
         assert!(dry_run.plan.artifact.is_some());
+        assert_eq!(
+            dry_run.identity.kind,
+            verbatim_core::wire_schemas::WireArtifactKind::IndexProfileDeleteResult
+        );
+        assert_eq!(dry_run.identity.artifact_id, "index-profile-delete");
         assert!(profile_root.exists());
 
         let Json(applied) = index_delete_profile(
@@ -16769,6 +16772,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            applied.identity.kind,
+            verbatim_core::wire_schemas::WireArtifactKind::IndexProfileDeleteResult
+        );
         assert_eq!(applied.apply.removed_artifacts.len(), 1);
         assert_eq!(applied.apply.sqlite.embedding_profile_index_meta_entries, 1);
         assert!(!profile_root.exists());
