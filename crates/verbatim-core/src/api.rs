@@ -7,7 +7,6 @@ use crate::collection::{
     CollectionMember, CollectionRecord, CollectionRoot, CollectionStatus, CollectionSyncReport,
 };
 use crate::config::ConfigReloadMetadata;
-use crate::index_gc::{IndexGcApplyReport, IndexGcConfig, IndexGcPlan};
 use crate::memory_budget::MemoryBudgetSnapshot;
 use crate::resource::ResourceQueueSnapshot;
 use crate::task::{TaskEvent, TaskId, TaskProfile, TaskSpan, TaskSummary};
@@ -383,13 +382,7 @@ pub struct IndexGcRequest {
     #[serde(default)]
     pub dry_run: bool,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexGcResponse {
-    pub dry_run: bool,
-    pub policy: IndexGcConfig,
-    pub plan: IndexGcPlan,
-    pub apply: IndexGcApplyReport,
-}
+pub use api_index_gc_result_identity::IndexGcResponse;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexProfileDeleteRequest {
     pub profile_id: String,
@@ -1208,6 +1201,8 @@ mod api_collection_status_result_identity;
 mod api_collection_sync_result_identity;
 #[path = "api_collection_watchers_status_result_identity.rs"]
 mod api_collection_watchers_status_result_identity;
+#[path = "api_index_gc_result_identity.rs"]
+mod api_index_gc_result_identity;
 #[path = "api_index_profile_delete_result_identity.rs"]
 mod api_index_profile_delete_result_identity;
 #[path = "api_ingest_result_identity.rs"]

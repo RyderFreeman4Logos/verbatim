@@ -5404,18 +5404,18 @@ mod tests {
             generation: None,
             reason: "staging directory age 0s is below stale threshold 86400s".into(),
         };
-        IndexGcResponse {
+        IndexGcResponse::new(
             dry_run,
-            policy: verbatim_core::index_gc::IndexGcConfig {
+            verbatim_core::index_gc::IndexGcConfig {
                 retain_previous_generations: 1,
                 stale_staging_seconds: 86_400,
             },
-            plan: verbatim_core::index_gc::IndexGcPlan {
+            verbatim_core::index_gc::IndexGcPlan {
                 entries: vec![entry.clone()],
                 skipped: vec![skipped],
                 approximate_reclaim_bytes: entry.approximate_bytes,
             },
-            apply: if dry_run {
+            if dry_run {
                 verbatim_core::index_gc::IndexGcApplyReport::default()
             } else {
                 verbatim_core::index_gc::IndexGcApplyReport {
@@ -5423,7 +5423,8 @@ mod tests {
                     reclaimed_bytes: entry.approximate_bytes,
                 }
             },
-        }
+        )
+        .expect("index GC response fixture")
     }
 
     fn sample_index_profile_delete_response(dry_run: bool) -> IndexProfileDeleteResponse {

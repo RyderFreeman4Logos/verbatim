@@ -1273,16 +1273,31 @@ mod tests {
 
     #[test]
     fn http_index_gc_posts_dry_run_request() {
-        let body = concat!(
-            "{\"dry_run\":true,",
-            "\"policy\":{\"retain_previous_generations\":2,\"stale_staging_seconds\":86400},",
-            "\"plan\":{\"entries\":[{\"path\":\"/tmp/verbatim/indexes/profiles/default/gen-1\",",
-            "\"kind\":\"generation\",\"profile_id\":\"default\",\"generation\":1,",
-            "\"approximate_bytes\":10,\"reason\":\"old\"}],\"skipped\":[],",
-            "\"approximate_reclaim_bytes\":10},",
-            "\"apply\":{\"removed\":[],\"reclaimed_bytes\":0}}"
-        );
-        let server = TestServer::respond_many(vec![json_response("200 OK", body)]);
+        let body = serde_json::to_string(
+            &IndexGcResponse::new(
+                true,
+                verbatim_core::index_gc::IndexGcConfig {
+                    retain_previous_generations: 2,
+                    stale_staging_seconds: 86_400,
+                },
+                verbatim_core::index_gc::IndexGcPlan {
+                    entries: vec![verbatim_core::index_gc::IndexGcPlanEntry {
+                        path: "/tmp/verbatim/indexes/profiles/default/gen-1".into(),
+                        kind: verbatim_core::index_gc::IndexGcArtifactKind::Generation,
+                        profile_id: Some("default".into()),
+                        generation: Some(1),
+                        approximate_bytes: 10,
+                        reason: "old".into(),
+                    }],
+                    skipped: vec![],
+                    approximate_reclaim_bytes: 10,
+                },
+                verbatim_core::index_gc::IndexGcApplyReport::default(),
+            )
+            .expect("index GC response fixture"),
+        )
+        .expect("index GC response encodes");
+        let server = TestServer::respond_many(vec![json_response("200 OK", &body)]);
         let client = HttpDaemonClient::with_base_url(server.base_url());
 
         let response = client.index_gc(&IndexGcRequest { dry_run: true }).unwrap();
