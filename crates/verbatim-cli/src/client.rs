@@ -1294,16 +1294,39 @@ mod tests {
         assert!(request.contains("\"dry_run\":true"));
     }
 
+    fn vector_json_cleanup_http_response(dry_run: bool) -> String {
+        let response = VectorJsonCleanupResponse::new(
+            dry_run,
+            verbatim_core::store::VectorJsonCleanupReport {
+                tables: verbatim_core::store::VectorJsonCleanupTables {
+                    chunk_vectors: verbatim_core::store::VectorJsonCleanupTableStats {
+                        eligible: 1,
+                        already_clean: 2,
+                        json_only: 3,
+                        missing_blob: 4,
+                        malformed_blob: 5,
+                    },
+                    embedding_cache: verbatim_core::store::VectorJsonCleanupTableStats {
+                        eligible: 6,
+                        already_clean: 7,
+                        json_only: 8,
+                        missing_blob: 9,
+                        malformed_blob: 10,
+                    },
+                },
+                cleared: Default::default(),
+            },
+        )
+        .expect("vector JSON cleanup response fixture");
+        json_response(
+            "200 OK",
+            &serde_json::to_string(&response).expect("cleanup response encodes"),
+        )
+    }
+
     #[test]
     fn http_vector_json_cleanup_posts_request() {
-        let body = concat!(
-            "{\"dry_run\":true,\"report\":{",
-            "\"tables\":{",
-            "\"chunk_vectors\":{\"eligible\":1,\"already_clean\":2,\"json_only\":3,\"missing_blob\":4,\"malformed_blob\":5},",
-            "\"embedding_cache\":{\"eligible\":6,\"already_clean\":7,\"json_only\":8,\"missing_blob\":9,\"malformed_blob\":10}",
-            "},\"cleared\":{\"chunk_vectors\":0,\"embedding_cache\":0}}}"
-        );
-        let server = TestServer::respond_many(vec![json_response("200 OK", body)]);
+        let server = TestServer::respond_many(vec![vector_json_cleanup_http_response(true)]);
         let client = HttpDaemonClient::with_base_url(server.base_url());
 
         let response = client

@@ -134,6 +134,7 @@ pub enum WireArtifactKind {
     CollectionRootResult,
     CollectionWatchersStatusResult,
     CollectionWatcherResult,
+    VectorJsonCleanupResult,
 }
 
 impl WireArtifactKind {
@@ -162,6 +163,7 @@ impl WireArtifactKind {
             Self::CollectionRootResult => "collection_root_result",
             Self::CollectionWatchersStatusResult => "collection_watchers_status_result",
             Self::CollectionWatcherResult => "collection_watcher_result",
+            Self::VectorJsonCleanupResult => "vector_json_cleanup_result",
         }
     }
 }

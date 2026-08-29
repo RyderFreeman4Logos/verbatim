@@ -2184,7 +2184,9 @@ async fn vector_json_cleanup(
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(pipeline_access_error)?;
-    Ok(Json(VectorJsonCleanupResponse { dry_run, report }))
+    let response = VectorJsonCleanupResponse::new(dry_run, report)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(response))
 }
 
 async fn add_source(
@@ -16629,6 +16631,11 @@ mod tests {
         .await
         .unwrap();
         assert!(dry_run.dry_run);
+        assert_eq!(
+            dry_run.identity.kind,
+            verbatim_core::wire_schemas::WireArtifactKind::VectorJsonCleanupResult
+        );
+        assert_eq!(dry_run.identity.artifact_id, "index-vector-json-cleanup");
         assert_eq!(dry_run.report.tables.chunk_vectors.eligible, 1);
         assert_eq!(dry_run.report.tables.chunk_vectors.json_only, 1);
         assert_eq!(dry_run.report.tables.embedding_cache.eligible, 1);
@@ -16645,6 +16652,10 @@ mod tests {
         .await
         .unwrap();
         assert!(!applied.dry_run);
+        assert_eq!(
+            applied.identity.kind,
+            verbatim_core::wire_schemas::WireArtifactKind::VectorJsonCleanupResult
+        );
         assert_eq!(applied.report.cleared.chunk_vectors, 1);
         assert_eq!(applied.report.cleared.embedding_cache, 1);
 
