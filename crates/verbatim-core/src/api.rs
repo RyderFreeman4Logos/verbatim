@@ -158,11 +158,11 @@ pub struct RelocateSourceRequest {
     pub new_path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckStaleResponse {
     pub stale: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_status: Option<IndexStatusResponse>,
+    pub identity: CanonicalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1193,6 +1193,8 @@ mod tests {
 #[path = "api_collection_root_result_identity.rs"]
 mod api_collection_root_result_identity;
 pub use api_collection_root_result_identity::AddCollectionRootResponse;
+#[path = "api_check_stale_result_identity.rs"]
+mod api_check_stale_result_identity;
 #[path = "api_collection_result_identity.rs"]
 mod api_collection_result_identity;
 #[path = "api_collection_status_result_identity.rs"]
@@ -1261,6 +1263,9 @@ mod api_task_run_identity_wire_tests;
 #[path = "api_task_wait_identity_wire_tests.rs"]
 mod api_task_wait_identity_wire_tests;
 
+#[cfg(test)]
+#[path = "api_check_stale_result_identity_wire_tests.rs"]
+mod api_check_stale_result_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_collection_status_result_identity_wire_tests.rs"]
 mod api_collection_status_result_identity_wire_tests;

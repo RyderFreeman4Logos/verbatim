@@ -2323,10 +2323,13 @@ async fn check_stale(
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok(Json(CheckStaleResponse {
-        stale: ids.into_iter().map(|id| id.0).collect(),
-        profile_status: Some(profile_status),
-    }))
+    let response = CheckStaleResponse::new(
+        ids.into_iter().map(|id| id.0).collect(),
+        Some(profile_status),
+    )
+    .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    Ok(Json(response))
 }
 
 async fn create_collection(
