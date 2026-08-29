@@ -130,6 +130,7 @@ pub enum WireArtifactKind {
     ReindexResult,
     CollectionSyncResult,
     CollectionStatusResult,
+    CollectionRootResult,
 }
 
 impl WireArtifactKind {
@@ -154,6 +155,7 @@ impl WireArtifactKind {
             Self::ReindexResult => "reindex_result",
             Self::CollectionSyncResult => "collection_sync_result",
             Self::CollectionStatusResult => "collection_status_result",
+            Self::CollectionRootResult => "collection_root_result",
         }
     }
 }

@@ -2413,13 +2413,13 @@ async fn add_collection_root(
         let status = store
             .collection_status(&name)?
             .with_context(|| format!("collection not found: {name}"))?;
-        Ok(AddCollectionRootResponse {
-            collection_name: status.collection.name,
+        AddCollectionRootResponse::new(
+            status.collection.name,
             root,
-            root_count: status.root_count,
-            member_count: status.member_count,
-            added: !already_present,
-        })
+            status.root_count,
+            status.member_count,
+            !already_present,
+        )
     })
     .await
     .map_err(|e| collection_error(&name_for_error, e))?;

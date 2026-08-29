@@ -225,15 +225,6 @@ pub struct AddCollectionRootRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AddCollectionRootResponse {
-    pub collection_name: String,
-    pub root: CollectionRoot,
-    pub root_count: usize,
-    pub member_count: usize,
-    pub added: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionSyncPathRequest {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1218,6 +1209,9 @@ mod tests {
 
     include!("api_retrieve_serialization_tests.rs");
 }
+#[path = "api_collection_root_result_identity.rs"]
+mod api_collection_root_result_identity;
+pub use api_collection_root_result_identity::AddCollectionRootResponse;
 #[path = "api_collection_status_result_identity.rs"]
 mod api_collection_status_result_identity;
 #[path = "api_collection_sync_result_identity.rs"]
