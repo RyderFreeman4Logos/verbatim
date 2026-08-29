@@ -4817,10 +4817,10 @@ mod tests {
 
         fn check_sources(&self) -> client::CliResult<CheckStaleResponse> {
             self.calls.borrow_mut().push("check_sources".into());
-            Ok(CheckStaleResponse {
-                stale: vec!["src-1".into()],
-                profile_status: Some(sample_index_status_response()),
-            })
+            Ok(
+                CheckStaleResponse::new(vec!["src-1".into()], Some(sample_index_status_response()))
+                    .unwrap(),
+            )
         }
 
         fn create_collection(
