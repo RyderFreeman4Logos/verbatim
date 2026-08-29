@@ -13,7 +13,8 @@ use verbatim_core::api::{
 #[cfg(test)]
 use verbatim_core::api::{
     ChunkingProfileStatusResponse, EmbeddingCapabilityStatusResponse, IndexGcResponse,
-    IndexProfileDeleteResponse, IndexStatusResponse, VectorJsonCleanupResponse,
+    IndexProfileDeleteResponse, IndexStatusResponse, IndexStatusResponseFields,
+    VectorJsonCleanupResponse,
 };
 
 mod auth;
@@ -5356,7 +5357,7 @@ mod tests {
     }
 
     fn sample_index_status_response() -> IndexStatusResponse {
-        IndexStatusResponse::new(
+        IndexStatusResponse::new(IndexStatusResponseFields(
             true,
             "openai:text-embedding-3-small".into(),
             4,
@@ -5383,7 +5384,7 @@ mod tests {
                 embedding_input_budget_tokens: Some(7168),
             },
             vec!["context window grew from 4096 to 8192; reindex is optional for quality".into()],
-        )
+        ))
         .expect("index status response fixture")
     }
 

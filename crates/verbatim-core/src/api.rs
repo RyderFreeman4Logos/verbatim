@@ -1207,6 +1207,7 @@ mod api_index_gc_result_identity;
 mod api_index_profile_delete_result_identity;
 #[path = "api_index_status_result_identity.rs"]
 mod api_index_status_result_identity;
+pub use api_index_status_result_identity::IndexStatusResponseFields;
 #[path = "api_ingest_result_identity.rs"]
 mod api_ingest_result_identity;
 #[cfg(test)]

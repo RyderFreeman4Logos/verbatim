@@ -1,5 +1,6 @@
 use crate::api::{
     ChunkingProfileStatusResponse, EmbeddingCapabilityStatusResponse, IndexStatusResponse,
+    IndexStatusResponseFields,
 };
 use crate::wire_schemas::{
     encode_wire_document, CanonicalIdentity, WireArtifactKind, WIRE_SCHEMA_VERSION,
@@ -25,7 +26,7 @@ fn response(
     optional_capability_and_chunking_fields: bool,
 ) -> IndexStatusResponse {
     let stale_source_count = stale_source_ids.len();
-    IndexStatusResponse::new(
+    IndexStatusResponse::new(IndexStatusResponseFields(
         embedding_enabled,
         if embedding_enabled {
             "openai:text-embedding-3-small".into()
@@ -64,7 +65,7 @@ fn response(
         } else {
             Vec::new()
         },
-    )
+    ))
     .expect("index status response fixture")
 }
 

@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::api::{
     ChunkingProfileStatusResponse, EmbeddingCapabilityStatusResponse, IndexStatusResponse,
+    IndexStatusResponseFields,
 };
 use crate::canonical_chunker::{CanonicalChunkerConfig, CANONICAL_CHUNKER_VERSION};
 
@@ -1803,7 +1804,7 @@ where
             );
         }
         let chunker_config = &self.embedding_profile_spec.chunker_config;
-        IndexStatusResponse::new(
+        IndexStatusResponse::new(IndexStatusResponseFields(
             self.embedding_enabled,
             self.active_profile_id.as_str().to_string(),
             sources.len(),
@@ -1832,7 +1833,7 @@ where
                     .embedding_input_budget_tokens,
             },
             messages,
-        )
+        ))
     }
 
     pub async fn ingest_source(&mut self, source_id: &SourceId) -> Result<EmbeddingCacheStats> {

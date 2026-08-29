@@ -8,6 +8,18 @@ use crate::wire_schemas::{
     encode_wire_document, CanonicalIdentity, WireArtifactKind, WIRE_SCHEMA_VERSION,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexStatusResponseFields(
+    pub bool,
+    pub String,
+    pub usize,
+    pub usize,
+    pub Vec<String>,
+    pub EmbeddingCapabilityStatusResponse,
+    pub ChunkingProfileStatusResponse,
+    pub Vec<String>,
+);
+
 #[derive(Debug, Serialize)]
 struct IndexStatusResponseBody<'a> {
     embedding_enabled: bool,
@@ -35,45 +47,28 @@ struct IndexStatusResponseWire {
     identity: CanonicalIdentity,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn index_status_result_identity_from_parts(
-    embedding_enabled: bool,
-    active_profile_id: &str,
-    source_count: usize,
-    stale_source_count: usize,
-    stale_source_ids: &[String],
-    capability: &EmbeddingCapabilityStatusResponse,
-    chunking: &ChunkingProfileStatusResponse,
-    messages: &[String],
+fn index_status_result_identity_from_body(
+    body: IndexStatusResponseBody<'_>,
 ) -> Result<CanonicalIdentity> {
     CanonicalIdentity::from_body(
         WireArtifactKind::IndexStatusResult,
         WIRE_SCHEMA_VERSION,
         "index-status",
-        &encode_wire_document(&IndexStatusResponseBody {
-            embedding_enabled,
-            active_profile_id,
-            source_count,
-            stale_source_count,
-            stale_source_ids,
-            capability,
-            chunking,
-            messages,
-        })?,
+        &encode_wire_document(&body)?,
     )
 }
 
 fn index_status_result_identity(response: &IndexStatusResponse) -> Result<CanonicalIdentity> {
-    index_status_result_identity_from_parts(
-        response.embedding_enabled,
-        &response.active_profile_id,
-        response.source_count,
-        response.stale_source_count,
-        &response.stale_source_ids,
-        &response.capability,
-        &response.chunking,
-        &response.messages,
-    )
+    index_status_result_identity_from_body(IndexStatusResponseBody {
+        embedding_enabled: response.embedding_enabled,
+        active_profile_id: &response.active_profile_id,
+        source_count: response.source_count,
+        stale_source_count: response.stale_source_count,
+        stale_source_ids: &response.stale_source_ids,
+        capability: &response.capability,
+        chunking: &response.chunking,
+        messages: &response.messages,
+    })
 }
 
 fn validate_index_status_result_identity(response: &IndexStatusResponse) -> Result<()> {
@@ -86,38 +81,42 @@ fn validate_index_status_result_identity(response: &IndexStatusResponse) -> Resu
 }
 
 impl IndexStatusResponse {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        embedding_enabled: bool,
-        active_profile_id: String,
-        source_count: usize,
-        stale_source_count: usize,
-        stale_source_ids: Vec<String>,
-        capability: EmbeddingCapabilityStatusResponse,
-        chunking: ChunkingProfileStatusResponse,
-        messages: Vec<String>,
-    ) -> Result<Self> {
-        let identity = index_status_result_identity_from_parts(
-            embedding_enabled,
-            &active_profile_id,
-            source_count,
-            stale_source_count,
-            &stale_source_ids,
-            &capability,
-            &chunking,
-            &messages,
-        )?;
+    pub fn new(fields: IndexStatusResponseFields) -> Result<Self> {
+        let identity = index_status_result_identity_from_body(IndexStatusResponseBody {
+            embedding_enabled: fields.0,
+            active_profile_id: &fields.1,
+            source_count: fields.2,
+            stale_source_count: fields.3,
+            stale_source_ids: &fields.4,
+            capability: &fields.5,
+            chunking: &fields.6,
+            messages: &fields.7,
+        })?;
         Ok(Self {
-            embedding_enabled,
-            active_profile_id,
-            source_count,
-            stale_source_count,
-            stale_source_ids,
-            capability,
-            chunking,
-            messages,
+            embedding_enabled: fields.0,
+            active_profile_id: fields.1,
+            source_count: fields.2,
+            stale_source_count: fields.3,
+            stale_source_ids: fields.4,
+            capability: fields.5,
+            chunking: fields.6,
+            messages: fields.7,
             identity,
         })
+    }
+
+    pub fn with_message(mut self, message: String) -> Result<Self> {
+        self.messages.push(message);
+        Self::new(IndexStatusResponseFields(
+            self.embedding_enabled,
+            self.active_profile_id,
+            self.source_count,
+            self.stale_source_count,
+            self.stale_source_ids,
+            self.capability,
+            self.chunking,
+            self.messages,
+        ))
     }
 }
 
