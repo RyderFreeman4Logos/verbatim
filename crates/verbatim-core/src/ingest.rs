@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::api::{
     ChunkingProfileStatusResponse, EmbeddingCapabilityStatusResponse, IndexStatusResponse,
+    IndexStatusResponseFields,
 };
 use crate::canonical_chunker::{CanonicalChunkerConfig, CANONICAL_CHUNKER_VERSION};
 
@@ -1803,13 +1804,13 @@ where
             );
         }
         let chunker_config = &self.embedding_profile_spec.chunker_config;
-        Ok(IndexStatusResponse {
-            embedding_enabled: self.embedding_enabled,
-            active_profile_id: self.active_profile_id.as_str().to_string(),
-            source_count: sources.len(),
-            stale_source_count: stale_source_ids.len(),
-            stale_source_ids: stale_source_ids.into_iter().map(|id| id.0).collect(),
-            capability: EmbeddingCapabilityStatusResponse {
+        IndexStatusResponse::new(IndexStatusResponseFields(
+            self.embedding_enabled,
+            self.active_profile_id.as_str().to_string(),
+            sources.len(),
+            stale_source_ids.len(),
+            stale_source_ids.into_iter().map(|id| id.0).collect(),
+            EmbeddingCapabilityStatusResponse {
                 provider: self.embedding_profile_spec.provider.clone(),
                 model: self.embedding_profile_spec.model.clone(),
                 dimension: self.embedding_profile_spec.dimension,
@@ -1822,7 +1823,7 @@ where
                 quantization: self.embedding_profile_spec.quantization.clone(),
                 weight_identity: self.embedding_profile_spec.weight_identity.clone(),
             },
-            chunking: ChunkingProfileStatusResponse {
+            ChunkingProfileStatusResponse {
                 version: CHUNKER_VERSION.to_string(),
                 child_target_tokens: chunker_config.child_target_tokens,
                 child_overlap_tokens: chunker_config.child_overlap_tokens,
@@ -1832,7 +1833,7 @@ where
                     .embedding_input_budget_tokens,
             },
             messages,
-        })
+        ))
     }
 
     pub async fn ingest_source(&mut self, source_id: &SourceId) -> Result<EmbeddingCacheStats> {

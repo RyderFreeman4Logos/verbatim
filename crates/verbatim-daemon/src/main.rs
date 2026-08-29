@@ -1731,13 +1731,12 @@ fn cached_index_status(state: &SharedState) -> Result<Option<IndexStatusResponse
 }
 
 fn cached_index_status_for_busy_pipeline(state: &SharedState) -> Result<IndexStatusResponse> {
-    let mut response = cached_index_status(state)?
+    let response = cached_index_status(state)?
         .with_context(|| "index status is unavailable until the first live status snapshot")?;
-    response.messages.push(
+    response.with_message(
         "Serving last-known index status because the ingest pipeline is busy with a long-running indexing operation."
             .to_string(),
-    );
-    Ok(response)
+    )
 }
 
 async fn with_task_store_write<T, F>(state: &SharedState, operation: F) -> Result<T>
@@ -12106,6 +12105,7 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.contains("last-known index status")));
+        assert!(serde_json::to_value(&response).is_ok());
         restore_pipeline(&state, pipeline).expect("restore pipeline slot");
     }
 
