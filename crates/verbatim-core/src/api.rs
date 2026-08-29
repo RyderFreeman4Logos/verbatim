@@ -260,10 +260,11 @@ pub struct CollectionWatcherUpdateRequest {
     pub auto_index_enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionWatcherResponse {
     pub collection: CollectionRecord,
     pub watcher: CollectionWatcherStatus,
+    pub identity: CanonicalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -2526,10 +2526,9 @@ async fn collection_watcher_status(
         .get(&collection.name)
         .cloned();
     let watcher = collection_watcher_status_from_parts(&collection, status);
-    Ok(Json(CollectionWatcherResponse {
-        collection,
-        watcher,
-    }))
+    CollectionWatcherResponse::new(collection.name.clone(), collection, watcher)
+        .map(Json)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 async fn update_collection_watcher(
@@ -2562,10 +2561,9 @@ async fn update_collection_watcher(
         .get(&collection.name)
         .cloned();
     let watcher = collection_watcher_status_from_parts(&collection, status);
-    Ok(Json(CollectionWatcherResponse {
-        collection,
-        watcher,
-    }))
+    CollectionWatcherResponse::new(collection.name.clone(), collection, watcher)
+        .map(Json)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 fn collection_response(store: &Store, collection: CollectionRecord) -> Result<CollectionResponse> {
