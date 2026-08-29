@@ -4880,9 +4880,10 @@ mod tests {
                 .borrow_mut()
                 .push(format!("sync_collection:{name}"));
             self.last_collection_sync.replace(Some(request.clone()));
-            Ok(CollectionSyncResponse {
-                report: sample_collection_sync_report(),
-            })
+            Ok(
+                CollectionSyncResponse::new(name, sample_collection_sync_report())
+                    .map_err(|error| client::CliError::Api(error.to_string()))?,
+            )
         }
 
         fn collection_status(&self, name: &str) -> client::CliResult<CollectionStatusResponse> {

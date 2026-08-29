@@ -91,3 +91,4 @@ fn retrieve_result_omits_structured_locator_until_requested() {
 }
 
 include!("api_reindex_result_identity_wire_tests.rs");
+include!("api_collection_sync_result_identity_wire_tests.rs");

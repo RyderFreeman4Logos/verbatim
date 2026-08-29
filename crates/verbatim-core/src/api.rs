@@ -261,7 +261,6 @@ pub struct CollectionResponse {
 pub struct CollectionStatusResponse {
     pub status: CollectionStatus,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionWatcherUpdateRequest {
     pub enabled: bool,
@@ -306,11 +305,11 @@ pub struct CollectionWatcherStatus {
     pub last_task_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionSyncResponse {
     pub report: CollectionSyncReport,
+    pub identity: CanonicalIdentity,
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionFilterRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1218,7 +1217,8 @@ mod tests {
 
     include!("api_retrieve_serialization_tests.rs");
 }
-
+#[path = "api_collection_sync_result_identity.rs"]
+mod api_collection_sync_result_identity;
 #[path = "api_ingest_result_identity.rs"]
 mod api_ingest_result_identity;
 #[path = "api_reindex_result_identity.rs"]

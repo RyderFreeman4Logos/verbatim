@@ -447,7 +447,12 @@ impl DaemonClient for HttpDaemonClient {
         request: &CollectionSyncRequest,
     ) -> CliResult<CollectionSyncResponse> {
         let route = CollectionApiEndpoint::SyncCollection;
-        self.request_json(collection_method(route), &route.path(name), Some(request))
+        let response: CollectionSyncResponse =
+            self.request_json(collection_method(route), &route.path(name), Some(request))?;
+        response
+            .validate_for_collection(name)
+            .map_err(|error| CliError::Api(error.to_string()))?;
+        Ok(response)
     }
 
     fn collection_status(&self, name: &str) -> CliResult<CollectionStatusResponse> {
@@ -978,6 +983,7 @@ mod tests {
     use super::*;
 
     include!("tests/issue_332_client_route_tests.rs");
+    include!("tests/collection_sync_http_fixture.rs");
     include!("tests/report_artifact_evidence_route_tests.rs");
     include!("tests/report_artifact_lookup_route_tests.rs");
     include!("tests/task_wait_client_fixtures.rs");
@@ -1156,10 +1162,7 @@ mod tests {
             "\"root_count\":1,\"member_count\":1,\"added\":true}"
         );
         let collection_list = "[{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}]";
-        let sync = concat!(
-            "{\"report\":{\"member_count\":1,\"added\":1,\"removed\":0,\"unchanged\":0,",
-            "\"scanned_roots\":1,\"max_depth\":32,\"skipped\":[]}}"
-        );
+        let sync = COLLECTION_SYNC_RESPONSE;
         let status = concat!(
             "{\"status\":{\"collection\":{\"name\":\"articles\",\"created_at\":\"1\",",
             "\"updated_at\":\"2\"},\"root_count\":1,\"member_count\":1}}"
