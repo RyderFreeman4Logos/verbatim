@@ -1314,9 +1314,7 @@ mod tests {
 
     #[test]
     fn http_ingest_force_uses_query_parameter() {
-        let server = TestServer::respond_once(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ingested\":2}",
-        );
+        let server = TestServer::respond_many([ingest_http_response(2)]);
         let client = HttpDaemonClient::with_base_url(server.base_url());
 
         let response = client.ingest(None, true, None, false).unwrap();
@@ -1329,9 +1327,7 @@ mod tests {
 
     #[test]
     fn http_ingest_profile_vectors_only_uses_query_parameters() {
-        let server = TestServer::respond_once(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ingested\":1}",
-        );
+        let server = TestServer::respond_many([ingest_http_response(1)]);
         let client = HttpDaemonClient::with_base_url(server.base_url());
 
         let response = client
@@ -1342,6 +1338,15 @@ mod tests {
         assert!(server.request().starts_with(
             "POST /api/ingest/src-1?embedding_profile_id=alt.profile&vectors_only=true HTTP/1.1"
         ));
+    }
+
+    fn ingest_http_response(ingested: usize) -> String {
+        let body =
+            serde_json::to_string(&IngestResponse::new(ingested).expect("ingest response fixture"))
+                .expect("ingest response encodes");
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+        )
     }
 
     fn task_created_http_response(task_id: &str) -> String {
