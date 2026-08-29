@@ -2498,7 +2498,9 @@ async fn list_collection_watcher_statuses(
             )
         })
         .collect();
-    Ok(Json(CollectionWatchersStatusResponse { watchers }))
+    CollectionWatchersStatusResponse::new(watchers)
+        .map(Json)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 async fn collection_watcher_status(
@@ -9972,6 +9974,7 @@ mod tests {
     use task_status_wait_tests::{
         task_status_wait_deadline, wait_for_task_status, wait_for_task_status_until,
     };
+    include!("collection_watchers_status_identity_tests.rs");
 
     fn has_task_terminalize_span(spans: &[verbatim_core::task::TaskSpan]) -> bool {
         spans
@@ -13631,52 +13634,6 @@ mod tests {
         let wire = serde_json::to_string(&existing_add).unwrap();
         assert!(!wire.contains("\"members\":["));
         assert!(!wire.contains("member-127.md"));
-    }
-
-    #[tokio::test]
-    async fn collection_watcher_api_persists_settings_and_reports_status() {
-        let test_dir = TestDir::new("collection-watcher-api");
-        let config = retrieve_test_config("http://127.0.0.1:9/v1");
-        let pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
-        let state = test_state(config, test_dir.path(), pipeline);
-
-        let _ = create_collection(
-            State(Arc::clone(&state)),
-            Json(CreateCollectionRequest {
-                name: "articles".into(),
-                ignore_patterns: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
-
-        let Json(response) = update_collection_watcher(
-            State(Arc::clone(&state)),
-            Path("articles".into()),
-            Json(CollectionWatcherUpdateRequest {
-                enabled: true,
-                auto_index_enabled: Some(false),
-            }),
-        )
-        .await
-        .unwrap();
-
-        assert!(response.collection.watch_enabled);
-        assert!(!response.collection.auto_index_enabled);
-        assert!(response.watcher.watch_enabled);
-        assert!(!response.watcher.auto_index_enabled);
-
-        let Json(single) =
-            collection_watcher_status(State(Arc::clone(&state)), Path("articles".into()))
-                .await
-                .unwrap();
-        assert!(single.collection.watch_enabled);
-
-        let Json(all) = list_collection_watcher_statuses(State(Arc::clone(&state)))
-            .await
-            .unwrap();
-        assert_eq!(all.watchers.len(), 1);
-        assert_eq!(all.watchers[0].collection_name, "articles");
     }
 
     #[tokio::test]
