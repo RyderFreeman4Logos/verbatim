@@ -3,7 +3,7 @@ fn issue_332_inspect_and_remove_keep_established_raw_source_routes() {
     let server = TestServer::respond_many([
         json_response(
             "200 OK",
-            r#"{"id":"legacy-source-id","path":"/tmp/legacy","status":"Indexed","hash":"hash","parser_used":null,"last_ingested_at":null}"#,
+            r#"{"id":"legacy-source-id","path":"/tmp/legacy","status":"Indexed","hash":"hash","parser_used":null,"last_ingested_at":null,"identity":{"kind":"source_record","schema_version":{"major":1,"minor":0,"patch":0},"artifact_id":"legacy-source-id","content_hash":"ea1492e2bb7df37b7034b549c3bf6c609cb01d377d5222df20d24f1bc5cc90ef"}}"#,
         ),
         "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
     ]);
@@ -20,7 +20,7 @@ fn issue_332_inspect_and_remove_keep_established_raw_source_routes() {
 #[test]
 fn issue_332_http_relocate_carries_opaque_source_id_in_json_body() {
     let server = TestServer::respond_once(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"opaque?query#fragment/segment\",\"path\":\"/srv/verbatim/renamed.md\",\"status\":\"Indexed\",\"hash\":\"hash-1\",\"parser_used\":\"markdown\",\"last_ingested_at\":\"now\"}",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"id\":\"opaque?query#fragment/segment\",\"path\":\"/srv/verbatim/renamed.md\",\"status\":\"Indexed\",\"hash\":\"hash-1\",\"parser_used\":\"markdown\",\"last_ingested_at\":\"now\",\"identity\":{\"kind\":\"source_record\",\"schema_version\":{\"major\":1,\"minor\":0,\"patch\":0},\"artifact_id\":\"opaque?query#fragment/segment\",\"content_hash\":\"107ebe3e8524173449da226d44089ff163542b7574bb87928b8339e28db777d4\"}}",
     );
     let client = HttpDaemonClient::with_base_url(server.base_url());
 
