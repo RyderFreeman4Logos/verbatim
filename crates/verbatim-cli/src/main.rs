@@ -5463,9 +5463,9 @@ mod tests {
     }
 
     fn sample_vector_json_cleanup_response(dry_run: bool) -> VectorJsonCleanupResponse {
-        VectorJsonCleanupResponse {
+        VectorJsonCleanupResponse::new(
             dry_run,
-            report: verbatim_core::store::VectorJsonCleanupReport {
+            verbatim_core::store::VectorJsonCleanupReport {
                 tables: verbatim_core::store::VectorJsonCleanupTables {
                     chunk_vectors: verbatim_core::store::VectorJsonCleanupTableStats {
                         eligible: 2,
@@ -5491,7 +5491,8 @@ mod tests {
                     }
                 },
             },
-        }
+        )
+        .expect("cleanup fixture")
     }
 
     fn collection_leaf_command_paths_from_clap() -> Vec<String> {

@@ -10,10 +10,10 @@ use crate::config::ConfigReloadMetadata;
 use crate::index_gc::{IndexGcApplyReport, IndexGcConfig, IndexGcPlan};
 use crate::index_profile_delete::{IndexProfileDeleteApplyReport, IndexProfileDeletePlan};
 use crate::memory_budget::MemoryBudgetSnapshot;
+use crate::resource::ResourceQueueSnapshot;
 use crate::task::{TaskEvent, TaskId, TaskProfile, TaskSpan, TaskSummary};
 use crate::types::{BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceLocator};
 use crate::wire_schemas::CanonicalIdentity;
-use crate::{resource::ResourceQueueSnapshot, store::VectorJsonCleanupReport};
 
 /// HTTP methods used by shared daemon API route metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,12 +414,6 @@ pub struct VectorJsonCleanupRequest {
     #[serde(default)]
     pub confirm: bool,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VectorJsonCleanupResponse {
-    pub dry_run: bool,
-    pub report: VectorJsonCleanupReport,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskCreatedResponse {
     pub task_id: String,
@@ -1241,6 +1235,9 @@ mod api_source_record_identity;
 mod api_task_created_identity;
 #[path = "api_task_profile_identity.rs"]
 mod api_task_profile_identity;
+#[path = "api_vector_json_cleanup_result_identity.rs"]
+mod api_vector_json_cleanup_result_identity;
+pub use api_vector_json_cleanup_result_identity::VectorJsonCleanupResponse;
 
 #[cfg(test)]
 #[path = "api_generated_ask_context_pack_wire_tests.rs"]
