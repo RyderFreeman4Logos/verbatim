@@ -2569,11 +2569,7 @@ async fn update_collection_watcher(
 fn collection_response(store: &Store, collection: CollectionRecord) -> Result<CollectionResponse> {
     let roots = store.list_collection_roots(&collection.name)?;
     let members = store.list_collection_members(&collection.name)?;
-    Ok(CollectionResponse {
-        collection,
-        roots,
-        members,
-    })
+    CollectionResponse::new(collection, roots, members)
 }
 
 fn collection_sync_path_input(request: CollectionSyncPathRequest) -> CollectionSyncPathInput {

@@ -1,9 +1,17 @@
     #[test]
     fn http_collection_routes_are_plumbed_from_shared_inventory() {
-        let collection = concat!(
-            "{\"collection\":{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"},",
-            "\"roots\":[],\"members\":[]}"
-        );
+        let collection = serde_json::to_string(
+            &CollectionResponse::new(
+                serde_json::from_str(
+                    "{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}",
+                )
+                .unwrap(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let collection_root = COLLECTION_ROOT_RESPONSE;
         let collection_list = "[{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}]";
         let sync = COLLECTION_SYNC_RESPONSE;
@@ -33,10 +41,10 @@
         )
         .unwrap();
         let server = TestServer::respond_many(vec![
-            json_response("201 Created", collection),
+            json_response("201 Created", &collection),
             json_response("200 OK", collection_root),
             json_response("200 OK", collection_list),
-            json_response("200 OK", collection),
+            json_response("200 OK", &collection),
             "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
             json_response("200 OK", sync),
             json_response("200 OK", &status),

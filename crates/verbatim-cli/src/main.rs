@@ -5329,17 +5329,18 @@ mod tests {
     }
 
     fn sample_collection_response() -> CollectionResponse {
-        CollectionResponse {
-            collection: sample_collection_record(),
-            roots: vec![sample_collection_root()],
-            members: vec![verbatim_core::collection::CollectionMember {
+        CollectionResponse::new(
+            sample_collection_record(),
+            vec![sample_collection_root()],
+            vec![verbatim_core::collection::CollectionMember {
                 collection_name: "articles".into(),
                 source_id: SourceId("src-1".into()),
                 logical_path: "one.md".into(),
                 source_path: PathBuf::from("/tmp/articles/one.md"),
                 updated_at: "3".into(),
             }],
-        }
+        )
+        .unwrap()
     }
 
     fn sample_collection_sync_report() -> CollectionSyncReport {
