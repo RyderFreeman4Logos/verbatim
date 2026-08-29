@@ -2064,12 +2064,9 @@ async fn index_gc(
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.into()))?
     .map_err(pipeline_access_error)?;
-    Ok(Json(IndexGcResponse {
-        dry_run,
-        policy: policy_config,
-        plan,
-        apply,
-    }))
+    let response = IndexGcResponse::new(dry_run, policy_config, plan, apply)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(response))
 }
 
 async fn index_status(
