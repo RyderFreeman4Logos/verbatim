@@ -5356,13 +5356,13 @@ mod tests {
     }
 
     fn sample_index_status_response() -> IndexStatusResponse {
-        IndexStatusResponse {
-            embedding_enabled: true,
-            active_profile_id: "openai:text-embedding-3-small".into(),
-            source_count: 4,
-            stale_source_count: 1,
-            stale_source_ids: vec!["src-1".into()],
-            capability: EmbeddingCapabilityStatusResponse {
+        IndexStatusResponse::new(
+            true,
+            "openai:text-embedding-3-small".into(),
+            4,
+            1,
+            vec!["src-1".into()],
+            EmbeddingCapabilityStatusResponse {
                 provider: "openai-compatible".into(),
                 model: "text-embedding-3-small".into(),
                 dimension: 1536,
@@ -5375,17 +5375,16 @@ mod tests {
                 quantization: Some("fp16".into()),
                 weight_identity: Some("sha256:weights".into()),
             },
-            chunking: ChunkingProfileStatusResponse {
+            ChunkingProfileStatusResponse {
                 version: "markdown-v1".into(),
                 child_target_tokens: 512,
                 child_overlap_tokens: 64,
                 parent_children_count: 4,
                 embedding_input_budget_tokens: Some(7168),
             },
-            messages: vec![
-                "context window grew from 4096 to 8192; reindex is optional for quality".into(),
-            ],
-        }
+            vec!["context window grew from 4096 to 8192; reindex is optional for quality".into()],
+        )
+        .expect("index status response fixture")
     }
 
     fn sample_index_gc_response(dry_run: bool) -> IndexGcResponse {

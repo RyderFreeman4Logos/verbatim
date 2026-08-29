@@ -165,7 +165,7 @@ pub struct CheckStaleResponse {
     pub profile_status: Option<IndexStatusResponse>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexStatusResponse {
     pub embedding_enabled: bool,
     pub active_profile_id: String,
@@ -174,8 +174,8 @@ pub struct IndexStatusResponse {
     pub stale_source_ids: Vec<String>,
     pub capability: EmbeddingCapabilityStatusResponse,
     pub chunking: ChunkingProfileStatusResponse,
-    #[serde(default)]
     pub messages: Vec<String>,
+    pub identity: CanonicalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1205,6 +1205,8 @@ mod api_collection_watchers_status_result_identity;
 mod api_index_gc_result_identity;
 #[path = "api_index_profile_delete_result_identity.rs"]
 mod api_index_profile_delete_result_identity;
+#[path = "api_index_status_result_identity.rs"]
+mod api_index_status_result_identity;
 #[path = "api_ingest_result_identity.rs"]
 mod api_ingest_result_identity;
 #[cfg(test)]
