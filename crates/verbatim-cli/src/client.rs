@@ -400,7 +400,12 @@ impl DaemonClient for HttpDaemonClient {
         request: &AddCollectionRootRequest,
     ) -> CliResult<AddCollectionRootResponse> {
         let route = CollectionApiEndpoint::AddCollectionRoot;
-        self.request_json(collection_method(route), &route.path(name), Some(request))
+        let response: AddCollectionRootResponse =
+            self.request_json(collection_method(route), &route.path(name), Some(request))?;
+        response
+            .validate_for_collection(name)
+            .map_err(|error| CliError::Api(error.to_string()))?;
+        Ok(response)
     }
 
     fn list_collections(&self) -> CliResult<Vec<CollectionRecord>> {
@@ -1159,13 +1164,7 @@ mod tests {
             "{\"collection\":{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"},",
             "\"roots\":[],\"members\":[]}"
         );
-        let collection_root = concat!(
-            "{\"collection_name\":\"articles\",",
-            "\"root\":{\"collection_name\":\"articles\",\"path\":\"/tmp/articles\",",
-            "\"canonical_path\":\"/tmp/articles\",\"kind\":\"directory\",",
-            "\"added_at\":\"1\",\"updated_at\":\"2\"},",
-            "\"root_count\":1,\"member_count\":1,\"added\":true}"
-        );
+        let collection_root = COLLECTION_ROOT_RESPONSE;
         let collection_list = "[{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}]";
         let sync = COLLECTION_SYNC_RESPONSE;
         let status = COLLECTION_STATUS_RESPONSE;

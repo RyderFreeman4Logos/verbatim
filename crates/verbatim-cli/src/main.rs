@@ -2797,15 +2797,10 @@ mod tests {
     #[test]
     fn collection_add_root_existing_output_is_bounded_for_large_membership() {
         let client = MockDaemonClient::default();
-        client
-            .collection_root_response
-            .replace(Some(AddCollectionRootResponse {
-                collection_name: "articles".into(),
-                root: sample_collection_root(),
-                root_count: 1,
-                member_count: 2_250,
-                added: false,
-            }));
+        client.collection_root_response.replace(Some(
+            AddCollectionRootResponse::new("articles", sample_collection_root(), 1, 2_250, false)
+                .unwrap(),
+        ));
         let local = MockLocalActions::default();
 
         let (code, stdout, stderr) = run_mock_with(
@@ -5327,13 +5322,7 @@ mod tests {
     }
 
     fn sample_add_collection_root_response() -> AddCollectionRootResponse {
-        AddCollectionRootResponse {
-            collection_name: "articles".into(),
-            root: sample_collection_root(),
-            root_count: 1,
-            member_count: 1,
-            added: true,
-        }
+        AddCollectionRootResponse::new("articles", sample_collection_root(), 1, 1, true).unwrap()
     }
 
     fn sample_collection_response() -> CollectionResponse {
