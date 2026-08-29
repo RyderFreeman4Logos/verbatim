@@ -266,10 +266,10 @@ pub struct CollectionWatcherResponse {
     pub watcher: CollectionWatcherStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionWatchersStatusResponse {
-    #[serde(default)]
     pub watchers: Vec<CollectionWatcherStatus>,
+    pub identity: CanonicalIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1216,6 +1216,8 @@ pub use api_collection_root_result_identity::AddCollectionRootResponse;
 mod api_collection_status_result_identity;
 #[path = "api_collection_sync_result_identity.rs"]
 mod api_collection_sync_result_identity;
+#[path = "api_collection_watchers_status_result_identity.rs"]
+mod api_collection_watchers_status_result_identity;
 #[path = "api_ingest_result_identity.rs"]
 mod api_ingest_result_identity;
 #[cfg(test)]

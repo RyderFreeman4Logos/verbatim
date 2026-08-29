@@ -4901,9 +4901,8 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push("list_collection_watcher_statuses".into());
-            Ok(CollectionWatchersStatusResponse {
-                watchers: vec![sample_collection_watcher_status()],
-            })
+            CollectionWatchersStatusResponse::new(vec![sample_collection_watcher_status()])
+                .map_err(|error| client::CliError::Api(error.to_string()))
         }
 
         fn collection_watcher_status(

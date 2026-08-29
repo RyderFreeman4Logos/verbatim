@@ -1177,7 +1177,13 @@ mod tests {
             "{{\"collection\":{{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}},\
              \"watcher\":{watcher_status}}}"
         );
-        let watchers = format!("{{\"watchers\":[{watcher_status}]}}");
+        let watchers = serde_json::to_string(
+            &CollectionWatchersStatusResponse::new(vec![
+                serde_json::from_str(watcher_status).unwrap()
+            ])
+            .unwrap(),
+        )
+        .unwrap();
         let server = TestServer::respond_many(vec![
             json_response("201 Created", collection),
             json_response("200 OK", collection_root),
