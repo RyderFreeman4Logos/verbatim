@@ -4951,7 +4951,7 @@ mod tests {
             self.calls.borrow_mut().push(format!(
                 "ingest:{source_id:?}:{force}:{embedding_profile_id:?}:{vectors_only}"
             ));
-            Ok(IngestResponse { ingested: 1 })
+            Ok(IngestResponse::new(1).expect("ingest response fixture"))
         }
 
         fn reindex(&self, request: &ReindexRequest) -> client::CliResult<ReindexResponse> {

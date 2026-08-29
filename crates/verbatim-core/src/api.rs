@@ -10,11 +10,10 @@ use crate::config::ConfigReloadMetadata;
 use crate::index_gc::{IndexGcApplyReport, IndexGcConfig, IndexGcPlan};
 use crate::index_profile_delete::{IndexProfileDeleteApplyReport, IndexProfileDeletePlan};
 use crate::memory_budget::MemoryBudgetSnapshot;
-use crate::resource::ResourceQueueSnapshot;
-use crate::store::VectorJsonCleanupReport;
 use crate::task::{TaskEvent, TaskId, TaskProfile, TaskSpan, TaskSummary};
 use crate::types::{BBox, ImageArtifact, RetrievalDebug, RetrievalProvenance, SourceLocator};
 use crate::wire_schemas::CanonicalIdentity;
+use crate::{resource::ResourceQueueSnapshot, store::VectorJsonCleanupReport};
 
 /// HTTP methods used by shared daemon API route metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,9 +363,10 @@ pub struct CollectionResultProvenance {
     pub member_updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestResponse {
     pub ingested: usize,
+    pub identity: CanonicalIdentity,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReindexRequest {
@@ -1227,6 +1227,9 @@ mod api_task_created_identity;
 #[path = "api_source_record_identity.rs"]
 mod api_source_record_identity;
 
+#[path = "api_ingest_result_identity.rs"]
+mod api_ingest_result_identity;
+
 #[path = "api_source_created_identity.rs"]
 mod api_source_created_identity;
 
@@ -1281,3 +1284,7 @@ mod api_task_created_identity_wire_tests;
 #[cfg(test)]
 #[path = "api_source_record_identity_wire_tests.rs"]
 mod api_source_record_identity_wire_tests;
+
+#[cfg(test)]
+#[path = "api_ingest_result_identity_wire_tests.rs"]
+mod api_ingest_result_identity_wire_tests;

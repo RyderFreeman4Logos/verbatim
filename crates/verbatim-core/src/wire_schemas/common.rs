@@ -126,6 +126,7 @@ pub enum WireArtifactKind {
     TaskCreated,
     SourceCreated,
     SourceRecord,
+    IngestResult,
 }
 
 impl WireArtifactKind {
@@ -146,6 +147,7 @@ impl WireArtifactKind {
             Self::TaskCreated => "task_created",
             Self::SourceCreated => "source_created",
             Self::SourceRecord => "source_record",
+            Self::IngestResult => "ingest_result",
         }
     }
 }

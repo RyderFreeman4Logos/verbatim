@@ -6679,9 +6679,8 @@ async fn execute_started_ingest_task(
 ) -> Result<IngestResponse, (StatusCode, Json<ErrorResponse>)> {
     let (outcome, profile_id) =
         run_indexing_operation(Arc::clone(&state), task_id, &controls, "ingest").await?;
-    let response = IngestResponse {
-        ingested: outcome.source_count,
-    };
+    let response = IngestResponse::new(outcome.source_count)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     finish_task_success(
         &state,
         task_id,
