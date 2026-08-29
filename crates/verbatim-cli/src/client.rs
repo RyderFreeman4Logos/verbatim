@@ -1362,9 +1362,9 @@ mod tests {
     #[test]
     fn http_reindex_posts_json_to_daemon() {
         let server = TestServer::respond_many(vec![
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"reindexed\":1}".to_string(),
+            reindex_http_response(1),
             task_created_http_response("task-1"),
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"reindexed\":2}".to_string(),
+            reindex_http_response(2),
         ]);
         let client = HttpDaemonClient::with_base_url(server.base_url());
         let request = ReindexRequest {
@@ -1401,6 +1401,16 @@ mod tests {
         assert!(requests[2].contains("\"force\":true"));
         assert!(requests[2].contains("\"all\":false"));
         assert!(!requests[2].contains("\"source_id\""));
+    }
+
+    fn reindex_http_response(reindexed: usize) -> String {
+        let body = serde_json::to_string(
+            &ReindexResponse::new(reindexed).expect("reindex response fixture"),
+        )
+        .expect("reindex response encodes");
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+        )
     }
 
     #[test]

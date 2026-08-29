@@ -383,9 +383,10 @@ pub struct ReindexRequest {
     #[serde(default)]
     pub vectors_only: bool,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReindexResponse {
     pub reindexed: usize,
+    pub identity: CanonicalIdentity,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexGcRequest {
@@ -1218,17 +1219,16 @@ mod tests {
     include!("api_retrieve_serialization_tests.rs");
 }
 
-#[path = "api_task_profile_identity.rs"]
-mod api_task_profile_identity;
-
-#[path = "api_task_created_identity.rs"]
-mod api_task_created_identity;
-
-#[path = "api_source_record_identity.rs"]
-mod api_source_record_identity;
-
 #[path = "api_ingest_result_identity.rs"]
 mod api_ingest_result_identity;
+#[path = "api_reindex_result_identity.rs"]
+mod api_reindex_result_identity;
+#[path = "api_source_record_identity.rs"]
+mod api_source_record_identity;
+#[path = "api_task_created_identity.rs"]
+mod api_task_created_identity;
+#[path = "api_task_profile_identity.rs"]
+mod api_task_profile_identity;
 
 #[path = "api_source_created_identity.rs"]
 mod api_source_created_identity;

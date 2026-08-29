@@ -4957,7 +4957,7 @@ mod tests {
         fn reindex(&self, request: &ReindexRequest) -> client::CliResult<ReindexResponse> {
             self.calls.borrow_mut().push("reindex".into());
             self.last_reindex.replace(Some(request.clone()));
-            Ok(ReindexResponse { reindexed: 1 })
+            Ok(ReindexResponse::new(1).expect("reindex response fixture"))
         }
 
         fn submit_ask_task(&self, request: &AskRequest) -> client::CliResult<TaskCreatedResponse> {

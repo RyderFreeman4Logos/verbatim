@@ -127,6 +127,7 @@ pub enum WireArtifactKind {
     SourceCreated,
     SourceRecord,
     IngestResult,
+    ReindexResult,
 }
 
 impl WireArtifactKind {
@@ -148,6 +149,7 @@ impl WireArtifactKind {
             Self::SourceCreated => "source_created",
             Self::SourceRecord => "source_record",
             Self::IngestResult => "ingest_result",
+            Self::ReindexResult => "reindex_result",
         }
     }
 }

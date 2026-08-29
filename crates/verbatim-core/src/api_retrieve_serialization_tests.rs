@@ -89,3 +89,5 @@ fn retrieve_result_omits_structured_locator_until_requested() {
     let requested_encoded = serde_json::to_string(&requested).unwrap();
     assert!(requested_encoded.contains("structured_locator"));
 }
+
+include!("api_reindex_result_identity_wire_tests.rs");
