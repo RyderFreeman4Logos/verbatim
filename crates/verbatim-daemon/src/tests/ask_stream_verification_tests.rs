@@ -221,6 +221,16 @@ async fn ask_stream_without_verifier_preserves_token_streaming() {
     assert_eq!(tokens.len(), 1, "SSE: {body}");
     let token: AskTokenEvent = serde_json::from_str(tokens[0]).unwrap();
     assert_eq!(token.text, raw_answer);
+    let token_wire: serde_json::Value = serde_json::from_str(tokens[0]).unwrap();
+    assert_eq!(token_wire["identity"]["kind"], "ask_token_event");
+    assert_eq!(token_wire["identity"]["artifact_id"], "ask-stream-token");
+    assert_eq!(
+        token_wire["identity"]["schema_version"],
+        serde_json::to_value(WIRE_SCHEMA_VERSION).unwrap()
+    );
+    assert!(token_wire["identity"]["content_hash"]
+        .as_str()
+        .is_some_and(|hash| !hash.is_empty()));
     assert_eq!(event_data(&body, "citation").len(), 1, "SSE: {body}");
     assert!(event_data(&body, "answer").is_empty(), "SSE: {body}");
     assert_eq!(model_server.chat_requests(), 1);
