@@ -104,13 +104,14 @@ fn sync_ask_citation_publishes_report_artifact_identity() {
 
 #[test]
 fn sse_citation_event_publishes_report_artifact_identity() {
-    let event = AskCitationEvent {
-        citations: vec![citation_response_with_collections(
+    let event = AskCitationEvent::new(
+        vec![citation_response_with_collections(
             report_citation(),
             &HashMap::new(),
         )],
-        verified: true,
-    };
+        true,
+    )
+    .unwrap();
     let encoded = serde_json::to_value(event).unwrap();
 
     assert_eq!(
@@ -254,7 +255,24 @@ async fn default_generated_ask_stream_publishes_terminal_identities() {
 
     let citations = event_data(&body, "citation");
     assert_eq!(citations.len(), 1, "SSE: {body}");
-    let citation: AskCitationEvent = serde_json::from_str(citations[0]).unwrap();
+    let citation_wire: serde_json::Value = serde_json::from_str(citations[0]).unwrap();
+    assert_eq!(citation_wire["identity"]["kind"], "ask_citation_event");
+    assert_eq!(
+        citation_wire["identity"]["artifact_id"],
+        "ask-stream-citation"
+    );
+    assert_eq!(
+        citation_wire["identity"]["schema_version"],
+        serde_json::to_value(WIRE_SCHEMA_VERSION).unwrap()
+    );
+    assert!(citation_wire["identity"]["content_hash"]
+        .as_str()
+        .is_some_and(|hash| !hash.is_empty()));
+    let citation: AskCitationEvent = serde_json::from_value(citation_wire.clone()).unwrap();
+    let mut mismatched_citation = citation_wire;
+    mismatched_citation["identity"]["kind"] = serde_json::json!("derived_artifact");
+    serde_json::from_value::<AskCitationEvent>(mismatched_citation)
+        .expect_err("stream citation identity mismatch must fail closed");
     let completed_answer = format!(
         "{raw_answer}\n\nReferences:\n[{}] {}: {}\n",
         citation.citations[0].label, citation.citations[0].kind, citation.citations[0].locator

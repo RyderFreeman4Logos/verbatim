@@ -277,7 +277,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::{self, Cursor, Read, Write};
 
-    use verbatim_core::api::{AskErrorEvent, AskTokenEvent, TaskWaitEvent};
+    use verbatim_core::api::{
+        AskCitationEvent, AskErrorEvent, AskTokenEvent, CitationResponse, TaskWaitEvent,
+    };
     use verbatim_core::task::{TaskEvent, TaskSpan, TaskSummary};
 
     use super::*;
@@ -297,6 +299,27 @@ mod tests {
         format!(
             "event: token\ndata: {}\n\n",
             serde_json::to_string(&AskTokenEvent::new(text).unwrap()).unwrap()
+        )
+    }
+
+    fn citation_frame() -> String {
+        let event = AskCitationEvent::new(
+            vec![CitationResponse {
+                label: "E1".into(),
+                evidence_id: "ev-1".into(),
+                kind: "original_text".into(),
+                role: "original_text".into(),
+                derived_from: None,
+                collections: Vec::new(),
+                locator: "PDF p.1 para.1".into(),
+                text_preview: "preview".into(),
+            }],
+            false,
+        )
+        .unwrap();
+        format!(
+            "event: citation\ndata: {}\n\n",
+            serde_json::to_string(&event).unwrap()
         )
     }
 
@@ -320,7 +343,7 @@ mod tests {
             "{}{}{}",
             token_frame("Hel"),
             token_frame("lo [E1]."),
-            "event: citation\ndata: {\"citations\":[{\"label\":\"E1\",\"evidence_id\":\"ev-1\",\"kind\":\"original_text\",\"role\":\"original_text\",\"derived_from\":null,\"locator\":\"PDF p.1 para.1\",\"text_preview\":\"preview\"}],\"verified\":false}\n\n",
+            citation_frame(),
         );
         let mut stdout = FlushRecorder::default();
 
