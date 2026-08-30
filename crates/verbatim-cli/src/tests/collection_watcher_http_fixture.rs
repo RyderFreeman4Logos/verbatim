@@ -13,7 +13,16 @@
         )
         .unwrap();
         let collection_root = COLLECTION_ROOT_RESPONSE;
-        let collection_list = "[{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}]";
+        let collection_list = serde_json::to_string(
+            &CollectionListResponse::new(vec![
+                serde_json::from_str(
+                    "{\"name\":\"articles\",\"created_at\":\"1\",\"updated_at\":\"2\"}",
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
         let sync = COLLECTION_SYNC_RESPONSE;
         let status = COLLECTION_STATUS_RESPONSE;
         let watcher_status = concat!(
@@ -43,7 +52,7 @@
         let server = TestServer::respond_many(vec![
             json_response("201 Created", &collection),
             json_response("200 OK", collection_root),
-            json_response("200 OK", collection_list),
+            json_response("200 OK", &collection_list),
             json_response("200 OK", &collection),
             "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
             json_response("200 OK", sync),
@@ -187,4 +196,18 @@
             Some("articles"),
         );
         assert!(requests[9].contains("\"enabled\":true"));
+    }
+
+    #[test]
+    fn collection_list_result_identity_rejects_invalid_identity() {
+        let mut response = serde_json::to_value(CollectionListResponse::new(Vec::new()).unwrap())
+            .unwrap();
+        response["identity"]["content_hash"] = Value::String("0".repeat(64));
+        let body = serde_json::to_string(&response).unwrap();
+        let server = TestServer::respond_many(vec![json_response("200 OK", &body)]);
+
+        let error = HttpDaemonClient::with_base_url(server.base_url())
+            .list_collections()
+            .expect_err("invalid collection-list identity must fail closed");
+        assert!(error.to_string().contains("invalid JSON"));
     }

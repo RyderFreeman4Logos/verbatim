@@ -113,6 +113,8 @@ use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
 mod audit_receipt;
 #[path = "auth_middleware.rs"]
 mod auth_middleware;
+#[path = "collection_list_api.rs"]
+mod collection_list_api;
 #[path = "deletion_api.rs"]
 mod deletion_api;
 #[path = "report_artifact_api.rs"]
@@ -128,6 +130,7 @@ include!("collection_sync_response.rs");
 #[path = "sqlite_durability_ops.rs"]
 mod sqlite_durability_ops;
 
+use collection_list_api::list_collections;
 use deletion_api::{
     delete_source, list_deletion_reports, reconcile_deletions_on_startup,
     start_deletion_reconcile_scheduler, STARTUP_DELETION_RECONCILE_BATCH_SIZE,
@@ -2344,16 +2347,6 @@ async fn create_collection(
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
 
     Ok((StatusCode::CREATED, Json(response)))
-}
-
-async fn list_collections(
-    State(state): State<SharedState>,
-) -> Result<Json<Vec<CollectionRecord>>, (StatusCode, Json<ErrorResponse>)> {
-    let collections = with_task_store_read(&state, |store| store.list_collections())
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(Json(collections))
 }
 
 async fn get_collection(
