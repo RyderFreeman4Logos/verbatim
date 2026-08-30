@@ -50,6 +50,10 @@ async fn delete_source_with_disabled_qdrant_persists_terminal_receipt_and_return
     .unwrap();
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(body.is_empty());
     let report = with_task_store_read(&state, move |store| store.latest_deletion_report(&source_id))
         .await
         .unwrap()

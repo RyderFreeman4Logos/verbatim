@@ -2,6 +2,7 @@
 
 use super::*;
 use verbatim_core::deletion::{DeletionOutcome, DeletionProduct, PersistedDeletionReport};
+use verbatim_core::DeletionReportResponse;
 
 pub(super) const STARTUP_DELETION_RECONCILE_BATCH_SIZE: usize = 16;
 pub(super) const DELETION_RECONCILE_INTERVAL: Duration = if cfg!(test) {
@@ -47,7 +48,9 @@ pub(super) async fn delete_source(
     .into_iter()
     .any(|product| receipt.report.status_for(product) == Some(DeletionOutcome::Pending));
     if has_pending_work {
-        Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+        let response = DeletionReportResponse::new(receipt)
+            .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        Ok((StatusCode::ACCEPTED, Json(response)).into_response())
     } else {
         Ok(StatusCode::NO_CONTENT.into_response())
     }

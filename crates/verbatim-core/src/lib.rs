@@ -6,10 +6,16 @@ pub mod api;
 #[path = "api_collection_list_result_identity.rs"]
 pub mod collection_list_result_identity;
 pub use collection_list_result_identity::CollectionListResponse;
+#[path = "api_deletion_report_result_identity.rs"]
+pub mod deletion_report_result_identity;
+pub use deletion_report_result_identity::DeletionReportResponse;
 #[path = "api_ask_retrieval_debug_identity.rs"]
 mod api_ask_retrieval_debug_identity;
 pub mod cache_identity;
 pub mod canonical_chunker;
+#[cfg(test)]
+#[path = "api_deletion_report_result_identity_wire_tests.rs"]
+mod deletion_report_result_identity_wire_tests;
 
 pub mod chunker;
 pub mod citation_audit;
