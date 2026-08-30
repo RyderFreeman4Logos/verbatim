@@ -109,6 +109,7 @@ use verbatim_core::types::{
     RetrievalResult, Source, SourceId, SourceLocator, SourceStatus,
 };
 use verbatim_core::upstream::{sanitize_text, UpstreamFailureError};
+use verbatim_core::SourceListResponse;
 
 mod audit_receipt;
 #[path = "auth_middleware.rs"]
@@ -2213,7 +2214,7 @@ async fn add_source(
 
 async fn list_sources(
     State(state): State<SharedState>,
-) -> Result<Json<Vec<SourceResponse>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<SourceListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let sources = with_task_store_read(&state, |store| {
         store
             .list_sources()?
@@ -2234,7 +2235,9 @@ async fn list_sources(
     .await
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    Ok(Json(sources))
+    let response = SourceListResponse::new(sources)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(response))
 }
 
 async fn get_source(

@@ -22,7 +22,7 @@ use verbatim_core::api::{
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
 use verbatim_core::graphrag::ReportArtifactManifest;
-use verbatim_core::CollectionListResponse;
+use verbatim_core::{CollectionListResponse, SourceListResponse};
 
 #[cfg(test)]
 use crate::auth::HTTP_ERROR_TRUNCATION_MARKER;
@@ -346,7 +346,9 @@ impl DaemonClient for HttpDaemonClient {
     }
 
     fn list_sources(&self) -> CliResult<Vec<SourceResponse>> {
-        self.request_json::<Vec<SourceResponse>, ()>(Method::GET, "/api/sources", None)
+        let response =
+            self.request_json::<SourceListResponse, ()>(Method::GET, "/api/sources", None)?;
+        Ok(response.sources)
     }
 
     fn get_source(&self, id: &str) -> CliResult<SourceResponse> {
@@ -1004,6 +1006,7 @@ mod tests {
 
     use super::*;
 
+    include!("tests/source_list_result_identity.rs");
     include!("tests/issue_332_client_route_tests.rs");
     include!("tests/collection_sync_http_fixture.rs");
     include!("tests/report_artifact_evidence_route_tests.rs");
