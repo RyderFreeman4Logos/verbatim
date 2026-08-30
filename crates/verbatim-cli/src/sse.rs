@@ -1,9 +1,9 @@
 use std::io::{BufRead, BufReader, Read, Write};
 
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 use verbatim_core::api::{
-    AskCitationEvent, AskErrorEvent, AskResponse, AskTokenEvent, TaskWaitEvent,
+    AskCitationEvent, AskErrorEvent, AskResponse, AskRetrievalDebugEvent, AskTokenEvent,
+    TaskWaitEvent,
 };
 
 use crate::client::{CliError, CliResult};
@@ -197,8 +197,8 @@ where
                 Ok(())
             }
             "retrieval" => {
-                let debug: Value = decode_event("retrieval", &frame.data)?;
-                render::write_retrieval_debug(self.stdout, &debug)?;
+                let event: AskRetrievalDebugEvent = decode_event("retrieval", &frame.data)?;
+                render::write_retrieval_debug_typed(self.stdout, &event.debug)?;
                 Ok(())
             }
             "error" => Err(stream_error(&frame.data)),
@@ -278,7 +278,8 @@ mod tests {
     use std::io::{self, Cursor, Read, Write};
 
     use verbatim_core::api::{
-        AskCitationEvent, AskErrorEvent, AskTokenEvent, CitationResponse, TaskWaitEvent,
+        AskCitationEvent, AskErrorEvent, AskRetrievalDebugEvent, AskTokenEvent, CitationResponse,
+        TaskWaitEvent,
     };
     use verbatim_core::task::{TaskEvent, TaskSpan, TaskSummary};
 
@@ -446,6 +447,51 @@ mod tests {
             self.flushes += 1;
             Ok(())
         }
+    }
+
+    #[test]
+    fn consumes_bound_retrieval_debug_event_with_existing_rendering() {
+        let debug: verbatim_core::types::RetrievalDebug =
+            serde_json::from_value(serde_json::json!({
+                "dense_vector_path": "resident_hnsw",
+                "bm25_hits": [],
+                "dense_hits": [],
+                "rrf_fused_hits": [],
+                "graph_expanded_hits": [],
+                "reranker": {"status": "disabled", "scores": []},
+                "final_evidence_pack": []
+            }))
+            .unwrap();
+        let event = AskRetrievalDebugEvent::new(debug.clone()).unwrap();
+        let data = serde_json::to_string(&event).unwrap();
+        let stream = format!("event: retrieval\ndata: {data}\n\n");
+
+        let mut stdout = Vec::new();
+        consume_ask_sse(Cursor::new(stream), &mut stdout).unwrap();
+        let mut expected = Vec::new();
+        crate::render::write_retrieval_debug_typed(&mut expected, &debug).unwrap();
+        assert_eq!(stdout, expected);
+    }
+
+    #[test]
+    fn rejects_mutated_retrieval_identity_at_cli_boundary() {
+        let debug: verbatim_core::types::RetrievalDebug =
+            serde_json::from_value(serde_json::json!({
+                "bm25_hits": [],
+                "dense_hits": [],
+                "rrf_fused_hits": [],
+                "graph_expanded_hits": [],
+                "reranker": {"status": "disabled", "scores": []},
+                "final_evidence_pack": []
+            }))
+            .unwrap();
+        let event = AskRetrievalDebugEvent::new(debug).unwrap();
+        let mut wire = serde_json::to_value(event).unwrap();
+        wire["identity"]["artifact_id"] = serde_json::json!("other-retrieval-debug");
+        let stream = format!("event: retrieval\ndata: {}\n\n", wire);
+
+        let mut stdout = Vec::new();
+        assert!(consume_ask_sse(Cursor::new(stream), &mut stdout).is_err());
     }
 
     struct ChunkedReader {

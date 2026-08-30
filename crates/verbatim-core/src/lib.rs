@@ -3,6 +3,8 @@ pub mod auth;
 pub use auth::{AuthMode, DaemonAuthConfig, Principal, Role};
 pub mod adk_integration;
 pub mod api;
+#[path = "api_ask_retrieval_debug_identity.rs"]
+mod api_ask_retrieval_debug_identity;
 pub mod cache_identity;
 pub mod canonical_chunker;
 

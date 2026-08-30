@@ -542,6 +542,7 @@ pub use retrieve_envelope::generated_ask_stream_context_pack;
 mod ask_run_identity;
 #[path = "api_ask_token_identity.rs"]
 mod ask_token_identity;
+pub use crate::api_ask_retrieval_debug_identity::AskRetrievalDebugEvent;
 pub use ask_token_identity::AskTokenEvent;
 #[path = "api_evidence_identity.rs"]
 mod evidence_identity;
