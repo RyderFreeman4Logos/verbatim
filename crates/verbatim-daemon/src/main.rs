@@ -8577,13 +8577,12 @@ where
 }
 
 fn sse_error_event(status: StatusCode, error: impl Into<String>) -> Event {
-    sse_json_event(
-        "error",
-        &AskErrorEvent {
-            status: Some(status.as_u16()),
-            error: error.into(),
-        },
-    )
+    match AskErrorEvent::new(Some(status.as_u16()), error) {
+        Ok(event) => sse_json_event("error", &event),
+        Err(error) => Event::default()
+            .event("error")
+            .data(format!("failed to serialize error event: {error}")),
+    }
 }
 
 // ---------------------------------------------------------------------------

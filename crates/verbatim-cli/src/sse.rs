@@ -277,7 +277,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::{self, Cursor, Read, Write};
 
-    use verbatim_core::api::{AskTokenEvent, TaskWaitEvent};
+    use verbatim_core::api::{AskErrorEvent, AskTokenEvent, TaskWaitEvent};
     use verbatim_core::task::{TaskEvent, TaskSpan, TaskSummary};
 
     use super::*;
@@ -355,7 +355,11 @@ mod tests {
 
     #[test]
     fn error_event_returns_cli_error() {
-        let stream = "event: error\ndata: {\"status\":500,\"error\":\"model failed\"}\n\n";
+        let event = AskErrorEvent::new(Some(500), "model failed").unwrap();
+        let stream = format!(
+            "event: error\ndata: {}\n\n",
+            serde_json::to_string(&event).unwrap()
+        );
         let mut stdout = Vec::new();
 
         let error = consume_ask_sse(Cursor::new(stream), &mut stdout).unwrap_err();

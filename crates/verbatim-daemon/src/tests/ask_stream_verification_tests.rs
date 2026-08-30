@@ -198,6 +198,10 @@ async fn ask_stream_with_invalid_verifier_publishes_only_safe_error() {
     assert_eq!(errors.len(), 1, "SSE: {body}");
     let error: AskErrorEvent = serde_json::from_str(errors[0]).unwrap();
     assert_eq!(error.status, Some(500));
+    assert_eq!(error.identity.kind.as_str(), "ask_error_event");
+    assert_eq!(error.identity.artifact_id, "ask-stream-error");
+    assert_eq!(error.identity.schema_version, WIRE_SCHEMA_VERSION);
+    assert!(!error.identity.content_hash.as_str().is_empty());
     assert!(
         error.error.starts_with("verifier returned invalid JSON:"),
         "unexpected error: {}",

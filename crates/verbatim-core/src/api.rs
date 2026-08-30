@@ -1032,11 +1032,9 @@ pub struct AskCitationEvent {
     pub verified: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AskErrorEvent {
-    pub status: Option<u16>,
-    pub error: String,
-}
+#[path = "api_ask_error_identity.rs"]
+mod ask_error_identity;
+pub use ask_error_identity::AskErrorEvent;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigResponse {
