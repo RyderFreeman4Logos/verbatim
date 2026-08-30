@@ -540,6 +540,9 @@ mod retrieve_envelope;
 pub use retrieve_envelope::generated_ask_stream_context_pack;
 #[path = "api_ask_run_identity.rs"]
 mod ask_run_identity;
+#[path = "api_ask_token_identity.rs"]
+mod ask_token_identity;
+pub use ask_token_identity::AskTokenEvent;
 #[path = "api_evidence_identity.rs"]
 mod evidence_identity;
 #[path = "api_generated_ask_identity.rs"]
@@ -1020,11 +1023,6 @@ impl ErrorResponse {
             upstream_failure: None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AskTokenEvent {
-    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

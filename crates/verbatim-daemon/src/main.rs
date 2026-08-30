@@ -5311,15 +5311,8 @@ async fn execute_ask_stream_task_inner(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             );
-            try_send_stream_event(
-                &tx_tokens,
-                sse_json_event(
-                    "token",
-                    &AskTokenEvent {
-                        text: delta.to_string(),
-                    },
-                ),
-            )?;
+            let token_event = AskTokenEvent::new(delta.to_string())?;
+            try_send_stream_event(&tx_tokens, sse_json_event("token", &token_event))?;
             Ok(())
         })
         .await
@@ -19342,12 +19335,7 @@ mod tests {
         let on_delta = move |delta: &str| {
             try_send_stream_event(
                 &tx_tokens,
-                sse_json_event(
-                    "token",
-                    &AskTokenEvent {
-                        text: delta.to_string(),
-                    },
-                ),
+                sse_json_event("token", &AskTokenEvent::new(delta.to_string())?),
             )?;
             Ok::<_, anyhow::Error>(())
         };

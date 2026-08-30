@@ -277,7 +277,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::{self, Cursor, Read, Write};
 
-    use verbatim_core::api::TaskWaitEvent;
+    use verbatim_core::api::{AskTokenEvent, TaskWaitEvent};
     use verbatim_core::task::{TaskEvent, TaskSpan, TaskSummary};
 
     use super::*;
@@ -293,28 +293,34 @@ mod tests {
         )
     }
 
+    fn token_frame(text: &str) -> String {
+        format!(
+            "event: token\ndata: {}\n\n",
+            serde_json::to_string(&AskTokenEvent::new(text).unwrap()).unwrap()
+        )
+    }
+
     #[test]
     fn parses_named_data_frame() {
-        let frame = parse_frame("event: token\ndata: {\"text\":\"hi\"}\n").unwrap();
+        let data = serde_json::to_string(&AskTokenEvent::new("hi").unwrap()).unwrap();
+        let frame = parse_frame(&format!("event: token\ndata: {data}\n")).unwrap();
 
         assert_eq!(
             frame,
             SseFrame {
                 event: Some("token".into()),
-                data: "{\"text\":\"hi\"}".into(),
+                data,
             }
         );
     }
 
     #[test]
     fn consumes_tokens_as_frames_arrive_and_renders_citations() {
-        let stream = concat!(
-            "event: token\n",
-            "data: {\"text\":\"Hel\"}\n\n",
-            "event: token\n",
-            "data: {\"text\":\"lo [E1].\"}\n\n",
-            "event: citation\n",
-            "data: {\"citations\":[{\"label\":\"E1\",\"evidence_id\":\"ev-1\",\"kind\":\"original_text\",\"role\":\"original_text\",\"derived_from\":null,\"locator\":\"PDF p.1 para.1\",\"text_preview\":\"preview\"}],\"verified\":false}\n\n",
+        let stream = format!(
+            "{}{}{}",
+            token_frame("Hel"),
+            token_frame("lo [E1]."),
+            "event: citation\ndata: {\"citations\":[{\"label\":\"E1\",\"evidence_id\":\"ev-1\",\"kind\":\"original_text\",\"role\":\"original_text\",\"derived_from\":null,\"locator\":\"PDF p.1 para.1\",\"text_preview\":\"preview\"}],\"verified\":false}\n\n",
         );
         let mut stdout = FlushRecorder::default();
 
@@ -329,7 +335,7 @@ mod tests {
 
     #[test]
     fn consumes_split_utf8_code_points_without_replacement() {
-        let stream = concat!("event: token\n", "data: {\"text\":\"streamed 你好 π\"}\n\n",);
+        let stream = token_frame("streamed 你好 π");
         let split = stream
             .find("你")
             .expect("test stream contains multibyte text")
