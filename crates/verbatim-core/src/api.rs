@@ -1033,6 +1033,10 @@ pub use ask_citation_identity::AskCitationEvent;
 mod ask_error_identity;
 pub use ask_error_identity::AskErrorEvent;
 
+#[path = "api_ask_collection_filter_identity.rs"]
+mod ask_collection_filter_identity;
+pub use ask_collection_filter_identity::AskCollectionFilterEvent;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigResponse {
     pub config: Value,
