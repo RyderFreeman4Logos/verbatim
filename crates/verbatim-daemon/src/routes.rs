@@ -220,8 +220,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::net::SocketAddr;
     use tower::ServiceExt;
+    use verbatim_core::deletion::{DeletionOutcome, DeletionProduct, PersistedDeletionReport};
     use verbatim_core::ingest::IngestPipeline;
-    use verbatim_core::CollectionListResponse;
+    use verbatim_core::{CollectionListResponse, DeletionReportResponse};
 
     struct TestDir(std::path::PathBuf);
 
@@ -430,6 +431,80 @@ mod tests {
         assert_eq!(response.identity.kind.as_str(), "collection_list_result");
         assert_eq!(response.identity.schema_version.to_string(), "1.0.0");
         assert_eq!(response.identity.artifact_id, "collections");
+    }
+
+    #[tokio::test]
+    async fn deletion_routes_bind_only_the_pending_receipt() {
+        let unique = format!(
+            "verbatim-daemon-deletion-result-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let data_dir = TestDir(std::env::temp_dir().join(unique));
+        std::fs::create_dir_all(&data_dir.0).unwrap();
+        let source_path = data_dir.0.join("pending.md");
+        std::fs::write(&source_path, "delete through the production router").unwrap();
+        let mut config = retrieve_test_config("http://127.0.0.1:9/v1");
+        config.qdrant.enabled = true;
+        config.qdrant.url = "http://127.0.0.1:9".into();
+        let pipeline = IngestPipeline::new(&config, &data_dir.0).unwrap();
+        let source_id = pipeline.add_source(&source_path).unwrap();
+        let state = crate::tests::test_state(config, &data_dir.0, pipeline);
+        let app = build_router(state);
+
+        let mut delete_request = Request::builder()
+            .method(Method::DELETE)
+            .uri(PATH_SOURCE_BY_ID.replace("{id}", &source_id.0))
+            .body(Body::empty())
+            .unwrap();
+        delete_request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),
+        ));
+        let delete_response = app.clone().oneshot(delete_request).await.unwrap();
+        assert_eq!(delete_response.status(), StatusCode::ACCEPTED);
+        let bytes = to_bytes(delete_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(bytes.starts_with(b"{\"source_id\":"));
+        let response: DeletionReportResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response.source_id, source_id);
+        assert_eq!(response.identity.kind.as_str(), "deletion_report_result");
+        assert_eq!(response.identity.schema_version.to_string(), "1.0.0");
+        assert_eq!(response.identity.artifact_id, response.source_id.0);
+        assert_eq!(
+            response.report.status_for(DeletionProduct::Qdrant),
+            Some(DeletionOutcome::Pending)
+        );
+
+        let mut list_request = Request::builder()
+            .method(Method::GET)
+            .uri(PATH_DELETION_REPORTS)
+            .body(Body::empty())
+            .unwrap();
+        list_request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),
+        ));
+        let list_response = app.oneshot(list_request).await.unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let bytes = to_bytes(list_response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(bytes.starts_with(b"[{\"source_id\":"));
+        assert!(!bytes
+            .windows(b"\"identity\"".len())
+            .any(|window| window == b"\"identity\""));
+        let reports: Vec<PersistedDeletionReport> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(reports
+            .iter()
+            .all(|report| report.source_id == response.source_id));
+        let latest = reports.last().unwrap();
+        assert_eq!(latest.recorded_at, response.recorded_at);
+        assert_eq!(latest.retention_policy, response.retention_policy);
+        assert_eq!(latest.report, response.report);
     }
 
     #[test]
