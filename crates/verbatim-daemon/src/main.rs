@@ -5408,17 +5408,9 @@ async fn execute_ask_stream_task_inner(
             citation_response_with_collections(citation, &query_scope.collection_provenance)
         })
         .collect::<Vec<_>>();
-    send_stream_event(
-        &tx,
-        sse_json_event(
-            "citation",
-            &AskCitationEvent {
-                citations: citations.clone(),
-                verified: gen_result.verified,
-            },
-        ),
-    )
-    .await?;
+    let citation_event = AskCitationEvent::new(citations.clone(), gen_result.verified)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    send_stream_event(&tx, sse_json_event("citation", &citation_event)).await?;
 
     let context = source_bounded_retrieval::executed_retrieve_for_generated_ask(
         &question,

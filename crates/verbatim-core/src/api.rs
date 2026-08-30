@@ -1025,12 +1025,9 @@ impl ErrorResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AskCitationEvent {
-    #[serde(default)]
-    pub citations: Vec<CitationResponse>,
-    pub verified: bool,
-}
+#[path = "api_ask_citation_identity.rs"]
+mod ask_citation_identity;
+pub use ask_citation_identity::AskCitationEvent;
 
 #[path = "api_ask_error_identity.rs"]
 mod ask_error_identity;
