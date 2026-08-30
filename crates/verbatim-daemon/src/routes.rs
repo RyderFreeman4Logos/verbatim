@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deletion_routes_bind_only_the_pending_receipt() {
+    async fn deletion_report_list_result_identity() {
         let unique = format!(
             "verbatim-daemon-deletion-result-identity-{}-{}",
             std::process::id(),
@@ -492,11 +492,25 @@ mod tests {
         let bytes = to_bytes(list_response.into_body(), 1024 * 1024)
             .await
             .unwrap();
-        assert!(bytes.starts_with(b"[{\"source_id\":"));
-        assert!(!bytes
-            .windows(b"\"identity\"".len())
-            .any(|window| window == b"\"identity\""));
-        let reports: Vec<PersistedDeletionReport> = serde_json::from_slice(&bytes).unwrap();
+        assert!(bytes.starts_with(b"{\"reports\":[{\"source_id\":"));
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let reports: Vec<PersistedDeletionReport> =
+            serde_json::from_value(wire["reports"].clone()).unwrap();
+        assert_eq!(wire["identity"]["kind"], "deletion_report_list_result");
+        assert_eq!(
+            wire["identity"]["schema_version"],
+            serde_json::json!({
+                "major": 1,
+                "minor": 0,
+                "patch": 0,
+            })
+        );
+        assert_eq!(wire["identity"]["artifact_id"], "deletion-reports");
+        assert!(wire["reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|report| report.get("identity").is_none()));
         assert_eq!(reports.len(), 2);
         assert!(reports
             .iter()

@@ -6,6 +6,9 @@ pub mod api;
 #[path = "api_collection_list_result_identity.rs"]
 pub mod collection_list_result_identity;
 pub use collection_list_result_identity::CollectionListResponse;
+#[path = "api_deletion_report_list_result_identity.rs"]
+pub mod deletion_report_list_result_identity;
+pub use deletion_report_list_result_identity::DeletionReportListResponse;
 #[path = "api_deletion_report_result_identity.rs"]
 pub mod deletion_report_result_identity;
 pub use deletion_report_result_identity::DeletionReportResponse;
