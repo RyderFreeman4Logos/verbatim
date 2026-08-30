@@ -434,6 +434,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_list_result_identity() {
+        let (test_dir, state) = test_state("source-list-result-identity");
+        let source_ids = {
+            let pipeline = state.pipeline.lock().unwrap().take().unwrap();
+            let first = test_dir.0.join("first.md");
+            let second = test_dir.0.join("second.md");
+            std::fs::write(&first, "first source").unwrap();
+            std::fs::write(&second, "second source").unwrap();
+            pipeline.add_source(&first).unwrap();
+            pipeline.add_source(&second).unwrap();
+            let ids = pipeline
+                .store()
+                .list_sources()
+                .unwrap()
+                .into_iter()
+                .map(|source| source.id.0)
+                .collect::<Vec<_>>();
+            state.pipeline.lock().unwrap().replace(pipeline);
+            ids
+        };
+        let app = build_router(state);
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri(PATH_SOURCES)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),
+        ));
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(bytes.starts_with(b"{\"sources\":["));
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["identity"]["kind"], "source_list_result");
+        assert_eq!(
+            body["identity"]["schema_version"],
+            serde_json::json!({
+                "major": 1,
+                "minor": 0,
+                "patch": 0,
+            })
+        );
+        assert_eq!(body["identity"]["artifact_id"], "sources");
+        let sources: Vec<verbatim_core::api::SourceResponse> =
+            serde_json::from_value(body["sources"].clone()).unwrap();
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.id.clone())
+                .collect::<Vec<_>>(),
+            source_ids
+        );
+        assert!(sources
+            .iter()
+            .all(|source| source.identity.validate().is_ok()));
+    }
+
+    #[tokio::test]
     async fn deletion_report_list_result_identity() {
         let unique = format!(
             "verbatim-daemon-deletion-result-identity-{}-{}",

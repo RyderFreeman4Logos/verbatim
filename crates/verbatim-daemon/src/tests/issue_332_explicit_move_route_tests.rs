@@ -3,8 +3,9 @@ use axum::extract::connect_info::ConnectInfo;
 use axum::http::{header, Method, Request, StatusCode};
 use serde_json::Value;
 use tower::ServiceExt;
-use verbatim_core::api::{
-    ErrorResponse, EvidenceResponse, RetrieveRequest, RetrieveResponse, SourceResponse,
+use verbatim_core::{
+    api::{ErrorResponse, EvidenceResponse, RetrieveRequest, RetrieveResponse, SourceResponse},
+    SourceListResponse,
 };
 
 use super::*;
@@ -127,10 +128,13 @@ async fn issue_332_source_record_identity_is_published_by_inspect_and_list() {
         issue_332_request(&app, Method::GET, "/api/sources", serde_json::Value::Null).await;
     assert_eq!(response.status(), StatusCode::OK);
     let sources_wire: Value = issue_332_body(response).await;
-    assert_eq!(sources_wire[0]["identity"]["kind"], "source_record");
-    let sources: Vec<SourceResponse> = serde_json::from_value(sources_wire)
+    assert_eq!(
+        sources_wire["sources"][0]["identity"]["kind"],
+        "source_record"
+    );
+    let sources: SourceListResponse = serde_json::from_value(sources_wire)
         .expect("stamped source-record list must validate on decode");
-    assert_eq!(sources.len(), 1);
+    assert_eq!(sources.sources.len(), 1);
 
     let response = issue_332_request(
         &app,
