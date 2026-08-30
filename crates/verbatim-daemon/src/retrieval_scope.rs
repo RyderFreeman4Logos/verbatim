@@ -1,7 +1,12 @@
 use std::collections::BTreeSet;
 
 use anyhow::{bail, Result};
-use verbatim_core::api::CollectionFilterRequest;
+use axum::http::StatusCode;
+use axum::response::sse::Event;
+use axum::Json;
+use verbatim_core::api::{
+    AskCollectionFilterEvent, CollectionFilterRequest, CollectionFilterResponse, ErrorResponse,
+};
 use verbatim_core::collection::validate_collection_name;
 use verbatim_core::config::RetrievalConfig;
 use verbatim_core::types::SourceId;
@@ -100,4 +105,12 @@ fn shell_arg(value: &str) -> String {
     } else {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
+}
+
+pub(crate) fn filter_event(
+    response: &CollectionFilterResponse,
+) -> std::result::Result<Event, (StatusCode, Json<ErrorResponse>)> {
+    let event = AskCollectionFilterEvent::new(response.clone())
+        .map_err(|error| super::err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(super::sse_json_event("collection_filter", &event))
 }

@@ -11,6 +11,23 @@ async fn ask_stream_body(
     chat_responses: &[&str],
     fail_success_persistence: bool,
 ) -> (String, MockModelServer) {
+    ask_stream_body_with_filter(
+        name,
+        verifier_enabled,
+        chat_responses,
+        fail_success_persistence,
+        CollectionFilterRequest::default(),
+    )
+    .await
+}
+
+async fn ask_stream_body_with_filter(
+    name: &str,
+    verifier_enabled: bool,
+    chat_responses: &[&str],
+    fail_success_persistence: bool,
+    collection_filter: CollectionFilterRequest,
+) -> (String, MockModelServer) {
     let model_server =
         MockModelServer::start_with_chat_responses(3, chat_responses.iter().copied()).await;
     let test_dir = TestDir::new(name);
@@ -30,6 +47,31 @@ async fn ask_stream_body(
     let mut pipeline = IngestPipeline::new(&config, test_dir.path()).unwrap();
     let source_id = pipeline.add_source(&source_path).unwrap();
     pipeline.ingest_source(&source_id).await.unwrap();
+    if !collection_filter.is_empty() {
+        use verbatim_core::collection::{CollectionMemberCandidate, CollectionSyncReport};
+
+        pipeline.store().create_collection("articles", &[]).unwrap();
+        pipeline
+            .store()
+            .replace_collection_members(
+                "articles",
+                &[CollectionMemberCandidate {
+                    source_id: source_id.clone(),
+                    logical_path: "doc.md".into(),
+                    source_path: fs::canonicalize(&source_path).unwrap(),
+                }],
+                CollectionSyncReport {
+                    member_count: 1,
+                    added: 1,
+                    removed: 0,
+                    unchanged: 0,
+                    scanned_roots: 1,
+                    max_depth: 32,
+                    skipped: Vec::new(),
+                },
+            )
+            .unwrap();
+    }
     let state = test_state(config, test_dir.path(), pipeline);
     state.fail_next_task_success_persistence.store(
         fail_success_persistence,
@@ -46,7 +88,7 @@ async fn ask_stream_body(
             serde_json::to_vec(&AskRequest {
                 question: "What does the stored evidence say?".into(),
                 source_id: Some(source_id.0),
-                collection_filter: CollectionFilterRequest::default(),
+                collection_filter,
                 embedding_profile_id: None,
                 show_retrieval: false,
                 context_only: false,
@@ -332,6 +374,48 @@ async fn default_generated_ask_stream_publishes_terminal_identities() {
     serde_json::from_value::<AskResponse>(mismatched)
         .expect_err("stream ask-run identity mismatch must fail closed");
     assert!(body.trim_end().ends_with(ask_runs[0]), "SSE: {body}");
+}
+
+#[tokio::test]
+async fn ask_stream_collection_filter_publishes_bound_identity() {
+    let (body, _model_server) = ask_stream_body_with_filter(
+        "ask-stream-collection-filter-identity",
+        false,
+        &["The safe answer is alpha [E1]."],
+        false,
+        CollectionFilterRequest {
+            collection_ids: Vec::new(),
+            names: vec!["articles".into()],
+            require_fresh: false,
+        },
+    )
+    .await;
+
+    let filters = event_data(&body, "collection_filter");
+    assert_eq!(filters.len(), 1, "SSE: {body}");
+    let wire: serde_json::Value = serde_json::from_str(filters[0]).unwrap();
+    assert_eq!(wire["requested"]["names"], serde_json::json!(["articles"]));
+    assert_eq!(wire["identity"]["kind"], "ask_collection_filter_event");
+    assert_eq!(
+        wire["identity"]["artifact_id"],
+        "ask-stream-collection-filter"
+    );
+    assert_eq!(
+        wire["identity"]["schema_version"],
+        serde_json::to_value(WIRE_SCHEMA_VERSION).unwrap()
+    );
+    assert!(wire["identity"]["content_hash"]
+        .as_str()
+        .is_some_and(|hash| !hash.is_empty()));
+    let event: verbatim_core::api::AskCollectionFilterEvent =
+        serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(event.requested.names, vec!["articles"]);
+    assert_eq!(event.identity.kind.as_str(), "ask_collection_filter_event");
+    assert!(
+        body.find("event: collection_filter").unwrap()
+            < body.find("event: generated_interpretation").unwrap(),
+        "collection_filter must precede generated_interpretation: {body}"
+    );
 }
 
 #[tokio::test]

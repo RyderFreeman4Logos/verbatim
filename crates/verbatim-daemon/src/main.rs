@@ -5430,7 +5430,7 @@ async fn execute_ask_stream_task_inner(
         }
     }
     if let Some(collection_filter) = &query_scope.collection_filter {
-        send_stream_event(&tx, sse_json_event("collection_filter", collection_filter)).await?;
+        send_stream_event(&tx, retrieval_scope::filter_event(collection_filter)?).await?;
     }
 
     let generated_interpretation = generated_interpretation_wire(
