@@ -1,8 +1,8 @@
 //! Daemon-bound erasure handlers and startup reconciliation.
 
 use super::*;
-use verbatim_core::deletion::{DeletionOutcome, DeletionProduct, PersistedDeletionReport};
-use verbatim_core::DeletionReportResponse;
+use verbatim_core::deletion::{DeletionOutcome, DeletionProduct};
+use verbatim_core::{DeletionReportListResponse, DeletionReportResponse};
 
 pub(super) const STARTUP_DELETION_RECONCILE_BATCH_SIZE: usize = 16;
 pub(super) const DELETION_RECONCILE_INTERVAL: Duration = if cfg!(test) {
@@ -59,11 +59,13 @@ pub(super) async fn delete_source(
 /// Return durable, content-free deletion receipts for operational audit.
 pub(super) async fn list_deletion_reports(
     State(state): State<SharedState>,
-) -> Result<Json<Vec<PersistedDeletionReport>>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<DeletionReportListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let reports = with_task_store_read(&state, |store| store.list_deletion_reports())
         .await
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    Ok(Json(reports))
+    let response = DeletionReportListResponse::new(reports)
+        .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(response))
 }
 
 /// Reconcile one bounded batch of pending erasures after the pipeline is restored.
