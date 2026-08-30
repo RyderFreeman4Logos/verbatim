@@ -5424,11 +5424,8 @@ async fn execute_ask_stream_task_inner(
         send_stream_event(&tx, sse_json_event("context_pack", &pack)).await?;
     }
 
-    if show_retrieval {
-        if let Some(debug) = retrieval_debug.as_ref() {
-            send_stream_event(&tx, sse_json_event("retrieval", debug)).await?;
-        }
-    }
+    source_bounded_retrieval::retrieval_event(&tx, show_retrieval, retrieval_debug.as_ref())
+        .await?;
     if let Some(collection_filter) = &query_scope.collection_filter {
         send_stream_event(&tx, retrieval_scope::filter_event(collection_filter)?).await?;
     }

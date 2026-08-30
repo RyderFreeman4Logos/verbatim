@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use verbatim_core::api::RetrieveResponse;
+use axum::{http::StatusCode, response::sse::Event, Json};
+use verbatim_core::api::{AskRetrievalDebugEvent, ErrorResponse, RetrieveResponse};
 use verbatim_core::retrieve::refresh_evidence_pack_debug;
 use verbatim_core::store::Store;
 use verbatim_core::types::{
@@ -223,4 +224,19 @@ pub(super) fn executed_retrieve_for_generated_ask(
                 .map(|evidence| evidence.id.0.as_str())
         }),
     )
+}
+
+pub(super) async fn retrieval_event(
+    tx: &tokio::sync::mpsc::Sender<Event>,
+    show_retrieval: bool,
+    debug: Option<&RetrievalDebug>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if show_retrieval {
+        if let Some(debug) = debug {
+            let event = AskRetrievalDebugEvent::new(debug.clone())
+                .map_err(|error| super::err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            super::send_stream_event(tx, super::sse_json_event("retrieval", &event)).await?;
+        }
+    }
+    Ok(())
 }

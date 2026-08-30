@@ -11,11 +11,28 @@ async fn ask_stream_body(
     chat_responses: &[&str],
     fail_success_persistence: bool,
 ) -> (String, MockModelServer) {
-    ask_stream_body_with_filter(
+    ask_stream_body_with_filter_impl(
         name,
         verifier_enabled,
         chat_responses,
         fail_success_persistence,
+        false,
+        CollectionFilterRequest::default(),
+    )
+    .await
+}
+
+async fn ask_stream_body_with_retrieval(
+    name: &str,
+    verifier_enabled: bool,
+    chat_responses: &[&str],
+) -> (String, MockModelServer) {
+    ask_stream_body_with_filter_impl(
+        name,
+        verifier_enabled,
+        chat_responses,
+        false,
+        true,
         CollectionFilterRequest::default(),
     )
     .await
@@ -26,6 +43,25 @@ async fn ask_stream_body_with_filter(
     verifier_enabled: bool,
     chat_responses: &[&str],
     fail_success_persistence: bool,
+    collection_filter: CollectionFilterRequest,
+) -> (String, MockModelServer) {
+    ask_stream_body_with_filter_impl(
+        name,
+        verifier_enabled,
+        chat_responses,
+        fail_success_persistence,
+        false,
+        collection_filter,
+    )
+    .await
+}
+
+async fn ask_stream_body_with_filter_impl(
+    name: &str,
+    verifier_enabled: bool,
+    chat_responses: &[&str],
+    fail_success_persistence: bool,
+    show_retrieval: bool,
     collection_filter: CollectionFilterRequest,
 ) -> (String, MockModelServer) {
     let model_server =
@@ -90,7 +126,7 @@ async fn ask_stream_body_with_filter(
                 source_id: Some(source_id.0),
                 collection_filter,
                 embedding_profile_id: None,
-                show_retrieval: false,
+                show_retrieval,
                 context_only: false,
                 limit: None,
                 page_size: None,
@@ -450,4 +486,28 @@ async fn generated_ask_stream_context_pack_stamps_sse_from_retrieve() {
     assert_eq!(pack.header.profile_ref.as_deref(), Some("default"));
     assert!(pack.header.generation.is_some());
     assert!(pack.model_fingerprint.is_none());
+}
+
+#[tokio::test]
+async fn generated_ask_stream_retrieval_stamps_bound_identity() {
+    let raw_answer = "The unverified streamed answer is alpha [E1].";
+    let (body, _model_server) =
+        ask_stream_body_with_retrieval("ask-stream-retrieval-debug-identity", false, &[raw_answer])
+            .await;
+
+    let retrieval = event_data(&body, "retrieval");
+    assert_eq!(retrieval.len(), 1, "SSE: {body}");
+    let wire: serde_json::Value = serde_json::from_str(retrieval[0]).unwrap();
+    let event: verbatim_core::api::AskRetrievalDebugEvent =
+        serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(event.identity.kind.as_str(), "ask_retrieval_debug_event");
+    assert_eq!(event.identity.artifact_id, "ask-stream-retrieval-debug");
+    assert_eq!(
+        wire["identity"]["schema_version"],
+        serde_json::json!({"major": 1, "minor": 0, "patch": 0})
+    );
+    assert!(
+        retrieval[0].find("\"display_evidence_pack\"").unwrap()
+            < retrieval[0].find("\"identity\"").unwrap()
+    );
 }
