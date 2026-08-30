@@ -22,6 +22,7 @@ use verbatim_core::api::{
 use verbatim_core::collection::CollectionRecord;
 use verbatim_core::config::{self, Config, DaemonConfig};
 use verbatim_core::graphrag::ReportArtifactManifest;
+use verbatim_core::CollectionListResponse;
 
 #[cfg(test)]
 use crate::auth::HTTP_ERROR_TRUNCATION_MARKER;
@@ -410,11 +411,12 @@ impl DaemonClient for HttpDaemonClient {
 
     fn list_collections(&self) -> CliResult<Vec<CollectionRecord>> {
         let route = CollectionApiEndpoint::ListCollections;
-        self.request_json::<Vec<CollectionRecord>, ()>(
+        let response = self.request_json::<CollectionListResponse, ()>(
             collection_method(route),
             route.path_template(),
             None,
-        )
+        )?;
+        Ok(response.collections)
     }
 
     fn get_collection(&self, name: &str) -> CliResult<CollectionResponse> {

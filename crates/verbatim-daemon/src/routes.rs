@@ -214,13 +214,14 @@ pub(crate) fn build_router(state: SharedState) -> Router {
 mod tests {
     use super::*;
     use crate::tests::retrieve_test_config;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::extract::connect_info::ConnectInfo;
     use axum::http::{Method, Request, StatusCode};
     use std::collections::BTreeSet;
     use std::net::SocketAddr;
     use tower::ServiceExt;
     use verbatim_core::ingest::IngestPipeline;
+    use verbatim_core::CollectionListResponse;
 
     struct TestDir(std::path::PathBuf);
 
@@ -405,6 +406,30 @@ mod tests {
                 "inventory path template {template} (probe {path}) must be registered on the constructed Router; got {status}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn collection_list_route_publishes_bound_response() {
+        let (_test_dir, state) = test_state("collection-list-result-identity");
+        let app = build_router(state);
+        let mut request = Request::builder()
+            .method(Method::GET)
+            .uri(PATH_COLLECTIONS)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),
+        ));
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(bytes.starts_with(b"{\"collections\":[],\"identity\":"));
+        let response: CollectionListResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(response.collections.is_empty());
+        assert_eq!(response.identity.kind.as_str(), "collection_list_result");
+        assert_eq!(response.identity.schema_version.to_string(), "1.0.0");
+        assert_eq!(response.identity.artifact_id, "collections");
     }
 
     #[test]

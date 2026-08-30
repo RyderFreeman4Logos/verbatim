@@ -3,6 +3,9 @@ pub mod auth;
 pub use auth::{AuthMode, DaemonAuthConfig, Principal, Role};
 pub mod adk_integration;
 pub mod api;
+#[path = "api_collection_list_result_identity.rs"]
+pub mod collection_list_result_identity;
+pub use collection_list_result_identity::CollectionListResponse;
 #[path = "api_ask_retrieval_debug_identity.rs"]
 mod api_ask_retrieval_debug_identity;
 pub mod cache_identity;
