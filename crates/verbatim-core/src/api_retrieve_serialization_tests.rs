@@ -7,6 +7,8 @@ fn retrieve_result_omits_structured_locator_until_requested() {
         source_id: None,
         collection_filter: None,
         embedding_profile_id: "default".into(),
+        query_plan: None,
+        evidence_pack: None,
         generation: None,
         limit: 12,
         page_size: 1,

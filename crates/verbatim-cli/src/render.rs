@@ -3543,6 +3543,8 @@ mod tests {
             source_id: Some("src-internal-123".into()),
             collection_filter: None,
             embedding_profile_id: "default".into(),
+            query_plan: None,
+            evidence_pack: None,
             generation: None,
             limit: 10,
             page_size: 10,

@@ -8,32 +8,132 @@ use super::{
 };
 use crate::wire_schemas::{
     ContextPackEnvelope, ContextPackFields, EvidencePackEnvelope, EvidencePackFields,
-    QueryPlanEnvelope, QueryPlanFields,
+    QueryPlanCollectionFilter, QueryPlanControls, QueryPlanEnvelope, QueryPlanFields,
 };
 
 const LIVE_RETRIEVE_QUERY_PLAN_ID: &str = "live-retrieve";
 const LIVE_RETRIEVE_EVIDENCE_PACK_ID: &str = "live-retrieve-evidence";
 const LIVE_ASK_CONTEXT_PACK_ID: &str = "live-ask-context";
 
+fn normalized_values(values: &[String]) -> Result<Vec<String>> {
+    if values.iter().any(|value| value.trim().is_empty()) {
+        anyhow::bail!("query plan collection controls must not contain blank values");
+    }
+    let mut normalized = values.to_vec();
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn query_plan_controls(
+    source_id: Option<&str>,
+    collection_filter: &CollectionFilterRequest,
+    mut controls: QueryPlanControls,
+) -> Result<QueryPlanControls> {
+    if source_id.is_some_and(|value| value.trim().is_empty()) {
+        anyhow::bail!("query plan source_id must not be blank");
+    }
+    let collection_filter = QueryPlanCollectionFilter {
+        collection_ids: normalized_values(&collection_filter.collection_ids)?,
+        names: normalized_values(&collection_filter.names)?,
+        require_fresh: collection_filter.require_fresh,
+    };
+    controls.source_id = source_id.map(str::to_string);
+    controls.collection_filter = (!collection_filter.is_empty()).then_some(collection_filter);
+    Ok(controls)
+}
+
+fn query_plan_from_controls(
+    question: &str,
+    embedding_profile_id: Option<&str>,
+    controls: QueryPlanControls,
+) -> Result<QueryPlanEnvelope> {
+    QueryPlanEnvelope::new_with_controls(
+        QueryPlanFields {
+            artifact_id: LIVE_RETRIEVE_QUERY_PLAN_ID.into(),
+            query_text: question.to_string(),
+            steps: Vec::new(),
+            generation: None,
+            profile_ref: embedding_profile_id.map(str::to_string),
+        },
+        controls,
+    )
+}
+
 pub(super) fn query_plan_from_question(
     question: &str,
     embedding_profile_id: Option<&str>,
 ) -> Result<QueryPlanEnvelope> {
-    QueryPlanEnvelope::new(QueryPlanFields {
-        artifact_id: LIVE_RETRIEVE_QUERY_PLAN_ID.into(),
-        query_text: question.to_string(),
-        steps: Vec::new(),
-        generation: None,
-        profile_ref: embedding_profile_id.map(str::to_string),
-    })
+    query_plan_from_controls(question, embedding_profile_id, QueryPlanControls::default())
+}
+
+pub(super) fn query_plan_from_retrieve_request(
+    request: &RetrieveRequest,
+) -> Result<QueryPlanEnvelope> {
+    query_plan_from_retrieve_request_with_profile(request, request.embedding_profile_id.as_deref())
+}
+
+pub fn query_plan_from_retrieve_request_with_profile(
+    request: &RetrieveRequest,
+    embedding_profile_id: Option<&str>,
+) -> Result<QueryPlanEnvelope> {
+    query_plan_from_controls(
+        &request.question,
+        embedding_profile_id,
+        query_plan_controls(
+            request.source_id.as_deref(),
+            &request.collection_filter,
+            QueryPlanControls {
+                limit: request.limit,
+                page_size: request.page_size,
+                page: request.page,
+                fast: request.fast,
+                rerank: request.rerank,
+                dense_top_k: request.dense_top_k,
+                bm25_top_k: request.bm25_top_k,
+                rerank_top_n: request.rerank_top_n,
+                bypass_cache: request.bypass_cache,
+                include_debug: request.include_debug,
+                include_debug_packs: request.include_debug_packs,
+                include_locator: request.include_locator,
+                passage: request.passage,
+                ..QueryPlanControls::default()
+            },
+        )?,
+    )
+}
+
+pub(super) fn query_plan_from_ask_request(request: &AskRequest) -> Result<QueryPlanEnvelope> {
+    query_plan_from_ask_request_with_profile(request, request.embedding_profile_id.as_deref())
+}
+
+pub fn query_plan_from_ask_request_with_profile(
+    request: &AskRequest,
+    embedding_profile_id: Option<&str>,
+) -> Result<QueryPlanEnvelope> {
+    query_plan_from_controls(
+        &request.question,
+        embedding_profile_id,
+        query_plan_controls(
+            request.source_id.as_deref(),
+            &request.collection_filter,
+            QueryPlanControls {
+                limit: request.limit,
+                page_size: request.page_size,
+                page: request.page,
+                ..QueryPlanControls::default()
+            },
+        )?,
+    )
 }
 
 pub(super) fn bind_query_plan_to_question(
     question: &str,
     embedding_profile_id: Option<&str>,
+    controls: QueryPlanControls,
     plan: Option<QueryPlanEnvelope>,
 ) -> Result<QueryPlanEnvelope> {
-    let expected = query_plan_from_question(question, embedding_profile_id)?;
+    let expected = query_plan_from_controls(question, embedding_profile_id, controls)?;
     if let Some(plan) = plan {
         plan.validate()?;
         if plan.header.identity.content_hash != expected.header.identity.content_hash {
@@ -51,11 +151,12 @@ pub(super) fn bind_evidence_pack_to_retrieve(
     results: &[RetrieveResultResponse],
     embedding_profile_id: &str,
     generation: Option<&str>,
+    plan: &QueryPlanEnvelope,
     pack: &EvidencePackEnvelope,
 ) -> Result<()> {
     pack.validate()?;
     let Some(expected) =
-        evidence_pack_from_retrieve(query, results, embedding_profile_id, generation)?
+        evidence_pack_from_retrieve(query, results, embedding_profile_id, generation, plan)?
     else {
         anyhow::bail!("evidence pack must match returned evidence");
     };
@@ -80,11 +181,19 @@ pub(super) fn context_pack_from_ask_context(
     let Some(context) = context else {
         return Ok(None);
     };
+    let plan = context
+        .query_plan
+        .clone()
+        .unwrap_or(query_plan_from_question(
+            &context.query,
+            Some(&context.embedding_profile_id),
+        )?);
     let Some(evidence_pack) = evidence_pack_from_retrieve(
         &context.query,
         &context.results,
         &context.embedding_profile_id,
         context.generation.as_deref(),
+        &plan,
     )?
     else {
         return Ok(None);
@@ -152,10 +261,11 @@ fn require_non_blank_result_evidence_ids(results: &[RetrieveResultResponse]) -> 
 }
 
 pub(super) fn evidence_pack_from_retrieve(
-    query: &str,
+    _query: &str,
     results: &[RetrieveResultResponse],
     embedding_profile_id: &str,
     generation: Option<&str>,
+    plan: &QueryPlanEnvelope,
 ) -> Result<Option<EvidencePackEnvelope>> {
     require_non_blank_result_evidence_ids(results)?;
     if results.is_empty() {
@@ -165,7 +275,6 @@ pub(super) fn evidence_pack_from_retrieve(
         .iter()
         .map(|result| result.evidence_id.clone())
         .collect();
-    let plan = query_plan_from_question(query, Some(embedding_profile_id))?;
     EvidencePackEnvelope::new(EvidencePackFields {
         artifact_id: LIVE_RETRIEVE_EVIDENCE_PACK_ID.into(),
         evidence_unit_ids,
@@ -221,8 +330,7 @@ impl Serialize for RetrieveRequest {
         S: serde::Serializer,
     {
         let query_plan =
-            query_plan_from_question(&self.question, self.embedding_profile_id.as_deref())
-                .map_err(serde::ser::Error::custom)?;
+            query_plan_from_retrieve_request(self).map_err(serde::ser::Error::custom)?;
         RetrieveRequestWire {
             question: self.question.clone(),
             query_plan: Some(query_plan),
@@ -256,6 +364,27 @@ impl<'de> Deserialize<'de> for RetrieveRequest {
         bind_query_plan_to_question(
             &wire.question,
             wire.embedding_profile_id.as_deref(),
+            query_plan_controls(
+                wire.source_id.as_deref(),
+                &wire.collection_filter,
+                QueryPlanControls {
+                    limit: wire.limit,
+                    page_size: wire.page_size,
+                    page: wire.page,
+                    fast: wire.fast,
+                    rerank: wire.rerank,
+                    dense_top_k: wire.dense_top_k,
+                    bm25_top_k: wire.bm25_top_k,
+                    rerank_top_n: wire.rerank_top_n,
+                    bypass_cache: wire.bypass_cache,
+                    include_debug: wire.include_debug,
+                    include_debug_packs: wire.include_debug_packs,
+                    include_locator: wire.include_locator,
+                    passage: wire.passage,
+                    ..QueryPlanControls::default()
+                },
+            )
+            .map_err(serde::de::Error::custom)?,
             wire.query_plan,
         )
         .map_err(serde::de::Error::custom)?;
@@ -309,9 +438,7 @@ impl Serialize for AskRequest {
     where
         S: serde::Serializer,
     {
-        let query_plan =
-            query_plan_from_question(&self.question, self.embedding_profile_id.as_deref())
-                .map_err(serde::ser::Error::custom)?;
+        let query_plan = query_plan_from_ask_request(self).map_err(serde::ser::Error::custom)?;
         AskRequestWire {
             question: self.question.clone(),
             query_plan: Some(query_plan),
@@ -337,6 +464,17 @@ impl<'de> Deserialize<'de> for AskRequest {
         bind_query_plan_to_question(
             &wire.question,
             wire.embedding_profile_id.as_deref(),
+            query_plan_controls(
+                wire.source_id.as_deref(),
+                &wire.collection_filter,
+                QueryPlanControls {
+                    limit: wire.limit,
+                    page_size: wire.page_size,
+                    page: wire.page,
+                    ..QueryPlanControls::default()
+                },
+            )
+            .map_err(serde::de::Error::custom)?,
             wire.query_plan,
         )
         .map_err(serde::de::Error::custom)?;
@@ -402,6 +540,8 @@ impl RetrieveResponse {
             source_id: None,
             collection_filter: None,
             embedding_profile_id: embedding_profile_id.clone(),
+            query_plan: None,
+            evidence_pack: None,
             generation,
             limit: returned_results,
             page_size: returned_results.max(1),

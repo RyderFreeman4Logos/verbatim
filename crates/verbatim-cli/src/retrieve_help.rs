@@ -35,3 +35,11 @@ Debugging:
   JSON output retains structured locator/provenance fields and full evidence
   identifiers for evidence lookups, but retrieval debug diagnostics stay on stderr.
 "#;
+
+pub(super) fn rerank_override(rerank: bool, no_rerank: bool) -> Option<bool> {
+    match (rerank, no_rerank) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}

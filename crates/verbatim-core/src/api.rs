@@ -535,9 +535,13 @@ mod response_taxonomy;
 pub use response_taxonomy::{OutputTextPlane, ResponseTextTaxonomy, TextFieldTaxonomy};
 #[path = "api_response_serialization.rs"]
 mod response_serialization;
+pub use response_serialization::RetrieveResponse;
 #[path = "api_retrieve_envelope.rs"]
 mod retrieve_envelope;
-pub use retrieve_envelope::generated_ask_stream_context_pack;
+pub use retrieve_envelope::{
+    generated_ask_stream_context_pack, query_plan_from_ask_request_with_profile,
+    query_plan_from_retrieve_request_with_profile,
+};
 #[path = "api_ask_run_identity.rs"]
 mod ask_run_identity;
 #[path = "api_ask_token_identity.rs"]
@@ -630,28 +634,6 @@ pub struct RetrieveRequest {
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RetrieveResponse {
-    pub task_id: String,
-    pub query: String,
-    pub text_taxonomy: ResponseTextTaxonomy,
-    pub source_id: Option<String>,
-    pub collection_filter: Option<CollectionFilterResponse>,
-    pub embedding_profile_id: String,
-    pub generation: Option<String>,
-    pub limit: usize,
-    pub page_size: usize,
-    pub page: usize,
-    pub total_results: usize,
-    pub returned_results: usize,
-    pub source_bounded: bool,
-    pub controls: RetrieveControlsResponse,
-    pub audit_receipt: AuditReceipt,
-    pub timings: Vec<RetrieveTimingResponse>,
-    pub results: Vec<RetrieveResultResponse>,
-    pub debug: Option<RetrievalDebug>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1213,6 +1195,9 @@ mod api_ingest_result_identity;
 #[cfg(test)]
 #[path = "api_locator_tests.rs"]
 mod api_locator_tests;
+#[cfg(test)]
+#[path = "api_query_plan_controls_tests.rs"]
+mod api_query_plan_controls_tests;
 #[path = "api_reindex_result_identity.rs"]
 mod api_reindex_result_identity;
 #[cfg(test)]

@@ -140,7 +140,10 @@ use report_artifact_api::get_report_artifact;
 use retrieval_scope::{
     apply_default_collection_scope, collection_filter_names, collection_freshness_remediation_error,
 };
-use source_bounded_retrieval::filter_generated_retrieval_evidence;
+use source_bounded_retrieval::{
+    ask_query_plan, executed_retrieve_for_generated_ask, filter_generated_retrieval_evidence,
+    retrieval_event, retrieve_debug_options, retrieve_query_plan,
+};
 use source_relocation_api::relocate_source;
 
 // ---------------------------------------------------------------------------
@@ -4672,6 +4675,9 @@ async fn execute_retrieve_task_inner(
     let execution_started = Instant::now();
     ensure_task_started(&state, task_id).await?;
     let queue_wait_ms = task_queue_wait_ms(&state, task_id).await?;
+    let (embedding_profile_id, query_plan) =
+        retrieve_query_plan(&req, &controls.config.embedding.profile_id)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let question = req.question;
     let source_id = req.source_id.map(SourceId);
     let collection_filter = apply_default_collection_scope(
@@ -4679,11 +4685,6 @@ async fn execute_retrieve_task_inner(
         source_id.as_ref(),
         req.collection_filter,
     );
-    let embedding_profile_id = parse_embedding_profile_id(
-        req.embedding_profile_id.as_deref(),
-        &controls.config.embedding.profile_id,
-    )
-    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let freshness_profile_id = controls
         .config
         .embedding
@@ -4834,6 +4835,7 @@ async fn execute_retrieve_task_inner(
         collection_filter: query_scope.collection_filter,
         collection_provenance: query_scope.collection_provenance,
         embedding_profile_id,
+        query_plan: Some(query_plan),
         controls,
         results,
         debug,
@@ -4909,6 +4911,8 @@ async fn execute_ask_task_inner_with_config(
     let execution_started = Instant::now();
     ensure_task_started(&state, task_id).await?;
     let queue_wait_ms = task_queue_wait_ms(&state, task_id).await?;
+    let (embedding_profile_id, query_plan) = ask_query_plan(&req, &config.embedding.profile_id)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let question = req.question;
     let source_id = req.source_id.map(SourceId);
     let collection_filter = apply_default_collection_scope(
@@ -4916,11 +4920,6 @@ async fn execute_ask_task_inner_with_config(
         source_id.as_ref(),
         req.collection_filter,
     );
-    let embedding_profile_id = parse_embedding_profile_id(
-        req.embedding_profile_id.as_deref(),
-        &config.embedding.profile_id,
-    )
-    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let show_retrieval = req.show_retrieval;
     let freshness_profile_id = config
         .embedding
@@ -5118,14 +5117,13 @@ async fn execute_ask_task_inner_with_config(
         citations,
         verified: gen_result.verified,
         retrieval: retrieval_for_response,
-        context: Some(
-            source_bounded_retrieval::executed_retrieve_for_generated_ask(
-                &question,
-                embedding_profile_id.as_str(),
-                generation,
-                &results,
-            ),
-        ),
+        context: Some(executed_retrieve_for_generated_ask(
+            &question,
+            embedding_profile_id.as_str(),
+            generation,
+            &results,
+            Some(query_plan),
+        )),
         collection_filter: query_scope.collection_filter,
     };
     let response_formatting_ms = elapsed_ms(response_started);
@@ -5208,6 +5206,8 @@ async fn execute_ask_stream_task_inner(
     }
 
     ensure_task_started(&state, task_id).await?;
+    let (embedding_profile_id, query_plan) = ask_query_plan(&req, &config.embedding.profile_id)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let question = req.question;
     let source_id = req.source_id.map(SourceId);
     let collection_filter = apply_default_collection_scope(
@@ -5215,11 +5215,6 @@ async fn execute_ask_stream_task_inner(
         source_id.as_ref(),
         req.collection_filter,
     );
-    let embedding_profile_id = parse_embedding_profile_id(
-        req.embedding_profile_id.as_deref(),
-        &config.embedding.profile_id,
-    )
-    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let show_retrieval = req.show_retrieval;
     let freshness_profile_id = config
         .embedding
@@ -5408,11 +5403,12 @@ async fn execute_ask_stream_task_inner(
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     send_stream_event(&tx, sse_json_event("citation", &citation_event)).await?;
 
-    let context = source_bounded_retrieval::executed_retrieve_for_generated_ask(
+    let context = executed_retrieve_for_generated_ask(
         &question,
         embedding_profile_id.as_str(),
         generation,
         &results,
+        Some(query_plan),
     );
     if let Some(pack) = generated_ask_stream_context_pack(Some(&context), None)
         .map_err(|error| err(StatusCode::INTERNAL_SERVER_ERROR, error))?
@@ -5420,8 +5416,7 @@ async fn execute_ask_stream_task_inner(
         send_stream_event(&tx, sse_json_event("context_pack", &pack)).await?;
     }
 
-    source_bounded_retrieval::retrieval_event(&tx, show_retrieval, retrieval_debug.as_ref())
-        .await?;
+    retrieval_event(&tx, show_retrieval, retrieval_debug.as_ref()).await?;
     if let Some(collection_filter) = &query_scope.collection_filter {
         send_stream_event(&tx, retrieval_scope::filter_event(collection_filter)?).await?;
     }
@@ -5563,34 +5558,6 @@ struct RetrievedContext {
     sources: HashMap<String, Source>,
 }
 
-fn retrieve_debug_display_scope(controls: &EffectiveRetrieveControls) -> RetrievalDisplayScope {
-    RetrievalDisplayScope::page(controls.limit, controls.page_size, controls.page)
-}
-
-fn empty_retrieval_display_scope() -> RetrievalDisplayScope {
-    RetrievalDisplayScope::Window { start: 0, len: 0 }
-}
-
-fn retrieve_debug_options(controls: &EffectiveRetrieveControls) -> RetrievalDebugOptions {
-    if controls.passage {
-        let empty_scope = empty_retrieval_display_scope();
-        let canonical_budget = RetrievalCanonicalSelectionBudget::new(empty_scope, empty_scope);
-        return if controls.include_debug && controls.include_debug_packs {
-            RetrievalDebugOptions::full(canonical_budget)
-        } else {
-            RetrievalDebugOptions::compact(canonical_budget)
-        };
-    }
-
-    let canonical_budget =
-        RetrievalCanonicalSelectionBudget::scoped(retrieve_debug_display_scope(controls));
-    if controls.include_debug && controls.include_debug_packs {
-        RetrievalDebugOptions::full(canonical_budget)
-    } else {
-        RetrievalDebugOptions::compact(canonical_budget)
-    }
-}
-
 #[derive(Debug, Clone)]
 struct QueryScope {
     source_id: Option<SourceId>,
@@ -5606,6 +5573,7 @@ struct RetrieveResponseInput {
     collection_filter: Option<CollectionFilterResponse>,
     collection_provenance: HashMap<String, Vec<CollectionResultProvenance>>,
     embedding_profile_id: EmbeddingProfileId,
+    query_plan: Option<verbatim_core::wire_schemas::QueryPlanEnvelope>,
     controls: EffectiveRetrieveControls,
     results: Vec<RetrievalResult>,
     debug: RetrievalDebug,
@@ -7880,6 +7848,7 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
         collection_filter,
         collection_provenance,
         embedding_profile_id,
+        query_plan,
         controls,
         results,
         debug,
@@ -7918,6 +7887,7 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
     };
     let (controls_response, audit_receipt) =
         audit_receipt::snapshot(embedding_profile_id.as_str(), &controls, &results_page);
+    let query_plan = query_plan.context("retrieve response missing validated query plan")?;
 
     Ok(RetrieveResponse {
         task_id: task_id.0,
@@ -7941,6 +7911,8 @@ fn retrieve_response(store: &Store, input: RetrieveResponseInput) -> Result<Retr
         }],
         results: results_page,
         debug: controls.include_debug.then_some(debug),
+        query_plan: Some(query_plan),
+        evidence_pack: None,
     })
 }
 
@@ -9929,6 +9901,10 @@ mod tests {
     mod issue_332_explicit_move_route_tests;
     #[path = "issue_533_graphrag_retrieve_label_tests.rs"]
     mod issue_533_graphrag_retrieve_label_tests;
+    #[path = "query_plan_test_support.rs"]
+    mod query_plan_test_support;
+    #[path = "retrieve_response_pack_tests.rs"]
+    mod retrieve_response_pack_tests;
     #[path = "retrieve_sidecar_tests.rs"]
     mod retrieve_sidecar_tests;
     #[path = "source_bounded_output_tests.rs"]
@@ -13035,222 +13011,6 @@ mod tests {
     }
 
     include!("tests/ask_response_serialization_tests.rs");
-
-    #[test]
-    fn retrieve_response_pages_context_pack_without_full_locator_by_default() {
-        let results = vec![
-            test_retrieval_result(1, "chunk-1", "ev-1", EvidenceKind::Text),
-            test_retrieval_result(2, "chunk-2", "ev-2", EvidenceKind::Text),
-        ];
-        let mut debug = empty_retrieval_debug();
-        refresh_final_evidence_pack_debug(&mut debug, &results);
-
-        let response = persisted_retrieve_response(RetrieveResponseInput {
-            task_id: TaskId("task-1".into()),
-            query: "What is cited?".into(),
-            source_filter: Some(SourceId("src".into())),
-            collection_filter: None,
-            collection_provenance: HashMap::new(),
-            embedding_profile_id: EmbeddingProfileId::default_profile(),
-            controls: EffectiveRetrieveControls {
-                limit: 2,
-                page_size: 1,
-                page: 2,
-                include_debug: false,
-                include_debug_packs: false,
-                include_locator: false,
-                passage: false,
-                bypass_cache: false,
-                fast: false,
-                config: Config::default(),
-                retrieval_config: RetrievalConfig::default(),
-                rerank_config: RerankConfig::default(),
-            },
-            results,
-            debug,
-            sources: HashMap::new(),
-            retrieval_ms: 7,
-        });
-
-        assert_eq!(response.total_results, 2);
-        assert_eq!(response.returned_results, 1);
-        assert_eq!(response.results[0].index, 1);
-        assert_eq!(response.results[0].evidence_id, "ev-2");
-        assert!(response.results[0].structured_locator.is_none());
-        assert!(response.results[0].provenance.is_none());
-        assert!(response.debug.is_none());
-    }
-
-    #[test]
-    fn retrieve_response_no_passage_uses_canonical_display_support_pack() {
-        let results = vec![test_canonical_retrieval_result(
-            1,
-            "chunk-2tim4",
-            &[("ev-1", 1), ("ev-8", 8), ("ev-9", 9)],
-        )];
-        let mut debug = empty_retrieval_debug();
-        refresh_final_evidence_pack_debug(&mut debug, &results);
-        debug.display_evidence_pack = vec![RetrievalEvidencePackEntry {
-            label: "E1".into(),
-            ..debug.final_evidence_pack[1].clone()
-        }];
-        debug.display_evidence_count = debug.display_evidence_pack.len();
-
-        let response = persisted_retrieve_response(RetrieveResponseInput {
-            task_id: TaskId("task-1".into()),
-            query: "crown of righteousness".into(),
-            source_filter: Some(SourceId("src".into())),
-            collection_filter: None,
-            collection_provenance: HashMap::new(),
-            embedding_profile_id: EmbeddingProfileId::default_profile(),
-            controls: EffectiveRetrieveControls {
-                limit: 1,
-                page_size: 1,
-                page: 1,
-                include_debug: false,
-                include_debug_packs: false,
-                include_locator: true,
-                passage: false,
-                bypass_cache: false,
-                fast: false,
-                config: Config::default(),
-                retrieval_config: RetrievalConfig::default(),
-                rerank_config: RerankConfig::default(),
-            },
-            results,
-            debug,
-            sources: HashMap::new(),
-            retrieval_ms: 7,
-        });
-
-        assert_eq!(response.total_results, 1);
-        assert_eq!(response.returned_results, 1);
-        let result = &response.results[0];
-        assert_eq!(result.evidence_id, "ev-8");
-        assert_eq!(result.chunk_id, "chunk-2tim4");
-        assert_eq!(result.score, 1.0);
-        assert_eq!(result.locator, "2 Timothy 4:8");
-        assert_eq!(result.snippet, "verse 8 text.");
-        assert!(matches!(
-            result.structured_locator,
-            Some(SourceLocator::Canonical { .. })
-        ));
-    }
-
-    #[test]
-    fn retrieve_response_passage_mode_pages_by_canonical_chunk() {
-        let results = vec![test_canonical_retrieval_result(
-            1,
-            "chunk-2tim4",
-            &[("ev-1", 1), ("ev-2", 2), ("ev-3", 3)],
-        )];
-        let mut debug = empty_retrieval_debug();
-        refresh_final_evidence_pack_debug(&mut debug, &results);
-        debug.display_evidence_pack = vec![RetrievalEvidencePackEntry {
-            label: "E1".into(),
-            ..debug.final_evidence_pack[1].clone()
-        }];
-        debug.display_evidence_count = debug.display_evidence_pack.len();
-
-        let response = persisted_retrieve_response(RetrieveResponseInput {
-            task_id: TaskId("task-1".into()),
-            query: "crown of righteousness".into(),
-            source_filter: Some(SourceId("src".into())),
-            collection_filter: None,
-            collection_provenance: HashMap::new(),
-            embedding_profile_id: EmbeddingProfileId::default_profile(),
-            controls: EffectiveRetrieveControls {
-                limit: 1,
-                page_size: 1,
-                page: 1,
-                include_debug: false,
-                include_debug_packs: false,
-                include_locator: true,
-                passage: true,
-                bypass_cache: false,
-                fast: false,
-                config: Config::default(),
-                retrieval_config: RetrievalConfig::default(),
-                rerank_config: RerankConfig::default(),
-            },
-            results,
-            debug,
-            sources: HashMap::new(),
-            retrieval_ms: 7,
-        });
-
-        assert_eq!(response.total_results, 1);
-        assert_eq!(response.returned_results, 1);
-        assert_eq!(response.results.len(), 1);
-        let passage = &response.results[0];
-        assert_eq!(passage.index, 0);
-        assert_eq!(passage.rank, 1);
-        assert_eq!(passage.locator, "2 Timothy 4:1-3");
-        assert_eq!(passage.snippet, "verse 1 text. verse 2 text. verse 3 text.");
-        assert!(matches!(
-            passage.structured_locator,
-            Some(SourceLocator::Canonical { .. })
-        ));
-    }
-
-    #[test]
-    fn retrieve_response_passage_mode_uses_ranked_chunk_membership_without_debug_pack() {
-        let results = vec![
-            test_canonical_retrieval_result(
-                1,
-                "chunk-2tim4",
-                &[("ev-1", 1), ("ev-2", 2), ("ev-3", 3)],
-            ),
-            test_canonical_retrieval_result(
-                2,
-                "chunk-ps23",
-                &[("ev-ps23-1", 1), ("ev-ps23-2", 2), ("ev-ps23-3", 3)],
-            ),
-        ];
-        let mut debug = empty_retrieval_debug();
-        debug.evidence_pack_mode = RetrievalDebugEvidencePackMode::Compact;
-        debug.final_evidence_pack.clear();
-        debug.display_evidence_pack.clear();
-
-        let response = persisted_retrieve_response(RetrieveResponseInput {
-            task_id: TaskId("task-1".into()),
-            query: "crown of righteousness".into(),
-            source_filter: Some(SourceId("src".into())),
-            collection_filter: None,
-            collection_provenance: HashMap::new(),
-            embedding_profile_id: EmbeddingProfileId::default_profile(),
-            controls: EffectiveRetrieveControls {
-                limit: 1,
-                page_size: 1,
-                page: 1,
-                include_debug: false,
-                include_debug_packs: false,
-                include_locator: true,
-                passage: true,
-                bypass_cache: false,
-                fast: false,
-                config: Config::default(),
-                retrieval_config: RetrievalConfig::default(),
-                rerank_config: RerankConfig::default(),
-            },
-            results,
-            debug,
-            sources: HashMap::new(),
-            retrieval_ms: 7,
-        });
-
-        assert_eq!(response.total_results, 2);
-        assert_eq!(response.returned_results, 1);
-        let passage = &response.results[0];
-        assert_eq!(passage.evidence_id, "ev-1");
-        assert_eq!(passage.chunk_id, "chunk-2tim4");
-        assert_eq!(passage.locator, "2 Timothy 4:1-3");
-        assert_eq!(passage.snippet, "verse 1 text. verse 2 text. verse 3 text.");
-        assert!(matches!(
-            passage.structured_locator,
-            Some(SourceLocator::Canonical { .. })
-        ));
-    }
 
     #[test]
     fn retrieve_debug_options_passage_default_skips_full_pack_and_support_selection() {
