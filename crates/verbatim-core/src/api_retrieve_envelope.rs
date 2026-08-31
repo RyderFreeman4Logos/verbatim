@@ -60,6 +60,20 @@ fn query_plan_from_controls(
     )
 }
 
+pub fn query_plan_from_effective_controls_with_profile(
+    question: &str,
+    source_id: Option<&str>,
+    collection_filter: &CollectionFilterRequest,
+    embedding_profile_id: Option<&str>,
+    controls: QueryPlanControls,
+) -> Result<QueryPlanEnvelope> {
+    query_plan_from_controls(
+        question,
+        embedding_profile_id,
+        query_plan_controls(source_id, collection_filter, controls)?,
+    )
+}
+
 pub(super) fn query_plan_from_question(
     question: &str,
     embedding_profile_id: Option<&str>,

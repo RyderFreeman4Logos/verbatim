@@ -4675,16 +4675,20 @@ async fn execute_retrieve_task_inner(
     let execution_started = Instant::now();
     ensure_task_started(&state, task_id).await?;
     let queue_wait_ms = task_queue_wait_ms(&state, task_id).await?;
-    let (embedding_profile_id, query_plan) =
-        retrieve_query_plan(&req, &controls.config.embedding.profile_id)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let question = req.question;
-    let source_id = req.source_id.map(SourceId);
+    let question = req.question.clone();
+    let source_id = req.source_id.clone().map(SourceId);
     let collection_filter = apply_default_collection_scope(
         &controls.config.retrieval,
         source_id.as_ref(),
-        req.collection_filter,
+        req.collection_filter.clone(),
     );
+    let (embedding_profile_id, query_plan) = retrieve_query_plan(
+        &req,
+        &controls.config.embedding.profile_id,
+        &collection_filter,
+        &controls,
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let freshness_profile_id = controls
         .config
         .embedding
@@ -4911,16 +4915,22 @@ async fn execute_ask_task_inner_with_config(
     let execution_started = Instant::now();
     ensure_task_started(&state, task_id).await?;
     let queue_wait_ms = task_queue_wait_ms(&state, task_id).await?;
-    let (embedding_profile_id, query_plan) = ask_query_plan(&req, &config.embedding.profile_id)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let question = req.question;
-    let source_id = req.source_id.map(SourceId);
+    let question = req.question.clone();
+    let source_id = req.source_id.clone().map(SourceId);
     let collection_filter = apply_default_collection_scope(
         &config.retrieval,
         source_id.as_ref(),
-        req.collection_filter,
+        req.collection_filter.clone(),
     );
     let show_retrieval = req.show_retrieval;
+    let (embedding_profile_id, query_plan) = ask_query_plan(
+        &req,
+        &config.embedding.profile_id,
+        &collection_filter,
+        &config,
+        show_retrieval,
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let freshness_profile_id = config
         .embedding
         .enabled
@@ -5206,16 +5216,22 @@ async fn execute_ask_stream_task_inner(
     }
 
     ensure_task_started(&state, task_id).await?;
-    let (embedding_profile_id, query_plan) = ask_query_plan(&req, &config.embedding.profile_id)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let question = req.question;
-    let source_id = req.source_id.map(SourceId);
+    let question = req.question.clone();
+    let source_id = req.source_id.clone().map(SourceId);
     let collection_filter = apply_default_collection_scope(
         &config.retrieval,
         source_id.as_ref(),
-        req.collection_filter,
+        req.collection_filter.clone(),
     );
     let show_retrieval = req.show_retrieval;
+    let (embedding_profile_id, query_plan) = ask_query_plan(
+        &req,
+        &config.embedding.profile_id,
+        &collection_filter,
+        &config,
+        show_retrieval,
+    )
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let freshness_profile_id = config
         .embedding
         .enabled

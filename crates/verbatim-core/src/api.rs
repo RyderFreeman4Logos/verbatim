@@ -540,7 +540,7 @@ pub use response_serialization::RetrieveResponse;
 mod retrieve_envelope;
 pub use retrieve_envelope::{
     generated_ask_stream_context_pack, query_plan_from_ask_request_with_profile,
-    query_plan_from_retrieve_request_with_profile,
+    query_plan_from_effective_controls_with_profile, query_plan_from_retrieve_request_with_profile,
 };
 #[path = "api_ask_run_identity.rs"]
 mod ask_run_identity;

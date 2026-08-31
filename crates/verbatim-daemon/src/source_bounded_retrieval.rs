@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use axum::{http::StatusCode, response::sse::Event, Json};
 use verbatim_core::api::{
-    AskRequest, AskRetrievalDebugEvent, ErrorResponse, RetrieveRequest, RetrieveResponse,
+    AskRequest, AskRetrievalDebugEvent, CollectionFilterRequest, ErrorResponse, RetrieveRequest,
+    RetrieveResponse,
 };
 use verbatim_core::retrieve::{
     refresh_evidence_pack_debug, RetrievalCanonicalSelectionBudget, RetrievalDebugOptions,
@@ -13,8 +14,9 @@ use verbatim_core::store::Store;
 use verbatim_core::types::{
     ChunkId, EmbeddingProfileId, EvidenceKind, RetrievalDebug, RetrievalResult,
 };
+use verbatim_core::wire_schemas::QueryPlanControls;
 
-use super::EffectiveRetrieveControls;
+use super::{Config, EffectiveRetrieveControls};
 
 fn retrieve_debug_display_scope(controls: &EffectiveRetrieveControls) -> RetrievalDisplayScope {
     RetrievalDisplayScope::page(controls.limit, controls.page_size, controls.page)
@@ -49,6 +51,8 @@ pub(super) fn retrieve_debug_options(
 pub(super) fn retrieve_query_plan(
     request: &RetrieveRequest,
     default_profile_id: &EmbeddingProfileId,
+    collection_filter: &CollectionFilterRequest,
+    controls: &EffectiveRetrieveControls,
 ) -> Result<(
     EmbeddingProfileId,
     verbatim_core::wire_schemas::QueryPlanEnvelope,
@@ -57,9 +61,27 @@ pub(super) fn retrieve_query_plan(
         request.embedding_profile_id.as_deref(),
         default_profile_id,
     )?;
-    let plan = verbatim_core::api::query_plan_from_retrieve_request_with_profile(
-        request,
+    let plan = verbatim_core::api::query_plan_from_effective_controls_with_profile(
+        &request.question,
+        request.source_id.as_deref(),
+        collection_filter,
         Some(profile.as_str()),
+        QueryPlanControls {
+            limit: Some(controls.limit),
+            page_size: Some(controls.page_size),
+            page: Some(controls.page),
+            fast: controls.fast,
+            rerank: Some(controls.rerank_config.enabled),
+            dense_top_k: Some(controls.retrieval_config.dense_top_k),
+            bm25_top_k: Some(controls.retrieval_config.bm25_top_k),
+            rerank_top_n: Some(controls.rerank_config.top_n),
+            bypass_cache: controls.bypass_cache,
+            include_debug: controls.include_debug,
+            include_debug_packs: controls.include_debug_packs,
+            include_locator: controls.include_locator,
+            passage: controls.passage,
+            ..QueryPlanControls::default()
+        },
     )?;
     Ok((profile, plan))
 }
@@ -67,6 +89,9 @@ pub(super) fn retrieve_query_plan(
 pub(super) fn ask_query_plan(
     request: &AskRequest,
     default_profile_id: &EmbeddingProfileId,
+    collection_filter: &CollectionFilterRequest,
+    config: &Config,
+    show_retrieval: bool,
 ) -> Result<(
     EmbeddingProfileId,
     verbatim_core::wire_schemas::QueryPlanEnvelope,
@@ -75,9 +100,20 @@ pub(super) fn ask_query_plan(
         request.embedding_profile_id.as_deref(),
         default_profile_id,
     )?;
-    let plan = verbatim_core::api::query_plan_from_ask_request_with_profile(
-        request,
+    let plan = verbatim_core::api::query_plan_from_effective_controls_with_profile(
+        &request.question,
+        request.source_id.as_deref(),
+        collection_filter,
         Some(profile.as_str()),
+        QueryPlanControls {
+            rerank: Some(config.rerank.enabled),
+            dense_top_k: Some(config.retrieval.dense_top_k),
+            bm25_top_k: Some(config.retrieval.bm25_top_k),
+            rerank_top_n: Some(config.rerank.top_n),
+            include_debug: show_retrieval,
+            include_debug_packs: show_retrieval,
+            ..QueryPlanControls::default()
+        },
     )?;
     Ok((profile, plan))
 }
