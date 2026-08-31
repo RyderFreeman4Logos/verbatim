@@ -283,7 +283,8 @@ test_staged_index_mutation_fails_closed() {
 prepare_pre_push_fixture() {
     local repo="$1"
     local bin_dir="$2"
-    mkdir -p "$repo/scripts/hooks"
+    mkdir -p "$repo/scripts/hooks" "$repo/scripts/monolith" "$repo/scripts/tests"
+    cp "$root/scripts/tests/fixture-cleanup.sh" "$repo/scripts/tests/"
     cp "$checker" "$repo/scripts/monolith/check.sh"
     cp "$root/scripts/monolith/tokenizer_runner.py" \
         "$repo/scripts/monolith/tokenizer_runner.py"
@@ -370,6 +371,7 @@ prepare_aggregate_fixture() {
         "$repo/scripts/monolith/tokenizer_runner.py"
     cp "$root/scripts/monolith/tokenizer_contract.py" \
         "$repo/scripts/monolith/tokenizer_contract.py"
+    cp "$root/scripts/tests/fixture-cleanup.sh" "$repo/scripts/tests/"
     printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/scripts/tests/version-check-tests.sh"
     printf '#!/usr/bin/env bash\nexit 0\n' >"$repo/scripts/tests/monolith-check-tests.sh"
     cat >"$bin_dir/cargo" <<'SH'

@@ -2,6 +2,8 @@
 set -euo pipefail
 shopt -s inherit_errexit
 root="$(git rev-parse --show-toplevel)"
+# shellcheck source=fixture-cleanup.sh
+source "$root/scripts/tests/fixture-cleanup.sh"
 checker="$root/scripts/monolith/check.sh"
 tokenizer_runner="$root/scripts/monolith/tokenizer_runner.py"
 pre_push_checker="$root/scripts/hooks/check-pre-push-version-bumps.sh"
@@ -15,7 +17,11 @@ readonly tokenizer_revision="c68d1f804a4c172846716b7be99e9378e16512b7"
 readonly checker_outer_timeout_seconds=15
 readonly expected_case_manifest_sha256="c42c3a9185d98945b19af7b04f082a5d3a55b76771a8ea1e010666df36c8a622"
 cleanup() {
-    rm -rf -- "$test_root"
+    local status=$?
+    if ! cleanup_fixture_root "$test_root" "$root"; then
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
 }
 trap cleanup EXIT
 die() {
