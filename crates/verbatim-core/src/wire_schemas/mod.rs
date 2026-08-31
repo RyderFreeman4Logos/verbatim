@@ -28,8 +28,9 @@ pub use derived::{
 pub use envelopes::{
     decode_context_pack_envelope_json, decode_evidence_pack_envelope_json,
     decode_query_plan_envelope_json, decode_workflow_envelope_json, ContextPackEnvelope,
-    ContextPackFields, EvidencePackEnvelope, EvidencePackFields, QueryPlanEnvelope,
-    QueryPlanFields, WorkflowEnvelope, WorkflowEnvelopeFields, WorkflowPhase,
+    ContextPackFields, EvidencePackEnvelope, EvidencePackFields, QueryPlanCollectionFilter,
+    QueryPlanControls, QueryPlanEnvelope, QueryPlanFields, WorkflowEnvelope,
+    WorkflowEnvelopeFields, WorkflowPhase,
 };
 pub use identity::{
     CanonicalIdentity, CanonicalIdentityFields, ContentHash, WireEnvelopeHeader,

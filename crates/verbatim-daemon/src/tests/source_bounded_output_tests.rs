@@ -697,6 +697,9 @@ fn retrieve_output_input(result: RetrievalResult, passage: bool) -> RetrieveResp
         collection_filter: None,
         collection_provenance: HashMap::new(),
         embedding_profile_id: EmbeddingProfileId::default_profile(),
+        query_plan: Some(super::query_plan_test_support::test_query_plan(
+            "What is cited?",
+        )),
         controls: EffectiveRetrieveControls {
             limit: 1,
             page_size: 1,

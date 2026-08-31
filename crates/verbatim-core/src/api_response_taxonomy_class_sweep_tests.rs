@@ -54,6 +54,11 @@ fn supplied_taxonomy_is_recomputed_for_all_response_shapes() {
         "ask with nested retrieve context",
         &ask,
         &[
+            "context.query_plan.header.identity.artifact_id",
+            "context.query_plan.header.identity.content_hash",
+            "context.query_plan.header.identity.kind",
+            "context.query_plan.header.profile_ref",
+            "context.query_plan.query_text",
             "context.evidence_pack.header.generation",
             "context_pack.header.generation",
         ],

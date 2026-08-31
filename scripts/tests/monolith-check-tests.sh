@@ -233,14 +233,16 @@ run_fmt_fixture() {
     (cd "$repo" && PATH="$bin_dir:$PATH" run_without_git_env just fmt)
 }
 run_pre_push() {
-    local repo="$1" bin_dir="$2" input="$3" version_log="$4" full_gate_log="$5" compat_bin
+    local repo="$1" bin_dir="$2" input="$3" version_log="$4" full_gate_log="$5"
+    local full_gate_receipt="${6:-}" compat_bin
     compat_bin="$repo/pre-push-compat-bin"
     mkdir -p "$compat_bin"
     cat >"$compat_bin/just" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "$#" -eq 2 ] && [ "$1" = pre-push-gate ] && [ "$2" = head ]; then
-    exec "${MONOLITH_LEGACY_JUST:?}" pre-commit head
+    printf '%s %s\n' "$1" "$2" >>"${FULL_GATE_LOG:?}"
+    exit 0
 fi
 exec "${MONOLITH_LEGACY_JUST:?}" "$@"
 SH
@@ -251,6 +253,7 @@ SH
             printf '%s\n' "$input"
         fi | PATH="$compat_bin:$repo/test-bin:$bin_dir:$PATH" BASE_REF=base \
             MONOLITH_LEGACY_JUST="$repo/test-bin/just" \
+            VERBATIM_FULL_GATE_RECEIPT="$full_gate_receipt" \
             VERSION_CHECK_LOG="$version_log" FULL_GATE_LOG="$full_gate_log" \
             run_without_git_env "$repo/scripts/hooks/check-pre-push-version-bumps.sh"
     )

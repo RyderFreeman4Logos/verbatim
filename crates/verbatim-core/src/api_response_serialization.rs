@@ -4,9 +4,34 @@ use super::{
     ask_run_identity, evidence_identity, generated_ask_identity, retrieval_run_identity,
     retrieve_envelope, AnswerKind, AskResponse, AuditReceipt, CitationResponse,
     CollectionFilterResponse, EvidenceResponse, ResponseTextTaxonomy, RetrievalDebug,
-    RetrieveControlsResponse, RetrieveResponse, RetrieveResultResponse, RetrieveTimingResponse,
+    RetrieveControlsResponse, RetrieveResultResponse, RetrieveTimingResponse,
 };
 use crate::wire_schemas::{CanonicalIdentity, ContextPackEnvelope, EvidencePackEnvelope};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrieveResponse {
+    pub task_id: String,
+    pub query: String,
+    pub text_taxonomy: ResponseTextTaxonomy,
+    pub source_id: Option<String>,
+    pub collection_filter: Option<CollectionFilterResponse>,
+    pub embedding_profile_id: String,
+    pub query_plan: Option<crate::wire_schemas::QueryPlanEnvelope>,
+    /// Validated evidence lineage retained across response wire decoding.
+    pub evidence_pack: Option<EvidencePackEnvelope>,
+    pub generation: Option<String>,
+    pub limit: usize,
+    pub page_size: usize,
+    pub page: usize,
+    pub total_results: usize,
+    pub returned_results: usize,
+    pub source_bounded: bool,
+    pub controls: RetrieveControlsResponse,
+    pub audit_receipt: AuditReceipt,
+    pub timings: Vec<RetrieveTimingResponse>,
+    pub results: Vec<RetrieveResultResponse>,
+    pub debug: Option<RetrievalDebug>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AskResponseWire {
@@ -150,6 +175,8 @@ struct RetrieveResponseWire {
     collection_filter: Option<CollectionFilterResponse>,
     embedding_profile_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    query_plan: Option<crate::wire_schemas::QueryPlanEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     generation: Option<String>,
     limit: usize,
     page_size: usize,
@@ -203,6 +230,36 @@ impl Serialize for RetrieveResponse {
             None,
         )
         .map_err(serde::ser::Error::custom)?;
+        let query_plan = match self.query_plan.clone() {
+            Some(plan) => plan,
+            None => retrieve_envelope::query_plan_from_question(
+                &self.query,
+                Some(&self.embedding_profile_id),
+            )
+            .map_err(serde::ser::Error::custom)?,
+        };
+        let evidence_pack = match self.evidence_pack.as_ref() {
+            Some(pack) => {
+                retrieve_envelope::bind_evidence_pack_to_retrieve(
+                    &self.query,
+                    &self.results,
+                    &self.embedding_profile_id,
+                    self.generation.as_deref(),
+                    &query_plan,
+                    pack,
+                )
+                .map_err(serde::ser::Error::custom)?;
+                Some(pack.clone())
+            }
+            None => retrieve_envelope::evidence_pack_from_retrieve(
+                &self.query,
+                &self.results,
+                &self.embedding_profile_id,
+                self.generation.as_deref(),
+                &query_plan,
+            )
+            .map_err(serde::ser::Error::custom)?,
+        };
         let wire = RetrieveResponseWire {
             task_id: self.task_id.clone(),
             query: self.query.clone(),
@@ -210,6 +267,7 @@ impl Serialize for RetrieveResponse {
             source_id: self.source_id.clone(),
             collection_filter: self.collection_filter.clone(),
             embedding_profile_id: self.embedding_profile_id.clone(),
+            query_plan: Some(query_plan.clone()),
             generation: self.generation.clone(),
             limit: self.limit,
             page_size: self.page_size,
@@ -222,13 +280,7 @@ impl Serialize for RetrieveResponse {
             timings: self.timings.clone(),
             results: self.results.clone(),
             debug: self.debug.clone(),
-            evidence_pack: retrieve_envelope::evidence_pack_from_retrieve(
-                &self.query,
-                &self.results,
-                &self.embedding_profile_id,
-                self.generation.as_deref(),
-            )
-            .map_err(serde::ser::Error::custom)?,
+            evidence_pack,
             identity: Some(identity),
         };
         let mut value = serde_json::to_value(wire).map_err(serde::ser::Error::custom)?;
@@ -255,11 +307,20 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
             wire.identity.as_ref(),
         )
         .map_err(serde::de::Error::custom)?;
+        let query_plan = match wire.query_plan.clone() {
+            Some(plan) => plan,
+            None => retrieve_envelope::query_plan_from_question(
+                &wire.query,
+                Some(&wire.embedding_profile_id),
+            )
+            .map_err(serde::de::Error::custom)?,
+        };
         retrieve_envelope::evidence_pack_from_retrieve(
             &wire.query,
             &wire.results,
             &wire.embedding_profile_id,
             wire.generation.as_deref(),
+            &query_plan,
         )
         .map_err(serde::de::Error::custom)?;
         if let Some(pack) = &wire.evidence_pack {
@@ -268,6 +329,7 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
                 &wire.results,
                 &wire.embedding_profile_id,
                 wire.generation.as_deref(),
+                &query_plan,
                 pack,
             )
             .map_err(serde::de::Error::custom)?;
@@ -281,6 +343,8 @@ impl<'de> Deserialize<'de> for RetrieveResponse {
             source_id: wire.source_id,
             collection_filter: wire.collection_filter,
             embedding_profile_id: wire.embedding_profile_id,
+            query_plan: Some(query_plan),
+            evidence_pack: wire.evidence_pack,
             generation: wire.generation,
             limit: wire.limit,
             page_size: wire.page_size,

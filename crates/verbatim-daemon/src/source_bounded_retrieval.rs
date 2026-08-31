@@ -2,12 +2,121 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use axum::{http::StatusCode, response::sse::Event, Json};
-use verbatim_core::api::{AskRetrievalDebugEvent, ErrorResponse, RetrieveResponse};
-use verbatim_core::retrieve::refresh_evidence_pack_debug;
+use verbatim_core::api::{
+    AskRequest, AskRetrievalDebugEvent, CollectionFilterRequest, ErrorResponse, RetrieveRequest,
+    RetrieveResponse,
+};
+use verbatim_core::retrieve::{
+    refresh_evidence_pack_debug, RetrievalCanonicalSelectionBudget, RetrievalDebugOptions,
+    RetrievalDisplayScope,
+};
 use verbatim_core::store::Store;
 use verbatim_core::types::{
     ChunkId, EmbeddingProfileId, EvidenceKind, RetrievalDebug, RetrievalResult,
 };
+use verbatim_core::wire_schemas::QueryPlanControls;
+
+use super::{Config, EffectiveRetrieveControls};
+
+fn retrieve_debug_display_scope(controls: &EffectiveRetrieveControls) -> RetrievalDisplayScope {
+    RetrievalDisplayScope::page(controls.limit, controls.page_size, controls.page)
+}
+
+fn empty_retrieval_display_scope() -> RetrievalDisplayScope {
+    RetrievalDisplayScope::Window { start: 0, len: 0 }
+}
+
+pub(super) fn retrieve_debug_options(
+    controls: &EffectiveRetrieveControls,
+) -> RetrievalDebugOptions {
+    if controls.passage {
+        let empty_scope = empty_retrieval_display_scope();
+        let canonical_budget = RetrievalCanonicalSelectionBudget::new(empty_scope, empty_scope);
+        return if controls.include_debug && controls.include_debug_packs {
+            RetrievalDebugOptions::full(canonical_budget)
+        } else {
+            RetrievalDebugOptions::compact(canonical_budget)
+        };
+    }
+
+    let canonical_budget =
+        RetrievalCanonicalSelectionBudget::scoped(retrieve_debug_display_scope(controls));
+    if controls.include_debug && controls.include_debug_packs {
+        RetrievalDebugOptions::full(canonical_budget)
+    } else {
+        RetrievalDebugOptions::compact(canonical_budget)
+    }
+}
+
+pub(super) fn retrieve_query_plan(
+    request: &RetrieveRequest,
+    default_profile_id: &EmbeddingProfileId,
+    collection_filter: &CollectionFilterRequest,
+    controls: &EffectiveRetrieveControls,
+) -> Result<(
+    EmbeddingProfileId,
+    verbatim_core::wire_schemas::QueryPlanEnvelope,
+)> {
+    let profile = super::parse_embedding_profile_id(
+        request.embedding_profile_id.as_deref(),
+        default_profile_id,
+    )?;
+    let plan = verbatim_core::api::query_plan_from_effective_controls_with_profile(
+        &request.question,
+        request.source_id.as_deref(),
+        collection_filter,
+        Some(profile.as_str()),
+        QueryPlanControls {
+            limit: Some(controls.limit),
+            page_size: Some(controls.page_size),
+            page: Some(controls.page),
+            fast: controls.fast,
+            rerank: Some(controls.rerank_config.enabled),
+            dense_top_k: Some(controls.retrieval_config.dense_top_k),
+            bm25_top_k: Some(controls.retrieval_config.bm25_top_k),
+            rerank_top_n: Some(controls.rerank_config.top_n),
+            bypass_cache: controls.bypass_cache,
+            include_debug: controls.include_debug,
+            include_debug_packs: controls.include_debug_packs,
+            include_locator: controls.include_locator,
+            passage: controls.passage,
+            ..QueryPlanControls::default()
+        },
+    )?;
+    Ok((profile, plan))
+}
+
+pub(super) fn ask_query_plan(
+    request: &AskRequest,
+    default_profile_id: &EmbeddingProfileId,
+    collection_filter: &CollectionFilterRequest,
+    config: &Config,
+    show_retrieval: bool,
+) -> Result<(
+    EmbeddingProfileId,
+    verbatim_core::wire_schemas::QueryPlanEnvelope,
+)> {
+    let profile = super::parse_embedding_profile_id(
+        request.embedding_profile_id.as_deref(),
+        default_profile_id,
+    )?;
+    let plan = verbatim_core::api::query_plan_from_effective_controls_with_profile(
+        &request.question,
+        request.source_id.as_deref(),
+        collection_filter,
+        Some(profile.as_str()),
+        QueryPlanControls {
+            rerank: Some(config.rerank.enabled),
+            dense_top_k: Some(config.retrieval.dense_top_k),
+            bm25_top_k: Some(config.retrieval.bm25_top_k),
+            rerank_top_n: Some(config.rerank.top_n),
+            include_debug: show_retrieval,
+            include_debug_packs: show_retrieval,
+            ..QueryPlanControls::default()
+        },
+    )?;
+    Ok((profile, plan))
+}
 
 pub(super) fn filter_generated_retrieval_evidence(
     store: &Store,
@@ -212,8 +321,9 @@ pub(super) fn executed_retrieve_for_generated_ask(
     embedding_profile_id: impl Into<String>,
     generation: Option<String>,
     results: &[RetrievalResult],
+    query_plan: Option<verbatim_core::wire_schemas::QueryPlanEnvelope>,
 ) -> RetrieveResponse {
-    RetrieveResponse::from_executed_ask_units(
+    let mut response = RetrieveResponse::from_executed_ask_units(
         question,
         embedding_profile_id,
         generation,
@@ -223,7 +333,9 @@ pub(super) fn executed_retrieve_for_generated_ask(
                 .iter()
                 .map(|evidence| evidence.id.0.as_str())
         }),
-    )
+    );
+    response.query_plan = query_plan;
+    response
 }
 
 pub(super) async fn retrieval_event(

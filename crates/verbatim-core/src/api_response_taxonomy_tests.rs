@@ -133,6 +133,8 @@ fn retrieve_response_taxonomy_classifies_generated_and_source_result_text_by_rol
         source_id: Some("src".into()),
         collection_filter: None,
         embedding_profile_id: "default".into(),
+        query_plan: None,
+        evidence_pack: None,
         generation: None,
         limit: 2,
         page_size: 2,

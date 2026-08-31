@@ -38,7 +38,7 @@ fn sample_query_plan() -> QueryPlanEnvelope {
     .unwrap()
 }
 
-fn sample_retrieve_response(query: &str, evidence_id: &str) -> RetrieveResponse {
+pub(super) fn sample_retrieve_response(query: &str, evidence_id: &str) -> RetrieveResponse {
     RetrieveResponse {
         task_id: "task-1".into(),
         query: query.into(),
@@ -46,6 +46,8 @@ fn sample_retrieve_response(query: &str, evidence_id: &str) -> RetrieveResponse 
         source_id: None,
         collection_filter: None,
         embedding_profile_id: "default".into(),
+        query_plan: None,
+        evidence_pack: None,
         generation: Some("7".into()),
         limit: 12,
         page_size: 1,
@@ -107,7 +109,7 @@ fn sample_retrieve_response(query: &str, evidence_id: &str) -> RetrieveResponse 
     }
 }
 
-fn sample_ask_context_response(evidence_id: &str) -> AskResponse {
+pub(super) fn sample_ask_context_response(evidence_id: &str) -> AskResponse {
     AskResponse {
         task_id: "task-1".into(),
         answer: String::new(),
@@ -191,6 +193,7 @@ fn context_pack_hash(encoded: &serde_json::Value) -> String {
         .unwrap()
         .into()
 }
+
 #[test]
 fn live_retrieve_request_valid_query_plan_envelope_round_trips() {
     let plan = live_question_plan("What is cited?");

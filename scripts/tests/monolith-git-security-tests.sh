@@ -283,7 +283,7 @@ test_staged_index_mutation_fails_closed() {
 prepare_pre_push_fixture() {
     local repo="$1"
     local bin_dir="$2"
-    mkdir -p "$repo/scripts/hooks" "$repo/test-bin"
+    mkdir -p "$repo/scripts/hooks"
     cp "$checker" "$repo/scripts/monolith/check.sh"
     cp "$root/scripts/monolith/tokenizer_runner.py" \
         "$repo/scripts/monolith/tokenizer_runner.py"
@@ -295,16 +295,10 @@ prepare_pre_push_fixture() {
 set -euo pipefail
 printf '%s\n' "$*" >>"${VERSION_CHECK_LOG:?}"
 SH
-    cat >"$repo/test-bin/just" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >>"${FULL_GATE_LOG:?}"
-SH
     chmod +x \
         "$repo/scripts/monolith/check.sh" \
         "$repo/scripts/hooks/check-pre-push-version-bumps.sh" \
-        "$repo/scripts/hooks/check-version-bumped.sh" \
-        "$repo/test-bin/just"
+        "$repo/scripts/hooks/check-version-bumped.sh"
     write_fake_tokenizer "$bin_dir"
 }
 
@@ -346,13 +340,14 @@ refs/heads/bad $bad_object refs/heads/bad $zero"
         || die 'pre-push monolith gate created Python bytecode artifacts'
     : >"$version_log"
     : >"$full_gate_log"
-    assert_success 'deletion ref is ignored' \
-        run_pre_push "$repo" "$bin_dir" \
+    run_without_git_env git -C "$repo" switch -q --detach "$good_object"
+    run_pre_push "$repo" "$bin_dir" \
         "refs/heads/deleted $zero refs/heads/deleted $good_object" \
         "$version_log" "$full_gate_log"
-    [ ! -s "$version_log" ] || die 'deletion ref invoked an object validator'
-    [ "$(<"$full_gate_log")" = 'pre-commit head' ] \
-        || die 'deletion ref did not continue to the full head gate'
+    [ "$(<"$version_log")" = '--scope head' ] \
+        || die 'deletion ref skipped head check'
+    [ "$(<"$full_gate_log")" = 'pre-push-gate head' ] \
+        || die 'deletion ref skipped full gate'
     : >"$version_log"
     : >"$full_gate_log"
     assert_failure_matching 'malformed pre-push stdin blocks' \

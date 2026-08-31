@@ -106,14 +106,6 @@ fn clap_exit_code(error: &clap::Error) -> u8 {
     }
 }
 
-fn rerank_override(rerank: bool, no_rerank: bool) -> Option<bool> {
-    match (rerank, no_rerank) {
-        (true, false) => Some(true),
-        (false, true) => Some(false),
-        _ => None,
-    }
-}
-
 fn ask_context_controls_present(
     limit: Option<usize>,
     page_size: Option<usize>,
@@ -434,7 +426,7 @@ where
                 page_size,
                 page,
                 fast,
-                rerank: rerank_override(rerank, no_rerank),
+                rerank: retrieve_help::rerank_override(rerank, no_rerank),
                 dense_top_k,
                 bm25_top_k,
                 rerank_top_n,
@@ -5564,6 +5556,8 @@ mod tests {
                 .embedding_profile_id
                 .clone()
                 .unwrap_or_else(|| "default".into()),
+            query_plan: None,
+            evidence_pack: None,
             generation: None,
             limit: request.limit.unwrap_or(12),
             page_size: request.page_size.unwrap_or(1),

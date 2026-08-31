@@ -202,6 +202,9 @@ fn pair_input(results: Vec<RetrievalResult>, passage: bool) -> RetrieveResponseI
         collection_filter: None,
         collection_provenance: HashMap::new(),
         embedding_profile_id: EmbeddingProfileId::default_profile(),
+        query_plan: Some(super::super::query_plan_test_support::test_query_plan(
+            "What is bound?",
+        )),
         controls: EffectiveRetrieveControls {
             limit: 2,
             page_size: 2,

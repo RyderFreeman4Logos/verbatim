@@ -7,10 +7,7 @@ use super::common::WireArtifactKind;
 use super::identity::{CanonicalIdentity, WireEnvelopeHeader, WireEnvelopeHeaderFields};
 use super::ser::{encode_wire_document, wire_content_hash};
 
-/// Minimal QueryPlan wire envelope (API-002 walking skeleton).
-///
-/// Full plan IR, profile refs, and policy decisions are residual; this slice
-/// only freezes identity, schema version, and a small body for round-trips.
+/// QueryPlan wire envelope. Retrieval controls are part of the plan identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryPlanEnvelope {
@@ -20,6 +17,76 @@ pub struct QueryPlanEnvelope {
     /// Ordered opaque retrieval step labels.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_filter: Option<QueryPlanCollectionFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fast: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dense_top_k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_top_k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_top_n: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bypass_cache: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_debug: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_debug_packs: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_locator: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub passage: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryPlanCollectionFilter {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collection_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_fresh: bool,
+}
+
+impl QueryPlanCollectionFilter {
+    pub fn is_empty(&self) -> bool {
+        self.collection_ids.is_empty() && self.names.is_empty() && !self.require_fresh
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct QueryPlanControls {
+    pub source_id: Option<String>,
+    pub collection_filter: Option<QueryPlanCollectionFilter>,
+    pub limit: Option<usize>,
+    pub page_size: Option<usize>,
+    pub page: Option<usize>,
+    pub fast: bool,
+    pub rerank: Option<bool>,
+    pub dense_top_k: Option<usize>,
+    pub bm25_top_k: Option<usize>,
+    pub rerank_top_n: Option<usize>,
+    pub bypass_cache: bool,
+    pub include_debug: bool,
+    pub include_debug_packs: bool,
+    pub include_locator: bool,
+    pub passage: bool,
 }
 
 /// Field bundle for [`QueryPlanEnvelope::new`].
@@ -34,6 +101,10 @@ pub struct QueryPlanFields {
 
 impl QueryPlanEnvelope {
     pub fn new(fields: QueryPlanFields) -> Result<Self> {
+        Self::new_with_controls(fields, QueryPlanControls::default())
+    }
+
+    pub fn new_with_controls(fields: QueryPlanFields, controls: QueryPlanControls) -> Result<Self> {
         if fields.query_text.trim().is_empty() {
             bail!("query_text must not be empty");
         }
@@ -45,6 +116,21 @@ impl QueryPlanEnvelope {
         let body = QueryPlanBody {
             query_text: fields.query_text.clone(),
             steps: fields.steps.clone(),
+            source_id: controls.source_id.clone(),
+            collection_filter: controls.collection_filter.clone(),
+            limit: controls.limit,
+            page_size: controls.page_size,
+            page: controls.page,
+            fast: controls.fast,
+            rerank: controls.rerank,
+            dense_top_k: controls.dense_top_k,
+            bm25_top_k: controls.bm25_top_k,
+            rerank_top_n: controls.rerank_top_n,
+            bypass_cache: controls.bypass_cache,
+            include_debug: controls.include_debug,
+            include_debug_packs: controls.include_debug_packs,
+            include_locator: controls.include_locator,
+            passage: controls.passage,
         };
         let body_bytes = encode_wire_document(&body)?;
         let identity = CanonicalIdentity::from_body(
@@ -62,6 +148,21 @@ impl QueryPlanEnvelope {
             header,
             query_text: fields.query_text,
             steps: fields.steps,
+            source_id: controls.source_id,
+            collection_filter: controls.collection_filter,
+            limit: controls.limit,
+            page_size: controls.page_size,
+            page: controls.page,
+            fast: controls.fast,
+            rerank: controls.rerank,
+            dense_top_k: controls.dense_top_k,
+            bm25_top_k: controls.bm25_top_k,
+            rerank_top_n: controls.rerank_top_n,
+            bypass_cache: controls.bypass_cache,
+            include_debug: controls.include_debug,
+            include_debug_packs: controls.include_debug_packs,
+            include_locator: controls.include_locator,
+            passage: controls.passage,
         })
     }
 
@@ -81,13 +182,29 @@ impl QueryPlanEnvelope {
                 bail!("query plan steps must not contain empty entries");
             }
         }
-        verify_body_hash(
-            self.header.identity.content_hash.as_str(),
-            &QueryPlanBody {
-                query_text: self.query_text.clone(),
-                steps: self.steps.clone(),
-            },
-        )
+        verify_body_hash(self.header.identity.content_hash.as_str(), &self.body())
+    }
+
+    fn body(&self) -> QueryPlanBody {
+        QueryPlanBody {
+            query_text: self.query_text.clone(),
+            steps: self.steps.clone(),
+            source_id: self.source_id.clone(),
+            collection_filter: self.collection_filter.clone(),
+            limit: self.limit,
+            page_size: self.page_size,
+            page: self.page,
+            fast: self.fast,
+            rerank: self.rerank,
+            dense_top_k: self.dense_top_k,
+            bm25_top_k: self.bm25_top_k,
+            rerank_top_n: self.rerank_top_n,
+            bypass_cache: self.bypass_cache,
+            include_debug: self.include_debug,
+            include_debug_packs: self.include_debug_packs,
+            include_locator: self.include_locator,
+            passage: self.passage,
+        }
     }
 }
 
@@ -96,6 +213,36 @@ impl QueryPlanEnvelope {
 struct QueryPlanBody {
     query_text: String,
     steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collection_filter: Option<QueryPlanCollectionFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    fast: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rerank: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dense_top_k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bm25_top_k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rerank_top_n: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    bypass_cache: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    include_debug: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    include_debug_packs: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    include_locator: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    passage: bool,
 }
 
 /// Minimal EvidencePack wire envelope.
