@@ -7136,9 +7136,9 @@ mod tests {
         store: &Store,
         profile_id: &EmbeddingProfileId,
         source_path: &Path,
-    ) -> SourceId {
+    ) -> Result<SourceId> {
         let mut source = test_source("src-context", source_path.to_path_buf());
-        source.hash = file_hash(source_path).unwrap();
+        source.hash = file_hash(source_path)?;
         store.add_source(&source).unwrap();
         let chunk =
             insert_child_text(store, &source.id, "chunk-context", "alpha context text").unwrap();
@@ -7153,7 +7153,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        source.id
+        Ok(source.id)
     }
 
     #[test]
@@ -7740,13 +7740,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_embedding_profile_records_zero_vector_status_for_target_source() {
-        let tempdir = tempfile::tempdir().unwrap();
+    async fn build_embedding_profile_records_zero_vector_status_for_target_source() -> Result<()> {
+        let tempdir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let store = Store::in_memory().unwrap();
         let source_path = tempdir.path().join("empty.txt");
         fs::write(&source_path, "").unwrap();
         let mut source = test_source("src-empty", source_path.clone());
-        source.hash = file_hash(&source_path).unwrap();
+        source.hash = file_hash(&source_path)?;
         source.status = SourceStatus::Stale;
         store.add_source(&source).unwrap();
         let mut pipeline = IngestPipeline::from_parts(
@@ -7772,16 +7772,17 @@ mod tests {
             SourceStatus::Indexed
         );
         assert!(pipeline.check_stale().unwrap().is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn build_embedding_profile_records_zero_vector_status_for_all_sources() {
-        let tempdir = tempfile::tempdir().unwrap();
+    async fn build_embedding_profile_records_zero_vector_status_for_all_sources() -> Result<()> {
+        let tempdir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let store = Store::in_memory().unwrap();
         let source_path = tempdir.path().join("empty.txt");
         fs::write(&source_path, "").unwrap();
         let mut source = test_source("src-empty", source_path.clone());
-        source.hash = file_hash(&source_path).unwrap();
+        source.hash = file_hash(&source_path)?;
         source.status = SourceStatus::Stale;
         store.add_source(&source).unwrap();
         let mut pipeline = IngestPipeline::from_parts(
@@ -7807,6 +7808,7 @@ mod tests {
             SourceStatus::Indexed
         );
         assert!(pipeline.check_stale().unwrap().is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -7880,13 +7882,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_stale_reports_missing_active_profile_vectors() {
-        let tempdir = tempfile::tempdir().unwrap();
+    async fn check_stale_reports_missing_active_profile_vectors() -> Result<()> {
+        let tempdir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let store = Store::in_memory().unwrap();
         let source_path = tempdir.path().join("first.txt");
         fs::write(&source_path, "alpha text").unwrap();
         let mut source = test_source("src-1", source_path.clone());
-        source.hash = file_hash(&source_path).unwrap();
+        source.hash = file_hash(&source_path)?;
         insert_source_with_child_text(&store, &source, "chunk-1", "alpha text").unwrap();
         let mut pipeline = IngestPipeline::from_parts(
             store,
@@ -7923,11 +7925,12 @@ mod tests {
                 .status,
             SourceStatus::Indexed
         );
+        Ok(())
     }
 
     #[test]
-    fn context_window_shrink_marks_existing_profile_vectors_stale() {
-        let tempdir = tempfile::tempdir().unwrap();
+    fn context_window_shrink_marks_existing_profile_vectors_stale() -> Result<()> {
+        let tempdir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let source_path = tempdir.path().join("context.txt");
         fs::write(&source_path, "alpha context text").unwrap();
         let high_config = embedding_context_config(8192);
@@ -7938,7 +7941,7 @@ mod tests {
                 pipeline.store(),
                 pipeline.active_embedding_profile_id(),
                 &source_path,
-            );
+            )?;
             assert!(pipeline.check_stale().unwrap().is_empty());
             source_id
         };
@@ -7957,11 +7960,12 @@ mod tests {
             .list_vector_documents_for_profile(pipeline.active_embedding_profile_id())
             .unwrap()
             .is_empty());
+        Ok(())
     }
 
     #[test]
-    fn context_window_growth_keeps_existing_vectors_as_quality_reindex_opportunity() {
-        let tempdir = tempfile::tempdir().unwrap();
+    fn context_window_growth_keeps_existing_vectors_as_quality_reindex_opportunity() -> Result<()> {
+        let tempdir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let source_path = tempdir.path().join("context.txt");
         fs::write(&source_path, "alpha context text").unwrap();
         let low_config = embedding_context_config(128);
@@ -7972,7 +7976,7 @@ mod tests {
                 pipeline.store(),
                 pipeline.active_embedding_profile_id(),
                 &source_path,
-            );
+            )?;
             assert!(pipeline.check_stale().unwrap().is_empty());
         }
 
@@ -7993,14 +7997,15 @@ mod tests {
                 .len(),
             1
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn restart_preserves_endpoint_discovered_profile_until_refresh_confirms_same_capability()
-    {
+    async fn restart_preserves_endpoint_discovered_profile_until_refresh_confirms_same_capability(
+    ) -> Result<()> {
         let body = r#"{"data":[{"id":"same-configured-model","served_model":"served-a","max_model_len":8192,"dtype":"float16","quantization":"fp16","revision":"Sha256:ABCDef"}]}"#;
         let (base_url, handle) = spawn_embedding_models_server(vec![body]);
-        let tempdir = tempfile::tempdir().unwrap();
+        let tempdir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let source_path = tempdir.path().join("context.txt");
         fs::write(&source_path, "alpha context text").unwrap();
         let mut config = test_config();
@@ -8027,7 +8032,7 @@ mod tests {
                 pipeline.store(),
                 pipeline.active_embedding_profile_id(),
                 &source_path,
-            );
+            )?;
             assert!(pipeline.check_stale().unwrap().is_empty());
             source_id
         };
@@ -8064,7 +8069,7 @@ mod tests {
         assert!(!pipeline
             .store()
             .find_stale_sources_for_profile(
-                &HashMap::from([(source_id.clone(), file_hash(&source_path).unwrap())]),
+                &HashMap::from([(source_id.clone(), file_hash(&source_path)?)]),
                 pipeline.active_embedding_profile_id(),
             )
             .unwrap()
@@ -8074,6 +8079,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].line, "GET /v1/models HTTP/1.1");
         assert!(requests[0].body.is_empty());
+        Ok(())
     }
 
     #[test]
