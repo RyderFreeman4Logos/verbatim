@@ -146,6 +146,14 @@ pub(super) fn bind_query_plan_to_question(
     Ok(expected)
 }
 
+fn validate_live_retrieve_query_plan(plan: &QueryPlanEnvelope) -> Result<()> {
+    plan.validate()?;
+    if plan.header.identity.artifact_id != LIVE_RETRIEVE_QUERY_PLAN_ID {
+        anyhow::bail!("retrieve query plan artifact_id must be live-retrieve");
+    }
+    Ok(())
+}
+
 pub(super) fn bind_evidence_pack_to_retrieve(
     query: &str,
     results: &[RetrieveResultResponse],
@@ -154,6 +162,7 @@ pub(super) fn bind_evidence_pack_to_retrieve(
     plan: &QueryPlanEnvelope,
     pack: &EvidencePackEnvelope,
 ) -> Result<()> {
+    validate_live_retrieve_query_plan(plan)?;
     pack.validate()?;
     let Some(expected) =
         evidence_pack_from_retrieve(query, results, embedding_profile_id, generation, plan)?
@@ -267,6 +276,7 @@ pub(super) fn evidence_pack_from_retrieve(
     generation: Option<&str>,
     plan: &QueryPlanEnvelope,
 ) -> Result<Option<EvidencePackEnvelope>> {
+    validate_live_retrieve_query_plan(plan)?;
     require_non_blank_result_evidence_ids(results)?;
     if results.is_empty() {
         return Ok(None);

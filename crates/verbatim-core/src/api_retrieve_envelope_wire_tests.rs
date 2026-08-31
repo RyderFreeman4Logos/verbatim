@@ -109,7 +109,7 @@ pub(super) fn sample_retrieve_response(query: &str, evidence_id: &str) -> Retrie
     }
 }
 
-fn sample_ask_context_response(evidence_id: &str) -> AskResponse {
+pub(super) fn sample_ask_context_response(evidence_id: &str) -> AskResponse {
     AskResponse {
         task_id: "task-1".into(),
         answer: String::new(),

@@ -1206,6 +1206,9 @@ mod api_response_taxonomy_tests;
 #[cfg(test)]
 #[path = "api_retrieve_envelope_wire_tests.rs"]
 mod api_retrieve_envelope_wire_tests;
+#[cfg(test)]
+#[path = "api_retrieve_query_plan_wire_tests.rs"]
+mod api_retrieve_query_plan_wire_tests;
 #[path = "api_source_created_identity.rs"]
 mod api_source_created_identity;
 #[path = "api_source_record_identity.rs"]
