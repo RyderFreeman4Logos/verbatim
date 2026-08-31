@@ -246,11 +246,34 @@ validator|--scope|head" \
 
     : >"$validator_log"
     : >"$full_gate_log"
-    assert_failure_matching \
-        'pre-push fails closed without an exact full-gate receipt' \
-        'missing full-gate receipt' \
+    assert_success \
+        'pre-push runs the canonical gate without a receipt' \
         run_pre_push_path "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log"
-    assert_file_content 'missing receipt does not invoke the full gate' '' "$full_gate_log"
+    assert_file_content \
+        'missing receipt invokes the canonical gate' \
+        'pre-push-gate head' \
+        "$full_gate_log"
+
+    : >"$validator_log"
+    : >"$full_gate_log"
+    missing_receipt="$repo/missing-full-gate-receipt.log"
+    assert_failure_matching \
+        'pre-push rejects a missing receipt path' \
+        'missing full-gate receipt' \
+        run_pre_push_path \
+        "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log" '' "$missing_receipt"
+    assert_file_content 'missing receipt path does not invoke the full gate' '' "$full_gate_log"
+
+    printf 'PRE_HEAD=%s\nPRE_TREE=%s\n' \
+        "$good_object" \
+        "$(run_without_local_git_env git -C "$repo" rev-parse "$good_object^{tree}")" \
+        >"$full_gate_receipt"
+    assert_failure_matching \
+        'pre-push rejects a malformed receipt' \
+        'lacks pre-attestation' \
+        run_pre_push_path \
+        "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log" '' "$full_gate_receipt"
+    assert_file_content 'malformed receipt does not invoke the full gate' '' "$full_gate_log"
 
     write_full_gate_receipt "$repo" "$full_gate_receipt" "$unchanged_object"
     assert_failure_matching \

@@ -67,7 +67,10 @@ done
 "$monolith_checker" --scope head
 
 full_gate_receipt="${VERBATIM_FULL_GATE_RECEIPT:-}"
-[ -n "$full_gate_receipt" ] || die "missing full-gate receipt"
+if [ -z "$full_gate_receipt" ]; then
+    just pre-push-gate head
+    exit 0
+fi
 [ -f "$full_gate_receipt" ] || die "missing full-gate receipt: $full_gate_receipt"
 
 receipt_has_line() {

@@ -241,7 +241,8 @@ run_pre_push() {
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "$#" -eq 2 ] && [ "$1" = pre-push-gate ] && [ "$2" = head ]; then
-    exec "${MONOLITH_LEGACY_JUST:?}" pre-commit head
+    printf '%s %s\n' "$1" "$2" >>"${FULL_GATE_LOG:?}"
+    exit 0
 fi
 exec "${MONOLITH_LEGACY_JUST:?}" "$@"
 SH

@@ -341,13 +341,13 @@ refs/heads/bad $bad_object refs/heads/bad $zero"
     : >"$version_log"
     : >"$full_gate_log"
     run_without_git_env git -C "$repo" switch -q --detach "$good_object"
-    assert_failure_matching 'deletion ref requires a full-gate receipt' \
-        'missing full-gate receipt' \
-        run_pre_push "$repo" "$bin_dir" \
+    run_pre_push "$repo" "$bin_dir" \
         "refs/heads/deleted $zero refs/heads/deleted $good_object" \
         "$version_log" "$full_gate_log"
-    [ "$(<"$version_log")" = '--scope head' ] || die 'deletion ref did not run the head validator'
-    [ ! -s "$full_gate_log" ] || die 'deletion ref reran the full head gate'
+    [ "$(<"$version_log")" = '--scope head' ] \
+        || die 'deletion ref skipped head check'
+    [ "$(<"$full_gate_log")" = 'pre-push-gate head' ] \
+        || die 'deletion ref skipped full gate'
     : >"$version_log"
     : >"$full_gate_log"
     assert_failure_matching 'malformed pre-push stdin blocks' \
