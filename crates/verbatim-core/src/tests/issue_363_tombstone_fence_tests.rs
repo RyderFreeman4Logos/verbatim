@@ -185,7 +185,13 @@ fn spawn_pausing_qdrant_upsert_server(
                         r#"{"status":"ok","result":{}}"#
                     };
                     requests.push(request);
-                    write_http_response(&mut stream, status, body);
+                    if let Err(error) = write_http_response(&mut stream, status, body) {
+                        assert_eq!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe,
+                            "write qdrant test response: {error}"
+                        );
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if stop_rx.try_recv().is_ok() {
@@ -248,15 +254,14 @@ fn http_request_complete(buffer: &[u8]) -> bool {
 }
 
 #[cfg(feature = "qdrant")]
-fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
+fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
-    )
-    .unwrap();
-    stream.flush().unwrap();
+    )?;
+    stream.flush()
 }
 
 #[cfg(feature = "qdrant")]
@@ -320,26 +325,25 @@ fn finalize_qdrant_outcome(store: &Store, source_id: &SourceId, outcome: Deletio
 
 #[cfg(feature = "qdrant")]
 #[tokio::test]
-async fn durable_tombstone_fence_requeues_failed_qdrant_compensation_with_full_synchronous_writer()
-{
-    let tempdir = tempfile::tempdir().unwrap();
+async fn durable_tombstone_fence_requeues_failed_qdrant_compensation_with_full_synchronous_writer(
+) -> Result<()> {
+    let tempdir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
     let database_path = tempdir.path().join("verbatim.db");
     let source_path = tempdir.path().join("failed-qdrant-compensation.md");
-    fs::write(&source_path, "in-flight qdrant source body").unwrap();
+    fs::write(&source_path, "in-flight qdrant source body")?;
     let observed_synchronous = Arc::new(Mutex::new(None));
     let requeue_writer = Arc::clone(&observed_synchronous);
     let mut pipeline = IngestPipeline::from_parts(
         Store::new_with_durability_profile(
             &database_path,
             crate::store::SqliteDurabilityProfile::Durable,
-        )
-        .unwrap(),
+        )?,
         HnswIndex::new(),
         StaticEmbeddingClient,
         tempdir.path().to_path_buf(),
     );
-    let source_id = pipeline.add_source(&source_path).unwrap();
-    pipeline.ingest_source(&source_id).await.unwrap();
+    let source_id = pipeline.add_source(&source_path)?;
+    pipeline.ingest_source(&source_id).await?;
 
     let (qdrant_url, upsert_started, release, _stop, server) =
         spawn_pausing_qdrant_upsert_server(6, Some(5));
@@ -352,17 +356,16 @@ async fn durable_tombstone_fence_requeues_failed_qdrant_compensation_with_full_s
     let mut sync = Box::pin(pipeline.sync_qdrant_source(&source_id));
     tokio::select! {
         _ = &mut sync => panic!("qdrant sync completed before the upsert pause"),
-        result = upsert_started => result.unwrap(),
+        result = upsert_started => result?,
     }
 
     let store = Store::new_with_durability_profile(
         &database_path,
         crate::store::SqliteDurabilityProfile::Durable,
-    )
-    .unwrap();
+    )?;
     store.remove_source(&source_id).unwrap();
     finalize_qdrant_outcome(&store, &source_id, DeletionOutcome::Erased);
-    release.send(()).unwrap();
+    release.send(())?;
     sync.await;
 
     let requests = server.join().unwrap();
@@ -379,6 +382,7 @@ async fn durable_tombstone_fence_requeues_failed_qdrant_compensation_with_full_s
         store.qdrant_deletion_outcome(&source_id).unwrap(),
         Some(DeletionOutcome::Pending)
     );
+    Ok(())
 }
 
 #[cfg(feature = "qdrant")]
