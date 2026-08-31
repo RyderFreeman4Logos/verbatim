@@ -8,6 +8,7 @@ license.workspace = true
 default = ["parser-pdf-oxide"]
 parser-pdf-oxide = ["dep:image", "dep:lopdf", "dep:pdf_oxide"]
 parser-pdfplumber = ["dep:image", "dep:lopdf", "dep:pdfplumber"]
+parser-anydoc-pdf = ["dep:anydoc", "dep:pdf-inspector"]
 qdrant = []
 
 [dependencies]
@@ -31,6 +32,8 @@ pdf_oxide = { version = "0.3", optional = true }
 pdfplumber = { version = "0.2", optional = true }
 lopdf = { version = "0.42", default-features = false, optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+anydoc = { version = "=0.2.4", optional = true }
+pdf-inspector = { version = "=1.14.2", optional = true }
 pulldown-cmark = "0.12"
 instant-distance = "0.6"
 tantivy = "0.26"

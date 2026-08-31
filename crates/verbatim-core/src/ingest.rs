@@ -1666,6 +1666,7 @@ where
                     &evidence,
                     &image_artifacts,
                     Some(&profile),
+                    None,
                 );
                 if ocr_profile_stale(&diagnostics, Some(&profile)) {
                     stale_set.insert(source.id.clone());
@@ -1739,6 +1740,7 @@ where
                 &evidence,
                 &image_artifacts,
                 Some(&profile),
+                None,
             );
             if ocr_profile_stale(&diagnostics, Some(&profile)) {
                 return Ok(SourceIngestSnapshot {
@@ -2018,9 +2020,10 @@ where
                 .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
-        let (mut evidence, prepared_image_artifacts, pdf_scan) = {
+        let (mut evidence, prepared_image_artifacts, pdf_scan, conversion) = {
             let _cpu_permit = cpu_permit;
-            let mut parsed_evidence = parser.parse(&source.path)?;
+            let (mut parsed_evidence, conversion) =
+                parser.parse_with_derived_metadata(&source.path)?;
             crate::pdf_selector::attach_pdf_selectors(
                 &mut parsed_evidence,
                 &new_source.hash,
@@ -2052,7 +2055,7 @@ where
                     )
                 })
                 .or_else(|| pdf_scan_summary(&evidence, &prepared_image_artifacts.artifacts));
-            (evidence, prepared_image_artifacts, pdf_scan)
+            (evidence, prepared_image_artifacts, pdf_scan, conversion)
         };
         if pdf_scan.as_ref().is_some_and(|scan| {
             scan.page_count > 0 && scan.image_only_page_count == scan.page_count
@@ -2067,6 +2070,7 @@ where
                 "evidence_count": evidence.len(),
                 "image_artifact_count": prepared_image_artifacts.artifacts.len(),
                 "pdf_scan": pdf_scan,
+                "conversion": conversion,
             }),
         );
         let phase = PhaseTiming::start(IngestTaskStage::Ocr.as_str());
@@ -2207,6 +2211,7 @@ where
                 .as_ref()
                 .map(|provider| provider.profile())
                 .as_ref(),
+            conversion.as_ref(),
         );
         let (mut graph_nodes, mut graph_edges) = build_evidence_graph(
             &new_source,
@@ -8424,7 +8429,7 @@ mod tests {
         }));
         assert!(evidence.iter().all(|unit| unit.kind != EvidenceKind::Ocr));
         let artifacts = reopened.list_image_artifacts_by_source(&source_id).unwrap();
-        let diagnostics = source_ingest_diagnostics(&path, &evidence, &artifacts, None);
+        let diagnostics = source_ingest_diagnostics(&path, &evidence, &artifacts, None, None);
         assert_eq!(diagnostics.ocr.status, OcrSourceStatus::NotRequired);
         assert_eq!(diagnostics.pdf.as_ref().unwrap().image_only_page_count, 0);
     }

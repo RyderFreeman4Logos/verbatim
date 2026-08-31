@@ -34,6 +34,7 @@ fn sample_source() -> SourceResponse {
 fn sample_diagnostics() -> SourceIngestDiagnostics {
     SourceIngestDiagnostics {
         pdf: None,
+        conversion: None,
         ocr: SourceOcrDiagnostics {
             enabled: false,
             status: OcrSourceStatus::NotRequired,
