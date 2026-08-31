@@ -78,6 +78,9 @@ fi
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
     || die "cannot determine the repository root"
 cd "$repo_root"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=../tests/fixture-cleanup.sh
+source "$script_dir/../tests/fixture-cleanup.sh"
 
 if [ -z "$base_ref" ]; then
     base_ref="origin/${DEFAULT_BRANCH:-main}"
@@ -93,7 +96,11 @@ base_tree="$(git rev-parse --verify --quiet "${base_commit}^{tree}")" \
     || die "cannot resolve base tree"
 tmp_root="$(mktemp -d)" || die "cannot create version snapshot directory"
 cleanup() {
-    rm -rf -- "$tmp_root"
+    local status=$?
+    if ! cleanup_fixture_root "$tmp_root" "$repo_root"; then
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
 }
 trap cleanup EXIT
 

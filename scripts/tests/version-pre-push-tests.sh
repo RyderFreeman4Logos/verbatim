@@ -97,6 +97,8 @@ prepare_pre_push_fixture() {
     mkdir -p "$repo/scripts/hooks" "$repo/scripts/monolith" "$repo/scripts/tests" "$repo/test-bin"
     cp "$root/justfile" "$repo/justfile"
     cp "$checker" "$repo/scripts/hooks/check-version-bumped.sh"
+    cp "$root/scripts/tests/fixture-cleanup.sh" \
+        "$repo/scripts/tests/fixture-cleanup.sh"
     cp "$pre_push_checker" "$repo/scripts/hooks/check-pre-push-version-bumps.sh"
     cp "$monolith_checker" "$repo/scripts/monolith/check.sh"
     cp "$root/scripts/monolith/tokenizer_runner.py" \

@@ -98,6 +98,8 @@ tokenizer_runner="$script_dir/tokenizer_runner.py"
 tokenizer_contract="$script_dir/tokenizer_contract.py"
 [ -r "$tokenizer_contract" ] || die "tokenizer contract helper is unavailable"
 cd "$repo_root"
+# shellcheck source=../tests/fixture-cleanup.sh
+source "$script_dir/../tests/fixture-cleanup.sh"
 if [ -z "$base_ref" ]; then
     default_branch="${DEFAULT_BRANCH:-main}"
     if git rev-parse --verify --quiet "origin/${default_branch}^{commit}" >/dev/null; then
@@ -145,7 +147,11 @@ if [ -z "$candidate_tree" ]; then
 fi
 tmp_root="$(mktemp -d)"
 cleanup() {
-    rm -rf -- "$tmp_root"
+    local status=$?
+    if ! cleanup_fixture_root "$tmp_root" "$repo_root"; then
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
 }
 trap cleanup EXIT
 tokenizer_timeout_seconds="${MONOLITH_TOKENIZER_TIMEOUT_SECONDS:-$tokenizer_timeout_default}"

@@ -2,8 +2,17 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=fixture-cleanup.sh
+source "$repo_root/scripts/tests/fixture-cleanup.sh"
 tmp_root="$(mktemp -d)"
-trap 'rm -rf "${tmp_root}"' EXIT
+cleanup() {
+    local status=$?
+    if ! cleanup_fixture_root "$tmp_root" "$repo_root"; then
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
 
 fail() {
     echo "FAIL: $*" >&2

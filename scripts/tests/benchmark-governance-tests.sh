@@ -5,6 +5,8 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=fixture-cleanup.sh
+source "$root/scripts/tests/fixture-cleanup.sh"
 schema_path="${BENCH_SCHEMA_PATH:-$root/docs/evals/benchmark-manifest.schema.toml}"
 valid_path="${BENCH_VALID_PATH:-$root/docs/evals/examples/minimal-benchmark.example.toml}"
 leakage_path="${BENCH_LEAKAGE_PATH:-$root/docs/evals/examples/group-leakage.fixture.toml}"
@@ -24,7 +26,11 @@ pass() {
 
 tmp_root="$(mktemp -d)"
 cleanup() {
-    rm -rf -- "$tmp_root"
+    local status=$?
+    if ! cleanup_fixture_root "$tmp_root" "$root"; then
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
 }
 trap cleanup EXIT
 

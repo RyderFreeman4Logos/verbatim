@@ -143,6 +143,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     set -euo pipefail
 
     root="$(git rev-parse --show-toplevel)"
+    # shellcheck source=fixture-cleanup.sh
+    source "$root/scripts/tests/fixture-cleanup.sh"
     test_root="$(mktemp -d)"
     case_filter="${GATE_FIXTURE_TEST_CASE:-}"
     registered_case_count=0
@@ -152,7 +154,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     readonly expected_case_manifest_sha256="d354cc95daedeee243ebad139bd70526795d4c1247f6cff28ff179fa7a687685"
 
     cleanup() {
-        rm -rf -- "$test_root"
+        local status=$?
+        if ! cleanup_fixture_root "$test_root" "$root"; then
+            [ "$status" -ne 0 ] || status=1
+        fi
+        exit "$status"
     }
     trap cleanup EXIT
 
@@ -233,7 +239,51 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         sed -n -e '/^CASE: /p' -e '/^.*-tests: PASS /p'
     }
 
+    test_fixture_cleanup_preserves_canonical_target() {
+        local fixture_root="$test_root/cleanup-target"
+        local canonical_target="$fixture_root/canonical-target"
+        local target_link="$fixture_root/target"
+        local helper="$root/scripts/tests/fixture-cleanup.sh"
+        local output status
+
+        mkdir -p "$canonical_target"
+        printf 'sentinel\n' >"$canonical_target/sentinel"
+        ln -s "$canonical_target" "$target_link"
+
+        set +e
+        output="$(bash -c 'source "$1"; cleanup_fixture_root "$2" "$3"' _ \
+            "$helper" "$target_link" "$fixture_root" 2>&1)"
+        status=$?
+        set -e
+        [ "$status" -ne 0 ] || die 'canonical target cleanup was accepted'
+        grep -Fq 'refusing to remove canonical Cargo target' <<<"$output" \
+            || die 'canonical target cleanup rejection was not reported'
+        [ -L "$target_link" ] || die 'canonical target symlink was removed'
+        [ -f "$canonical_target/sentinel" ] \
+            || die 'canonical target directory was removed'
+
+        local nested_target="$target_link/nested-fixture"
+        mkdir -p "$nested_target"
+        set +e
+        output="$(bash -c 'source "$1"; cleanup_fixture_root "$2" "$3"' _ \
+            "$helper" "$nested_target" "$fixture_root" 2>&1)"
+        status=$?
+        set -e
+        [ "$status" -ne 0 ] || die 'canonical target descendant cleanup was accepted'
+        [ -d "$nested_target" ] \
+            || die 'canonical target descendant was removed'
+
+        local safe_root="$fixture_root/safe"
+        mkdir -p "$safe_root"
+        cleanup_fixture_root "$safe_root" "$fixture_root" \
+            || die 'ordinary fixture cleanup was rejected'
+        [ ! -e "$safe_root" ] || die 'ordinary fixture root was not removed'
+
+        printf 'TARGET-CLEANUP: canonical=preserved ordinary=removed\n'
+    }
+
     test_canonical_entrypoint_sanitization() {
+        test_fixture_cleanup_preserves_canonical_target
         local clean_monolith hostile_monolith clean_version hostile_version
         clean_monolith="$(JUST_NO_DOTENV=true env -u MONOLITH_TEST_CASE just monolith-check-test 2>&1)" \
             || {
