@@ -520,6 +520,14 @@ const RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS: &[&str] = &[
     "evidence_pack.query_plan_hash",
 ];
 
+const RETRIEVE_QUERY_PLAN_FIELDS: &[&str] = &[
+    "query_plan.header.identity.artifact_id",
+    "query_plan.header.identity.content_hash",
+    "query_plan.header.identity.kind",
+    "query_plan.header.profile_ref",
+    "query_plan.query_text",
+];
+
 const ASK_CONTEXT_PACK_IDENTITY_FIELDS: &[&str] = &[
     "context_pack.evidence_pack_hash",
     "context_pack.header.generation",
@@ -539,22 +547,28 @@ fn collect_serialized_string_leaves(
     match value {
         Value::Object(object) => {
             let synthesize_pack = should_synthesize_retrieve_evidence_pack(object);
+            let synthesize_query_plan = should_synthesize_retrieve_query_plan(object);
             let synthesize_context_pack = should_synthesize_ask_context_pack(object);
             let mut evidence_identity =
                 super::evidence_identity::EvidenceIdentityTaxonomy::start(object);
             let mut retrieval_run_identity =
                 super::retrieval_run_identity::RetrievalRunIdentityTaxonomy::start(object);
             let mut emitted_pack = false;
+            let mut emitted_query_plan = false;
             let mut emitted_context_pack = false;
             for (key, child) in object {
                 retrieval_run_identity.emit_before(path, key, fields);
                 if synthesize_pack && !emitted_pack && key.as_str() > "evidence_pack" {
-                    push_retrieve_evidence_pack_identity_fields(path, fields);
+                    push_identity_fields(path, fields, RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS);
                     emitted_pack = true;
+                }
+                if synthesize_query_plan && !emitted_query_plan && key.as_str() > "query_plan" {
+                    push_identity_fields(path, fields, RETRIEVE_QUERY_PLAN_FIELDS);
+                    emitted_query_plan = true;
                 }
                 if synthesize_context_pack && !emitted_context_pack && key.as_str() > "context_pack"
                 {
-                    push_ask_context_pack_identity_fields(path, fields);
+                    push_identity_fields(path, fields, ASK_CONTEXT_PACK_IDENTITY_FIELDS);
                     emitted_context_pack = true;
                 }
                 evidence_identity.emit_before(path, key, fields);
@@ -572,10 +586,13 @@ fn collect_serialized_string_leaves(
             }
             retrieval_run_identity.emit_after(path, fields);
             if synthesize_pack && !emitted_pack {
-                push_retrieve_evidence_pack_identity_fields(path, fields);
+                push_identity_fields(path, fields, RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS);
+            }
+            if synthesize_query_plan && !emitted_query_plan {
+                push_identity_fields(path, fields, RETRIEVE_QUERY_PLAN_FIELDS);
             }
             if synthesize_context_pack && !emitted_context_pack {
-                push_ask_context_pack_identity_fields(path, fields);
+                push_identity_fields(path, fields, ASK_CONTEXT_PACK_IDENTITY_FIELDS);
             }
             evidence_identity.emit_after(path, fields);
         }
@@ -603,6 +620,14 @@ fn should_synthesize_retrieve_evidence_pack(object: &serde_json::Map<String, Val
     !object.contains_key("evidence_pack") && has_non_blank_retrieve_result_ids(object)
 }
 
+fn should_synthesize_retrieve_query_plan(object: &serde_json::Map<String, Value>) -> bool {
+    !object.contains_key("query_plan")
+        && object.contains_key("task_id")
+        && object.contains_key("query")
+        && object.contains_key("embedding_profile_id")
+        && object.contains_key("results")
+}
+
 fn should_synthesize_ask_context_pack(object: &serde_json::Map<String, Value>) -> bool {
     !object.contains_key("context_pack")
         && object
@@ -627,27 +652,13 @@ fn has_non_blank_retrieve_result_ids(object: &serde_json::Map<String, Value>) ->
             })
 }
 
-fn push_retrieve_evidence_pack_identity_fields(path: &str, fields: &mut Vec<TextFieldTaxonomy>) {
+fn push_identity_fields(path: &str, fields: &mut Vec<TextFieldTaxonomy>, identity_fields: &[&str]) {
     let prefix = if path.is_empty() {
         String::new()
     } else {
         format!("{path}.")
     };
-    for field in RETRIEVE_EVIDENCE_PACK_IDENTITY_FIELDS {
-        fields.push(TextFieldTaxonomy {
-            field: format!("{prefix}{field}"),
-            plane: OutputTextPlane::Metadata,
-        });
-    }
-}
-
-fn push_ask_context_pack_identity_fields(path: &str, fields: &mut Vec<TextFieldTaxonomy>) {
-    let prefix = if path.is_empty() {
-        String::new()
-    } else {
-        format!("{path}.")
-    };
-    for field in ASK_CONTEXT_PACK_IDENTITY_FIELDS {
+    for field in identity_fields {
         fields.push(TextFieldTaxonomy {
             field: format!("{prefix}{field}"),
             plane: OutputTextPlane::Metadata,
