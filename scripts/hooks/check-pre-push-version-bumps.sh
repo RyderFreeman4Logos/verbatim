@@ -63,4 +63,27 @@ done
 
 [ "$input_seen" -eq 1 ] || die "missing pre-push reference input"
 
-just pre-push-gate head
+"$version_checker" --scope head
+"$monolith_checker" --scope head
+
+full_gate_receipt="${VERBATIM_FULL_GATE_RECEIPT:-}"
+[ -n "$full_gate_receipt" ] || die "missing full-gate receipt"
+[ -f "$full_gate_receipt" ] || die "missing full-gate receipt: $full_gate_receipt"
+
+receipt_has_line() {
+    local expected="$1"
+    local count
+
+    count="$(grep -Fxc -- "$expected" "$full_gate_receipt" || true)"
+    [ "$count" = 1 ]
+}
+
+head="$(git rev-parse HEAD)" || die "cannot determine HEAD"
+tree="$(git rev-parse 'HEAD^{tree}')" || die "cannot determine HEAD tree"
+receipt_has_line "PRE_HEAD=$head" || die "full-gate receipt does not match HEAD"
+receipt_has_line "PRE_TREE=$tree" || die "full-gate receipt does not match HEAD tree"
+receipt_has_line 'PRE_ATTESTATION=PASS' || die "full-gate receipt lacks pre-attestation"
+receipt_has_line 'INNER_GATE_EXIT=0' || die "full-gate receipt inner gate did not pass"
+receipt_has_line 'POST_ATTESTATION=PASS' || die "full-gate receipt lacks post-attestation"
+receipt_has_line 'GATE_EXIT=0' || die "full-gate receipt gate_exit did not pass"
+printf 'pre-push: attested full-gate receipt for HEAD %s\n' "$head"

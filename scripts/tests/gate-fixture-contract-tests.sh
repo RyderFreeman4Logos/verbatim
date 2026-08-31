@@ -402,12 +402,14 @@ PY
     }
 
     prepare_lefthook_fixture() {
-        local repo="$1" lefthook_version
+        local repo="$1" lefthook_version head tree
         lefthook_version="$(lefthook version)"
         [ "$lefthook_version" = 2.1.10 ] \
             || die "expected Lefthook 2.1.10, got $lefthook_version"
         mkdir -p "$repo/scripts/hooks" "$repo/scripts/monolith" "$repo/test-bin"
         run_isolated_git git -C "$repo" init -q
+        run_isolated_git git -C "$repo" config user.email 'fixture@example.invalid'
+        run_isolated_git git -C "$repo" config user.name 'Gate Fixture'
         cp "$root/lefthook.yml" "$repo/lefthook.yml"
         cp "$root/scripts/hooks/check-pre-push-version-bumps.sh" \
             "$repo/scripts/hooks/check-pre-push-version-bumps.sh"
@@ -439,6 +441,13 @@ exit 64
 SH
         chmod +x "$repo/scripts/hooks/check-version-bumped.sh" \
             "$repo/scripts/monolith/check.sh" "$repo/test-bin/just"
+        printf 'fixture\n' >"$repo/fixture"
+        run_isolated_git git -C "$repo" add -- .
+        run_isolated_git git -C "$repo" commit -q -m fixture
+        head="$(run_isolated_git git -C "$repo" rev-parse HEAD)"
+        tree="$(run_isolated_git git -C "$repo" rev-parse "$head^{tree}")"
+        printf 'PRE_HEAD=%s\nPRE_TREE=%s\nPRE_ATTESTATION=PASS\nINNER_GATE_EXIT=0\nPOST_ATTESTATION=PASS\nGATE_EXIT=0\n' \
+            "$head" "$tree" >"$repo/full-gate-receipt.log"
     }
 
     run_lefthook_pre_push() {
@@ -446,6 +455,7 @@ SH
         printf '%s\n' "$refs" | (
             cd "$repo"
             run_isolated_git env GATE_FIXTURE_LOG="${GATE_FIXTURE_LOG:?}" \
+                VERBATIM_FULL_GATE_RECEIPT="$repo/full-gate-receipt.log" \
                 PATH="$repo/test-bin:$PATH" LEFTHOOK_NO_AUTO_INSTALL=1 \
                 lefthook run pre-push --command version-bump --force --no-auto-install
         )
@@ -457,7 +467,7 @@ SH
         log="$repo/boundary.log"
         prepare_lefthook_fixture "$repo"
         : >"$log"
-        object='1111111111111111111111111111111111111111'
+        object="$(run_isolated_git git -C "$repo" rev-parse HEAD)"
         refs="refs/heads/main $object refs/heads/main $object
 refs/tags/v0.1.1 $object refs/tags/v0.1.1 $object"
         output="$(GATE_FIXTURE_LOG="$log" run_lefthook_pre_push "$repo" "$refs" 2>&1)" || {
@@ -468,10 +478,11 @@ refs/tags/v0.1.1 $object refs/tags/v0.1.1 $object"
 monolith|--scope object --object $object
 version|--scope object --object $object
 monolith|--scope object --object $object
-just|pre-push-gate head"
+version|--scope head
+monolith|--scope head"
         [ "$(<"$log")" = "$expected" ] || die 'pre-push boundary did not preserve complete stdin'
-        grep -Fq 'pre-push-gate: PARTIAL PASS (head)' <<<"$output" \
-            || die 'pre-push boundary did not emit its partial receipt'
+        grep -Fq 'attested full-gate receipt' <<<"$output" \
+            || die 'pre-push boundary did not attest its full-gate receipt'
     }
 
     write_lefthook_mutation() {

@@ -7,6 +7,7 @@ run_pre_push_path() {
     local validator_log="$3"
     local full_gate_log="$4"
     local failing_object="${5:-}"
+    local full_gate_receipt="${6:-}"
 
     (
         cd "$repo" || exit
@@ -15,11 +16,23 @@ run_pre_push_path() {
         fi | run_without_local_git_env env \
             BASE_REF=base \
             PATH="$repo/test-bin:$PATH" \
+            VERBATIM_FULL_GATE_RECEIPT="$full_gate_receipt" \
             VERSION_CHECK_FAIL_OBJECT="$failing_object" \
             VERSION_CHECK_FULL_GATE_LOG="$full_gate_log" \
             VERSION_CHECK_VALIDATOR_LOG="$validator_log" \
             "$repo/scripts/hooks/check-pre-push-version-bumps.sh"
     )
+}
+
+write_full_gate_receipt() {
+    local repo="$1"
+    local path="$2"
+    local head="${3:-$(run_without_local_git_env git -C "$repo" rev-parse HEAD)}"
+    local tree="${4:-$(run_without_local_git_env git -C "$repo" rev-parse "$head^{tree}")}"
+    local gate_exit="${5:-0}"
+
+    printf 'GATE_COMMAND=just pre-commit head\nPRE_HEAD=%s\nPRE_TREE=%s\nPRE_ATTESTATION=PASS\nINNER_GATE_EXIT=0\nPOST_ATTESTATION=PASS\nGATE_EXIT=%s\n' \
+        "$head" "$tree" "$gate_exit" >"$path"
 }
 
 run_just_recipe() {
@@ -132,6 +145,10 @@ install_pre_push_recorders() {
         '#!/usr/bin/env bash' \
         'set -euo pipefail' \
         ': "${VERSION_CHECK_VALIDATOR_LOG:?}"' \
+        'if [ "$#" -eq 2 ] && [ "$1" = "--scope" ] && [ "$2" = "head" ]; then' \
+        '    printf "validator|%s|%s\\n" "$1" "$2" >>"$VERSION_CHECK_VALIDATOR_LOG"' \
+        '    exit 0' \
+        'fi' \
         'if [ "$#" -ne 4 ] || [ "$1" != "--scope" ] || [ "$2" != "object" ] || [ "$3" != "--object" ]; then' \
         '    printf "unexpected validator invocation: %s\\n" "$*" >&2' \
         '    exit 64' \
@@ -195,15 +212,6 @@ run_version_pre_push_tests() {
             run_without_local_git_env "$checker" --scope object --object "$unchanged_object" --base-ref base
     )
 
-    internal_gate_output="$(assert_success_output \
-        'internal pre-push aggregate runs the bounded production gate' \
-        run_just_recipe "$repo" pre-push-gate head)"
-    assert_output_count \
-        'internal pre-push aggregate partial receipt' \
-        '^pre-push-gate: PARTIAL PASS \(head\)$' \
-        1 \
-        "$internal_gate_output"
-
     write_manifest "$repo/Cargo.toml" "0.1.0"
     run_without_local_git_env git -C "$repo" add Cargo.toml
     install_pre_push_recorders "$repo"
@@ -211,23 +219,62 @@ run_version_pre_push_tests() {
     full_gate_log="$repo/full-gate.log"
     : >"$validator_log"
     : >"$full_gate_log"
+    full_gate_receipt="$repo/full-gate-receipt.log"
     zero_object='0000000000000000000000000000000000000000'
     multi_ref_input="refs/heads/main $good_object refs/heads/main $zero_object
 refs/tags/v0.1.1 $tag_object refs/tags/v0.1.1 $zero_object"
+
+    write_full_gate_receipt "$repo" "$full_gate_receipt"
     pre_push_output="$(assert_success_output \
-        'pre-push validates every pushed non-deletion object before the full HEAD gate' \
-        run_pre_push_path "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log")"
+        'pre-push attests a matching full-gate receipt without rerunning it' \
+        run_pre_push_path \
+        "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log" '' "$full_gate_receipt")"
     assert_file_content \
-        'pre-push validator calls for multiple refs' \
+        'pre-push validator calls for matching receipt' \
         "validator|--scope|object|--object|$good_object
-validator|--scope|object|--object|$tag_object" \
+validator|--scope|object|--object|$tag_object
+validator|--scope|head" \
         "$validator_log"
     assert_output_count \
-        'pre-push monolith validator calls for multiple refs' \
-        '^Scope: object$' \
-        2 \
+        'pre-push monolith validators attest the matching receipt' \
+        '^Scope: (object|head)$' \
+        3 \
         "$pre_push_output"
-    assert_file_content 'pre-push internal gate call' 'pre-push-gate head' "$full_gate_log"
+    assert_file_content 'matching receipt skips the full gate' '' "$full_gate_log"
+    grep -Fq 'attested full-gate receipt' <<<"$pre_push_output" \
+        || die 'matching receipt did not emit an attestation'
+
+    : >"$validator_log"
+    : >"$full_gate_log"
+    assert_failure_matching \
+        'pre-push fails closed without an exact full-gate receipt' \
+        'missing full-gate receipt' \
+        run_pre_push_path "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log"
+    assert_file_content 'missing receipt does not invoke the full gate' '' "$full_gate_log"
+
+    write_full_gate_receipt "$repo" "$full_gate_receipt" "$unchanged_object"
+    assert_failure_matching \
+        'pre-push rejects a full-gate receipt for another HEAD' \
+        'does not match HEAD' \
+        run_pre_push_path \
+        "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log" '' "$full_gate_receipt"
+    assert_file_content 'mismatched receipt does not invoke the full gate' '' "$full_gate_log"
+
+    write_full_gate_receipt "$repo" "$full_gate_receipt" '' "$zero_object"
+    assert_failure_matching \
+        'pre-push rejects a full-gate receipt for another tree' \
+        'does not match HEAD tree' \
+        run_pre_push_path \
+        "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log" '' "$full_gate_receipt"
+    assert_file_content 'tree-mismatched receipt does not invoke the full gate' '' "$full_gate_log"
+
+    write_full_gate_receipt "$repo" "$full_gate_receipt" '' '' 1
+    assert_failure_matching \
+        'pre-push rejects a nonzero full-gate receipt' \
+        'gate_exit did not pass' \
+        run_pre_push_path \
+        "$repo" "$multi_ref_input" "$validator_log" "$full_gate_log" '' "$full_gate_receipt"
+    assert_file_content 'nonzero receipt does not invoke the full gate' '' "$full_gate_log"
 
     : >"$validator_log"
     : >"$full_gate_log"
@@ -270,13 +317,15 @@ validator|--scope|object|--object|$tag_object" \
 
     : >"$validator_log"
     : >"$full_gate_log"
+    write_full_gate_receipt "$repo" "$full_gate_receipt"
     assert_success \
-        'pre-push skips deletions but still runs the full gate' \
+        'pre-push skips deletions and attests the full gate' \
         run_pre_push_path \
         "$repo" \
         "refs/heads/deleted $zero_object refs/heads/deleted $good_object" \
         "$validator_log" \
-        "$full_gate_log"
-    assert_file_content 'deletion does not invoke the object validator' '' "$validator_log"
-    assert_file_content 'deletion internal gate call' 'pre-push-gate head' "$full_gate_log"
+        "$full_gate_log" \
+        '' "$full_gate_receipt"
+    assert_file_content 'deletion invokes only the head validator' 'validator|--scope|head' "$validator_log"
+    assert_file_content 'deletion skips the full gate' '' "$full_gate_log"
 }
