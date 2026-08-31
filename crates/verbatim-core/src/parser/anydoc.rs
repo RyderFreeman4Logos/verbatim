@@ -6,12 +6,45 @@ use anyhow::{Context, Result};
 
 use crate::parser::text_segments::pdf_page_evidence_units;
 use crate::traits::Parser;
+#[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
+use crate::types::ParsedImageArtifact;
 use crate::types::{DerivedConversionMetadata, EvidenceUnit, SourceId};
+
+fn fallback_to_native_pdf(
+    path: &Path,
+    anydoc_error: anyhow::Error,
+) -> Result<(Vec<EvidenceUnit>, Option<DerivedConversionMetadata>)> {
+    #[cfg(feature = "parser-pdf-oxide")]
+    {
+        crate::parser::oxide::PdfOxideParser
+            .parse(path)
+            .map(|units| (units, None))
+            .map_err(|fallback_error| {
+                anyhow::anyhow!("{anydoc_error}; native PDF fallback failed: {fallback_error}")
+            })
+    }
+    #[cfg(all(not(feature = "parser-pdf-oxide"), feature = "parser-pdfplumber"))]
+    {
+        crate::parser::plumber::PdfPlumberParser
+            .parse(path)
+            .map(|units| (units, None))
+            .map_err(|fallback_error| {
+                anyhow::anyhow!("{anydoc_error}; native PDF fallback failed: {fallback_error}")
+            })
+    }
+    #[cfg(not(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber")))]
+    {
+        let _ = path;
+        Err(anydoc_error)
+    }
+}
 
 const CONVERTER: &str = "anydoc+pdf-inspector";
 const CONVERTER_VERSION: &str = "anydoc@0.2.4;pdf-inspector@1.14.2";
 
-/// Optional PDF adapter that rejects OCR and keeps PDF page anchors native.
+/// Optional PDF adapter that preserves AnyDoc conversion for native PDFs and
+/// falls through to the configured native parser when OCR or image content is
+/// outside AnyDoc's conversion boundary.
 pub struct AnyDocPdfParser;
 
 impl Parser for AnyDocPdfParser {
@@ -34,14 +67,33 @@ impl Parser for AnyDocPdfParser {
     ) -> Result<(Vec<EvidenceUnit>, Option<DerivedConversionMetadata>)> {
         let bytes =
             fs::read(path).with_context(|| format!("failed to read: {}", path.display()))?;
-        let markdown = anydoc::to_markdown_bytes(&bytes, anydoc::Format::Pdf)
-            .map_err(|error| anyhow::anyhow!("anydoc PDF conversion failed: {error}"))?;
-        if markdown.is_empty() {
-            anyhow::bail!("anydoc PDF conversion produced no Markdown");
-        }
+        let markdown = match anydoc::to_markdown_bytes(&bytes, anydoc::Format::Pdf) {
+            Ok(markdown) if !markdown.is_empty() => markdown,
+            Ok(_) => {
+                return fallback_to_native_pdf(
+                    path,
+                    anyhow::anyhow!("anydoc PDF conversion produced no Markdown"),
+                )
+            }
+            Err(error) => {
+                return fallback_to_native_pdf(
+                    path,
+                    anyhow::anyhow!("anydoc PDF conversion failed: {error}"),
+                )
+            }
+        };
 
-        let items = pdf_inspector::extract_text_with_positions_pages(path, None)
-            .context("failed to extract native PDF text with pdf-inspector")?;
+        let items = match pdf_inspector::extract_text_with_positions_pages(path, None) {
+            Ok(items) => items,
+            Err(error) => {
+                return fallback_to_native_pdf(
+                    path,
+                    anyhow::anyhow!(
+                        "failed to extract native PDF text with pdf-inspector: {error}"
+                    ),
+                )
+            }
+        };
         let mut pages = BTreeMap::<u32, String>::new();
         for item in items {
             let text = item.text.trim();
@@ -79,6 +131,15 @@ impl Parser for AnyDocPdfParser {
                 output_hash: crate::types::hex_sha256(markdown.as_bytes()),
             }),
         ))
+    }
+
+    #[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
+    fn extract_image_artifacts_with_limits(
+        &self,
+        path: &Path,
+        limits: crate::image_limits::ImageArtifactLimits,
+    ) -> Result<Vec<ParsedImageArtifact>> {
+        crate::parser::bounded_pdf_images::extract_image_artifacts(path, limits)
     }
 }
 
