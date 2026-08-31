@@ -225,42 +225,37 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
-    fn database_identity(path: &Path) -> (u32, u32) {
-        let conn = Connection::open(path).unwrap();
-        let application_id = conn
-            .query_row("PRAGMA application_id", [], |row| row.get(0))
-            .unwrap();
-        let user_version = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        (application_id, user_version)
+    fn database_identity(path: &Path) -> Result<(u32, u32)> {
+        let conn = Connection::open(path)?;
+        let application_id = conn.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+        let user_version = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        Ok((application_id, user_version))
     }
 
     #[test]
-    fn store_identity_fresh_database_is_stamped_and_reopens() {
-        let dir = tempdir().unwrap();
+    fn store_identity_fresh_database_is_stamped_and_reopens() -> Result<()> {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let path = dir.path().join("fresh.db");
 
-        drop(Store::new(&path).unwrap());
+        drop(Store::new(&path)?);
         assert_eq!(
-            database_identity(&path),
+            database_identity(&path)?,
             (STORE_APPLICATION_ID, STORE_USER_VERSION)
         );
 
-        Store::open_existing_readonly(&path).unwrap();
-        Store::new(&path).unwrap();
+        Store::open_existing_readonly(&path)?;
+        Store::new(&path)?;
+        Ok(())
     }
 
     #[test]
-    fn store_identity_wrong_application_id_fails_writable_and_readonly() {
+    fn store_identity_wrong_application_id_fails_writable_and_readonly() -> Result<()> {
         for readonly in [false, true] {
-            let dir = tempdir().unwrap();
+            let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
             let path = dir.path().join("wrong-product.db");
-            let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "application_id", u32::from_be_bytes(*b"NOPE"))
-                .unwrap();
+            let conn = Connection::open(&path)?;
+            conn.pragma_update(None, "application_id", u32::from_be_bytes(*b"NOPE"))?;
             drop(conn);
 
             let result = if readonly {
@@ -273,16 +268,16 @@ mod tests {
                 .expect("wrong-product database must fail closed");
             assert!(error.to_string().contains("application_id"));
         }
+        Ok(())
     }
 
     #[test]
-    fn store_identity_newer_user_version_fails_writable_and_readonly() {
+    fn store_identity_newer_user_version_fails_writable_and_readonly() -> Result<()> {
         for readonly in [false, true] {
-            let dir = tempdir().unwrap();
+            let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
             let path = dir.path().join("newer.db");
-            let conn = Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", STORE_USER_VERSION + 1)
-                .unwrap();
+            let conn = Connection::open(&path)?;
+            conn.pragma_update(None, "user_version", STORE_USER_VERSION + 1)?;
             drop(conn);
 
             let result = if readonly {
@@ -293,13 +288,14 @@ mod tests {
             let error = result.err().expect("newer database must fail closed");
             assert!(error.to_string().contains("user_version"));
         }
+        Ok(())
     }
 
     #[test]
-    fn store_identity_legacy_unstamped_database_migrates_and_is_stamped() {
-        let dir = tempdir().unwrap();
+    fn store_identity_legacy_unstamped_database_migrates_and_is_stamped() -> Result<()> {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let path = dir.path().join("legacy.db");
-        let conn = Connection::open(&path).unwrap();
+        let conn = Connection::open(&path)?;
         conn.execute_batch(
             "CREATE TABLE tasks (
                 id TEXT PRIMARY KEY,
@@ -313,22 +309,26 @@ mod tests {
                 result_json TEXT,
                 error TEXT
             );",
-        )
-        .unwrap();
+        )?;
         drop(conn);
 
-        let store = Store::new(&path).unwrap();
-        assert!(table_has_column(store.connection(), "tasks", "progress_json").unwrap());
+        let store = Store::new(&path)?;
+        assert!(table_has_column(
+            store.connection(),
+            "tasks",
+            "progress_json"
+        )?);
         drop(store);
         assert_eq!(
-            database_identity(&path),
+            database_identity(&path)?,
             (STORE_APPLICATION_ID, STORE_USER_VERSION)
         );
+        Ok(())
     }
 
     #[test]
-    fn durability_profiles_apply_and_report_effective_pragmas() {
-        let dir = tempdir().unwrap();
+    fn durability_profiles_apply_and_report_effective_pragmas() -> Result<()> {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let cases = [
             (SqliteDurabilityProfile::Durable, "full", 100, "RPO=0"),
             (
@@ -347,8 +347,8 @@ mod tests {
 
         for (profile, synchronous, wal_autocheckpoint_pages, rpo_fragment) in cases {
             let path = dir.path().join(format!("{profile:?}.db"));
-            let store = Store::new_with_durability_profile(&path, profile).unwrap();
-            let effective = store.effective_durability().unwrap();
+            let store = Store::new_with_durability_profile(&path, profile)?;
+            let effective = store.effective_durability()?;
 
             assert_eq!(effective.profile, profile);
             assert_eq!(effective.journal_mode, "wal");
@@ -357,6 +357,7 @@ mod tests {
             assert!(effective.busy_timeout_millis > 0);
             assert!(effective.rpo.contains(rpo_fragment));
         }
+        Ok(())
     }
 
     #[test]
@@ -427,71 +428,65 @@ mod tests {
     }
 
     #[test]
-    fn passive_checkpoint_reports_long_reader_without_unbounded_wal_growth() {
-        let dir = tempdir().unwrap();
+    fn passive_checkpoint_reports_long_reader_without_unbounded_wal_growth() -> Result<()> {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let path = dir.path().join("checkpoint.db");
-        let store =
-            Store::new_with_durability_profile(&path, SqliteDurabilityProfile::Durable).unwrap();
+        let store = Store::new_with_durability_profile(&path, SqliteDurabilityProfile::Durable)?;
         store
             .conn
-            .execute_batch("CREATE TABLE checkpoint_test (value INTEGER NOT NULL);")
-            .unwrap();
+            .execute_batch("CREATE TABLE checkpoint_test (value INTEGER NOT NULL);")?;
 
-        let reader = Connection::open(&path).unwrap();
-        reader.execute_batch("BEGIN DEFERRED;").unwrap();
-        let _: i64 = reader
-            .query_row("SELECT COUNT(*) FROM checkpoint_test", [], |row| row.get(0))
-            .unwrap();
+        let reader = Connection::open(&path)?;
+        reader.execute_batch("BEGIN DEFERRED;")?;
+        let _: i64 =
+            reader.query_row("SELECT COUNT(*) FROM checkpoint_test", [], |row| row.get(0))?;
         store
             .conn
-            .execute("INSERT INTO checkpoint_test (value) VALUES (1)", [])
-            .unwrap();
+            .execute("INSERT INTO checkpoint_test (value) VALUES (1)", [])?;
 
-        let checkpoint = store.checkpoint_wal().unwrap();
+        let checkpoint = store.checkpoint_wal()?;
         assert!(checkpoint.blocked);
         assert!(checkpoint.log_frames > checkpoint.checkpointed_frames);
 
-        reader.execute_batch("ROLLBACK;").unwrap();
-        let shutdown = store.checkpoint_wal_on_shutdown().unwrap();
+        reader.execute_batch("ROLLBACK;")?;
+        let shutdown = store.checkpoint_wal_on_shutdown()?;
         assert_eq!(shutdown.mode, SqliteCheckpointMode::Truncate);
+        Ok(())
     }
 
     #[test]
-    fn recovery_integrity_check_accepts_a_clean_database() {
-        let store = Store::in_memory().unwrap();
-        store.verify_integrity_after_recovery().unwrap();
+    fn recovery_integrity_check_accepts_a_clean_database() -> Result<()> {
+        let store = Store::in_memory()?;
+        store.verify_integrity_after_recovery()?;
+        Ok(())
     }
 
     #[test]
-    fn reopen_recovers_committed_wal_rows_retained_by_a_reader() {
-        let dir = tempdir().unwrap();
+    fn reopen_recovers_committed_wal_rows_retained_by_a_reader() -> Result<()> {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
         let path = dir.path().join("recovery.db");
-        let store =
-            Store::new_with_durability_profile(&path, SqliteDurabilityProfile::Durable).unwrap();
+        let store = Store::new_with_durability_profile(&path, SqliteDurabilityProfile::Durable)?;
         store
             .conn
-            .execute_batch("CREATE TABLE recovery_test (value INTEGER NOT NULL);")
-            .unwrap();
+            .execute_batch("CREATE TABLE recovery_test (value INTEGER NOT NULL);")?;
 
-        let reader = Connection::open(&path).unwrap();
-        reader.execute_batch("BEGIN DEFERRED;").unwrap();
-        let _: i64 = reader
-            .query_row("SELECT COUNT(*) FROM recovery_test", [], |row| row.get(0))
-            .unwrap();
+        let reader = Connection::open(&path)?;
+        reader.execute_batch("BEGIN DEFERRED;")?;
+        let _: i64 =
+            reader.query_row("SELECT COUNT(*) FROM recovery_test", [], |row| row.get(0))?;
         store
             .conn
-            .execute("INSERT INTO recovery_test (value) VALUES (7)", [])
-            .unwrap();
+            .execute("INSERT INTO recovery_test (value) VALUES (7)", [])?;
         drop(store);
 
-        let reopened =
-            Store::new_with_durability_profile(&path, SqliteDurabilityProfile::Durable).unwrap();
-        let rows: i64 = reopened
-            .conn
-            .query_row("SELECT COUNT(*) FROM recovery_test", [], |row| row.get(0))
-            .unwrap();
+        let reopened = Store::new_with_durability_profile(&path, SqliteDurabilityProfile::Durable)?;
+        let rows: i64 =
+            reopened
+                .conn
+                .query_row("SELECT COUNT(*) FROM recovery_test", [], |row| row.get(0))?;
         assert_eq!(rows, 1, "committed WAL row must survive a writer restart");
-        reopened.verify_integrity_after_recovery().unwrap();
-        reader.execute_batch("ROLLBACK;").unwrap();
+        reopened.verify_integrity_after_recovery()?;
+        reader.execute_batch("ROLLBACK;")?;
+        Ok(())
     }
 }
