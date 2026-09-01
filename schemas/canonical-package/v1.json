@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://verbatim.dev/schemas/canonical-package/v1.json",
+  "title": "Verbatim canonical package v1 manifest",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "profile", "content_kind", "work_id", "version_id", "language"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$"},
+    "profile": {"type": "string", "minLength": 1},
+    "content_kind": {"type": "string", "minLength": 1},
+    "work_id": {"type": "string", "minLength": 1},
+    "version_id": {"type": "string", "minLength": 1},
+    "language": {"type": "string", "minLength": 1}
+  }
+}
