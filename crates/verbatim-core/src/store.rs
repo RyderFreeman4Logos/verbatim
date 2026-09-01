@@ -19,6 +19,8 @@ use crate::types::{
     GraphEdge, GraphEdgeId, GraphNode, GraphNodeId, ImageArtifact, ImageId, Source,
     SourceEmbeddingStatus, SourceId, SourceStatus, DEFAULT_EMBEDDING_PROFILE_ID,
 };
+#[cfg(test)]
+use crate::types::{EvidenceKind, GraphNodeKind};
 use crate::vision_caption::{ImageCaption, ImageCaptionRecord, ImageCaptionStatus};
 use anyhow::{bail, Context, Result};
 use rusqlite::{
