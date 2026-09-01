@@ -3,7 +3,7 @@
 A canonical package is a directory containing exactly the required walking-skeleton files:
 
 - `manifest.json`: schema version, profile, content kind, work ID, edition/version ID, language, and optional original-source SHA-256 plus `DerivedConversionMetadata`.
-- `units.jsonl`: one canonical unit per line. Units retain the existing canonical JSONL fields and IDs (`cjson:v1:`), must match manifest identity fields, include text, and include at least one serialized `BackingSelector`. Supplied selectors are retained; the walking skeleton resolves `SourceNative { scheme: "usfm" }` against the unit's canonical reference. An optional `text_hash` must match the text.
+- `units.jsonl`: one canonical unit per line. Each unit has a unique nonempty `unit_id`, persisted as its evidence identity; legacy single-file canonical JSONL retains generated `cjson:v1:` IDs. Units must match manifest identity fields, include text, and include at least one serialized `BackingSelector`. Supplied selectors are retained; the walking skeleton resolves `SourceNative { scheme: "usfm" }` against the unit's canonical reference. An optional `text_hash` must match the text.
 
 Validate locally without a daemon:
 
