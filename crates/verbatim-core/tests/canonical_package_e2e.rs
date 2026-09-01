@@ -202,6 +202,40 @@ async fn canonical_package_ingests_verse_and_footnote_as_distinct_kinds() {
 }
 
 #[tokio::test]
+async fn canonical_package_footnote_text_stays_out_of_verse_chunks() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+    let source_id = pipeline.add_source(&fixture("verse-footnote")).unwrap();
+
+    pipeline.ingest_source(&source_id).await.unwrap();
+    let footnote_text = pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap()
+        .into_iter()
+        .find(|unit| unit.id.0 == "pkg:john-3-16-note-1")
+        .unwrap()
+        .text;
+    let verse_chunks = pipeline
+        .store()
+        .list_chunks_by_source(&source_id)
+        .unwrap()
+        .into_iter()
+        .filter(|chunk| {
+            chunk
+                .evidence_unit_ids
+                .iter()
+                .any(|id| id.0 == "pkg:john-3-16")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(!verse_chunks.is_empty());
+    assert!(verse_chunks
+        .iter()
+        .all(|chunk| !chunk.text.contains(&footnote_text)));
+}
+
+#[tokio::test]
 async fn canonical_package_footnote_relation_resolves_to_verse_anchor() {
     let tempdir = tempfile::tempdir().unwrap();
     let mut pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
