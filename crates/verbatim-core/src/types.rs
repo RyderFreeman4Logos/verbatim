@@ -281,6 +281,7 @@ pub enum EdgeType {
     PageContainsImage,
     ImageNearText,
     MarkdownLinksTo,
+    FootnoteReferencesVerse,
     GeneratedDependsOn,
     GeneratedImplements,
     GeneratedMentions,
@@ -304,6 +305,7 @@ impl EdgeType {
             Self::PageContainsImage => "page_contains_image",
             Self::ImageNearText => "image_near_text",
             Self::MarkdownLinksTo => "markdown_links_to",
+            Self::FootnoteReferencesVerse => "footnote_references_verse",
             Self::GeneratedDependsOn => "generated_depends_on",
             Self::GeneratedImplements => "generated_implements",
             Self::GeneratedMentions => "generated_mentions",
@@ -668,6 +670,8 @@ pub struct Source {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceKind {
     Text,
+    Verse,
+    Footnote,
     Ocr,
     Image,
     Generated,

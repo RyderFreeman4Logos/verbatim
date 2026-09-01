@@ -1,9 +1,10 @@
 # Canonical package v1
 
-A canonical package is a directory containing exactly the required walking-skeleton files:
+A canonical package is a directory containing `manifest.json`, `units.jsonl`, and an optional `relations.jsonl`:
 
 - `manifest.json`: schema version, profile, content kind, work ID, edition/version ID, language, and optional original-source SHA-256 plus `DerivedConversionMetadata`.
-- `units.jsonl`: one canonical unit per line. Each unit has a unique nonempty `unit_id`, persisted as its evidence identity; legacy single-file canonical JSONL retains generated `cjson:v1:` IDs. Units must match manifest identity fields, include text, and include at least one serialized `BackingSelector`. Supplied selectors are retained; the walking skeleton resolves `SourceNative { scheme: "usfm" }` against the unit's canonical reference. An optional `text_hash` must match the text.
+- `units.jsonl`: one canonical unit per line. Each unit has a unique nonempty `unit_id`, persisted as its evidence identity; legacy single-file canonical JSONL retains generated `cjson:v1:` IDs. Units must match manifest identity fields, include text, and include at least one serialized `BackingSelector`. Supplied selectors are retained; the walking skeleton resolves `SourceNative { scheme: "usfm" }` against the unit's canonical reference. An optional `text_hash` must match the text. Unit `content_kind` accepts `verse` and `footnote` (or the legacy `text` default).
+- `relations.jsonl` (optional): a `footnote_references_verse` relation from a footnote unit ID to a verse unit ID.
 
 Validate locally without a daemon:
 
@@ -14,4 +15,4 @@ verbatim canonical validate path/to/package --format json
 
 Validation is fail-closed for unsupported schema majors and malformed or unresolvable source-native selectors. JSON reports expose package hash separately from original-source/converter provenance and each unit's canonical locator, selector, and text hash. Package validation runs before source registration; invalid packages do not create source or index state.
 
-Legacy single-file canonical `.jsonl` ingest remains supported unchanged. This v1 boundary does not yet cover relations, assets, source trees, exhaustive hierarchy validation, or migration.
+Legacy single-file canonical `.jsonl` ingest remains supported unchanged. This v1 boundary does not yet cover assets, source trees, exhaustive hierarchy validation, or migration.

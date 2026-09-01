@@ -11,6 +11,8 @@ pub(crate) fn evidence_debug_role(
 
     match evidence.kind {
         crate::types::EvidenceKind::Text => RetrievalEvidenceRole::OriginalText,
+        crate::types::EvidenceKind::Verse => RetrievalEvidenceRole::OriginalText,
+        crate::types::EvidenceKind::Footnote => RetrievalEvidenceRole::OriginalText,
         crate::types::EvidenceKind::Ocr => RetrievalEvidenceRole::OcrText,
         crate::types::EvidenceKind::Image => RetrievalEvidenceRole::ImageArtifact,
         crate::types::EvidenceKind::Generated if evidence.derived_from.is_some() => {

@@ -25,6 +25,16 @@ fn write_package(path: &Path, schema_version: &str, units: &str) {
     fs::write(path.join("units.jsonl"), units).unwrap();
 }
 
+fn relation_package(tempdir: &tempfile::TempDir, relation: &str) -> PathBuf {
+    let package = tempdir.path().join("relation");
+    fs::create_dir(&package).unwrap();
+    for file in ["manifest.json", "units.jsonl"] {
+        fs::copy(fixture("verse-footnote").join(file), package.join(file)).unwrap();
+    }
+    fs::write(package.join("relations.jsonl"), relation).unwrap();
+    package
+}
+
 #[test]
 fn canonical_package_validates_golden_package() {
     let report = validate_package(&fixture("valid"));
@@ -166,6 +176,103 @@ async fn canonical_package_ingest_preserves_unit_identity() {
         ingested_ids.into_iter().map(|id| id.0).collect::<Vec<_>>(),
         ["pkg:john-3-16", "pkg:john-4-1"]
     );
+}
+
+#[tokio::test]
+async fn canonical_package_ingests_verse_and_footnote_as_distinct_kinds() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+    let source_id = pipeline.add_source(&fixture("verse-footnote")).unwrap();
+
+    pipeline.ingest_source(&source_id).await.unwrap();
+    let evidence = pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap()
+        .into_iter()
+        .map(|unit| (unit.id.0.clone(), unit))
+        .collect::<BTreeMap<_, _>>();
+
+    let verse = &evidence["pkg:john-3-16"];
+    let footnote = &evidence["pkg:john-3-16-note-1"];
+    assert_eq!(serde_json::to_value(verse.kind).unwrap(), "Verse");
+    assert_eq!(serde_json::to_value(footnote.kind).unwrap(), "Footnote");
+    assert_eq!(verse.text, "For God so loved the world.");
+    assert!(!verse.text.contains(&footnote.text));
+}
+
+#[tokio::test]
+async fn canonical_package_footnote_relation_resolves_to_verse_anchor() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+    let source_id = pipeline.add_source(&fixture("verse-footnote")).unwrap();
+
+    pipeline.ingest_source(&source_id).await.unwrap();
+    let note_node = verbatim_core::types::GraphNodeId::new(
+        &source_id,
+        verbatim_core::types::GraphNodeKind::EvidenceUnit,
+        "pkg:john-3-16-note-1",
+    );
+    let verse_node = verbatim_core::types::GraphNodeId::new(
+        &source_id,
+        verbatim_core::types::GraphNodeKind::EvidenceUnit,
+        "pkg:john-3-16",
+    );
+
+    assert!(pipeline
+        .store()
+        .list_graph_edges_by_source(&source_id)
+        .unwrap()
+        .iter()
+        .any(|edge| {
+            serde_json::to_value(edge.edge_type).unwrap() == "footnote_references_verse"
+                && edge.from_node_id == note_node
+                && edge.to_node_id == verse_node
+        }));
+}
+
+#[test]
+fn canonical_package_rejects_unknown_content_kind() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let error = pipeline
+        .add_source(&fixture("unknown-content-kind"))
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("CANONICAL_PACKAGE_UNIT_CONTENT_KIND_UNKNOWN"));
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
+}
+
+#[test]
+fn canonical_package_rejects_relation_to_missing_unit() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = relation_package(
+        &tempdir,
+        r#"{"relation_type":"footnote_references_verse","from_unit_id":"pkg:john-3-16-note-1","to_unit_id":"pkg:missing"}"#,
+    );
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let error = pipeline.add_source(&package).unwrap_err().to_string();
+
+    assert!(error.contains("CANONICAL_PACKAGE_RELATION_ENDPOINT_UNKNOWN"));
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
+}
+
+#[test]
+fn canonical_package_rejects_reversed_footnote_relation() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = relation_package(
+        &tempdir,
+        r#"{"relation_type":"footnote_references_verse","from_unit_id":"pkg:john-3-16","to_unit_id":"pkg:john-3-16-note-1"}"#,
+    );
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let error = pipeline.add_source(&package).unwrap_err().to_string();
+
+    assert!(error.contains("CANONICAL_PACKAGE_RELATION_KIND_INVALID"));
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
 }
 
 #[test]
