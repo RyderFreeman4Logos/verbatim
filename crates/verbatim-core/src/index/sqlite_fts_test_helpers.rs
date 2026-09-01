@@ -26,6 +26,7 @@ pub(super) fn evidence(source_id: &SourceId, id: &str) -> EvidenceUnit {
         heading_path: Vec::new(),
         language: None,
         position: 0,
+        annotations: Default::default(),
     }
 }
 

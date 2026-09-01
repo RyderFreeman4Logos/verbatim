@@ -344,6 +344,7 @@ mod tests {
             heading_path: vec!["H".to_string()],
             language: None,
             position: 0,
+            annotations: Default::default(),
         }
     }
 

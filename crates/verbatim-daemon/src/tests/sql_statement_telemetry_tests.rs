@@ -158,6 +158,7 @@ fn populated_bm25_evidence(
         heading_path: vec!["Startup".into()],
         language: None,
         position,
+        annotations: Default::default(),
     }
 }
 

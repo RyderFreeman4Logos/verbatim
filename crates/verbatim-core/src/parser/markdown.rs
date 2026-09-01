@@ -351,6 +351,7 @@ fn flush_block(
             .collect(),
         language: None,
         position: *position,
+        annotations: Default::default(),
     });
     *position += 1;
 }

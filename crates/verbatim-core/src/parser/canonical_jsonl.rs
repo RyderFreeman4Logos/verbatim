@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -90,6 +90,12 @@ impl Parser for CanonicalJsonlParser {
                     path.display()
                 );
             }
+            let annotations = entry
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.annotations.clone())
+                .unwrap_or_default();
+            validate_annotations(&annotations, line_no, path)?;
 
             let components: Vec<ReferenceComponent> = entry
                 .components
@@ -156,6 +162,7 @@ impl Parser for CanonicalJsonlParser {
                 heading_path,
                 language: entry.language.clone(),
                 position: (index - 1) as u32,
+                annotations,
             });
         }
 
@@ -230,6 +237,28 @@ fn build_normalized(components: &[ReferenceComponent]) -> String {
         .join(":")
 }
 
+fn validate_annotations(
+    annotations: &BTreeMap<String, String>,
+    line_no: u32,
+    path: &Path,
+) -> Result<()> {
+    if annotations.len() > 8 {
+        bail!(
+            "canonical JSONL annotations exceed maximum key count (8) on line {line_no} of {}",
+            path.display()
+        );
+    }
+    for (key, value) in annotations {
+        if key.len() > 64 || value.len() > 64 {
+            bail!(
+                "canonical JSONL annotations key or value exceeds maximum size (64 bytes) on line {line_no} of {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 // ---- Serde structs for JSONL deserialization ----
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +297,8 @@ struct JsonlComponent {
 struct JsonlMetadata {
     #[serde(default)]
     section_heading: Option<String>,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
 }
 
 #[cfg(test)]

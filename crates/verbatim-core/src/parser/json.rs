@@ -75,6 +75,7 @@ impl JsonScalarText {
             text,
             language: None,
             position: position.try_into().unwrap_or(u32::MAX),
+            annotations: Default::default(),
         }
     }
 }

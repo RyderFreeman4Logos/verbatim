@@ -1351,6 +1351,7 @@ mod tests {
                     heading_path: vec!["Chapter 2".into()],
                     language: None,
                     position: 0,
+                    annotations: Default::default(),
                 },
                 EvidenceUnit {
                     id: EvidenceId("ev-2".into()),
@@ -1367,6 +1368,7 @@ mod tests {
                     heading_path: vec![],
                     language: None,
                     position: 1,
+                    annotations: Default::default(),
                 },
             ],
             provenance: RetrievalProvenance::seed(1, ChunkId("c1".into()), SourceId("src".into())),
@@ -1432,7 +1434,8 @@ mod tests {
                     heading_path: vec!["Generated image captions".into()],
                     language: None,
                     position: 10,
-                },
+                                    annotations: Default::default(),
+},
                 EvidenceUnit {
                     id: EvidenceId("img-1".into()),
                     source_id: SourceId("src".into()),
@@ -1444,7 +1447,8 @@ mod tests {
                     heading_path: vec![],
                     language: None,
                     position: 9,
-                },
+                                    annotations: Default::default(),
+},
             ],
             provenance: RetrievalProvenance::seed(
                 1,
@@ -1508,6 +1512,7 @@ mod tests {
                 heading_path: vec!["OCR text".into()],
                 language: None,
                 position: 3,
+                annotations: Default::default(),
             }],
             provenance: RetrievalProvenance::seed(1, chunk_id, source_id),
         }]
@@ -2139,6 +2144,7 @@ mod tests {
             heading_path: vec![],
             language: None,
             position: 11,
+            annotations: Default::default(),
         });
         let artifacts = [sample_image_artifact(), artifact_two];
 

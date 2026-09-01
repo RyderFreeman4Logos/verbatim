@@ -139,6 +139,7 @@ mod tests {
             heading_path: Vec::new(),
             language: None,
             position,
+            annotations: Default::default(),
         }
     }
 
@@ -174,6 +175,7 @@ mod tests {
                     format!("john:3:{position}"),
                 ),
             },
+            annotations: Default::default(),
             ..text_evidence(source_id, id, text, position)
         }
     }

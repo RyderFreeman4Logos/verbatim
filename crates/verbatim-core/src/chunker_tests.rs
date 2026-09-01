@@ -20,6 +20,7 @@ fn make_evidence(n: usize, heading: &str) -> Vec<EvidenceUnit> {
             },
             language: None,
             position: i as u32,
+            annotations: Default::default(),
         })
         .collect()
 }
@@ -559,6 +560,7 @@ fn markdown_evidence(
         heading_path: vec![heading_text],
         language: None,
         position,
+        annotations: Default::default(),
     }
 }
 
