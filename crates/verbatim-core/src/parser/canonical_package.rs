@@ -155,6 +155,9 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
         }
         Err(error) => diagnostics.push(diagnostic("CANONICAL_PACKAGE_UNITS_MISSING", UNITS, error)),
     }
+    if let Err(error) = CanonicalJsonlParser.parse(&units_path) {
+        diagnostics.push(diagnostic("CANONICAL_PACKAGE_UNIT_INVALID", UNITS, error));
+    }
     if unit_count == 0
         && diagnostics
             .iter()
@@ -218,7 +221,12 @@ fn validate_manifest(manifest: &Manifest, diagnostics: &mut Vec<CanonicalPackage
         .next()
         .and_then(|major| major.parse::<u64>().ok())
     {
-        Some(SUPPORTED_MAJOR) => {}
+        Some(SUPPORTED_MAJOR) if is_supported_schema_version(&manifest.schema_version) => {}
+        Some(SUPPORTED_MAJOR) => diagnostics.push(CanonicalPackageDiagnostic {
+            code: "CANONICAL_PACKAGE_SCHEMA_VERSION_INVALID",
+            location: MANIFEST.into(),
+            message: "schema_version must match 1.<minor>.<patch>".into(),
+        }),
         Some(_) => diagnostics.push(CanonicalPackageDiagnostic {
             code: "CANONICAL_PACKAGE_UNSUPPORTED_SCHEMA_MAJOR",
             location: MANIFEST.into(),
@@ -233,6 +241,18 @@ fn validate_manifest(manifest: &Manifest, diagnostics: &mut Vec<CanonicalPackage
         }
         None => {}
     }
+}
+
+fn is_supported_schema_version(version: &str) -> bool {
+    let mut parts = version.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some("1"), Some(minor), Some(patch), None)
+            if !minor.is_empty()
+                && !patch.is_empty()
+                && minor.bytes().all(|byte| byte.is_ascii_digit())
+                && patch.bytes().all(|byte| byte.is_ascii_digit())
+    )
 }
 
 fn validate_unit(
