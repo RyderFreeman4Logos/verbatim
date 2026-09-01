@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -9,8 +10,8 @@ use sha2::{Digest, Sha256};
 use crate::parser::canonical_jsonl::CanonicalJsonlParser;
 use crate::traits::Parser;
 use crate::types::{
-    hex_sha256, BackingSelector, CanonicalLocator, DerivedConversionMetadata, EvidenceUnit,
-    SourceId, SourceLocator,
+    hex_sha256, BackingSelector, CanonicalLocator, DerivedConversionMetadata, EvidenceId,
+    EvidenceUnit, SourceId, SourceLocator,
 };
 
 const MANIFEST: &str = "manifest.json";
@@ -69,6 +70,8 @@ struct Manifest {
 #[derive(Debug, Default, Deserialize)]
 struct Unit {
     #[serde(default)]
+    unit_id: String,
+    #[serde(default)]
     source_profile: String,
     #[serde(default)]
     work_id: String,
@@ -110,8 +113,13 @@ impl Parser for CanonicalPackageParser {
             );
         }
         let mut units = CanonicalJsonlParser.parse(&path.join(UNITS))?;
+        let unit_ids = package_unit_ids(&path.join(UNITS))?;
+        if units.len() != unit_ids.len() {
+            bail!("canonical package unit identity count mismatch");
+        }
         let source_id = SourceId::from_path(path);
-        for unit in &mut units {
+        for (unit, unit_id) in units.iter_mut().zip(unit_ids) {
+            unit.id = EvidenceId(unit_id);
             unit.source_id = source_id.clone();
         }
         Ok(units)
@@ -146,6 +154,7 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
     validate_manifest(&manifest, &mut diagnostics);
 
     let mut unit_count = 0;
+    let mut unit_id_locations = HashMap::new();
     match fs::File::open(&units_path) {
         Ok(file) => {
             for (index, line) in BufReader::new(file).lines().enumerate() {
@@ -164,7 +173,15 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
                 };
                 unit_count += 1;
                 match serde_json::from_str::<Unit>(&line) {
-                    Ok(unit) => validate_unit(&unit, &manifest, &location, &mut diagnostics),
+                    Ok(unit) => {
+                        validate_unit(&unit, &manifest, &location, &mut diagnostics);
+                        validate_unit_id(
+                            &unit,
+                            &location,
+                            &mut unit_id_locations,
+                            &mut diagnostics,
+                        );
+                    }
                     Err(error) => diagnostics.push(diagnostic(
                         "CANONICAL_PACKAGE_UNIT_INVALID",
                         &location,
@@ -302,6 +319,7 @@ fn validate_unit(
     diagnostics: &mut Vec<CanonicalPackageDiagnostic>,
 ) {
     for (field, value) in [
+        ("unit_id", &unit.unit_id),
         ("source_profile", &unit.source_profile),
         ("work_id", &unit.work_id),
         ("version_id", &unit.version_id),
@@ -356,6 +374,40 @@ fn validate_unit(
             });
         }
     }
+}
+
+fn validate_unit_id(
+    unit: &Unit,
+    location: &str,
+    unit_id_locations: &mut HashMap<String, String>,
+    diagnostics: &mut Vec<CanonicalPackageDiagnostic>,
+) {
+    if unit.unit_id.trim().is_empty() {
+        return;
+    }
+    if let Some(first_location) = unit_id_locations.insert(unit.unit_id.clone(), location.into()) {
+        diagnostics.push(CanonicalPackageDiagnostic {
+            code: "CANONICAL_PACKAGE_UNIT_ID_DUPLICATE",
+            location: location.into(),
+            message: format!("unit_id duplicates {first_location}"),
+        });
+    }
+}
+
+fn package_unit_ids(path: &Path) -> Result<Vec<String>> {
+    let mut unit_ids = Vec::new();
+    for line in BufReader::new(fs::File::open(path)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        unit_ids.push(
+            serde_json::from_str::<Unit>(&line)
+                .map(|unit| unit.unit_id)
+                .context("parse canonical package unit identity")?,
+        );
+    }
+    Ok(unit_ids)
 }
 
 fn validate_source_native_selector(

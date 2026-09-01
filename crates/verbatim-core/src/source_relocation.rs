@@ -3,17 +3,6 @@
 //! Parser output is path-keyed, while the catalog identity must remain stable across a
 //! relocation. This module owns the one fail-closed remap seam and the one SQLite
 //! transaction that updates location-bearing catalog fields.
-
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::fs;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
-
 use super::{
     map_storage_error, row_to_evidence_unit, status_to_str, str_to_status, SqliteWriteOperation,
     Store,
@@ -26,15 +15,20 @@ use crate::types::{
     EvidenceId, EvidenceKind, EvidenceUnit, GraphNodeId, GraphNodeKind, Source, SourceId,
     SourceLocator, SourceStatus,
 };
-
+use anyhow::{bail, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 #[path = "source_relocation/collection_boundary.rs"]
 mod collection_boundary;
 #[path = "source_relocation/held_snapshot.rs"]
 mod held_snapshot;
-
 use collection_boundary::collection_covering_path;
 use held_snapshot::{open_relocation_target, relocation_target_io_error, HeldInputSnapshot};
-
 /// Stable daemon-facing classification for expected source relocation failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceRelocationErrorKind {
@@ -43,13 +37,11 @@ pub enum SourceRelocationErrorKind {
     /// The requested source identity is not present in the catalog.
     NotFound,
 }
-
 #[derive(Debug)]
 struct SourceRelocationError {
     kind: SourceRelocationErrorKind,
     source: anyhow::Error,
 }
-
 impl fmt::Display for SourceRelocationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.source.fmt(formatter)
@@ -161,8 +153,13 @@ where
             }
             let mut parsed = parsed?;
             crate::pdf_selector::attach_pdf_selectors(&mut parsed, &source.hash, parser_used);
-            let mut parsed = remap_parser_evidence_identity(parsed, &parser_source_id, source_id)
-                .map_err(validation_error)?;
+            let mut parsed = remap_parser_evidence_identity(
+                parsed,
+                &parser_source_id,
+                source_id,
+                parser.name() == "canonical_package",
+            )
+            .map_err(validation_error)?;
             rewrite_relocation_locator_paths(&mut parsed, &parser_path, &canonical_path)
                 .map_err(validation_error)?;
             target.validate_content_identity(&source.hash)?;
@@ -538,11 +535,12 @@ fn path_entry_is_missing(path: &Path) -> Result<bool> {
     }
 }
 
-/// Remap path-keyed IDs while retaining strict self-contained canonical JSONL IDs.
+/// Remap path-keyed IDs while retaining self-contained canonical IDs.
 pub(crate) fn remap_parser_evidence_identity(
     evidence: Vec<EvidenceUnit>,
     parser_source_id: &SourceId,
     catalog_source_id: &SourceId,
+    preserves_unit_ids: bool,
 ) -> Result<Vec<EvidenceUnit>> {
     let mut remapped_ids = HashMap::with_capacity(evidence.len());
     let mut output_ids = HashSet::with_capacity(evidence.len());
@@ -559,7 +557,9 @@ pub(crate) fn remap_parser_evidence_identity(
             Some(suffix) if suffix.starts_with(':') => {
                 EvidenceId(format!("{}{suffix}", catalog_source_id.0))
             }
-            _ if parser::canonical_jsonl::is_generated_evidence_id(&unit.id) => unit.id.clone(),
+            _ if parser::canonical_jsonl::is_generated_evidence_id(&unit.id) || preserves_unit_ids => {
+                unit.id.clone()
+            }
             _ => bail!(
                 "parser evidence id is neither source-prefixed by {} nor a valid self-contained canonical JSONL id: {}",
                 bounded_text(&parser_source_id.0),

@@ -2048,6 +2048,7 @@ where
                 parsed_evidence,
                 &SourceId::from_path(&source.path),
                 source_id,
+                parser.name() == "canonical_package",
             )?;
             let parsed_image_artifacts = extract_image_artifacts_for_ingest(
                 parser.as_ref(),
@@ -10427,6 +10428,88 @@ model = "local-vision"
             VectorIndexResidency::LowMemory => assert!(pipeline.hnsw().is_empty()),
             VectorIndexResidency::ResidentHnsw => assert_eq!(pipeline.hnsw().len(), vectors.len()),
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_package_text_edit_invalidates_only_changed_unit_vectors() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let package = tempdir.path().join("package");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("manifest.json"),
+            r#"{"schema_version":"1.0.0","profile":"bible","content_kind":"text","work_id":"KJV","version_id":"public-domain","language":"en"}"#,
+        )
+        .unwrap();
+        let original = concat!(
+            r#"{"unit_id":"pkg:john-3-16","source_profile":"bible","work_id":"KJV","version_id":"public-domain","language":"en","components":[{"level":"book","value":"John","ordinal":43},{"level":"chapter","value":"3","ordinal":3},{"level":"verse","value":"16","ordinal":16}],"text":"stable text","backing_selectors":[{"type":"SourceNative","scheme":"usfm","value":"JHN 3:16"}]}"#,
+            "\n",
+            r#"{"unit_id":"pkg:john-4-1","source_profile":"bible","work_id":"KJV","version_id":"public-domain","language":"en","components":[{"level":"book","value":"John","ordinal":43},{"level":"chapter","value":"4","ordinal":4},{"level":"verse","value":"1","ordinal":1}],"text":"changed text","backing_selectors":[{"type":"SourceNative","scheme":"usfm","value":"JHN 4:1"}]}"#,
+            "\n"
+        );
+        std::fs::write(package.join("units.jsonl"), original).unwrap();
+        let store = Store::in_memory().unwrap();
+        let embedding = RecordingEmbeddingClient::new();
+        let mut pipeline = IngestPipeline::from_parts(
+            store,
+            HnswIndex::new(),
+            embedding.clone(),
+            tempdir.path().to_path_buf(),
+        );
+        let source_id = pipeline.add_source(&package).unwrap();
+
+        let first = pipeline.ingest_source(&source_id).await.unwrap();
+        let first_chunks = pipeline.store().list_chunks_by_source(&source_id).unwrap();
+        let first_stable = first_chunks
+            .iter()
+            .find(|chunk| {
+                chunk.chunk_type == ChunkType::Child
+                    && chunk.evidence_unit_ids == [EvidenceId("pkg:john-3-16".into())]
+            })
+            .unwrap()
+            .clone();
+        let first_changed = first_chunks
+            .iter()
+            .find(|chunk| {
+                chunk.chunk_type == ChunkType::Child
+                    && chunk.evidence_unit_ids == [EvidenceId("pkg:john-4-1".into())]
+            })
+            .unwrap()
+            .clone();
+        assert_eq!(first.cache_misses, 2);
+
+        std::fs::write(
+            package.join("units.jsonl"),
+            original.replace("changed text", "changed text edited"),
+        )
+        .unwrap();
+        let second = pipeline.ingest_source(&source_id).await.unwrap();
+        let second_chunks = pipeline.store().list_chunks_by_source(&source_id).unwrap();
+        let second_stable = second_chunks
+            .iter()
+            .find(|chunk| chunk.id == first_stable.id)
+            .unwrap();
+        let second_changed = second_chunks
+            .iter()
+            .find(|chunk| chunk.evidence_unit_ids == [EvidenceId("pkg:john-4-1".into())])
+            .unwrap();
+
+        assert_eq!(second.cache_hits, 1);
+        assert_eq!(second.cache_misses, 1);
+        assert_eq!(second.reused_chunks, 1);
+        assert_eq!(second.changed_chunks, 1);
+        assert_eq!(second.embedded_chunks, 1);
+        assert_eq!(second_stable.chunk_hash, first_stable.chunk_hash);
+        assert_eq!(
+            second_stable.embedding_input_hash,
+            first_stable.embedding_input_hash
+        );
+        assert_ne!(second_changed.id, first_changed.id);
+        assert_ne!(second_changed.chunk_hash, first_changed.chunk_hash);
+        assert_ne!(
+            second_changed.embedding_input_hash,
+            first_changed.embedding_input_hash
+        );
+        assert_eq!(embedding.calls().len(), 2);
     }
 
     #[tokio::test]

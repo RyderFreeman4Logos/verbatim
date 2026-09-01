@@ -363,6 +363,7 @@ fn issue_332_parser_identity_remap_is_complete_and_fail_closed() {
         vec![first.clone(), second.clone()],
         &parser_source,
         &catalog_source,
+        false,
     )
     .unwrap();
     assert_eq!(remapped[0].id, EvidenceId("catalog-source:first".into()));
@@ -374,7 +375,7 @@ fn issue_332_parser_identity_remap_is_complete_and_fail_closed() {
         Some(EvidenceId("catalog-source:first".into()))
     );
     assert_eq!(
-        remap_parser_evidence_identity(vec![first.clone()], &parser_source, &parser_source)
+        remap_parser_evidence_identity(vec![first.clone()], &parser_source, &parser_source, false)
             .unwrap()[0]
             .id,
         first.id
@@ -382,25 +383,33 @@ fn issue_332_parser_identity_remap_is_complete_and_fail_closed() {
 
     let mut mixed = first.clone();
     mixed.source_id = SourceId("other-source".into());
-    assert!(remap_parser_evidence_identity(vec![mixed], &parser_source, &catalog_source).is_err());
+    assert!(
+        remap_parser_evidence_identity(vec![mixed], &parser_source, &catalog_source, false)
+            .is_err()
+    );
     for bad_id in ["", "not-prefixed", "parser-source-without-boundary"] {
         let bad = synthetic_evidence(bad_id, &parser_source, 0);
         assert!(
-            remap_parser_evidence_identity(vec![bad], &parser_source, &catalog_source).is_err()
+            remap_parser_evidence_identity(vec![bad], &parser_source, &catalog_source, false)
+                .is_err()
         );
     }
     assert!(remap_parser_evidence_identity(
         vec![first.clone(), first.clone()],
         &parser_source,
         &catalog_source,
+        false,
     )
     .is_err());
     let mut dangling = second;
     dangling.derived_from = Some(EvidenceId("parser-source:missing".into()));
-    assert!(
-        remap_parser_evidence_identity(vec![first, dangling], &parser_source, &catalog_source,)
-            .is_err()
-    );
+    assert!(remap_parser_evidence_identity(
+        vec![first, dangling],
+        &parser_source,
+        &catalog_source,
+        false,
+    )
+    .is_err());
 }
 
 #[tokio::test]

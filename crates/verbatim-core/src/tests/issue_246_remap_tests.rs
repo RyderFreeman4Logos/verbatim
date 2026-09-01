@@ -17,7 +17,8 @@ fn issue_246_canonical_parser_ids_are_strict_at_remap_boundary() {
         .unwrap();
     let stable_id = parsed[0].id.clone();
 
-    let remapped = remap_parser_evidence_identity(parsed, &parser_source, &catalog_source).unwrap();
+    let remapped =
+        remap_parser_evidence_identity(parsed, &parser_source, &catalog_source, false).unwrap();
     assert_eq!(remapped[0].id, stable_id);
     assert_eq!(remapped[0].source_id, catalog_source);
 
@@ -34,7 +35,8 @@ fn issue_246_canonical_parser_ids_are_strict_at_remap_boundary() {
     ] {
         let bad = synthetic_evidence(&bad_id, &parser_source, 0);
         assert!(
-            remap_parser_evidence_identity(vec![bad], &parser_source, &catalog_source).is_err(),
+            remap_parser_evidence_identity(vec![bad], &parser_source, &catalog_source, false)
+                .is_err(),
             "accepted malformed self-contained id: {bad_id}"
         );
     }

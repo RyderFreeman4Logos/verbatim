@@ -37,6 +37,16 @@ fn canonical_package_validates_golden_package() {
 }
 
 #[test]
+fn canonical_package_persists_package_unit_id() {
+    let units = CanonicalPackageParser.parse(&fixture("valid")).unwrap();
+
+    assert_eq!(
+        units.into_iter().map(|unit| unit.id.0).collect::<Vec<_>>(),
+        ["pkg:john-3-16", "pkg:john-4-1"]
+    );
+}
+
+#[test]
 fn canonical_package_preserves_source_native_selectors() {
     let package = fixture("valid");
     let original = CanonicalPackageParser.parse(&package).unwrap();
@@ -152,7 +162,37 @@ async fn canonical_package_ingest_preserves_unit_identity() {
         .collect::<Vec<_>>();
 
     assert_eq!(ingested_ids, expected_ids);
-    assert!(ingested_ids.iter().all(|id| id.0.starts_with("cjson:v1:")));
+    assert_eq!(
+        ingested_ids.into_iter().map(|id| id.0).collect::<Vec<_>>(),
+        ["pkg:john-3-16", "pkg:john-4-1"]
+    );
+}
+
+#[test]
+fn canonical_package_rejects_duplicate_unit_id() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = tempdir.path().join("duplicate-unit-id");
+    fs::create_dir(&package).unwrap();
+    fs::copy(
+        fixture("valid").join("manifest.json"),
+        package.join("manifest.json"),
+    )
+    .unwrap();
+    let units = fs::read_to_string(fixture("valid").join("units.jsonl"))
+        .unwrap()
+        .replace("pkg:john-4-1", "pkg:john-3-16");
+    fs::write(package.join("units.jsonl"), units).unwrap();
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let report = validate_package(&package);
+
+    assert!(!report.valid);
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|item| item.code == "CANONICAL_PACKAGE_UNIT_ID_DUPLICATE"));
+    assert!(pipeline.add_source(&package).is_err());
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
 }
 
 #[test]
@@ -176,7 +216,7 @@ fn canonical_package_rejects_empty_component_objects_before_persist() {
     write_package(
         &package,
         "1.0.0",
-        r#"{"source_profile":"bible","work_id":"KJV","version_id":"public-domain","language":"en","components":[{}],"text":"text","backing_selectors":[{"type":"LineRange","start":1,"end":1}]}"#,
+        r#"{"unit_id":"pkg:invalid-components","source_profile":"bible","work_id":"KJV","version_id":"public-domain","language":"en","components":[{}],"text":"text","backing_selectors":[{"type":"LineRange","start":1,"end":1}]}"#,
     );
     let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
 
@@ -195,7 +235,7 @@ fn canonical_package_rejects_non_semver_schema_version() {
         write_package(
             &package,
             schema_version,
-            r#"{"source_profile":"bible","work_id":"KJV","version_id":"public-domain","language":"en","components":[{"level":"book","value":"John"}],"text":"text","backing_selectors":[{"type":"LineRange","start":1,"end":1}]}"#,
+            r#"{"unit_id":"pkg:invalid-schema","source_profile":"bible","work_id":"KJV","version_id":"public-domain","language":"en","components":[{"level":"book","value":"John"}],"text":"text","backing_selectors":[{"type":"LineRange","start":1,"end":1}]}"#,
         );
         let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
 
