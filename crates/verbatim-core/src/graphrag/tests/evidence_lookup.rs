@@ -24,6 +24,7 @@ fn evidence_lookup_rejects_report_artifact_ids() {
             heading_path: Vec::new(),
             language: None,
             position: 0,
+            annotations: Default::default(),
         };
         store
             .bulk_insert_evidence(std::slice::from_ref(&unit))

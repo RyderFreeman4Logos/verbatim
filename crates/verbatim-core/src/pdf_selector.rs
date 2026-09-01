@@ -604,6 +604,7 @@ mod tests {
             heading_path: Vec::new(),
             language: None,
             position: 0,
+            annotations: Default::default(),
         }];
 
         attach_pdf_selectors(&mut evidence, &hex_sha256(b"original-pdf"), "pdf_oxide");
@@ -639,6 +640,7 @@ mod tests {
                     heading_path: Vec::new(),
                     language: None,
                     position: index,
+                    annotations: Default::default(),
                 }
             })
             .collect::<Vec<_>>();

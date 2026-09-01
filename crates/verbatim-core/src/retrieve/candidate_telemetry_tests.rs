@@ -493,7 +493,8 @@ fn batch_hydration_keeps_sql_statement_count_constant_across_fused_candidate_poo
             heading_path: vec!["batch".into()],
             language: None,
             position: 0,
-        };
+                    annotations: Default::default(),
+};
         let chunk = Chunk {
             id: ChunkId(id.clone()),
             source_id: source.id.clone(),

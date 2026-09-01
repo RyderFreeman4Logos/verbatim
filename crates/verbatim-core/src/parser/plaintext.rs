@@ -59,6 +59,7 @@ impl Parser for PlaintextParser {
                         heading_path: Vec::new(),
                         language: None,
                         position,
+                        annotations: Default::default(),
                     });
                     position += 1;
                 }
@@ -101,6 +102,7 @@ impl Parser for PlaintextParser {
                 heading_path: Vec::new(),
                 language: None,
                 position,
+                annotations: Default::default(),
             });
         }
 

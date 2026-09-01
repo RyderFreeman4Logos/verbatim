@@ -18140,6 +18140,7 @@ mod tests {
             heading_path: Vec::new(),
             language: None,
             position: 0,
+            annotations: Default::default(),
         };
         let chunk = Chunk {
             id: chunk_id.clone(),
@@ -18208,6 +18209,7 @@ mod tests {
                 heading_path: Vec::new(),
                 language: None,
                 position: *verse,
+                annotations: Default::default(),
             })
             .collect::<Vec<_>>();
         let chunk = Chunk {

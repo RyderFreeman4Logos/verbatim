@@ -174,6 +174,7 @@ fn sole_source_erasure_prevents_cache_hit_resurrection_for_reseeded_source() {
             heading_path: vec!["Images".into()],
             language: None,
             position: 0,
+            annotations: Default::default(),
         }])
         .unwrap();
     store
@@ -276,6 +277,7 @@ fn v1_to_v2_replace_then_erase_purges_historical_v1_caches() {
         heading_path: vec!["Images".into()],
         language: None,
         position: 0,
+        annotations: Default::default(),
     };
     let v2_chunk = Chunk {
         id: ChunkId("child-v2".into()),
@@ -403,6 +405,7 @@ fn v1_to_v2_replace_then_erase_purges_historical_v1_caches() {
             heading_path: vec!["Images".into()],
             language: None,
             position: 0,
+            annotations: Default::default(),
         }])
         .unwrap();
     store
@@ -549,6 +552,7 @@ fn pre_commit_orphan_caches_are_purged_on_erasure() {
             heading_path: vec!["Images".into()],
             language: None,
             position: 0,
+            annotations: Default::default(),
         }])
         .unwrap();
     store
@@ -616,6 +620,7 @@ fn seed_source_with_caches(
             heading_path: vec!["Images".into()],
             language: None,
             position: 0,
+            annotations: Default::default(),
         }])
         .unwrap();
     store

@@ -42,6 +42,7 @@ pub(crate) fn pdf_page_evidence_units(
                 heading_path: Vec::new(),
                 language: None,
                 position: *position,
+                annotations: Default::default(),
             };
             *position += 1;
             unit

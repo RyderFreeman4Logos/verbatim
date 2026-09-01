@@ -1,5 +1,4 @@
 //! Validation and atomic persistence for explicit, identity-preserving source relocation.
-//!
 //! Parser output is path-keyed, while the catalog identity must remain stable across a
 //! relocation. This module owns the one fail-closed remap seam and the one SQLite
 //! transaction that updates location-bearing catalog fields.
@@ -731,7 +730,7 @@ fn direct_text_evidence_tx(
 ) -> Result<Vec<EvidenceUnit>> {
     let mut statement = tx.prepare(
         "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json,
-                language, position, derived_from_evidence_id
+                language, position, derived_from_evidence_id, annotations_json
          FROM evidence_units WHERE source_id = ?1 AND kind = 'Text' ORDER BY position",
     )?;
     let rows = statement.query_map(params![&source_id.0], row_to_evidence_unit)?;
@@ -747,6 +746,7 @@ fn evidence_matches_except_locator(expected: &EvidenceUnit, relocated: &Evidence
         && expected.text_hash == relocated.text_hash
         && expected.heading_path == relocated.heading_path
         && expected.language == relocated.language
+        && expected.annotations == relocated.annotations
         && expected.position == relocated.position
 }
 

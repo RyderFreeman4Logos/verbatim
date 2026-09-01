@@ -395,6 +395,7 @@ mod tests {
             heading_path: heading.map(|h| vec![h.to_string()]).unwrap_or_default(),
             language: None,
             position,
+            annotations: Default::default(),
         }
     }
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -779,6 +780,8 @@ pub struct EvidenceUnit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     pub position: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

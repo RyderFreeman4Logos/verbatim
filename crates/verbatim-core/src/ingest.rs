@@ -1572,6 +1572,11 @@ where
                     diagnostic.message
                 );
             }
+        } else if abs_path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            parser::canonical_jsonl::CanonicalJsonlParser.parse(&abs_path)?;
         }
         if let Some(source) = self.store.get_source_by_path(&abs_path)? {
             return Ok(source.id);
@@ -6134,6 +6139,7 @@ fn prepare_image_artifacts(
             heading_path: Vec::new(),
             language: None,
             position: start_position + evidence.len() as u32,
+            annotations: Default::default(),
         });
         artifacts.push(ImageArtifact {
             image_id,
@@ -6989,6 +6995,7 @@ mod tests {
             heading_path: Vec::new(),
             language: None,
             position: 0,
+            annotations: Default::default(),
         }
     }
 
@@ -9100,6 +9107,7 @@ model = "local-vision"
             heading_path: Vec::new(),
             language: None,
             position: 0,
+            annotations: Default::default(),
         };
         let mut parsed_image = test_parsed_image_artifact("png");
         parsed_image.nearby_text_before = Some(text.into());

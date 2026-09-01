@@ -22,13 +22,13 @@ impl Store {
         let Some((evidence, generation)) = self
             .conn
             .query_row(
-                "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id,
+                "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id, annotations_json,
                         COALESCE((SELECT generation FROM embedding_profile_index_meta WHERE profile_id = ?2), '0')
                  FROM evidence_units WHERE id = ?1",
                 params![id.0, profile_id.as_str()],
                 |row| {
                     let evidence = row_to_evidence_unit(row)?;
-                    let generation: String = row.get(10)?;
+                    let generation: String = row.get(11)?;
                     Ok((evidence, generation))
                 },
             )
@@ -63,7 +63,7 @@ impl Store {
         for batch in ids.chunks(SQLITE_VARIABLE_LIMIT.saturating_sub(1).max(1)) {
             let placeholders = vec!["?"; batch.len()].join(", ");
             let sql = format!(
-                "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id,
+                "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id, annotations_json,
                         COALESCE((SELECT generation FROM embedding_profile_index_meta WHERE profile_id = ?), '0')
                  FROM evidence_units WHERE id IN ({placeholders})"
             );
@@ -76,7 +76,7 @@ impl Store {
                 let id = EvidenceId(row.get(0)?);
                 evidence.insert(id, row_to_evidence_unit(row).map_err(Into::into));
                 if generation.is_none() {
-                    let raw: String = row.get(10)?;
+                    let raw: String = row.get(11)?;
                     raw.parse::<u64>()
                         .context("parse profile index generation")?;
                     generation = Some(raw);

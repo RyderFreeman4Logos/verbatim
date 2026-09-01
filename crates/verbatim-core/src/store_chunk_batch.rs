@@ -76,7 +76,7 @@ impl Store {
         for batch in ids.chunks(SQLITE_VARIABLE_LIMIT) {
             let placeholders = vec!["?"; batch.len()].join(", ");
             let sql = format!(
-                "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id FROM evidence_units WHERE id IN ({placeholders})"
+                "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id, annotations_json FROM evidence_units WHERE id IN ({placeholders})"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let mut rows = stmt.query(params_from_iter(batch.iter().map(|id| &id.0)))?;

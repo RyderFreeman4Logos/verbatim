@@ -517,6 +517,7 @@ pub fn ocr_evidence_from_output(
                 heading_path: Vec::new(),
                 language: None,
                 position: start_position + idx as u32,
+                annotations: Default::default(),
             })
         })
         .collect()

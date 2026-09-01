@@ -19,5 +19,6 @@ pub(super) fn synthetic_evidence(id: &str, source_id: &SourceId, position: u32) 
         heading_path: Vec::new(),
         language: None,
         position,
+        annotations: Default::default(),
     }
 }

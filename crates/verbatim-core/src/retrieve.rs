@@ -3011,6 +3011,7 @@ mod tests {
             heading_path: Vec::new(),
             language: None,
             position: 0,
+            annotations: Default::default(),
         };
         let chunk = Chunk {
             id: ChunkId(chunk_id.into()),
@@ -3132,6 +3133,7 @@ mod tests {
                 heading_path: Vec::new(),
                 language: None,
                 position: *verse,
+                annotations: Default::default(),
             })
             .collect::<Vec<_>>();
         let chunk = Chunk {
@@ -3222,6 +3224,7 @@ mod tests {
                     heading_path: Vec::new(),
                     language: None,
                     position: verse,
+                    annotations: Default::default(),
                 }
             })
             .collect::<Vec<_>>();
@@ -3323,6 +3326,7 @@ mod tests {
                 heading_path: self.heading_path.clone(),
                 language: None,
                 position: 0,
+                annotations: Default::default(),
             };
             let chunk = Chunk {
                 id: ChunkId(self.chunk_id.into()),
@@ -3409,6 +3413,7 @@ mod tests {
             heading_path: Vec::new(),
             language: None,
             position: 1,
+            annotations: Default::default(),
         };
         let chunk = Chunk {
             id: ChunkId(chunk_id.into()),
@@ -5539,6 +5544,7 @@ mod tests {
             heading_path: Vec::new(),
             language: None,
             position: 1,
+            annotations: Default::default(),
         };
         store
             .bulk_insert_evidence(std::slice::from_ref(&parent_extra))

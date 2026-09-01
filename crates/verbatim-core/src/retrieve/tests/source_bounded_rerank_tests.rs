@@ -22,6 +22,7 @@ fn insert_evidence_kind_chunk(
         heading_path: Vec::new(),
         language: None,
         position: 0,
+        annotations: Default::default(),
     };
     let chunk = Chunk {
         id: ChunkId(chunk_id.into()),

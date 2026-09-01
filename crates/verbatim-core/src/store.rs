@@ -531,6 +531,12 @@ impl Store {
         )?;
         ensure_column(
             &self.conn,
+            "evidence_units",
+            "annotations_json",
+            "ALTER TABLE evidence_units ADD COLUMN annotations_json TEXT NOT NULL DEFAULT '{}'",
+        )?;
+        ensure_column(
+            &self.conn,
             "tasks",
             "progress_json",
             "ALTER TABLE tasks ADD COLUMN progress_json TEXT",
@@ -1164,7 +1170,7 @@ impl Store {
             bail!("report artifact ids are not evidence: {}", id.0);
         }
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id FROM evidence_units WHERE id = ?1"
+            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id, annotations_json FROM evidence_units WHERE id = ?1"
         )?;
         let mut rows = stmt.query_map(params![id.0], row_to_evidence_unit)?;
         match rows.next() {
@@ -1175,7 +1181,7 @@ impl Store {
 
     pub fn list_evidence_by_source(&self, source_id: &SourceId) -> Result<Vec<EvidenceUnit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id FROM evidence_units WHERE source_id = ?1 ORDER BY position"
+            "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id, annotations_json FROM evidence_units WHERE source_id = ?1 ORDER BY position"
         )?;
         let rows = stmt.query_map(params![source_id.0], row_to_evidence_unit)?;
         rows.map(|row| row.map_err(Into::into)).collect()
@@ -3382,12 +3388,14 @@ fn replace_source_contents_tx(
 
 fn insert_evidence_units_tx(tx: &Transaction<'_>, units: &[EvidenceUnit]) -> Result<()> {
     let mut stmt = tx.prepare(
-        "INSERT INTO evidence_units (id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+        "INSERT INTO evidence_units (id, source_id, kind, locator_json, text, text_hash, heading_path_json, language, position, derived_from_evidence_id, annotations_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
     )?;
     for unit in units {
         let locator_json = serde_json::to_string(&unit.locator).context("serialize locator")?;
         let heading_json =
             serde_json::to_string(&unit.heading_path).context("serialize heading_path")?;
+        let annotations_json =
+            serde_json::to_string(&unit.annotations).context("serialize annotations")?;
         stmt.execute(params![
             &unit.id.0,
             &unit.source_id.0,
@@ -3399,6 +3407,7 @@ fn insert_evidence_units_tx(tx: &Transaction<'_>, units: &[EvidenceUnit]) -> Res
             unit.language.as_deref(),
             unit.position,
             unit.derived_from.as_ref().map(|id| &id.0),
+            annotations_json,
         ])?;
     }
     Ok(())
@@ -3415,11 +3424,14 @@ fn row_to_evidence_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceUni
     let language: Option<String> = row.get(7)?;
     let position: u32 = row.get(8)?;
     let derived_from: Option<String> = row.get(9)?;
+    let annotations_json: String = row.get(10)?;
 
     let locator = serde_json::from_str(&locator_json)
         .map_err(|err| from_json_error(3, "SourceLocator", err))?;
     let heading_path = serde_json::from_str(&heading_json)
         .map_err(|err| from_json_error(6, "Vec<String>", err))?;
+    let annotations = serde_json::from_str(&annotations_json)
+        .map_err(|err| from_json_error(10, "BTreeMap<String, String>", err))?;
 
     Ok(EvidenceUnit {
         id: EvidenceId(id),
@@ -3432,6 +3444,7 @@ fn row_to_evidence_unit(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceUni
         heading_path,
         language,
         position,
+        annotations,
     })
 }
 
@@ -4452,7 +4465,8 @@ CREATE TABLE IF NOT EXISTS evidence_units (
     heading_path_json TEXT,
     language TEXT,
     position INTEGER NOT NULL,
-    derived_from_evidence_id TEXT
+    derived_from_evidence_id TEXT,
+    annotations_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS image_artifacts (
     image_id TEXT PRIMARY KEY,
@@ -5436,6 +5450,7 @@ pub(crate) mod tests {
                 heading_path: vec!["Chapter 1".into()],
                 language: None,
                 position: 0,
+                annotations: Default::default(),
             },
             EvidenceUnit {
                 id: EvidenceId("ev-2".into()),
@@ -5448,6 +5463,7 @@ pub(crate) mod tests {
                 heading_path: vec!["Chapter 1".into()],
                 language: None,
                 position: 1,
+                annotations: Default::default(),
             },
         ]
     }
