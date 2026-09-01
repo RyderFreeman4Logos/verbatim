@@ -128,10 +128,14 @@ impl Parser for CanonicalJsonlParser {
                 end: None,
                 display,
                 normalized,
-                backing_selectors: vec![BackingSelector::LineRange {
-                    start: line_no,
-                    end: line_no,
-                }],
+                backing_selectors: if entry.backing_selectors.is_empty() {
+                    vec![BackingSelector::LineRange {
+                        start: line_no,
+                        end: line_no,
+                    }]
+                } else {
+                    entry.backing_selectors
+                },
             };
 
             units.push(EvidenceUnit {
@@ -227,6 +231,8 @@ struct JsonlEntry {
     display_citation: Option<String>,
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    backing_selectors: Vec<BackingSelector>,
     #[serde(default)]
     metadata: Option<JsonlMetadata>,
 }

@@ -8,11 +8,15 @@ use sha2::{Digest, Sha256};
 
 use crate::parser::canonical_jsonl::CanonicalJsonlParser;
 use crate::traits::Parser;
-use crate::types::{hex_sha256, BackingSelector, EvidenceUnit, SourceId};
+use crate::types::{
+    hex_sha256, BackingSelector, CanonicalLocator, DerivedConversionMetadata, EvidenceUnit,
+    SourceId, SourceLocator,
+};
 
 const MANIFEST: &str = "manifest.json";
 const UNITS: &str = "units.jsonl";
 const SUPPORTED_MAJOR: u64 = 1;
+const USFM_SOURCE_NATIVE_SCHEME: &str = "usfm";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CanonicalPackageDiagnostic {
@@ -26,8 +30,20 @@ pub struct CanonicalPackageReport {
     pub valid: bool,
     pub schema_version: Option<String>,
     pub unit_count: usize,
+    pub package_hash: Option<String>,
+    pub original_source_hash: Option<String>,
+    pub conversion: Option<DerivedConversionMetadata>,
+    pub units: Vec<CanonicalPackageUnitReport>,
     pub diagnostics: Vec<CanonicalPackageDiagnostic>,
     pub report_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CanonicalPackageUnitReport {
+    pub locator: CanonicalLocator,
+    pub original_source_hash: Option<String>,
+    pub conversion: Option<DerivedConversionMetadata>,
+    pub text_hash: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -44,6 +60,10 @@ struct Manifest {
     version_id: String,
     #[serde(default)]
     language: String,
+    #[serde(default)]
+    original_source_hash: Option<String>,
+    #[serde(default)]
+    conversion: Option<DerivedConversionMetadata>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -155,9 +175,24 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
         }
         Err(error) => diagnostics.push(diagnostic("CANONICAL_PACKAGE_UNITS_MISSING", UNITS, error)),
     }
-    if let Err(error) = CanonicalJsonlParser.parse(&units_path) {
-        diagnostics.push(diagnostic("CANONICAL_PACKAGE_UNIT_INVALID", UNITS, error));
-    }
+    let units = match CanonicalJsonlParser.parse(&units_path) {
+        Ok(units) => units
+            .into_iter()
+            .filter_map(|unit| match unit.locator {
+                SourceLocator::Canonical { locator } => Some(CanonicalPackageUnitReport {
+                    locator,
+                    original_source_hash: manifest.original_source_hash.clone(),
+                    conversion: manifest.conversion.clone(),
+                    text_hash: unit.text_hash,
+                }),
+                _ => None,
+            })
+            .collect(),
+        Err(error) => {
+            diagnostics.push(diagnostic("CANONICAL_PACKAGE_UNIT_INVALID", UNITS, error));
+            Vec::new()
+        }
+    };
     if unit_count == 0
         && diagnostics
             .iter()
@@ -170,7 +205,8 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
         });
     }
     let valid = diagnostics.is_empty();
-    let payload = serde_json::json!({"valid": valid, "schema_version": manifest.schema_version, "unit_count": unit_count, "diagnostics": diagnostics});
+    let package_hash = package_hash(path).ok();
+    let payload = serde_json::json!({"valid": valid, "schema_version": manifest.schema_version, "unit_count": unit_count, "package_hash": package_hash, "original_source_hash": manifest.original_source_hash, "conversion": manifest.conversion, "units": units, "diagnostics": diagnostics});
     let report_hash = hex_sha256(
         serde_json::to_string(&payload)
             .expect("report serializes")
@@ -180,6 +216,10 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
         valid,
         schema_version: (!manifest.schema_version.is_empty()).then_some(manifest.schema_version),
         unit_count,
+        package_hash,
+        original_source_hash: manifest.original_source_hash,
+        conversion: manifest.conversion,
+        units,
         diagnostics,
         report_hash,
     }
@@ -304,6 +344,9 @@ fn validate_unit(
             message: "at least one backing selector is required".into(),
         });
     }
+    for selector in &unit.backing_selectors {
+        validate_source_native_selector(selector, unit, location, diagnostics);
+    }
     if let Some(hash) = &unit.text_hash {
         if *hash != hex_sha256(unit.text.as_bytes()) {
             diagnostics.push(CanonicalPackageDiagnostic {
@@ -313,6 +356,66 @@ fn validate_unit(
             });
         }
     }
+}
+
+fn validate_source_native_selector(
+    selector: &BackingSelector,
+    unit: &Unit,
+    location: &str,
+    diagnostics: &mut Vec<CanonicalPackageDiagnostic>,
+) {
+    let BackingSelector::SourceNative { scheme, value } = selector else {
+        return;
+    };
+    let expected = match source_native_selector_value(scheme, unit) {
+        Ok(expected) => expected,
+        Err(message) => {
+            diagnostics.push(CanonicalPackageDiagnostic {
+                code: "CANONICAL_PACKAGE_SOURCE_NATIVE_SELECTOR_INVALID",
+                location: location.into(),
+                message,
+            });
+            return;
+        }
+    };
+    if value != &expected {
+        diagnostics.push(CanonicalPackageDiagnostic {
+            code: "CANONICAL_PACKAGE_SOURCE_NATIVE_SELECTOR_INVALID",
+            location: location.into(),
+            message: format!("{scheme} selector does not resolve to this canonical unit"),
+        });
+    }
+}
+
+fn source_native_selector_value(scheme: &str, unit: &Unit) -> Result<String, String> {
+    if scheme != USFM_SOURCE_NATIVE_SCHEME {
+        return Err(format!(
+            "unsupported source-native selector scheme {scheme}"
+        ));
+    }
+    let component = |level| {
+        unit.components
+            .iter()
+            .find(|component| {
+                component.get("level").and_then(serde_json::Value::as_str) == Some(level)
+            })
+            .and_then(|component| component.get("value"))
+            .and_then(serde_json::Value::as_str)
+    };
+    let Some(book) = component("book") else {
+        return Err("usfm selector requires a book component".into());
+    };
+    let Some(chapter) = component("chapter") else {
+        return Err("usfm selector requires a chapter component".into());
+    };
+    let Some(verse) = component("verse") else {
+        return Err("usfm selector requires a verse component".into());
+    };
+    let book = match book {
+        "John" => "JHN",
+        _ => return Err(format!("usfm selector cannot resolve book {book}")),
+    };
+    Ok(format!("{book} {chapter}:{verse}"))
 }
 
 fn diagnostic(

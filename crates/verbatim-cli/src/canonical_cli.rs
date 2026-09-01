@@ -99,5 +99,14 @@ mod tests {
         let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(report["unit_count"], 2);
         assert_eq!(report["report_hash"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            report["original_source_hash"],
+            "0bc1dd60d3bb6082799548fd022a62108d510b59523e04de6071e396b79d018c"
+        );
+        assert_eq!(report["conversion"]["converter"], "fixture-converter");
+        assert_eq!(
+            report["units"][0]["locator"]["backing_selectors"][0]["type"],
+            "SourceNative"
+        );
     }
 }
