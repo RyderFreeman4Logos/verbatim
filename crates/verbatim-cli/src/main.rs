@@ -18,6 +18,7 @@ use verbatim_core::api::{
 };
 
 mod auth;
+mod canonical_cli;
 mod client;
 mod local;
 mod render;
@@ -451,6 +452,7 @@ where
             resolve_cli::run_resolve(&reference, format, stdout)?;
             Ok(0)
         }
+        Commands::Canonical { command } => canonical_cli::run(command, stdout),
         Commands::Evidence { eid } => {
             let evidence = client.get_evidence(&eid)?;
             render::write_evidence(stdout, &evidence)?;
@@ -1564,6 +1566,11 @@ enum Commands {
         /// Output format: text (default) or json.
         #[arg(long, value_enum)]
         format: Option<ResolveFormat>,
+    },
+    /// Validate a canonical directory package without contacting the daemon.
+    Canonical {
+        #[command(subcommand)]
+        command: canonical_cli::CanonicalCommand,
     },
     /// Inspect one evidence unit through the daemon API.
     #[command(

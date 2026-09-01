@@ -3,6 +3,7 @@ pub mod anydoc;
 #[cfg(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber"))]
 mod bounded_pdf_images;
 pub mod canonical_jsonl;
+pub mod canonical_package;
 pub mod json;
 pub mod markdown;
 #[cfg(feature = "parser-pdf-oxide")]
@@ -37,6 +38,9 @@ pub fn select_parser(name: &str) -> Result<Box<dyn Parser>> {
 }
 
 pub fn parser_for_extension(path: &Path) -> Result<Box<dyn Parser>> {
+    if path.is_dir() {
+        return Ok(Box::new(canonical_package::CanonicalPackageParser));
+    }
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

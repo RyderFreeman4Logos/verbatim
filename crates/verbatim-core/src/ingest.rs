@@ -1558,6 +1558,21 @@ where
     pub fn add_source(&self, path: &Path) -> Result<SourceId> {
         let abs_path = std::fs::canonicalize(path)
             .with_context(|| format!("resolve path: {}", path.display()))?;
+        if abs_path.is_dir() {
+            let report = parser::canonical_package::validate_package(&abs_path);
+            if !report.valid {
+                let diagnostic = report
+                    .diagnostics
+                    .first()
+                    .expect("invalid report has diagnostic");
+                bail!(
+                    "{} at {}: {}",
+                    diagnostic.code,
+                    diagnostic.location,
+                    diagnostic.message
+                );
+            }
+        }
         if let Some(source) = self.store.get_source_by_path(&abs_path)? {
             return Ok(source.id);
         }
@@ -6415,6 +6430,9 @@ fn source_pdf_page_count(path: &Path) -> Result<Option<usize>> {
 }
 
 fn file_hash(path: &Path) -> Result<String> {
+    if path.is_dir() {
+        return parser::canonical_package::package_hash(path);
+    }
     let data = std::fs::read(path).with_context(|| format!("read file: {}", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(&data);
