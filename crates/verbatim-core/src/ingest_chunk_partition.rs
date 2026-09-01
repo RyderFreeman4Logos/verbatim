@@ -114,7 +114,8 @@ fn chunk_mixed_evidence(
 }
 
 fn is_canonical_verse(unit: &EvidenceUnit) -> bool {
-    unit.kind == EvidenceKind::Verse && matches!(unit.locator, SourceLocator::Canonical { .. })
+    // Footnotes keep the generic chunker; other canonical locators stay unit-aligned.
+    unit.kind != EvidenceKind::Footnote && matches!(unit.locator, SourceLocator::Canonical { .. })
 }
 
 #[cfg(test)]
