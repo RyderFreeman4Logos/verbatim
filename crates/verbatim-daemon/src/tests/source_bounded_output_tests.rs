@@ -8,6 +8,8 @@ use crate::source_bounded_retrieval::filter_generated_retrieval_evidence;
 
 const CORRUPTED_EVIDENCE_TEXT: &str = "Mutated persisted evidence must not escape.";
 
+#[path = "anydoc_daemon_tests.rs"]
+mod anydoc_daemon_tests;
 #[path = "audit_receipt_tests.rs"]
 mod audit_receipt_tests;
 #[path = "canonical_fixture_passage_tests.rs"]
