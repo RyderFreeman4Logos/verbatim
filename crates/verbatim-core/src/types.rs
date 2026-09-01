@@ -745,10 +745,19 @@ pub struct SourceOcrDiagnostics {
     pub evidence_profile_hashes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedConversionMetadata {
+    pub converter: String,
+    pub converter_version: String,
+    pub output_hash: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceIngestDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf: Option<PdfScanSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversion: Option<DerivedConversionMetadata>,
     pub ocr: SourceOcrDiagnostics,
 }
 

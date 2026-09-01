@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::OcrConfig;
 use crate::types::{
-    hex_sha256, BBox, EvidenceKind, EvidenceUnit, ImageArtifact, OcrLocatorMetadata, OcrProfile,
-    OcrSourceStatus, PdfPageScanSummary, PdfScanSummary, SourceId, SourceIngestDiagnostics,
-    SourceLocator, SourceOcrDiagnostics,
+    hex_sha256, BBox, DerivedConversionMetadata, EvidenceKind, EvidenceUnit, ImageArtifact,
+    OcrLocatorMetadata, OcrProfile, OcrSourceStatus, PdfPageScanSummary, PdfScanSummary, SourceId,
+    SourceIngestDiagnostics, SourceLocator, SourceOcrDiagnostics,
 };
 
 const MEANINGFUL_TEXT_MIN_CHARS: usize = 16;
@@ -428,6 +428,7 @@ pub fn source_ingest_diagnostics(
     evidence: &[EvidenceUnit],
     image_artifacts: &[ImageArtifact],
     current_profile: Option<&OcrProfile>,
+    conversion: Option<&DerivedConversionMetadata>,
 ) -> SourceIngestDiagnostics {
     let is_pdf = path
         .extension()
@@ -451,6 +452,7 @@ pub fn source_ingest_diagnostics(
 
     SourceIngestDiagnostics {
         pdf,
+        conversion: conversion.cloned(),
         ocr: SourceOcrDiagnostics {
             enabled: current_profile.is_some(),
             status,

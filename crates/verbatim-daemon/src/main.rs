@@ -2285,6 +2285,7 @@ fn source_response(
         &evidence,
         &image_artifacts,
         current_ocr_profile,
+        None,
     );
     SourceResponse::new(
         source.id.0,

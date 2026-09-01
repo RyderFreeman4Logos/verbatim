@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::image_limits::ImageArtifactLimits;
 use crate::store::Store;
-use crate::types::{ChunkId, EvidenceUnit, ParsedImageArtifact, SourceId};
+use crate::types::{
+    ChunkId, DerivedConversionMetadata, EvidenceUnit, ParsedImageArtifact, SourceId,
+};
 
 /// Sanitized embedding endpoint/runtime semantics that can affect vector identity.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +35,12 @@ pub trait Parser: Send + Sync {
     fn name(&self) -> &str;
     fn supported_extensions(&self) -> &[&str];
     fn parse(&self, path: &Path) -> Result<Vec<EvidenceUnit>>;
+    fn parse_with_derived_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<(Vec<EvidenceUnit>, Option<DerivedConversionMetadata>)> {
+        Ok((self.parse(path)?, None))
+    }
     fn extract_image_artifacts(&self, path: &Path) -> Result<Vec<ParsedImageArtifact>> {
         self.extract_image_artifacts_with_limits(path, ImageArtifactLimits::default())
     }
