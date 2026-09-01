@@ -35,7 +35,9 @@ fn verifier_provenance(
     evidence_id: &EvidenceId,
 ) -> VerifierEvidenceProvenance {
     let summary = match (citation.kind, citation.derived_from.as_ref()) {
-        (EvidenceKind::Text, _) => "original source text",
+        (EvidenceKind::Text | EvidenceKind::Verse | EvidenceKind::Footnote, _) => {
+            "original source text"
+        }
         (EvidenceKind::Ocr, _) => "OCR-derived source text with structured locator",
         (EvidenceKind::Image, _) => "original image artifact locator",
         (EvidenceKind::Generated, Some(_)) => {
@@ -95,7 +97,7 @@ fn verifier_visual_support(
     };
 
     let (support_level, caution) = match (citation.kind, citation.derived_from.as_ref()) {
-        (EvidenceKind::Text, _) => (
+        (EvidenceKind::Text | EvidenceKind::Verse | EvidenceKind::Footnote, _) => (
             "text_only",
             "Use this source for document text claims, not visual content claims.",
         ),
@@ -156,6 +158,8 @@ fn citation_image_artifact_evidence_id<'a>(
     match citation.kind {
         EvidenceKind::Image => Some(evidence_id),
         EvidenceKind::Generated => citation.derived_from.as_ref(),
-        EvidenceKind::Text | EvidenceKind::Ocr => None,
+        EvidenceKind::Text | EvidenceKind::Verse | EvidenceKind::Footnote | EvidenceKind::Ocr => {
+            None
+        }
     }
 }

@@ -8437,7 +8437,13 @@ async fn get_evidence(
 
     match evidence {
         Some(eu) => {
-            let source_bounded = matches!(eu.kind, EvidenceKind::Text | EvidenceKind::Image);
+            let source_bounded = matches!(
+                eu.kind,
+                EvidenceKind::Text
+                    | EvidenceKind::Verse
+                    | EvidenceKind::Footnote
+                    | EvidenceKind::Image
+            );
             Ok(Json(EvidenceResponse {
                 kind: evidence_kind_name(eu.kind).to_string(),
                 id: eu.id.0,
@@ -8469,6 +8475,8 @@ async fn get_evidence(
 fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Text => "text",
+        EvidenceKind::Verse => "verse",
+        EvidenceKind::Footnote => "footnote",
         EvidenceKind::Ocr => "ocr",
         EvidenceKind::Image => "image",
         EvidenceKind::Generated => "generated",
@@ -8478,6 +8486,8 @@ fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
 fn citation_kind_name(citation: &CitationRef) -> &'static str {
     match citation.kind {
         EvidenceKind::Text => "original_text",
+        EvidenceKind::Verse => "verse",
+        EvidenceKind::Footnote => "footnote",
         EvidenceKind::Ocr => "ocr_text",
         EvidenceKind::Image => "image_artifact",
         EvidenceKind::Generated if citation.derived_from.is_some() => "image_caption_generated",
@@ -8506,6 +8516,8 @@ fn retrieval_evidence_role(
 
     match evidence.kind {
         EvidenceKind::Text => RetrievalEvidenceRole::OriginalText,
+        EvidenceKind::Verse => RetrievalEvidenceRole::OriginalText,
+        EvidenceKind::Footnote => RetrievalEvidenceRole::OriginalText,
         EvidenceKind::Ocr => RetrievalEvidenceRole::OcrText,
         EvidenceKind::Image => RetrievalEvidenceRole::ImageArtifact,
         EvidenceKind::Generated if evidence.derived_from.is_some() => {

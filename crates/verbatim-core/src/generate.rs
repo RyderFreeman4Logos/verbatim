@@ -865,7 +865,9 @@ pub fn image_artifact_evidence_id(evidence: &EvidenceUnit) -> Option<&EvidenceId
     match evidence.kind {
         EvidenceKind::Image => Some(&evidence.id),
         EvidenceKind::Generated => evidence.derived_from.as_ref(),
-        EvidenceKind::Text | EvidenceKind::Ocr => None,
+        EvidenceKind::Text | EvidenceKind::Verse | EvidenceKind::Footnote | EvidenceKind::Ocr => {
+            None
+        }
     }
 }
 
@@ -1029,6 +1031,8 @@ fn push_source_pack_entry(
 fn source_pack_kind_label(evidence: &EvidenceUnit) -> &'static str {
     match evidence.kind {
         EvidenceKind::Text => "original_text",
+        EvidenceKind::Verse => "verse",
+        EvidenceKind::Footnote => "footnote",
         EvidenceKind::Ocr => "ocr_text",
         EvidenceKind::Image => "image_artifact",
         EvidenceKind::Generated if evidence.derived_from.is_some() => "image_caption_generated",
@@ -1111,6 +1115,8 @@ fn is_evidence_label(token: &str) -> bool {
 fn citation_kind_label(kind: EvidenceKind, derived_from: Option<&EvidenceId>) -> &'static str {
     match kind {
         EvidenceKind::Text => "original_text",
+        EvidenceKind::Verse => "verse",
+        EvidenceKind::Footnote => "footnote",
         EvidenceKind::Ocr => "ocr_text",
         EvidenceKind::Image => "image_artifact",
         EvidenceKind::Generated if derived_from.is_some() => "image_caption_generated",

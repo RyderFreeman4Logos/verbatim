@@ -3,14 +3,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use rusqlite::{
-    params, params_from_iter,
-    types::{Type, Value},
-    Connection, OpenFlags, OptionalExtension, Row, Transaction,
-};
-use serde::de::DeserializeOwned;
-
 use crate::canonical_chunker::CANONICAL_CHUNKER_VERSION;
 use crate::collection::{
     resolve_collection_root, validate_collection_name, CollectionMember, CollectionMemberCandidate,
@@ -23,11 +15,17 @@ use crate::task::{
 use crate::traits::VectorDocument;
 use crate::types::report_artifact::is_report_artifact_id;
 use crate::types::{
-    hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceKind,
-    EvidenceUnit, GraphEdge, GraphEdgeId, GraphNode, GraphNodeId, GraphNodeKind, ImageArtifact,
-    ImageId, Source, SourceEmbeddingStatus, SourceId, SourceStatus, DEFAULT_EMBEDDING_PROFILE_ID,
+    hex_sha256, Chunk, ChunkId, ChunkType, EdgeType, EmbeddingProfileId, EvidenceId, EvidenceUnit,
+    GraphEdge, GraphEdgeId, GraphNode, GraphNodeId, ImageArtifact, ImageId, Source,
+    SourceEmbeddingStatus, SourceId, SourceStatus, DEFAULT_EMBEDDING_PROFILE_ID,
 };
 use crate::vision_caption::{ImageCaption, ImageCaptionRecord, ImageCaptionStatus};
+use anyhow::{bail, Context, Result};
+use rusqlite::{
+    params, params_from_iter,
+    types::{Type, Value},
+    Connection, OpenFlags, OptionalExtension, Row, Transaction,
+};
 
 #[path = "store_evidence_spans.rs"]
 mod evidence_spans;
@@ -39,6 +37,8 @@ pub(crate) mod source_relocation;
 mod store_cache;
 #[path = "store_chunk_batch.rs"]
 mod store_chunk_batch;
+#[path = "store_codecs.rs"]
+mod store_codecs;
 #[path = "store_deletion.rs"]
 mod store_deletion;
 #[path = "store_source_bounded_generation.rs"]
@@ -50,6 +50,11 @@ pub use source_contents_replacement::{
 };
 pub use source_relocation::{source_relocation_error_kind, SourceRelocationErrorKind};
 pub use store_cache::SourceEmbeddingCacheVector;
+use store_codecs::{
+    chunk_type_to_str, evidence_kind_to_str, image_caption_status_to_str, invalid_text_value,
+    json_from_sql, status_to_str, str_to_chunk_type, str_to_edge_type, str_to_evidence_kind,
+    str_to_graph_node_kind, str_to_image_caption_status, str_to_status,
+};
 
 #[cfg(test)]
 #[path = "store_evidence_spans_tests.rs"]
@@ -1553,8 +1558,6 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-
-    // --- EmbeddingsMeta ---
 
     pub fn ensure_embedding_profile(
         &self,
@@ -4332,56 +4335,6 @@ fn bump_all_profile_index_generations(tx: &Transaction<'_>) -> Result<u64> {
         .context("parse default profile index generation")
 }
 
-fn status_to_str(s: &SourceStatus) -> &'static str {
-    match s {
-        SourceStatus::Pending => "Pending",
-        SourceStatus::Indexed => "Indexed",
-        SourceStatus::Stale => "Stale",
-    }
-}
-
-fn str_to_status(s: &str) -> SourceStatus {
-    match s {
-        "Indexed" => SourceStatus::Indexed,
-        "Stale" => SourceStatus::Stale,
-        _ => SourceStatus::Pending,
-    }
-}
-
-fn evidence_kind_to_str(kind: EvidenceKind) -> &'static str {
-    match kind {
-        EvidenceKind::Text => "Text",
-        EvidenceKind::Ocr => "Ocr",
-        EvidenceKind::Image => "Image",
-        EvidenceKind::Generated => "Generated",
-    }
-}
-
-fn str_to_evidence_kind(kind: &str) -> EvidenceKind {
-    match kind {
-        "Ocr" => EvidenceKind::Ocr,
-        "Image" => EvidenceKind::Image,
-        "Generated" => EvidenceKind::Generated,
-        _ => EvidenceKind::Text,
-    }
-}
-
-fn image_caption_status_to_str(status: ImageCaptionStatus) -> &'static str {
-    match status {
-        ImageCaptionStatus::Success => "Success",
-        ImageCaptionStatus::Failed => "Failed",
-        ImageCaptionStatus::Skipped => "Skipped",
-    }
-}
-
-fn str_to_image_caption_status(status: &str) -> ImageCaptionStatus {
-    match status {
-        "Success" => ImageCaptionStatus::Success,
-        "Skipped" => ImageCaptionStatus::Skipped,
-        _ => ImageCaptionStatus::Failed,
-    }
-}
-
 fn unix_timestamp_string() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4402,75 +4355,6 @@ fn elapsed_ms_since_unix_seconds(started_at: &str) -> Option<u64> {
         .saturating_sub(started_ms)
         .try_into()
         .ok()
-}
-
-fn chunk_type_to_str(ct: &ChunkType) -> &'static str {
-    match ct {
-        ChunkType::Child => "Child",
-        ChunkType::Parent => "Parent",
-    }
-}
-
-fn str_to_chunk_type(s: &str) -> ChunkType {
-    match s {
-        "Parent" => ChunkType::Parent,
-        _ => ChunkType::Child,
-    }
-}
-
-fn str_to_graph_node_kind(value: &str, column: usize) -> rusqlite::Result<GraphNodeKind> {
-    match value {
-        "Source" => Ok(GraphNodeKind::Source),
-        "Page" => Ok(GraphNodeKind::Page),
-        "Section" => Ok(GraphNodeKind::Section),
-        "Chunk" => Ok(GraphNodeKind::Chunk),
-        "EvidenceUnit" => Ok(GraphNodeKind::EvidenceUnit),
-        "ImageArtifact" => Ok(GraphNodeKind::ImageArtifact),
-        "GeneratedEntity" => Ok(GraphNodeKind::GeneratedEntity),
-        "GeneratedClaim" => Ok(GraphNodeKind::GeneratedClaim),
-        _ => Err(invalid_text_value(
-            column,
-            format!("unknown graph node kind: {value}"),
-        )),
-    }
-}
-
-fn str_to_edge_type(value: &str, column: usize) -> rusqlite::Result<EdgeType> {
-    match value {
-        "contains" | "Contains" => Ok(EdgeType::Contains),
-        "derived_from" | "DerivedFrom" => Ok(EdgeType::DerivedFrom),
-        "parent" => Ok(EdgeType::Parent),
-        "child" => Ok(EdgeType::Child),
-        "previous" => Ok(EdgeType::Previous),
-        "next" | "Next" => Ok(EdgeType::Next),
-        "same_source" => Ok(EdgeType::SameSource),
-        "same_page" => Ok(EdgeType::SamePage),
-        "section_contains" => Ok(EdgeType::SectionContains),
-        "page_contains_image" => Ok(EdgeType::PageContainsImage),
-        "image_near_text" => Ok(EdgeType::ImageNearText),
-        "markdown_links_to" => Ok(EdgeType::MarkdownLinksTo),
-        "generated_depends_on" => Ok(EdgeType::GeneratedDependsOn),
-        "generated_implements" => Ok(EdgeType::GeneratedImplements),
-        "generated_mentions" => Ok(EdgeType::GeneratedMentions),
-        "generated_conflicts_with" => Ok(EdgeType::GeneratedConflictsWith),
-        "generated_supports" => Ok(EdgeType::GeneratedSupports),
-        "generated_other" => Ok(EdgeType::GeneratedOther),
-        _ => Err(invalid_text_value(
-            column,
-            format!("unknown graph edge type: {value}"),
-        )),
-    }
-}
-
-fn invalid_text_value(column: usize, message: String) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        column,
-        Type::Text,
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            message,
-        )),
-    )
 }
 
 fn collection_record_from_row(row: &Row<'_>) -> rusqlite::Result<CollectionRecord> {
@@ -4512,13 +4396,6 @@ fn collection_member_from_row(row: &Row<'_>) -> rusqlite::Result<CollectionMembe
         source_path: PathBuf::from(row.get::<_, String>(3)?),
         updated_at: row.get(4)?,
     })
-}
-
-fn json_from_sql<T>(column: usize, value: &str) -> rusqlite::Result<T>
-where
-    T: DeserializeOwned,
-{
-    serde_json::from_str(value).map_err(|error| invalid_text_value(column, error.to_string()))
 }
 
 const SCHEMA: &str = r#"

@@ -2035,10 +2035,15 @@ where
                 .with_resource(waiting_resource_progress("cpu_worker", "cpu")),
         );
         let cpu_permit = acquire_ingest_resource("cpu_worker", "cpu").await?;
-        let (mut evidence, prepared_image_artifacts, pdf_scan, conversion) = {
+        let (mut evidence, prepared_image_artifacts, pdf_scan, conversion, package_relations) = {
             let _cpu_permit = cpu_permit;
             let (mut parsed_evidence, conversion) =
                 parser.parse_with_derived_metadata(&source.path)?;
+            let package_relations = if parser.name() == "canonical_package" {
+                parser::canonical_package::package_relations(&source.path)?
+            } else {
+                Vec::new()
+            };
             crate::pdf_selector::attach_pdf_selectors(
                 &mut parsed_evidence,
                 &new_source.hash,
@@ -2071,7 +2076,13 @@ where
                     )
                 })
                 .or_else(|| pdf_scan_summary(&evidence, &prepared_image_artifacts.artifacts));
-            (evidence, prepared_image_artifacts, pdf_scan, conversion)
+            (
+                evidence,
+                prepared_image_artifacts,
+                pdf_scan,
+                conversion,
+                package_relations,
+            )
         };
         if pdf_scan.as_ref().is_some_and(|scan| {
             scan.page_count > 0 && scan.image_only_page_count == scan.page_count
@@ -2236,6 +2247,7 @@ where
             &links,
             &prepared_image_artifacts.artifacts,
             &prepared_image_artifacts.text_proximities,
+            &package_relations,
         );
         drop(cpu_permit);
         self.record_task_event(
@@ -5344,6 +5356,7 @@ fn build_evidence_graph(
     links: &[(ChunkId, EvidenceId)],
     image_artifacts: &[ImageArtifact],
     image_text_proximities: &[ImageTextProximity],
+    package_relations: &[parser::canonical_package::CanonicalPackageRelation],
 ) -> (Vec<GraphNode>, Vec<GraphEdge>) {
     let mut graph = GraphBuildState::new(source);
     let evidence_by_id: HashMap<EvidenceId, &EvidenceUnit> = evidence
@@ -5354,6 +5367,7 @@ fn build_evidence_graph(
     for unit in evidence {
         graph.add_evidence_node(unit);
     }
+    graph.add_package_relations(package_relations);
 
     for (ordinal, chunk) in chunks.iter().enumerate() {
         graph.add_chunk_node(chunk, ordinal as u32, &evidence_by_id);
@@ -5485,6 +5499,27 @@ impl GraphBuildState {
         if !has_parent {
             let source_node_id = self.source_node_id.clone();
             self.push_parent_child_edges(&source_node_id, &node_id, Some(unit.position));
+        }
+    }
+
+    fn add_package_relations(
+        &mut self,
+        relations: &[parser::canonical_package::CanonicalPackageRelation],
+    ) {
+        for (ordinal, relation) in relations.iter().enumerate() {
+            let Some(from_node_id) = self.evidence_nodes.get(&relation.from_unit_id).cloned()
+            else {
+                continue;
+            };
+            let Some(to_node_id) = self.evidence_nodes.get(&relation.to_unit_id).cloned() else {
+                continue;
+            };
+            self.push_edge(
+                EdgeType::FootnoteReferencesVerse,
+                &from_node_id,
+                &to_node_id,
+                Some(ordinal as u32),
+            );
         }
     }
 
@@ -5968,6 +6003,8 @@ fn evidence_matches_nearby_text(unit: &EvidenceUnit, nearby_text: &str) -> bool 
 fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Text => "text",
+        EvidenceKind::Verse => "verse",
+        EvidenceKind::Footnote => "footnote",
         EvidenceKind::Ocr => "ocr",
         EvidenceKind::Image => "image",
         EvidenceKind::Generated => "generated",
@@ -9085,6 +9122,7 @@ model = "local-vision"
             &chunk_output.links,
             &prepared.artifacts,
             &prepared.text_proximities,
+            &[],
         );
 
         let image_node_id = GraphNodeId::new(

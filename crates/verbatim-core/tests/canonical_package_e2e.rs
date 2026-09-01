@@ -168,6 +168,73 @@ async fn canonical_package_ingest_preserves_unit_identity() {
     );
 }
 
+#[tokio::test]
+async fn canonical_package_ingests_verse_and_footnote_as_distinct_kinds() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+    let source_id = pipeline.add_source(&fixture("verse-footnote")).unwrap();
+
+    pipeline.ingest_source(&source_id).await.unwrap();
+    let evidence = pipeline
+        .store()
+        .list_evidence_by_source(&source_id)
+        .unwrap()
+        .into_iter()
+        .map(|unit| (unit.id.0.clone(), unit))
+        .collect::<BTreeMap<_, _>>();
+
+    let verse = &evidence["pkg:john-3-16"];
+    let footnote = &evidence["pkg:john-3-16-note-1"];
+    assert_eq!(serde_json::to_value(verse.kind).unwrap(), "Verse");
+    assert_eq!(serde_json::to_value(footnote.kind).unwrap(), "Footnote");
+    assert_eq!(verse.text, "For God so loved the world.");
+    assert!(!verse.text.contains(&footnote.text));
+}
+
+#[tokio::test]
+async fn canonical_package_footnote_relation_resolves_to_verse_anchor() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+    let source_id = pipeline.add_source(&fixture("verse-footnote")).unwrap();
+
+    pipeline.ingest_source(&source_id).await.unwrap();
+    let note_node = verbatim_core::types::GraphNodeId::new(
+        &source_id,
+        verbatim_core::types::GraphNodeKind::EvidenceUnit,
+        "pkg:john-3-16-note-1",
+    );
+    let verse_node = verbatim_core::types::GraphNodeId::new(
+        &source_id,
+        verbatim_core::types::GraphNodeKind::EvidenceUnit,
+        "pkg:john-3-16",
+    );
+
+    assert!(pipeline
+        .store()
+        .list_graph_edges_by_source(&source_id)
+        .unwrap()
+        .iter()
+        .any(|edge| {
+            serde_json::to_value(edge.edge_type).unwrap() == "footnote_references_verse"
+                && edge.from_node_id == note_node
+                && edge.to_node_id == verse_node
+        }));
+}
+
+#[test]
+fn canonical_package_rejects_unknown_content_kind() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let error = pipeline
+        .add_source(&fixture("unknown-content-kind"))
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("CANONICAL_PACKAGE_UNIT_CONTENT_KIND_UNKNOWN"));
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
+}
+
 #[test]
 fn canonical_package_rejects_duplicate_unit_id() {
     let tempdir = tempfile::tempdir().unwrap();

@@ -64,6 +64,12 @@ impl Parser for CanonicalJsonlParser {
             }
             let entry: JsonlEntry = serde_json::from_str(trimmed)
                 .with_context(|| format!("invalid JSON on line {line_no} of {}", path.display()))?;
+            let kind = evidence_kind_from_content_kind(&entry.content_kind)?;
+            let content_kind = if entry.content_kind.is_empty() {
+                "text"
+            } else {
+                &entry.content_kind
+            };
 
             // Reject lines missing required fields.
             if entry.source_profile.is_empty() {
@@ -102,6 +108,7 @@ impl Parser for CanonicalJsonlParser {
                 &entry.work_id,
                 entry.version_id.as_deref(),
                 &normalized,
+                content_kind,
             );
             if let Some(first_line) = identity_lines.insert(id.0.clone(), line_no) {
                 bail!(
@@ -141,7 +148,7 @@ impl Parser for CanonicalJsonlParser {
             units.push(EvidenceUnit {
                 id,
                 source_id: source_id.clone(),
-                kind: EvidenceKind::Text,
+                kind,
                 derived_from: None,
                 locator: SourceLocator::Canonical { locator },
                 text: entry.text.clone(),
@@ -166,6 +173,7 @@ fn generated_evidence_id(
     work_id: &str,
     version_id: Option<&str>,
     normalized: &str,
+    content_kind: &str,
 ) -> EvidenceId {
     let mut payload = Vec::with_capacity(128);
     append_identity_field(&mut payload, b"canonical-jsonl-evidence-id-v1");
@@ -179,7 +187,7 @@ fn generated_evidence_id(
         None => payload.push(0),
     }
     append_identity_field(&mut payload, normalized.as_bytes());
-    append_identity_field(&mut payload, b"text");
+    append_identity_field(&mut payload, content_kind.as_bytes());
     EvidenceId(format!(
         "{GENERATED_EVIDENCE_ID_PREFIX}{}",
         hex_sha256(&payload)
@@ -194,6 +202,15 @@ pub(crate) fn is_generated_evidence_id(id: &EvidenceId) -> bool {
                     .bytes()
                     .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         })
+}
+
+pub(crate) fn evidence_kind_from_content_kind(content_kind: &str) -> Result<EvidenceKind> {
+    match content_kind {
+        "" | "text" => Ok(EvidenceKind::Text),
+        "verse" => Ok(EvidenceKind::Verse),
+        "footnote" => Ok(EvidenceKind::Footnote),
+        _ => bail!("unknown canonical JSONL content_kind {content_kind}"),
+    }
 }
 
 fn append_identity_field(payload: &mut Vec<u8>, field: &[u8]) {
@@ -231,6 +248,8 @@ struct JsonlEntry {
     display_citation: Option<String>,
     #[serde(default)]
     text: String,
+    #[serde(default)]
+    content_kind: String,
     #[serde(default)]
     backing_selectors: Vec<BackingSelector>,
     #[serde(default)]
