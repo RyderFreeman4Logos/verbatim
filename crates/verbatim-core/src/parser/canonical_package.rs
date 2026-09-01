@@ -171,6 +171,7 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
 
     let mut unit_count = 0;
     let mut unit_id_locations = HashMap::new();
+    let mut unit_content_kinds = HashMap::new();
     match fs::File::open(&units_path) {
         Ok(file) => {
             for (index, line) in BufReader::new(file).lines().enumerate() {
@@ -197,6 +198,7 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
                             &mut unit_id_locations,
                             &mut diagnostics,
                         );
+                        unit_content_kinds.insert(unit.unit_id.clone(), unit.content_kind.clone());
                     }
                     Err(error) => diagnostics.push(diagnostic(
                         "CANONICAL_PACKAGE_UNIT_INVALID",
@@ -208,13 +210,7 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
         }
         Err(error) => diagnostics.push(diagnostic("CANONICAL_PACKAGE_UNITS_MISSING", UNITS, error)),
     }
-    if let Err(error) = package_relations(path) {
-        diagnostics.push(diagnostic(
-            "CANONICAL_PACKAGE_RELATION_INVALID",
-            RELATIONS,
-            error,
-        ));
-    }
+    validate_relation_endpoints(path, &unit_content_kinds, &mut diagnostics);
     let units = match CanonicalJsonlParser.parse(&units_path) {
         Ok(units) => units
             .into_iter()
@@ -280,6 +276,86 @@ pub fn package_hash(path: &Path) -> Result<String> {
         hasher.update(bytes);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_relation_endpoints(
+    path: &Path,
+    unit_content_kinds: &HashMap<String, String>,
+    diagnostics: &mut Vec<CanonicalPackageDiagnostic>,
+) {
+    let relations_path = path.join(RELATIONS);
+    if !relations_path.is_file() {
+        return;
+    }
+    let file = match fs::File::open(&relations_path) {
+        Ok(file) => file,
+        Err(error) => {
+            diagnostics.push(diagnostic(
+                "CANONICAL_PACKAGE_RELATION_INVALID",
+                RELATIONS,
+                error,
+            ));
+            return;
+        }
+    };
+
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line_no = index + 1;
+        let location = format!("{RELATIONS}:{line_no}");
+        let line = match line {
+            Ok(line) if !line.trim().is_empty() => line,
+            Ok(_) => continue,
+            Err(error) => {
+                diagnostics.push(diagnostic(
+                    "CANONICAL_PACKAGE_RELATION_INVALID",
+                    &location,
+                    error,
+                ));
+                continue;
+            }
+        };
+        let relation = match serde_json::from_str::<PackageRelation>(&line) {
+            Ok(relation) => relation,
+            Err(error) => {
+                diagnostics.push(diagnostic(
+                    "CANONICAL_PACKAGE_RELATION_INVALID",
+                    &location,
+                    error,
+                ));
+                continue;
+            }
+        };
+        if relation.relation_type != "footnote_references_verse"
+            || relation.from_unit_id.is_empty()
+            || relation.to_unit_id.is_empty()
+        {
+            diagnostics.push(CanonicalPackageDiagnostic {
+                code: "CANONICAL_PACKAGE_RELATION_INVALID",
+                location,
+                message: "relation type and endpoints are required".into(),
+            });
+            continue;
+        }
+        let (Some(from_kind), Some(to_kind)) = (
+            unit_content_kinds.get(&relation.from_unit_id),
+            unit_content_kinds.get(&relation.to_unit_id),
+        ) else {
+            diagnostics.push(CanonicalPackageDiagnostic {
+                code: "CANONICAL_PACKAGE_RELATION_ENDPOINT_UNKNOWN",
+                location,
+                message: "relation endpoint does not name a package unit".into(),
+            });
+            continue;
+        };
+        if from_kind != "footnote" || to_kind != "verse" {
+            diagnostics.push(CanonicalPackageDiagnostic {
+                code: "CANONICAL_PACKAGE_RELATION_KIND_INVALID",
+                location,
+                message: "footnote_references_verse requires a footnote source and verse target"
+                    .into(),
+            });
+        }
+    }
 }
 
 pub(crate) fn package_relations(path: &Path) -> Result<Vec<CanonicalPackageRelation>> {

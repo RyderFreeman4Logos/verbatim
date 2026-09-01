@@ -25,6 +25,16 @@ fn write_package(path: &Path, schema_version: &str, units: &str) {
     fs::write(path.join("units.jsonl"), units).unwrap();
 }
 
+fn relation_package(tempdir: &tempfile::TempDir, relation: &str) -> PathBuf {
+    let package = tempdir.path().join("relation");
+    fs::create_dir(&package).unwrap();
+    for file in ["manifest.json", "units.jsonl"] {
+        fs::copy(fixture("verse-footnote").join(file), package.join(file)).unwrap();
+    }
+    fs::write(package.join("relations.jsonl"), relation).unwrap();
+    package
+}
+
 #[test]
 fn canonical_package_validates_golden_package() {
     let report = validate_package(&fixture("valid"));
@@ -232,6 +242,36 @@ fn canonical_package_rejects_unknown_content_kind() {
         .to_string();
 
     assert!(error.contains("CANONICAL_PACKAGE_UNIT_CONTENT_KIND_UNKNOWN"));
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
+}
+
+#[test]
+fn canonical_package_rejects_relation_to_missing_unit() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = relation_package(
+        &tempdir,
+        r#"{"relation_type":"footnote_references_verse","from_unit_id":"pkg:john-3-16-note-1","to_unit_id":"pkg:missing"}"#,
+    );
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let error = pipeline.add_source(&package).unwrap_err().to_string();
+
+    assert!(error.contains("CANONICAL_PACKAGE_RELATION_ENDPOINT_UNKNOWN"));
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
+}
+
+#[test]
+fn canonical_package_rejects_reversed_footnote_relation() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = relation_package(
+        &tempdir,
+        r#"{"relation_type":"footnote_references_verse","from_unit_id":"pkg:john-3-16","to_unit_id":"pkg:john-3-16-note-1"}"#,
+    );
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let error = pipeline.add_source(&package).unwrap_err().to_string();
+
+    assert!(error.contains("CANONICAL_PACKAGE_RELATION_KIND_INVALID"));
     assert!(pipeline.store().list_sources().unwrap().is_empty());
 }
 
