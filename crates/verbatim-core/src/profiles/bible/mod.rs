@@ -14,6 +14,10 @@ use super::{
 };
 use crate::types::{CanonicalLocator, ReferenceComponent};
 use canon_registry::CanonRegistry;
+use versification_registry::VersificationRegistry;
+
+/// Stable diagnostic for a Bible coordinate outside Protestant bounds.
+pub const BIBLE_REFERENCE_OUT_OF_BOUNDS: &str = "BIBLE_REFERENCE_OUT_OF_BOUNDS";
 
 /// Find a book by its full name or abbreviation through the canonical registry.
 fn resolve_book(input: &str) -> Option<(usize, &'static str)> {
@@ -180,6 +184,44 @@ fn parse_ref_part(s: &str) -> Option<(u32, u32, Option<u32>, Option<u32>)> {
         let chapter: u32 = s.trim().parse().ok()?;
         Some((chapter, chapter, None, None))
     }
+}
+
+/// Check every parsed endpoint against the Protestant versification bounds.
+/// Chapter-only endpoints use verse one only to prove chapter presence; no
+/// verse component is added to the parsed reference.
+pub fn validate_reference_bounds(reference: &ParsedReference) -> bool {
+    let valid_endpoint = |components: &[ReferenceComponent]| {
+        let Some(book) = components.first() else {
+            return false;
+        };
+        if book.level != "book" {
+            return false;
+        }
+        let Some(book) = CanonRegistry::resolve(&book.value) else {
+            return false;
+        };
+        let Some(chapter) = components.get(1) else {
+            return false;
+        };
+        if chapter.level != "chapter" {
+            return false;
+        }
+        let Ok(chapter) = chapter.value.parse::<u16>() else {
+            return false;
+        };
+        match components {
+            [_, _] => VersificationRegistry::lookup(book.id, chapter, 1).is_some(),
+            [_, _, verse] if verse.level == "verse" => {
+                let Ok(verse) = verse.value.parse::<u16>() else {
+                    return false;
+                };
+                VersificationRegistry::lookup(book.id, chapter, verse).is_some()
+            }
+            _ => false,
+        }
+    };
+
+    valid_endpoint(&reference.start) && reference.end.as_ref().is_none_or(|end| valid_endpoint(end))
 }
 
 /// Bible source profile.
@@ -379,6 +421,14 @@ mod tests {
         let parsed = registry.try_parse("John 3:16");
         assert!(parsed.is_some());
         assert_eq!(parsed.unwrap().profile_id, "bible");
+    }
+
+    #[test]
+    fn registry_rejects_out_of_bounds_bible_references() {
+        let registry = crate::profiles::ProfileRegistry::new();
+        for reference in ["John 3:999", "John 99:1", "John 3-99"] {
+            assert!(registry.try_parse(reference).is_none(), "{reference}");
+        }
     }
 
     #[test]
