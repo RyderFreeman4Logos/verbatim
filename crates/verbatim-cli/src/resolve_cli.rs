@@ -4,6 +4,7 @@ use std::io::Write;
 
 use crate::client::CliError;
 use crate::ResolveFormat;
+use verbatim_core::profiles::{ProfileRegistry, ReferenceParseError};
 
 pub(super) fn run_resolve<W>(
     reference: &str,
@@ -13,12 +14,23 @@ pub(super) fn run_resolve<W>(
 where
     W: Write,
 {
-    let registry = verbatim_core::profiles::ProfileRegistry::new();
-    let parsed = registry.try_parse(reference).ok_or_else(|| {
-        CliError::Api(format!(
-            "could not parse \"{reference}\" as a canonical reference"
-        ))
-    })?;
+    let registry = ProfileRegistry::new();
+    let parsed = match registry.try_parse_with_diagnostic(reference) {
+        Ok(parsed) => parsed,
+        Err(ReferenceParseError::NotAReference) => {
+            return Err(CliError::Api(format!(
+                "could not parse \"{reference}\" as a canonical reference"
+            )))
+        }
+        Err(error @ ReferenceParseError::OutOfBounds) => {
+            return Err(CliError::Api(format!(
+                "{}: reference \"{reference}\" is outside Protestant versification bounds",
+                error
+                    .diagnostic_code()
+                    .unwrap_or("BIBLE_REFERENCE_OUT_OF_BOUNDS")
+            )))
+        }
+    };
 
     // Build normalized key from start components
     let normalized: String = parsed
@@ -61,4 +73,19 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_reference_reports_stable_bounds_diagnostic() {
+        for reference in ["John 3:999", "John 99:1"] {
+            let mut stdout = Vec::new();
+            let error = run_resolve(reference, None, &mut stdout).unwrap_err();
+            assert!(stdout.is_empty(), "{reference}: {stdout:?}");
+            assert!(error.to_string().contains("BIBLE_REFERENCE_OUT_OF_BOUNDS"));
+        }
+    }
 }

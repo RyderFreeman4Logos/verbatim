@@ -29,6 +29,25 @@ pub enum ReferenceConfidence {
     Low,
 }
 
+/// Why a structured reference was not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceParseError {
+    /// The input is not an unambiguous structured reference.
+    NotAReference,
+    /// A parsed reference falls outside its profile's known bounds.
+    OutOfBounds,
+}
+
+impl ReferenceParseError {
+    /// Return a stable machine-readable diagnostic code when one applies.
+    pub const fn diagnostic_code(self) -> Option<&'static str> {
+        match self {
+            Self::NotAReference => None,
+            Self::OutOfBounds => Some(bible::BIBLE_REFERENCE_OUT_OF_BOUNDS),
+        }
+    }
+}
+
 /// Trait for source-family-specific reference logic.
 pub trait SourceProfile: Send + Sync {
     fn id(&self) -> &str;
@@ -55,18 +74,29 @@ impl ProfileRegistry {
     /// Try to parse `input` as a canonical reference using all registered profiles.
     /// Returns the first high-confidence match.
     pub fn try_parse(&self, input: &str) -> Option<ParsedReference> {
+        self.try_parse_with_diagnostic(input).ok()
+    }
+
+    /// Try to parse `input`, preserving a stable diagnostic for rejected bounds.
+    pub fn try_parse_with_diagnostic(
+        &self,
+        input: &str,
+    ) -> Result<ParsedReference, ReferenceParseError> {
         let trimmed = input.trim();
         if trimmed.is_empty() || trimmed.len() > 200 {
-            return None;
+            return Err(ReferenceParseError::NotAReference);
         }
         for profile in &self.profiles {
             if let Some(parsed) = profile.parse_reference(trimmed) {
+                if profile.id() == "bible" && !bible::validate_reference_bounds(&parsed) {
+                    return Err(ReferenceParseError::OutOfBounds);
+                }
                 if parsed.confidence == ReferenceConfidence::High {
-                    return Some(parsed);
+                    return Ok(parsed);
                 }
             }
         }
-        None
+        Err(ReferenceParseError::NotAReference)
     }
 
     /// Get a profile by ID.
