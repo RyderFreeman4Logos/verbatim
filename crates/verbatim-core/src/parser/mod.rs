@@ -15,6 +15,7 @@ pub mod plaintext;
 #[cfg(feature = "parser-pdfplumber")]
 pub mod plumber;
 pub(crate) mod text_segments;
+pub mod usfm;
 
 use std::path::Path;
 
@@ -25,6 +26,7 @@ use crate::traits::Parser;
 pub fn select_parser(name: &str) -> Result<Box<dyn Parser>> {
     match name {
         "canonical_jsonl" => Ok(Box::new(canonical_jsonl::CanonicalJsonlParser)),
+        "usfm" => Ok(Box::new(usfm::UsfmParser)),
         #[cfg(feature = "parser-pdf-oxide")]
         "pdf_oxide" => Ok(Box::new(oxide::PdfOxideParser)),
         #[cfg(feature = "parser-pdfplumber")]
@@ -35,7 +37,7 @@ pub fn select_parser(name: &str) -> Result<Box<dyn Parser>> {
         "markdown" => Ok(Box::new(markdown::MarkdownParser)),
         "plaintext" => Ok(Box::new(plaintext::PlaintextParser)),
         _ => bail!(
-            "unknown parser: {name}. Available: canonical_jsonl, pdf_oxide, pdfplumber, anydoc_pdf, json, markdown, plaintext"
+            "unknown parser: {name}. Available: canonical_jsonl, usfm, pdf_oxide, pdfplumber, anydoc_pdf, json, markdown, plaintext"
         ),
     }
 }
@@ -59,6 +61,7 @@ pub fn parser_for_extension(path: &Path) -> Result<Box<dyn Parser>> {
             bail!("no PDF parser available (enable parser-pdf-oxide or parser-anydoc-pdf feature)")
         }
         "jsonl" => Ok(Box::new(canonical_jsonl::CanonicalJsonlParser)),
+        "usfm" => Ok(Box::new(usfm::UsfmParser)),
         "json" => Ok(Box::new(json::JsonParser)),
         "md" | "markdown" => Ok(Box::new(markdown::MarkdownParser)),
         "txt" | "text" => Ok(Box::new(plaintext::PlaintextParser)),
