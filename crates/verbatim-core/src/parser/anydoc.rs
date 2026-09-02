@@ -68,7 +68,7 @@ impl Parser for AnyDocPdfParser {
         let bytes =
             fs::read(path).with_context(|| format!("failed to read: {}", path.display()))?;
         let markdown = match anydoc::to_markdown_bytes(&bytes, anydoc::Format::Pdf) {
-            Ok(markdown) if !markdown.is_empty() => markdown,
+            Ok(markdown) if !markdown.trim().is_empty() => markdown,
             Ok(_) => {
                 return fallback_to_native_pdf(
                     path,
@@ -118,16 +118,21 @@ impl Parser for AnyDocPdfParser {
                 &mut position,
             ));
         }
-        crate::pdf_selector::attach_pdf_selectors(
-            &mut units,
-            &crate::types::hex_sha256(&bytes),
-            self.name(),
-        );
+        if units.is_empty() {
+            return fallback_to_native_pdf(
+                path,
+                anyhow::anyhow!("anydoc PDF conversion produced no source evidence"),
+            );
+        }
+        let original_source_hash = crate::types::hex_sha256(&bytes);
+        crate::pdf_selector::attach_pdf_selectors(&mut units, &original_source_hash, self.name());
         Ok((
             units,
             Some(DerivedConversionMetadata {
+                adapter: self.name().to_string(),
                 converter: CONVERTER.to_string(),
                 converter_version: CONVERTER_VERSION.to_string(),
+                original_source_hash,
                 output_hash: crate::types::hex_sha256(markdown.as_bytes()),
             }),
         ))
@@ -180,11 +185,35 @@ mod tests {
         assert_eq!(
             conversion,
             Some(DerivedConversionMetadata {
+                adapter: "anydoc_pdf".into(),
                 converter: "anydoc+pdf-inspector".into(),
                 converter_version: "anydoc@0.2.4;pdf-inspector@1.14.2".into(),
+                original_source_hash: crate::types::hex_sha256(&original),
                 output_hash: "18f2f6e8bda2d1c75a1898299ed4087e4f8274e2f9746e4ed1c4da325ab88539"
                     .into(),
             })
+        );
+    }
+
+    #[test]
+    fn empty_inspector_units_fall_back_to_native_pdf() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("empty-units.pdf");
+        write_pdf_with_image_and_invisible_text(&path, "Native fallback evidence");
+
+        let (units, conversion) = AnyDocPdfParser
+            .parse_with_derived_metadata(&path)
+            .expect("empty inspector evidence should use native PDF fallback");
+
+        assert!(
+            conversion.is_none(),
+            "native fallback must not keep the AnyDoc conversion envelope"
+        );
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.text.contains("Native fallback evidence")),
+            "native PDF fallback should recover overlay text, got {units:?}"
         );
     }
 
@@ -200,6 +229,32 @@ mod tests {
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
             stream_object(b"<<", content.as_bytes()),
+        ];
+        std::fs::write(path, pdf_bytes(objects)).unwrap();
+    }
+
+    fn write_pdf_with_image_and_invisible_text(path: &Path, text: &str) {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        let image = vec![255_u8; 8 * 8 * 3];
+        let invisible = format!(
+            "BT\n/F1 12 Tf\n3 Tr\n72 160 Td\n({escaped} 0) Tj\n0 -10 Td\n({escaped} 1) Tj\n0 -10 Td\n({escaped} 2) Tj\n0 -10 Td\n({escaped} 3) Tj\n0 -10 Td\n({escaped} 4) Tj\n0 -10 Td\n({escaped} 5) Tj\n0 -10 Td\n({escaped} 6) Tj\n0 -10 Td\n({escaped} 7) Tj\n0 -10 Td\n({escaped} 8) Tj\n0 -10 Td\n({escaped} 9) Tj\nET\n"
+        );
+        let spaces = "BT\n/F1 12 Tf\n72 180 Td\n( ) Tj\n0 -10 Td\n( ) Tj\n0 -10 Td\n( ) Tj\nET\n";
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 8 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            stream_object(
+                b"<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+                &image,
+            ),
+            stream_object(b"<<", invisible.as_bytes()),
+            stream_object(b"<<", spaces.as_bytes()),
         ];
         std::fs::write(path, pdf_bytes(objects)).unwrap();
     }

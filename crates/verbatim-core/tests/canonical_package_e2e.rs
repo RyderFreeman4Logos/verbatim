@@ -47,6 +47,59 @@ fn canonical_package_validates_golden_package() {
 }
 
 #[test]
+fn canonical_package_parse_exposes_conversion_envelope() {
+    let (units, conversion) = CanonicalPackageParser
+        .parse_with_derived_metadata(&fixture("valid"))
+        .unwrap();
+    let report = validate_package(&fixture("valid"));
+
+    assert_eq!(units.len(), 2);
+    assert_eq!(conversion, report.conversion);
+    let conversion = conversion.expect("fixture conversion envelope");
+    assert_eq!(conversion.adapter, "fixture-adapter");
+    assert_eq!(
+        conversion.original_source_hash,
+        "0bc1dd60d3bb6082799548fd022a62108d510b59523e04de6071e396b79d018c"
+    );
+    assert_eq!(
+        conversion.output_hash,
+        "10e35c9b02b6297550a7c4009b2a9620bc9360331b90895d40f0a1bd5963dcdd"
+    );
+}
+
+#[test]
+fn canonical_package_rejects_empty_conversion_output() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = tempdir.path().join("empty-conversion");
+    fs::create_dir(&package).unwrap();
+    let manifest = fs::read_to_string(fixture("valid").join("manifest.json"))
+        .unwrap()
+        .replace(
+            "10e35c9b02b6297550a7c4009b2a9620bc9360331b90895d40f0a1bd5963dcdd",
+            "",
+        );
+    fs::write(package.join("manifest.json"), manifest).unwrap();
+    fs::copy(
+        fixture("valid").join("units.jsonl"),
+        package.join("units.jsonl"),
+    )
+    .unwrap();
+
+    let report = validate_package(&package);
+
+    assert!(!report.valid);
+    assert_eq!(
+        report.diagnostics[0].code,
+        "CANONICAL_PACKAGE_CONVERSION_INVALID"
+    );
+    assert_eq!(
+        report.diagnostics[0].message,
+        "conversion output_hash is required"
+    );
+    assert!(CanonicalPackageParser.parse(&package).is_err());
+}
+
+#[test]
 fn canonical_package_persists_package_unit_id() {
     let units = CanonicalPackageParser.parse(&fixture("valid")).unwrap();
 

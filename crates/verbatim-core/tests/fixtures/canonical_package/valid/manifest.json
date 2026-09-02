@@ -7,8 +7,10 @@
   "language": "en",
   "original_source_hash": "0bc1dd60d3bb6082799548fd022a62108d510b59523e04de6071e396b79d018c",
   "conversion": {
+    "adapter": "fixture-adapter",
     "converter": "fixture-converter",
     "converter_version": "1.0.0",
+    "original_source_hash": "0bc1dd60d3bb6082799548fd022a62108d510b59523e04de6071e396b79d018c",
     "output_hash": "10e35c9b02b6297550a7c4009b2a9620bc9360331b90895d40f0a1bd5963dcdd"
   }
 }

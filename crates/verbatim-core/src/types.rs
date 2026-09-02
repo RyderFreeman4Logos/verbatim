@@ -760,8 +760,15 @@ pub struct SourceOcrDiagnostics {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DerivedConversionMetadata {
+    #[serde(default)]
+    pub adapter: String,
+    #[serde(default)]
     pub converter: String,
+    #[serde(default)]
     pub converter_version: String,
+    #[serde(default)]
+    pub original_source_hash: String,
+    #[serde(default)]
     pub output_hash: String,
 }
 

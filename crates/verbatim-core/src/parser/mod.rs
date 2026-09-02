@@ -4,6 +4,7 @@ pub mod anydoc;
 mod bounded_pdf_images;
 pub mod canonical_jsonl;
 pub mod canonical_package;
+mod canonical_package_conversion;
 pub mod json;
 pub mod markdown;
 #[cfg(feature = "parser-pdf-oxide")]
