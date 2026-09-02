@@ -178,7 +178,8 @@ impl Parser for CanonicalJsonlParser {
 ///
 /// The v1 payload is SHA-256 over unsigned 64-bit big-endian length-prefixed
 /// fields in this order: domain, source profile, work, optional-version tag and
-/// value, normalized locator, and content kind.
+/// value, optional canon/versification tags and values, normalized locator, and
+/// content kind. Absent canon and versification IDs are omitted for compatibility.
 fn generated_evidence_id(
     source_profile: &str,
     work_id: &str,
@@ -199,13 +200,15 @@ fn generated_evidence_id(
         }
         None => payload.push(0),
     }
-    for id in [canon_id, versification_id] {
-        match id {
-            Some(id) => {
-                payload.push(1);
-                append_identity_field(&mut payload, id.as_bytes());
+    if canon_id.is_some() || versification_id.is_some() {
+        for id in [canon_id, versification_id] {
+            match id {
+                Some(id) => {
+                    payload.push(1);
+                    append_identity_field(&mut payload, id.as_bytes());
+                }
+                None => payload.push(0),
             }
-            None => payload.push(0),
         }
     }
     append_identity_field(&mut payload, normalized.as_bytes());
