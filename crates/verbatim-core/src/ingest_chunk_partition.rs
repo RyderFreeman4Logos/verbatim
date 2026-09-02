@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 
 use crate::canonical_chunker::{chunk_canonical_units, CanonicalChunkerConfig};
 use crate::chunker::{chunk_evidence, ChunkOutput, ChunkerConfig};
-use crate::types::{EvidenceUnit, SourceId, SourceLocator};
+use crate::types::{EvidenceKind, EvidenceUnit, SourceId, SourceLocator};
 
 pub(super) struct PartitionedChunkOutput {
     pub(super) output: ChunkOutput,
@@ -23,7 +23,7 @@ pub(super) fn chunk_searchable_evidence_by_locator(
 ) -> Result<PartitionedChunkOutput> {
     let canonical_evidence_count = evidence
         .iter()
-        .filter(|unit| matches!(unit.locator, SourceLocator::Canonical { .. }))
+        .filter(|unit| is_canonical_verse(unit))
         .count();
     let noncanonical_evidence_count = evidence.len() - canonical_evidence_count;
     let (output, strategies_used) = match (canonical_evidence_count, noncanonical_evidence_count) {
@@ -71,16 +71,11 @@ fn chunk_mixed_evidence(
     config: &ChunkerConfig,
     canonical_config: &CanonicalChunkerConfig,
 ) -> Result<ChunkOutput> {
-    let (canonical, noncanonical): (Vec<_>, Vec<_>) = evidence
-        .iter()
-        .cloned()
-        .partition(|unit| matches!(unit.locator, SourceLocator::Canonical { .. }));
+    let (canonical, noncanonical): (Vec<_>, Vec<_>) =
+        evidence.iter().cloned().partition(is_canonical_verse);
     let canonical_output = chunk_canonical_units(source_id, &canonical, canonical_config)?;
     let noncanonical_output = chunk_evidence(source_id, &noncanonical, config);
-    let [mut output, other] = if evidence
-        .first()
-        .is_some_and(|unit| matches!(unit.locator, SourceLocator::Canonical { .. }))
-    {
+    let [mut output, other] = if evidence.first().is_some_and(is_canonical_verse) {
         [canonical_output, noncanonical_output]
     } else {
         [noncanonical_output, canonical_output]
@@ -118,6 +113,11 @@ fn chunk_mixed_evidence(
     Ok(output)
 }
 
+fn is_canonical_verse(unit: &EvidenceUnit) -> bool {
+    // Footnotes keep the generic chunker; other canonical locators stay unit-aligned.
+    unit.kind != EvidenceKind::Footnote && matches!(unit.locator, SourceLocator::Canonical { .. })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +150,7 @@ mod tests {
         position: u32,
     ) -> EvidenceUnit {
         EvidenceUnit {
+            kind: EvidenceKind::Verse,
             locator: SourceLocator::Canonical {
                 locator: CanonicalLocator::single_unit(
                     "bible",
