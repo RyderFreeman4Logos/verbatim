@@ -35,7 +35,9 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 anydoc = { version = "=0.2.4", optional = true }
 pdf-inspector = { version = "=1.14.2", optional = true }
 pulldown-cmark = "0.12"
+quick-xml.workspace = true
 instant-distance = "0.6"
+zip.workspace = true
 tantivy = "0.26"
 
 [dev-dependencies]
