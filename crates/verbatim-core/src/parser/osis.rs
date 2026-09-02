@@ -76,6 +76,7 @@ impl Element {
 #[derive(Default)]
 struct Counts {
     roots: usize,
+    osis_texts: usize,
     books: usize,
     chapters: usize,
     verses: usize,
@@ -101,22 +102,29 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
     let mut stack = Vec::new();
     let mut counts = Counts::default();
     let mut verse = None;
-    let mut declaration_seen = false;
+    let mut event_seen = false;
 
     loop {
         let event = reader.read_event_into(&mut buffer).map_err(|error| {
             malformed_xml(bytes, reader.buffer_position() as usize, path, error)
         })?;
         let line = line_number(bytes, reader.buffer_position() as usize);
+        let first_event = !event_seen;
         match event {
-            Event::Decl(_) => {
-                if declaration_seen || counts.roots != 0 || !stack.is_empty() {
+            Event::Decl(declaration) => {
+                if !first_event {
                     bail!(
-                        "OSIS_UNEXPECTED_STRUCTURE: XML declaration must precede the root on line {line} of {}",
+                        "OSIS_UNEXPECTED_STRUCTURE: XML declaration must be the first event on line {line} of {}",
                         path.display()
                     );
                 }
-                declaration_seen = true;
+                validate_declaration(
+                    &declaration,
+                    bytes,
+                    reader.buffer_position() as usize,
+                    line,
+                    path,
+                )?;
             }
             Event::DocType(_) => {
                 bail!(
@@ -243,6 +251,7 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
             }
             Event::Eof => break,
         }
+        event_seen = true;
         buffer.clear();
     }
 
@@ -286,6 +295,13 @@ fn next_element(
         [Element::Osis] => {
             require_name(name, "osisText", line, path)?;
             ensure_attributes(attrs, &[], line, path)?;
+            if counts.osis_texts != 0 {
+                bail!(
+                    "OSIS_DUPLICATE_OSIS_TEXT: only one osisText container is supported on line {line} of {}",
+                    path.display()
+                );
+            }
+            counts.osis_texts += 1;
             Ok(Element::OsisText)
         }
         [Element::Osis, Element::OsisText] => {
@@ -613,6 +629,55 @@ fn reject_milestone(
     Ok(())
 }
 
+fn validate_declaration(
+    declaration: &quick_xml::events::BytesDecl<'_>,
+    bytes: &[u8],
+    position: usize,
+    line: u32,
+    path: &Path,
+) -> Result<()> {
+    let version = declaration
+        .xml_version()
+        .map_err(|error| malformed_xml(bytes, position, path, error))?;
+    if version != XmlVersion::Explicit1_0 {
+        bail!(
+            "OSIS_UNSUPPORTED_XML_DECLARATION: XML version must be 1.0 on line {line} of {}",
+            path.display()
+        );
+    }
+
+    let encoding = declaration
+        .encoding()
+        .transpose()
+        .map_err(|error| malformed_xml(bytes, position, path, error))?;
+    if let Some(encoding) = encoding {
+        let encoding = std::str::from_utf8(encoding.as_ref())
+            .map_err(|error| malformed_xml(bytes, position, path, error))?;
+        if !encoding.eq_ignore_ascii_case("UTF-8") {
+            bail!(
+                "OSIS_UNSUPPORTED_XML_DECLARATION: XML encoding `{encoding}` is unsupported on line {line} of {}",
+                path.display()
+            );
+        }
+    }
+
+    let standalone = declaration
+        .standalone()
+        .transpose()
+        .map_err(|error| malformed_xml(bytes, position, path, error))?;
+    if let Some(standalone) = standalone {
+        let standalone = std::str::from_utf8(standalone.as_ref())
+            .map_err(|error| malformed_xml(bytes, position, path, error))?;
+        if standalone != "yes" && standalone != "no" {
+            bail!(
+                "OSIS_UNSUPPORTED_XML_DECLARATION: standalone value `{standalone}` is unsupported on line {line} of {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn reject_declarations(bytes: &[u8], path: &Path) -> Result<()> {
     for needle in [b"<!doctype".as_slice(), b"<!entity".as_slice()] {
         let lowered = bytes.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
@@ -657,46 +722,5 @@ fn line_number(bytes: &[u8], position: usize) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::OsisParser;
-    use crate::traits::Parser;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-
-    fn fixture(contents: &str) -> NamedTempFile {
-        let mut file = NamedTempFile::with_suffix(".osis").unwrap();
-        file.write_all(contents.as_bytes()).unwrap();
-        file.flush().unwrap();
-        file
-    }
-
-    #[test]
-    fn rejects_missing_osis_id() {
-        let file = fixture(
-            "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse>text</verse></chapter></div></osisText></osis>",
-        );
-        let error = OsisParser.parse(file.path()).unwrap_err().to_string();
-        assert!(error.contains("OSIS_MISSING_ATTRIBUTE"));
-        assert!(error.contains("line 1"));
-    }
-
-    #[test]
-    fn rejects_invalid_verse_coordinate() {
-        let file = fixture(
-            "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.37\">text</verse></chapter></div></osisText></osis>",
-        );
-        let error = OsisParser.parse(file.path()).unwrap_err().to_string();
-        assert!(error.contains("OSIS_INVALID_COORDINATE"));
-        assert!(error.contains("line 1"));
-    }
-
-    #[test]
-    fn rejects_duplicate_osis_id_attributes() {
-        let file = fixture(
-            "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.16\" osisID=\"JHN.3.16\">text</verse></chapter></div></osisText></osis>",
-        );
-        let error = OsisParser.parse(file.path()).unwrap_err().to_string();
-        assert!(error.contains("OSIS_MALFORMED_XML"));
-        assert!(error.contains("line 1"));
-    }
-}
+#[path = "osis_tests.rs"]
+mod tests;
