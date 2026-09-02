@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::parser::text_segments::pdf_page_evidence_units;
 use crate::traits::Parser;
@@ -119,7 +119,10 @@ impl Parser for AnyDocPdfParser {
             ));
         }
         if units.is_empty() {
-            bail!("anydoc PDF conversion produced no source evidence");
+            return fallback_to_native_pdf(
+                path,
+                anyhow::anyhow!("anydoc PDF conversion produced no source evidence"),
+            );
         }
         let original_source_hash = crate::types::hex_sha256(&bytes);
         crate::pdf_selector::attach_pdf_selectors(&mut units, &original_source_hash, self.name());
@@ -192,6 +195,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_inspector_units_fall_back_to_native_pdf() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("empty-units.pdf");
+        write_pdf_with_image_and_invisible_text(&path, "Native fallback evidence");
+
+        let (units, conversion) = AnyDocPdfParser
+            .parse_with_derived_metadata(&path)
+            .expect("empty inspector evidence should use native PDF fallback");
+
+        assert!(
+            conversion.is_none(),
+            "native fallback must not keep the AnyDoc conversion envelope"
+        );
+        assert!(
+            units
+                .iter()
+                .any(|unit| unit.text.contains("Native fallback evidence")),
+            "native PDF fallback should recover overlay text, got {units:?}"
+        );
+    }
+
     fn write_pdf_with_text(path: &Path, text: &str) {
         let escaped = text
             .replace('\\', "\\\\")
@@ -204,6 +229,32 @@ mod tests {
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_vec(),
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
             stream_object(b"<<", content.as_bytes()),
+        ];
+        std::fs::write(path, pdf_bytes(objects)).unwrap();
+    }
+
+    fn write_pdf_with_image_and_invisible_text(path: &Path, text: &str) {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        let image = vec![255_u8; 8 * 8 * 3];
+        let invisible = format!(
+            "BT\n/F1 12 Tf\n3 Tr\n72 160 Td\n({escaped} 0) Tj\n0 -10 Td\n({escaped} 1) Tj\n0 -10 Td\n({escaped} 2) Tj\n0 -10 Td\n({escaped} 3) Tj\n0 -10 Td\n({escaped} 4) Tj\n0 -10 Td\n({escaped} 5) Tj\n0 -10 Td\n({escaped} 6) Tj\n0 -10 Td\n({escaped} 7) Tj\n0 -10 Td\n({escaped} 8) Tj\n0 -10 Td\n({escaped} 9) Tj\nET\n"
+        );
+        let spaces = "BT\n/F1 12 Tf\n72 180 Td\n( ) Tj\n0 -10 Td\n( ) Tj\n0 -10 Td\n( ) Tj\nET\n";
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 8 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            stream_object(
+                b"<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+                &image,
+            ),
+            stream_object(b"<<", invisible.as_bytes()),
+            stream_object(b"<<", spaces.as_bytes()),
         ];
         std::fs::write(path, pdf_bytes(objects)).unwrap();
     }
