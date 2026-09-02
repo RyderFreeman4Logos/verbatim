@@ -5,6 +5,8 @@ mod bounded_pdf_images;
 pub mod canonical_jsonl;
 pub mod canonical_package;
 mod canonical_package_conversion;
+pub mod epub_inspect;
+mod epub_xml;
 pub mod json;
 pub mod markdown;
 #[cfg(feature = "parser-pdf-oxide")]
