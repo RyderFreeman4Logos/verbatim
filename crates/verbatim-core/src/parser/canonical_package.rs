@@ -624,11 +624,29 @@ fn validate_reference_bounds(
             .and_then(|component| component.get("value"))
             .and_then(serde_json::Value::as_str)
     };
-    let (Some(book), Some(chapter), Some(verse)) = (
-        component("book"),
-        component("chapter").and_then(|value| value.parse::<u16>().ok()),
-        component("verse").and_then(|value| value.parse::<u16>().ok()),
-    ) else {
+    let Some(book) = component("book") else {
+        return;
+    };
+    let Some(chapter_value) = component("chapter") else {
+        return;
+    };
+    let Ok(chapter) = chapter_value.parse::<u16>() else {
+        diagnostics.push(CanonicalPackageDiagnostic {
+            code: "CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS",
+            location: location.into(),
+            message: format!("reference chapter {chapter_value} is not a valid unsigned integer"),
+        });
+        return;
+    };
+    let Some(verse_value) = component("verse") else {
+        return;
+    };
+    let Ok(verse) = verse_value.parse::<u16>() else {
+        diagnostics.push(CanonicalPackageDiagnostic {
+            code: "CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS",
+            location: location.into(),
+            message: format!("reference verse {verse_value} is not a valid unsigned integer"),
+        });
         return;
     };
     let Some(book) = CanonRegistry::resolve(book) else {

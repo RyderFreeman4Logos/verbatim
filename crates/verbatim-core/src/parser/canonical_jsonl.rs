@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::profiles::bible::versification_registry::VersificationRegistry;
 use crate::traits::Parser;
 use crate::types::{
     hex_sha256, BackingSelector, CanonicalLocator, EvidenceId, EvidenceKind, EvidenceUnit,
@@ -89,6 +90,14 @@ impl Parser for CanonicalJsonlParser {
                     "missing or empty required field `text` on line {line_no} of {}",
                     path.display()
                 );
+            }
+            if let Some(versification_id) = entry.versification_id.as_deref() {
+                if VersificationRegistry::by_id(versification_id).is_none() {
+                    bail!(
+                        "unknown canonical JSONL versification_id {versification_id} on line {line_no} of {}",
+                        path.display()
+                    );
+                }
             }
             let annotations = entry
                 .metadata
@@ -437,6 +446,23 @@ mod tests {
             units[0].id.0,
             "cjson:v1:a71ce2432af61a12f9ea7cdd5535b1ef95b7adc9fbf218572e24c5d4b6d31d80"
         );
+    }
+
+    #[test]
+    fn canonical_jsonl_rejects_unknown_versification() {
+        let invalid = JOHN_316.replace(
+            "\"version_id\":\"digital-edition-2017\"",
+            "\"version_id\":\"digital-edition-2017\",\"versification_id\":\"unknown\"",
+        );
+        let f = write_jsonl(&[&invalid]);
+
+        let error = CanonicalJsonlParser
+            .parse(f.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unknown canonical JSONL versification_id"));
+        assert!(error.contains("line 1"));
     }
 
     #[test]

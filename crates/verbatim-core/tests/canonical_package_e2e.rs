@@ -139,6 +139,30 @@ fn canonical_package_rejects_out_of_bound_verse() {
 }
 
 #[test]
+fn canonical_package_rejects_malformed_verse() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = tempdir.path().join("malformed-verse");
+    fs::create_dir(&package).unwrap();
+    fs::copy(
+        fixture("valid").join("manifest.json"),
+        package.join("manifest.json"),
+    )
+    .unwrap();
+    let units = fs::read_to_string(fixture("valid").join("units.jsonl"))
+        .unwrap()
+        .replace("John 3:16", "John 3:999999")
+        .replace("JHN 3:16", "JHN 3:999999")
+        .replace("\"value\":\"16\"", "\"value\":\"999999\"");
+    fs::write(package.join("units.jsonl"), units).unwrap();
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let error = pipeline.add_source(&package).unwrap_err().to_string();
+
+    assert!(error.contains("CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS"));
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
+}
+
+#[test]
 fn canonical_package_preserves_source_native_selectors() {
     let package = fixture("valid");
     let original = CanonicalPackageParser.parse(&package).unwrap();
