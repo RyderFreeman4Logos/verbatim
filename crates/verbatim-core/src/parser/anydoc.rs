@@ -10,10 +10,41 @@ use crate::traits::Parser;
 use crate::types::ParsedImageArtifact;
 use crate::types::{DerivedConversionMetadata, EvidenceUnit, SourceId};
 
+fn fallback_to_native_pdf(
+    path: &Path,
+    anydoc_error: anyhow::Error,
+) -> Result<(Vec<EvidenceUnit>, Option<DerivedConversionMetadata>)> {
+    #[cfg(feature = "parser-pdf-oxide")]
+    {
+        crate::parser::oxide::PdfOxideParser
+            .parse(path)
+            .map(|units| (units, None))
+            .map_err(|fallback_error| {
+                anyhow::anyhow!("{anydoc_error}; native PDF fallback failed: {fallback_error}")
+            })
+    }
+    #[cfg(all(not(feature = "parser-pdf-oxide"), feature = "parser-pdfplumber"))]
+    {
+        crate::parser::plumber::PdfPlumberParser
+            .parse(path)
+            .map(|units| (units, None))
+            .map_err(|fallback_error| {
+                anyhow::anyhow!("{anydoc_error}; native PDF fallback failed: {fallback_error}")
+            })
+    }
+    #[cfg(not(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber")))]
+    {
+        let _ = path;
+        Err(anydoc_error)
+    }
+}
+
 const CONVERTER: &str = "anydoc+pdf-inspector";
 const CONVERTER_VERSION: &str = "anydoc@0.2.4;pdf-inspector@1.14.2";
 
-/// Optional PDF adapter that preserves AnyDoc conversion for native PDFs.
+/// Optional PDF adapter that preserves AnyDoc conversion for native PDFs and
+/// falls through to the configured native parser when OCR or image content is
+/// outside AnyDoc's conversion boundary.
 pub struct AnyDocPdfParser;
 
 impl Parser for AnyDocPdfParser {
@@ -36,16 +67,33 @@ impl Parser for AnyDocPdfParser {
     ) -> Result<(Vec<EvidenceUnit>, Option<DerivedConversionMetadata>)> {
         let bytes =
             fs::read(path).with_context(|| format!("failed to read: {}", path.display()))?;
-        let markdown = anydoc::to_markdown_bytes(&bytes, anydoc::Format::Pdf)
-            .map_err(|error| anyhow::anyhow!("anydoc PDF conversion failed: {error}"))?;
-        if markdown.trim().is_empty() {
-            bail!("anydoc PDF conversion produced no Markdown");
-        }
+        let markdown = match anydoc::to_markdown_bytes(&bytes, anydoc::Format::Pdf) {
+            Ok(markdown) if !markdown.trim().is_empty() => markdown,
+            Ok(_) => {
+                return fallback_to_native_pdf(
+                    path,
+                    anyhow::anyhow!("anydoc PDF conversion produced no Markdown"),
+                )
+            }
+            Err(error) => {
+                return fallback_to_native_pdf(
+                    path,
+                    anyhow::anyhow!("anydoc PDF conversion failed: {error}"),
+                )
+            }
+        };
 
-        let items =
-            pdf_inspector::extract_text_with_positions_pages(path, None).map_err(|error| {
-                anyhow::anyhow!("failed to extract native PDF text with pdf-inspector: {error}")
-            })?;
+        let items = match pdf_inspector::extract_text_with_positions_pages(path, None) {
+            Ok(items) => items,
+            Err(error) => {
+                return fallback_to_native_pdf(
+                    path,
+                    anyhow::anyhow!(
+                        "failed to extract native PDF text with pdf-inspector: {error}"
+                    ),
+                )
+            }
+        };
         let mut pages = BTreeMap::<u32, String>::new();
         for item in items {
             let text = item.text.trim();
