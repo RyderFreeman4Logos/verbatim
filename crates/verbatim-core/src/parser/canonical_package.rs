@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::parser::canonical_jsonl::{evidence_kind_from_content_kind, CanonicalJsonlParser};
+use crate::parser::canonical_package_conversion::validate_conversion;
 use crate::profiles::bible::canon_registry::{CanonRegistry, VERSION as CANON_VERSION};
 use crate::profiles::bible::versification_registry::{
     VersificationRegistry, VERSION as VERSIFICATION_VERSION,
@@ -158,6 +159,15 @@ impl Parser for CanonicalPackageParser {
         }
         Ok(units)
     }
+
+    fn parse_with_derived_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<(Vec<EvidenceUnit>, Option<DerivedConversionMetadata>)> {
+        let units = self.parse(path)?;
+        let conversion = read_manifest(path)?.conversion;
+        Ok((units, conversion))
+    }
 }
 
 pub fn validate_package(path: &Path) -> CanonicalPackageReport {
@@ -186,6 +196,7 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
         }
     };
     validate_manifest(&manifest, &mut diagnostics);
+    validate_conversion(manifest.conversion.as_ref(), &mut diagnostics);
 
     let mut unit_count = 0;
     let mut unit_id_locations = HashMap::new();

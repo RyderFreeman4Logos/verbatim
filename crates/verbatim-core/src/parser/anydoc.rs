@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::parser::text_segments::pdf_page_evidence_units;
 use crate::traits::Parser;
@@ -10,41 +10,10 @@ use crate::traits::Parser;
 use crate::types::ParsedImageArtifact;
 use crate::types::{DerivedConversionMetadata, EvidenceUnit, SourceId};
 
-fn fallback_to_native_pdf(
-    path: &Path,
-    anydoc_error: anyhow::Error,
-) -> Result<(Vec<EvidenceUnit>, Option<DerivedConversionMetadata>)> {
-    #[cfg(feature = "parser-pdf-oxide")]
-    {
-        crate::parser::oxide::PdfOxideParser
-            .parse(path)
-            .map(|units| (units, None))
-            .map_err(|fallback_error| {
-                anyhow::anyhow!("{anydoc_error}; native PDF fallback failed: {fallback_error}")
-            })
-    }
-    #[cfg(all(not(feature = "parser-pdf-oxide"), feature = "parser-pdfplumber"))]
-    {
-        crate::parser::plumber::PdfPlumberParser
-            .parse(path)
-            .map(|units| (units, None))
-            .map_err(|fallback_error| {
-                anyhow::anyhow!("{anydoc_error}; native PDF fallback failed: {fallback_error}")
-            })
-    }
-    #[cfg(not(any(feature = "parser-pdf-oxide", feature = "parser-pdfplumber")))]
-    {
-        let _ = path;
-        Err(anydoc_error)
-    }
-}
-
 const CONVERTER: &str = "anydoc+pdf-inspector";
 const CONVERTER_VERSION: &str = "anydoc@0.2.4;pdf-inspector@1.14.2";
 
-/// Optional PDF adapter that preserves AnyDoc conversion for native PDFs and
-/// falls through to the configured native parser when OCR or image content is
-/// outside AnyDoc's conversion boundary.
+/// Optional PDF adapter that preserves AnyDoc conversion for native PDFs.
 pub struct AnyDocPdfParser;
 
 impl Parser for AnyDocPdfParser {
@@ -67,33 +36,16 @@ impl Parser for AnyDocPdfParser {
     ) -> Result<(Vec<EvidenceUnit>, Option<DerivedConversionMetadata>)> {
         let bytes =
             fs::read(path).with_context(|| format!("failed to read: {}", path.display()))?;
-        let markdown = match anydoc::to_markdown_bytes(&bytes, anydoc::Format::Pdf) {
-            Ok(markdown) if !markdown.is_empty() => markdown,
-            Ok(_) => {
-                return fallback_to_native_pdf(
-                    path,
-                    anyhow::anyhow!("anydoc PDF conversion produced no Markdown"),
-                )
-            }
-            Err(error) => {
-                return fallback_to_native_pdf(
-                    path,
-                    anyhow::anyhow!("anydoc PDF conversion failed: {error}"),
-                )
-            }
-        };
+        let markdown = anydoc::to_markdown_bytes(&bytes, anydoc::Format::Pdf)
+            .map_err(|error| anyhow::anyhow!("anydoc PDF conversion failed: {error}"))?;
+        if markdown.trim().is_empty() {
+            bail!("anydoc PDF conversion produced no Markdown");
+        }
 
-        let items = match pdf_inspector::extract_text_with_positions_pages(path, None) {
-            Ok(items) => items,
-            Err(error) => {
-                return fallback_to_native_pdf(
-                    path,
-                    anyhow::anyhow!(
-                        "failed to extract native PDF text with pdf-inspector: {error}"
-                    ),
-                )
-            }
-        };
+        let items =
+            pdf_inspector::extract_text_with_positions_pages(path, None).map_err(|error| {
+                anyhow::anyhow!("failed to extract native PDF text with pdf-inspector: {error}")
+            })?;
         let mut pages = BTreeMap::<u32, String>::new();
         for item in items {
             let text = item.text.trim();
@@ -118,16 +70,18 @@ impl Parser for AnyDocPdfParser {
                 &mut position,
             ));
         }
-        crate::pdf_selector::attach_pdf_selectors(
-            &mut units,
-            &crate::types::hex_sha256(&bytes),
-            self.name(),
-        );
+        if units.is_empty() {
+            bail!("anydoc PDF conversion produced no source evidence");
+        }
+        let original_source_hash = crate::types::hex_sha256(&bytes);
+        crate::pdf_selector::attach_pdf_selectors(&mut units, &original_source_hash, self.name());
         Ok((
             units,
             Some(DerivedConversionMetadata {
+                adapter: self.name().to_string(),
                 converter: CONVERTER.to_string(),
                 converter_version: CONVERTER_VERSION.to_string(),
+                original_source_hash,
                 output_hash: crate::types::hex_sha256(markdown.as_bytes()),
             }),
         ))
@@ -180,8 +134,10 @@ mod tests {
         assert_eq!(
             conversion,
             Some(DerivedConversionMetadata {
+                adapter: "anydoc_pdf".into(),
                 converter: "anydoc+pdf-inspector".into(),
                 converter_version: "anydoc@0.2.4;pdf-inspector@1.14.2".into(),
+                original_source_hash: crate::types::hex_sha256(&original),
                 output_hash: "18f2f6e8bda2d1c75a1898299ed4087e4f8274e2f9746e4ed1c4da325ab88539"
                     .into(),
             })
