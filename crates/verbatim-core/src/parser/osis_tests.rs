@@ -50,6 +50,53 @@ fn accepts_legal_leading_xml_declaration() {
 }
 
 #[test]
+fn accepts_xml_declaration_with_standalone_without_encoding() {
+    for standalone in ["yes", "no"] {
+        let file = fixture(&format!(
+            "<?xml version=\"1.0\" standalone=\"{standalone}\"?>\n<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.16\">text</verse></chapter></div></osisText></osis>"
+        ));
+        let units = OsisParser.parse(file.path()).unwrap();
+        assert_eq!(units.len(), 1);
+    }
+}
+
+#[test]
+fn rejects_duplicate_xml_declaration_encoding_without_partial_evidence() {
+    let file = fixture(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" encoding=\"UTF-8\"?><osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.16\">text</verse></chapter></div></osisText></osis>",
+    );
+    let result = OsisParser.parse(file.path());
+    assert!(result.is_err());
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("OSIS_MALFORMED_XML"));
+    assert!(error.contains("line 1"));
+}
+
+#[test]
+fn rejects_unknown_xml_declaration_attribute_without_partial_evidence() {
+    let file = fixture(
+        "<?xml version=\"1.0\" foo=\"bar\"?><osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.16\">text</verse></chapter></div></osisText></osis>",
+    );
+    let result = OsisParser.parse(file.path());
+    assert!(result.is_err());
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("OSIS_MALFORMED_XML"));
+    assert!(error.contains("line 1"));
+}
+
+#[test]
+fn rejects_out_of_order_xml_declaration_encoding_without_partial_evidence() {
+    let file = fixture(
+        "<?xml encoding=\"UTF-8\" version=\"1.0\"?><osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.16\">text</verse></chapter></div></osisText></osis>",
+    );
+    let result = OsisParser.parse(file.path());
+    assert!(result.is_err());
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("OSIS_MALFORMED_XML"));
+    assert!(error.contains("line 1"));
+}
+
+#[test]
 fn rejects_xml_declaration_after_prolog_whitespace() {
     let file = fixture(
         " \n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.16\">text</verse></chapter></div></osisText></osis>",

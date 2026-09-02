@@ -636,6 +636,44 @@ fn validate_declaration(
     line: u32,
     path: &Path,
 ) -> Result<()> {
+    let declaration_start = BytesStart::from_content(
+        std::str::from_utf8(declaration.as_ref())
+            .map_err(|error| malformed_xml(bytes, position, path, error))?,
+        3,
+    );
+    let declaration_attributes = ["version", "encoding", "standalone"];
+    let mut previous_attribute = None;
+    let mut seen_attributes = [false; 3];
+    for attribute in declaration_start.attributes().with_checks(true) {
+        let attribute = attribute.map_err(|error| malformed_xml(bytes, position, path, error))?;
+        let key = xml_name(attribute.key.as_ref(), bytes, position, path)?;
+        let index = declaration_attributes
+            .iter()
+            .position(|name| *name == key)
+            .ok_or_else(|| {
+                anyhow!(
+                    "OSIS_MALFORMED_XML: unknown XML declaration attribute `{key}` on line {line} of {}",
+                    path.display()
+                )
+            })?;
+        if seen_attributes[index] {
+            bail!(
+                "OSIS_MALFORMED_XML: duplicate XML declaration attribute `{key}` on line {line} of {}",
+                path.display()
+            );
+        }
+        if (previous_attribute.is_none() && index != 0)
+            || previous_attribute.is_some_and(|previous| index < previous)
+        {
+            bail!(
+                "OSIS_MALFORMED_XML: out-of-order XML declaration attribute `{key}` on line {line} of {}",
+                path.display()
+            );
+        }
+        seen_attributes[index] = true;
+        previous_attribute = Some(index);
+    }
+
     let version = declaration
         .xml_version()
         .map_err(|error| malformed_xml(bytes, position, path, error))?;
