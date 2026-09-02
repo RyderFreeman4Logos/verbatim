@@ -7,6 +7,7 @@
 //! [`crate::types`] and [`super`].
 
 pub mod canon_registry;
+pub mod versification_registry;
 
 use super::{
     default_normalize, default_render, ParsedReference, ReferenceConfidence, SourceProfile,

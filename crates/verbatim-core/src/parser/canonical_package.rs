@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::parser::canonical_jsonl::{evidence_kind_from_content_kind, CanonicalJsonlParser};
+use crate::profiles::bible::canon_registry::{CanonRegistry, VERSION as CANON_VERSION};
+use crate::profiles::bible::versification_registry::{
+    VersificationRegistry, VERSION as VERSIFICATION_VERSION,
+};
 use crate::traits::Parser;
 use crate::types::{
     hex_sha256, BackingSelector, CanonicalLocator, DerivedConversionMetadata, EvidenceId,
@@ -61,6 +65,10 @@ struct Manifest {
     #[serde(default)]
     version_id: String,
     #[serde(default)]
+    canon_id: Option<String>,
+    #[serde(default)]
+    versification_id: Option<String>,
+    #[serde(default)]
     language: String,
     #[serde(default)]
     original_source_hash: Option<String>,
@@ -78,6 +86,10 @@ struct Unit {
     work_id: String,
     #[serde(default)]
     version_id: String,
+    #[serde(default)]
+    canon_id: Option<String>,
+    #[serde(default)]
+    versification_id: Option<String>,
     #[serde(default)]
     language: String,
     #[serde(default)]
@@ -129,6 +141,8 @@ impl Parser for CanonicalPackageParser {
             );
         }
         let mut units = CanonicalJsonlParser.parse(&path.join(UNITS))?;
+        let manifest = read_manifest(path)?;
+        let (canon_id, versification_id) = registry_ids(&manifest);
         let unit_ids = package_unit_ids(&path.join(UNITS))?;
         if units.len() != unit_ids.len() {
             bail!("canonical package unit identity count mismatch");
@@ -137,6 +151,10 @@ impl Parser for CanonicalPackageParser {
         for (unit, unit_id) in units.iter_mut().zip(unit_ids) {
             unit.id = EvidenceId(unit_id);
             unit.source_id = source_id.clone();
+            if let SourceLocator::Canonical { locator } = &mut unit.locator {
+                locator.canon_id = Some(canon_id.to_string());
+                locator.versification_id = Some(versification_id.to_string());
+            }
         }
         Ok(units)
     }
@@ -212,18 +230,30 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
     }
     validate_relation_endpoints(path, &unit_content_kinds, &mut diagnostics);
     let units = match CanonicalJsonlParser.parse(&units_path) {
-        Ok(units) => units
-            .into_iter()
-            .filter_map(|unit| match unit.locator {
-                SourceLocator::Canonical { locator } => Some(CanonicalPackageUnitReport {
-                    locator,
-                    original_source_hash: manifest.original_source_hash.clone(),
-                    conversion: manifest.conversion.clone(),
-                    text_hash: unit.text_hash,
-                }),
-                _ => None,
-            })
-            .collect(),
+        Ok(units) => {
+            let (canon_id, versification_id) = registry_ids(&manifest);
+            units
+                .into_iter()
+                .filter_map(|unit| match unit.locator {
+                    SourceLocator::Canonical { mut locator } => {
+                        locator.canon_id =
+                            Some(locator.canon_id.unwrap_or_else(|| canon_id.to_string()));
+                        locator.versification_id = Some(
+                            locator
+                                .versification_id
+                                .unwrap_or_else(|| versification_id.to_string()),
+                        );
+                        Some(CanonicalPackageUnitReport {
+                            locator,
+                            original_source_hash: manifest.original_source_hash.clone(),
+                            conversion: manifest.conversion.clone(),
+                            text_hash: unit.text_hash,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
         Err(error) => {
             diagnostics.push(diagnostic("CANONICAL_PACKAGE_UNIT_INVALID", UNITS, error));
             Vec::new()
@@ -390,6 +420,22 @@ pub(crate) fn package_relations(path: &Path) -> Result<Vec<CanonicalPackageRelat
     Ok(relations)
 }
 
+fn read_manifest(path: &Path) -> Result<Manifest> {
+    let contents = fs::read_to_string(path.join(MANIFEST))
+        .with_context(|| format!("read {}", path.join(MANIFEST).display()))?;
+    serde_json::from_str(&contents).context("parse canonical package manifest")
+}
+
+fn registry_ids(manifest: &Manifest) -> (&str, &str) {
+    (
+        manifest.canon_id.as_deref().unwrap_or(CANON_VERSION),
+        manifest
+            .versification_id
+            .as_deref()
+            .unwrap_or(VERSIFICATION_VERSION),
+    )
+}
+
 fn validate_manifest(manifest: &Manifest, diagnostics: &mut Vec<CanonicalPackageDiagnostic>) {
     for (field, value) in [
         ("schema_version", &manifest.schema_version),
@@ -406,6 +452,29 @@ fn validate_manifest(manifest: &Manifest, diagnostics: &mut Vec<CanonicalPackage
                 message: format!("{field} is required"),
             });
         }
+    }
+    let (canon_id, versification_id) = registry_ids(manifest);
+    if canon_id != CANON_VERSION {
+        diagnostics.push(CanonicalPackageDiagnostic {
+            code: "CANONICAL_PACKAGE_CANON_UNKNOWN",
+            location: format!("{MANIFEST}:canon_id"),
+            message: format!("unknown canon_id {canon_id}"),
+        });
+    }
+    if VersificationRegistry::by_id(versification_id).is_none() {
+        diagnostics.push(CanonicalPackageDiagnostic {
+            code: "CANONICAL_PACKAGE_VERSIFICATION_UNKNOWN",
+            location: format!("{MANIFEST}:versification_id"),
+            message: format!("unknown versification_id {versification_id}"),
+        });
+    } else if !VersificationRegistry::compatible_with_canon(canon_id) {
+        diagnostics.push(CanonicalPackageDiagnostic {
+            code: "CANONICAL_PACKAGE_VERSIFICATION_CANON_MISMATCH",
+            location: format!("{MANIFEST}:versification_id"),
+            message: format!(
+                "versification_id {versification_id} is incompatible with canon_id {canon_id}"
+            ),
+        });
     }
     match manifest
         .schema_version
@@ -497,6 +566,25 @@ fn validate_unit(
             });
         }
     }
+    if let Some(actual) = &unit.canon_id {
+        if actual != registry_ids(manifest).0 {
+            diagnostics.push(CanonicalPackageDiagnostic {
+                code: "CANONICAL_PACKAGE_UNIT_MANIFEST_MISMATCH",
+                location: location.into(),
+                message: "canon_id does not match manifest".into(),
+            });
+        }
+    }
+    if let Some(actual) = &unit.versification_id {
+        if actual != registry_ids(manifest).1 {
+            diagnostics.push(CanonicalPackageDiagnostic {
+                code: "CANONICAL_PACKAGE_UNIT_MANIFEST_MISMATCH",
+                location: location.into(),
+                message: "versification_id does not match manifest".into(),
+            });
+        }
+    }
+    validate_reference_bounds(unit, manifest, location, diagnostics);
     if unit.backing_selectors.is_empty() {
         diagnostics.push(CanonicalPackageDiagnostic {
             code: "CANONICAL_PACKAGE_SELECTOR_MISSING",
@@ -515,6 +603,54 @@ fn validate_unit(
                 message: "text_hash does not match text".into(),
             });
         }
+    }
+}
+
+fn validate_reference_bounds(
+    unit: &Unit,
+    manifest: &Manifest,
+    location: &str,
+    diagnostics: &mut Vec<CanonicalPackageDiagnostic>,
+) {
+    if unit.source_profile != "bible" {
+        return;
+    }
+    let component = |level: &str| {
+        unit.components
+            .iter()
+            .find(|component| {
+                component.get("level").and_then(serde_json::Value::as_str) == Some(level)
+            })
+            .and_then(|component| component.get("value"))
+            .and_then(serde_json::Value::as_str)
+    };
+    let (Some(book), Some(chapter), Some(verse)) = (
+        component("book"),
+        component("chapter").and_then(|value| value.parse::<u16>().ok()),
+        component("verse").and_then(|value| value.parse::<u16>().ok()),
+    ) else {
+        return;
+    };
+    let Some(book) = CanonRegistry::resolve(book) else {
+        diagnostics.push(CanonicalPackageDiagnostic {
+            code: "CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS",
+            location: location.into(),
+            message: "reference book is not in the selected canon".into(),
+        });
+        return;
+    };
+    let (_, versification_id) = registry_ids(manifest);
+    if VersificationRegistry::by_id(versification_id).is_some()
+        && VersificationRegistry::lookup(book.id, chapter, verse).is_none()
+    {
+        diagnostics.push(CanonicalPackageDiagnostic {
+            code: "CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS",
+            location: location.into(),
+            message: format!(
+                "reference {} {}:{} is outside versification bounds",
+                book.id, chapter, verse
+            ),
+        });
     }
 }
 

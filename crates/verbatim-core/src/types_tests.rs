@@ -254,6 +254,8 @@ fn canonical_locator_round_trips_through_json() {
         profile_id: "bible".into(),
         work_id: "CSB".into(),
         version_id: Some("digital-edition-2017".into()),
+        canon_id: None,
+        versification_id: None,
         start: vec![
             ReferenceComponent {
                 level: "book".into(),

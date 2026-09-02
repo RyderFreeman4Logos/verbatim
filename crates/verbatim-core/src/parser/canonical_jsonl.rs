@@ -113,6 +113,8 @@ impl Parser for CanonicalJsonlParser {
                 &entry.source_profile,
                 &entry.work_id,
                 entry.version_id.as_deref(),
+                entry.canon_id.as_deref(),
+                entry.versification_id.as_deref(),
                 &normalized,
                 content_kind,
             );
@@ -137,6 +139,8 @@ impl Parser for CanonicalJsonlParser {
                 profile_id: entry.source_profile.clone(),
                 work_id: entry.work_id.clone(),
                 version_id: entry.version_id.clone(),
+                canon_id: entry.canon_id.clone(),
+                versification_id: entry.versification_id.clone(),
                 start: components,
                 end: None,
                 display,
@@ -179,6 +183,8 @@ fn generated_evidence_id(
     source_profile: &str,
     work_id: &str,
     version_id: Option<&str>,
+    canon_id: Option<&str>,
+    versification_id: Option<&str>,
     normalized: &str,
     content_kind: &str,
 ) -> EvidenceId {
@@ -192,6 +198,15 @@ fn generated_evidence_id(
             append_identity_field(&mut payload, version_id.as_bytes());
         }
         None => payload.push(0),
+    }
+    for id in [canon_id, versification_id] {
+        match id {
+            Some(id) => {
+                payload.push(1);
+                append_identity_field(&mut payload, id.as_bytes());
+            }
+            None => payload.push(0),
+        }
     }
     append_identity_field(&mut payload, normalized.as_bytes());
     append_identity_field(&mut payload, content_kind.as_bytes());
@@ -269,6 +284,10 @@ struct JsonlEntry {
     work_id: String,
     #[serde(default)]
     version_id: Option<String>,
+    #[serde(default)]
+    canon_id: Option<String>,
+    #[serde(default)]
+    versification_id: Option<String>,
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]
