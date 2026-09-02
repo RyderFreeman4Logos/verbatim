@@ -414,6 +414,10 @@ pub struct CanonicalLocator {
     pub work_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canon_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versification_id: Option<String>,
     /// Reference components for the start of the range.
     pub start: Vec<ReferenceComponent>,
     /// Reference components for the end of the range (`None` for a single unit).
@@ -440,6 +444,8 @@ impl CanonicalLocator {
             profile_id: profile_id.to_string(),
             work_id: work_id.to_string(),
             version_id: None,
+            canon_id: None,
+            versification_id: None,
             start: components,
             end: None,
             display,
@@ -461,6 +467,8 @@ impl CanonicalLocator {
             profile_id: profile_id.to_string(),
             work_id: work_id.to_string(),
             version_id: None,
+            canon_id: None,
+            versification_id: None,
             start,
             end: Some(end),
             display,

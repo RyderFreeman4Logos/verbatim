@@ -57,6 +57,112 @@ fn canonical_package_persists_package_unit_id() {
 }
 
 #[test]
+fn canonical_package_rejects_unknown_versification() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = tempdir.path().join("unknown-versification");
+    fs::create_dir(&package).unwrap();
+    let manifest = fs::read_to_string(fixture("valid").join("manifest.json"))
+        .unwrap()
+        .replace(
+            "\"version_id\": \"public-domain\"",
+            "\"version_id\": \"public-domain\",\n  \"canon_id\": \"protestant-66/v1\",\n  \"versification_id\": \"unknown\"",
+        );
+    fs::write(package.join("manifest.json"), manifest).unwrap();
+    fs::copy(
+        fixture("valid").join("units.jsonl"),
+        package.join("units.jsonl"),
+    )
+    .unwrap();
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let error = pipeline.add_source(&package).unwrap_err().to_string();
+
+    assert!(error.contains("CANONICAL_PACKAGE_VERSIFICATION_UNKNOWN"));
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
+}
+
+#[test]
+fn canonical_package_persists_canon_and_versification_ids() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = tempdir.path().join("versioned-locator");
+    fs::create_dir(&package).unwrap();
+    let manifest = fs::read_to_string(fixture("valid").join("manifest.json"))
+        .unwrap()
+        .replace(
+            "\"version_id\": \"public-domain\"",
+            "\"version_id\": \"public-domain\",\n  \"canon_id\": \"protestant-66/v1\",\n  \"versification_id\": \"protestant-66/v1\"",
+        );
+    fs::write(package.join("manifest.json"), manifest).unwrap();
+    let units = fs::read_to_string(fixture("valid").join("units.jsonl"))
+        .unwrap()
+        .replace(
+            "\"version_id\":\"public-domain\"",
+            "\"version_id\":\"public-domain\",\"canon_id\":\"protestant-66/v1\",\"versification_id\":\"protestant-66/v1\"",
+        );
+    fs::write(package.join("units.jsonl"), units).unwrap();
+
+    let units = CanonicalPackageParser.parse(&package).unwrap();
+    let locator = match &units[0].locator {
+        verbatim_core::types::SourceLocator::Canonical { locator } => locator,
+        _ => panic!("expected canonical locator"),
+    };
+
+    assert_eq!(locator.canon_id.as_deref(), Some("protestant-66/v1"));
+    assert_eq!(
+        locator.versification_id.as_deref(),
+        Some("protestant-66/v1")
+    );
+}
+
+#[test]
+fn canonical_package_rejects_out_of_bound_verse() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = tempdir.path().join("out-of-bound-verse");
+    fs::create_dir(&package).unwrap();
+    fs::copy(
+        fixture("valid").join("manifest.json"),
+        package.join("manifest.json"),
+    )
+    .unwrap();
+    let units = fs::read_to_string(fixture("valid").join("units.jsonl"))
+        .unwrap()
+        .replace("John 3:16", "John 3:99")
+        .replace("JHN 3:16", "JHN 3:99")
+        .replace("\"value\":\"16\"", "\"value\":\"99\"");
+    fs::write(package.join("units.jsonl"), units).unwrap();
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let error = pipeline.add_source(&package).unwrap_err().to_string();
+
+    assert!(error.contains("CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS"));
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
+}
+
+#[test]
+fn canonical_package_rejects_malformed_verse() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let package = tempdir.path().join("malformed-verse");
+    fs::create_dir(&package).unwrap();
+    fs::copy(
+        fixture("valid").join("manifest.json"),
+        package.join("manifest.json"),
+    )
+    .unwrap();
+    let units = fs::read_to_string(fixture("valid").join("units.jsonl"))
+        .unwrap()
+        .replace("John 3:16", "John 3:999999")
+        .replace("JHN 3:16", "JHN 3:999999")
+        .replace("\"value\":\"16\"", "\"value\":\"999999\"");
+    fs::write(package.join("units.jsonl"), units).unwrap();
+    let pipeline = IngestPipeline::new(&Config::default(), tempdir.path()).unwrap();
+
+    let error = pipeline.add_source(&package).unwrap_err().to_string();
+
+    assert!(error.contains("CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS"));
+    assert!(pipeline.store().list_sources().unwrap().is_empty());
+}
+
+#[test]
 fn canonical_package_preserves_source_native_selectors() {
     let package = fixture("valid");
     let original = CanonicalPackageParser.parse(&package).unwrap();

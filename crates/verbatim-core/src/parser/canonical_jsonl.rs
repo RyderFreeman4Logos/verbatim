@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::profiles::bible::versification_registry::VersificationRegistry;
 use crate::traits::Parser;
 use crate::types::{
     hex_sha256, BackingSelector, CanonicalLocator, EvidenceId, EvidenceKind, EvidenceUnit,
@@ -90,6 +91,14 @@ impl Parser for CanonicalJsonlParser {
                     path.display()
                 );
             }
+            if let Some(versification_id) = entry.versification_id.as_deref() {
+                if VersificationRegistry::by_id(versification_id).is_none() {
+                    bail!(
+                        "unknown canonical JSONL versification_id {versification_id} on line {line_no} of {}",
+                        path.display()
+                    );
+                }
+            }
             let annotations = entry
                 .metadata
                 .as_ref()
@@ -113,6 +122,8 @@ impl Parser for CanonicalJsonlParser {
                 &entry.source_profile,
                 &entry.work_id,
                 entry.version_id.as_deref(),
+                entry.canon_id.as_deref(),
+                entry.versification_id.as_deref(),
                 &normalized,
                 content_kind,
             );
@@ -137,6 +148,8 @@ impl Parser for CanonicalJsonlParser {
                 profile_id: entry.source_profile.clone(),
                 work_id: entry.work_id.clone(),
                 version_id: entry.version_id.clone(),
+                canon_id: entry.canon_id.clone(),
+                versification_id: entry.versification_id.clone(),
                 start: components,
                 end: None,
                 display,
@@ -174,11 +187,14 @@ impl Parser for CanonicalJsonlParser {
 ///
 /// The v1 payload is SHA-256 over unsigned 64-bit big-endian length-prefixed
 /// fields in this order: domain, source profile, work, optional-version tag and
-/// value, normalized locator, and content kind.
+/// value, optional canon/versification tags and values, normalized locator, and
+/// content kind. Absent canon and versification IDs are omitted for compatibility.
 fn generated_evidence_id(
     source_profile: &str,
     work_id: &str,
     version_id: Option<&str>,
+    canon_id: Option<&str>,
+    versification_id: Option<&str>,
     normalized: &str,
     content_kind: &str,
 ) -> EvidenceId {
@@ -192,6 +208,17 @@ fn generated_evidence_id(
             append_identity_field(&mut payload, version_id.as_bytes());
         }
         None => payload.push(0),
+    }
+    if canon_id.is_some() || versification_id.is_some() {
+        for id in [canon_id, versification_id] {
+            match id {
+                Some(id) => {
+                    payload.push(1);
+                    append_identity_field(&mut payload, id.as_bytes());
+                }
+                None => payload.push(0),
+            }
+        }
     }
     append_identity_field(&mut payload, normalized.as_bytes());
     append_identity_field(&mut payload, content_kind.as_bytes());
@@ -269,6 +296,10 @@ struct JsonlEntry {
     work_id: String,
     #[serde(default)]
     version_id: Option<String>,
+    #[serde(default)]
+    canon_id: Option<String>,
+    #[serde(default)]
+    versification_id: Option<String>,
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]
@@ -415,6 +446,23 @@ mod tests {
             units[0].id.0,
             "cjson:v1:a71ce2432af61a12f9ea7cdd5535b1ef95b7adc9fbf218572e24c5d4b6d31d80"
         );
+    }
+
+    #[test]
+    fn canonical_jsonl_rejects_unknown_versification() {
+        let invalid = JOHN_316.replace(
+            "\"version_id\":\"digital-edition-2017\"",
+            "\"version_id\":\"digital-edition-2017\",\"versification_id\":\"unknown\"",
+        );
+        let f = write_jsonl(&[&invalid]);
+
+        let error = CanonicalJsonlParser
+            .parse(f.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unknown canonical JSONL versification_id"));
+        assert!(error.contains("line 1"));
     }
 
     #[test]
