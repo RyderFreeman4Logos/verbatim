@@ -93,7 +93,8 @@ struct VerseData {
 }
 
 fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
-    std::str::from_utf8(bytes).map_err(|_| anyhow!("OSIS_MALFORMED_XML: invalid UTF-8"))?;
+    std::str::from_utf8(bytes)
+        .map_err(|error| malformed_xml(bytes, error.valid_up_to(), path, error))?;
     reject_declarations(bytes, path)?;
 
     let mut reader = Reader::from_reader(bytes);

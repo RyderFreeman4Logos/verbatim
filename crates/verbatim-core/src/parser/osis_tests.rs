@@ -10,6 +10,22 @@ fn fixture(contents: &str) -> NamedTempFile {
     file
 }
 
+fn byte_fixture(contents: &[u8]) -> NamedTempFile {
+    let mut file = NamedTempFile::with_suffix(".osis").unwrap();
+    file.write_all(contents).unwrap();
+    file.flush().unwrap();
+    file
+}
+
+#[test]
+fn rejects_invalid_utf8_with_line_and_path() {
+    let file = byte_fixture(b"<osis>\n\xff");
+    let error = OsisParser.parse(file.path()).unwrap_err().to_string();
+    assert!(error.contains("OSIS_MALFORMED_XML"));
+    assert!(error.contains("line 2"));
+    assert!(error.contains(file.path().to_str().unwrap()));
+}
+
 #[test]
 fn rejects_missing_osis_id() {
     let file = fixture(
