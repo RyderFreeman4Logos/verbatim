@@ -27,6 +27,19 @@ fn rejects_invalid_utf8_with_line_and_path() {
 }
 
 #[test]
+fn rejects_xml_10_illegal_character_with_line_and_path() {
+    let file = byte_fixture(
+        b"<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.16\">bad\x01text</verse></chapter></div></osisText></osis>",
+    );
+    let result = OsisParser.parse(file.path());
+    assert!(result.is_err());
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("OSIS_MALFORMED_XML"));
+    assert!(error.contains("line 1"));
+    assert!(error.contains(file.path().to_str().unwrap()));
+}
+
+#[test]
 fn rejects_missing_osis_id() {
     let file = fixture(
         "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse>text</verse></chapter></div></osisText></osis>",

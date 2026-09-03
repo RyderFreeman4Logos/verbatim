@@ -93,8 +93,21 @@ struct VerseData {
 }
 
 fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
-    std::str::from_utf8(bytes)
+    let text = std::str::from_utf8(bytes)
         .map_err(|error| malformed_xml(bytes, error.valid_up_to(), path, error))?;
+    if let Some((position, character)) = text.char_indices().find(|(_, character)| {
+        !matches!(
+            *character as u32,
+            0x09 | 0x0a | 0x0d | 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff
+        )
+    }) {
+        return Err(malformed_xml(
+            bytes,
+            position,
+            path,
+            format!("illegal XML 1.0 character U+{:04X}", character as u32),
+        ));
+    }
     reject_declarations(bytes, path)?;
 
     let mut reader = Reader::from_reader(bytes);
