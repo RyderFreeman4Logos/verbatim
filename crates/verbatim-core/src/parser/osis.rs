@@ -17,6 +17,10 @@ use crate::types::{
     ReferenceComponent, SourceId, SourceLocator,
 };
 
+#[path = "osis_xml.rs"]
+mod osis_xml;
+use osis_xml::{illegal_xml_10_character, reject_illegal_xml_10_chars};
+
 const SOURCE_NATIVE_SCHEME: &str = "osis";
 const WORK_ID: &str = "OSIS";
 
@@ -95,12 +99,7 @@ struct VerseData {
 fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
     let text = std::str::from_utf8(bytes)
         .map_err(|error| malformed_xml(bytes, error.valid_up_to(), path, error))?;
-    if let Some((position, character)) = text.char_indices().find(|(_, character)| {
-        !matches!(
-            *character as u32,
-            0x09 | 0x0a | 0x0d | 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff
-        )
-    }) {
+    if let Some((position, character)) = illegal_xml_10_character(text) {
         return Err(malformed_xml(
             bytes,
             position,
@@ -147,9 +146,23 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
                 );
             }
             Event::GeneralRef(reference) => {
+                let reference = std::str::from_utf8(reference.as_ref()).map_err(|error| {
+                    malformed_xml(bytes, reader.buffer_position() as usize, path, error)
+                })?;
+                if reference.starts_with('#') {
+                    let escaped = format!("&{reference};");
+                    let expanded = unescape(&escaped).map_err(|error| {
+                        malformed_xml(bytes, reader.buffer_position() as usize, path, error)
+                    })?;
+                    reject_illegal_xml_10_chars(
+                        &expanded,
+                        bytes,
+                        reader.buffer_position() as usize,
+                        path,
+                    )?;
+                }
                 bail!(
-                    "OSIS_ENTITY_REJECTED: entity reference `{}` is not permitted on line {line} of {}",
-                    String::from_utf8_lossy(reference.as_ref()),
+                    "OSIS_ENTITY_REJECTED: entity reference `{reference}` is not permitted on line {line} of {}",
                     path.display()
                 );
             }
@@ -248,6 +261,12 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
                 let decoded = unescape(&decoded).map_err(|error| {
                     malformed_xml(bytes, reader.buffer_position() as usize, path, error)
                 })?;
+                reject_illegal_xml_10_chars(
+                    &decoded,
+                    bytes,
+                    reader.buffer_position() as usize,
+                    path,
+                )?;
                 if let Some(Element::Verse { text, .. }) = stack.last_mut() {
                     text.push_str(&decoded);
                 } else if !decoded.trim().is_empty() {
@@ -546,6 +565,7 @@ fn attributes(
             .decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
             .map_err(|error| malformed_xml(bytes, position, path, error))?
             .into_owned();
+        reject_illegal_xml_10_chars(&value, bytes, position, path)?;
         result.insert(key, value);
     }
     Ok(result)
