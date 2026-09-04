@@ -15,9 +15,18 @@ use crate::types::{
 };
 
 /// The deliberately small USFM vocabulary supported by this walking skeleton.
-pub const SUPPORTED_MARKERS: &[&str] = &["id", "c", "v"];
+pub const SUPPORTED_MARKERS: &[&str] = &["id", "c", "v", "f", "fe", "x"];
 const SOURCE_NATIVE_SCHEME: &str = "usfm";
 const WORK_ID: &str = "USFM";
+const FOOTNOTE_MARKERS: &[&str] = &["f", "fe"];
+const FOOTNOTE_TEXT_MARKERS: &[&str] = &["ft", "fr", "fq", "fqa", "fk", "fl", "fw", "fv", "fp"];
+const CROSS_REFERENCE_TEXT_MARKERS: &[&str] = &["xt", "xo", "xk", "xq", "xdc", "xot", "xnt"];
+
+struct ParsedNote {
+    note_type: &'static str,
+    text: String,
+    line: u32,
+}
 
 pub struct UsfmParser;
 
@@ -43,6 +52,7 @@ fn parse_content(content: &str, path: &Path) -> Result<Vec<EvidenceUnit>> {
     let mut verse = None;
     let mut verse_text = None;
     let mut verse_line = None;
+    let mut notes = Vec::new();
     let mut last_line = 0;
 
     for (index, raw_line) in content.lines().enumerate() {
@@ -108,7 +118,8 @@ fn parse_content(content: &str, path: &Path) -> Result<Vec<EvidenceUnit>> {
                         path.display()
                     );
                 }
-                let (verse_token, text) = verse_payload(payload, path, line)?;
+                let (verse_token, text, parsed_notes) = verse_payload(payload, path, line)?;
+                notes.extend(parsed_notes);
                 let verse_number = number(verse_token, path, line, "v")?;
                 let address = VersificationRegistry::lookup(book.id, chapter, verse_number)
                     .ok_or_else(|| {
@@ -123,6 +134,15 @@ fn parse_content(content: &str, path: &Path) -> Result<Vec<EvidenceUnit>> {
                 verse = Some(address.verse);
                 verse_text = Some(text.to_string());
                 verse_line = Some(line);
+            }
+            marker if FOOTNOTE_MARKERS.contains(&marker) || marker == "x" => {
+                if verse.is_none() {
+                    bail!(
+                        "USFM_MALFORMED_MARKER: \\{marker} precedes \\v on line {line} of {}",
+                        path.display()
+                    );
+                }
+                notes.push(parse_note(marker, payload, path, line)?);
             }
             _ => {
                 bail!(
@@ -202,19 +222,49 @@ fn parse_content(content: &str, path: &Path) -> Result<Vec<EvidenceUnit>> {
         ],
     };
 
-    Ok(vec![EvidenceUnit {
-        id: EvidenceId(format!("{}:usfm:n0", source_id.0)),
-        source_id,
+    let verse_id = EvidenceId(format!("{}:usfm:n0", source_id.0));
+    let verse_unit = EvidenceUnit {
+        id: verse_id.clone(),
+        source_id: source_id.clone(),
         kind: EvidenceKind::Verse,
         derived_from: None,
-        locator: SourceLocator::Canonical { locator },
+        locator: SourceLocator::Canonical {
+            locator: locator.clone(),
+        },
         text_hash: hex_sha256(text.as_bytes()),
         text,
         heading_path: Vec::new(),
         language: None,
         position: 0,
         annotations: BTreeMap::new(),
-    }])
+    };
+    let mut units = vec![verse_unit];
+    for (index, note) in notes.into_iter().enumerate() {
+        let mut note_locator = locator.clone();
+        note_locator.display = format!("{} note {}", note_locator.display, index + 1);
+        note_locator.backing_selectors = vec![BackingSelector::LineRange {
+            start: note.line,
+            end: note.line,
+        }];
+        let mut annotations = BTreeMap::new();
+        annotations.insert("note_type".to_string(), note.note_type.to_string());
+        units.push(EvidenceUnit {
+            id: EvidenceId(format!("{}:usfm:n{}", source_id.0, index + 1)),
+            source_id: source_id.clone(),
+            kind: EvidenceKind::Footnote,
+            derived_from: Some(verse_id.clone()),
+            locator: SourceLocator::Canonical {
+                locator: note_locator,
+            },
+            text_hash: hex_sha256(note.text.as_bytes()),
+            text: note.text,
+            heading_path: Vec::new(),
+            language: None,
+            position: (index + 1) as u32,
+            annotations,
+        });
+    }
+    Ok(units)
 }
 
 fn marker_line<'a>(line: &'a str, path: &Path, line_number: u32) -> Result<(&'a str, &'a str)> {
@@ -244,7 +294,7 @@ fn marker_line<'a>(line: &'a str, path: &Path, line_number: u32) -> Result<(&'a 
     };
     let marker = &body[..marker_end];
     let payload = body[marker_end..].trim();
-    if marker.is_empty() || payload.contains('\\') {
+    if marker.is_empty() {
         bail!(
             "USFM_UNTERMINATED_MARKER: unterminated marker on line {line_number} of {}",
             path.display()
@@ -264,7 +314,11 @@ fn single_token<'a>(payload: &'a str, path: &Path, line: u32, marker: &str) -> R
     }
 }
 
-fn verse_payload<'a>(payload: &'a str, path: &Path, line: u32) -> Result<(&'a str, &'a str)> {
+fn verse_payload<'a>(
+    payload: &'a str,
+    path: &Path,
+    line: u32,
+) -> Result<(&'a str, String, Vec<ParsedNote>)> {
     let Some(separator) = payload.find(char::is_whitespace) else {
         bail!(
             "USFM_MALFORMED_MARKER: \\v requires verse text on line {line} of {}",
@@ -272,14 +326,139 @@ fn verse_payload<'a>(payload: &'a str, path: &Path, line: u32) -> Result<(&'a st
         );
     };
     let verse = &payload[..separator];
-    let text = payload[separator..].trim();
-    if verse.is_empty() || text.is_empty() {
+    let raw_text = payload[separator..].trim();
+    if verse.is_empty() || raw_text.is_empty() {
         bail!(
             "USFM_MALFORMED_MARKER: \\v requires verse number and text on line {line} of {}",
             path.display()
         );
     }
-    Ok((verse, text))
+    let (text, notes) = split_inline_notes(raw_text, path, line)?;
+    if text.is_empty() {
+        bail!(
+            "USFM_MALFORMED_MARKER: \\v requires verse text on line {line} of {}",
+            path.display()
+        );
+    }
+    Ok((verse, text, notes))
+}
+
+fn split_inline_notes(input: &str, path: &Path, line: u32) -> Result<(String, Vec<ParsedNote>)> {
+    let mut text = String::new();
+    let mut notes = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_start) = input[cursor..].find('\\') {
+        let start = cursor + relative_start;
+        text.push_str(&input[cursor..start]);
+        let body = &input[start + 1..];
+        let Some(marker_end) = body.find(char::is_whitespace) else {
+            bail!(
+                "USFM_UNTERMINATED_MARKER: unterminated marker on line {line} of {}",
+                path.display()
+            );
+        };
+        let marker = &body[..marker_end];
+        if !matches!(marker, "f" | "fe" | "x") {
+            bail!(
+                "USFM_UNKNOWN_MARKER: unknown marker \\{marker} on line {line} of {}",
+                path.display()
+            );
+        }
+        let payload_start = start + 1 + marker_end;
+        let close = format!("\\{marker}*");
+        let remainder = &input[payload_start..];
+        let Some(close_start) = remainder.find(&close) else {
+            bail!(
+                "USFM_UNTERMINATED_MARKER: unterminated marker on line {line} of {}",
+                path.display()
+            );
+        };
+        notes.push(parse_note_body(
+            marker,
+            remainder[..close_start].trim(),
+            path,
+            line,
+        )?);
+        cursor = payload_start + close_start + close.len();
+    }
+    text.push_str(&input[cursor..]);
+    Ok((text.trim().to_string(), notes))
+}
+
+fn parse_note(marker: &str, payload: &str, path: &Path, line: u32) -> Result<ParsedNote> {
+    let close = format!("\\{marker}*");
+    let Some(body) = payload.strip_suffix(&close) else {
+        bail!(
+            "USFM_UNTERMINATED_MARKER: unterminated marker on line {line} of {}",
+            path.display()
+        );
+    };
+    parse_note_body(marker, body.trim(), path, line)
+}
+
+fn parse_note_body(marker: &str, payload: &str, path: &Path, line: u32) -> Result<ParsedNote> {
+    let (note_type, allowed_markers) = match marker {
+        "f" => ("footnote", FOOTNOTE_TEXT_MARKERS),
+        "fe" => ("endnote", FOOTNOTE_TEXT_MARKERS),
+        "x" => ("cross_reference", CROSS_REFERENCE_TEXT_MARKERS),
+        _ => unreachable!("note parser called for unsupported marker"),
+    };
+    let mut body = payload.trim_start();
+    if let Some(rest) = body.strip_prefix('+') {
+        body = rest.trim_start();
+    }
+    let mut text = Vec::new();
+    let mut cursor = 0;
+    while cursor < body.len() {
+        let remainder = &body[cursor..];
+        if let Some(marker_body) = remainder.strip_prefix('\\') {
+            let marker_end = marker_body
+                .find(char::is_whitespace)
+                .unwrap_or(marker_body.len());
+            let nested_marker = &marker_body[..marker_end];
+            if !allowed_markers.contains(&nested_marker) {
+                bail!(
+                    "USFM_UNKNOWN_MARKER: unknown marker \\{nested_marker} on line {line} of {}",
+                    path.display()
+                );
+            }
+            let payload_start = cursor + 1 + marker_end;
+            let nested_end = body[payload_start..]
+                .find('\\')
+                .unwrap_or(body[payload_start..].len());
+            let nested_payload = body[payload_start..payload_start + nested_end].trim();
+            let is_text = match marker {
+                "x" => nested_marker == "xt",
+                _ => matches!(nested_marker, "ft" | "fq" | "fqa" | "fk" | "fw"),
+            };
+            if is_text && !nested_payload.is_empty() {
+                text.push(nested_payload.to_string());
+            }
+            cursor = payload_start + nested_end;
+            while cursor < body.len() && body.as_bytes()[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+        } else {
+            let end = remainder.find('\\').unwrap_or(remainder.len());
+            let plain = remainder[..end].trim();
+            if !plain.is_empty() {
+                text.push(plain.to_string());
+            }
+            cursor += end;
+        }
+    }
+    let text = text.join(" ");
+    if text.is_empty() {
+        bail!(
+            "USFM_MALFORMED_MARKER: \\{marker} requires note text on line {line} of {}",
+            path.display()
+        );
+    }
+    Ok(ParsedNote {
+        note_type,
+        text,
+        line,
+    })
 }
 
 fn number(token: &str, path: &Path, line: u32, marker: &str) -> Result<u16> {
@@ -331,6 +510,35 @@ mod tests {
                     .contains(&BackingSelector::LineRange { start: 3, end: 3 }));
             }
             locator => panic!("expected canonical locator, got {locator:?}"),
+        }
+    }
+
+    #[test]
+    fn notes_and_cross_references_emit_annotated_units_linked_to_verse() {
+        let file = fixture(
+            r#"\id JHN
+\c 3
+\v 16 For God so loved the world. \f + \ft Or loved all people.\f* \fe + \ft Endnote text.\fe* \x + \xo 3:16 \xt John 3:16\x*
+"#,
+        );
+        let units = UsfmParser.parse(file.path()).unwrap();
+
+        assert_eq!(units.len(), 4);
+        let verse = &units[0];
+        assert_eq!(verse.kind, EvidenceKind::Verse);
+        assert_eq!(verse.text, "For God so loved the world.");
+        for (unit, note_type, text) in [
+            (&units[1], "footnote", "Or loved all people."),
+            (&units[2], "endnote", "Endnote text."),
+            (&units[3], "cross_reference", "John 3:16"),
+        ] {
+            assert_eq!(unit.kind, EvidenceKind::Footnote);
+            assert_eq!(unit.text, text);
+            assert_eq!(unit.derived_from.as_ref(), Some(&verse.id));
+            assert_eq!(
+                unit.annotations.get("note_type"),
+                Some(&note_type.to_string())
+            );
         }
     }
 
