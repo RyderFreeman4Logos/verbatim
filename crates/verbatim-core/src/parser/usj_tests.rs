@@ -304,19 +304,76 @@ fn rejects_unscoped_text_without_partial_units() {
 }
 
 #[test]
-fn rejects_notes_until_the_notes_slice_is_implemented() {
+fn notes_and_cross_references_emit_annotated_units_linked_to_verse() {
     let file = fixture(
         br#"{
   "type": "USJ",
   "version": "3.1",
   "content": [
     {"type": "book", "marker": "id", "code": "JHN", "content": ["John"]},
-    {"type": "note", "marker": "f", "content": ["not implemented"]}
+    {"type": "chapter", "marker": "c", "number": "3", "sid": "JHN 3"},
+    {"type": "para", "marker": "p", "content": [
+      {"type": "verse", "marker": "v", "number": "16", "sid": "JHN 3:16"},
+      "For God so loved the world.",
+      {"type": "note", "marker": "f", "caller": "+", "content": [
+        {"type": "char", "marker": "fr", "content": ["3:16"]},
+        {"type": "char", "marker": "ft", "content": ["Or loved all people."]}
+      ]},
+      {"type": "note", "marker": "fe", "caller": "+", "content": [
+        {"type": "char", "marker": "ft", "content": ["Endnote text."]}
+      ]},
+      {"type": "note", "marker": "x", "caller": "+", "content": [
+        {"type": "char", "marker": "xo", "content": ["3:16"]},
+        {"type": "char", "marker": "xt", "content": ["John 3:16"]}
+      ]}
+    ]}
+  ]
+}"#,
+    );
+    let units = UsjParser.parse(file.path()).unwrap();
+
+    assert_eq!(units.len(), 4);
+    let verse = &units[0];
+    assert_eq!(verse.kind, EvidenceKind::Verse);
+    assert_eq!(verse.text, "For God so loved the world.");
+    for (unit, note_type, text) in [
+        (&units[1], "footnote", "Or loved all people."),
+        (&units[2], "endnote", "Endnote text."),
+        (&units[3], "cross_reference", "John 3:16"),
+    ] {
+        assert_eq!(unit.kind, EvidenceKind::Footnote);
+        assert_eq!(unit.text, text);
+        assert_eq!(unit.derived_from.as_ref(), Some(&verse.id));
+        assert_eq!(
+            unit.annotations.get("note_type"),
+            Some(&note_type.to_string())
+        );
+    }
+}
+
+#[test]
+fn rejects_unknown_note_marker_with_line_and_path() {
+    let file = fixture(
+        br#"{
+  "type": "USJ",
+  "version": "3.1",
+  "content": [
+    {"type": "book", "marker": "id", "code": "JHN", "content": ["John"]},
+    {"type": "chapter", "marker": "c", "number": "3", "sid": "JHN 3"},
+    {"type": "para", "marker": "p", "content": [
+      {"type": "verse", "marker": "v", "number": "16", "sid": "JHN 3:16"},
+      "text",
+      {"type": "note", "marker": "z", "content": []}
+    ]}
   ]
 }"#,
     );
     let error = UsjParser.parse(file.path()).unwrap_err().to_string();
 
-    assert!(error.contains("USJ_UNKNOWN_CRITICAL"), "{error}");
-    assert!(error.contains("line 6"), "{error}");
+    assert!(error.contains("USJ_UNKNOWN_MARKER"), "{error}");
+    assert!(error.contains("line 10"), "{error}");
+    assert!(
+        error.contains(&file.path().display().to_string()),
+        "{error}"
+    );
 }
