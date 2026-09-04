@@ -32,7 +32,53 @@ fn container_and_chapter_verse_milestones_emit_equivalent_evidence() {
         "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.16\">For God so loved the world.</verse></chapter></div></osisText></osis>",
     );
     let milestones = fixture(
-        "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter sID=\"John.3\"/><verse sID=\"JHN.3.16\"/>For God so loved the world.<verse eID=\"JHN.3.16\"/><chapter eID=\"John.3\"/></div></osisText></osis>",
+        "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter sID=\"John.3\" osisID=\"John.3\"/><verse sID=\"JHN.3.16\" osisID=\"JHN.3.16\"/>For God so loved the world.<verse eID=\"JHN.3.16\"/><chapter eID=\"John.3\"/></div></osisText></osis>",
+    );
+    let parser = OsisParser;
+    let expected = parser.parse(container.path()).unwrap();
+    let actual = parser.parse(milestones.path()).unwrap();
+
+    assert_eq!(expected.len(), 1);
+    assert_eq!(actual.len(), 1);
+    let mut expected = expected[0].clone();
+    let mut actual = actual[0].clone();
+    actual.id = expected.id.clone();
+    actual.source_id = expected.source_id.clone();
+    without_line_selectors(&mut expected);
+    without_line_selectors(&mut actual);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn milestone_pair_keys_can_differ_from_canonical_ids() {
+    let container = fixture(
+        "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.16\">For God so loved the world.</verse></chapter></div></osisText></osis>",
+    );
+    let milestones = fixture(
+        "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter sID=\"chapter-key\" osisID=\"John.3\"/><verse sID=\"verse-key\" osisID=\"JHN.3.16\"/>For God so loved the world.<verse eID=\"verse-key\"/><chapter eID=\"chapter-key\"/></div></osisText></osis>",
+    );
+    let parser = OsisParser;
+    let expected = parser.parse(container.path()).unwrap();
+    let actual = parser.parse(milestones.path()).unwrap();
+
+    assert_eq!(expected.len(), 1);
+    assert_eq!(actual.len(), 1);
+    let mut expected = expected[0].clone();
+    let mut actual = actual[0].clone();
+    actual.id = expected.id.clone();
+    actual.source_id = expected.source_id.clone();
+    without_line_selectors(&mut expected);
+    without_line_selectors(&mut actual);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn chapter_container_and_verse_milestones_emit_equivalent_evidence() {
+    let container = fixture(
+        "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse osisID=\"JHN.3.16\">For God so loved the world.</verse></chapter></div></osisText></osis>",
+    );
+    let milestones = fixture(
+        "<osis><osisText><div type=\"book\" osisID=\"John\"><chapter osisID=\"John.3\"><verse sID=\"verse-key\" osisID=\"JHN.3.16\"/>For God so loved the world.<verse eID=\"verse-key\"/></chapter></div></osisText></osis>",
     );
     let parser = OsisParser;
     let expected = parser.parse(container.path()).unwrap();
@@ -62,28 +108,31 @@ fn malformed_milestone_pairs_fail_closed_with_stable_diagnostics() {
         ),
         (
             "mismatched_end_id",
-            "<chapter sID=\"John.3\"/><verse sID=\"JHN.3.16\"/>text<verse eID=\"JHN.3.17\"/>",
+            "<chapter sID=\"chapter-key\" osisID=\"John.3\"/><verse sID=\"verse-key\" osisID=\"JHN.3.16\"/>text<verse eID=\"wrong-key\"/>",
         ),
         (
             "overlapping_start",
-            "<chapter sID=\"John.3\"/><chapter sID=\"John.3\"/>",
+            "<chapter sID=\"chapter-key\" osisID=\"John.3\"/><chapter sID=\"chapter-key-2\" osisID=\"John.3\"/>",
         ),
         (
             "duplicate_end",
-            "<chapter sID=\"John.3\"/><chapter eID=\"John.3\"/><chapter eID=\"John.3\"/>",
+            "<chapter sID=\"chapter-key\" osisID=\"John.3\"/><chapter eID=\"chapter-key\"/><chapter eID=\"chapter-key\"/>",
         ),
-        ("unclosed_chapter", "<chapter sID=\"John.3\"/>"),
+        (
+            "unclosed_chapter",
+            "<chapter sID=\"chapter-key\" osisID=\"John.3\"/>",
+        ),
         (
             "eof_open_verse",
-            "<chapter sID=\"John.3\"/><verse sID=\"JHN.3.16\"/>text",
+            "<chapter sID=\"chapter-key\" osisID=\"John.3\"/><verse sID=\"verse-key\" osisID=\"JHN.3.16\"/>text",
         ),
         (
             "mixed_container_milestone",
-            "<chapter osisID=\"John.3\"><verse sID=\"JHN.3.16\"/>text",
+            "<chapter osisID=\"John.3\"><chapter sID=\"chapter-key\" osisID=\"John.3\"/>",
         ),
         (
             "text_outside_open_verse",
-            "<chapter sID=\"John.3\"/>text<chapter eID=\"John.3\"/>",
+            "<chapter sID=\"chapter-key\" osisID=\"John.3\"/>text<chapter eID=\"chapter-key\"/>",
         ),
     ];
 

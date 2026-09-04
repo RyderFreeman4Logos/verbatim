@@ -14,6 +14,7 @@ pub(super) enum Milestone {
     },
     Verse {
         id: String,
+        osis_id: String,
         book: CanonBook,
         chapter: u16,
         verse: u16,
@@ -23,9 +24,9 @@ pub(super) enum Milestone {
 }
 
 enum Marker {
-    ChapterStart(String),
+    ChapterStart { id: String, osis_id: String },
     ChapterEnd(String),
-    VerseStart(String),
+    VerseStart { id: String, osis_id: String },
     VerseEnd(String),
 }
 
@@ -156,9 +157,14 @@ fn marker(
         );
     }
     let id_name = if has_start { "sID" } else { "eID" };
+    let allowed = if has_start {
+        &["sID", "osisID"][..]
+    } else {
+        &["eID"][..]
+    };
     if attrs
         .keys()
-        .any(|key| !key.starts_with("xmlns") && key != id_name)
+        .any(|key| !key.starts_with("xmlns") && !allowed.contains(&key.as_str()))
     {
         bail!(
             "OSIS_MALFORMED_MILESTONE: unsupported attribute on `{name}` milestone on line {line} of {}",
@@ -168,7 +174,6 @@ fn marker(
     let id = attrs
         .get(id_name)
         .filter(|value| !value.trim().is_empty())
-        .filter(|value| value.split_whitespace().count() == 1)
         .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -176,10 +181,24 @@ fn marker(
                 path.display()
             )
         })?;
+    let osis_id = if has_start {
+        attrs
+            .get("osisID")
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OSIS_MALFORMED_MILESTONE: missing `osisID` on `{name}` milestone on line {line} of {}",
+                    path.display()
+                )
+            })?
+    } else {
+        String::new()
+    };
     Ok(Some(match (name, has_start) {
-        ("chapter", true) => Marker::ChapterStart(id),
+        ("chapter", true) => Marker::ChapterStart { id, osis_id },
         ("chapter", false) => Marker::ChapterEnd(id),
-        ("verse", true) => Marker::VerseStart(id),
+        ("verse", true) => Marker::VerseStart { id, osis_id },
         ("verse", false) => Marker::VerseEnd(id),
         _ => unreachable!(),
     }))
@@ -188,6 +207,12 @@ fn marker(
 fn milestone_book(stack: &[Element], line: u32, path: &Path) -> Result<CanonBook> {
     match stack {
         [Element::Osis, Element::OsisText, Element::Book { book }] => Ok(*book),
+        [
+            Element::Osis,
+            Element::OsisText,
+            Element::Book { book },
+            Element::Chapter { .. },
+        ] => Ok(*book),
         _ => bail!(
             "OSIS_MALFORMED_MILESTONE: milestone is outside the book container on line {line} of {}",
             path.display()
@@ -206,30 +231,37 @@ fn handle(
 ) -> Result<()> {
     let book = milestone_book(stack, line, path)?;
     match marker {
-        Marker::ChapterStart(id) => {
+        Marker::ChapterStart { id, osis_id } => {
             if !milestones.is_empty() || counts.chapters != 0 {
                 bail!(
                     "OSIS_MALFORMED_MILESTONE: duplicate or overlapping chapter start `{id}` on line {line} of {}",
                     path.display()
                 );
             }
-            let chapter = parse_chapter(&id, book, line, path)?;
+            let chapter = parse_chapter(&osis_id, book, line, path)?;
             counts.chapters += 1;
             milestones.push(Milestone::Chapter { id, book, chapter });
         }
-        Marker::VerseStart(id) => {
+        Marker::VerseStart { id, osis_id } => {
             let (chapter_book, chapter) = match milestones.last() {
                 Some(Milestone::Chapter {
                     book: chapter_book,
                     chapter,
                     ..
                 }) => (*chapter_book, *chapter),
-                _ => {
-                    bail!(
-                        "OSIS_MALFORMED_MILESTONE: verse start `{id}` has no open chapter milestone on line {line} of {}",
-                        path.display()
-                    )
-                }
+                _ => match stack.last() {
+                    Some(Element::Chapter {
+                        book: chapter_book,
+                        chapter,
+                        ..
+                    }) => (*chapter_book, *chapter),
+                    _ => {
+                        bail!(
+                            "OSIS_MALFORMED_MILESTONE: verse start `{id}` has no open chapter milestone on line {line} of {}",
+                            path.display()
+                        )
+                    }
+                },
             };
             if counts.verses != 0 {
                 bail!(
@@ -237,10 +269,11 @@ fn handle(
                     path.display()
                 );
             }
-            let verse_number = parse_verse(&id, book, chapter_book, chapter, line, path)?;
+            let verse_number = parse_verse(&osis_id, book, chapter_book, chapter, line, path)?;
             counts.verses += 1;
             milestones.push(Milestone::Verse {
                 id,
+                osis_id,
                 book,
                 chapter,
                 verse: verse_number,
@@ -283,10 +316,11 @@ fn handle(
             }
             let (book, chapter, verse_number, osis_id, line_start, text) = match milestones.pop() {
                 Some(Milestone::Verse {
+                    id: _,
                     book,
                     chapter,
                     verse: verse_number,
-                    id: osis_id,
+                    osis_id,
                     line_start,
                     text,
                 }) => (book, chapter, verse_number, osis_id, line_start, text),
