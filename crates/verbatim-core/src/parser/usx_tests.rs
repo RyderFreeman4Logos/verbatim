@@ -41,6 +41,39 @@ fn assert_rejects_declaration(declaration: &str, expected: &str) {
 }
 
 #[test]
+fn usx_notes_and_cross_references_emit_annotated_units_linked_to_verse() {
+    let file = fixture(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<usx version="3.0">
+  <book code="JHN" style="id">John</book>
+  <chapter number="3" style="c" sid="JHN 3"/>
+  <para style="p"><verse number="16" style="v" sid="JHN 3:16"/>For God so loved the world.<note caller="+" style="f"><char style="ft">Or loved all people.</char></note><note caller="+" style="fe"><char style="ft">Endnote text.</char></note><note caller="+" style="x"><char style="xo">3:16</char><char style="xt">John 3:16</char></note><verse eid="JHN 3:16"/></para>
+  <chapter eid="JHN 3"/>
+</usx>
+"#,
+    );
+    let units = UsxParser.parse(file.path()).unwrap();
+
+    assert_eq!(units.len(), 4);
+    let verse = &units[0];
+    assert_eq!(verse.kind, EvidenceKind::Verse);
+    assert_eq!(verse.text, "For God so loved the world.");
+    for (unit, note_type, text) in [
+        (&units[1], "footnote", "Or loved all people."),
+        (&units[2], "endnote", "Endnote text."),
+        (&units[3], "cross_reference", "John 3:16"),
+    ] {
+        assert_eq!(unit.kind, EvidenceKind::Footnote);
+        assert_eq!(unit.text, text);
+        assert_eq!(unit.derived_from.as_ref(), Some(&verse.id));
+        assert_eq!(
+            unit.annotations.get("note_type"),
+            Some(&note_type.to_string())
+        );
+    }
+}
+
+#[test]
 fn parses_one_verse_with_canonical_usx_backing() {
     let file = fixture(ONE_VERSE.as_bytes());
     let units = UsxParser.parse(file.path()).unwrap();
