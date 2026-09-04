@@ -168,7 +168,7 @@ where
                 .store()
                 .list_evidence_by_source(source_id)?
                 .into_iter()
-                .filter(|unit| unit.kind == EvidenceKind::Text)
+                .filter(|unit| unit.kind != EvidenceKind::Image)
                 .collect::<Vec<_>>();
             let mut expected = stored.clone();
             crate::pdf_selector::attach_pdf_selectors(&mut expected, &source.hash, parser_used);
@@ -385,7 +385,7 @@ impl Store {
                 require_changed_row(
                     tx.execute(
                         "UPDATE evidence_units SET locator_json = ?1
-                         WHERE id = ?2 AND source_id = ?3 AND kind = 'Text' AND locator_json = ?4",
+                         WHERE id = ?2 AND source_id = ?3 AND locator_json = ?4",
                         params![new_locator, &evidence_id.0, &expected_source.id.0, old_locator],
                     )?,
                     "evidence locator",
@@ -731,7 +731,7 @@ fn direct_text_evidence_tx(
     let mut statement = tx.prepare(
         "SELECT id, source_id, kind, locator_json, text, text_hash, heading_path_json,
                 language, position, derived_from_evidence_id, annotations_json
-         FROM evidence_units WHERE source_id = ?1 AND kind = 'Text' ORDER BY position",
+         FROM evidence_units WHERE source_id = ?1 AND kind <> 'Image' ORDER BY position",
     )?;
     let rows = statement.query_map(params![&source_id.0], row_to_evidence_unit)?;
     rows.map(|row| row.map_err(Into::into)).collect()
