@@ -1,6 +1,7 @@
 use super::*;
 use crate::types::{BackingSelector, EvidenceKind, SourceLocator};
 use std::io::Write;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 fn fixture(contents: &[u8]) -> NamedTempFile {
@@ -18,6 +19,26 @@ const ONE_VERSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   <chapter eid="JHN 3"/>
 </usx>
 "#;
+
+const ONE_VERSE_BODY: &str = r#"<usx version="3.0">
+  <book code="JHN" style="id">John</book>
+  <chapter number="3" style="c" altnumber="III" pubnumber="3" sid="JHN 3"/>
+  <para style="p"><verse number="16" style="v" altnumber="XVI" pubnumber="16" sid="JHN 3:16"/>For God so loved the world.<verse eid="JHN 3:16"/></para>
+  <chapter eid="JHN 3"/>
+</usx>
+"#;
+
+fn assert_rejects_declaration(declaration: &str, expected: &str) {
+    let contents = format!("{declaration}\n{ONE_VERSE_BODY}");
+    let file = fixture(contents.as_bytes());
+    let error = UsxParser.parse(file.path()).unwrap_err().to_string();
+    assert!(error.contains(expected), "{error}");
+    assert!(error.contains("line 1"), "{error}");
+    assert!(
+        error.contains(&file.path().display().to_string()),
+        "{error}"
+    );
+}
 
 #[test]
 fn parses_one_verse_with_canonical_usx_backing() {
@@ -40,6 +61,47 @@ fn parses_one_verse_with_canonical_usx_backing() {
         }
         locator => panic!("expected canonical locator, got {locator:?}"),
     }
+}
+
+#[test]
+fn rejects_illegal_xml_declaration_grammar_before_units() {
+    for (declaration, expected) in [
+        (r#"<?xml version="1.0" foo="bar"?>"#, "USX_MALFORMED_XML"),
+        (
+            r#"<?xml version="1.0" encoding="UTF-8" encoding="UTF-8"?>"#,
+            "USX_MALFORMED_XML",
+        ),
+        (
+            r#"<?xml version="1.0" standalone="maybe"?>"#,
+            "USX_UNSUPPORTED_XML_DECLARATION",
+        ),
+        (
+            r#"<?xml encoding="UTF-8" version="1.0"?>"#,
+            "USX_MALFORMED_XML",
+        ),
+    ] {
+        assert_rejects_declaration(declaration, expected);
+    }
+}
+
+#[test]
+fn parses_event_dense_source_with_bounded_line_tracking() {
+    let mut contents = String::with_capacity(300_000);
+    contents.push_str("<usx version=\"3.0\"><book code=\"JHN\" style=\"id\"/><chapter number=\"3\" style=\"c\" sid=\"JHN 3\"/><para style=\"p\"><verse number=\"16\" style=\"v\" sid=\"JHN 3:16\"/>");
+    for _ in 0..10_000 {
+        contents.push_str("<char style=\"add\">x</char>");
+    }
+    contents.push_str("<verse eid=\"JHN 3:16\"/></para><chapter eid=\"JHN 3\"/></usx>");
+    let file = fixture(contents.as_bytes());
+
+    let started = Instant::now();
+    let units = UsxParser.parse(file.path()).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "event-dense USX parsing exceeded the bounded duration"
+    );
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].text.len(), 10_000);
 }
 
 #[test]

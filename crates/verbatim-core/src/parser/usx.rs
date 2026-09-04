@@ -25,9 +25,9 @@ const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 #[path = "usx_xml.rs"]
 mod usx_xml;
 use usx_xml::{
-    attributes, ensure_attributes, illegal_xml_10_character, line_number, malformed_xml,
-    positive_number, reject_declarations, reject_illegal_xml_10_chars, require_attr,
-    require_char_attributes, require_name, require_para_attributes, validate_declaration, xml_name,
+    attributes, ensure_attributes, illegal_xml_10_character, malformed_xml, positive_number,
+    reject_declarations, reject_illegal_xml_10_chars, require_attr, require_char_attributes,
+    require_name, require_para_attributes, validate_declaration, xml_name, LineCounter,
 };
 
 /// A deliberately narrow USX 3.0 parser for canonical verse milestones.
@@ -133,13 +133,14 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
     let mut verses = Vec::new();
     let mut root_closed = false;
     let mut event_seen = false;
+    let mut line_counter = LineCounter::new();
 
     loop {
         let event = reader.read_event_into(&mut buffer).map_err(|error| {
             malformed_xml(bytes, reader.buffer_position() as usize, path, error)
         })?;
         let position = reader.buffer_position() as usize;
-        let line = line_number(bytes, position);
+        let line = line_counter.advance_to(bytes, position);
         let first_event = !event_seen;
         match event {
             Event::Decl(declaration) => {
@@ -266,38 +267,39 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
         buffer.clear();
     }
 
+    let end_line = line_counter.advance_to(bytes, bytes.len());
     if counts.roots != 1 || !root_closed || !stack.is_empty() {
         bail!(
             "USX_MALFORMED_XML: expected one complete root on line {} of {}",
-            line_number(bytes, bytes.len()),
+            end_line,
             path.display()
         );
     }
     if chapter.is_some() {
         bail!(
             "USX_INCOMPLETE_CHAPTER: missing chapter end milestone on line {} of {}",
-            line_number(bytes, bytes.len()),
+            end_line,
             path.display()
         );
     }
     if open_verse.is_some() {
         bail!(
             "USX_INCOMPLETE_VERSE: missing verse end milestone on line {} of {}",
-            line_number(bytes, bytes.len()),
+            end_line,
             path.display()
         );
     }
     if counts.books != 1 || book.is_none() {
         bail!(
             "USX_MISSING_BOOK: expected one book element on line {} of {}",
-            line_number(bytes, bytes.len()),
+            end_line,
             path.display()
         );
     }
     if verses.is_empty() {
         bail!(
             "USX_MISSING_VERSE: expected at least one verse milestone on line {} of {}",
-            line_number(bytes, bytes.len()),
+            end_line,
             path.display()
         );
     }
