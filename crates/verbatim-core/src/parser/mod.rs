@@ -17,6 +17,7 @@ pub mod plaintext;
 pub mod plumber;
 pub(crate) mod text_segments;
 pub mod usfm;
+pub mod usj;
 pub mod usx;
 
 use std::path::Path;
@@ -30,6 +31,7 @@ pub fn select_parser(name: &str) -> Result<Box<dyn Parser>> {
         "canonical_jsonl" => Ok(Box::new(canonical_jsonl::CanonicalJsonlParser)),
         "usfm" => Ok(Box::new(usfm::UsfmParser)),
         "usx" => Ok(Box::new(usx::UsxParser)),
+        "usj" => Ok(Box::new(usj::UsjParser)),
         "osis" => Ok(Box::new(osis::OsisParser)),
 
         #[cfg(feature = "parser-pdf-oxide")]
@@ -42,7 +44,7 @@ pub fn select_parser(name: &str) -> Result<Box<dyn Parser>> {
         "markdown" => Ok(Box::new(markdown::MarkdownParser)),
         "plaintext" => Ok(Box::new(plaintext::PlaintextParser)),
         _ => bail!(
-            "unknown parser: {name}. Available: canonical_jsonl, usfm, usx, osis, pdf_oxide, pdfplumber, anydoc_pdf, json, markdown, plaintext"
+            "unknown parser: {name}. Available: canonical_jsonl, usfm, usx, usj, osis, pdf_oxide, pdfplumber, anydoc_pdf, json, markdown, plaintext"
         ),
     }
 }
@@ -68,6 +70,7 @@ pub fn parser_for_extension(path: &Path) -> Result<Box<dyn Parser>> {
         "jsonl" => Ok(Box::new(canonical_jsonl::CanonicalJsonlParser)),
         "usfm" => Ok(Box::new(usfm::UsfmParser)),
         "usx" => Ok(Box::new(usx::UsxParser)),
+        "usj" => Ok(Box::new(usj::UsjParser)),
         "osis" => Ok(Box::new(osis::OsisParser)),
         "json" => Ok(Box::new(json::JsonParser)),
         "md" | "markdown" => Ok(Box::new(markdown::MarkdownParser)),
