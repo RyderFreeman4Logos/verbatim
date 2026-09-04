@@ -12,6 +12,20 @@ fn fixture(contents: &[u8]) -> NamedTempFile {
     file
 }
 
+fn line_range(unit: &crate::types::EvidenceUnit) -> (u32, u32) {
+    let SourceLocator::Canonical { locator } = &unit.locator else {
+        panic!("expected canonical locator")
+    };
+    locator
+        .backing_selectors
+        .iter()
+        .find_map(|selector| match selector {
+            BackingSelector::LineRange { start, end } => Some((*start, *end)),
+            _ => None,
+        })
+        .expect("expected line range backing")
+}
+
 const ONE_VERSE: &str = r#"{
   "type": "USJ",
   "version": "3.1",
@@ -35,6 +49,87 @@ fn explicit_and_extension_selection_route_to_usj() {
             .name(),
         "usj"
     );
+}
+
+#[test]
+fn line_range_uses_verse_span_when_object_keys_are_reordered() {
+    let file = fixture(
+        br#"{
+  "type": "USJ",
+  "version": "3.1",
+  "content": [
+    {"type": "book", "marker": "id", "code": "JHN", "content": ["John"]},
+    {"type": "chapter", "marker": "c", "number": "3", "sid": "JHN 3"},
+    {"type": "para", "marker": "p", "content": [
+      {
+        "sid": "JHN 3:16",
+        "marker": "v",
+        "number": "16",
+        "type": "verse"
+      },
+      "first verse",
+      {"type": "verse", "marker": "v", "number": "17", "sid": "JHN 3:17"},
+      "second verse"
+    ]}
+  ]
+}"#,
+    );
+    let units = UsjParser.parse(file.path()).unwrap();
+
+    assert_eq!(units.len(), 2);
+    assert_eq!(line_range(&units[0]), (8, 14));
+    assert_eq!(line_range(&units[1]), (15, 16));
+}
+
+#[test]
+fn line_range_covers_text_with_alternate_json_escapes() {
+    let file = fixture(
+        br#"{
+  "type": "USJ",
+  "version": "3.1",
+  "content": [
+    {"type": "book", "marker": "id", "code": "JHN", "content": ["John"]},
+    {"type": "chapter", "marker": "c", "number": "3", "sid": "JHN 3"},
+    {"type": "para", "marker": "p", "content": [
+      {"type": "verse", "marker": "v", "number": "16", "sid": "JHN 3:16"},
+      "\u0046or God so loved the world."
+    ]}
+  ]
+}"#,
+    );
+    let units = UsjParser.parse(file.path()).unwrap();
+
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].text, "For God so loved the world.");
+    assert_eq!(line_range(&units[0]), (8, 9));
+}
+
+#[test]
+fn line_range_covers_the_complete_multiline_verse_node() {
+    let file = fixture(
+        br#"{
+  "type": "USJ",
+  "version": "3.1",
+  "content": [
+    {"type": "book", "marker": "id", "code": "JHN", "content": ["John"]},
+    {"type": "chapter", "marker": "c", "number": "3", "sid": "JHN 3"},
+    {"type": "para", "marker": "p", "content": [
+      {
+        "sid": "JHN 3:16",
+        "content": ["line one\nline two"],
+        "marker": "v",
+        "number": "16",
+        "type": "verse"
+      }
+    ]}
+  ]
+}"#,
+    );
+    let units = UsjParser.parse(file.path()).unwrap();
+
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].text, "line one\nline two");
+    assert_eq!(line_range(&units[0]), (8, 14));
 }
 
 #[test]

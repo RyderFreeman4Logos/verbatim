@@ -44,41 +44,13 @@ struct VerseData {
     chapter: u16,
     verse: u16,
     sid: String,
-    line_start: u32,
-    line_end: u32,
+    source_span: SourceSpan,
     text: String,
 }
 
-struct SourceScan<'a> {
-    source: &'a str,
-    offset: usize,
-}
-
-impl<'a> SourceScan<'a> {
-    fn new(source: &'a str) -> Self {
-        Self { source, offset: 0 }
-    }
-
-    fn type_line(&mut self, node_type: &str) -> u32 {
-        let Some(start) = find_type(self.source, node_type, self.offset) else {
-            return line_at(self.source, self.offset);
-        };
-        self.offset = start + node_type.len();
-        line_at(self.source, start)
-    }
-
-    fn value_line(&mut self, value: &str) -> u32 {
-        let Some(needle) = serde_json::to_string(value).ok() else {
-            return line_at(self.source, self.offset);
-        };
-        let Some(relative) = self.source[self.offset..].find(&needle) else {
-            return line_at(self.source, self.offset);
-        };
-        let start = self.offset + relative;
-        self.offset = start + needle.len();
-        line_at(self.source, start)
-    }
-}
+#[path = "usj_spans.rs"]
+mod usj_spans;
+use usj_spans::{line_at, SourceScan, SourceSpan};
 
 fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
     let source = std::str::from_utf8(bytes).map_err(|error| {
@@ -100,8 +72,8 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
     let root = document
         .as_object()
         .ok_or_else(|| diagnostic("USJ_INCOMPLETE_ROOT", "root must be an object", 1, path))?;
-    let mut scan = SourceScan::new(source);
-    let root_line = 1;
+    let scan = SourceScan::new(source, &document, path)?;
+    let root_line = scan.node_line(&document, path)?;
     if require_string(root, "type", "USJ_INCOMPLETE_ROOT", root_line, path)? != "USJ" {
         return Err(diagnostic(
             "USJ_INCOMPLETE_ROOT",
@@ -139,18 +111,18 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
     let mut verses = Vec::new();
     let mut seen_verses = BTreeSet::new();
     for node in content {
+        let line = scan.node_line(node, path)?;
         let object = node.as_object().ok_or_else(|| {
             diagnostic(
                 "USJ_UNEXPECTED_STRUCTURE",
                 "root content entries must be objects",
-                line_at(source, scan.offset),
+                line,
                 path,
             )
         })?;
         let node_type = node_type(object).unwrap_or("<missing>");
-        let line = scan.type_line(node_type);
         match node_type {
-            "book" => parse_book(object, &mut book, line, &mut scan, path)?,
+            "book" => parse_book(object, &mut book, line, &scan, path)?,
             "chapter" => {
                 let parsed = parse_chapter(object, book, line, path)?;
                 chapter = Some(parsed);
@@ -161,7 +133,7 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
                 chapter,
                 &mut verses,
                 &mut seen_verses,
-                &mut scan,
+                &scan,
                 line,
                 path,
             )?,
@@ -182,18 +154,18 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
         );
     }
 
-    Ok(verses
+    verses
         .into_iter()
         .enumerate()
-        .map(|(position, verse)| evidence_unit(verse, path, position))
-        .collect())
+        .map(|(position, verse)| evidence_unit(verse, &scan, path, position))
+        .collect()
 }
 
 fn parse_book(
     object: &Map<String, Value>,
     book: &mut Option<CanonBook>,
     line: u32,
-    scan: &mut SourceScan<'_>,
+    scan: &SourceScan<'_>,
     path: &Path,
 ) -> Result<()> {
     if book.is_some() {
@@ -231,7 +203,7 @@ fn parse_book(
         for item in content {
             if let Value::Object(node) = item {
                 let node_type = node_type(node).unwrap_or("<missing>");
-                let node_line = scan.type_line(node_type);
+                let node_line = scan.node_line(item, path)?;
                 bail!(
                     "USJ_UNKNOWN_CRITICAL: unsupported book node type `{node_type}` on line {node_line} of {}",
                     path.display()
@@ -293,7 +265,7 @@ fn parse_para(
     chapter: Option<(CanonBook, u16)>,
     verses: &mut Vec<VerseData>,
     seen_verses: &mut BTreeSet<String>,
-    scan: &mut SourceScan<'_>,
+    scan: &SourceScan<'_>,
     line: u32,
     path: &Path,
 ) -> Result<()> {
@@ -319,9 +291,9 @@ fn parse_para(
             Value::String(text) => {
                 if let Some(verse) = open.as_mut() {
                     verse.text.push_str(text);
-                    verse.line_end = scan.value_line(text);
+                    scan.extend(&mut verse.source_span, item, line, path)?;
                 } else {
-                    let text_line = scan.value_line(text);
+                    let text_line = scan.node_line(item, path)?;
                     bail!(
                         "USJ_UNEXPECTED_STRUCTURE: text is outside a verse on line {text_line} of {}",
                         path.display()
@@ -330,13 +302,13 @@ fn parse_para(
             }
             Value::Object(node) => {
                 let node_type = node_type(node).unwrap_or("<missing>");
-                let node_line = scan.type_line(node_type);
+                let node_line = scan.node_line(item, path)?;
                 match node_type {
                     "verse" => {
                         if let Some(verse) = open.take() {
                             finish_verse(verse, verses, node_line, path)?;
                         }
-                        let verse = start_verse(node, book, chapter, node_line, scan, path)?;
+                        let verse = start_verse(item, book, chapter, node_line, scan, path)?;
                         if !seen_verses.insert(verse.sid.clone()) {
                             bail!(
                                 "USJ_DUPLICATE_VERSE: duplicate verse `{}` on line {node_line} of {}",
@@ -359,7 +331,7 @@ fn parse_para(
                             }
                         }
                     }
-                    "char" => append_char(node, &mut open, scan, node_line, path)?,
+                    "char" => append_char(item, &mut open, scan, node_line, path)?,
                     _ => {
                         bail!(
                             "USJ_UNKNOWN_CRITICAL: unsupported node type `{node_type}` on line {node_line} of {}",
@@ -385,7 +357,7 @@ fn parse_para(
 fn append_content(
     item: &Value,
     open: &mut Option<VerseData>,
-    scan: &mut SourceScan<'_>,
+    scan: &SourceScan<'_>,
     line: u32,
     path: &Path,
 ) -> Result<()> {
@@ -393,9 +365,9 @@ fn append_content(
         Value::String(text) => {
             if let Some(verse) = open.as_mut() {
                 verse.text.push_str(text);
-                verse.line_end = scan.value_line(text);
+                scan.extend(&mut verse.source_span, item, line, path)?;
             } else {
-                let text_line = scan.value_line(text);
+                let text_line = scan.node_line(item, path)?;
                 bail!(
                     "USJ_UNEXPECTED_STRUCTURE: text is outside a verse on line {text_line} of {}",
                     path.display()
@@ -404,7 +376,7 @@ fn append_content(
             Ok(())
         }
         Value::Object(node) if node_type(node) == Some("char") => {
-            append_char(node, open, scan, line, path)
+            append_char(item, open, scan, line, path)
         }
         Value::Object(node) => {
             let node_type = node_type(node).unwrap_or("<missing>");
@@ -421,12 +393,20 @@ fn append_content(
 }
 
 fn append_char(
-    node: &Map<String, Value>,
+    node_value: &Value,
     open: &mut Option<VerseData>,
-    scan: &mut SourceScan<'_>,
+    scan: &SourceScan<'_>,
     line: u32,
     path: &Path,
 ) -> Result<()> {
+    let node = node_value.as_object().ok_or_else(|| {
+        diagnostic(
+            "USJ_UNEXPECTED_STRUCTURE",
+            "character node must be an object",
+            line,
+            path,
+        )
+    })?;
     require_string(node, "marker", "USJ_INCOMPLETE_NODE", line, path)?;
     let content = node.get("content").ok_or_else(|| {
         diagnostic(
@@ -447,17 +427,28 @@ fn append_char(
     for item in content {
         append_content(item, open, scan, line, path)?;
     }
+    if let Some(verse) = open.as_mut() {
+        scan.extend(&mut verse.source_span, node_value, line, path)?;
+    }
     Ok(())
 }
 
 fn start_verse(
-    object: &Map<String, Value>,
+    node: &Value,
     book: Option<CanonBook>,
     chapter: Option<(CanonBook, u16)>,
     line: u32,
-    scan: &mut SourceScan<'_>,
+    scan: &SourceScan<'_>,
     path: &Path,
 ) -> Result<VerseData> {
+    let object = node.as_object().ok_or_else(|| {
+        diagnostic(
+            "USJ_UNEXPECTED_STRUCTURE",
+            "verse node must be an object",
+            line,
+            path,
+        )
+    })?;
     let book =
         book.ok_or_else(|| diagnostic("USJ_INCOMPLETE_ROOT", "verse precedes book", line, path))?;
     let (chapter_book, chapter_number) = chapter
@@ -488,14 +479,12 @@ fn start_verse(
             path.display()
         );
     }
-    let line_start = scan.value_line(sid).max(line);
     Ok(VerseData {
         book,
         chapter: chapter_number,
         verse,
         sid: sid.to_string(),
-        line_start,
-        line_end: line_start,
+        source_span: scan.span(node, line, path)?,
         text: String::new(),
     })
 }
@@ -518,7 +507,12 @@ fn finish_verse(
     Ok(())
 }
 
-fn evidence_unit(verse: VerseData, path: &Path, position: usize) -> EvidenceUnit {
+fn evidence_unit(
+    verse: VerseData,
+    scan: &SourceScan<'_>,
+    path: &Path,
+    position: usize,
+) -> Result<EvidenceUnit> {
     let source_id = SourceId::from_path(path);
     let components = vec![
         ReferenceComponent {
@@ -551,17 +545,18 @@ fn evidence_unit(verse: VerseData, path: &Path, position: usize) -> EvidenceUnit
     );
     locator.canon_id = Some(CANON_VERSION.to_string());
     locator.versification_id = Some(VERSIFICATION_VERSION.to_string());
+    let (line_start, line_end) = scan.line_range(verse.source_span, path)?;
     locator.backing_selectors = vec![
         BackingSelector::SourceNative {
             scheme: SOURCE_NATIVE_SCHEME.to_string(),
             value: verse.sid,
         },
         BackingSelector::LineRange {
-            start: verse.line_start,
-            end: verse.line_end,
+            start: line_start,
+            end: line_end,
         },
     ];
-    EvidenceUnit {
+    Ok(EvidenceUnit {
         id: EvidenceId(format!("{}:usj:n{position}", source_id.0)),
         source_id,
         kind: EvidenceKind::Verse,
@@ -573,7 +568,7 @@ fn evidence_unit(verse: VerseData, path: &Path, position: usize) -> EvidenceUnit
         language: None,
         position: position as u32,
         annotations: BTreeMap::new(),
-    }
+    })
 }
 
 fn node_type(object: &Map<String, Value>) -> Option<&str> {
@@ -614,45 +609,6 @@ fn parse_number(value: &str, kind: &str, line: u32, path: &Path) -> Result<u16> 
 
 fn diagnostic(code: &str, detail: impl std::fmt::Display, line: u32, path: &Path) -> anyhow::Error {
     anyhow!("{code}: {detail} on line {line} of {}", path.display())
-}
-
-fn find_type(source: &str, node_type: &str, start: usize) -> Option<usize> {
-    let expected = format!("\"{node_type}\"");
-    let mut offset = start.min(source.len());
-    while let Some(relative) = source[offset..].find("\"type\"") {
-        let key_start = offset + relative;
-        let mut value_start = key_start + "\"type\"".len();
-        while source
-            .as_bytes()
-            .get(value_start)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            value_start += 1;
-        }
-        if source.as_bytes().get(value_start) == Some(&b':') {
-            value_start += 1;
-            while source
-                .as_bytes()
-                .get(value_start)
-                .is_some_and(u8::is_ascii_whitespace)
-            {
-                value_start += 1;
-            }
-            if source[value_start..].starts_with(&expected) {
-                return Some(key_start);
-            }
-        }
-        offset = key_start + 1;
-    }
-    None
-}
-
-fn line_at(source: &str, offset: usize) -> u32 {
-    source[..offset.min(source.len())]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count() as u32
-        + 1
 }
 
 fn line_at_bytes(source: &[u8], offset: usize) -> u32 {
