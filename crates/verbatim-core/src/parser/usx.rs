@@ -30,6 +30,9 @@ use usx_xml::{
     require_name, require_para_attributes, validate_declaration, xml_name, LineCounter,
 };
 
+#[path = "usx_notes.rs"]
+mod usx_notes;
+
 /// A deliberately narrow USX 3.0 parser for canonical verse milestones.
 pub struct UsxParser;
 
@@ -65,6 +68,7 @@ enum Element {
     Book,
     Para,
     Char,
+    Note,
 }
 
 impl Element {
@@ -74,6 +78,7 @@ impl Element {
             Self::Book => "book",
             Self::Para => "para",
             Self::Char => "char",
+            Self::Note => "note",
         }
     }
 }
@@ -90,6 +95,20 @@ struct ChapterData {
     sid: String,
 }
 
+struct ParsedNote {
+    note_type: &'static str,
+    text: String,
+    line: u32,
+}
+
+struct OpenNote {
+    note_type: &'static str,
+    allowed_markers: &'static [&'static str],
+    char_style: Option<String>,
+    text: String,
+    line: u32,
+}
+
 struct VerseData {
     book: CanonBook,
     chapter: u16,
@@ -98,6 +117,7 @@ struct VerseData {
     line_start: u32,
     line_end: u32,
     text: String,
+    notes: Vec<ParsedNote>,
 }
 
 struct OpenVerse {
@@ -107,6 +127,7 @@ struct OpenVerse {
     sid: String,
     line_start: u32,
     text: String,
+    notes: Vec<ParsedNote>,
 }
 
 fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
@@ -130,6 +151,7 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
     let mut book = None;
     let mut chapter = None;
     let mut open_verse = None;
+    let mut open_note = None;
     let mut verses = Vec::new();
     let mut root_closed = false;
     let mut event_seen = false;
@@ -175,8 +197,22 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
             Event::Start(start) => {
                 let name = xml_name(start.name().as_ref(), bytes, position, path)?;
                 let attrs = attributes(&start, reader.decoder(), bytes, position, path)?;
-                let element =
-                    start_element(&stack, &name, &attrs, &mut counts, &mut book, line, path)?;
+                let element = if name == "note" {
+                    usx_notes::start_note(
+                        &stack,
+                        &attrs,
+                        open_verse.as_ref(),
+                        &mut open_note,
+                        line,
+                        path,
+                    )?;
+                    Element::Note
+                } else if name == "char" && matches!(stack.last(), Some(Element::Note)) {
+                    usx_notes::start_note_char(&attrs, open_note.as_mut(), line, path)?;
+                    Element::Char
+                } else {
+                    start_element(&stack, &name, &attrs, &mut counts, &mut book, line, path)?
+                };
                 if matches!(element, Element::Usx) {
                     root_closed = false;
                 }
@@ -213,7 +249,13 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
                         path.display()
                     );
                 }
-                if matches!(element, Element::Usx) {
+                if matches!(element, Element::Note) {
+                    usx_notes::close_note(&mut open_verse, &mut open_note, line, path)?;
+                } else if matches!(element, Element::Char) {
+                    if let Some(note) = open_note.as_mut() {
+                        note.char_style = None;
+                    }
+                } else if matches!(element, Element::Usx) {
                     if chapter.is_some() || open_verse.is_some() {
                         bail!(
                             "USX_INCOMPLETE_ROOT: root closed before chapter and verse milestones on line {line} of {}",
@@ -232,8 +274,10 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
                 reject_illegal_xml_10_chars(&decoded, bytes, position, path)?;
                 match stack.last() {
                     Some(Element::Book) => {}
-                    Some(Element::Para) | Some(Element::Char) => {
-                        if let Some(verse) = open_verse.as_mut() {
+                    Some(Element::Note) | Some(Element::Para) | Some(Element::Char) => {
+                        if let Some(note) = open_note.as_mut() {
+                            usx_notes::append_note_text(note, &decoded);
+                        } else if let Some(verse) = open_verse.as_mut() {
                             verse.text.push_str(&decoded);
                         }
                     }
@@ -304,11 +348,11 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
         );
     }
 
-    let units = verses
-        .into_iter()
-        .enumerate()
-        .map(|(position, verse)| evidence_unit(verse, path, position))
-        .collect();
+    let mut units = Vec::new();
+    let mut position = 0;
+    for verse in verses {
+        units.extend(usx_notes::evidence_units(verse, path, &mut position));
+    }
     Ok(units)
 }
 
@@ -587,6 +631,7 @@ fn handle_verse(
             line_start: current.line_start,
             line_end: line,
             text,
+            notes: current.notes,
         });
         return Ok(());
     }
@@ -636,6 +681,7 @@ fn handle_verse(
         sid,
         line_start: line,
         text: String::new(),
+        notes: Vec::new(),
     });
     Ok(())
 }
@@ -688,66 +734,6 @@ fn validate_reference(
             "USX_INVALID_COORDINATE: invalid reference `{value}` on line {line} of {}",
             path.display()
         ),
-    }
-}
-
-fn evidence_unit(data: VerseData, path: &Path, position: usize) -> EvidenceUnit {
-    let components = vec![
-        ReferenceComponent {
-            level: "book".to_string(),
-            value: data.book.name.to_string(),
-            ordinal: Some(data.book.ordinal as u32),
-        },
-        ReferenceComponent {
-            level: "chapter".to_string(),
-            value: data.chapter.to_string(),
-            ordinal: Some(data.chapter as u32),
-        },
-        ReferenceComponent {
-            level: "verse".to_string(),
-            value: data.verse.to_string(),
-            ordinal: Some(data.verse as u32),
-        },
-    ];
-    let normalized = components
-        .iter()
-        .map(|component| component.value.replace(' ', "").to_lowercase())
-        .collect::<Vec<_>>()
-        .join(":");
-    let source_id = SourceId::from_path(path);
-    let locator = CanonicalLocator {
-        profile_id: "bible".to_string(),
-        work_id: WORK_ID.to_string(),
-        version_id: None,
-        canon_id: Some(CANON_VERSION.to_string()),
-        versification_id: Some(VERSIFICATION_VERSION.to_string()),
-        start: components,
-        end: None,
-        display: format!("{} {}:{}", data.book.name, data.chapter, data.verse),
-        normalized,
-        backing_selectors: vec![
-            BackingSelector::SourceNative {
-                scheme: SOURCE_NATIVE_SCHEME.to_string(),
-                value: data.sid,
-            },
-            BackingSelector::LineRange {
-                start: data.line_start,
-                end: data.line_end,
-            },
-        ],
-    };
-    EvidenceUnit {
-        id: EvidenceId(format!("{}:usx:n{position}", source_id.0)),
-        source_id,
-        kind: EvidenceKind::Verse,
-        derived_from: None,
-        locator: SourceLocator::Canonical { locator },
-        text_hash: hex_sha256(data.text.as_bytes()),
-        text: data.text,
-        heading_path: Vec::new(),
-        language: None,
-        position: position as u32,
-        annotations: BTreeMap::new(),
     }
 }
 
