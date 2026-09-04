@@ -17,6 +17,8 @@ use crate::types::{
     ReferenceComponent, SourceId, SourceLocator,
 };
 
+#[path = "osis_milestones.rs"]
+mod osis_milestones;
 #[path = "osis_xml.rs"]
 mod osis_xml;
 use osis_xml::{illegal_xml_10_character, reject_illegal_xml_10_chars};
@@ -113,6 +115,7 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut stack = Vec::new();
+    let mut milestones = Vec::new();
     let mut counts = Counts::default();
     let mut verse = None;
     let mut event_seen = false;
@@ -180,7 +183,13 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
                     reader.buffer_position() as usize,
                     path,
                 )?;
-                reject_milestone(&name, &attributes, line, path)?;
+                osis_milestones::validate_start(
+                    &name,
+                    &attributes,
+                    !milestones.is_empty(),
+                    line,
+                    path,
+                )?;
                 let element = next_element(&stack, &name, &attributes, &mut counts, line, path)?;
                 if matches!(element, Element::Osis) {
                     counts.roots += 1;
@@ -201,11 +210,15 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
                     reader.buffer_position() as usize,
                     path,
                 )?;
-                reject_milestone(&name, &attributes, line, path)?;
-                bail!(
-                    "OSIS_UNEXPECTED_STRUCTURE: empty `{name}` element is unsupported on line {line} of {}",
-                    path.display()
-                );
+                osis_milestones::handle_empty(
+                    &name,
+                    &attributes,
+                    &stack,
+                    &mut milestones,
+                    &mut counts,
+                    &mut verse,
+                    (line, path),
+                )?;
             }
             Event::End(end) => {
                 let name = xml_name(
@@ -214,6 +227,7 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
                     reader.buffer_position() as usize,
                     path,
                 )?;
+                osis_milestones::validate_end(&name, !milestones.is_empty(), line, path)?;
                 let element = stack.pop().ok_or_else(|| {
                     anyhow!(
                         "OSIS_MALFORMED_XML: unexpected end element `{name}` on line {line} of {}",
@@ -267,14 +281,7 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
                     reader.buffer_position() as usize,
                     path,
                 )?;
-                if let Some(Element::Verse { text, .. }) = stack.last_mut() {
-                    text.push_str(&decoded);
-                } else if !decoded.trim().is_empty() {
-                    bail!(
-                        "OSIS_UNEXPECTED_STRUCTURE: non-whitespace text outside verse on line {line} of {}",
-                        path.display()
-                    );
-                }
+                osis_milestones::append_text(&mut stack, &mut milestones, &decoded, line, path)?;
             }
             Event::CData(_) | Event::Comment(_) | Event::PI(_) => {
                 bail!(
@@ -288,6 +295,7 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
         buffer.clear();
     }
 
+    osis_milestones::require_closed(&milestones, bytes, path)?;
     if counts.roots != 1 || !stack.is_empty() {
         bail!(
             "OSIS_MALFORMED_XML: expected one complete root on line {} of {}",
@@ -642,21 +650,6 @@ fn require_name(name: &str, expected: &str, line: u32, path: &Path) -> Result<()
     if name != expected {
         bail!(
             "OSIS_UNEXPECTED_STRUCTURE: expected `{expected}`, found `{name}` on line {line} of {}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn reject_milestone(
-    name: &str,
-    attrs: &BTreeMap<String, String>,
-    line: u32,
-    path: &Path,
-) -> Result<()> {
-    if name == "milestone" || attrs.keys().any(|key| key == "sID" || key == "eID") {
-        bail!(
-            "OSIS_UNSUPPORTED_MILESTONE: milestone elements are unsupported on line {line} of {}",
             path.display()
         );
     }
