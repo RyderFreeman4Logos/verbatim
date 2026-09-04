@@ -17,6 +17,7 @@ pub mod plaintext;
 pub mod plumber;
 pub(crate) mod text_segments;
 pub mod usfm;
+pub mod usx;
 
 use std::path::Path;
 
@@ -28,7 +29,9 @@ pub fn select_parser(name: &str) -> Result<Box<dyn Parser>> {
     match name {
         "canonical_jsonl" => Ok(Box::new(canonical_jsonl::CanonicalJsonlParser)),
         "usfm" => Ok(Box::new(usfm::UsfmParser)),
+        "usx" => Ok(Box::new(usx::UsxParser)),
         "osis" => Ok(Box::new(osis::OsisParser)),
+
         #[cfg(feature = "parser-pdf-oxide")]
         "pdf_oxide" => Ok(Box::new(oxide::PdfOxideParser)),
         #[cfg(feature = "parser-pdfplumber")]
@@ -39,7 +42,7 @@ pub fn select_parser(name: &str) -> Result<Box<dyn Parser>> {
         "markdown" => Ok(Box::new(markdown::MarkdownParser)),
         "plaintext" => Ok(Box::new(plaintext::PlaintextParser)),
         _ => bail!(
-            "unknown parser: {name}. Available: canonical_jsonl, usfm, osis, pdf_oxide, pdfplumber, anydoc_pdf, json, markdown, plaintext"
+            "unknown parser: {name}. Available: canonical_jsonl, usfm, usx, osis, pdf_oxide, pdfplumber, anydoc_pdf, json, markdown, plaintext"
         ),
     }
 }
@@ -64,6 +67,7 @@ pub fn parser_for_extension(path: &Path) -> Result<Box<dyn Parser>> {
         }
         "jsonl" => Ok(Box::new(canonical_jsonl::CanonicalJsonlParser)),
         "usfm" => Ok(Box::new(usfm::UsfmParser)),
+        "usx" => Ok(Box::new(usx::UsxParser)),
         "osis" => Ok(Box::new(osis::OsisParser)),
         "json" => Ok(Box::new(json::JsonParser)),
         "md" | "markdown" => Ok(Box::new(markdown::MarkdownParser)),
@@ -91,11 +95,53 @@ mod tests {
 </osis>
 "#;
 
+    const ONE_USX_VERSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<usx version="3.0">
+  <book code="JHN" style="id">John</book>
+  <chapter number="3" style="c" sid="JHN 3"/>
+  <para style="p">
+    <verse number="16" style="v" sid="JHN 3:16"/>For God so loved the world.
+    <verse eid="JHN 3:16"/>
+  </para>
+  <chapter eid="JHN 3"/>
+</usx>
+"#;
+
     fn fixture(contents: &str) -> NamedTempFile {
         let mut file = NamedTempFile::with_suffix(".osis").unwrap();
         file.write_all(contents.as_bytes()).unwrap();
         file.flush().unwrap();
         file
+    }
+
+    #[test]
+    fn usx_verse_container_emits_canonical_source_native_evidence() {
+        let file = NamedTempFile::with_suffix(".usx").unwrap();
+        std::fs::write(file.path(), ONE_USX_VERSE).unwrap();
+        let parser = select_parser("usx").unwrap();
+        assert_eq!(parser.name(), "usx");
+        let units = parser.parse(file.path()).unwrap();
+
+        assert_eq!(units.len(), 1);
+        let unit = &units[0];
+        assert_eq!(unit.kind, EvidenceKind::Verse);
+        assert_eq!(unit.text, "For God so loved the world.");
+        match &unit.locator {
+            SourceLocator::Canonical { locator } => {
+                assert_eq!(locator.display, "John 3:16");
+                assert_eq!(locator.normalized, "john:3:16");
+                assert!(locator
+                    .backing_selectors
+                    .contains(&BackingSelector::SourceNative {
+                        scheme: "usx".to_string(),
+                        value: "JHN 3:16".to_string(),
+                    }));
+                assert!(locator
+                    .backing_selectors
+                    .contains(&BackingSelector::LineRange { start: 6, end: 7 }));
+            }
+            locator => panic!("expected canonical locator, got {locator:?}"),
+        }
     }
 
     #[test]
@@ -134,6 +180,12 @@ mod tests {
         let parser = parser_for_extension(file.path()).unwrap();
         assert_eq!(parser.name(), "osis");
         assert!(parser_for_extension(std::path::Path::new("source.xml")).is_err());
+    }
+
+    #[test]
+    fn usx_extension_selects_usx_parser() {
+        let parser = parser_for_extension(std::path::Path::new("source.usx")).unwrap();
+        assert_eq!(parser.name(), "usx");
     }
 
     #[test]
