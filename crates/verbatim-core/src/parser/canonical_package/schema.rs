@@ -38,6 +38,8 @@ pub(super) struct Manifest {
     pub(super) validation: Option<Validation>,
     #[serde(default)]
     pub(super) rights: Option<Rights>,
+    #[serde(default)]
+    pub(super) files: Vec<PackageFile>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -287,4 +289,11 @@ pub(super) fn validate_contract(
             ));
         }
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(super) struct PackageFile {
+    pub path: String,
+    pub sha256: String,
+    pub media_type: String,
 }

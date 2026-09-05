@@ -68,7 +68,7 @@ fn canonical_package_parse_exposes_conversion_envelope() {
     );
     assert_eq!(
         conversion.output_hash,
-        "10e35c9b02b6297550a7c4009b2a9620bc9360331b90895d40f0a1bd5963dcdd"
+        "dc3fd5076331c96f1852576cb44b624583750484b46700c4a7e9199019dbee72"
     );
 }
 
@@ -80,7 +80,7 @@ fn canonical_package_rejects_empty_conversion_output() {
     let manifest = fs::read_to_string(fixture("valid").join("manifest.json"))
         .unwrap()
         .replace(
-            "10e35c9b02b6297550a7c4009b2a9620bc9360331b90895d40f0a1bd5963dcdd",
+            "dc3fd5076331c96f1852576cb44b624583750484b46700c4a7e9199019dbee72",
             "",
         );
     fs::write(package.join("manifest.json"), manifest).unwrap();
@@ -152,6 +152,15 @@ fn canonical_package_persists_canon_and_versification_ids() {
             "\"version_id\":\"public-domain\"",
             "\"version_id\":\"public-domain\",\"canon_id\":\"protestant-66/v1\",\"versification_id\":\"protestant-66/v1\"",
         );
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(package.join("manifest.json")).unwrap()).unwrap();
+    manifest["conversion"]["output_hash"] =
+        verbatim_core::types::hex_sha256(units.as_bytes()).into();
+    fs::write(
+        package.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
     fs::write(package.join("units.jsonl"), units).unwrap();
 
     let units = CanonicalPackageParser.parse(&package).unwrap();

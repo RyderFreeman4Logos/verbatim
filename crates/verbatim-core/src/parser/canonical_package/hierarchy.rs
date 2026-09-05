@@ -113,15 +113,15 @@ fn coordinates(values: &[serde_json::Value], note: bool) -> Result<Vec<u32>, &'s
             let value: u32 = component
                 .value
                 .parse()
-                .map_err(|_| "CANONICAL_PACKAGE_ORDINAL_INVALID")?;
+                .map_err(|_| "CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS")?;
+            if index <= 2 && u16::try_from(value).is_err() {
+                return Err("CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS");
+            }
             if value == 0 || value.to_string() != component.value {
                 return Err("CANONICAL_PACKAGE_ORDINAL_INVALID");
             }
             value
         };
-        if component.ordinal != Some(expected) {
-            return Err("CANONICAL_PACKAGE_ORDINAL_INVALID");
-        }
         ordinals.push(expected);
     }
     let book = components
@@ -140,6 +140,13 @@ fn coordinates(values: &[serde_json::Value], note: bool) -> Result<Vec<u32>, &'s
         .ok_or("CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS")?;
     if VersificationRegistry::lookup(book.id, chapter, verse).is_none() {
         return Err("CANONICAL_PACKAGE_REFERENCE_OUT_OF_BOUNDS");
+    }
+    if components
+        .iter()
+        .zip(&ordinals)
+        .any(|(component, expected)| component.ordinal != Some(*expected))
+    {
+        return Err("CANONICAL_PACKAGE_ORDINAL_INVALID");
     }
     if !note {
         ordinals.push(0);

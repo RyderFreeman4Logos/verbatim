@@ -78,3 +78,76 @@ ordered diagnostics with stable `code` and package-relative `location`, and a
 machine-readable SHA-256 `report_hash`. Locations use `file:physical-line` for
 records and `manifest.json:field` for manifest fields. Invalid admission precedes
 `Store::add_source`. Producer validation claims never bypass local checks.
+
+## Files and hashes
+
+The complete layout is `manifest.json`, `units.jsonl`, optional `relations.jsonl`,
+optional `assets/`, and optional `source/`. Unknown root files/directories,
+symlink members, special files and non-UTF-8 names MUST be rejected before member
+content is opened. File names are portable relative paths: no empty/dot/parent
+components, backslashes, colons or control characters.
+
+`manifest.files` is an optional array (default empty) of objects with `path`,
+`sha256` and `media_type`. Every file below `assets/` or `source/` MUST appear
+exactly once; every entry MUST exist as a regular file, have a lowercase SHA-256
+matching its bytes, and have a nonempty `type/subtype` media type. Missing,
+unlisted, duplicate, unsafe or corrupt files are errors. Empty directories have
+no semantic content. Assets are retained package files, never implicit Evidence.
+
+If `original_source.path` is supplied, it MUST point to an inventoried `source/`
+file whose digest equals `original_source_hash`. Without bundled original bytes,
+validation emits `CANONICAL_PACKAGE_SOURCE_NOT_BUNDLED`: the claim is preserved,
+but its digest cannot be verified locally. `conversion.output_hash` MUST equal
+SHA-256 of the exact `units.jsonl` bytes, including whitespace and line endings.
+Converter artifact hashes are declarations of identity, not authenticity proofs.
+
+The package hash covers every regular package file, including source and assets,
+in lexicographic portable-path order. Each file contributes big-endian u64 name
+byte length, UTF-8 name bytes, big-endian u64 content length, and content bytes.
+The report hash is SHA-256 of compact UTF-8 JSON for the report with `report_hash`
+omitted and object keys sorted recursively. Neither hash includes the package's
+absolute directory path. Even invalid reports use the same report-hash rule.
+
+## Warning and migration policy
+
+Warnings are separate from error `diagnostics` and do not make `valid` false.
+A producer `validation.status` of `warnings` emits
+`CANONICAL_PACKAGE_PRODUCER_WARNINGS`; a rights license of `unknown` emits
+`CANONICAL_PACKAGE_RIGHTS_UNKNOWN`. Human and JSON reports include warnings.
+`canonical validate --deny-warnings` returns exit 1 for either errors or warnings;
+the default returns exit 1 only for errors, otherwise 0. `--format json` includes
+the same report hash as human output. Local validation never contacts a daemon.
+
+A multilingual package declares `language: "mul"`; each unit still supplies its
+own nonempty language identifier. Other manifests require exact language matches.
+Relations MUST be unique, and multiple footnotes use distinct note ordinals.
+
+`verbatim canonical migrate legacy.jsonl new-package --manifest identity.json`
+is the compatibility adapter. An identity template supplies `language` and
+`rights`; it may explicitly supply work/edition and registry identifiers. Missing
+work/edition come from the first legacy record. Unknown edition identity is not
+invented. Registry IDs default to the current supported registry; input record
+identity must agree with the completed manifest. Missing unit languages use the
+manifest language, or `und` for a multilingual manifest. Existing record fields,
+metadata and display citations are preserved; no endpoint is inferred from
+presentation text. Legacy generated Evidence IDs are reused unchanged.
+
+The adapter bundles the exact original JSONL as `source/original.jsonl`, hashes
+its own running binary as the converter artifact, and computes output integrity.
+Its provenance starts at this JSONL input; it does not claim to reconstruct an
+unknown upstream EPUB conversion history. It uses a temporary sibling directory
+and publishes only after the shared validator succeeds. The destination MUST be
+absent and owned by the caller throughout migration; existing targets are never
+intentionally replaced. Invalid migration leaves no destination or staging files.
+
+Example identity template (rights must describe the actual input):
+
+```json
+{"language":"en","rights":{"license":"LicenseRef-Private","statement":"Local use only; no redistribution."}}
+```
+
+The public `complete` fixture retains the canonical Bible fixture's fields and
+adds a separately backed synthetic note, a relation and an inventoried asset.
+Private corpora use the same CLI adapter; compare the result against the specific
+input record count and hash. Private source text is not committed. Standalone `.jsonl` parsing and ingest
+remain unchanged, including their original generated IDs and language semantics.

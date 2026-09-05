@@ -1,0 +1,45 @@
+{
+  "schema_version": "1.0.0",
+  "profile": "bible",
+  "content_kind": "text",
+  "work_id": "verbatim-fixture",
+  "version_id": "cc0-1.0",
+  "language": "mul",
+  "original_source_hash": "7c420920719a0d408b47b98032ac30fbed9f22028c001353193baf301723603c",
+  "conversion": {
+    "adapter": "fixture-adapter",
+    "converter": "fixture-converter",
+    "converter_version": "1.0.0",
+    "original_source_hash": "7c420920719a0d408b47b98032ac30fbed9f22028c001353193baf301723603c",
+    "output_hash": "55f29d8ca022d8c99970114145cee3779214c5a9f8a6b04cb261ed30c6741b27"
+  },
+  "canon_id": "protestant-66/v1",
+  "versification_id": "protestant-66/v1",
+  "original_source": {
+    "format": "canonical-jsonl",
+    "name": "canonical_bible_with_synthetic_note.jsonl",
+    "path": "source/original.jsonl"
+  },
+  "converter_artifact_hash": "4280f654c0e3f14b1cc2fc1762c9353bc3106ceaf39f7d5dd963c60088499a2b",
+  "validation": {
+    "status": "passed",
+    "validator": "fixture-validator",
+    "version": "1.0.0"
+  },
+  "rights": {
+    "license": "CC0-1.0",
+    "statement": "Synthetic fixture; public-domain quotation."
+  },
+  "files": [
+    {
+      "path": "source/original.jsonl",
+      "sha256": "7c420920719a0d408b47b98032ac30fbed9f22028c001353193baf301723603c",
+      "media_type": "application/x-ndjson"
+    },
+    {
+      "path": "assets/illustration.txt",
+      "sha256": "e4e54af2063cdae45f666109cfe06972bb3d1a41881fe5c8fb1096e8ea267315",
+      "media_type": "text/plain"
+    }
+  ]
+}

@@ -10502,6 +10502,15 @@ model = "local-vision"
                     format!("{unit}\n")
                 })
                 .collect::<String>();
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(package.join("manifest.json")).unwrap())
+                    .unwrap();
+            manifest["conversion"]["output_hash"] = hex_sha256(text.as_bytes()).into();
+            std::fs::write(
+                package.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
             std::fs::write(package.join("units.jsonl"), text).unwrap();
         };
         write_units(original);

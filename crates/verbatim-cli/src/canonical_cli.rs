@@ -13,11 +13,24 @@ pub(super) enum CanonicalCommand {
         #[arg(long, value_enum)]
         format: Option<CanonicalFormat>,
     },
+    /// Convert legacy JSONL into a new, validated package; preserve the original bytes.
+    Migrate {
+        input: PathBuf,
+        destination: PathBuf,
+        #[arg(long, value_name = "IDENTITY_JSON")]
+        manifest: PathBuf,
+        #[arg(long, value_enum)]
+        format: Option<CanonicalFormat>,
+    },
+    /// Validate a package locally before ingestion, including all inventoried files.
     Validate {
         #[arg(value_name = "PACKAGE")]
         package: PathBuf,
         #[arg(long, value_enum)]
         format: Option<CanonicalFormat>,
+        /// Return nonzero for warnings as well as errors.
+        #[arg(long)]
+        deny_warnings: bool,
     },
 }
 
@@ -57,40 +70,71 @@ pub(super) fn run<W: Write>(command: CanonicalCommand, stdout: &mut W) -> Result
             }
             Ok(if report.valid { 0 } else { 1 })
         }
-        CanonicalCommand::Validate { package, format } => {
+        CanonicalCommand::Migrate {
+            input,
+            destination,
+            manifest,
+            format,
+        } => {
+            let report = verbatim_core::parser::canonical_package::migrate_legacy_jsonl(
+                &input,
+                &manifest,
+                &destination,
+            )
+            .map_err(|error| CliError::Api(error.to_string()))?;
+            write_package_report(&report, format, false, stdout)
+        }
+        CanonicalCommand::Validate {
+            package,
+            format,
+            deny_warnings,
+        } => {
             let report = verbatim_core::parser::canonical_package::validate_package(&package);
-            match format.unwrap_or(CanonicalFormat::Human) {
-                CanonicalFormat::Json => writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::to_string(&report)
-                        .map_err(|error| CliError::Api(error.to_string()))?
-                )
-                .map_err(CliError::Io)?,
-                CanonicalFormat::Human => {
-                    writeln!(stdout, "valid: {}", report.valid).map_err(CliError::Io)?;
-                    writeln!(
-                        stdout,
-                        "schema_version: {}",
-                        report.schema_version.as_deref().unwrap_or("unknown")
-                    )
-                    .map_err(CliError::Io)?;
-                    writeln!(stdout, "unit_count: {}", report.unit_count).map_err(CliError::Io)?;
-                    for diagnostic in &report.diagnostics {
-                        writeln!(
-                            stdout,
-                            "{} {}: {}",
-                            diagnostic.code, diagnostic.location, diagnostic.message
-                        )
-                        .map_err(CliError::Io)?;
-                    }
-                    writeln!(stdout, "report_hash: {}", report.report_hash)
-                        .map_err(CliError::Io)?;
-                }
-            }
-            Ok(if report.valid { 0 } else { 1 })
+            write_package_report(&report, format, deny_warnings, stdout)
         }
     }
+}
+
+fn write_package_report<W: Write>(
+    report: &verbatim_core::parser::canonical_package::CanonicalPackageReport,
+    format: Option<CanonicalFormat>,
+    deny_warnings: bool,
+    stdout: &mut W,
+) -> Result<u8, CliError> {
+    match format.unwrap_or(CanonicalFormat::Human) {
+        CanonicalFormat::Json => writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string(&report).map_err(|error| CliError::Api(error.to_string()))?
+        )
+        .map_err(CliError::Io)?,
+        CanonicalFormat::Human => {
+            writeln!(stdout, "valid: {}", report.valid).map_err(CliError::Io)?;
+            writeln!(
+                stdout,
+                "schema_version: {}",
+                report.schema_version.as_deref().unwrap_or("unknown")
+            )
+            .map_err(CliError::Io)?;
+            writeln!(stdout, "unit_count: {}", report.unit_count).map_err(CliError::Io)?;
+            for diagnostic in report.diagnostics.iter().chain(&report.warnings) {
+                writeln!(
+                    stdout,
+                    "{} {}: {}",
+                    diagnostic.code, diagnostic.location, diagnostic.message
+                )
+                .map_err(CliError::Io)?;
+            }
+            writeln!(stdout, "report_hash: {}", report.report_hash).map_err(CliError::Io)?;
+        }
+    }
+    Ok(
+        if report.valid && (!deny_warnings || report.warnings.is_empty()) {
+            0
+        } else {
+            1
+        },
+    )
 }
 
 #[cfg(test)]
@@ -110,6 +154,7 @@ mod tests {
                 CanonicalCommand::Validate {
                     package: package.clone(),
                     format: None,
+                    deny_warnings: false,
                 },
                 &mut output,
             )
@@ -124,6 +169,7 @@ mod tests {
                 CanonicalCommand::Validate {
                     package,
                     format: Some(CanonicalFormat::Json),
+                    deny_warnings: false,
                 },
                 &mut output,
             )
@@ -142,6 +188,70 @@ mod tests {
             report["units"][0]["locator"]["backing_selectors"][0]["type"],
             "SourceNative"
         );
+    }
+
+    #[test]
+    fn canonical_validate_cli_warning_policy_and_migration_command() {
+        use clap::FromArgMatches;
+        let package = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../verbatim-core/tests/fixtures/canonical_package/valid");
+        let matches = CanonicalCommand::augment_subcommands(clap::Command::new("canonical"))
+            .try_get_matches_from([
+                "canonical",
+                "validate",
+                package.to_str().unwrap(),
+                "--deny-warnings",
+                "--format",
+                "json",
+            ])
+            .expect("warning policy must be exposed");
+        let command = CanonicalCommand::from_arg_matches(&matches).unwrap();
+        let mut output = Vec::new();
+        assert_eq!(run(command, &mut output).unwrap(), 1);
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(report["valid"], true);
+        assert_eq!(
+            report["warnings"][0]["code"],
+            "CANONICAL_PACKAGE_SOURCE_NOT_BUNDLED"
+        );
+    }
+
+    #[test]
+    fn canonical_package_cli_migration_is_exposed() {
+        assert!(
+            CanonicalCommand::augment_subcommands(clap::Command::new("canonical"))
+                .try_get_matches_from([
+                    "canonical",
+                    "migrate",
+                    "legacy.jsonl",
+                    "new-package",
+                    "--manifest",
+                    "identity.json"
+                ])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn canonical_validate_cli_errors_have_locations_and_nonzero_exit() {
+        let package = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../verbatim-core/tests/fixtures/canonical_package/invalid-text-hash");
+        let mut output = Vec::new();
+        assert_eq!(
+            run(
+                CanonicalCommand::Validate {
+                    package,
+                    format: None,
+                    deny_warnings: false
+                },
+                &mut output
+            )
+            .unwrap(),
+            1
+        );
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("CANONICAL_PACKAGE_TEXT_HASH_MISMATCH units.jsonl:1"));
+        assert!(text.contains("report_hash:"));
     }
 
     #[test]
