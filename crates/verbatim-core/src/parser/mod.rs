@@ -23,11 +23,33 @@ pub mod usx;
 #[cfg(test)]
 mod round_trip_tests;
 
+use std::io::Read;
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::traits::Parser;
+
+pub(crate) const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) fn read_bounded_source<R: Read>(
+    reader: R,
+    format: &str,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_SOURCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {format} source {}", path.display()))?;
+    if bytes.len() > MAX_SOURCE_BYTES {
+        bail!(
+            "{format}_SOURCE_TOO_LARGE: source exceeds {MAX_SOURCE_BYTES} bytes on line 1 of {}",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
 
 pub fn select_parser(name: &str) -> Result<Box<dyn Parser>> {
     match name {
@@ -84,7 +106,7 @@ pub fn parser_for_extension(path: &Path) -> Result<Box<dyn Parser>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parser_for_extension, select_parser};
+    use super::{parser_for_extension, select_parser, MAX_SOURCE_BYTES};
     use crate::types::{BackingSelector, EvidenceKind, SourceLocator};
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -113,9 +135,35 @@ mod tests {
 </usx>
 "#;
 
+    const ONE_USFM_VERSE: &str = r#"\id JHN
+\c 3
+\v 16 For God so loved the world.
+"#;
+
+    const ONE_USJ_VERSE: &str = r#"{
+  "type": "USJ",
+  "version": "3.1",
+  "content": [
+    {"type": "book", "marker": "id", "code": "JHN", "content": ["John"]},
+    {"type": "chapter", "marker": "c", "number": "3", "sid": "JHN 3"},
+    {"type": "para", "marker": "p", "content": [
+      {"type": "verse", "marker": "v", "number": "16", "sid": "JHN 3:16"},
+      "For God so loved the world."
+    ]}
+  ]
+}
+"#;
+
     fn fixture(contents: &str) -> NamedTempFile {
         let mut file = NamedTempFile::with_suffix(".osis").unwrap();
         file.write_all(contents.as_bytes()).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    fn structured_fixture(contents: &[u8], suffix: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::with_suffix(suffix).unwrap();
+        file.write_all(contents).unwrap();
         file.flush().unwrap();
         file
     }
@@ -192,6 +240,50 @@ mod tests {
     fn usx_extension_selects_usx_parser() {
         let parser = parser_for_extension(std::path::Path::new("source.usx")).unwrap();
         assert_eq!(parser.name(), "usx");
+    }
+
+    #[test]
+    fn structured_bible_parsers_reject_oversize_sources_without_partial_units() {
+        let oversized_len = MAX_SOURCE_BYTES
+            .checked_add(1)
+            .expect("source bound should fit in usize");
+        for (name, suffix) in [("usfm", ".usfm"), ("usx", ".usx"), ("usj", ".usj")] {
+            let file = NamedTempFile::with_suffix(suffix).unwrap();
+            file.as_file().set_len(oversized_len as u64).unwrap();
+            let parser = select_parser(name).unwrap();
+            let error = parser.parse(file.path()).unwrap_err().to_string();
+
+            assert!(
+                error.contains(&format!("{}_SOURCE_TOO_LARGE", name.to_ascii_uppercase())),
+                "{error}"
+            );
+            assert!(
+                error.contains(&file.path().display().to_string()),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_bible_parsers_stream_small_fixtures_through_existing_parsers() {
+        let fixtures = [
+            ("usfm", ".usfm", ONE_USFM_VERSE.as_bytes()),
+            ("usx", ".usx", ONE_USX_VERSE.as_bytes()),
+            ("usj", ".usj", ONE_USJ_VERSE.as_bytes()),
+        ];
+        for (name, suffix, contents) in fixtures {
+            let file = structured_fixture(contents, suffix);
+            let parser = select_parser(name).unwrap();
+            let units = parser.parse(file.path()).unwrap();
+
+            assert_eq!(units.len(), 1, "{name}");
+            assert_eq!(units[0].kind, EvidenceKind::Verse, "{name}");
+            let SourceLocator::Canonical { locator } = &units[0].locator else {
+                panic!("expected canonical locator for {name}");
+            };
+            assert_eq!(locator.display, "John 3:16", "{name}");
+            assert_eq!(locator.normalized, "john:3:16", "{name}");
+        }
     }
 
     #[test]

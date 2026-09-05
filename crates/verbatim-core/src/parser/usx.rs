@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use quick_xml::Reader;
+
+use super::read_bounded_source;
 
 use crate::profiles::bible::canon_registry::{CanonBook, CanonRegistry, VERSION as CANON_VERSION};
 use crate::profiles::bible::versification_registry::{
@@ -20,7 +21,6 @@ use crate::types::{
 
 const SOURCE_NATIVE_SCHEME: &str = "usx";
 const WORK_ID: &str = "USX";
-const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[path = "usx_xml.rs"]
 mod usx_xml;
@@ -48,16 +48,7 @@ impl Parser for UsxParser {
     fn parse(&self, path: &Path) -> Result<Vec<EvidenceUnit>> {
         let file = fs::File::open(path)
             .with_context(|| format!("failed to read USX source {}", path.display()))?;
-        let mut bytes = Vec::new();
-        file.take(MAX_SOURCE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("failed to read USX source {}", path.display()))?;
-        if bytes.len() as u64 > MAX_SOURCE_BYTES {
-            bail!(
-                "USX_SOURCE_TOO_LARGE: source exceeds {MAX_SOURCE_BYTES} bytes on line 1 of {}",
-                path.display()
-            );
-        }
+        let bytes = read_bounded_source(file, "USX", path)?;
         parse_bytes(&bytes, path)
     }
 }
