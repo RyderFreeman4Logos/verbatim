@@ -46,11 +46,16 @@ struct VerseData {
     sid: String,
     source_span: SourceSpan,
     text: String,
+    notes: Vec<ParsedNote>,
 }
 
 #[path = "usj_spans.rs"]
 mod usj_spans;
 use usj_spans::{line_at, SourceScan, SourceSpan};
+
+#[path = "usj_notes.rs"]
+mod usj_notes;
+use usj_notes::{parse_note, ParsedNote};
 
 fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
     let source = std::str::from_utf8(bytes).map_err(|error| {
@@ -154,11 +159,12 @@ fn parse_bytes(bytes: &[u8], path: &Path) -> Result<Vec<EvidenceUnit>> {
         );
     }
 
-    verses
-        .into_iter()
-        .enumerate()
-        .map(|(position, verse)| evidence_unit(verse, &scan, path, position))
-        .collect()
+    let mut units = Vec::new();
+    let mut position = 0;
+    for verse in verses {
+        units.extend(evidence_units(verse, &scan, path, &mut position)?);
+    }
+    Ok(units)
 }
 
 fn parse_book(
@@ -332,6 +338,7 @@ fn parse_para(
                         }
                     }
                     "char" => append_char(item, &mut open, scan, node_line, path)?,
+                    "note" => parse_note(item, &mut open, scan, node_line, path)?,
                     _ => {
                         bail!(
                             "USJ_UNKNOWN_CRITICAL: unsupported node type `{node_type}` on line {node_line} of {}",
@@ -377,6 +384,9 @@ fn append_content(
         }
         Value::Object(node) if node_type(node) == Some("char") => {
             append_char(item, open, scan, line, path)
+        }
+        Value::Object(node) if node_type(node) == Some("note") => {
+            parse_note(item, open, scan, line, path)
         }
         Value::Object(node) => {
             let node_type = node_type(node).unwrap_or("<missing>");
@@ -486,6 +496,7 @@ fn start_verse(
         sid: sid.to_string(),
         source_span: scan.span(node, line, path)?,
         text: String::new(),
+        notes: Vec::new(),
     })
 }
 
@@ -507,12 +518,12 @@ fn finish_verse(
     Ok(())
 }
 
-fn evidence_unit(
+fn evidence_units(
     verse: VerseData,
     scan: &SourceScan<'_>,
     path: &Path,
-    position: usize,
-) -> Result<EvidenceUnit> {
+    position: &mut usize,
+) -> Result<Vec<EvidenceUnit>> {
     let source_id = SourceId::from_path(path);
     let components = vec![
         ReferenceComponent {
@@ -556,19 +567,54 @@ fn evidence_unit(
             end: line_end,
         },
     ];
-    Ok(EvidenceUnit {
-        id: EvidenceId(format!("{}:usj:n{position}", source_id.0)),
-        source_id,
+    let verse_position = *position;
+    *position += 1;
+    let verse_id = EvidenceId(format!("{}:usj:n{verse_position}", source_id.0));
+    let verse_text = verse.text;
+    let mut units = vec![EvidenceUnit {
+        id: verse_id.clone(),
+        source_id: source_id.clone(),
         kind: EvidenceKind::Verse,
         derived_from: None,
-        locator: SourceLocator::Canonical { locator },
-        text_hash: hex_sha256(verse.text.as_bytes()),
-        text: verse.text,
+        locator: SourceLocator::Canonical {
+            locator: locator.clone(),
+        },
+        text_hash: hex_sha256(verse_text.as_bytes()),
+        text: verse_text,
         heading_path: Vec::new(),
         language: None,
-        position: position as u32,
+        position: verse_position as u32,
         annotations: BTreeMap::new(),
-    })
+    }];
+    for note in verse.notes {
+        let note_position = *position;
+        *position += 1;
+        let (note_line_start, note_line_end) = scan.line_range(note.source_span, path)?;
+        let mut note_locator = locator.clone();
+        note_locator.display = format!("{} note {note_position}", note_locator.display);
+        note_locator.backing_selectors = vec![BackingSelector::LineRange {
+            start: note_line_start,
+            end: note_line_end,
+        }];
+        let mut annotations = BTreeMap::new();
+        annotations.insert("note_type".to_string(), note.note_type.to_string());
+        units.push(EvidenceUnit {
+            id: EvidenceId(format!("{}:usj:n{note_position}", source_id.0)),
+            source_id: source_id.clone(),
+            kind: EvidenceKind::Footnote,
+            derived_from: Some(verse_id.clone()),
+            locator: SourceLocator::Canonical {
+                locator: note_locator,
+            },
+            text_hash: hex_sha256(note.text.as_bytes()),
+            text: note.text,
+            heading_path: Vec::new(),
+            language: None,
+            position: note_position as u32,
+            annotations,
+        });
+    }
+    Ok(units)
 }
 
 fn node_type(object: &Map<String, Value>) -> Option<&str> {
