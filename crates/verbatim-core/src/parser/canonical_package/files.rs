@@ -1,13 +1,70 @@
 //! Package-relative inventory and byte-integrity checks. Never follow member symlinks.
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path};
 
 use super::{
     diagnostic, schema::sha256, CanonicalPackageDiagnostic, Manifest, MANIFEST, RELATIONS, UNITS,
 };
-use crate::types::hex_sha256;
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+#[path = "files_tests.rs"]
+mod tests;
+
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
+
+fn update_reader(
+    reader: &mut impl Read,
+    hasher: &mut Sha256,
+    expected_len: u64,
+    length_framed: bool,
+) -> Result<()> {
+    if length_framed {
+        hasher.update(expected_len.to_be_bytes());
+    }
+    let mut buffer = [0; HASH_BUFFER_BYTES];
+    let mut actual_len = 0_u64;
+    loop {
+        let remaining = expected_len.saturating_sub(actual_len).saturating_add(1);
+        let request = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = reader.read(&mut buffer[..request])?;
+        if read == 0 {
+            break;
+        }
+        actual_len = actual_len
+            .checked_add(read as u64)
+            .context("hashed file length overflow")?;
+        hasher.update(&buffer[..read]);
+        if actual_len > expected_len {
+            break;
+        }
+    }
+    if actual_len != expected_len {
+        bail!("file size changed while hashing: expected {expected_len} bytes, read {actual_len}");
+    }
+    Ok(())
+}
+
+fn update_file(path: &Path, hasher: &mut Sha256, length_framed: bool) -> Result<()> {
+    let mut file = fs::File::open(path)?;
+    let expected_len = file.metadata()?.len();
+    update_reader(&mut file, hasher, expected_len, length_framed)
+}
+
+pub(super) fn sha256_file(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    update_file(path, &mut hasher, false)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub(super) fn update_framed_hash(path: &Path, hasher: &mut Sha256) -> Result<()> {
+    update_file(path, hasher, true)
+}
 
 fn safe_path(value: &str) -> bool {
     !value.is_empty()
@@ -108,8 +165,8 @@ pub(super) fn validate(
             ));
             continue;
         }
-        match fs::read(root.join(&file.path)) {
-            Ok(bytes) if hex_sha256(&bytes) == file.sha256 => {}
+        match sha256_file(&root.join(&file.path)) {
+            Ok(hash) if hash == file.sha256 => {}
             Ok(_) => diagnostics.push(diagnostic(
                 "CANONICAL_PACKAGE_FILE_HASH_MISMATCH",
                 &file.path,
@@ -154,8 +211,8 @@ pub(super) fn validate(
             ));
         }
     }
-    if let (Some(conversion), Ok(bytes)) = (&manifest.conversion, fs::read(root.join(UNITS))) {
-        if conversion.output_hash != hex_sha256(&bytes) {
+    if let (Some(conversion), Ok(hash)) = (&manifest.conversion, sha256_file(&root.join(UNITS))) {
+        if conversion.output_hash != hash {
             diagnostics.push(diagnostic(
                 "CANONICAL_PACKAGE_OUTPUT_HASH_MISMATCH",
                 UNITS,

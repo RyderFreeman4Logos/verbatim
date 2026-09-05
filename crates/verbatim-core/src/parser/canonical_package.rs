@@ -340,12 +340,10 @@ pub fn package_hash(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
     let names = files::names(path)?;
     for name in names {
-        let bytes =
-            fs::read(path.join(&name)).with_context(|| format!("read package file {name}"))?;
         hasher.update((name.len() as u64).to_be_bytes());
         hasher.update(name.as_bytes());
-        hasher.update((bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
+        files::update_framed_hash(&path.join(&name), &mut hasher)
+            .with_context(|| format!("read package file {name}"))?;
     }
     Ok(format!("{:x}", hasher.finalize()))
 }

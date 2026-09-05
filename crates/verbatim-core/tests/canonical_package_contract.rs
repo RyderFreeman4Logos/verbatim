@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use verbatim_core::config::Config;
 use verbatim_core::ingest::IngestPipeline;
 use verbatim_core::parser::canonical_package::{validate_package, CanonicalPackageParser};
@@ -276,6 +277,60 @@ fn canonical_package_asset_bytes_bind_package_and_report_hashes() {
     let after = validate_package(&path);
     assert_ne!(before.package_hash, after.package_hash);
     assert_ne!(before.report_hash, after.report_hash);
+}
+
+#[test]
+fn canonical_package_streams_declared_and_undeclared_members_compatibly() {
+    fn whole_file_hash(path: &Path, names: &[&str]) -> String {
+        let mut hasher = Sha256::new();
+        for name in names {
+            let bytes = fs::read(path.join(name)).unwrap();
+            hasher.update((name.len() as u64).to_be_bytes());
+            hasher.update(name.as_bytes());
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let path = bundled_package(root.path());
+    let bytes = vec![b'x'; 2 * 64 * 1024 + 17];
+    fs::write(path.join("assets/note.txt"), &bytes).unwrap();
+    edit_manifest(&path, |manifest| {
+        manifest["files"][1]["sha256"] = json!(hex_sha256(&bytes));
+    });
+
+    let declared = validate_package(&path);
+    assert!(declared.valid, "{:?}", declared.diagnostics);
+    let expected = whole_file_hash(
+        &path,
+        &[
+            "assets/note.txt",
+            "manifest.json",
+            "source/original.usfm",
+            "units.jsonl",
+        ],
+    );
+    assert_eq!(declared.package_hash.as_deref(), Some(expected.as_str()));
+
+    fs::write(path.join("assets/extra.bin"), &bytes).unwrap();
+    let undeclared = validate_package(&path);
+    assert!(undeclared.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "CANONICAL_PACKAGE_FILE_UNDECLARED"
+            && diagnostic.location == "assets/extra.bin"
+    }));
+    let expected = whole_file_hash(
+        &path,
+        &[
+            "assets/extra.bin",
+            "assets/note.txt",
+            "manifest.json",
+            "source/original.usfm",
+            "units.jsonl",
+        ],
+    );
+    assert_eq!(undeclared.package_hash.as_deref(), Some(expected.as_str()));
 }
 
 #[test]

@@ -1,16 +1,18 @@
 //! Lossless legacy record adapter. The legacy parser remains the evidence-ID authority.
 use std::fs;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
-use super::{validate_package, CanonicalPackageReport, MANIFEST, UNITS};
+use super::{files, validate_package, CanonicalPackageReport, MANIFEST, UNITS};
 use crate::parser::canonical_jsonl::CanonicalJsonlParser;
 use crate::profiles::bible::canon_registry::VERSION as CANON_VERSION;
 use crate::profiles::bible::versification_registry::VERSION as VERSIFICATION_VERSION;
 use crate::traits::Parser;
-use crate::types::{hex_sha256, SourceLocator};
+use crate::types::SourceLocator;
 
 /// Adapt legacy JSONL to a new package, preserving raw input and existing evidence IDs.
 ///
@@ -47,15 +49,32 @@ pub fn migrate_legacy_jsonl(
         .and_then(Value::as_str)
         .context("manifest language must be a string")?
         .to_owned();
-    let source_bytes = fs::read(input)?;
-    let source_hash = hex_sha256(&source_bytes);
-    let mut output = String::new();
-    for (line, evidence) in std::str::from_utf8(&source_bytes)?
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .zip(&units)
-    {
-        let mut record: Value = serde_json::from_str(line)?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let staged = tempfile::Builder::new()
+        .prefix(".verbatim-package-")
+        .tempdir_in(parent)?;
+    fs::create_dir(staged.path().join("source"))?;
+    let bundled_source = staged.path().join("source/original.jsonl");
+    std::io::copy(
+        &mut fs::File::open(input)?,
+        &mut fs::File::create(&bundled_source)?,
+    )?;
+    let source_hash = files::sha256_file(&bundled_source)?;
+
+    let output_path = staged.path().join(UNITS);
+    let mut output = BufWriter::new(fs::File::create(&output_path)?);
+    let mut output_hasher = Sha256::new();
+    let mut evidence = units.iter();
+    for line in BufReader::new(fs::File::open(&bundled_source)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let evidence = evidence.next().context("legacy unit count changed")?;
+        let mut record: Value = serde_json::from_str(&line)?;
         let fields = record
             .as_object_mut()
             .context("legacy unit must be an object")?;
@@ -76,10 +95,19 @@ pub fn migrate_legacy_jsonl(
         fields
             .entry("language")
             .or_insert_with(|| json!(if language == "mul" { "und" } else { &language }));
-        output.push_str(&serde_json::to_string(&record)?);
-        output.push('\n');
+        let bytes = serde_json::to_vec(&record)?;
+        output.write_all(&bytes)?;
+        output.write_all(b"\n")?;
+        output_hasher.update(&bytes);
+        output_hasher.update(b"\n");
     }
-    let converter_artifact_hash = hex_sha256(&fs::read(std::env::current_exe()?)?);
+    if evidence.next().is_some() {
+        bail!("legacy unit count changed");
+    }
+    output.flush()?;
+    drop(output);
+    let output_hash = format!("{:x}", output_hasher.finalize());
+    let converter_artifact_hash = files::sha256_file(&std::env::current_exe()?)?;
     object.insert("schema_version".into(), json!("1.0.0"));
     object.insert("profile".into(), json!(locator.profile_id));
     object.insert("content_kind".into(), json!("text"));
@@ -95,19 +123,9 @@ pub fn migrate_legacy_jsonl(
         "converter_artifact_hash".into(),
         json!(converter_artifact_hash),
     );
-    object.insert("conversion".into(), json!({"adapter":"legacy-canonical-jsonl", "converter":"verbatim.canonical.migrate", "converter_version":env!("CARGO_PKG_VERSION"), "original_source_hash":source_hash, "output_hash":hex_sha256(output.as_bytes())}));
+    object.insert("conversion".into(), json!({"adapter":"legacy-canonical-jsonl", "converter":"verbatim.canonical.migrate", "converter_version":env!("CARGO_PKG_VERSION"), "original_source_hash":source_hash, "output_hash":output_hash}));
     object.insert("validation".into(), json!({"status":"passed", "validator":"verbatim.canonical.validate", "version":env!("CARGO_PKG_VERSION")}));
     object.insert("files".into(), json!([{"path":"source/original.jsonl", "sha256":source_hash, "media_type":"application/x-ndjson"}]));
-    let parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let staged = tempfile::Builder::new()
-        .prefix(".verbatim-package-")
-        .tempdir_in(parent)?;
-    fs::create_dir(staged.path().join("source"))?;
-    fs::write(staged.path().join("source/original.jsonl"), &source_bytes)?;
-    fs::write(staged.path().join(UNITS), output)?;
     fs::write(
         staged.path().join(MANIFEST),
         serde_json::to_vec_pretty(&manifest)?,
