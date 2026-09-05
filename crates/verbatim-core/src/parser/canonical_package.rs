@@ -1,3 +1,9 @@
+//! Canonical package admission and parsing share this validator. See the v1 normative schema.
+
+mod hierarchy;
+mod schema;
+
+use schema::{registry_ids, validate_manifest, Manifest, Unit};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -9,10 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::parser::canonical_jsonl::{evidence_kind_from_content_kind, CanonicalJsonlParser};
 use crate::parser::canonical_package_conversion::validate_conversion;
-use crate::profiles::bible::canon_registry::{CanonRegistry, VERSION as CANON_VERSION};
-use crate::profiles::bible::versification_registry::{
-    VersificationRegistry, VERSION as VERSIFICATION_VERSION,
-};
+use crate::profiles::bible::canon_registry::CanonRegistry;
+use crate::profiles::bible::versification_registry::VersificationRegistry;
 use crate::traits::Parser;
 use crate::types::{
     hex_sha256, BackingSelector, CanonicalLocator, DerivedConversionMetadata, EvidenceId,
@@ -22,7 +26,6 @@ use crate::types::{
 const MANIFEST: &str = "manifest.json";
 const UNITS: &str = "units.jsonl";
 const RELATIONS: &str = "relations.jsonl";
-const SUPPORTED_MAJOR: u64 = 1;
 const USFM_SOURCE_NATIVE_SCHEME: &str = "usfm";
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +46,8 @@ pub struct CanonicalPackageReport {
     pub units: Vec<CanonicalPackageUnitReport>,
     pub diagnostics: Vec<CanonicalPackageDiagnostic>,
     pub report_hash: String,
+    /// Complete declared provenance, rights and validation claim (not independent attestation).
+    pub manifest: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,58 +56,6 @@ pub struct CanonicalPackageUnitReport {
     pub original_source_hash: Option<String>,
     pub conversion: Option<DerivedConversionMetadata>,
     pub text_hash: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct Manifest {
-    #[serde(default)]
-    schema_version: String,
-    #[serde(default)]
-    profile: String,
-    #[serde(default)]
-    content_kind: String,
-    #[serde(default)]
-    work_id: String,
-    #[serde(default)]
-    version_id: String,
-    #[serde(default)]
-    canon_id: Option<String>,
-    #[serde(default)]
-    versification_id: Option<String>,
-    #[serde(default)]
-    language: String,
-    #[serde(default)]
-    original_source_hash: Option<String>,
-    #[serde(default)]
-    conversion: Option<DerivedConversionMetadata>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct Unit {
-    #[serde(default)]
-    unit_id: String,
-    #[serde(default)]
-    source_profile: String,
-    #[serde(default)]
-    work_id: String,
-    #[serde(default)]
-    version_id: String,
-    #[serde(default)]
-    canon_id: Option<String>,
-    #[serde(default)]
-    versification_id: Option<String>,
-    #[serde(default)]
-    language: String,
-    #[serde(default)]
-    components: Vec<serde_json::Value>,
-    #[serde(default)]
-    text: String,
-    #[serde(default)]
-    content_kind: String,
-    #[serde(default)]
-    text_hash: Option<String>,
-    #[serde(default)]
-    backing_selectors: Vec<BackingSelector>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,7 +94,7 @@ impl Parser for CanonicalPackageParser {
                 diagnostic.message
             );
         }
-        let mut units = CanonicalJsonlParser.parse(&path.join(UNITS))?;
+        let mut units = parse_units(path)?;
         let manifest = read_manifest(path)?;
         let (canon_id, versification_id) = registry_ids(&manifest);
         let unit_ids = package_unit_ids(&path.join(UNITS))?;
@@ -197,7 +150,9 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
     };
     validate_manifest(&manifest, &mut diagnostics);
     validate_conversion(manifest.conversion.as_ref(), &mut diagnostics);
+    schema::validate_contract(&manifest, &mut diagnostics);
 
+    let mut ordering = hierarchy::Ordering::default();
     let mut unit_count = 0;
     let mut unit_id_locations = HashMap::new();
     let mut unit_content_kinds = HashMap::new();
@@ -221,6 +176,7 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
                 match serde_json::from_str::<Unit>(&line) {
                     Ok(unit) => {
                         validate_unit(&unit, &manifest, &location, &mut diagnostics);
+                        ordering.validate(&unit, &location, &mut diagnostics);
                         validate_unit_id(
                             &unit,
                             &location,
@@ -240,7 +196,7 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
         Err(error) => diagnostics.push(diagnostic("CANONICAL_PACKAGE_UNITS_MISSING", UNITS, error)),
     }
     validate_relation_endpoints(path, &unit_content_kinds, &mut diagnostics);
-    let units = match CanonicalJsonlParser.parse(&units_path) {
+    let units = match parse_units(path) {
         Ok(units) => {
             let (canon_id, versification_id) = registry_ids(&manifest);
             units
@@ -281,9 +237,10 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
             message: "units.jsonl must contain at least one unit".into(),
         });
     }
+    let manifest_value = serde_json::to_value(&manifest).expect("manifest serializes");
     let valid = diagnostics.is_empty();
     let package_hash = package_hash(path).ok();
-    let payload = serde_json::json!({"valid": valid, "schema_version": manifest.schema_version, "unit_count": unit_count, "package_hash": package_hash, "original_source_hash": manifest.original_source_hash, "conversion": manifest.conversion, "units": units, "diagnostics": diagnostics});
+    let payload = serde_json::json!({"valid": valid, "schema_version": manifest.schema_version, "unit_count": unit_count, "package_hash": package_hash, "original_source_hash": manifest.original_source_hash, "conversion": manifest.conversion, "units": units, "diagnostics": diagnostics, "manifest": manifest_value});
     let report_hash = hex_sha256(
         serde_json::to_string(&payload)
             .expect("report serializes")
@@ -299,6 +256,7 @@ pub fn validate_package(path: &Path) -> CanonicalPackageReport {
         units,
         diagnostics,
         report_hash,
+        manifest: manifest_value,
     }
 }
 
@@ -437,96 +395,6 @@ fn read_manifest(path: &Path) -> Result<Manifest> {
     serde_json::from_str(&contents).context("parse canonical package manifest")
 }
 
-fn registry_ids(manifest: &Manifest) -> (&str, &str) {
-    (
-        manifest.canon_id.as_deref().unwrap_or(CANON_VERSION),
-        manifest
-            .versification_id
-            .as_deref()
-            .unwrap_or(VERSIFICATION_VERSION),
-    )
-}
-
-fn validate_manifest(manifest: &Manifest, diagnostics: &mut Vec<CanonicalPackageDiagnostic>) {
-    for (field, value) in [
-        ("schema_version", &manifest.schema_version),
-        ("profile", &manifest.profile),
-        ("content_kind", &manifest.content_kind),
-        ("work_id", &manifest.work_id),
-        ("version_id", &manifest.version_id),
-        ("language", &manifest.language),
-    ] {
-        if value.trim().is_empty() {
-            diagnostics.push(CanonicalPackageDiagnostic {
-                code: "CANONICAL_PACKAGE_MANIFEST_REQUIRED_FIELD",
-                location: format!("{MANIFEST}:{field}"),
-                message: format!("{field} is required"),
-            });
-        }
-    }
-    let (canon_id, versification_id) = registry_ids(manifest);
-    if canon_id != CANON_VERSION {
-        diagnostics.push(CanonicalPackageDiagnostic {
-            code: "CANONICAL_PACKAGE_CANON_UNKNOWN",
-            location: format!("{MANIFEST}:canon_id"),
-            message: format!("unknown canon_id {canon_id}"),
-        });
-    }
-    if VersificationRegistry::by_id(versification_id).is_none() {
-        diagnostics.push(CanonicalPackageDiagnostic {
-            code: "CANONICAL_PACKAGE_VERSIFICATION_UNKNOWN",
-            location: format!("{MANIFEST}:versification_id"),
-            message: format!("unknown versification_id {versification_id}"),
-        });
-    } else if !VersificationRegistry::compatible_with_canon(canon_id) {
-        diagnostics.push(CanonicalPackageDiagnostic {
-            code: "CANONICAL_PACKAGE_VERSIFICATION_CANON_MISMATCH",
-            location: format!("{MANIFEST}:versification_id"),
-            message: format!(
-                "versification_id {versification_id} is incompatible with canon_id {canon_id}"
-            ),
-        });
-    }
-    match manifest
-        .schema_version
-        .split('.')
-        .next()
-        .and_then(|major| major.parse::<u64>().ok())
-    {
-        Some(SUPPORTED_MAJOR) if is_supported_schema_version(&manifest.schema_version) => {}
-        Some(SUPPORTED_MAJOR) => diagnostics.push(CanonicalPackageDiagnostic {
-            code: "CANONICAL_PACKAGE_SCHEMA_VERSION_INVALID",
-            location: MANIFEST.into(),
-            message: "schema_version must match 1.<minor>.<patch>".into(),
-        }),
-        Some(_) => diagnostics.push(CanonicalPackageDiagnostic {
-            code: "CANONICAL_PACKAGE_UNSUPPORTED_SCHEMA_MAJOR",
-            location: MANIFEST.into(),
-            message: format!("unsupported schema version {}", manifest.schema_version),
-        }),
-        None if !manifest.schema_version.is_empty() => {
-            diagnostics.push(CanonicalPackageDiagnostic {
-                code: "CANONICAL_PACKAGE_SCHEMA_VERSION_INVALID",
-                location: MANIFEST.into(),
-                message: "schema_version must start with a numeric major version".into(),
-            })
-        }
-        None => {}
-    }
-}
-
-fn is_supported_schema_version(version: &str) -> bool {
-    let mut parts = version.split('.');
-    matches!(
-        (parts.next(), parts.next(), parts.next(), parts.next()),
-        (Some("1"), Some(minor), Some(patch), None)
-            if !minor.is_empty()
-                && !patch.is_empty()
-                && minor.bytes().all(|byte| byte.is_ascii_digit())
-                && patch.bytes().all(|byte| byte.is_ascii_digit())
-    )
-}
-
 fn validate_unit(
     unit: &Unit,
     manifest: &Manifest,
@@ -605,6 +473,20 @@ fn validate_unit(
     }
     for selector in &unit.backing_selectors {
         validate_source_native_selector(selector, unit, location, diagnostics);
+        if !hierarchy::valid_selector(selector) {
+            diagnostics.push(diagnostic(
+                "CANONICAL_PACKAGE_SELECTOR_INVALID",
+                location,
+                "invalid selector shape or range",
+            ));
+        }
+    }
+    if unit.text_hash.is_none() {
+        diagnostics.push(diagnostic(
+            "CANONICAL_PACKAGE_UNIT_REQUIRED_FIELD",
+            location,
+            "text_hash is required",
+        ));
     }
     if let Some(hash) = &unit.text_hash {
         if *hash != hex_sha256(unit.text.as_bytes()) {
@@ -701,6 +583,31 @@ fn validate_unit_id(
     }
 }
 
+fn parse_units(path: &Path) -> Result<Vec<EvidenceUnit>> {
+    let mut units = CanonicalJsonlParser.parse(&path.join(UNITS))?;
+    let lines = fs::read_to_string(path.join(UNITS))?;
+    for (evidence, line) in units
+        .iter_mut()
+        .zip(lines.lines().filter(|line| !line.trim().is_empty()))
+    {
+        let record: Unit = serde_json::from_str(line)?;
+        if let (Some(end), SourceLocator::Canonical { locator }) =
+            (record.end_components, &mut evidence.locator)
+        {
+            let end: Vec<crate::types::ReferenceComponent> =
+                serde_json::from_value(serde_json::to_value(end)?)?;
+            let normalized = end
+                .iter()
+                .map(|c| c.value.to_lowercase().replace(' ', ""))
+                .collect::<Vec<_>>()
+                .join(":");
+            locator.normalized = format!("{}-{normalized}", locator.normalized);
+            locator.end = Some(end);
+        }
+    }
+    Ok(units)
+}
+
 fn package_unit_ids(path: &Path) -> Result<Vec<String>> {
     let mut unit_ids = Vec::new();
     for line in BufReader::new(fs::File::open(path)?).lines() {
@@ -770,10 +677,9 @@ fn source_native_selector_value(scheme: &str, unit: &Unit) -> Result<String, Str
     let Some(verse) = component("verse") else {
         return Err("usfm selector requires a verse component".into());
     };
-    let book = match book {
-        "John" => "JHN",
-        _ => return Err(format!("usfm selector cannot resolve book {book}")),
-    };
+    let book = CanonRegistry::resolve(book)
+        .ok_or_else(|| format!("usfm selector cannot resolve book {book}"))?
+        .id;
     Ok(format!("{book} {chapter}:{verse}"))
 }
 

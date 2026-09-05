@@ -4,5 +4,29 @@
   "content_kind": "text",
   "work_id": "KJV",
   "version_id": "public-domain",
-  "language": "en"
+  "language": "en",
+  "canon_id": "protestant-66/v1",
+  "versification_id": "protestant-66/v1",
+  "original_source_hash": "feccc439aca5debd0208adb22aa1df1ab3c43de25dac31033b9f3625f815a68e",
+  "original_source": {
+    "format": "usfm",
+    "name": "fixture.usfm"
+  },
+  "converter_artifact_hash": "4280f654c0e3f14b1cc2fc1762c9353bc3106ceaf39f7d5dd963c60088499a2b",
+  "validation": {
+    "status": "passed",
+    "validator": "fixture-validator",
+    "version": "1.0.0"
+  },
+  "rights": {
+    "license": "CC0-1.0",
+    "statement": "Synthetic fixture; public-domain quotation."
+  },
+  "conversion": {
+    "adapter": "fixture-adapter",
+    "converter": "fixture-converter",
+    "converter_version": "1.0.0",
+    "original_source_hash": "feccc439aca5debd0208adb22aa1df1ab3c43de25dac31033b9f3625f815a68e",
+    "output_hash": "b3887a593f1adb2f6d55f1ed138751c640acf38374eb6cb3896437dee36ce0b2"
+  }
 }

@@ -15,14 +15,19 @@ fn fixture(name: &str) -> PathBuf {
 
 fn write_package(path: &Path, schema_version: &str, units: &str) {
     fs::create_dir(path).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(fixture("valid").join("manifest.json")).unwrap())
+            .unwrap();
+    manifest["schema_version"] = schema_version.into();
     fs::write(
         path.join("manifest.json"),
-        format!(
-            r#"{{"schema_version":"{schema_version}","profile":"bible","content_kind":"text","work_id":"KJV","version_id":"public-domain","language":"en"}}"#
-        ),
+        serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
-    fs::write(path.join("units.jsonl"), units).unwrap();
+    let mut unit: serde_json::Value = serde_json::from_str(units).unwrap();
+    unit["text_hash"] =
+        verbatim_core::types::hex_sha256(unit["text"].as_str().unwrap().as_bytes()).into();
+    fs::write(path.join("units.jsonl"), unit.to_string()).unwrap();
 }
 
 fn relation_package(tempdir: &tempfile::TempDir, relation: &str) -> PathBuf {
@@ -117,8 +122,8 @@ fn canonical_package_rejects_unknown_versification() {
     let manifest = fs::read_to_string(fixture("valid").join("manifest.json"))
         .unwrap()
         .replace(
-            "\"version_id\": \"public-domain\"",
-            "\"version_id\": \"public-domain\",\n  \"canon_id\": \"protestant-66/v1\",\n  \"versification_id\": \"unknown\"",
+            "\"versification_id\": \"protestant-66/v1\"",
+            "\"versification_id\": \"unknown\"",
         );
     fs::write(package.join("manifest.json"), manifest).unwrap();
     fs::copy(
@@ -139,12 +144,7 @@ fn canonical_package_persists_canon_and_versification_ids() {
     let tempdir = tempfile::tempdir().unwrap();
     let package = tempdir.path().join("versioned-locator");
     fs::create_dir(&package).unwrap();
-    let manifest = fs::read_to_string(fixture("valid").join("manifest.json"))
-        .unwrap()
-        .replace(
-            "\"version_id\": \"public-domain\"",
-            "\"version_id\": \"public-domain\",\n  \"canon_id\": \"protestant-66/v1\",\n  \"versification_id\": \"protestant-66/v1\"",
-        );
+    let manifest = fs::read_to_string(fixture("valid").join("manifest.json")).unwrap();
     fs::write(package.join("manifest.json"), manifest).unwrap();
     let units = fs::read_to_string(fixture("valid").join("units.jsonl"))
         .unwrap()
@@ -235,7 +235,7 @@ fn canonical_package_preserves_source_native_selectors() {
         format!("{}\n", lines.join("\n")),
     )
     .unwrap();
-    let reordered_units = CanonicalPackageParser.parse(&reordered).unwrap();
+    assert!(CanonicalPackageParser.parse(&reordered).is_err());
 
     let records = |units: &[verbatim_core::types::EvidenceUnit]| {
         units
@@ -249,7 +249,7 @@ fn canonical_package_preserves_source_native_selectors() {
             })
             .collect::<BTreeMap<_, _>>()
     };
-    assert_eq!(records(&original), records(&reordered_units));
+    assert_eq!(records(&original).len(), 2);
     assert_eq!(
         records(&original)["john:3:16"].0,
         vec![verbatim_core::types::BackingSelector::SourceNative {
@@ -523,7 +523,7 @@ fn canonical_package_rejects_empty_component_objects_before_persist() {
     let result = pipeline.add_source(&package);
 
     let error = result.unwrap_err().to_string();
-    assert!(error.contains("CANONICAL_PACKAGE_UNIT_INVALID"));
+    assert!(error.contains("CANONICAL_PACKAGE_HIERARCHY_INVALID"));
     assert!(pipeline.store().list_sources().unwrap().is_empty());
 }
 
