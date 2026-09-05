@@ -4,6 +4,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use super::read_bounded_source;
+
 use crate::profiles::bible::canon_registry::{CanonRegistry, VERSION as CANON_VERSION};
 use crate::profiles::bible::versification_registry::{
     VersificationRegistry, VERSION as VERSIFICATION_VERSION,
@@ -40,9 +42,12 @@ impl Parser for UsfmParser {
     }
 
     fn parse(&self, path: &Path) -> Result<Vec<EvidenceUnit>> {
-        let content = fs::read_to_string(path)
+        let file = fs::File::open(path)
             .with_context(|| format!("failed to read USFM source {}", path.display()))?;
-        parse_content(&content, path)
+        let bytes = read_bounded_source(file, "USFM", path)?;
+        let content = std::str::from_utf8(&bytes)
+            .with_context(|| format!("failed to read USFM source {}", path.display()))?;
+        parse_content(content, path)
     }
 }
 

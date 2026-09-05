@@ -5,6 +5,8 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{Map, Value};
 
+use super::read_bounded_source;
+
 use crate::profiles::bible::canon_registry::{CanonBook, CanonRegistry, VERSION as CANON_VERSION};
 use crate::profiles::bible::versification_registry::{
     VersificationRegistry, VERSION as VERSIFICATION_VERSION,
@@ -32,8 +34,9 @@ impl Parser for UsjParser {
     }
 
     fn parse(&self, path: &Path) -> Result<Vec<EvidenceUnit>> {
-        let bytes = fs::read(path)
+        let file = fs::File::open(path)
             .with_context(|| format!("failed to read USJ source {}", path.display()))?;
+        let bytes = read_bounded_source(file, "USJ", path)?;
         parse_bytes(&bytes, path)
     }
 }
