@@ -44,8 +44,34 @@ fn three_formats_round_trip_to_same_verse_and_note_relations() {
     let usx = parse_fixture("usx", USX);
     let usj = parse_fixture("usj", USJ);
 
+    for (format, units) in [("usfm", &usfm), ("usx", &usx), ("usj", &usj)] {
+        let verse = units
+            .iter()
+            .find(|unit| unit.kind == EvidenceKind::Verse)
+            .expect("fixture verse");
+        assert_eq!(verse.text, "For God so loved the world", "{format}");
+    }
+
     compare_round_trip(&[("usfm", &usfm), ("usx", &usx), ("usj", &usj)])
         .expect("USFM, USX, and USJ should be equivalent");
+}
+
+#[test]
+fn round_trip_mismatch_fails_when_verse_text_changes() {
+    let usfm = parse_fixture("usfm", USFM);
+    let usx = parse_fixture("usx", USX);
+    let mut usj = parse_fixture("usj", USJ);
+    let verse = usj
+        .iter_mut()
+        .find(|unit| unit.kind == EvidenceKind::Verse)
+        .expect("fixture verse");
+    verse.text = "Changed verse text.".to_string();
+
+    let error = compare_round_trip(&[("usfm", &usfm), ("usx", &usx), ("usj", &usj)])
+        .expect_err("a verse-text mismatch must fail closed")
+        .to_string();
+    assert!(error.contains("round-trip mismatch for usj"), "{error}");
+    assert!(error.contains("verse_text"), "{error}");
 }
 
 #[test]
@@ -92,7 +118,7 @@ fn compare_round_trip(formats: &[(&str, &[EvidenceUnit])]) -> Result<()> {
         let actual = round_trip_signature(format, units)?;
         if actual != expected {
             bail!(
-                "round-trip mismatch for {format}: expected canonical verse and (note_type, text, derived_from) {expected:?}, got {actual:?}"
+                "round-trip mismatch for {format}: expected canonical verse and (profile_id, normalized, display, verse_text) plus (note_type, text, derived_from) {expected:?}, got {actual:?}"
             );
         }
     }
@@ -102,7 +128,10 @@ fn compare_round_trip(formats: &[(&str, &[EvidenceUnit])]) -> Result<()> {
 fn round_trip_signature(
     format: &str,
     units: &[EvidenceUnit],
-) -> Result<((String, String, String), Vec<(String, String, String)>)> {
+) -> Result<(
+    (String, String, String, String),
+    Vec<(String, String, String)>,
+)> {
     let verses = units
         .iter()
         .filter(|unit| unit.kind == EvidenceKind::Verse)
@@ -153,7 +182,15 @@ fn round_trip_signature(
         notes.push((note_type.clone(), note.text.clone(), parent_identity.1));
     }
     notes.sort();
-    Ok((verse_identity, notes))
+    Ok((
+        (
+            verse_identity.0,
+            verse_identity.1,
+            verse_identity.2,
+            verse.text.clone(),
+        ),
+        notes,
+    ))
 }
 
 fn canonical_identity(unit: &EvidenceUnit) -> Result<(String, String, String)> {
