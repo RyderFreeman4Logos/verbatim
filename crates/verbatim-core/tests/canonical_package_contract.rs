@@ -104,6 +104,7 @@ fn canonical_package_checks_hierarchy_order_and_ranges() {
         ("wrong-ordinal", "CANONICAL_PACKAGE_ORDINAL_INVALID"),
         ("backwards", "CANONICAL_PACKAGE_ORDER_INVALID"),
         ("duplicate-locator", "CANONICAL_PACKAGE_LOCATOR_DUPLICATE"),
+        ("range-overlap", "CANONICAL_PACKAGE_RANGE_OVERLAP"),
         ("reversed-range", "CANONICAL_PACKAGE_RANGE_INVALID"),
         ("malformed-range", "CANONICAL_PACKAGE_RANGE_INVALID"),
         ("selector-range", "CANONICAL_PACKAGE_SELECTOR_INVALID"),
@@ -118,6 +119,12 @@ fn canonical_package_checks_hierarchy_order_and_ranges() {
         let path = package(root.path());
         edit_units(&path, |units| {
             let original = units[0].clone();
+            if case == "range-overlap" {
+                let mut end = original["components"].clone();
+                end[2]["value"] = json!("18");
+                end[2]["ordinal"] = json!(18);
+                units[0]["end_components"] = end;
+            }
             let unit = &mut units[1];
             match case {
                 "missing-level" => {
@@ -135,6 +142,14 @@ fn canonical_package_checks_hierarchy_order_and_ranges() {
                     units.swap(0, 1);
                 }
                 "duplicate-locator" => unit["components"] = original["components"].clone(),
+                "range-overlap" => {
+                    unit["components"] = original["components"].clone();
+                    unit["components"][2]["value"] = json!("17");
+                    unit["components"][2]["ordinal"] = json!(17);
+                    unit["display_citation"] = json!("John 3:17");
+                    unit["backing_selectors"] =
+                        json!([{"type":"SourceNative","scheme":"usfm","value":"JHN 3:17"}]);
+                }
                 "reversed-range" => unit["end_components"] = original["components"].clone(),
                 "malformed-range" => unit["end_components"] = json!([{}]),
                 "selector-range" => {
@@ -233,6 +248,16 @@ fn canonical_package_validates_all_files_before_admission() {
             "manifest.json:files.1.path",
         ),
         (
+            "invalid-digest",
+            "CANONICAL_PACKAGE_FILE_METADATA_INVALID",
+            "manifest.json:files.1",
+        ),
+        (
+            "invalid-media-type",
+            "CANONICAL_PACKAGE_FILE_METADATA_INVALID",
+            "manifest.json:files.1",
+        ),
+        (
             "unlisted",
             "CANONICAL_PACKAGE_FILE_UNDECLARED",
             "assets/extra.txt",
@@ -256,6 +281,10 @@ fn canonical_package_validates_all_files_before_admission() {
                 edit_manifest(&path, |m| m["files"][1]["path"] = json!("../outside"))
             }
             "duplicate-file" => edit_manifest(&path, |m| m["files"][1] = m["files"][0].clone()),
+            "invalid-digest" => edit_manifest(&path, |m| m["files"][1]["sha256"] = json!("bad")),
+            "invalid-media-type" => {
+                edit_manifest(&path, |m| m["files"][1]["media_type"] = json!("text plain"))
+            }
             "unlisted" => fs::write(path.join("assets/extra.txt"), "extra").unwrap(),
             "symlink" => {
                 fs::remove_file(path.join("assets/note.txt")).unwrap();
