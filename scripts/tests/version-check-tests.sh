@@ -275,10 +275,16 @@ test_version_snapshot_isolation() {
     repo="$(init_repo snapshot-isolation)"
     hooks="$(run_without_local_git_env git -C "$repo" \
         rev-parse --path-format=absolute --git-path hooks)"
-    case "$hooks" in
-        "$repo"/*) ;;
-        *) printf 'FAIL: fixture hooks escaped repository: %s\n' "$hooks" >&2; exit 1 ;;
-    esac
+    # Git --path-format=absolute follows a symlink TMPDIR; test -ef keeps
+    # lexical and physical fixture identity without unsetting TMP*.
+    if ! [ "$hooks" -ef "$repo/.git/hooks" ]; then
+        printf 'FAIL: fixture hooks escaped repository: %s\n' "$hooks" >&2
+        exit 1
+    fi
+    if [ "$hostile_hooks" -ef "$repo/.git/hooks" ]; then
+        printf 'FAIL: fixture hooks matched outside hooks: %s\n' "$hostile_hooks" >&2
+        exit 1
+    fi
     [ ! -e "$hooks/pre-commit" ] || {
         printf 'FAIL: hostile init.templateDir populated the fixture\n' >&2
         exit 1
