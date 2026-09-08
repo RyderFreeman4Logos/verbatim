@@ -1,18 +1,20 @@
-# Canonical package v1
+# Canonical package
 
-A canonical package is a directory containing `manifest.json`, `units.jsonl`, and an optional `relations.jsonl`:
-
-- `manifest.json`: schema version, profile, content kind, work ID, edition/version ID, language, and optional original-source SHA-256 plus `DerivedConversionMetadata`.
-- `units.jsonl`: one canonical unit per line. Each unit has a unique nonempty `unit_id`, persisted as its evidence identity; legacy single-file canonical JSONL retains generated `cjson:v1:` IDs. Units must match manifest identity fields, include text, and include at least one serialized `BackingSelector`. Supplied selectors are retained; the walking skeleton resolves `SourceNative { scheme: "usfm" }` against the unit's canonical reference. An optional `text_hash` must match the text. Unit `content_kind` accepts `verse` and `footnote` (or the legacy `text` default).
-- `relations.jsonl` (optional): a `footnote_references_verse` relation from a footnote unit ID to a verse unit ID.
-
-Validate locally without a daemon:
+The [versioned normative v1 contract](canonical-package-v1.md) defines manifest
+identity/provenance/rights and unit hierarchy, ranges, annotations and selectors.
+A package directory contains `manifest.json`, `units.jsonl`, and optional
+`relations.jsonl`, `assets/`, and `source/`. Package validation runs before source registration through
+the same validator used by the CLI and parser.
 
 ```text
 verbatim canonical validate path/to/package
 verbatim canonical validate path/to/package --format json
+verbatim canonical validate path/to/package --deny-warnings
+verbatim canonical migrate legacy.jsonl new-package --manifest identity.json
 ```
 
-Validation is fail-closed for unsupported schema majors and malformed or unresolvable source-native selectors. JSON reports expose package hash separately from original-source/converter provenance and each unit's canonical locator, selector, and text hash. Package validation runs before source registration; invalid packages do not create source or index state.
+Legacy single-file canonical `.jsonl` ingest remains supported unchanged. Its
+`cjson:v1:` generated IDs remain stable; package IDs are explicitly supplied.
 
-Legacy single-file canonical `.jsonl` ingest remains supported unchanged. This v1 boundary does not yet cover assets, source trees, exhaustive hierarchy validation, or migration.
+See the normative contract for the identity template, file inventory, hash framing,
+warning policy and lossless migration guarantees.

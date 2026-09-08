@@ -10483,7 +10483,7 @@ model = "local-vision"
         std::fs::create_dir(&package).unwrap();
         std::fs::write(
             package.join("manifest.json"),
-            r#"{"schema_version":"1.0.0","profile":"bible","content_kind":"text","work_id":"KJV","version_id":"public-domain","language":"en"}"#,
+            include_str!("../tests/fixtures/canonical_package/valid/manifest.json"),
         )
         .unwrap();
         let original = concat!(
@@ -10492,7 +10492,28 @@ model = "local-vision"
             r#"{"unit_id":"pkg:john-4-1","source_profile":"bible","work_id":"KJV","version_id":"public-domain","language":"en","components":[{"level":"book","value":"John","ordinal":43},{"level":"chapter","value":"4","ordinal":4},{"level":"verse","value":"1","ordinal":1}],"text":"changed text","backing_selectors":[{"type":"SourceNative","scheme":"usfm","value":"JHN 4:1"}]}"#,
             "\n"
         );
-        std::fs::write(package.join("units.jsonl"), original).unwrap();
+        let write_units = |text: &str| {
+            let text = text
+                .lines()
+                .map(|line| {
+                    let mut unit: serde_json::Value = serde_json::from_str(line).unwrap();
+                    unit["text_hash"] =
+                        hex_sha256(unit["text"].as_str().unwrap().as_bytes()).into();
+                    format!("{unit}\n")
+                })
+                .collect::<String>();
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(package.join("manifest.json")).unwrap())
+                    .unwrap();
+            manifest["conversion"]["output_hash"] = hex_sha256(text.as_bytes()).into();
+            std::fs::write(
+                package.join("manifest.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(package.join("units.jsonl"), text).unwrap();
+        };
+        write_units(original);
         let store = Store::in_memory().unwrap();
         let embedding = RecordingEmbeddingClient::new();
         let mut pipeline = IngestPipeline::from_parts(
@@ -10523,11 +10544,7 @@ model = "local-vision"
             .clone();
         assert_eq!(first.cache_misses, 2);
 
-        std::fs::write(
-            package.join("units.jsonl"),
-            original.replace("changed text", "changed text edited"),
-        )
-        .unwrap();
+        write_units(&original.replace("changed text", "changed text edited"));
         let second = pipeline.ingest_source(&source_id).await.unwrap();
         let second_chunks = pipeline.store().list_chunks_by_source(&source_id).unwrap();
         let second_stable = second_chunks
